@@ -18,6 +18,11 @@ pub mod popup;
 pub mod actions;
 pub mod http;
 pub mod persistence;
+pub mod chat;
+
+/// Current `WorldSettings::chat_settings_version` (2 = the server-per-world model with
+/// Send To / Show Only; see `persistence::migrate_chat_settings`).
+pub const CHAT_SETTINGS_VERSION: u32 = 2;
 pub mod daemon;
 pub mod theme;
 pub mod keynames;
@@ -1940,15 +1945,28 @@ pub struct WorldSettings {
     pub auto_connect_type: AutoConnectType,
     pub keep_alive_type: KeepAliveType,
     pub keep_alive_cmd: String,
-    // Slack settings
+    // Slack settings (see src/chat/). `slack_token` is the bot token (xoxb-),
+    // `slack_app_token` the app-level Socket Mode token (xapp-). `slack_channel` is the
+    // Send To spec, `slack_channels` the comma-separated "Show Only" filter (empty =
+    // every channel), `slack_workspace` the workspace name (informational, set by Fetch).
     slack_token: String,
+    slack_app_token: String,
     slack_channel: String,
+    slack_channels: String,
     slack_workspace: String,
-    // Discord settings
+    // Discord settings. `discord_guild` is the Server spec, `discord_channel` the Send
+    // To spec (a channel or @user), `discord_channels` the "Show Only" filter.
+    // `discord_dm_user` is legacy (pre-overhaul DM-only worlds); load-time migration
+    // folds it into discord_channel/discord_channels (persistence::migrate_chat_settings).
     discord_token: String,
     discord_guild: String,
     discord_channel: String,
-    discord_dm_user: String, // User ID for DM (creates DM channel on connect)
+    discord_channels: String,
+    discord_dm_user: String,
+    /// Which chat-settings model these fields follow (`persistence::migrate_chat_settings`).
+    /// A world loaded from a file without the key is pre-overhaul (0) and is migrated
+    /// once; the key is always written, so the migration never repeats.
+    chat_settings_version: u32,
     // User notes (stored per-world, edited with /edit command)
     pub notes: String,
     // GMCP packages to request (comma-separated, e.g. "Client.Media 1, Char.Vitals 1").
@@ -2007,12 +2025,16 @@ impl Default for WorldSettings {
             keep_alive_type: KeepAliveType::Nop,
             keep_alive_cmd: String::new(),
             slack_token: String::new(),
+            slack_app_token: String::new(),
             slack_channel: String::new(),
+            slack_channels: String::new(),
             slack_workspace: String::new(),
             discord_token: String::new(),
             discord_guild: String::new(),
             discord_channel: String::new(),
+            discord_channels: String::new(),
             discord_dm_user: String::new(),
+            chat_settings_version: CHAT_SETTINGS_VERSION,
             notes: String::new(),
             gmcp_packages: DEFAULT_GMCP_PACKAGES.to_string(),
             auto_reconnect_secs: 0,
@@ -2302,6 +2324,9 @@ pub enum Command {
     /// (`None`), every connected world (`Some("-ALL")`, case-insensitive, real
     /// TF spelling), or one named world (`Some(name)`).
     Disconnect { world: Option<String> },
+    /// /chat (aliases /discord, /slack) - Slack/Discord world commands: status,
+    /// channels, users, to <target> [-d], msg <target> <text>. `world` from `-w<name>`.
+    Chat { world: Option<String>, args: String },
     /// /flush - clear output buffer for current world
     Flush,
     /// /menu - show menu popup to select windows/popups
@@ -2492,6 +2517,19 @@ pub fn parse_command(input: &str) -> Command {
         "/disconnect" | "/dc" => {
             let world = if args.is_empty() { None } else { Some(args.join(" ")) };
             Command::Disconnect { world }
+        }
+        "/chat" | "/discord" | "/slack" => {
+            let mut world = None;
+            let mut rest: Vec<&str> = args.to_vec();
+            if let Some(first) = rest.first() {
+                if let Some(w) = first.strip_prefix("-w") {
+                    if !w.is_empty() {
+                        world = Some(w.to_string());
+                    }
+                    rest.remove(0);
+                }
+            }
+            Command::Chat { world, args: rest.join(" ") }
         }
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
@@ -3281,6 +3319,16 @@ pub struct World {
     proxy_socket_fd: Option<RawFd>, // Store Unix socket fd to TLS proxy for hot reload
     #[cfg(not(unix))]
     proxy_socket_fd: Option<i64>,   // Placeholder on non-Unix (never used)
+    /// Slack/Discord session (see `crate::chat`): `Some` from the moment a connect
+    /// starts until disconnect. Dropping it is what ends the session - every task of
+    /// the session exits - so `clear_connection_state` dropping it is the whole of
+    /// "disconnect" for a chat world.
+    pub(crate) chat: Option<chat::ChatHandle>,
+    /// A connected chat world's current send target (shown as the prompt).
+    pub(crate) chat_target: Option<chat::directory::ChatTarget>,
+    /// Set by a hot reload's state restore for a chat world that was connected: the
+    /// session send target (a spec) and Discord resume data, consumed by the reconnect.
+    pub(crate) chat_restore: Option<(String, Option<chat::ResumeState>)>,
     is_tls: bool,                // Track if using TLS
     /// MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): set by
     /// `App::should_defer_reload_for_mccp2` right before it sends `IAC DONT MCCP2` and
@@ -3578,6 +3626,9 @@ impl World {
             scrollback_tx: None,
             socket_fd: None,
             proxy_socket_fd: None,
+            chat: None,
+            chat_target: None,
+            chat_restore: None,
             is_tls: false,
             mccp2_resume_after_reload: false,
             telnet_mode: false,
@@ -3717,6 +3768,12 @@ impl World {
         self.proxy_pid = None;
         self.proxy_socket_path = None;
         self.proxy_socket_fd = None;
+        // Chat worlds: dropping the handle stops the session's tasks (see World::chat),
+        // and the bump makes any of its events still in the channel stale.
+        if self.chat.take().is_some() {
+            self.connection_id += 1;
+        }
+        self.chat_target = None;
         self.command_tx = None;
         self.connected = false;
         self.socket_fd = None;
@@ -4545,6 +4602,21 @@ impl World {
     /// attempts and flips to `false` the instant the user turns auto-reconnect off, rather than
     /// toggling on every retry cycle. Drives both the cycle tier (`WorldSwitchInfo::is_reconnecting`)
     /// and the amber separator dot (`render_separator_bar`).
+    /// Whether the idle keepalive (NOP / custom command / generic) applies to this world.
+    /// Only MUD worlds: a Slack/Discord writer would post the keepalive as chat text -
+    /// `IAC NOP` arrived in the channel as "\u{FFFD}\u{FFFD}" every five idle minutes.
+    pub(crate) fn wants_keepalive(&self) -> bool {
+        self.settings.world_type.is_mud()
+    }
+
+    /// Sending a line answers a MUD's prompt, so it goes. A chat world's prompt is
+    /// its send-target indicator (`App::refresh_chat_prompt`) and stays.
+    pub(crate) fn clear_prompt_after_send(&mut self) {
+        if self.settings.world_type.is_mud() {
+            self.prompt.clear();
+        }
+    }
+
     pub(crate) fn is_reconnecting(&self) -> bool {
         !self.connected && self.was_connected && self.settings.auto_reconnect_secs > 0
     }
@@ -4838,6 +4910,13 @@ pub struct App {
     pub ban_list: BanList,
     /// Per-user connections in multiuser mode: (world_index, username) -> UserConnection
     pub user_connections: std::collections::HashMap<(usize, String), UserConnection>,
+    /// Multiuser connects in flight (`AppEvent::MultiuserConnectResult` not yet back).
+    /// A second request for the same key is ignored meanwhile: two live sockets for one
+    /// (world, user) would both feed that user's output and either one's EOF would mark
+    /// the survivor disconnected, since multiuser events carry no connection id.
+    pub multiuser_connecting: std::collections::HashSet<(usize, String)>,
+    /// Source of `UserConnection::chat_conn_id` values (unique per process).
+    pub multiuser_chat_seq: u64,
     /// TinyFugue scripting engine
     pub tf_engine: tf::TfEngine,
     /// Loaded theme colors from ~/.clay/theme.dat
@@ -5066,6 +5145,8 @@ impl App {
             users: Vec::new(),
             ban_list: BanList::new(),
             user_connections: std::collections::HashMap::new(),
+            multiuser_connecting: std::collections::HashSet::new(),
+            multiuser_chat_seq: 0,
             tf_engine: tf::TfEngine::new(),
             theme_file: theme::ThemeFile::with_defaults(),
             keybindings: keybindings::KeyBindings::defaults(),
@@ -6000,6 +6081,9 @@ impl App {
             discord_guild: world.settings.discord_guild.clone(),
             discord_channel: world.settings.discord_channel.clone(),
             discord_dm_user: world.settings.discord_dm_user.clone(),
+            discord_channels: world.settings.discord_channels.clone(),
+            slack_app_token: world.settings.slack_app_token.clone(),
+            slack_channels: world.settings.slack_channels.clone(),
         };
 
         let def = create_world_editor_popup(&settings);
@@ -6897,6 +6981,9 @@ impl App {
                     w.settings.discord_guild = settings.discord_guild;
                     w.settings.discord_channel = settings.discord_channel;
                     w.settings.discord_dm_user = settings.discord_dm_user;
+                    w.settings.discord_channels = settings.discord_channels;
+                    w.settings.slack_app_token = settings.slack_app_token;
+                    w.settings.slack_channels = settings.slack_channels;
                     self.needs_output_redraw = true;
                 }
             }
@@ -6905,6 +6992,10 @@ impl App {
             // request/response, never from this broadcast — so there is nothing here to
             // update; `has_notes` alone would have nowhere to go.
             WsMessage::NotesChanged { .. } => {}
+            // SSH remote console: a world editor Fetch result for the popup it opened.
+            WsMessage::ChatLookupResult { request_id, world_index, result } => {
+                self.apply_chat_directory_to_editor(request_id, world_index, &result);
+            }
             // No-op (T1.13): the console draws no PAUSED badge — that status indicator is
             // web/GUI-only, and `rendering.rs` never reads a paused flag for this client —
             // so there is nothing to mirror here either.
@@ -7046,6 +7137,9 @@ impl App {
             discord_guild: w.settings.discord_guild,
             discord_channel: w.settings.discord_channel,
             discord_dm_user: w.settings.discord_dm_user,
+            discord_channels: w.settings.discord_channels,
+            slack_app_token: w.settings.slack_app_token,
+            slack_channels: w.settings.slack_channels,
             auto_reconnect_secs,
             auto_reconnect_on_web,
             ..WorldSettings::default()
@@ -8788,6 +8882,12 @@ impl App {
                 discord_guild: world.settings.discord_guild.clone(),
                 discord_channel: world.settings.discord_channel.clone(),
                 discord_dm_user: world.settings.discord_dm_user.clone(),
+                discord_channels: world.settings.discord_channels.clone(),
+                slack_app_token: world.settings.slack_app_token.clone(),
+                slack_channels: world.settings.slack_channels.clone(),
+                has_discord_token: !world.settings.discord_token.is_empty(),
+                has_slack_token: !world.settings.slack_token.is_empty(),
+                has_slack_app_token: !world.settings.slack_app_token.is_empty(),
             },
             last_send_secs: None,
             last_recv_secs: None,
@@ -8892,6 +8992,7 @@ impl App {
         discord_guild: String,
         discord_channel: String,
         discord_dm_user: String,
+        chat: Option<crate::websocket::ChatSettingsUpdate>,
     ) {
         if world_index >= self.worlds.len() {
             return;
@@ -8968,6 +9069,22 @@ impl App {
         if !discord_dm_user.is_empty() {
             self.worlds[world_index].settings.discord_dm_user = discord_dm_user;
         }
+        // A client that knows the overhauled chat model sends `chat`: authoritative for
+        // the non-secret fields, so an empty value clears (the legacy fields above can't).
+        if let Some(c) = chat {
+            let w = &mut self.worlds[world_index].settings;
+            w.discord_guild = c.discord_guild.trim().to_string();
+            w.discord_channel = c.discord_channel.trim().to_string();
+            w.discord_channels = c.discord_channels.trim().to_string();
+            // The legacy DM field is folded into Send To/Show Only by the editor now.
+            w.discord_dm_user.clear();
+            w.slack_channel = c.slack_channel.trim().to_string();
+            w.slack_channels = c.slack_channels.trim().to_string();
+            w.slack_workspace = c.slack_workspace.trim().to_string();
+            if !c.slack_app_token.trim().is_empty() {
+                w.slack_app_token = c.slack_app_token.trim().to_string();
+            }
+        }
         let _ = persistence::save_settings(self);
         let has_password = !self.worlds[world_index].settings.password.is_empty();
         let has_notes = !self.worlds[world_index].settings.notes.is_empty();
@@ -8996,6 +9113,12 @@ impl App {
             discord_guild: self.worlds[world_index].settings.discord_guild.clone(),
             discord_channel: self.worlds[world_index].settings.discord_channel.clone(),
             discord_dm_user: self.worlds[world_index].settings.discord_dm_user.clone(),
+            discord_channels: self.worlds[world_index].settings.discord_channels.clone(),
+            slack_app_token: self.worlds[world_index].settings.slack_app_token.clone(),
+            slack_channels: self.worlds[world_index].settings.slack_channels.clone(),
+            has_discord_token: !self.worlds[world_index].settings.discord_token.is_empty(),
+            has_slack_token: !self.worlds[world_index].settings.slack_token.is_empty(),
+            has_slack_app_token: !self.worlds[world_index].settings.slack_app_token.is_empty(),
         };
         self.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
     }
@@ -11106,6 +11229,11 @@ impl App {
         is_daemon_mode: bool,
     ) -> Vec<String> {
         self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
+        // Slack/Discord lines come through here too (App::handle_chat_event re-dispatches
+        // them as ServerData so they get triggers/gag/archive/broadcast for free). They are
+        // already-rendered UTF-8 text, so every MUD-protocol step below - FANSI detection,
+        // MCP `#$#` filtering, idler-keepalive gagging, BAMF portals - is skipped for them.
+        let is_mud = self.worlds[world_idx].settings.world_type.is_mud();
         // Snapshot the new-text watermark once up front: real MUD text arriving while someone's
         // viewing this world (rule 1) can advance it via the non-gagged add_output call below.
         // Broadcast NewWatermark for that BEFORE broadcast_output_range sends the content it
@@ -11116,7 +11244,7 @@ impl App {
         // baked into the DOM at append time and never re-evaluated. The gagged-lines loop
         // handles its own ordering per line since it broadcasts per line already.
         // FANSI client detection: check for "Detecting client..." within 2s window
-        if let Some(deadline) = self.worlds[world_idx].fansi_detect_until {
+        if let Some(deadline) = self.worlds[world_idx].fansi_detect_until.filter(|_| is_mud) {
             if std::time::Instant::now() < deadline {
                 let peek = self.worlds[world_idx].effective_encoding().decode(bytes);
                 for line in peek.lines() {
@@ -11144,7 +11272,11 @@ impl App {
 
         // Consider "current" if console OR any web/GUI client is viewing this world
         let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
-        let decoded_data = self.worlds[world_idx].effective_encoding().decode(bytes);
+        let decoded_data = if is_mud {
+            self.worlds[world_idx].effective_encoding().decode(bytes)
+        } else {
+            Encoding::Utf8.decode(bytes)
+        };
 
         // Extract ANSI music sequences FIRST, before any other processing
         let (data, music_sequences) = if self.settings.ansi_music_enabled {
@@ -11190,7 +11322,7 @@ impl App {
         // `mcp::McpState::filter_lines`'s doc comment). Gated on `mcp_enabled` per
         // world (default on): off means `#$#` text passes straight through exactly as
         // if this block were not here at all, same posture as `msp_enabled`.
-        let (combined_data, mcp_replies, mcp_events) = if self.worlds[world_idx].settings.mcp_enabled {
+        let (combined_data, mcp_replies, mcp_events) = if is_mud && self.worlds[world_idx].settings.mcp_enabled {
             self.worlds[world_idx].mcp.filter_lines(&combined_data)
         } else {
             (combined_data, Vec::new(), Vec::new())
@@ -11219,7 +11351,7 @@ impl App {
             let is_partial = is_last && !ends_with_newline;
 
             // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
-            let uses_idler_keepalive = matches!(
+            let uses_idler_keepalive = is_mud && matches!(
                 self.worlds[world_idx].settings.keep_alive_type,
                 KeepAliveType::Custom | KeepAliveType::Generic
             );
@@ -11310,7 +11442,7 @@ impl App {
 
         // BAMF portal detection: #### Please reconnect to name@addr (host) port NNN ####
         let bamf_val = self.tf_engine.get_var("bamf").map(|v| v.to_string_value()).unwrap_or_default();
-        if bamf_val == "1" || bamf_val == "old" {
+        if is_mud && (bamf_val == "1" || bamf_val == "old") {
             for (line, _, _) in &processed_lines {
                 if let Some(portal) = parse_bamf_portal(line) {
                     let world_name = self.worlds[world_idx].name.clone();
@@ -11525,8 +11657,9 @@ impl App {
         self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Disconnect, &world_name, false);
 
         let more_mode = self.settings.more_mode_enabled;
-        // Push prompt to output before clearing
-        if !self.worlds[world_idx].prompt.is_empty() {
+        // Push prompt to output before clearing (a chat world's "prompt" is only its
+        // send-target indicator, not server text - see App::refresh_chat_prompt).
+        if !self.worlds[world_idx].prompt.is_empty() && self.worlds[world_idx].settings.world_type.is_mud() {
             let prompt_text = self.worlds[world_idx].prompt.trim().to_string();
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
@@ -11609,6 +11742,538 @@ impl App {
     /// Returns the earliest scheduled reconnect time across all worlds, if any.
     fn next_reconnect_instant(&self) -> Option<std::time::Instant> {
         self.worlds.iter().filter_map(|w| w.reconnect_at).min()
+    }
+
+    /// Deliver a `/dict`/`/urban`/`/translate`/`/url` result from `spawn_api_lookup`.
+    /// `client_id` 0 is the console (WebSocket client ids start at 1): the text goes into
+    /// the console's own input area. The console used to await these lookups inline, and
+    /// each has a 10s timeout (`/url` one per shortener it falls back through).
+    pub(crate) fn apply_api_lookup_result(&mut self, client_id: u64, world_index: usize, result: Result<String, String>, cursor_start: bool) {
+        if client_id == 0 {
+            match result {
+                Ok(text) => {
+                    self.input.cursor_position = if cursor_start { 0 } else { text.len() };
+                    self.input.buffer = text;
+                }
+                Err(e) => {
+                    let idx = if world_index < self.worlds.len() { world_index } else { self.current_world_index };
+                    self.add_output_to_world(idx, &e);
+                }
+            }
+            return;
+        }
+        match result {
+            Ok(text) => self.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
+            Err(e) => self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
+                world_index,
+                data: e,
+                is_viewed: false,
+                ts: current_timestamp_secs(),
+                from_server: false,
+                seq: 0, end_seq: None,
+                flush: false, gagged: false, highlight_colors: Vec::new(),
+            }),
+        }
+    }
+
+    /// Start every auto-reconnect whose `reconnect_at` is due, in the background (see
+    /// `spawn_world_connect`).
+    pub(crate) fn start_due_reconnects(&mut self, event_tx: &mpsc::Sender<AppEvent>) {
+        let now = std::time::Instant::now();
+        let due: Vec<usize> = (0..self.worlds.len())
+            .filter(|&i| self.worlds[i].reconnect_at.map(|t| t <= now).unwrap_or(false))
+            .collect();
+        for idx in due {
+            self.worlds[idx].reconnect_at = None;
+            if self.worlds[idx].connected || !self.worlds[idx].settings.has_connection_settings() {
+                continue;
+            }
+            if let Some(kind) = chat::ChatKind::from_world_type(&self.worlds[idx].settings.world_type) {
+                self.emit_reconnect_status(idx, &format!("Connecting to {}...", kind.name()));
+                self.spawn_chat_connect(idx, event_tx);
+                continue;
+            }
+            let settings = &self.worlds[idx].settings;
+            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+            let msg = format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg);
+            self.emit_reconnect_status(idx, &msg);
+            // skip_auto_login=true: handle_connection_success sends auto-login itself.
+            self.spawn_world_connect(idx, true, ConnectOrigin::AutoReconnect, event_tx);
+        }
+    }
+
+    /// Start connecting chat world `idx` (Slack/Discord) - see `crate::chat`. Returns
+    /// at once: the session reports back through `AppEvent::Chat`. Any previous session
+    /// is dropped first (so a second connect can never leave two sessions running), and
+    /// `connection_id` is bumped so its late events are ignored.
+    pub(crate) fn spawn_chat_connect(&mut self, idx: usize, event_tx: &mpsc::Sender<AppEvent>) {
+        let Some(kind) = chat::ChatKind::from_world_type(&self.worlds[idx].settings.world_type) else { return };
+        self.worlds[idx].chat = None;
+        self.worlds[idx].connection_id += 1;
+        let conn_id = self.worlds[idx].connection_id;
+        let (session_target, resume) = self.worlds[idx].chat_restore.take().unwrap_or_default();
+        let cfg = chat::ChatConfig::from_settings(
+            kind,
+            chat::ChatOwner::World(self.worlds[idx].name.clone()),
+            conn_id,
+            &self.worlds[idx].settings,
+            &session_target,
+            resume,
+        );
+        self.worlds[idx].chat = Some(chat::start(cfg, event_tx.clone()));
+    }
+
+    /// Start a world editor Fetch. `client_id` 0 = the console. Empty tokens fall back
+    /// to the world's stored ones (a remote editor may have been sent a blank token).
+    /// Never awaited here - the result arrives as `AppEvent::ChatLookupResult`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_chat_lookup(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        world_index: usize,
+        world_type: &str,
+        token: String,
+        app_token: String,
+        server: String,
+        event_tx: &mpsc::Sender<AppEvent>,
+    ) {
+        let stored = self.worlds.get(world_index).map(|w| w.settings.clone());
+        let pick = |given: String, stored: Option<&String>| -> String {
+            if given.trim().is_empty() { stored.cloned().unwrap_or_default() } else { given }
+        };
+        let event_tx = event_tx.clone();
+        match world_type {
+            "slack" => {
+                let token = pick(token, stored.as_ref().map(|s| &s.slack_token));
+                let app_token = pick(app_token, stored.as_ref().map(|s| &s.slack_app_token));
+                tokio::spawn(async move {
+                    let r = chat::slack::lookup(chat::slack::DEFAULT_API, &token, &app_token).await;
+                    let _ = event_tx.send(AppEvent::ChatLookupResult(client_id, request_id, world_index, r)).await;
+                });
+            }
+            _ => {
+                let token = pick(token, stored.as_ref().map(|s| &s.discord_token));
+                tokio::spawn(async move {
+                    let r = chat::discord::lookup(chat::discord::DEFAULT_API, &token, &server).await;
+                    let _ = event_tx.send(AppEvent::ChatLookupResult(client_id, request_id, world_index, r)).await;
+                });
+            }
+        }
+    }
+
+    /// Deliver a Fetch result: into the console's open world editor (client 0; only
+    /// if it is still the same editor and the same request), or to the WS client.
+    pub(crate) fn apply_chat_lookup_result(&mut self, client_id: u64, request_id: u64, world_index: usize, result: websocket::ChatDirectoryMsg) {
+        if client_id != 0 {
+            self.ws_send_to_client(client_id, WsMessage::ChatLookupResult { request_id, world_index, result });
+            return;
+        }
+        self.apply_chat_directory_to_editor(request_id, world_index, &result);
+    }
+
+    /// Put a Fetch result into this process's open console world editor - only if it
+    /// is still the editor for `world_index` and `request_id` is its latest Fetch.
+    pub(crate) fn apply_chat_directory_to_editor(&mut self, request_id: u64, world_index: usize, result: &websocket::ChatDirectoryMsg) {
+        if let Some(state) = self.popup_manager.current_mut() {
+            let same = state.definition.id == popup::PopupId("world_editor")
+                && state.get_custom("world_index").and_then(|s| s.parse::<usize>().ok()) == Some(world_index)
+                && state.get_custom("chat_lookup_id").and_then(|s| s.parse::<u64>().ok()) == Some(request_id);
+            if same {
+                popup::definitions::world_editor::apply_chat_directory(state, result);
+                self.needs_output_redraw = true;
+            }
+        }
+    }
+
+    /// Hot reload: chat worlds that were connected come back with `chat_restore` set
+    /// (by `persistence`'s reload-state restore) instead of a socket. Start their
+    /// sessions again - Discord RESUMEs, so messages sent during the reload are
+    /// replayed - and restore the send target they had.
+    pub(crate) fn resume_chat_worlds_after_reload(&mut self, event_tx: &mpsc::Sender<AppEvent>) {
+        for idx in 0..self.worlds.len() {
+            if self.worlds[idx].chat_restore.is_none() {
+                continue;
+            }
+            // Not connected until the session reports Ready.
+            self.worlds[idx].connected = false;
+            let kind = chat::ChatKind::from_world_type(&self.worlds[idx].settings.world_type).map(|k| k.name()).unwrap_or("chat");
+            self.add_output_to_world(idx, &format!("Reconnecting to {} after reload...", kind));
+            self.spawn_chat_connect(idx, event_tx);
+        }
+    }
+
+    /// Show a chat world's send target as its prompt (`[#general] `), which every
+    /// interface already renders, and tell remote clients.
+    pub(crate) fn refresh_chat_prompt(&mut self, idx: usize) {
+        let prompt = match &self.worlds[idx].chat_target {
+            Some(t) => format!("[{}] ", chat::render::sanitize_inline(&t.label)),
+            None => "[no target - /chat to <channel>] ".to_string(),
+        };
+        if self.worlds[idx].prompt != prompt {
+            self.worlds[idx].prompt = prompt.clone();
+            self.ws_broadcast(WsMessage::PromptUpdate { world_index: idx, prompt });
+            if idx == self.current_world_index {
+                self.needs_output_redraw = true;
+            }
+        }
+    }
+
+    /// The one consumer of `AppEvent::Chat`, shared by every event loop. Returns an
+    /// event for the loop to handle as if it had arrived itself: chat `Lines` become
+    /// `ServerData` (so they get triggers, gags, highlights, logging, the archive,
+    /// more-mode and the broadcast rules for free), a non-fatal close becomes
+    /// `Disconnected` (so the loop re-arms its reconnect timer).
+    pub(crate) fn handle_chat_event(&mut self, owner: chat::ChatOwner, conn_id: u64, ev: chat::ChatEvent) -> Option<AppEvent> {
+        let world_name = match owner {
+            chat::ChatOwner::World(name) => name,
+            chat::ChatOwner::Multiuser { world_index, username } => {
+                return self.handle_multiuser_chat_event(world_index, username, conn_id, ev);
+            }
+        };
+        let idx = self.find_world_index(&world_name)?;
+        if self.worlds[idx].connection_id != conn_id {
+            return None; // a session we already replaced or shut down
+        }
+        let connected = self.worlds[idx].connected;
+        match ev {
+            chat::ChatEvent::Status(text) => {
+                self.add_output_to_world(idx, &text);
+                None
+            }
+            chat::ChatEvent::Ready { cmd_tx, summary } => {
+                let label = summary.target.as_ref().map(|t| t.label.clone());
+                self.handle_connection_success(&world_name, cmd_tx, None, true);
+                let idx = self.find_world_index(&world_name)?;
+                let kind = chat::ChatKind::from_world_type(&self.worlds[idx].settings.world_type).map(|k| k.name()).unwrap_or("chat");
+                let mut msg = format!("Connected to {} {} as {}", kind, summary.server_name, summary.bot_name);
+                msg.push_str(&format!(" ({} channels).", summary.channel_count));
+                self.add_output_to_world(idx, &msg);
+                match (&label, &summary.target_error) {
+                    (Some(l), _) => self.add_output_to_world(idx, &format!("Typing sends to {}. Change with /chat to <channel>; list channels with /chat channels.", l)),
+                    (None, Some(e)) => self.add_output_to_world(idx, &format!("Send To target not found: {} Pick one with /chat to <channel>.", e)),
+                    (None, None) => self.add_output_to_world(idx, "No Send To target set - pick one with /chat to <channel> (see /chat channels)."),
+                }
+                self.worlds[idx].chat_target = summary.target;
+                self.refresh_chat_prompt(idx);
+                None
+            }
+            chat::ChatEvent::Lines(lines) => {
+                if !connected || lines.is_empty() {
+                    return None;
+                }
+                let mut data = lines.join("\n");
+                data.push('\n');
+                Some(AppEvent::ServerData(world_name, data.into_bytes()))
+            }
+            chat::ChatEvent::SelfLines(lines) => {
+                if connected && !lines.is_empty() {
+                    self.worlds[idx].last_receive_time = Some(std::time::Instant::now());
+                    self.emit_client_lines(idx, &lines, false);
+                }
+                None
+            }
+            chat::ChatEvent::TargetChanged(t) => {
+                if connected {
+                    self.worlds[idx].chat_target = Some(t);
+                    self.refresh_chat_prompt(idx);
+                }
+                None
+            }
+            chat::ChatEvent::Closed { reason, fatal } => {
+                self.add_output_to_world(idx, &reason);
+                if connected {
+                    if fatal {
+                        self.handle_disconnected(idx);
+                        self.worlds[idx].reconnect_at = None;
+                        None
+                    } else {
+                        Some(AppEvent::Disconnected(world_name, conn_id))
+                    }
+                } else {
+                    // Never got as far as connected: a failed connect.
+                    self.worlds[idx].chat = None;
+                    let secs = self.worlds[idx].settings.auto_reconnect_secs;
+                    if !fatal && secs > 0 {
+                        self.worlds[idx].reconnect_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs as u64));
+                        self.emit_reconnect_status(idx, &format!("Reconnecting in {} seconds...", secs));
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// Multiuser: start `username`'s session for chat world `world_index`. A world has
+    /// exactly one owner in multiuser mode (ConnectWorld is owner-checked), so this is
+    /// the world's one session - no per-user duplicates of one bot token.
+    pub(crate) fn start_multiuser_chat(&mut self, world_index: usize, username: &str, event_tx: &mpsc::Sender<AppEvent>) {
+        let Some(kind) = chat::ChatKind::from_world_type(&self.worlds[world_index].settings.world_type) else { return };
+        let key = (world_index, username.to_string());
+        if let Some(conn) = self.user_connections.get(&key) {
+            if conn.connected || conn.chat.is_some() {
+                return; // connected, or a connect already in flight
+            }
+        }
+        self.multiuser_chat_seq += 1;
+        let conn_id = self.multiuser_chat_seq;
+        let cfg = chat::ChatConfig::from_settings(
+            kind,
+            chat::ChatOwner::Multiuser { world_index, username: username.to_string() },
+            conn_id,
+            &self.worlds[world_index].settings,
+            "",
+            None,
+        );
+        let handle = chat::start(cfg, event_tx.clone());
+        let conn = self.user_connections.entry(key).or_default();
+        conn.chat = Some(handle);
+        conn.chat_conn_id = conn_id;
+        self.multiuser_chat_line(world_index, username, &format!("Connecting to {}...", kind.name()));
+    }
+
+    /// A status line to one multiuser user's view of a world.
+    fn multiuser_chat_line(&mut self, world_index: usize, username: &str, text: &str) {
+        let key = (world_index, username.to_string());
+        if let Some(conn) = self.user_connections.get_mut(&key) {
+            for line in text.lines() {
+                let seq = conn.output_lines.len() as u64;
+                conn.output_lines.push(OutputLine::new_client(line.to_string(), seq));
+            }
+        }
+        if let Some(ws) = &self.ws_server {
+            ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
+                world_index,
+                data: format!("{}\n", text),
+                is_viewed: true,
+                ts: current_timestamp_secs(),
+                from_server: false,
+                seq: 0, end_seq: None,
+                flush: false, gagged: false, highlight_colors: Vec::new(),
+            }, Some(username));
+        }
+    }
+
+    fn multiuser_chat_prompt(&mut self, world_index: usize, username: &str) {
+        let key = (world_index, username.to_string());
+        let Some(conn) = self.user_connections.get_mut(&key) else { return };
+        conn.prompt = match &conn.chat_target {
+            Some(t) => format!("[{}] ", chat::render::sanitize_inline(&t.label)),
+            None => "[no target - /chat to <channel>] ".to_string(),
+        };
+        let prompt = conn.prompt.clone();
+        if let Some(ws) = &self.ws_server {
+            ws.broadcast_to_owner(WsMessage::PromptUpdate { world_index, prompt }, Some(username));
+        }
+    }
+
+    /// Multiuser half of `handle_chat_event`. Lines are handed back as
+    /// `MultiuserServerData` so they take the same per-user path as MUD text.
+    fn handle_multiuser_chat_event(&mut self, world_index: usize, username: String, conn_id: u64, ev: chat::ChatEvent) -> Option<AppEvent> {
+        let key = (world_index, username.clone());
+        let conn = self.user_connections.get(&key)?;
+        if conn.chat_conn_id != conn_id || conn.chat.is_none() {
+            return None;
+        }
+        let connected = conn.connected;
+        match ev {
+            chat::ChatEvent::Status(text) => {
+                self.multiuser_chat_line(world_index, &username, &text);
+                None
+            }
+            chat::ChatEvent::Ready { cmd_tx, summary } => {
+                let now = std::time::Instant::now();
+                if let Some(conn) = self.user_connections.get_mut(&key) {
+                    conn.connected = true;
+                    conn.command_tx = Some(cmd_tx);
+                    conn.last_send_time = Some(now);
+                    conn.last_receive_time = Some(now);
+                    conn.chat_target = summary.target.clone();
+                }
+                let name = self.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
+                if let Some(ws) = &self.ws_server {
+                    ws.broadcast_to_owner(WsMessage::WorldConnected { world_index, name }, Some(&username));
+                }
+                let kind = self.worlds.get(world_index).and_then(|w| chat::ChatKind::from_world_type(&w.settings.world_type)).map(|k| k.name()).unwrap_or("chat");
+                self.multiuser_chat_line(world_index, &username, &format!(
+                    "Connected to {} {} as {} ({} channels).", kind, summary.server_name, summary.bot_name, summary.channel_count));
+                let hint = match (&summary.target, &summary.target_error) {
+                    (Some(t), _) => format!("Typing sends to {}. Change with /chat to <channel>.", t.label),
+                    (None, Some(e)) => format!("Send To target not found: {} Pick one with /chat to <channel>.", e),
+                    (None, None) => "No Send To target set - pick one with /chat to <channel>.".to_string(),
+                };
+                self.multiuser_chat_line(world_index, &username, &hint);
+                self.multiuser_chat_prompt(world_index, &username);
+                None
+            }
+            chat::ChatEvent::Lines(lines) | chat::ChatEvent::SelfLines(lines) => {
+                if !connected || lines.is_empty() {
+                    return None;
+                }
+                if let Some(conn) = self.user_connections.get_mut(&key) {
+                    conn.last_receive_time = Some(std::time::Instant::now());
+                }
+                let mut data = lines.join("\n");
+                data.push('\n');
+                Some(AppEvent::MultiuserServerData(world_index, username, data.into_bytes()))
+            }
+            chat::ChatEvent::TargetChanged(t) => {
+                if let Some(conn) = self.user_connections.get_mut(&key) {
+                    conn.chat_target = Some(t);
+                }
+                self.multiuser_chat_prompt(world_index, &username);
+                None
+            }
+            chat::ChatEvent::Closed { reason, fatal: _ } => {
+                self.multiuser_chat_line(world_index, &username, &reason);
+                if connected {
+                    Some(AppEvent::MultiuserDisconnected(world_index, username))
+                } else {
+                    // Never connected: drop the failed attempt so a new connect can start.
+                    if let Some(conn) = self.user_connections.get_mut(&key) {
+                        conn.chat = None;
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// Multiuser `/chat ...` typed into a chat world (multiuser SendCommand otherwise
+    /// sends every line to the connection as-is). Returns false when `command` isn't a
+    /// /chat command for a chat world, so the caller sends it normally.
+    pub(crate) fn multiuser_chat_command(&mut self, world_index: usize, username: &str, command: &str) -> bool {
+        let trimmed = command.trim_start();
+        let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((c, r)) => (c, r.trim()),
+            None => (trimmed, ""),
+        };
+        if !matches!(cmd.to_lowercase().as_str(), "/chat" | "/discord" | "/slack") {
+            return false;
+        }
+        let Some(world) = self.worlds.get(world_index) else { return false };
+        let Some(kind) = chat::ChatKind::from_world_type(&world.settings.world_type) else { return false };
+        let (send_to, filter) = commands::chat_send_to_and_filter(&world.settings, kind);
+        let key = (world_index, username.to_string());
+        let (text, save) = {
+            let conn = self.user_connections.get(&key);
+            let ctx = commands::ChatCmdCtx {
+                kind,
+                connected: conn.map(|c| c.connected).unwrap_or(false),
+                dir: conn.and_then(|c| c.chat.as_ref().map(|h| h.dir.clone())),
+                target: conn.and_then(|c| c.chat_target.as_ref()),
+                command_tx: conn.and_then(|c| c.command_tx.as_ref()),
+                send_to,
+                filter,
+            };
+            commands::run_chat_subcommand(&ctx, rest)
+        };
+        if let Some(value) = save {
+            commands::set_chat_send_to(self, world_index, kind, value);
+        }
+        if !text.is_empty() {
+            self.multiuser_chat_line(world_index, username, &text);
+        }
+        true
+    }
+
+    /// Connect world `idx` (a MUD world with connection settings) in a spawned task via
+    /// `daemon::connect_daemon_world`; the outcome comes back as
+    /// `AppEvent::WorldConnectResult` for `handle_world_connect_result`. Never await a
+    /// connect on the event loop: a connect to a down host can take seconds to fail (a
+    /// powered-off LAN host sends no RST, so it waits out an ARP timeout; the TLS-proxy
+    /// path polls up to 2s for its socket), and the whole UI and every remote client
+    /// freeze for that long. Auto-reconnect used to do exactly that on every retry.
+    pub(crate) fn spawn_world_connect(&mut self, idx: usize, skip_auto_login: bool, origin: ConnectOrigin, event_tx: &mpsc::Sender<AppEvent>) {
+        let settings = self.worlds[idx].settings.clone();
+        let world_name = self.worlds[idx].name.clone();
+        self.worlds[idx].connection_id += 1;
+        let connection_id = self.worlds[idx].connection_id;
+        let tls_proxy_enabled = self.settings.tls_proxy_enabled;
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            let result = daemon::connect_daemon_world(
+                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, skip_auto_login,
+                tls_proxy_enabled,
+            ).await;
+            let _ = event_tx.send(AppEvent::WorldConnectResult(world_name, connection_id, origin, result)).await;
+        });
+    }
+
+    /// Apply the outcome of a `spawn_world_connect`. The caller must re-arm its reconnect
+    /// timer afterwards (a failed auto-reconnect schedules the next try in `reconnect_at`).
+    pub(crate) fn handle_world_connect_result(&mut self, world_name: &str, connection_id: u64, origin: ConnectOrigin, result: daemon::DaemonConnectResult) {
+        let idx = self.find_world_index(world_name);
+        // The world moved on while the connect was in flight (deleted, a newer connect
+        // bumped connection_id, or it is already connected): the result is stale.
+        let stale = match idx {
+            Some(i) => self.worlds[i].connection_id != connection_id || self.worlds[i].connected,
+            None => true,
+        };
+        if stale {
+            if let Some((cmd_tx, _, _, proxy_pid, _)) = result {
+                // Close the socket we won't use (its reader's events carry the old
+                // connection_id and are ignored); a proxy process would outlive it.
+                let _ = cmd_tx.try_send(WriteCommand::Shutdown);
+                if let Some(pid) = proxy_pid {
+                    #[cfg(unix)]
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                    #[cfg(windows)]
+                    crate::platform::kill_proxy_process(pid);
+                }
+            }
+            return;
+        }
+        let idx = idx.unwrap();
+        match (origin, result) {
+            (ConnectOrigin::AutoReconnect | ConnectOrigin::Console, Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path))) => {
+                self.handle_connection_success(world_name, cmd_tx, socket_fd, is_tls);
+                if let Some(new_idx) = self.find_world_index(world_name) {
+                    self.worlds[new_idx].proxy_pid = proxy_pid;
+                    self.worlds[new_idx].proxy_socket_path = proxy_socket_path;
+                    if matches!(origin, ConnectOrigin::AutoReconnect) {
+                        self.emit_reconnect_status(new_idx, "Connected!");
+                    }
+                }
+            }
+            (ConnectOrigin::AutoReconnect, None) => {
+                let secs = self.worlds[idx].settings.auto_reconnect_secs;
+                if secs > 0 {
+                    self.worlds[idx].reconnect_at = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                    );
+                    self.emit_reconnect_status(idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
+                } else {
+                    self.emit_reconnect_status(idx, "Connection failed.");
+                }
+            }
+            (ConnectOrigin::Client { .. }, Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path))) => {
+                let w = &mut self.worlds[idx];
+                w.connected = true;
+                w.login_capture_guard = 6; // see World::login_capture_guard
+                w.command_tx = Some(cmd_tx);
+                w.was_connected = true;
+                w.skip_auto_login = false;
+                #[cfg(any(unix, windows))]
+                { w.socket_fd = socket_fd; }
+                w.is_tls = is_tls;
+                w.proxy_pid = proxy_pid;
+                w.proxy_socket_path = proxy_socket_path;
+                let now = std::time::Instant::now();
+                w.last_send_time = Some(now);
+                w.last_receive_time = Some(now);
+                self.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name: world_name.to_string() });
+            }
+            (ConnectOrigin::Console, None) => {
+                self.add_output_to_world(idx, "Connection failed.");
+            }
+            (ConnectOrigin::Client { report_failure }, None) => {
+                self.worlds[idx].skip_auto_login = false;
+                if report_failure {
+                    self.emit_client_text(idx, "Connection failed.", true);
+                }
+            }
+        }
     }
 
     /// Schedule immediate reconnection for all worlds with auto_reconnect_on_web enabled
@@ -12993,6 +13658,13 @@ impl App {
             let world_name_for_hook = self.worlds[world_idx].name.clone();
             self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Connect, &world_name_for_hook, false);
 
+            // Auto-login and FANSI detection are MUD things. A chat world's User/Password
+            // fields may still hold values from when it was a MUD world; "connect user
+            // pass" must never be posted into a Slack/Discord channel.
+            if !self.worlds[world_idx].settings.world_type.is_mud() {
+                self.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: self.worlds[world_idx].name.clone() });
+                return;
+            }
             // Send auto-login if configured
             let skip_login = self.worlds[world_idx].skip_auto_login;
             let user = self.worlds[world_idx].settings.user.clone();
@@ -13187,7 +13859,7 @@ impl App {
                 // send - no separate record_user_input call needed.
                 if world_index < self.worlds.len() && self.send_to_world(world_index, text) {
                     self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                    self.worlds[world_index].prompt.clear();
+                    self.worlds[world_index].clear_prompt_after_send();
                 }
             }
             Command::Import { .. } => {
@@ -13261,6 +13933,9 @@ impl App {
             }
             Command::Disconnect { world } => {
                 execute_disconnect_command(self, &world, world_index, false);
+            }
+            Command::Chat { world, args } => {
+                commands::execute_chat_command(self, &world, &args, world_index, false);
             }
             Command::Flush => {
                 // Clear output buffer for this world
@@ -13956,6 +14631,9 @@ impl App {
             WsMessage::LookupPublicIp => {
                 self.request_public_ip_lookup(None, event_tx.clone());
             }
+            WsMessage::ChatLookup { request_id, world_index, world_type, token, app_token, server } => {
+                self.spawn_chat_lookup(client_id, request_id, world_index, &world_type, token, app_token, server, event_tx);
+            }
             WsMessage::RefreshReachability => {
                 self.request_reachability_refresh(None, event_tx.clone());
             }
@@ -14019,13 +14697,13 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                     msp_enabled, mcp_enabled, mccp2_enabled,
                     world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace,
-                    discord_token, discord_guild, discord_channel, discord_dm_user,
+                    discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
             WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
@@ -14750,6 +15428,12 @@ impl App {
                     discord_guild: world.settings.discord_guild.clone(),
                     discord_channel: world.settings.discord_channel.clone(),
                     discord_dm_user: world.settings.discord_dm_user.clone(),
+                    discord_channels: world.settings.discord_channels.clone(),
+                    slack_app_token: world.settings.slack_app_token.clone(),
+                    slack_channels: world.settings.slack_channels.clone(),
+                    has_discord_token: !world.settings.discord_token.is_empty(),
+                    has_slack_token: !world.settings.slack_token.is_empty(),
+                    has_slack_app_token: !world.settings.slack_app_token.is_empty(),
                 },
                 last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
@@ -15509,6 +16193,22 @@ impl App {
     }
 }
 
+/// Who started a background world connect (`App::spawn_world_connect`) - decides what
+/// `App::handle_world_connect_result` does with the outcome.
+#[derive(Debug, Clone, Copy)]
+pub enum ConnectOrigin {
+    /// The auto-reconnect timer: success runs the full `handle_connection_success`; a
+    /// failure schedules the next retry.
+    AutoReconnect,
+    /// A web/GUI/`-D` client request handled by `daemon::handle_daemon_ws_message`.
+    /// `report_failure` is false for `/worlds -b` (background connect), which never
+    /// reported a failure.
+    Client { report_failure: bool },
+    /// The console's `/worlds` connect task, TLS-proxy branch (commands.rs). Only ever
+    /// sent on success - a proxy failure falls back to a direct connect in that task.
+    Console,
+}
+
 pub enum AppEvent {
     ServerData(String, Vec<u8>),  // world_name, raw bytes
     Disconnected(String, u64),     // world_name, connection_id
@@ -15528,10 +16228,23 @@ pub enum AppEvent {
     /// `handle_telnet_event`'s `world_idx`-shaped signature doesn't fit).
     Telnet(TelnetTarget, TelnetEvent),
     SystemMessage(String),       // message to display in current world's output
+    /// A client-side status line for one world, by name (e.g. progress from a background
+    /// connect task). Unlike `ServerData` it is not MUD text: no triggers, not archived.
+    WorldNotice(String, String),  // world_name, text
+    /// Everything a Slack/Discord session reports (see `crate::chat`): who it belongs
+    /// to, the connection_id it was started under, and what happened. Every event loop
+    /// hands these to `App::handle_chat_event` before its own `match`.
+    Chat(chat::ChatOwner, u64, chat::ChatEvent),
+    /// A world editor Fetch finished (`App::spawn_chat_lookup`): requesting client id
+    /// (0 = the console), request id, world index, result.
+    ChatLookupResult(u64, u64, usize, websocket::ChatDirectoryMsg),
     Sigusr1Received,             // SIGUSR1 received - trigger hot reload (not available on Android)
     // Background connection events
     ConnectionSuccess(String, mpsc::Sender<WriteCommand>, Option<SocketFd>, bool),  // world_name, cmd_tx, socket_fd, is_tls
     ConnectionFailed(String, String),  // world_name, error_message
+    /// Outcome of a background world connect (`App::spawn_world_connect`): world_name,
+    /// the connection_id it was started under, who asked, and the connect result.
+    WorldConnectResult(String, u64, ConnectOrigin, daemon::DaemonConnectResult),
     // WebSocket events
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
@@ -15541,13 +16254,13 @@ pub enum AppEvent {
     WsKeyRevoke(u64, String),                  // client_id, auth_key to revoke
     // Multiuser mode events (include username for per-user connection isolation)
     ConnectWorldRequest(usize, String),  // world_index, requesting username
+    /// Outcome of a multiuser per-user connect spawned by `ConnectWorldRequest`:
+    /// world_index, username, the writer channel on success.
+    MultiuserConnectResult(usize, String, Option<mpsc::Sender<WriteCommand>>),
     MultiuserServerData(usize, String, Vec<u8>),  // world_index, username, raw bytes
     MultiuserDisconnected(usize, String),         // world_index, username
     MultiuserTelnetDetected(usize, String),       // world_index, username
     MultiuserPrompt(usize, String, Vec<u8>),      // world_index, username, prompt bytes
-    // Slack/Discord events
-    SlackMessage(String, String), // world_name, formatted message
-    DiscordMessage(String, String), // world_name, formatted message
     // Media file downloaded and ready to play
     MediaFileReady(usize, String, std::path::PathBuf, i64, i64, bool),  // world_idx, key, path, volume, loops, is_music
     // API lookup result (dict/urban/translate) from spawned task
@@ -15601,6 +16314,13 @@ pub struct UserConnection {
     /// MSSP, ECHO masking, ...) - see `protocol_state::ProtocolState`'s doc comment for
     /// the full list and why multiuser needed its own copy (`World` embeds one too).
     pub protocol: protocol_state::ProtocolState,
+    /// Slack/Discord: this user's session for a chat world (see `crate::chat`). Some
+    /// from connect start; dropping it ends the session. In multiuser mode a world has
+    /// one owner, so this is the world's one session.
+    pub chat: Option<chat::ChatHandle>,
+    /// The session's id in `AppEvent::Chat` (events from an older session are stale).
+    pub chat_conn_id: u64,
+    pub chat_target: Option<chat::directory::ChatTarget>,
 }
 
 impl Default for UserConnection {
@@ -15627,6 +16347,9 @@ impl UserConnection {
             partial_line: String::new(),
             partial_in_pending: false,
             protocol: protocol_state::ProtocolState::default(),
+            chat: None,
+            chat_conn_id: 0,
+            chat_target: None,
         }
     }
 }
@@ -15761,6 +16484,17 @@ pub(crate) enum NewPopupAction {
     WorldEditorDelete(usize),
     /// World editor connect requested
     WorldEditorConnect(usize),
+    /// World editor Fetch (chat worlds): look up servers/channels with the editor's
+    /// current (unsaved) values. The popup stays open; the result comes back as
+    /// `ChatLookupResult` and is applied with `world_editor::apply_chat_directory`.
+    WorldEditorChatLookup {
+        world_index: usize,
+        world_type: String,
+        token: String,
+        app_token: String,
+        server: String,
+        request_id: u64,
+    },
     /// Notes list action
     NotesList(NotesListAction),
     /// Recent worlds popup action
@@ -15909,6 +16643,9 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) discord_guild: String,
     pub(crate) discord_channel: String,
     pub(crate) discord_dm_user: String,
+    pub(crate) discord_channels: String,
+    pub(crate) slack_app_token: String,
+    pub(crate) slack_channels: String,
 }
 
 /// Actions from the world selector popup
@@ -15992,7 +16729,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
-        WORLD_BTN_SAVE, WORLD_BTN_CANCEL, WORLD_BTN_DELETE, WORLD_BTN_CONNECT,
+        WORLD_FIELD_DISCORD_CHANNELS, WORLD_FIELD_SLACK_APP_TOKEN, WORLD_FIELD_SLACK_CHANNELS,
+        WORLD_BTN_SAVE, WORLD_BTN_CANCEL, WORLD_BTN_DELETE, WORLD_BTN_CONNECT, WORLD_BTN_FETCH,
         WorldType as PopupWorldType, update_field_visibility,
     };
     use popup::definitions::import::{
@@ -17588,6 +18326,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     discord_guild: state.get_text(WORLD_FIELD_DISCORD_GUILD).unwrap_or("").to_string(),
                     discord_channel: state.get_text(WORLD_FIELD_DISCORD_CHANNEL).unwrap_or("").to_string(),
                     discord_dm_user: state.get_text(WORLD_FIELD_DISCORD_DM_USER).unwrap_or("").to_string(),
+                    discord_channels: state.get_text(WORLD_FIELD_DISCORD_CHANNELS).unwrap_or("").to_string(),
+                    slack_app_token: state.get_text(WORLD_FIELD_SLACK_APP_TOKEN).unwrap_or("").to_string(),
+                    slack_channels: state.get_text(WORLD_FIELD_SLACK_CHANNELS).unwrap_or("").to_string(),
                 }
             };
 
@@ -17614,8 +18355,36 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         PopupWorldType::parse(&world_type_str),
                         keep_alive_str == "custom",
                     );
+                    // A Fetch pick list changed: copy the pick into its text field.
+                    if let Some(changed) = $state.selected_field().map(|f| f.id) {
+                        popup::definitions::world_editor::apply_pick(&mut *$state, changed);
+                    }
                 }};
             }
+            // Fetch button: start a lookup with the editor's current values.
+            let fetch = |state: &mut popup::PopupState| -> NewPopupAction {
+                if state.editing {
+                    state.commit_edit();
+                }
+                let world_type = state.get_selected(WORLD_FIELD_TYPE).unwrap_or("mud").to_string();
+                let (token, app_token, server) = if world_type == "slack" {
+                    (
+                        state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
+                        state.get_text(WORLD_FIELD_SLACK_APP_TOKEN).unwrap_or("").to_string(),
+                        String::new(),
+                    )
+                } else {
+                    (
+                        state.get_text(WORLD_FIELD_DISCORD_TOKEN).unwrap_or("").to_string(),
+                        String::new(),
+                        state.get_text(WORLD_FIELD_DISCORD_GUILD).unwrap_or("").to_string(),
+                    )
+                };
+                let request_id = state.get_custom("chat_lookup_id").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0) + 1;
+                state.set_custom("chat_lookup_id", request_id.to_string());
+                popup::definitions::world_editor::set_chat_status(state, "Fetching...");
+                NewPopupAction::WorldEditorChatLookup { world_index, world_type, token, app_token, server, request_id }
+            };
 
             match key.code {
                 Esc => {
@@ -17641,6 +18410,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         } else if state.is_button_focused(WORLD_BTN_DELETE) {
                             app.popup_manager.close();
                             return NewPopupAction::WorldEditorDelete(world_index);
+                        } else if state.is_button_focused(WORLD_BTN_FETCH) {
+                            return fetch(state);
                         } else if state.is_button_focused(WORLD_BTN_CONNECT) {
                             let _settings = extract_settings();
                             app.popup_manager.close();
@@ -17749,6 +18520,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         } else if btn_id == WORLD_BTN_DELETE {
                             app.popup_manager.close();
                             return NewPopupAction::WorldEditorDelete(world_index);
+                        } else if btn_id == WORLD_BTN_FETCH {
+                            return fetch(state);
                         } else if btn_id == WORLD_BTN_CONNECT {
                             let _settings = extract_settings();
                             app.popup_manager.close();
@@ -19002,6 +19775,7 @@ pub async fn run_app_headless(
             }
         }
 
+        app.resume_chat_worlds_after_reload(&event_tx);
         // Cleanup: mark disconnected worlds that claim to be connected but have no command channel
         for world in &mut app.worlds {
             if world.connected && world.command_tx.is_none() {
@@ -19225,6 +19999,16 @@ pub async fn run_app_headless(
         tokio::select! {
             // App events (server data, disconnects, WS client messages)
             Some(event) = event_rx.recv() => {
+                let event = match event {
+                    // Slack/Discord: one shared handler for every loop; it may hand back an
+                    // event (chat lines as ServerData, a lost session as Disconnected) to be
+                    // handled below exactly as if it had arrived by itself.
+                    AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
+                        Some(e) => e,
+                        None => continue,
+                    },
+                    e => e,
+                };
                 match event {
                     AppEvent::ServerData(ref world_name, ref bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
@@ -19287,6 +20071,22 @@ pub async fn run_app_headless(
                                 }
                             }
                             app.current_world_index = saved_current_world;
+                        }
+                    }
+                    AppEvent::Chat(..) => {} // handled by the prelude above
+                    AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
+                        app.apply_chat_lookup_result(client_id, request_id, world_index, result);
+                    }
+                    AppEvent::WorldNotice(world_name, text) => {
+                        if let Some(world_idx) = app.find_world_index(&world_name) {
+                            app.add_output_to_world(world_idx, &text);
+                        }
+                    }
+                    AppEvent::WorldConnectResult(world_name, connection_id, origin, result) => {
+                        app.handle_world_connect_result(&world_name, connection_id, origin, result);
+                        if let Some(next) = app.next_reconnect_instant() {
+                            let dur = next.saturating_duration_since(std::time::Instant::now());
+                            reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
                         }
                     }
                     AppEvent::Disconnected(ref world_name, conn_id) => {
@@ -19421,18 +20221,7 @@ pub async fn run_app_headless(
                         app.on_media_file_ready(world_idx, key, path, volume, loops, is_music);
                     }
                     AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
-                        match result {
-                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
-                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
-                                world_index,
-                                data: e,
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
-                            }),
-                        }
+                        app.apply_api_lookup_result(client_id, world_index, result, cursor_start);
                     }
                     AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
                         app.remote_ping_responses = None;
@@ -19522,7 +20311,7 @@ pub async fn run_app_headless(
                 app.reap_stale_ws_client_worlds();
                 app.maybe_renew_port_mapping();
                 for world in &mut app.worlds {
-                    if world.connected {
+                    if world.connected && world.wants_keepalive() {
                         // Only check last_send_time: server kicks us when WE go idle.
                         let should_send = match world.last_send_time {
                             Some(t) => t.elapsed() >= KEEPALIVE_INTERVAL,
@@ -19858,51 +20647,7 @@ pub async fn run_app_headless(
 
             // Auto-reconnect timer
             _ = &mut reconnect_sleep => {
-                let now = std::time::Instant::now();
-                let to_reconnect: Vec<String> = app.worlds.iter()
-                    .filter(|w| w.reconnect_at.map(|t| t <= now).unwrap_or(false))
-                    .map(|w| w.name.clone())
-                    .collect();
-                for world_name in to_reconnect {
-                    if let Some(idx) = app.find_world_index(&world_name) {
-                        app.worlds[idx].reconnect_at = None;
-                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
-                            let settings = app.worlds[idx].settings.clone();
-                            app.worlds[idx].connection_id += 1;
-                            let connection_id = app.worlds[idx].connection_id;
-                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                            app.emit_reconnect_status(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
-                            // Pass skip_auto_login=true to connect_daemon_world so it doesn't
-                            // send auto-login; handle_connection_success handles that instead.
-                            match daemon::connect_daemon_world(
-                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
-                                app.settings.tls_proxy_enabled,
-                            ).await {
-                                Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) => {
-                                    app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
-                                    if let Some(new_idx) = app.find_world_index(&world_name) {
-                                        app.worlds[new_idx].proxy_pid = proxy_pid;
-                                        app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
-                                        app.emit_reconnect_status(new_idx, "Connected!");
-                                    }
-                                }
-                                None => {
-                                    if let Some(current_idx) = app.find_world_index(&world_name) {
-                                        let secs = app.worlds[current_idx].settings.auto_reconnect_secs;
-                                        if secs > 0 {
-                                            app.worlds[current_idx].reconnect_at = Some(
-                                                std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
-                                            );
-                                            app.emit_reconnect_status(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
-                                        } else {
-                                            app.emit_reconnect_status(current_idx, "Connection failed.");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                app.start_due_reconnects(&event_tx);
                 // Re-arm timer for next scheduled reconnect
                 if let Some(next) = app.next_reconnect_instant() {
                     let dur = next.saturating_duration_since(std::time::Instant::now());
@@ -20417,6 +21162,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
+        app.resume_chat_worlds_after_reload(&event_tx);
         // Final cleanup pass: mark any world as disconnected if it claims to be connected
         // but has no command channel (meaning the connection wasn't successfully reconstructed)
         for world in &mut app.worlds {
@@ -20454,7 +21200,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
         // Send immediate keepalive for all reconnected worlds since we don't know how long they were idle
         for world in &mut app.worlds {
-            if world.connected {
+            if world.connected && world.wants_keepalive() {
                 if let Some(tx) = &world.command_tx {
                     let now = std::time::Instant::now();
 
@@ -20863,6 +21609,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 return Ok(());
                             }
                         }
+                        KeyAction::ChatLookup { world_index, world_type, token, app_token, server, request_id } => {
+                            app.spawn_chat_lookup(0, request_id, world_index, &world_type, token, app_token, server, &event_tx);
+                        }
                         KeyAction::RunImport { addr, password, auth_key, allow_insecure } => {
                             app.pending_console_import = Some((addr.clone(), password.clone(), auth_key.clone()));
                             let event_tx = event_tx.clone();
@@ -20996,7 +21745,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     let now = std::time::Instant::now();
                                                     app.current_world_mut().last_send_time = Some(now);
                                                     app.current_world_mut().last_user_command_time = Some(now);
-                                                    app.current_world_mut().prompt.clear();
+                                                    app.current_world_mut().clear_prompt_after_send();
                                                     // Reset more-mode counter after successfully sending
                                                     app.current_world_mut().lines_since_pause = 0;
                                                     app.record_user_input(world_idx_for_record, &text_for_record);
@@ -21146,6 +21895,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         | KeyAction::Connect
                                         | KeyAction::Reload
                                         | KeyAction::Suspend
+                                        | KeyAction::ChatLookup { .. }
                                         | KeyAction::RunImport { .. } => {}
                                     }
                                 }
@@ -21167,7 +21917,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             let now = std::time::Instant::now();
                                             app.current_world_mut().last_send_time = Some(now);
                                             app.current_world_mut().last_user_command_time = Some(now);
-                                            app.current_world_mut().prompt.clear();
+                                            app.current_world_mut().clear_prompt_after_send();
                                             // Reset more-mode counter after successfully sending command
                                             // This ensures the counter is 0 when the server response arrives
                                             app.current_world_mut().lines_since_pause = 0;
@@ -21198,6 +21948,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Server events (data from MUD connections)
             Some(event) = event_rx.recv() => {
                 needs_draw = true;
+                let event = match event {
+                    // Slack/Discord: one shared handler for every loop; it may hand back an
+                    // event (chat lines as ServerData, a lost session as Disconnected) to be
+                    // handled below exactly as if it had arrived by itself.
+                    AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
+                        Some(e) => e,
+                        None => continue,
+                    },
+                    e => e,
+                };
                 match event {
                     AppEvent::ServerData(ref world_name, bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
@@ -21258,6 +22018,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                             app.current_world_index = saved_current_world;
+                        }
+                    }
+                    AppEvent::Chat(..) => {} // handled by the prelude above
+                    AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
+                        app.apply_chat_lookup_result(client_id, request_id, world_index, result);
+                    }
+                    AppEvent::WorldNotice(world_name, text) => {
+                        if let Some(world_idx) = app.find_world_index(&world_name) {
+                            app.add_output_to_world(world_idx, &text);
+                        }
+                    }
+                    AppEvent::WorldConnectResult(world_name, connection_id, origin, result) => {
+                        app.handle_world_connect_result(&world_name, connection_id, origin, result);
+                        if let Some(next) = app.next_reconnect_instant() {
+                            let dur = next.saturating_duration_since(std::time::Instant::now());
+                            reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
                         }
                     }
                     AppEvent::Disconnected(ref world_name, conn_id) => {
@@ -21325,198 +22101,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     // Multiuser events are only used in multiuser mode, ignore in normal mode
                     AppEvent::MultiuserServerData(_, _, _) => {}
+                    AppEvent::MultiuserConnectResult(..) => {} // multiuser-only (daemon.rs)
                     AppEvent::MultiuserDisconnected(_, _) => {}
                     AppEvent::MultiuserTelnetDetected(_, _) => {}
                     AppEvent::MultiuserPrompt(_, _, _) => {}
-                    // Slack/Discord events
-                    AppEvent::SlackMessage(ref world_name, message) | AppEvent::DiscordMessage(ref world_name, message) => {
-                        if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-                            let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                            let world_name_for_triggers = world_name.clone();
-                            let world_type_for_triggers = app.worlds[world_idx].settings.world_type.name();
-                            let actions = app.settings.actions.clone();
-
-                            // Check action and TF triggers on the message
-                            let tr = process_triggers(&message, &world_name_for_triggers, world_type_for_triggers, &actions, &mut app.tf_engine);
-                            let commands_to_execute = tr.send_commands;
-                            let tf_commands_to_execute = tr.clay_commands;
-                            for msg in &tr.messages {
-                                app.emit_client_text(world_idx, msg, false);
-                            }
-
-                            let data = format!("{}\n", message);
-
-                            if tr.is_gagged {
-                                // Add as gagged line (only visible with F2)
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                // Gagged or not, still text from the world: born viewed when someone's
-                                // watching. Uses the broader is_current from the top of this handler
-                                // (console OR any WS viewer), not the narrower console-only one the
-                                // ServerData broadcast below uses for its own is_viewed field.
-                                let mut gagged_line = OutputLine::new_gagged(message.clone(), seq);
-                                gagged_line.viewed = is_current;
-                                // Route into pending_lines instead of output_lines when the world
-                                // is already paused with a backlog - same reasoning as
-                                // process_server_data's hold_gagged_in_pending: otherwise this
-                                // line's real seq lands in output_lines (and gets broadcast)
-                                // ahead of older, still-queued pending content, poisoning a
-                                // client's dedup high-water-mark against that undelivered
-                                // backlog.
-                                let hold_in_pending = app.worlds[world_idx].paused
-                                    && !app.worlds[world_idx].pending_lines.is_empty();
-                                if hold_in_pending {
-                                    app.worlds[world_idx].pending_lines.push(gagged_line);
-                                    // Not broadcast here - rides out with the pending release
-                                    // batch via App::broadcast_released_lines, same as every
-                                    // other pending line.
-                                } else {
-                                    app.worlds[world_idx].output_lines.push(gagged_line);
-                                    if !app.worlds[world_idx].paused {
-                                        app.worlds[world_idx].scroll_to_bottom();
-                                    }
-                                    // Broadcast gagged line to WebSocket clients
-                                    let is_current = world_idx == app.current_world_index;
-                                    let ws_data = message.replace('\r', "") + "\n";
-                                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
-                                        world_index: world_idx,
-                                        data: ws_data,
-                                        is_viewed: is_current,
-                                        ts: current_timestamp_secs(),
-                                        from_server: true,
-                                        seq, end_seq: Some(seq),
-                                        flush: false, gagged: true, highlight_colors: Vec::new(),
-                                    });
-                                }
-                            } else {
-                                // Add non-gagged output normally
-                                let settings = app.settings.clone();
-                                let console_height = app.output_height;
-                                let console_width = app.output_width;
-
-                                // Calculate minimum visible lines among all viewers for synchronized more-mode
-                                let console_viewing = world_idx == app.current_world_index;
-                                let ws_min = app.min_viewer_lines(world_idx);
-                                let output_height = match (console_viewing, ws_min) {
-                                    (true, Some(ws)) => console_height.min(ws as u16),
-                                    (true, None) => console_height,
-                                    (false, Some(ws)) => ws as u16,
-                                    (false, None) => console_height,
-                                };
-
-                                // Calculate minimum visible columns among all viewers for wrap width
-                                let ws_min_width = app.min_viewer_width(world_idx);
-                                let output_width = match (console_viewing, ws_min_width) {
-                                    (true, Some(ws_w)) => console_width.min(ws_w as u16),
-                                    (true, None) => console_width,
-                                    (false, Some(ws_w)) => ws_w as u16,
-                                    (false, None) => console_width,
-                                };
-
-                                // Track pending count before add_output for synchronized more-mode
-                                let pending_before = app.worlds[world_idx].pending_lines.len();
-                                let output_before = app.worlds[world_idx].output_lines.len();
-
-                                app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true, app.show_tags);
-
-                                // Calculate what went where
-                                let pending_after = app.worlds[world_idx].pending_lines.len();
-                                let output_after = app.worlds[world_idx].output_lines.len();
-                                let lines_to_output = output_after.saturating_sub(output_before);
-                                let lines_to_pending = pending_after.saturating_sub(pending_before);
-
-                                // For synchronized more-mode: only broadcast lines that went to output_lines
-                                if lines_to_output > 0 {
-                                    // Shared range broadcaster, so the batch carries the REAL
-                                    // seqs add_output allocated. This site used to hand-roll
-                                    // the join and send `seq: 0, end_seq: None` with
-                                    // `from_server: false` for genuine world text - the client
-                                    // never recorded those seqs as delivered (a permanent gap
-                                    // for the ack audit) and mis-attributed the lines.
-                                    app.broadcast_output_range(world_idx, output_before, lines_to_output, is_current, true, false);
-                                }
-
-                                // Broadcast pending count update if it changed
-                                // Use filtered broadcast to skip clients that received pending in InitialState
-                                if lines_to_pending > 0 || pending_after != pending_before {
-                                    app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
-                                }
-
-                                // Broadcast updated unseen count so all clients stay in sync
-                                let unseen_count = app.worlds[world_idx].unseen_lines;
-                                if unseen_count > 0 {
-                                    app.ws_broadcast(WsMessage::UnseenUpdate {
-                                        world_index: world_idx,
-                                        count: unseen_count,
-                                    });
-                                }
-
-                                // Broadcast activity count to keep all clients in sync
-                                app.broadcast_activity();
-                            }
-
-                            // Mark output for redraw if this is the current world
-                            if world_idx == app.current_world_index {
-                                app.needs_output_redraw = true;
-                            }
-
-                            // Execute any triggered commands
-                            // Temporarily set current_world to the triggering world so /send
-                            // without -w sends to the world that triggered the action
-                            let saved_current_world = app.current_world_index;
-                            app.current_world_index = world_idx;
-                            for cmd in commands_to_execute {
-                                if cmd.starts_with('/') {
-                                    // Unified command system - route through TF parser
-                                    app.sync_tf_world_info();
-                                    match app.tf_engine.execute(&cmd) {
-                                        tf::TfCommandResult::SendToMud(text) => {
-                                            app.send_to_world(world_idx, text);
-                                        }
-                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                            handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
-                                        }
-                                        tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.register_repeat_process(process);
-                                        }
-                                        tf::TfCommandResult::Quote { lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
-                                            if let Some((target_idx, resolved_lines)) = app.resolve_quote_lines(
-                                                lines, &world, delay_secs, recall_opts, strip_ansi, world_idx, disposition, false,
-                                            ) {
-                                                match disposition {
-                                                    tf::QuoteDisposition::Send => {
-                                                        for line in resolved_lines {
-                                                            app.send_to_world(target_idx, line);
-                                                        }
-                                                    }
-                                                    tf::QuoteDisposition::Echo => {
-                                                        for line in resolved_lines {
-                                                            app.add_output(&line);
-                                                        }
-                                                    }
-                                                    tf::QuoteDisposition::Exec => {
-                                                        for line in resolved_lines {
-                                                            handle_command(&line, &mut app, event_tx.clone()).await;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                } else {
-                                    // Plain text - send to MUD (captured via send_to_world)
-                                    app.send_to_world(world_idx, cmd);
-                                }
-                            }
-                            app.current_world_index = saved_current_world;
-                            // Execute TF-generated Clay commands
-                            for cmd in tf_commands_to_execute {
-                                let _ = app.tf_engine.execute(&cmd);
-                            }
-                        }
-                    }
                     AppEvent::WsClientConnected(_client_id) => {}
                     AppEvent::WsClientDisconnected(client_id) => {
                         app.handle_ws_client_disconnected(client_id);
@@ -21629,18 +22217,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.on_media_file_ready(world_idx, key, path, volume, loops, is_music);
                     }
                     AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
-                        match result {
-                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
-                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
-                                world_index,
-                                data: e,
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
-                            }),
-                        }
+                        app.apply_api_lookup_result(client_id, world_index, result, cursor_start);
                     }
                     AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
                         app.remote_ping_responses = None;
@@ -21732,7 +22309,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                 // Check keepalive for all connected worlds (send NOP if no activity in 5 min)
                 for world in &mut app.worlds {
-                    if world.connected {
+                    if world.connected && world.wants_keepalive() {
                         // Only check last_send_time: server kicks us when WE go idle,
                         // server-side data doesn't reset the server's idle timer for our side.
                         let should_send = match world.last_send_time {
@@ -22066,51 +22643,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
             // Auto-reconnect timer
             _ = &mut reconnect_sleep => {
-                let now = std::time::Instant::now();
-                let to_reconnect: Vec<String> = app.worlds.iter()
-                    .filter(|w| w.reconnect_at.map(|t| t <= now).unwrap_or(false))
-                    .map(|w| w.name.clone())
-                    .collect();
-                for world_name in to_reconnect {
-                    if let Some(idx) = app.find_world_index(&world_name) {
-                        app.worlds[idx].reconnect_at = None;
-                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
-                            let settings = app.worlds[idx].settings.clone();
-                            app.worlds[idx].connection_id += 1;
-                            let connection_id = app.worlds[idx].connection_id;
-                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                            app.emit_reconnect_status(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
-                            // Pass skip_auto_login=true to connect_daemon_world so it doesn't
-                            // send auto-login; handle_connection_success handles that instead.
-                            match daemon::connect_daemon_world(
-                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
-                                app.settings.tls_proxy_enabled,
-                            ).await {
-                                Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) => {
-                                    app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
-                                    if let Some(new_idx) = app.find_world_index(&world_name) {
-                                        app.worlds[new_idx].proxy_pid = proxy_pid;
-                                        app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
-                                        app.emit_reconnect_status(new_idx, "Connected!");
-                                    }
-                                }
-                                None => {
-                                    if let Some(current_idx) = app.find_world_index(&world_name) {
-                                        let secs = app.worlds[current_idx].settings.auto_reconnect_secs;
-                                        if secs > 0 {
-                                            app.worlds[current_idx].reconnect_at = Some(
-                                                std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
-                                            );
-                                            app.emit_reconnect_status(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
-                                        } else {
-                                            app.emit_reconnect_status(current_idx, "Connection failed.");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                app.start_due_reconnects(&event_tx);
                 // Re-arm timer for next scheduled reconnect
                 if let Some(next) = app.next_reconnect_instant() {
                     let dur = next.saturating_duration_since(std::time::Instant::now());
@@ -22128,6 +22661,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         let drain_deadline = std::time::Instant::now() + Duration::from_millis(16);
         while let Ok(event) = event_rx.try_recv() {
             needs_draw = true;
+            let event = match event {
+                // Slack/Discord: one shared handler for every loop; it may hand back an
+                // event (chat lines as ServerData, a lost session as Disconnected) to be
+                // handled below exactly as if it had arrived by itself.
+                AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
+                    Some(e) => e,
+                    None => continue,
+                },
+                e => e,
+            };
             match event {
                 AppEvent::ServerData(ref world_name, bytes) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
@@ -22181,6 +22724,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         app.current_world_index = saved_current_world;
+                    }
+                }
+                AppEvent::Chat(..) => {} // handled by the prelude above
+                AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
+                    app.apply_chat_lookup_result(client_id, request_id, world_index, result);
+                }
+                AppEvent::WorldNotice(world_name, text) => {
+                    if let Some(world_idx) = app.find_world_index(&world_name) {
+                        app.add_output_to_world(world_idx, &text);
+                    }
+                }
+                AppEvent::WorldConnectResult(world_name, connection_id, origin, result) => {
+                    app.handle_world_connect_result(&world_name, connection_id, origin, result);
+                    if let Some(next) = app.next_reconnect_instant() {
+                        let dur = next.saturating_duration_since(std::time::Instant::now());
+                        reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
                     }
                 }
                 AppEvent::Disconnected(ref world_name, conn_id) => {
@@ -22243,6 +22802,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 // Multiuser events are only used in multiuser mode, ignore in normal mode
                 AppEvent::MultiuserServerData(_, _, _) => {}
+                AppEvent::MultiuserConnectResult(..) => {} // multiuser-only (daemon.rs)
                 AppEvent::MultiuserDisconnected(_, _) => {}
                 AppEvent::MultiuserTelnetDetected(_, _) => {}
                 AppEvent::MultiuserPrompt(_, _, _) => {}
@@ -22272,129 +22832,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 AppEvent::ImportResult(client_id, addr, result) => {
                     app.handle_import_result(client_id, addr, result);
-                }
-                // Slack/Discord events
-                AppEvent::SlackMessage(ref world_name, message) | AppEvent::DiscordMessage(ref world_name, message) => {
-                    if let Some(world_idx) = app.find_world_index(world_name) {
-                        app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-                        let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                        let world_name_for_triggers = world_name.clone();
-                        let world_type_for_triggers = app.worlds[world_idx].settings.world_type.name();
-                        let actions = app.settings.actions.clone();
-
-                        // Check action and TF triggers on the message
-                        let tr = process_triggers(&message, &world_name_for_triggers, world_type_for_triggers, &actions, &mut app.tf_engine);
-                        let commands_to_execute = tr.send_commands;
-                        let tf_commands_to_execute = tr.clay_commands;
-                        for msg in &tr.messages {
-                            app.emit_client_text(world_idx, msg, false);
-                        }
-
-                        let data = format!("{}\n", message);
-
-                        if tr.is_gagged {
-                            // Add as gagged line (only visible with F2)
-                            let seq = app.worlds[world_idx].next_seq;
-                            app.worlds[world_idx].next_seq += 1;
-                            // Gagged or not, still text from the world: born viewed when someone's
-                            // watching. Uses the broader is_current from the top of this handler
-                            // (console OR any WS viewer), not the narrower console-only one the
-                            // ServerData broadcast below uses for its own is_viewed field.
-                            let mut gagged_line = OutputLine::new_gagged(message.clone(), seq);
-                            gagged_line.viewed = is_current;
-                            // Route into pending_lines instead of output_lines when the world
-                            // is already paused with a backlog - same reasoning as
-                            // process_server_data's hold_gagged_in_pending: otherwise this
-                            // line's real seq lands in output_lines (and gets broadcast) ahead
-                            // of older, still-queued pending content, poisoning a client's
-                            // dedup high-water-mark against that undelivered backlog.
-                            let hold_in_pending = app.worlds[world_idx].paused
-                                && !app.worlds[world_idx].pending_lines.is_empty();
-                            if hold_in_pending {
-                                app.worlds[world_idx].pending_lines.push(gagged_line);
-                                // Not broadcast here - rides out with the pending release batch
-                                // via App::broadcast_released_lines, same as every other
-                                // pending line.
-                            } else {
-                            app.worlds[world_idx].output_lines.push(gagged_line);
-                            if !app.worlds[world_idx].paused {
-                                app.worlds[world_idx].scroll_to_bottom();
-                            }
-                            // Broadcast gagged line to WebSocket clients
-                            let is_current = world_idx == app.current_world_index;
-                            let ws_data = message.replace('\r', "") + "\n";
-                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
-                                world_index: world_idx,
-                                data: ws_data,
-                                is_viewed: is_current,
-                                ts: current_timestamp_secs(),
-                                from_server: true,
-                                seq, end_seq: Some(seq),
-                                flush: false, gagged: true, highlight_colors: Vec::new(),
-                            });
-                            }
-                        } else {
-                            // Add non-gagged output normally
-                            let settings = app.settings.clone();
-                            let output_height = app.output_height;
-                            let console_width = app.output_width;
-                            let ws_min_width = app.min_viewer_width(world_idx);
-                            let console_viewing = world_idx == app.current_world_index;
-                            let output_width = match (console_viewing, ws_min_width) {
-                                (true, Some(ws_w)) => console_width.min(ws_w as u16),
-                                (true, None) => console_width,
-                                (false, Some(ws_w)) => ws_w as u16,
-                                (false, None) => console_width,
-                            };
-                            // Broadcast the REAL seqs add_output just allocated, via the
-                            // shared range broadcaster - this used to re-send the raw text
-                            // with `seq: 0, end_seq: None` and `from_server: false` for what
-                            // is genuine world text, so the client never recorded those seqs
-                            // as delivered (a permanent gap for the Phase C ack audit) and
-                            // mis-attributed the lines as client-generated.
-                            let output_before = app.worlds[world_idx].output_lines.len();
-                            app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true, app.show_tags);
-                            let output_after = app.worlds[world_idx].output_lines.len();
-                            app.broadcast_output_range(world_idx, output_before, output_after.saturating_sub(output_before), is_current, true, false);
-                        }
-
-                        // Mark output for redraw if this is the current world
-                        if world_idx == app.current_world_index {
-                            app.needs_output_redraw = true;
-                        }
-
-                        // Execute any triggered commands
-                        // Temporarily set current_world to the triggering world so /send
-                        // without -w sends to the world that triggered the action
-                        let saved_current_world = app.current_world_index;
-                        app.current_world_index = world_idx;
-                        for cmd in commands_to_execute {
-                            if cmd.starts_with('/') {
-                                // Unified command system - route through TF parser
-                                app.sync_tf_world_info();
-                                match app.tf_engine.execute(&cmd) {
-                                    tf::TfCommandResult::SendToMud(text) => {
-                                        app.send_to_world(world_idx, text);
-                                    }
-                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                        handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
-                                    }
-                                    tf::TfCommandResult::RepeatProcess(process) => {
-                                        app.register_repeat_process(process);
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                // Plain text - send to MUD (captured via send_to_world)
-                                app.send_to_world(world_idx, cmd);
-                            }
-                        }
-                        app.current_world_index = saved_current_world;
-                        // Execute TF-generated Clay commands
-                        for cmd in tf_commands_to_execute {
-                            let _ = app.tf_engine.execute(&cmd);
-                        }
-                    }
                 }
                 AppEvent::WsClientConnected(_) => {}
                 AppEvent::WsClientDisconnected(client_id) => {
@@ -22487,18 +22924,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.on_media_file_ready(world_idx, key, path, volume, loops, is_music);
                 }
                 AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
-                    match result {
-                        Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
-                        Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
-                            world_index,
-                            data: e,
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
-                        }),
-                    }
+                    app.apply_api_lookup_result(client_id, world_index, result, cursor_start);
                 }
                 AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
                     app.remote_ping_responses = None;

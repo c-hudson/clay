@@ -8920,6 +8920,12 @@ third
             discord_guild: "guild1".to_string(),
             discord_channel: "chan1".to_string(),
             discord_dm_user: "user1".to_string(),
+            discord_channels: "#a,#b".to_string(),
+            slack_app_token: "xapp-1".to_string(),
+            slack_channels: "#c".to_string(),
+            has_discord_token: true,
+            has_slack_token: true,
+            has_slack_app_token: true,
         };
         app.handle_remote_ws_message(WsMessage::WorldSettingsUpdated {
             world_index: 0,
@@ -9071,6 +9077,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
+            None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Slack,
@@ -9094,6 +9101,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud_timed_prompt".to_string(), 2500, "xoxb-new".to_string(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
+            None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt);
@@ -9121,6 +9129,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud".to_string(), 1000, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
+            None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Mud);
@@ -9246,6 +9255,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
+            None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -9266,6 +9276,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
+            None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -9286,6 +9297,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
+            None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -9364,6 +9376,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
+            None,
         );
         assert!(!app.worlds[0].settings.mccp2_enabled);
         match rx.try_recv() {
@@ -9382,6 +9395,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
+            None,
         );
         assert!(rx.try_recv().is_err(), "an unchanged save must not re-send the toggle");
     }
@@ -14042,6 +14056,7 @@ third
             KeyAction::Suspend => "Suspend".to_string(),
             KeyAction::SwitchedWorld(idx) => format!("SwitchedWorld({idx})"),
             KeyAction::RunImport { addr, .. } => format!("RunImport({addr})"),
+            KeyAction::ChatLookup { request_id, .. } => format!("ChatLookup({request_id})"),
             KeyAction::None => "None".to_string(),
         }
     }
@@ -16635,6 +16650,7 @@ third
             WriteCommand::Text(_) => panic!("expected a Raw wire write, got Text"),
             WriteCommand::Shutdown => panic!("expected a Raw wire write, got Shutdown"),
             WriteCommand::SetEncoding(_) => panic!("expected a Raw wire write, got SetEncoding"),
+            WriteCommand::Chat(_) => panic!("expected a Raw wire write, got Chat"),
         }
 
         let mut saw_negotiated = false;
@@ -16841,6 +16857,7 @@ third
             Ok(WriteCommand::Text(_)) => panic!("expected a Raw CHARSET ACCEPTED response, got Text"),
             Ok(WriteCommand::Shutdown) => panic!("expected a Raw CHARSET ACCEPTED response, got Shutdown"),
             Ok(WriteCommand::SetEncoding(_)) => panic!("expected the Raw CHARSET ACCEPTED response first, got SetEncoding"),
+            Ok(WriteCommand::Chat(_)) => panic!("expected the Raw CHARSET ACCEPTED response first, got Chat"),
             Err(_) => panic!("expected a queued CHARSET ACCEPTED response, channel was empty"),
         }
         // Job 13 (plan Phase 4, 4.4): accepting now also switches the writer's
@@ -18611,4 +18628,156 @@ third
                 assert_eq!(a, b, "characters lost or invented: {text} -> {out}");
             }
         }
+    }
+
+    // ---- Chat worlds (Slack/Discord) - App::handle_chat_event ----
+
+    fn chat_app() -> (App, tokio::sync::mpsc::Receiver<WriteCommand>) {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("Disc");
+        w.settings.world_type = WorldType::Discord;
+        w.settings.discord_token = "tok".to_string();
+        w.connection_id = 5;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        (app, rx)
+    }
+
+    fn ready(cmd_tx: tokio::sync::mpsc::Sender<WriteCommand>) -> chat::ChatEvent {
+        chat::ChatEvent::Ready {
+            cmd_tx,
+            summary: chat::ReadySummary {
+                bot_name: "claybot".into(),
+                server_name: "Srv".into(),
+                channel_count: 2,
+                target: Some(chat::directory::ChatTarget { channel_id: Some("1".into()), user_id: None, label: "#general".into() }),
+                target_error: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_chat_ready_connects_and_shows_target_as_prompt() {
+        let (mut app, _rx) = chat_app();
+        let (tx, _cmd_rx) = tokio::sync::mpsc::channel(8);
+        let owner = chat::ChatOwner::World("Disc".into());
+        assert!(app.handle_chat_event(owner.clone(), 5, ready(tx)).is_none());
+        assert!(app.worlds[0].connected);
+        assert!(app.worlds[0].was_connected);
+        assert_eq!(app.worlds[0].prompt, "[#general] ");
+        // Sending text never clears a chat world's prompt (it's the target indicator).
+        app.worlds[0].clear_prompt_after_send();
+        assert_eq!(app.worlds[0].prompt, "[#general] ");
+        let text: Vec<String> = app.worlds[0].output_lines.iter().map(|l| l.text.clone()).collect();
+        assert!(text.iter().any(|t| t.contains("Connected to Discord Srv as claybot")), "{text:?}");
+        assert!(text.iter().any(|t| t.contains("Typing sends to #general")), "{text:?}");
+    }
+
+    #[test]
+    fn test_chat_events_from_a_stale_session_are_dropped() {
+        let (mut app, _rx) = chat_app();
+        let (tx, _cmd_rx) = tokio::sync::mpsc::channel(8);
+        let owner = chat::ChatOwner::World("Disc".into());
+        // conn_id 4 != 5: an old session's Ready must not connect the world.
+        assert!(app.handle_chat_event(owner.clone(), 4, ready(tx)).is_none());
+        assert!(!app.worlds[0].connected);
+        // Lines for a world that isn't connected are dropped.
+        assert!(app.handle_chat_event(owner, 5, chat::ChatEvent::Lines(vec!["#g <a> x".into()])).is_none());
+    }
+
+    #[test]
+    fn test_chat_lines_become_server_data_and_closes_route_correctly() {
+        let (mut app, _rx) = chat_app();
+        let (tx, _cmd_rx) = tokio::sync::mpsc::channel(8);
+        let owner = chat::ChatOwner::World("Disc".into());
+        app.handle_chat_event(owner.clone(), 5, ready(tx));
+        match app.handle_chat_event(owner.clone(), 5, chat::ChatEvent::Lines(vec!["#g <a> one".into(), "  two".into()])) {
+            Some(AppEvent::ServerData(name, bytes)) => {
+                assert_eq!(name, "Disc");
+                assert_eq!(String::from_utf8(bytes).unwrap(), "#g <a> one\n  two\n");
+            }
+            _ => panic!("chat lines must be re-dispatched as ServerData"),
+        }
+        // Chat text through process_server_data: MUD-only processing (MCP) is skipped.
+        let before = app.worlds[0].output_lines.len();
+        app.process_server_data(0, b"#g <a> #$#mcp version: 2.1\n", 24, 80, false);
+        assert_eq!(app.worlds[0].output_lines.len(), before + 1, "a #$# line in chat text is shown, not eaten as MCP");
+        // Non-fatal close while connected: handed back as Disconnected for the loop.
+        assert!(matches!(
+            app.handle_chat_event(owner.clone(), 5, chat::ChatEvent::Closed { reason: "lost".into(), fatal: false }),
+            Some(AppEvent::Disconnected(ref n, 5)) if n == "Disc"
+        ));
+        // Fatal close: disconnected here, and auto-reconnect is suppressed.
+        app.worlds[0].settings.auto_reconnect_secs = 10;
+        assert!(app.handle_chat_event(owner, 5, chat::ChatEvent::Closed { reason: "bad token".into(), fatal: true }).is_none());
+        assert!(!app.worlds[0].connected);
+        assert!(app.worlds[0].reconnect_at.is_none());
+    }
+
+    #[test]
+    fn test_chat_worlds_skip_the_idle_keepalive() {
+        let (app, _rx) = chat_app();
+        assert!(!app.worlds[0].wants_keepalive());
+        assert!(World::new("m").wants_keepalive());
+    }
+
+    #[tokio::test]
+    async fn test_auto_reconnect_routes_chat_worlds_to_the_chat_session() {
+        let (mut app, _rx) = chat_app();
+        app.worlds[0].was_connected = true;
+        app.worlds[0].reconnect_at = Some(std::time::Instant::now());
+        let (tx, _erx) = tokio::sync::mpsc::channel(8);
+        app.start_due_reconnects(&tx);
+        assert!(app.worlds[0].chat.is_some(), "a chat session was started (not the MUD connect path)");
+        assert_eq!(app.worlds[0].connection_id, 6);
+        // Disconnecting drops the session and makes its in-flight events stale.
+        app.worlds[0].clear_connection_state(true, true);
+        assert!(app.worlds[0].chat.is_none());
+        assert_eq!(app.worlds[0].connection_id, 7);
+    }
+
+    #[tokio::test]
+    async fn test_multiuser_chat_session_is_owner_scoped() {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+        let mut w = World::new("Disc");
+        w.settings.world_type = WorldType::Discord;
+        w.settings.discord_token = "tok".to_string();
+        w.owner = Some("alice".to_string());
+        app.worlds.push(w);
+        let (tx, _erx) = tokio::sync::mpsc::channel(8);
+        app.start_multiuser_chat(0, "alice", &tx);
+        let key = (0usize, "alice".to_string());
+        let conn_id = app.user_connections[&key].chat_conn_id;
+        assert!(app.user_connections[&key].chat.is_some());
+        // A second connect while one is in flight is ignored (one session per world).
+        app.start_multiuser_chat(0, "alice", &tx);
+        assert_eq!(app.user_connections[&key].chat_conn_id, conn_id);
+
+        let owner = chat::ChatOwner::Multiuser { world_index: 0, username: "alice".into() };
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
+        assert!(app.handle_chat_event(owner.clone(), conn_id, ready(cmd_tx)).is_none());
+        assert!(app.user_connections[&key].connected);
+        assert_eq!(app.user_connections[&key].prompt, "[#general] ");
+        // A stale session id is ignored.
+        assert!(app.handle_chat_event(owner.clone(), conn_id + 99, chat::ChatEvent::Lines(vec!["x".into()])).is_none());
+        match app.handle_chat_event(owner.clone(), conn_id, chat::ChatEvent::Lines(vec!["#g <b> hi".into()])) {
+            Some(AppEvent::MultiuserServerData(0, u, bytes)) => {
+                assert_eq!(u, "alice");
+                assert_eq!(bytes, b"#g <b> hi\n");
+            }
+            _ => panic!("expected MultiuserServerData"),
+        }
+        // /chat is intercepted (not sent as chat text); plain text is not.
+        assert!(app.multiuser_chat_command(0, "alice", "/chat status"));
+        assert!(!app.multiuser_chat_command(0, "alice", "hello there"));
+        assert!(cmd_rx.try_recv().is_err(), "/chat status sent nothing to the chat");
+        // Losing the session while connected hands back MultiuserDisconnected.
+        assert!(matches!(
+            app.handle_chat_event(owner, conn_id, chat::ChatEvent::Closed { reason: "lost".into(), fatal: false }),
+            Some(AppEvent::MultiuserDisconnected(0, _))
+        ));
     }

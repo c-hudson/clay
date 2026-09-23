@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
-use futures::StreamExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -35,531 +34,13 @@ use crate::platform::enable_tcp_keepalive;
 #[cfg(all(unix, not(target_os = "android")))]
 use crate::platform::{
     get_executable_path, exec_reload, check_and_download_update,
-    spawn_tls_proxy,
 };
 #[cfg(windows)]
 use crate::platform::{
     get_executable_path, exec_reload, check_and_download_update,
-    spawn_tls_proxy, kill_proxy_process,
+    kill_proxy_process,
 };
 
-pub(crate) async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
-    // Capture world name for the reader task (stable across world deletions)
-    let world_name = app.current_world().name.clone();
-
-    // Clone settings values first to avoid borrow conflicts
-    let token = app.current_world().settings.slack_token.clone();
-    let channel = app.current_world().settings.slack_channel.clone();
-
-    if token.is_empty() {
-        app.add_output("Error: Slack token is required.");
-        app.add_output("Configure the token in world settings (/worlds -e)");
-        return false;
-    }
-
-    app.add_output("");
-    app.add_output("Connecting to Slack...");
-    app.add_output("");
-
-    // Get WebSocket URL from Slack API
-    let client = reqwest::Client::new();
-    let response = match client
-        .post("https://slack.com/api/apps.connections.open")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            app.add_output(&format!("Failed to connect to Slack API: {}", e));
-            return false;
-        }
-    };
-
-    let body: serde_json::Value = match response.json().await {
-        Ok(j) => j,
-        Err(e) => {
-            app.add_output(&format!("Failed to parse Slack response: {}", e));
-            return false;
-        }
-    };
-
-    if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let error = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-        app.add_output(&format!("Slack API error: {}", error));
-        return false;
-    }
-
-    let ws_url = match body.get("url").and_then(|v| v.as_str()) {
-        Some(u) => u.to_string(),
-        None => {
-            app.add_output("Slack response missing WebSocket URL");
-            return false;
-        }
-    };
-
-    app.add_output("Got WebSocket URL, connecting...");
-
-    // Connect to Slack WebSocket
-    use tokio_tungstenite::tungstenite::Message as WsMsg;
-
-    let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
-        Ok(s) => s,
-        Err(e) => {
-            app.add_output(&format!("Failed to connect to Slack WebSocket: {}", e));
-            return false;
-        }
-    };
-
-    app.add_output("Connected to Slack!");
-    app.current_world_mut().connected = true;
-    app.current_world_mut().was_connected = true;
-
-    let (write, mut read) = ws_stream.split();
-    let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
-
-    // Create command channel for sending messages
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
-    app.current_world_mut().command_tx = Some(cmd_tx);
-
-    // Spawn reader task
-    app.current_world_mut().connection_id += 1;
-    let reader_conn_id = app.current_world().connection_id;
-    let event_tx_clone = event_tx.clone();
-    let _token_clone = token.clone(); // Reserved for future use (user lookup, etc.)
-    let channel_clone = channel.clone();
-    let write_clone = write.clone();
-
-    tokio::spawn(async move {
-        use futures::SinkExt;
-
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(WsMsg::Text(text)) => {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        // Handle envelope acknowledgment
-                        if let Some(envelope_id) = json.get("envelope_id").and_then(|v| v.as_str()) {
-                            let ack = serde_json::json!({ "envelope_id": envelope_id });
-                            let mut w = write_clone.lock().await;
-                            let _ = w.send(WsMsg::Text(ack.to_string())).await;
-                        }
-
-                        // Handle events
-                        if let Some(payload) = json.get("payload") {
-                            if let Some(event) = payload.get("event") {
-                                let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                                if event_type == "message" {
-                                    // Check if it's the right channel
-                                    let msg_channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-                                    if channel_clone.is_empty() || msg_channel == channel_clone || msg_channel.contains(&channel_clone) {
-                                        let user = event.get("user").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                        let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                                        let formatted = format!("[{}] <{}> {}", msg_channel, user, text);
-                                        let _ = event_tx_clone.send(AppEvent::SlackMessage(world_name.clone(), formatted)).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(WsMsg::Close(_)) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
-                    break;
-                }
-                Err(_) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // Spawn writer task for sending messages
-    let token_for_writer = token.clone();
-    let channel_for_writer = channel.clone();
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        while let Some(cmd) = cmd_rx.recv().await {
-            let text = match cmd {
-                WriteCommand::Text(t) => t,
-                WriteCommand::Raw(r) => String::from_utf8_lossy(&r).to_string(),
-                WriteCommand::Shutdown => break,
-                // Slack is not a telnet connection - CHARSET negotiation (and
-                // therefore this command) can never reach it. Job 13 (plan
-                // Phase 4, 4.4) added the variant for the real telnet writer;
-                // it's unreachable here, same as WriteCommand::Raw already
-                // was mostly theoretical on this path.
-                WriteCommand::SetEncoding(_) => continue,
-            };
-            // Send message via chat.postMessage API
-            let _ = client
-                .post("https://slack.com/api/chat.postMessage")
-                .header("Authorization", format!("Bearer {}", token_for_writer))
-                .header("Content-Type", "application/json")
-                .json(&serde_json::json!({
-                    "channel": channel_for_writer,
-                    "text": text
-                }))
-                .send()
-                .await;
-        }
-    });
-
-    false
-}
-
-// ============================================================================
-// Discord Gateway Bot Connection
-// ============================================================================
-
-pub(crate) async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
-    // Capture world name for the reader task (stable across world deletions)
-    let world_name = app.current_world().name.clone();
-
-    // Clone settings values first to avoid borrow conflicts
-    let token = app.current_world().settings.discord_token.clone();
-    let _guild_id = app.current_world().settings.discord_guild.clone();
-    let mut channel_id = app.current_world().settings.discord_channel.clone();
-    let dm_user = app.current_world().settings.discord_dm_user.clone();
-
-    if token.is_empty() {
-        app.add_output("Error: Discord token is required.");
-        app.add_output("Configure the token in world settings (/worlds -e)");
-        return false;
-    }
-
-    app.add_output("");
-    app.add_output("Connecting to Discord...");
-
-    // If DM user is set, create a DM channel first
-    if !dm_user.is_empty() && channel_id.is_empty() {
-        app.add_output(&format!("Creating DM channel with user {}...", dm_user));
-
-        let client = reqwest::Client::new();
-        let response = match client
-            .post("https://discord.com/api/v10/users/@me/channels")
-            .header("Authorization", format!("Bot {}", token))
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "recipient_id": dm_user
-            }))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                app.add_output(&format!("Failed to create DM channel: {}", e));
-                return false;
-            }
-        };
-
-        let status = response.status();
-        let body: serde_json::Value = match response.json().await {
-            Ok(j) => j,
-            Err(e) => {
-                app.add_output(&format!("Failed to parse DM response: {} (HTTP {})", e, status));
-                return false;
-            }
-        };
-
-        if status.is_success() {
-            if let Some(id) = body.get("id").and_then(|v| v.as_str()) {
-                channel_id = id.to_string();
-                app.add_output(&format!("DM channel created: {}", channel_id));
-            } else {
-                app.add_output("Failed to create DM channel: no channel ID in response");
-                app.add_output(&format!("Response: {}", body));
-                return false;
-            }
-        } else {
-            let error_msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
-            let error_code = body.get("code").and_then(|v| v.as_i64());
-            app.add_output(&format!("Failed to create DM channel (HTTP {}): {}", status.as_u16(), error_msg));
-            if let Some(code) = error_code {
-                app.add_output(&format!("Discord error code: {}", code));
-            }
-            // Show hint for common errors
-            if status.as_u16() == 401 {
-                app.add_output("Hint: Check that your bot token is correct and includes 'Bot ' prefix if needed");
-            } else if status.as_u16() == 403 {
-                app.add_output("Hint: Bot may lack permissions or the user has DMs disabled");
-            }
-            return false;
-        }
-    }
-
-    // Resolve channel name to ID if needed
-    let guild_id = app.current_world().settings.discord_guild.clone();
-    if !channel_id.is_empty() && !channel_id.chars().all(|c| c.is_ascii_digit()) {
-        // Channel is a name, not an ID - need to resolve it
-        if guild_id.is_empty() {
-            app.add_output("Error: Guild ID is required when using a channel name.");
-            app.add_output("Either use a numeric channel ID or configure the Guild ID.");
-            return false;
-        }
-
-        app.add_output(&format!("Resolving channel name '{}'...", channel_id));
-
-        let client = reqwest::Client::new();
-        let url = format!("https://discord.com/api/v10/guilds/{}/channels", guild_id);
-        let response = match client
-            .get(&url)
-            .header("Authorization", format!("Bot {}", token))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                app.add_output(&format!("Failed to fetch guild channels: {}", e));
-                return false;
-            }
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let body: serde_json::Value = response.json().await.unwrap_or_default();
-            let error_msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
-            app.add_output(&format!("Failed to fetch guild channels (HTTP {}): {}", status.as_u16(), error_msg));
-            return false;
-        }
-
-        let channels: Vec<serde_json::Value> = match response.json().await {
-            Ok(c) => c,
-            Err(e) => {
-                app.add_output(&format!("Failed to parse channels response: {}", e));
-                return false;
-            }
-        };
-
-        // Find channel by name (case-insensitive)
-        let channel_name_lower = channel_id.to_lowercase();
-        let found_channel = channels.iter().find(|ch| {
-            ch.get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| n.to_lowercase() == channel_name_lower)
-                .unwrap_or(false)
-        });
-
-        match found_channel {
-            Some(ch) => {
-                if let Some(id) = ch.get("id").and_then(|v| v.as_str()) {
-                    app.add_output(&format!("Resolved '{}' to channel ID {}", channel_id, id));
-                    channel_id = id.to_string();
-                } else {
-                    app.add_output(&format!("Channel '{}' found but has no ID", channel_id));
-                    return false;
-                }
-            }
-            None => {
-                app.add_output(&format!("Channel '{}' not found in guild", channel_id));
-                // List available channels as a hint
-                let available: Vec<&str> = channels.iter()
-                    .filter_map(|ch| ch.get("name").and_then(|n| n.as_str()))
-                    .take(10)
-                    .collect();
-                if !available.is_empty() {
-                    app.add_output(&format!("Available channels: {}", available.join(", ")));
-                }
-                return false;
-            }
-        }
-    }
-
-    app.add_output("");
-
-    // Connect to Discord Gateway
-    use tokio_tungstenite::tungstenite::Message as WsMsg;
-
-    let (ws_stream, _) = match tokio_tungstenite::connect_async("wss://gateway.discord.gg/?v=10&encoding=json").await {
-        Ok(s) => s,
-        Err(e) => {
-            app.add_output(&format!("Failed to connect to Discord Gateway: {}", e));
-            return false;
-        }
-    };
-
-    let (write, mut read) = ws_stream.split();
-    let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
-
-    // Create command channel for sending messages
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
-    app.current_world_mut().command_tx = Some(cmd_tx);
-
-    // Clone world_name for both spawns before moving into first one
-    let world_name_for_writer = world_name.clone();
-
-    // Spawn reader/heartbeat task
-    app.current_world_mut().connection_id += 1;
-    let reader_conn_id = app.current_world().connection_id;
-    let event_tx_clone = event_tx.clone();
-    let token_clone = token.clone();
-    let channel_id_clone = channel_id.clone();
-    let write_clone = write.clone();
-
-    tokio::spawn(async move {
-        use futures::SinkExt;
-
-        let mut _heartbeat_interval: Option<u64> = None; // Reserved for dynamic heartbeat
-        let mut last_sequence: Option<u64> = None;
-        let mut _identified = false; // Track READY state
-
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(WsMsg::Text(text)) => {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        let op = json.get("op").and_then(|v| v.as_u64()).unwrap_or(0);
-
-                        // Update sequence number
-                        if let Some(s) = json.get("s").and_then(|v| v.as_u64()) {
-                            last_sequence = Some(s);
-                        }
-
-                        match op {
-                            10 => {
-                                // Hello - start heartbeat
-                                if let Some(d) = json.get("d") {
-                                    if let Some(interval) = d.get("heartbeat_interval").and_then(|v| v.as_u64()) {
-                                        _heartbeat_interval = Some(interval);
-
-                                        // Send IDENTIFY
-                                        let identify = serde_json::json!({
-                                            "op": 2,
-                                            "d": {
-                                                "token": token_clone,
-                                                "intents": 2099200, // GUILDS + GUILD_MESSAGES + MESSAGE_CONTENT
-                                                "properties": {
-                                                    "os": "linux",
-                                                    "browser": "clay",
-                                                    "device": "clay"
-                                                }
-                                            }
-                                        });
-                                        let mut w = write_clone.lock().await;
-                                        let _ = w.send(WsMsg::Text(identify.to_string())).await;
-                                    }
-                                }
-                            }
-                            0 => {
-                                // Dispatch event
-                                let event_type = json.get("t").and_then(|v| v.as_str()).unwrap_or("");
-
-                                if event_type == "READY" {
-                                    _identified = true;
-                                    let _ = event_tx_clone.send(AppEvent::DiscordMessage(world_name.clone(), "Connected to Discord!".to_string())).await;
-                                } else if event_type == "MESSAGE_CREATE" {
-                                    if let Some(d) = json.get("d") {
-                                        let msg_channel = d.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
-                                        if channel_id_clone.is_empty() || msg_channel == channel_id_clone {
-                                            let author = d.get("author").and_then(|a| a.get("username")).and_then(|v| v.as_str()).unwrap_or("unknown");
-                                            let content = d.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                                            let formatted = format!("[#{}] <{}> {}", msg_channel, author, content);
-                                            let _ = event_tx_clone.send(AppEvent::DiscordMessage(world_name.clone(), formatted)).await;
-                                        }
-                                    }
-                                }
-                            }
-                            11 => {
-                                // Heartbeat ACK - good, keep going
-                            }
-                            1 => {
-                                // Heartbeat request - send heartbeat
-                                let hb = serde_json::json!({
-                                    "op": 1,
-                                    "d": last_sequence
-                                });
-                                let mut w = write_clone.lock().await;
-                                let _ = w.send(WsMsg::Text(hb.to_string())).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Ok(WsMsg::Close(_)) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
-                    break;
-                }
-                Err(_) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // Spawn heartbeat task
-    let write_for_heartbeat = write.clone();
-    tokio::spawn(async move {
-        use futures::SinkExt;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(41)); // ~41s heartbeat
-        loop {
-            interval.tick().await;
-            let hb = serde_json::json!({
-                "op": 1,
-                "d": null
-            });
-            let mut w = write_for_heartbeat.lock().await;
-            if w.send(WsMsg::Text(hb.to_string())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Spawn writer task for sending messages via REST API
-    let token_for_writer = token.clone();
-    let channel_for_writer = channel_id.clone();
-    let event_tx_for_writer = event_tx.clone();
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        while let Some(cmd) = cmd_rx.recv().await {
-            let text = match cmd {
-                WriteCommand::Text(t) => t,
-                WriteCommand::Raw(r) => String::from_utf8_lossy(&r).to_string(),
-                WriteCommand::Shutdown => break,
-                // Discord is not a telnet connection - see the identical arm
-                // in connect_slack above.
-                WriteCommand::SetEncoding(_) => continue,
-            };
-            if channel_for_writer.is_empty() {
-                let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_name_for_writer.clone(), "Error: No channel configured".to_string())).await;
-                continue;
-            }
-            let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_for_writer);
-            match client
-                .post(&url)
-                .header("Authorization", format!("Bot {}", token_for_writer))
-                .header("Content-Type", "application/json")
-                .json(&serde_json::json!({
-                    "content": text
-                }))
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    if !response.status().is_success() {
-                        let status = response.status();
-                        let body: serde_json::Value = response.json().await.unwrap_or_default();
-                        let error_msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
-                        let msg = format!("Discord send failed (HTTP {}): {}", status.as_u16(), error_msg);
-                        let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_name_for_writer.clone(), msg)).await;
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("Discord send error: {}", e);
-                    let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_name_for_writer.clone(), msg)).await;
-                }
-            }
-        }
-    });
-
-    app.current_world_mut().connected = true;
-    app.current_world_mut().was_connected = true;
-
-    false
-}
 
 /// Convert UTF-8 characters with diacritics to ASCII equivalents
 /// for better compatibility with non-UTF-8 MUD worlds
@@ -1512,11 +993,17 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             // Route connection based on world type
             let world_type = app.current_world().settings.world_type.clone();
             match world_type {
-                WorldType::Slack => {
-                    return connect_slack(app, event_tx).await;
-                }
-                WorldType::Discord => {
-                    return connect_discord(app, event_tx).await;
+                WorldType::Slack | WorldType::Discord => {
+                    // Background session (crate::chat); reports back via AppEvent::Chat.
+                    let kind = if world_type == WorldType::Slack { "Slack" } else { "Discord" };
+                    if !app.current_world().settings.has_connection_settings() {
+                        app.add_output(&format!("Set the {} token first (/worlds -e).", kind));
+                        return false;
+                    }
+                    app.add_output(&format!("Connecting to {}...", kind));
+                    let idx = app.current_world_index;
+                    app.spawn_chat_connect(idx, &event_tx);
+                    return false;
                 }
                 WorldType::Mud | WorldType::MudTimedPrompt => {
                     // Continue with MUD connection below
@@ -1561,261 +1048,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output(&format!("Connecting to {}:{}{}...", host, port, ssl_msg));
             app.add_output("");
 
-            // Handle TLS proxy case separately (proxy does its own TCP connect)
-            // TLS proxy only available on Unix and Windows (not Android)
-            #[cfg(all(unix, not(target_os = "android")))]
-            if use_tls_proxy {
-                let world_name = app.current_world().name.clone();
-                match spawn_tls_proxy(&world_name, &host, &port) {
-                    Ok((proxy_pid, socket_path)) => {
-                        // Connect to the proxy via Unix socket
-                        match tokio::net::UnixStream::connect(&socket_path).await {
-                            Ok(unix_stream) => {
-                                // Store the Unix socket FD for hot reload preservation
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::io::AsRawFd;
-                                    app.current_world_mut().proxy_socket_fd = Some(unix_stream.as_raw_fd());
-                                }
-                                app.current_world_mut().socket_fd = None;  // Can't preserve TLS fd directly
-                                app.current_world_mut().is_tls = true;
-                                app.current_world_mut().proxy_pid = Some(proxy_pid);
-                                app.current_world_mut().proxy_socket_path = Some(socket_path);
-
-                                let (r, w) = unix_stream.into_split();
-                                let read_half = StreamReader::Proxy(r);
-                                let write_half = StreamWriter::Proxy(w);
-
-                                app.current_world_mut().connected = true;
-                                app.current_world_mut().was_connected = true;
-                                app.current_world_mut().prompt_count = 0;
-                                let now = std::time::Instant::now();
-                                app.current_world_mut().last_send_time = Some(now);
-                                app.current_world_mut().last_receive_time = Some(now);
-                                app.current_world_mut().is_initial_world = false;
-                                app.discard_initial_world();
-
-                                let world_name = app.current_world().name.clone();
-
-                                // Open log file if enabled
-                                if app.current_world().settings.log_enabled {
-                                    if app.current_world_mut().open_log_file() {
-                                        let log_path = app.current_world().get_log_path();
-                                        app.add_output(&format!("Logging to: {}", log_path.display()));
-                                    } else {
-                                        app.add_output("Warning: Could not open log file");
-                                    }
-                                }
-
-                                // Setup writer task (before reader task so telnet_tx is
-                                // available). Plan Job 13 (Phase 4, 4.4): migrated onto
-                                // spawn_telnet_writer, which encodes Text per the world's
-                                // currently-active encoding (effective_encoding() - just the
-                                // explicit per-world setting on this fresh connect, since
-                                // negotiated_encoding is always None until CHARSET
-                                // completes) and IAC-escapes the result, instead of the old
-                                // loop's unconditional `.as_bytes()` (finding 7: every writer
-                                // emitted UTF-8 regardless of what was negotiated).
-                                let initial_encoding = app.current_world().effective_encoding();
-                                let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
-                                app.current_world_mut().command_tx = Some(cmd_tx.clone());
-
-                                // Fire TF CONNECT hook - see /help hooks: "CONNECT world, cipher".
-                                let world_idx_for_hook = app.current_world_index;
-                                app.fire_tf_hook(Some(world_idx_for_hook), tf::TfHookEvent::Connect, &world_name, false);
-
-                                // Send auto-login if configured (for Connect type)
-                                // Requires BOTH username AND password to be set
-                                let skip_login = app.current_world().skip_auto_login;
-                                let auto_connect_type = app.current_world().settings.auto_connect_type;
-                                // Only clear skip flag for Connect type; Prompt/MooPrompt check it later in handle_prompt
-                                if auto_connect_type == AutoConnectType::Connect {
-                                    app.current_world_mut().skip_auto_login = false;
-                                }
-                                let user = app.current_world().settings.user.clone();
-                                let password = app.current_world().settings.password.clone();
-                                // FANSI worlds: always set up client detection window
-                                if app.current_world().settings.encoding == Encoding::Fansi {
-                                    app.current_world_mut().fansi_detect_until = Some(std::time::Instant::now() + Duration::from_secs(2));
-                                    if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                        let connect_cmd = format!("connect {} {}", user, password);
-                                        app.current_world_mut().fansi_login_pending = Some(connect_cmd);
-                                    }
-                                } else if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                    let connect_cmd = format!("connect {} {}", user, password);
-                                    let _ = cmd_tx.send(WriteCommand::Text(connect_cmd)).await;
-                                }
-
-                                // Start reader task with telnet processing
-                                app.current_world_mut().connection_id += 1;
-                                let reader_conn_id = app.current_world().connection_id;
-                                let event_tx_read = event_tx.clone();
-                                let read_world_name = world_name.clone();
-                                // Plan Job 6, 2.4 (investigate-differences-between-tinyfugu-
-                                // fluffy-stallman.md): migrated onto spawn_telnet_reader. Gains
-                                // over the old hand-rolled loop: MCCP2 decompression (finding 1
-                                // - this proxy path used to accept IAC DO MCCP2 and then render
-                                // the compressed stream as text), WontEchoSeen (the old loop's
-                                // Ok(n) branch never checked result.wont_echo_seen), and the
-                                // unified "Connection closed by server." message on EOF (this
-                                // loop used to skip it entirely - see telnet_reader.rs's own
-                                // `eof_emits_unified_close_message_then_disconnected` test).
-                                let telnet_cfg = TelnetConfig {
-                                    term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    msp_enabled: app.current_world().settings.msp_enabled,
-                                    mccp2_enabled: app.current_world().settings.mccp2_enabled,
-                                    // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path -
-                                    // only reached when use_ssl is true.
-                                    is_tls: use_ssl,
-                                    ..TelnetConfig::default()
-                                };
-                                spawn_telnet_reader(
-                                    read_half,
-                                    cmd_tx,
-                                    event_tx_read,
-                                    TelnetTarget::World(read_world_name),
-                                    reader_conn_id,
-                                    telnet_cfg,
-                                );
-
-                                // Connection established successfully via proxy, skip regular connection code
-                                return false;
-                            }
-                            Err(e) => {
-                                app.add_output(&format!("Failed to connect to TLS proxy: {}", e));
-                                #[cfg(unix)]
-                                unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
-                                return false;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("Failed to spawn TLS proxy: {}", e));
-                        app.add_output("Falling back to direct TLS connection...");
-                        // Fall through to direct TLS connection below
-                    }
-                }
-            }
-
-            // Handle TLS proxy on Windows via Named Pipe
-            #[cfg(windows)]
-            if use_tls_proxy {
-                let world_name = app.current_world().name.clone();
-                match spawn_tls_proxy(&world_name, &host, &port) {
-                    Ok((proxy_pid, pipe_path)) => {
-                        use tokio::net::windows::named_pipe::ClientOptions;
-                        match ClientOptions::new().open(&pipe_path) {
-                            Ok(pipe_client) => {
-                                app.current_world_mut().socket_fd = None;
-                                app.current_world_mut().is_tls = true;
-                                app.current_world_mut().proxy_pid = Some(proxy_pid);
-                                app.current_world_mut().proxy_socket_path = Some(pipe_path);
-
-                                let (r, w) = tokio::io::split(pipe_client);
-                                let read_half = StreamReader::NamedPipeProxy(r);
-                                let write_half = StreamWriter::NamedPipeProxy(w);
-
-                                app.current_world_mut().connected = true;
-                                app.current_world_mut().was_connected = true;
-                                app.current_world_mut().prompt_count = 0;
-                                let now = std::time::Instant::now();
-                                app.current_world_mut().last_send_time = Some(now);
-                                app.current_world_mut().last_receive_time = Some(now);
-                                app.current_world_mut().is_initial_world = false;
-                                app.discard_initial_world();
-
-                                let world_name = app.current_world().name.clone();
-
-                                if app.current_world().settings.log_enabled {
-                                    if app.current_world_mut().open_log_file() {
-                                        let log_path = app.current_world().get_log_path();
-                                        app.add_output(&format!("Logging to: {}", log_path.display()));
-                                    } else {
-                                        app.add_output("Warning: Could not open log file");
-                                    }
-                                }
-
-                                // Plan Job 13 (Phase 4, 4.4): migrated onto spawn_telnet_writer -
-                                // see the Unix-socket proxy block above for the full reasoning.
-                                // Mirrored, not independently verified: no mingw toolchain in
-                                // this sandbox to cross-check a #[cfg(windows)] path - see the
-                                // plan's Windows verification note.
-                                let initial_encoding = app.current_world().effective_encoding();
-                                let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
-                                app.current_world_mut().command_tx = Some(cmd_tx.clone());
-
-                                // Fire TF CONNECT hook - see /help hooks: "CONNECT world, cipher".
-                                let world_idx_for_hook = app.current_world_index;
-                                app.fire_tf_hook(Some(world_idx_for_hook), tf::TfHookEvent::Connect, &world_name, false);
-
-                                let skip_login = app.current_world().skip_auto_login;
-                                let auto_connect_type = app.current_world().settings.auto_connect_type;
-                                if auto_connect_type == AutoConnectType::Connect {
-                                    app.current_world_mut().skip_auto_login = false;
-                                }
-                                let user = app.current_world().settings.user.clone();
-                                let password = app.current_world().settings.password.clone();
-                                if app.current_world().settings.encoding == Encoding::Fansi {
-                                    app.current_world_mut().fansi_detect_until = Some(std::time::Instant::now() + Duration::from_secs(2));
-                                    if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                        let connect_cmd = format!("connect {} {}", user, password);
-                                        app.current_world_mut().fansi_login_pending = Some(connect_cmd);
-                                    }
-                                } else if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                    let connect_cmd = format!("connect {} {}", user, password);
-                                    let _ = cmd_tx.send(WriteCommand::Text(connect_cmd)).await;
-                                }
-
-                                app.current_world_mut().connection_id += 1;
-                                let reader_conn_id = app.current_world().connection_id;
-                                let event_tx_read = event_tx.clone();
-                                let read_world_name = world_name.clone();
-                                // Plan Job 6, 2.4 (investigate-differences-between-tinyfugu-
-                                // fluffy-stallman.md): migrated onto spawn_telnet_reader. Gains
-                                // over the old hand-rolled loop: MCCP2 decompression (finding 1
-                                // - this proxy path used to accept IAC DO MCCP2 and then render
-                                // the compressed stream as text), WontEchoSeen (the old loop's
-                                // Ok(n) branch never checked result.wont_echo_seen), and the
-                                // unified "Connection closed by server." message on EOF (this
-                                // loop used to skip it entirely). Mirrors the Unix-socket proxy
-                                // loop above and Job 5's daemon.rs named-pipe migration exactly;
-                                // unverified in this sandbox (no mingw toolchain to cross-check
-                                // a #[cfg(windows)] path - see the plan's Windows verification
-                                // note; re-checked on the Windows VM after Job 7).
-                                let telnet_cfg = TelnetConfig {
-                                    term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    msp_enabled: app.current_world().settings.msp_enabled,
-                                    mccp2_enabled: app.current_world().settings.mccp2_enabled,
-                                    // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path -
-                                    // only reached when use_ssl is true.
-                                    is_tls: use_ssl,
-                                    ..TelnetConfig::default()
-                                };
-                                spawn_telnet_reader(
-                                    read_half,
-                                    cmd_tx,
-                                    event_tx_read,
-                                    TelnetTarget::World(read_world_name),
-                                    reader_conn_id,
-                                    telnet_cfg,
-                                );
-
-                                return false;
-                            }
-                            Err(e) => {
-                                app.add_output(&format!("Failed to connect to TLS proxy: {}", e));
-                                crate::platform::kill_proxy_process(proxy_pid);
-                                return false;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("Failed to spawn TLS proxy: {}", e));
-                        app.add_output("Falling back to direct TLS connection...");
-                    }
-                }
-            }
-
             // Spawn connection in background to avoid blocking the UI
             app.current_world_mut().connection_id += 1;
             let reader_conn_id = app.current_world().connection_id;
@@ -1832,8 +1064,38 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             // Job 13 (plan Phase 4, 4.4): same reasoning, for spawn_telnet_writer's
             // initial encoding.
             let initial_encoding = app.current_world().effective_encoding();
+            #[cfg(not(target_os = "android"))]
+            let proxy_settings = app.current_world().settings.clone();
 
             tokio::spawn(async move {
+                // TLS proxy first, when enabled: the proxy holds the TLS connection so it
+                // survives hot reload. Done here, in the task, because starting the proxy
+                // waits for it to reach the MUD - seconds against a down host, and this
+                // used to run on the event loop and freeze the UI for all of it.
+                #[cfg(not(target_os = "android"))]
+                if use_tls_proxy {
+                    // skip_auto_login: handle_connection_success sends it (it also covers
+                    // FANSI detection and skip_auto_login, which the proxy helper doesn't).
+                    match crate::daemon::connect_via_tls_proxy(
+                        &world_name, &connect_host, &connect_port, &proxy_settings,
+                        event_tx_connect.clone(), reader_conn_id, true,
+                    ).await {
+                        Ok((cmd_tx, proxy_pid, proxy_path)) => {
+                            let _ = event_tx_connect.send(AppEvent::WorldConnectResult(
+                                world_name, reader_conn_id, crate::ConnectOrigin::Console,
+                                Some((cmd_tx, None, true, Some(proxy_pid), Some(proxy_path))),
+                            )).await;
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = event_tx_connect.send(AppEvent::WorldNotice(
+                                world_name.clone(),
+                                format!("{}. Falling back to direct TLS connection...", e),
+                            )).await;
+                        }
+                    }
+                }
+
                 // Try connecting to a host, resolving DNS and preferring IPv4
                 async fn try_connect_host(host: &str, port: &str) -> Result<TcpStream, std::io::Error> {
                     use tokio::net::lookup_host;
@@ -2047,6 +1309,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::Disconnect { world } => {
             execute_disconnect_command(app, &world, app.current_world_index, false);
+        }
+        Command::Chat { world, args } => {
+            let world_index = app.current_world_index;
+            execute_chat_command(app, &world, &args, world_index, false);
         }
         Command::Flush => {
             let line_count = app.current_world().output_lines.len();
@@ -2271,31 +1537,12 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             });
             app.add_output(&format!("TTS: {}", text));
         }
-        Command::Dict { word } => {
-            match lookup_definition(&word).await {
-                Ok(definition) => {
-                    let ascii_def = transliterate_to_ascii(&definition);
-                    let full_text = cap_text(format!("{}: {}", word, ascii_def), 1024);
-                    app.input.buffer = full_text;
-                    app.input.cursor_position = 0;
-                }
-                Err(e) => {
-                    app.add_output(&format!("Definition lookup failed: {}", e));
-                }
-            }
-        }
-        Command::Urban { word } => {
-            match lookup_urban_definition(&word).await {
-                Ok(definition) => {
-                    let ascii_def = transliterate_to_ascii(&definition);
-                    let full_text = cap_text(format!("{}: {}", word, ascii_def), 1024);
-                    app.input.buffer = full_text;
-                    app.input.cursor_position = 0;
-                }
-                Err(e) => {
-                    app.add_output(&format!("Urban Dictionary lookup failed: {}", e));
-                }
-            }
+        // In the background (result: AppEvent::ApiLookupResult to client 0, the console)
+        // - these used to be awaited here, freezing the UI for up to each lookup's 10s
+        // timeout.
+        cmd @ (Command::Dict { .. } | Command::Urban { .. }) => {
+            let world_index = app.current_world_index;
+            spawn_api_lookup(event_tx, 0, world_index, cmd, Vec::new());
         }
         Command::DictUsage => {
             let world_idx = app.current_world_index;
@@ -2313,18 +1560,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 "  Example: /urban yeet",
             ], false);
         }
-        Command::Translate { lang, text } => {
-            match lookup_translation(&text, &lang).await {
-                Ok(translation) => {
-                    let ascii_trans = transliterate_to_ascii(&translation);
-                    let full_text = cap_text(ascii_trans, 1024);
-                    app.input.buffer = full_text;
-                    app.input.cursor_position = 0;
-                }
-                Err(e) => {
-                    app.add_output(&format!("Translation failed: {}", e));
-                }
-            }
+        cmd @ Command::Translate { .. } => {
+            let world_index = app.current_world_index;
+            spawn_api_lookup(event_tx, 0, world_index, cmd, Vec::new());
         }
         Command::TranslateUsage => {
             let world_idx = app.current_world_index;
@@ -2336,17 +1574,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 "  Example: /tr es Hello",
             ], false);
         }
-        Command::TinyUrl { url } => {
-            let services = app.settings.url_shorteners.clone();
-            match shorten_url_fallback(&url, &services).await {
-                Ok(short) => {
-                    app.input.buffer = short;
-                    app.input.cursor_position = 0;
-                }
-                Err(e) => {
-                    app.add_output(&format!("URL shortening failed: {}", e));
-                }
-            }
+        cmd @ Command::TinyUrl { .. } => {
+            let world_index = app.current_world_index;
+            spawn_api_lookup(event_tx, 0, world_index, cmd, app.settings.url_shorteners.clone());
         }
         Command::TinyUrlUsage => {
             let world_idx = app.current_world_index;
@@ -3055,6 +2285,216 @@ pub(crate) fn execute_log_command(
                 app.settings.log_input_enabled = false;
             }
         }
+    }
+}
+
+/// Everything `/chat` needs to know about one chat session, whoever owns it (a
+/// single-user world or a multiuser user's connection).
+pub(crate) struct ChatCmdCtx<'a> {
+    pub kind: crate::chat::ChatKind,
+    pub connected: bool,
+    pub dir: Option<std::sync::Arc<std::sync::RwLock<crate::chat::directory::ChatDirectory>>>,
+    pub target: Option<&'a crate::chat::directory::ChatTarget>,
+    pub command_tx: Option<&'a mpsc::Sender<WriteCommand>>,
+    /// The world's Send To and Show Only settings (for `status`).
+    pub send_to: String,
+    pub filter: String,
+}
+
+/// Run a `/chat` subcommand. Returns the text to show, and - for `to ... -d` - the new
+/// Send To value the caller should save. Pure apart from the in-band `command_tx`
+/// sends, so every command path shares it.
+pub(crate) fn run_chat_subcommand(ctx: &ChatCmdCtx, args: &str) -> (String, Option<String>) {
+    let kind = ctx.kind;
+    let mut words = args.split_whitespace();
+    let sub = words.next().unwrap_or("status").to_lowercase();
+    let rest: Vec<&str> = words.collect();
+    if sub == "help" {
+        return match tf::parser::chat_help() {
+            tf::TfCommandResult::Success(Some(text)) => (text, None),
+            _ => (String::new(), None),
+        };
+    }
+    let live = ctx.connected && ctx.dir.is_some();
+    if matches!(sub.as_str(), "channels" | "list" | "users" | "to" | "msg") && !live {
+        return (format!("Not connected to {} - connect first (the channel list comes from the live session).", kind.name()), None);
+    }
+    match sub.as_str() {
+        "status" => {
+            let mut lines = Vec::new();
+            match (&ctx.dir, ctx.connected) {
+                (Some(d), true) => {
+                    let d = d.read().unwrap();
+                    lines.push(format!(
+                        "{} {} - connected as {}, {} channels.",
+                        kind.name(),
+                        d.server.as_ref().map(|x| x.1.as_str()).unwrap_or("?"),
+                        d.bot_name,
+                        d.sorted_channels().len()
+                    ));
+                }
+                (Some(_), false) => lines.push(format!("{}: connecting...", kind.name())),
+                _ => lines.push(format!("{}: not connected.", kind.name())),
+            }
+            let target = ctx.target.map(|t| t.label.clone()).unwrap_or_else(|| "(none)".to_string());
+            lines.push(format!("Sending to: {}   Default (Send To): {}", target, if ctx.send_to.is_empty() { "(none)" } else { &ctx.send_to }));
+            lines.push(format!("Showing: {}", if ctx.filter.trim().is_empty() { "all channels".to_string() } else { ctx.filter.clone() }));
+            lines.push("Commands: /chat channels | users | to <#channel|@user|-> [-d] | msg <target> <text> | help".to_string());
+            (lines.join("\n"), None)
+        }
+        "channels" | "list" => {
+            let filter = rest.join(" ").to_lowercase();
+            let current = ctx.target.and_then(|t| t.channel_id.clone());
+            let d = ctx.dir.as_ref().unwrap().read().unwrap();
+            let mut lines = Vec::new();
+            let mut last_cat: Option<String> = None;
+            for c in d.sorted_channels() {
+                if !filter.is_empty() && !c.name.to_lowercase().contains(filter.trim_start_matches('#')) {
+                    continue;
+                }
+                let cat = d.category_name(c);
+                if cat != last_cat {
+                    if let Some(n) = &cat {
+                        lines.push(format!("{}:", n));
+                    }
+                    last_cat = cat;
+                }
+                let mark = if current.as_deref() == Some(c.id.as_str()) { "*" } else { " " };
+                let note = if c.can_send == Some(false) { " (bot not in channel - /invite it)" } else { "" };
+                lines.push(format!(" {} #{}{}", mark, c.name, note));
+            }
+            if lines.is_empty() {
+                lines.push("No channels match.".to_string());
+            } else {
+                lines.push("(* = where typing goes; change with /chat to <name>)".to_string());
+            }
+            (lines.join("\n"), None)
+        }
+        "users" => {
+            let filter = rest.join(" ").to_lowercase();
+            let d = ctx.dir.as_ref().unwrap().read().unwrap();
+            let mut users: Vec<String> = d
+                .users
+                .values()
+                .filter(|u| u.id != d.bot_id)
+                .filter(|u| filter.is_empty() || u.username.to_lowercase().contains(&filter) || u.display.to_lowercase().contains(&filter))
+                .map(|u| if u.display.is_empty() || u.display == u.username { format!("  @{}", u.username) } else { format!("  @{} ({})", u.username, u.display) })
+                .collect();
+            users.sort();
+            if users.is_empty() {
+                ("Nobody seen yet - names are learned as people post (DM with /chat to @name).".to_string(), None)
+            } else {
+                (format!("People seen since connecting:\n{}", users.join("\n")), None)
+            }
+        }
+        "to" => {
+            let save = rest.contains(&"-d");
+            let spec: String = rest.iter().filter(|w| **w != "-d").copied().collect::<Vec<_>>().join(" ");
+            if spec.is_empty() {
+                return ("Usage: /chat to <#channel|@user|-> [-d]   (- = where the last message came from; -d also saves it as the default)".to_string(), None);
+            }
+            let resolved = ctx.dir.as_ref().unwrap().read().unwrap().resolve_target(&spec);
+            match resolved {
+                Ok(t) => {
+                    if let Some(tx) = ctx.command_tx {
+                        let _ = tx.try_send(WriteCommand::Chat(crate::chat::ChatOp::SetTarget(t.clone())));
+                    }
+                    if save {
+                        let value = match (&t.channel_id, &t.user_id) {
+                            (_, Some(uid)) => format!("{} ({})", t.label, uid),
+                            (Some(cid), None) => format!("{} ({})", t.label, cid),
+                            _ => t.label.clone(),
+                        };
+                        (format!("Now sending to {} (saved as this world's default).", t.label), Some(value))
+                    } else {
+                        (format!("Now sending to {}.", t.label), None)
+                    }
+                }
+                Err(e) => (e, None),
+            }
+        }
+        "msg" => {
+            if rest.len() < 2 {
+                return ("Usage: /chat msg <#channel|@user> <text>".to_string(), None);
+            }
+            let resolved = ctx.dir.as_ref().unwrap().read().unwrap().resolve_target(rest[0]);
+            match resolved {
+                Ok(t) => {
+                    if let Some(tx) = ctx.command_tx {
+                        let _ = tx.try_send(WriteCommand::Chat(crate::chat::ChatOp::SendTo(t, rest[1..].join(" "))));
+                    }
+                    (String::new(), None)
+                }
+                Err(e) => (e, None),
+            }
+        }
+        other => (format!("Unknown /chat subcommand '{}'. Try /chat help.", other), None),
+    }
+}
+
+/// Split a Send To / Show Only pair out of a world's settings for `kind`.
+pub(crate) fn chat_send_to_and_filter(s: &crate::WorldSettings, kind: crate::chat::ChatKind) -> (String, String) {
+    match kind {
+        crate::chat::ChatKind::Discord => (s.discord_channel.clone(), s.discord_channels.clone()),
+        crate::chat::ChatKind::Slack => (s.slack_channel.clone(), s.slack_channels.clone()),
+    }
+}
+
+/// Save a new Send To (`/chat to ... -d`).
+pub(crate) fn set_chat_send_to(app: &mut App, idx: usize, kind: crate::chat::ChatKind, value: String) {
+    match kind {
+        crate::chat::ChatKind::Discord => app.worlds[idx].settings.discord_channel = value,
+        crate::chat::ChatKind::Slack => app.worlds[idx].settings.slack_channel = value,
+    }
+    if app.multiuser_mode {
+        let _ = persistence::save_multiuser_settings(app);
+    } else {
+        let _ = persistence::save_settings(app);
+    }
+}
+
+/// Execute `/chat` (aliases `/discord`, `/slack`) for a single-user world - shared by
+/// the console, master WS and `-D` command paths, same pattern as
+/// `execute_disconnect_command`. Everything is synchronous: names resolve against the
+/// session's `ChatDirectory` cache, and target changes ride the world's `command_tx`
+/// in-band (`WriteCommand::Chat`). Multiuser calls `run_chat_subcommand` directly.
+pub(crate) fn execute_chat_command(app: &mut App, world: &Option<String>, args: &str, message_world_idx: usize, is_daemon_mode: bool) {
+    let idx = match world {
+        Some(name) => match app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+            Some(i) => i,
+            None => {
+                app.emit_client_text(message_world_idx, &format!("World '{}' not found.", name), is_daemon_mode);
+                return;
+            }
+        },
+        None => message_world_idx,
+    };
+    if idx >= app.worlds.len() {
+        return;
+    }
+    let Some(kind) = crate::chat::ChatKind::from_world_type(&app.worlds[idx].settings.world_type) else {
+        app.emit_client_text(idx, "/chat works on Slack and Discord worlds; this is a MUD world.", is_daemon_mode);
+        return;
+    };
+    let (send_to, filter) = chat_send_to_and_filter(&app.worlds[idx].settings, kind);
+    let (text, save) = {
+        let w = &app.worlds[idx];
+        let ctx = ChatCmdCtx {
+            kind,
+            connected: w.connected,
+            dir: w.chat.as_ref().map(|h| h.dir.clone()),
+            target: w.chat_target.as_ref(),
+            command_tx: w.command_tx.as_ref(),
+            send_to,
+            filter,
+        };
+        run_chat_subcommand(&ctx, args)
+    };
+    if let Some(value) = save {
+        set_chat_send_to(app, idx, kind, value);
+    }
+    if !text.is_empty() {
+        app.emit_client_text(idx, &text, is_daemon_mode);
     }
 }
 

@@ -571,6 +571,16 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if !world.settings.discord_dm_user.is_empty() {
             writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user)?;
         }
+        if !world.settings.discord_channels.is_empty() {
+            writeln!(file, "discord_channels={}", world.settings.discord_channels)?;
+        }
+        if !world.settings.slack_app_token.is_empty() {
+            writeln!(file, "slack_app_token={}", secret(&world.settings.slack_app_token))?;
+        }
+        if !world.settings.slack_channels.is_empty() {
+            writeln!(file, "slack_channels={}", world.settings.slack_channels)?;
+        }
+        writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
         // Notes (escape newlines and special chars)
         if !world.settings.notes.is_empty() {
             let escaped_notes = world.settings.notes
@@ -787,6 +797,40 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
 /// of these matters too: without it, a `/reload` triggered mid-upgrade from a pre-Job-6
 /// build would restore the old process's still-unmigrated in-memory value over the freshly
 /// migrated one the new process just loaded from settings.dat).
+/// One-time upgrade of a world's Slack/Discord settings to the server-per-world model
+/// (`CHAT_SETTINGS_VERSION`). Before it, a Discord world showed *only* its one channel
+/// (or one DM user) and Slack a single channel; now a world shows the whole server
+/// unless "Show Only" narrows it. So an existing channel is copied into Show Only too -
+/// an upgraded world looks exactly as it did - and a legacy DM-only world becomes Send
+/// To `@user` with a Show Only that matches no channel (DMs always show). A Slack app
+/// token (`xapp-`) pasted into the single old token field moves to its own field.
+/// Idempotent: guarded by the version, which every writer then records.
+pub(crate) fn migrate_chat_settings(s: &mut crate::WorldSettings) {
+    if s.chat_settings_version >= crate::CHAT_SETTINGS_VERSION {
+        return;
+    }
+    let dm = s.discord_dm_user.trim().to_string();
+    if !dm.is_empty() {
+        if s.discord_channel.trim().is_empty() {
+            s.discord_channel = format!("@{}", dm);
+            if s.discord_channels.trim().is_empty() {
+                s.discord_channels = format!("@{}", dm);
+            }
+        }
+        s.discord_dm_user.clear();
+    }
+    if !s.discord_channel.trim().is_empty() && s.discord_channels.trim().is_empty() {
+        s.discord_channels = s.discord_channel.trim().to_string();
+    }
+    if !s.slack_channel.trim().is_empty() && s.slack_channels.trim().is_empty() {
+        s.slack_channels = s.slack_channel.trim().to_string();
+    }
+    if s.slack_token.trim().starts_with("xapp-") && s.slack_app_token.is_empty() {
+        s.slack_app_token = std::mem::take(&mut s.slack_token);
+    }
+    s.chat_settings_version = crate::CHAT_SETTINGS_VERSION;
+}
+
 fn migrate_gmcp_packages(value: &str) -> String {
     if value == crate::LEGACY_DEFAULT_GMCP_PACKAGES {
         crate::DEFAULT_GMCP_PACKAGES.to_string()
@@ -836,6 +880,8 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
             let name = &line[7..line.len() - 1];
             // Find or create world
             let idx = app.find_or_create_world(name);
+            // A section without the key is pre-overhaul (see migrate_chat_settings).
+            app.worlds[idx].settings.chat_settings_version = 0;
             current_world = Some(app.worlds[idx].name.clone());
             current_action = None;
             in_banned_hosts = false;
@@ -1271,6 +1317,10 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "discord_guild" => world.settings.discord_guild = value.to_string(),
                         "discord_channel" => world.settings.discord_channel = value.to_string(),
                         "discord_dm_user" => world.settings.discord_dm_user = value.to_string(),
+                        "discord_channels" => world.settings.discord_channels = value.to_string(),
+                        "slack_app_token" => world.settings.slack_app_token = decrypt_password(value),
+                        "slack_channels" => world.settings.slack_channels = value.to_string(),
+                        "chat_settings_version" => world.settings.chat_settings_version = value.parse().unwrap_or(0),
                         // Notes
                         "notes" => world.settings.notes = unescape_string(value),
                         _ => {}
@@ -1280,6 +1330,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
         }
     }
 
+    for world in &mut app.worlds {
+        migrate_chat_settings(&mut world.settings);
+    }
     *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
 }
 
@@ -1457,6 +1510,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                 // Find or create world
                 let idx = app.find_or_create_world(&name_unescaped);
                 app.worlds[idx].owner = Some(owner_unescaped);
+                app.worlds[idx].settings.chat_settings_version = 0;
                 current_world = Some(app.worlds[idx].name.clone());
             } else {
                 // No owner specified - this will fail validation later
@@ -1641,6 +1695,19 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                             world.settings.auto_reconnect_secs = secs;
                             world.settings.auto_reconnect_on_web = on_web;
                         }
+                        // Chat worlds - save_multiuser_settings writes these, and without
+                        // these arms a multiuser restart silently dropped them.
+                        "slack_token" => world.settings.slack_token = decrypt_password(value),
+                        "slack_channel" => world.settings.slack_channel = value.to_string(),
+                        "slack_workspace" => world.settings.slack_workspace = value.to_string(),
+                        "discord_token" => world.settings.discord_token = decrypt_password(value),
+                        "discord_guild" => world.settings.discord_guild = value.to_string(),
+                        "discord_channel" => world.settings.discord_channel = value.to_string(),
+                        "discord_dm_user" => world.settings.discord_dm_user = value.to_string(),
+                        "discord_channels" => world.settings.discord_channels = value.to_string(),
+                        "slack_app_token" => world.settings.slack_app_token = decrypt_password(value),
+                        "slack_channels" => world.settings.slack_channels = value.to_string(),
+                        "chat_settings_version" => world.settings.chat_settings_version = value.parse().unwrap_or(0),
                         _ => {}
                     }
                 }
@@ -1682,6 +1749,9 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
         }
     }
 
+    for world in &mut app.worlds {
+        migrate_chat_settings(&mut world.settings);
+    }
     Ok(())
 }
 
@@ -1809,6 +1879,16 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             if !world.settings.discord_dm_user.is_empty() {
                 writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user)?;
             }
+            if !world.settings.discord_channels.is_empty() {
+                writeln!(file, "discord_channels={}", world.settings.discord_channels)?;
+            }
+            if !world.settings.slack_app_token.is_empty() {
+                writeln!(file, "slack_app_token={}", encrypt_password(&world.settings.slack_app_token))?;
+            }
+            if !world.settings.slack_channels.is_empty() {
+                writeln!(file, "slack_channels={}", world.settings.slack_channels)?;
+            }
+            writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
         }
     }
 
@@ -2216,6 +2296,33 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         if !world.settings.discord_dm_user.is_empty() {
             writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user.replace('=', "\\e"))?;
         }
+        if !world.settings.discord_channels.is_empty() {
+            writeln!(file, "discord_channels={}", world.settings.discord_channels.replace('=', "\\e"))?;
+        }
+        if !world.settings.slack_app_token.is_empty() {
+            writeln!(file, "slack_app_token={}", world.settings.slack_app_token.replace('=', "\\e"))?;
+        }
+        if !world.settings.slack_channels.is_empty() {
+            writeln!(file, "slack_channels={}", world.settings.slack_channels.replace('=', "\\e"))?;
+        }
+        writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
+        // A connected chat world's live session: its send target (a spec) and Discord
+        // resume data, so the restored world resumes instead of starting over.
+        if world.connected {
+            if let Some(t) = &world.chat_target {
+                let spec = match (&t.channel_id, &t.user_id) {
+                    (_, Some(u)) => format!("{} ({})", t.label, u),
+                    (Some(c), None) => format!("{} ({})", t.label, c),
+                    _ => t.label.clone(),
+                };
+                writeln!(file, "chat_session_target={}", spec.replace('=', "\\e"))?;
+            }
+            if let Some(r) = world.chat.as_ref().and_then(|h| h.resume_state()) {
+                writeln!(file, "chat_resume_session={}", r.session_id.replace('=', "\\e"))?;
+                writeln!(file, "chat_resume_seq={}", r.seq)?;
+                writeln!(file, "chat_resume_url={}", r.resume_url.replace('=', "\\e"))?;
+            }
+        }
         // Notes (escape special chars)
         if !world.settings.notes.is_empty() {
             let escaped_notes = world.settings.notes
@@ -2419,6 +2526,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         uses_wont_echo_prompt: bool,
         prompt: String,
         settings: WorldSettings,
+        /// Chat worlds: the live session's send target and Discord resume data.
+        chat_session_target: String,
+        chat_resume: Option<crate::chat::ResumeState>,
         next_seq: u64,
         seq_epoch: u64,
         partial_line: String,
@@ -2574,7 +2684,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         negotiated_encoding: None,
                         uses_wont_echo_prompt: false,
                         prompt: String::new(),
-                        settings: WorldSettings::default(),
+                        // A pre-overhaul state file has no chat_settings_version key.
+                        settings: WorldSettings { chat_settings_version: 0, ..WorldSettings::default() },
+                        chat_session_target: String::new(),
+                        chat_resume: None,
                         next_seq: 0,
                         seq_epoch: 0,
                         partial_line: String::new(),
@@ -3094,6 +3207,14 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "discord_guild" => tw.settings.discord_guild = unescape_string(value),
                             "discord_channel" => tw.settings.discord_channel = unescape_string(value),
                             "discord_dm_user" => tw.settings.discord_dm_user = unescape_string(value),
+                            "discord_channels" => tw.settings.discord_channels = unescape_string(value),
+                            "slack_app_token" => tw.settings.slack_app_token = unescape_string(value),
+                            "slack_channels" => tw.settings.slack_channels = unescape_string(value),
+                            "chat_settings_version" => tw.settings.chat_settings_version = value.parse().unwrap_or(0),
+                            "chat_session_target" => tw.chat_session_target = unescape_string(value),
+                            "chat_resume_session" => tw.chat_resume.get_or_insert_with(Default::default).session_id = unescape_string(value),
+                            "chat_resume_seq" => tw.chat_resume.get_or_insert_with(Default::default).seq = value.parse().unwrap_or(0),
+                            "chat_resume_url" => tw.chat_resume.get_or_insert_with(Default::default).resume_url = unescape_string(value),
                             // Notes
                             "notes" => tw.settings.notes = unescape_string(value),
                             _ => {}
@@ -3175,6 +3296,12 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.proxy_socket_path = tw.proxy_socket_path;
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
+        migrate_chat_settings(&mut world.settings);
+        if !world.settings.world_type.is_mud() && tw.connected {
+            // Reconnected (resumed) by the reload restore path - see World::chat_restore.
+            let resume = tw.chat_resume.filter(|r| !r.session_id.is_empty());
+            world.chat_restore = Some((tw.chat_session_target, resume));
+        }
         world.next_seq = tw.next_seq;
         // Empty means the state file predates this field (or archiving was off);
         // leave whatever the rebuilt World already has rather than clearing it.
@@ -3459,6 +3586,10 @@ mod tests {
             discord_guild: "disc_guild".to_string(),
             discord_channel: "disc_chan".to_string(),
             discord_dm_user: "disc_dm".to_string(),
+            discord_channels: "#disc_a,#disc_b".to_string(),
+            slack_app_token: "xapp-slack".to_string(),
+            slack_channels: "#slack_a".to_string(),
+            chat_settings_version: crate::CHAT_SETTINGS_VERSION,
             notes: "test notes\nline two".to_string(),
             gmcp_packages: "Custom.Package 1".to_string(), // default: "Client.Media 1, Char 1"
             auto_reconnect_secs: 30,                       // default: 0
@@ -3558,6 +3689,10 @@ mod tests {
         assert_eq!(a.discord_guild, b.discord_guild, "{context}: discord_guild");
         assert_eq!(a.discord_channel, b.discord_channel, "{context}: discord_channel");
         assert_eq!(a.discord_dm_user, b.discord_dm_user, "{context}: discord_dm_user");
+        assert_eq!(a.discord_channels, b.discord_channels, "{context}: discord_channels");
+        assert_eq!(a.slack_app_token, b.slack_app_token, "{context}: slack_app_token");
+        assert_eq!(a.slack_channels, b.slack_channels, "{context}: slack_channels");
+        assert_eq!(a.chat_settings_version, b.chat_settings_version, "{context}: chat_settings_version");
         assert_eq!(a.notes, b.notes, "{context}: notes");
         assert_eq!(a.gmcp_packages, b.gmcp_packages, "{context}: gmcp_packages");
         assert_eq!(a.auto_reconnect_secs, b.auto_reconnect_secs, "{context}: auto_reconnect_secs");
@@ -4079,6 +4214,106 @@ mod tests {
     /// unrecognized value must fall back to `Mud` (`WorldType::from_name`'s documented
     /// `_ => Mud` contract), in both settings.dat and the hot-reload state file - the
     /// two independent parsers that each call `WorldType::from_name` directly.
+    #[test]
+    fn test_chat_settings_migration_keeps_old_behaviour_once() {
+        // A pre-overhaul Discord world showed only its one channel: after migration the
+        // channel is both Send To and Show Only.
+        let mut s = WorldSettings { chat_settings_version: 0, ..WorldSettings::default() };
+        s.discord_channel = "123456789012345678".to_string();
+        migrate_chat_settings(&mut s);
+        assert_eq!(s.discord_channel, "123456789012345678");
+        assert_eq!(s.discord_channels, "123456789012345678");
+        assert_eq!(s.chat_settings_version, crate::CHAT_SETTINGS_VERSION);
+        // Idempotent: a user who later clears Show Only keeps it cleared.
+        s.discord_channels.clear();
+        migrate_chat_settings(&mut s);
+        assert!(s.discord_channels.is_empty());
+
+        // DM-only world: Send To @user, Show Only matches no channel (DMs always show).
+        let mut s = WorldSettings { chat_settings_version: 0, ..WorldSettings::default() };
+        s.discord_dm_user = "223456789012345678".to_string();
+        migrate_chat_settings(&mut s);
+        assert_eq!(s.discord_channel, "@223456789012345678");
+        assert_eq!(s.discord_channels, "@223456789012345678");
+        assert!(s.discord_dm_user.is_empty());
+
+        // Slack: an app token pasted into the one old token field moves to its own field.
+        let mut s = WorldSettings { chat_settings_version: 0, ..WorldSettings::default() };
+        s.slack_token = "xapp-1-abc".to_string();
+        s.slack_channel = "C0123ABCD".to_string();
+        migrate_chat_settings(&mut s);
+        assert!(s.slack_token.is_empty());
+        assert_eq!(s.slack_app_token, "xapp-1-abc");
+        assert_eq!(s.slack_channels, "C0123ABCD");
+
+        // A world already on the new model is never touched.
+        let mut s = WorldSettings::default();
+        s.discord_channel = "#general".to_string();
+        migrate_chat_settings(&mut s);
+        assert!(s.discord_channels.is_empty());
+    }
+
+    #[test]
+    fn test_chat_settings_version_key_controls_migration_on_load() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "[world:Old]\nworld_type=discord\ndiscord_channel=general\n\
+                       [world:New]\nworld_type=discord\ndiscord_channel=general\nchat_settings_version=2\n";
+        load_settings_from_str(&mut app, content);
+        let old = app.worlds.iter().find(|w| w.name == "Old").unwrap();
+        assert_eq!(old.settings.discord_channels, "general", "pre-overhaul world keeps showing only its channel");
+        let new = app.worlds.iter().find(|w| w.name == "New").unwrap();
+        assert!(new.settings.discord_channels.is_empty(), "a new-model world shows everything");
+        // And the version is written back, so the next load doesn't migrate again.
+        let mut out = Vec::new();
+        {
+            let mut app2 = App::new();
+            app2.worlds.clear();
+            let mut w = World::new("W");
+            w.settings.world_type = WorldType::Discord;
+            w.settings.discord_channel = "#x".to_string();
+            app2.worlds.push(w);
+            let tmp = std::env::temp_dir().join("clay_test_chat_version.dat");
+            save_settings_to_path(&app2, &tmp).unwrap();
+            out.extend(std::fs::read(&tmp).unwrap());
+            let _ = std::fs::remove_file(&tmp);
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("chat_settings_version=2"), "{text}");
+    }
+
+    #[test]
+    fn test_update_world_settings_chat_block_can_clear_fields() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("D");
+        w.settings.world_type = WorldType::Discord;
+        w.settings.discord_token = "tok".to_string();
+        w.settings.discord_guild = "Guild".to_string();
+        w.settings.discord_channel = "#general".to_string();
+        w.settings.discord_channels = "#general".to_string();
+        app.worlds.push(w);
+        let chat = crate::websocket::ChatSettingsUpdate {
+            discord_guild: "Guild".to_string(),
+            discord_channel: "#dev".to_string(),
+            discord_channels: String::new(),
+            ..Default::default()
+        };
+        app.update_world_settings(
+            0, "D".to_string(), String::new(), String::new(), String::new(),
+            String::new(), false, false,
+            "utf8".to_string(), "connect".to_string(), "nop".to_string(), String::new(),
+            String::new(), "0".to_string(), true, true, true,
+            "discord".to_string(), 1000, String::new(), String::new(), String::new(),
+            String::new(), "Guild".to_string(), "#dev".to_string(), String::new(),
+            Some(chat),
+        );
+        let s = &app.worlds[0].settings;
+        assert_eq!(s.discord_channel, "#dev");
+        assert!(s.discord_channels.is_empty(), "the chat block's empty Show Only clears it");
+        assert_eq!(s.discord_token, "tok", "an omitted (empty) token is left unchanged");
+    }
+
     #[test]
     fn test_world_type_mud_timed_prompt_and_unknown_name_round_trip_in_settings_dat() {
         let mut app = App::new();
@@ -4658,6 +4893,9 @@ pattern=foo
         assert_ne!(non_default.discord_guild, default.discord_guild, "discord_guild should differ");
         assert_ne!(non_default.discord_channel, default.discord_channel, "discord_channel should differ");
         assert_ne!(non_default.discord_dm_user, default.discord_dm_user, "discord_dm_user should differ");
+        assert_ne!(non_default.discord_channels, default.discord_channels, "discord_channels should differ");
+        assert_ne!(non_default.slack_app_token, default.slack_app_token, "slack_app_token should differ");
+        assert_ne!(non_default.slack_channels, default.slack_channels, "slack_channels should differ");
         assert_ne!(non_default.notes, default.notes, "notes should differ");
         assert_ne!(non_default.gmcp_packages, default.gmcp_packages, "gmcp_packages should differ");
         assert_ne!(non_default.auto_reconnect_secs, default.auto_reconnect_secs, "auto_reconnect_secs should differ");

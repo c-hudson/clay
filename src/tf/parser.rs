@@ -1767,6 +1767,42 @@ fn cmd_addworld(args: &str) -> TfCommandResult {
 }
 
 /// /help [topic] or /tfhelp [topic] - Display TF help
+/// `/help chat` (also shown by `/chat help`).
+pub(crate) fn chat_help() -> TfCommandResult {
+    TfCommandResult::Success(Some(
+        r#"/chat [-w<world>] [subcommand]      (aliases: /discord, /slack)
+
+Commands for Slack and Discord worlds. A chat world shows every channel of
+its server (Discord) or workspace (Slack) that the bot can read, each line
+tagged with where it came from:
+  #general <Alice> hello           a channel message
+  #general/bugs <Bob> fixed        a Discord thread
+  @alice <Alice> psst              a direct message to the bot
+  #general * Carol joined          a system/action line
+Whatever you type goes to the current send target, shown as the prompt.
+
+  /chat                    Status: server, bot, where typing goes
+  /chat channels [text]    List channels (* marks the send target)
+  /chat users [text]       People seen since connecting
+  /chat to <target>        Send typed text to <target> from now on
+  /chat to <target> -d     ...and save it as the world's default (Send To)
+  /chat to -               Reply where the last message came from
+  /chat msg <target> <text>  Send one message without switching
+
+<target> is #channel, a channel name, @user, or an id. Names are matched
+case-insensitively; if two channels share a name, use the id shown by the
+world editor's Fetch list.
+
+Triggers see the tagged line, e.g. /def -mregexp -t"^#general <(.*)> (.*)" ...
+Your own messages are shown but never fire triggers.
+
+Setup: /worlds -e, set Type to Discord or Slack, paste the token(s), press
+Fetch to pick the server and channel. See the "Chat Worlds" docs chapter
+for creating the bot."#
+            .to_string(),
+    ))
+}
+
 fn cmd_help(args: &str) -> TfCommandResult {
     let topic = args.trim().trim_start_matches('/').to_lowercase();
 
@@ -2263,7 +2299,7 @@ Clay:
   /reload  /version  /quit  /remote  /ban  /unban
   /flush  /dump  /note  /tag  /notify  /import  /window
   /font  /update  /dict  /urban  /translate  /url  /testmusic
-  /mssp  /msdp  /stats
+  /mssp  /msdp  /stats  /chat
 Variables:
   /set  /unset  /let  /setenv  /listvar  /toggle  /export
 Expressions & Control Flow:
@@ -2681,6 +2717,7 @@ Examples:
   /fg -c2 -<
   /fg -s SomeWorldThatMightNotExist"#.to_string()
             )),
+            "chat" | "discord" | "slack" => chat_help(),
             "dc" | "disconnect" => TfCommandResult::Success(Some(
                 "/dc [<world>|-ALL]\n\nDisconnect from the current world, a named world, or (with -ALL,\ncase-insensitive) every connected world.\n\nExamples:\n  /dc\n  /dc MyMUD\n  /dc -ALL".to_string()
             )),
@@ -4346,7 +4383,7 @@ mod tests {
         // Genuinely real Clay-native (non-TF) commands this text legitimately mentions
         // (reachable via `main.rs::parse_command`), plus the `/tf<name>` prefix escape.
         const CLAY_NATIVE_ONLY: &[&str] = &[
-            "actions", "connect", "dict", "dump", "flush", "font", "import",
+            "actions", "chat", "connect", "dict", "dump", "flush", "font", "import",
             "menu", "msdp", "mssp", "note", "notify", "reload", "remote", "setup", "stats", "tag",
             "testmusic", "tfgag", "tfhelp", "translate", "unban", "update",
             "urban", "url", "web", "window",

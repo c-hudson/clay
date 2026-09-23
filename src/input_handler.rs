@@ -90,6 +90,9 @@ pub(crate) enum KeyAction {
     /// same reasoning as KeyAction::Connect ("/__connect") — the actual async spawn is
     /// deferred to the one loop that does: the network round-trip can't happen here.
     RunImport { addr: String, password: Option<String>, auth_key: Option<String>, allow_insecure: bool },
+    /// World editor Fetch (chat worlds) from the console - spawned by the loop that
+    /// has event_tx, same reasoning as `RunImport`. See `App::spawn_chat_lookup`.
+    ChatLookup { world_index: usize, world_type: String, token: String, app_token: String, server: String, request_id: u64 },
     None,
 }
 
@@ -974,6 +977,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.discord_guild = settings.discord_guild;
                     app.worlds[idx].settings.discord_channel = settings.discord_channel;
                     app.worlds[idx].settings.discord_dm_user = settings.discord_dm_user;
+                    app.worlds[idx].settings.discord_channels = settings.discord_channels;
+                    app.worlds[idx].settings.slack_app_token = settings.slack_app_token;
+                    app.worlds[idx].settings.slack_channels = settings.slack_channels;
 
                     app.add_output(&format!("World '{}' saved.", app.worlds[idx].name));
                     let _ = persistence::save_settings(app);
@@ -986,6 +992,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 } else {
                     app.add_output("Cannot delete the last world.");
                 }
+            }
+            NewPopupAction::WorldEditorChatLookup { world_index, world_type, token, app_token, server, request_id } => {
+                return KeyAction::ChatLookup { world_index, world_type, token, app_token, server, request_id };
             }
             NewPopupAction::WorldEditorConnect(idx) => {
                 if idx < app.worlds.len() {

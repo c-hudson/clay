@@ -193,7 +193,21 @@ fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
         max_width = max_width.max(field_width);
     }
 
-    max_width
+    // The button row must fit too (same measure as `render_buttons`: "[label]", two
+    // spaces between buttons of a group, at least two between the left and right
+    // groups, one column of margin each side) - otherwise a popup with many buttons
+    // runs them together and cuts the last one off.
+    let group = |left: bool| -> (usize, usize) {
+        let widths: Vec<usize> = state.definition.buttons.iter()
+            .filter(|b| b.enabled && b.left_align == left)
+            .map(|b| display_width(&b.label) + 2)
+            .collect();
+        (widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1), widths.len())
+    };
+    let (lw, ln) = group(true);
+    let (rw, rn) = group(false);
+    let button_row = lw + rw + if ln > 0 && rn > 0 { 2 } else { 0 } + 2;
+    max_width.max(button_row)
 }
 
 /// Calculate required content height

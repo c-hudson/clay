@@ -130,6 +130,8 @@ pub fn spawn_telnet_writer(
                 WriteCommand::SetEncoding(new_encoding) => {
                     encoding = new_encoding;
                 }
+                // Slack/Discord only (see crate::chat) - never reaches a telnet writer.
+                WriteCommand::Chat(_) => {}
                 WriteCommand::Shutdown => {
                     let _ = write_half.shutdown().await;
                     break;

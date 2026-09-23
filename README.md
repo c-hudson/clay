@@ -450,7 +450,7 @@ upgrading from an older Clay that used `~/.clay.dat`/`~/.clay.key.dat`/`~/clay.t
 those legacy dotfiles are migrated into `~/.clay/` automatically on first run. Per-world
 settings include:
 
-- World type (MUD, MUD - Timed Prompt, Slack, Discord)
+- World type (MUD, MUD - Timed Prompt, Slack, Discord) - a Slack/Discord world shows a whole workspace/server, set up with a Fetch button instead of numeric ids (see docs/markdown/21-chat-worlds.md)
 - Hostname, port, SSL toggle
 - Username/password for auto-login
 - Character encoding (UTF-8, Latin1, FANSI)

@@ -18,7 +18,7 @@ use crate::actions::{action_commands_to_run,
     find_invocable_action, rewrite_slashless_action};
 use crate::telnet_reader::{spawn_telnet_reader, TelnetTarget};
 use crate::telnet_writer::spawn_telnet_writer;
-use crate::commands::{connect_slack, connect_discord, execute_send_command, execute_log_command,
+use crate::commands::{execute_send_command, execute_log_command,
     execute_disconnect_command, execute_add_world_command, execute_add_world_default_command,
     execute_remove_world_command, prepare_world_connect_host_port,
     execute_mssp_command, execute_msdp_command, execute_stats_command,
@@ -280,6 +280,16 @@ pub async fn run_daemon_server() -> io::Result<()> {
                 }
             }
             Some(event) = event_rx.recv() => {
+                let event = match event {
+                    // Slack/Discord: one shared handler for every loop; it may hand back an
+                    // event (chat lines as ServerData, a lost session as Disconnected) to be
+                    // handled below exactly as if it had arrived by itself.
+                    AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
+                        Some(e) => e,
+                        None => continue,
+                    },
+                    e => e,
+                };
                 match event {
                     AppEvent::ServerData(ref world_name, bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
@@ -330,6 +340,22 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 }
                             }
                             app.current_world_index = saved_current_world;
+                        }
+                    }
+                    AppEvent::Chat(..) => {} // handled by the prelude above
+                    AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
+                        app.apply_chat_lookup_result(client_id, request_id, world_index, result);
+                    }
+                    AppEvent::WorldNotice(world_name, text) => {
+                        if let Some(world_idx) = app.find_world_index(&world_name) {
+                            app.add_output_to_world(world_idx, &text);
+                        }
+                    }
+                    AppEvent::WorldConnectResult(world_name, connection_id, origin, result) => {
+                        app.handle_world_connect_result(&world_name, connection_id, origin, result);
+                        if let Some(next) = app.next_reconnect_instant() {
+                            let dur = next.saturating_duration_since(std::time::Instant::now());
+                            reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
                         }
                     }
                     AppEvent::Disconnected(ref world_name, conn_id) => {
@@ -418,18 +444,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         }
                     }
                     AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
-                        match result {
-                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
-                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
-                                world_index,
-                                data: e,
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
-                            }),
-                        }
+                        app.apply_api_lookup_result(client_id, world_index, result, cursor_start);
                     }
                     AppEvent::PublicIpResult(result, reply_to) => {
                         let line = app.apply_public_ip_result(result);
@@ -505,7 +520,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                 // piggybacking on this existing once-a-minute tick rather than a new timer.
                 app.reap_stale_ws_client_worlds();
                 for world in &mut app.worlds {
-                    if world.connected {
+                    if world.connected && world.wants_keepalive() {
                         // Only check last_send_time: server kicks us when WE go idle.
                         let should_send = match world.last_send_time {
                             Some(t) => t.elapsed() >= KEEPALIVE_INTERVAL,
@@ -583,50 +598,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
             // Auto-reconnect timer (mirrors run_app_headless): services World.reconnect_at,
             // scheduled by handle_disconnected above.
             _ = &mut reconnect_sleep => {
-                let now = std::time::Instant::now();
-                let to_reconnect: Vec<String> = app.worlds.iter()
-                    .filter(|w| w.reconnect_at.map(|t| t <= now).unwrap_or(false))
-                    .map(|w| w.name.clone())
-                    .collect();
-                for world_name in to_reconnect {
-                    if let Some(idx) = app.find_world_index(&world_name) {
-                        app.worlds[idx].reconnect_at = None;
-                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
-                            let settings = app.worlds[idx].settings.clone();
-                            app.worlds[idx].connection_id += 1;
-                            let connection_id = app.worlds[idx].connection_id;
-                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                            app.emit_reconnect_status(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
-                            // skip_auto_login=true: handle_connection_success sends auto-login itself.
-                            match connect_daemon_world(
-                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
-                                app.settings.tls_proxy_enabled,
-                            ).await {
-                                Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) => {
-                                    app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
-                                    if let Some(new_idx) = app.find_world_index(&world_name) {
-                                        app.worlds[new_idx].proxy_pid = proxy_pid;
-                                        app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
-                                        app.emit_reconnect_status(new_idx, "Connected!");
-                                    }
-                                }
-                                None => {
-                                    if let Some(current_idx) = app.find_world_index(&world_name) {
-                                        let secs = app.worlds[current_idx].settings.auto_reconnect_secs;
-                                        if secs > 0 {
-                                            app.worlds[current_idx].reconnect_at = Some(
-                                                std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
-                                            );
-                                            app.emit_reconnect_status(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
-                                        } else {
-                                            app.emit_reconnect_status(current_idx, "Connection failed.");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                app.start_due_reconnects(&event_tx);
                 // Re-arm timer for next scheduled reconnect
                 if let Some(next) = app.next_reconnect_instant() {
                     let dur = next.saturating_duration_since(std::time::Instant::now());
@@ -867,7 +839,7 @@ async fn handle_daemon_ws_message_impl(
                         let suppressed = app.fire_tf_hook(Some(world_index), tf::TfHookEvent::Send, &text, true);
                         if !suppressed && app.send_to_world(world_index, text) {
                             app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                            app.worlds[world_index].prompt.clear();
+                            app.worlds[world_index].clear_prompt_after_send();
                         }
                     }
                 }
@@ -947,6 +919,9 @@ async fn handle_daemon_ws_message_impl(
                     // fansi_login_pending, active_media, timing fields), leaking stale state
                     // into the next connection attempt on this world in daemon mode.
                     execute_disconnect_command(app, &world, world_index, true);
+                }
+                Command::Chat { world, args } => {
+                    crate::commands::execute_chat_command(app, &world, &args, world_index, true);
                 }
                 Command::Flush => {
                     if world_index < app.worlds.len() {
@@ -1242,33 +1217,19 @@ async fn handle_daemon_ws_message_impl(
                 // Connect command - use daemon connection logic
                 Command::Connect { .. } => {
                     if world_index < app.worlds.len() && !app.worlds[world_index].connected {
-                        // Slack/Discord worlds don't go through connect_daemon_world (that's
-                        // MUD-only, telnet/proxy-socket specific) - route them through the
-                        // same connect_slack/connect_discord commands.rs already uses for
-                        // console/master-WS. Those operate on app.current_world_index, so
-                        // temporarily point it at this request's target world and restore
-                        // it after, mirroring the WsAsyncAction::Connect delegation pattern
-                        // in main.rs (which ultimately calls into the same two functions).
-                        let world_type = app.worlds[world_index].settings.world_type.clone();
-                        if !world_type.is_mud() {
-                            let prev_index = app.current_world_index;
-                            app.current_world_index = world_index;
-                            let connected = match world_type {
-                                WorldType::Slack => connect_slack(app, event_tx.clone()).await,
-                                WorldType::Discord => connect_discord(app, event_tx.clone()).await,
-                                WorldType::Mud | WorldType::MudTimedPrompt => unreachable!(),
-                            };
-                            app.current_world_index = prev_index;
-                            if connected {
-                                app.worlds[world_index].was_connected = true;
-                                let name = app.worlds[world_index].name.clone();
-                                app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
+                        // Slack/Discord worlds run a background chat session instead of
+                        // connect_daemon_world (MUD-only) - see crate::chat.
+                        if !app.worlds[world_index].settings.world_type.is_mud() {
+                            if app.worlds[world_index].settings.has_connection_settings() {
+                                app.emit_client_text(world_index, "Connecting...", true);
+                                app.spawn_chat_connect(world_index, event_tx);
+                            } else {
+                                app.emit_client_text(world_index, "Set the bot token first (world editor).", true);
                             }
                             return;
                         }
                         if app.worlds[world_index].settings.has_connection_settings() {
                             let settings = app.worlds[world_index].settings.clone();
-                            let world_name = app.worlds[world_index].name.clone();
 
                             let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
                             app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
@@ -1281,44 +1242,10 @@ async fn handle_daemon_ws_message_impl(
                                 flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
 
-                            app.worlds[world_index].connection_id += 1;
+                            // In the background: awaiting the connect here froze this whole loop (and
+                            // every client) until it finished - see App::spawn_world_connect.
                             let skip_login = app.worlds[world_index].skip_auto_login;
-                            if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
-                                world_index,
-                                world_name.clone(),
-                                &settings,
-                                event_tx.clone(),
-                                app.worlds[world_index].connection_id,
-                                skip_login,
-                                app.settings.tls_proxy_enabled,
-                            ).await {
-                                app.worlds[world_index].connected = true;
-                                // Re-arm the login-capture guard for this fresh connection -
-                                // see World::login_capture_guard's doc comment.
-                                app.worlds[world_index].login_capture_guard = 6;
-                                app.worlds[world_index].command_tx = Some(cmd_tx);
-                                app.worlds[world_index].was_connected = true;
-                                app.worlds[world_index].skip_auto_login = false;
-                                app.worlds[world_index].socket_fd = socket_fd;
-                                app.worlds[world_index].is_tls = is_tls;
-                                app.worlds[world_index].proxy_pid = proxy_pid;
-                                app.worlds[world_index].proxy_socket_path = proxy_socket_path;
-                                let now = std::time::Instant::now();
-                                app.worlds[world_index].last_send_time = Some(now);
-                                app.worlds[world_index].last_receive_time = Some(now);
-                                app.ws_broadcast(WsMessage::WorldConnected { world_index, name: world_name });
-                            } else {
-                                app.worlds[world_index].skip_auto_login = false;
-                                app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                                    world_index,
-                                    data: "Connection failed.\n".to_string(),
-                                    is_viewed: false,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0, end_seq: None,
-                                    flush: false, gagged: false, highlight_colors: Vec::new(),
-                                });
-                            }
+                            app.spawn_world_connect(world_index, skip_login, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
                         } else {
                             app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
@@ -1335,26 +1262,9 @@ async fn handle_daemon_ws_message_impl(
                 Command::WorldConnectBackground { ref name } => {
                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                         if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
-                            let settings = app.worlds[idx].settings.clone();
-                            let world_name = app.worlds[idx].name.clone();
-                            app.worlds[idx].connection_id += 1;
-                            if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
-                                idx, world_name.clone(), &settings, event_tx.clone(),
-                                app.worlds[idx].connection_id, false, app.settings.tls_proxy_enabled,
-                            ).await {
-                                app.worlds[idx].connected = true;
-                                app.worlds[idx].login_capture_guard = 6; // see World::login_capture_guard
-                                app.worlds[idx].command_tx = Some(cmd_tx);
-                                app.worlds[idx].was_connected = true;
-                                app.worlds[idx].socket_fd = socket_fd;
-                                app.worlds[idx].is_tls = is_tls;
-                                app.worlds[idx].proxy_pid = proxy_pid;
-                                app.worlds[idx].proxy_socket_path = proxy_socket_path;
-                                let now = std::time::Instant::now();
-                                app.worlds[idx].last_send_time = Some(now);
-                                app.worlds[idx].last_receive_time = Some(now);
-                                app.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name: world_name });
-                            }
+                            // In the background - see App::spawn_world_connect. `/worlds -b` never
+                            // reported a failure, so it still doesn't.
+                            app.spawn_world_connect(idx, false, crate::ConnectOrigin::Client { report_failure: false }, event_tx);
                         }
                     } else {
                         app.emit_client_text(world_index, &format!("World '{}' not found.", name), true);
@@ -1374,39 +1284,14 @@ async fn handle_daemon_ws_message_impl(
                                 app.worlds[idx].skip_auto_login = true;
                             }
                             let settings = app.worlds[idx].settings.clone();
-                            let world_name = app.worlds[idx].name.clone();
 
                             let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
                             app.emit_client_text(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg), true);
 
-                            app.worlds[idx].connection_id += 1;
+                            // In the background: awaiting the connect here froze this whole loop (and
+                            // every client) until it finished - see App::spawn_world_connect.
                             let skip_login = app.worlds[idx].skip_auto_login;
-                            if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
-                                idx,
-                                world_name.clone(),
-                                &settings,
-                                event_tx.clone(),
-                                app.worlds[idx].connection_id,
-                                skip_login,
-                                app.settings.tls_proxy_enabled,
-                            ).await {
-                                app.worlds[idx].connected = true;
-                                app.worlds[idx].login_capture_guard = 6; // see World::login_capture_guard
-                                app.worlds[idx].command_tx = Some(cmd_tx);
-                                app.worlds[idx].was_connected = true;
-                                app.worlds[idx].skip_auto_login = false;
-                                app.worlds[idx].socket_fd = socket_fd;
-                                app.worlds[idx].is_tls = is_tls;
-                                app.worlds[idx].proxy_pid = proxy_pid;
-                                app.worlds[idx].proxy_socket_path = proxy_socket_path;
-                                let now = std::time::Instant::now();
-                                app.worlds[idx].last_send_time = Some(now);
-                                app.worlds[idx].last_receive_time = Some(now);
-                                app.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name: world_name });
-                            } else {
-                                app.worlds[idx].skip_auto_login = false;
-                                app.emit_client_text(idx, "Connection failed.", true);
-                            }
+                            app.spawn_world_connect(idx, skip_login, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
                         }
                     } else {
                         app.emit_client_text(world_index, &format!("World '{}' not found.", name), true);
@@ -1417,7 +1302,6 @@ async fn handle_daemon_ws_message_impl(
         WsMessage::ConnectWorld { world_index } => {
             if world_index < app.worlds.len() && !app.worlds[world_index].connected {
                 let settings = app.worlds[world_index].settings.clone();
-                let world_name = app.worlds[world_index].name.clone();
 
                 // Check if world has connection settings
                 if !settings.has_connection_settings() {
@@ -1445,45 +1329,10 @@ async fn handle_daemon_ws_message_impl(
                 });
 
                 // Attempt connection
-                app.worlds[world_index].connection_id += 1;
+                // In the background: awaiting the connect here froze this whole loop (and
+                // every client) until it finished - see App::spawn_world_connect.
                 let skip_login = app.worlds[world_index].skip_auto_login;
-                if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
-                    world_index,
-                    world_name.clone(),
-                    &settings,
-                    event_tx.clone(),
-                    app.worlds[world_index].connection_id,
-                    skip_login,
-                    app.settings.tls_proxy_enabled,
-                ).await {
-                    // Connection succeeded
-                    app.worlds[world_index].connected = true;
-                    app.worlds[world_index].login_capture_guard = 6; // see World::login_capture_guard
-                    app.worlds[world_index].command_tx = Some(cmd_tx);
-                    app.worlds[world_index].was_connected = true;
-                    app.worlds[world_index].skip_auto_login = false;
-                    app.worlds[world_index].socket_fd = socket_fd;
-                    app.worlds[world_index].is_tls = is_tls;
-                    app.worlds[world_index].proxy_pid = proxy_pid;
-                    app.worlds[world_index].proxy_socket_path = proxy_socket_path;
-                    let now = std::time::Instant::now();
-                    app.worlds[world_index].last_send_time = Some(now);
-                    app.worlds[world_index].last_receive_time = Some(now);
-
-                    app.ws_broadcast(WsMessage::WorldConnected { world_index, name: world_name });
-                } else {
-                    // Connection failed
-                    app.worlds[world_index].skip_auto_login = false;
-                    app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                        world_index,
-                        data: "Connection failed.\n".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0, end_seq: None,
-                        flush: false, gagged: false, highlight_colors: Vec::new(),
-                    });
-                }
+                app.spawn_world_connect(world_index, skip_login, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
             }
         }
         WsMessage::DisconnectWorld { world_index } => {
@@ -1513,6 +1362,9 @@ async fn handle_daemon_ws_message_impl(
         WsMessage::LookupPublicIp => {
             app.request_public_ip_lookup(None, event_tx.clone());
         }
+        WsMessage::ChatLookup { request_id, world_index, world_type, token, app_token, server } => {
+            app.spawn_chat_lookup(client_id, request_id, world_index, &world_type, token, app_token, server, event_tx);
+        }
         WsMessage::RefreshReachability => {
             app.request_reachability_refresh(None, event_tx.clone());
         }
@@ -1529,36 +1381,10 @@ async fn handle_daemon_ws_message_impl(
                     flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
                 if !app.worlds[world_index].connected {
-                    let settings = app.worlds[world_index].settings.clone();
-                    let world_name = app.worlds[world_index].name.clone();
-                    app.worlds[world_index].connection_id += 1;
+                    // In the background: awaiting the connect here froze this whole loop (and
+                    // every client) until it finished - see App::spawn_world_connect.
                     let skip_login = app.worlds[world_index].skip_auto_login;
-                    if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
-                        world_index,
-                        world_name.clone(),
-                        &settings,
-                        event_tx.clone(),
-                        app.worlds[world_index].connection_id,
-                        skip_login,
-                        app.settings.tls_proxy_enabled,
-                    ).await {
-                        app.worlds[world_index].connected = true;
-                        app.worlds[world_index].login_capture_guard = 6; // see World::login_capture_guard
-                        app.worlds[world_index].command_tx = Some(cmd_tx);
-                        app.worlds[world_index].was_connected = true;
-                        app.worlds[world_index].skip_auto_login = false;
-                        app.worlds[world_index].socket_fd = socket_fd;
-                        app.worlds[world_index].is_tls = is_tls;
-                        app.worlds[world_index].proxy_pid = proxy_pid;
-                        app.worlds[world_index].proxy_socket_path = proxy_socket_path;
-                        let now = std::time::Instant::now();
-                        app.worlds[world_index].last_send_time = Some(now);
-                        app.worlds[world_index].last_receive_time = Some(now);
-                        app.ws_broadcast(WsMessage::WorldConnected { world_index, name: world_name });
-                    } else {
-                        app.worlds[world_index].skip_auto_login = false;
-                        app.emit_client_text(world_index, "Connection failed.", true);
-                    }
+                    app.spawn_world_connect(world_index, skip_login, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
                 }
             }
         }
@@ -1948,13 +1774,13 @@ async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat } => {
             app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 msp_enabled, mcp_enabled, mccp2_enabled,
                 world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace,
-                discord_token, discord_guild, discord_channel, discord_dm_user,
+                discord_token, discord_guild, discord_channel, discord_dm_user, chat,
             );
         }
         WsMessage::CalculateNextWorld { current_index } => {
@@ -2236,6 +2062,16 @@ keep_alive_type=Generic
                 }
             }
             Some(event) = event_rx.recv() => {
+                let event = match event {
+                    // Slack/Discord: one shared handler for every loop; it may hand back an
+                    // event (chat lines as ServerData, a lost session as Disconnected) to be
+                    // handled below exactly as if it had arrived by itself.
+                    AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
+                        Some(e) => e,
+                        None => continue,
+                    },
+                    e => e,
+                };
                 match event {
                     AppEvent::WsClientMessage(client_id, msg) => {
                         handle_multiuser_ws_message(&mut app, client_id, *msg, &event_tx).await;
@@ -2250,10 +2086,12 @@ keep_alive_type=Generic
 
                         if world_index < app.worlds.len() && !already_connected {
                             let settings = app.worlds[world_index].settings.clone();
-                            let world_name = app.worlds[world_index].name.clone();
 
                             // Check if world has connection settings
-                            if !settings.has_connection_settings() {
+                            if !settings.world_type.is_mud() && settings.has_connection_settings() {
+                                // Slack/Discord: the owner's one chat session (crate::chat).
+                                app.start_multiuser_chat(world_index, &requesting_username, &event_tx);
+                            } else if !settings.has_connection_settings() {
                                 if let Some(ws) = &app.ws_server {
                                     ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
                                         world_index,
@@ -2265,13 +2103,31 @@ keep_alive_type=Generic
                                         flush: false, gagged: false, highlight_colors: Vec::new(),
                                     }, Some(&requesting_username));
                                 }
-                            // Create per-user connection
-                            } else if let Some(cmd_tx) = connect_multiuser_world(
-                                world_index,
-                                requesting_username.clone(),
-                                &settings,
-                                event_tx.clone(),
-                            ).await {
+                            } else if app.multiuser_connecting.insert(key) {
+                                // Per-user connection, made in the background: awaiting it
+                                // here froze the server for every user until a connect to a
+                                // down host gave up. The result comes back as
+                                // MultiuserConnectResult; a repeat request meanwhile is
+                                // ignored (the insert above returned false).
+                                let event_tx = event_tx.clone();
+                                tokio::spawn(async move {
+                                    let cmd_tx = connect_multiuser_world(
+                                        world_index,
+                                        requesting_username.clone(),
+                                        &settings,
+                                        event_tx.clone(),
+                                    ).await;
+                                    let _ = event_tx.send(AppEvent::MultiuserConnectResult(world_index, requesting_username, cmd_tx)).await;
+                                });
+                            }
+                        }
+                    }
+                    AppEvent::MultiuserConnectResult(world_index, requesting_username, cmd_tx) => {
+                        let key = (world_index, requesting_username.clone());
+                        app.multiuser_connecting.remove(&key);
+                        let already_connected = app.user_connections.get(&key).map(|c| c.connected).unwrap_or(false);
+                        match cmd_tx {
+                            Some(cmd_tx) if world_index < app.worlds.len() && !already_connected => {
                                 // Store connection in user_connections
                                 let mut conn = UserConnection::new();
                                 conn.connected = true;
@@ -2281,13 +2137,19 @@ keep_alive_type=Generic
                                 app.user_connections.insert(key, conn);
 
                                 // Send WorldConnected only to this user
+                                let world_name = app.worlds[world_index].name.clone();
                                 if let Some(ws) = &app.ws_server {
                                     ws.broadcast_to_owner(
                                         WsMessage::WorldConnected { world_index, name: world_name },
                                         Some(&requesting_username)
                                     );
                                 }
-                            } else {
+                            }
+                            Some(cmd_tx) => {
+                                // Nowhere to put it any more - close it.
+                                let _ = cmd_tx.try_send(WriteCommand::Shutdown);
+                            }
+                            None => {
                                 // Connection failed - send error to user
                                 if let Some(ws) = &app.ws_server {
                                     ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
@@ -2458,6 +2320,9 @@ fn handle_multiuser_disconnect(app: &mut App, world_index: usize, username: &str
     if let Some(conn) = app.user_connections.get_mut(&key) {
         conn.connected = false;
         conn.command_tx = None;
+        // Chat worlds: dropping the handle ends the session (see crate::chat).
+        conn.chat = None;
+        conn.chat_target = None;
         let was_masked = conn.protocol.echo_masked;
         conn.protocol.clear();
 
@@ -2624,6 +2489,102 @@ pub async fn connect_multiuser_world(
 
 /// Connect a world in daemon mode (non-multiuser)
 /// Returns (cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path) on success
+/// Connect world `world_name` to `host:port` through a TLS proxy process (a separate
+/// process holds the TLS connection so it survives hot reload; Clay talks to it over a
+/// Unix socket, or a Named Pipe on Windows), then start the telnet writer/reader on that
+/// link. Returns (cmd_tx, proxy_pid, socket/pipe path). Sends the auto-login itself
+/// unless `skip_auto_login`.
+///
+/// Shared by `connect_daemon_world` and the console's `/worlds` connect task. Always
+/// runs off the event loop: starting the proxy waits (a blocking sleep loop, hence
+/// `spawn_blocking`) for the proxy to reach the MUD, which against a down host takes
+/// seconds.
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn connect_via_tls_proxy(
+    world_name: &str,
+    host: &str,
+    port: &str,
+    settings: &WorldSettings,
+    event_tx: mpsc::Sender<AppEvent>,
+    connection_id: u64,
+    skip_auto_login: bool,
+) -> Result<(mpsc::Sender<WriteCommand>, u32, std::path::PathBuf), String> {
+    let (proxy_pid, proxy_path) = {
+        let (w, h, p) = (world_name.to_string(), host.to_string(), port.to_string());
+        tokio::task::spawn_blocking(move || spawn_tls_proxy(&w, &h, &p))
+            .await
+            .map_err(|e| format!("Failed to spawn TLS proxy: {}", e))?
+            .map_err(|e| format!("Failed to spawn TLS proxy: {}", e))?
+    };
+
+    #[cfg(unix)]
+    let (read_half, write_half) = {
+        let mut stream = None;
+        for attempt in 0..20 {
+            match tokio::net::UnixStream::connect(&proxy_path).await {
+                Ok(s) => { stream = Some(s); break; }
+                Err(_) => {
+                    if attempt < 19 { tokio::time::sleep(Duration::from_millis(100)).await; }
+                }
+            }
+        }
+        let Some(unix_stream) = stream else {
+            unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+            return Err("Failed to connect to TLS proxy".to_string());
+        };
+        let (r, w) = unix_stream.into_split();
+        (StreamReader::Proxy(r), StreamWriter::Proxy(w))
+    };
+    #[cfg(windows)]
+    let (read_half, write_half) = match connect_to_proxy_pipe(&proxy_path, 10).await {
+        Some(pipe_client) => {
+            let (r, w) = tokio::io::split(pipe_client);
+            (StreamReader::NamedPipeProxy(r), StreamWriter::NamedPipeProxy(w))
+        }
+        None => {
+            kill_proxy_process(proxy_pid);
+            return Err("Failed to connect to TLS proxy".to_string());
+        }
+    };
+
+    // Plan Job 13 (Phase 4, 4.4): spawn_telnet_writer. Fresh connect -
+    // settings.encoding is the right initial encoding.
+    let cmd_tx = spawn_telnet_writer(write_half, settings.encoding);
+    if !skip_auto_login {
+        let user = settings.user.clone();
+        let password = settings.password.clone();
+        if !user.is_empty() && !password.is_empty() && settings.auto_connect_type == AutoConnectType::Connect {
+            let tx = cmd_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = tx.send(WriteCommand::Text(format!("connect {} {}", user, password))).await;
+            });
+        }
+    }
+    // Plan Job 5, 2.3: spawn_telnet_reader (MCCP2, TTYPE/CHARSET events, WontEchoSeen,
+    // the unified "Connection closed by server." message on EOF).
+    let telnet_cfg = TelnetConfig {
+        term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
+        msp_enabled: settings.msp_enabled,
+        mccp2_enabled: settings.mccp2_enabled,
+        // Job 12 (plan Phase 4, 4.1): the proxy path is only reached for TLS.
+        is_tls: true,
+        ..TelnetConfig::default()
+    };
+    spawn_telnet_reader(
+        read_half,
+        cmd_tx.clone(),
+        event_tx,
+        TelnetTarget::World(world_name.to_string()),
+        connection_id,
+        telnet_cfg,
+    );
+    Ok((cmd_tx, proxy_pid, proxy_path))
+}
+
+/// `connect_daemon_world`'s result: (cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path).
+pub type DaemonConnectResult = Option<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool, Option<u32>, Option<std::path::PathBuf>)>;
+
 pub async fn connect_daemon_world(
     _world_index: usize,
     world_name: String,
@@ -2632,7 +2593,7 @@ pub async fn connect_daemon_world(
     connection_id: u64,
     skip_auto_login: bool,
     tls_proxy_enabled: bool,
-) -> Option<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool, Option<u32>, Option<std::path::PathBuf>)> {
+) -> DaemonConnectResult {
     #[cfg(target_os = "android")]
     let _ = tls_proxy_enabled;
     let host = &settings.hostname;
@@ -2643,133 +2604,15 @@ pub async fn connect_daemon_world(
         return None;
     }
 
-    // TLS proxy path — spawn a separate proxy process that holds the TLS connection
-    // so it survives hot reload. Platform-specific IPC: Unix sockets on Unix,
-    // Named Pipes on Windows.
-    #[cfg(all(unix, not(target_os = "android")))]
+    // TLS proxy path — a separate proxy process holds the TLS connection so it
+    // survives hot reload. Falls through to direct TLS if the proxy fails.
+    #[cfg(not(target_os = "android"))]
     if use_ssl && tls_proxy_enabled {
-        if let Ok((proxy_pid, socket_path)) = spawn_tls_proxy(&world_name, host, port) {
-            let mut connected = false;
-            for attempt in 0..20 {
-                match tokio::net::UnixStream::connect(&socket_path).await {
-                    Ok(unix_stream) => {
-                        let (r, w) = unix_stream.into_split();
-                        let read_half = StreamReader::Proxy(r);
-                        let write_half = StreamWriter::Proxy(w);
-                        // Plan Job 13 (Phase 4, 4.4): migrated onto spawn_telnet_writer.
-                        // Fresh connect - settings.encoding is the right initial encoding.
-                        let cmd_tx = spawn_telnet_writer(write_half, settings.encoding);
-                        if !skip_auto_login {
-                            let user = settings.user.clone();
-                            let password = settings.password.clone();
-                            let auto_connect_type = settings.auto_connect_type;
-                            if !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                let tx = cmd_tx.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    let _ = tx.send(WriteCommand::Text(format!("connect {} {}", user, password))).await;
-                                });
-                            }
-                        }
-                        let event_tx_read = event_tx.clone();
-                        let world_name_read = world_name.clone();
-                        let reader_conn_id = connection_id;
-                        // Plan Job 5, 2.3: migrated onto spawn_telnet_reader. Gains over
-                        // the old hand-rolled loop: MCCP2 decompression (this proxy path
-                        // used to accept IAC DO MCCP2 and then render the compressed
-                        // stream as text — finding 1), TTYPE/CHARSET events, WontEchoSeen,
-                        // and the unified "Connection closed by server." message on EOF.
-                        let telnet_cfg = TelnetConfig {
-                            term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                            msp_enabled: settings.msp_enabled,
-                            mccp2_enabled: settings.mccp2_enabled,
-                            // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path - only
-                            // reached when use_ssl is true.
-                            is_tls: use_ssl,
-                ..TelnetConfig::default()
-                        };
-                        spawn_telnet_reader(
-                            read_half,
-                            cmd_tx.clone(),
-                            event_tx_read,
-                            TelnetTarget::World(world_name_read),
-                            reader_conn_id,
-                            telnet_cfg,
-                        );
-                        return Some((cmd_tx, None, true, Some(proxy_pid), Some(socket_path)));
-                    }
-                    Err(_) => {
-                        if attempt < 19 { tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; }
-                        connected = false;
-                    }
-                }
-                if connected { break; }
-            }
-            if !connected {
-                unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
-            }
+        if let Ok((cmd_tx, proxy_pid, proxy_path)) = connect_via_tls_proxy(
+            &world_name, host, port, settings, event_tx.clone(), connection_id, skip_auto_login,
+        ).await {
+            return Some((cmd_tx, None, true, Some(proxy_pid), Some(proxy_path)));
         }
-        // Fall through to direct TLS if proxy failed
-    }
-
-    #[cfg(windows)]
-    if use_ssl && tls_proxy_enabled {
-        if let Ok((proxy_pid, pipe_path)) = spawn_tls_proxy(&world_name, host, port) {
-            match connect_to_proxy_pipe(&pipe_path, 10).await {
-                Some(pipe_client) => {
-                    let (r, w) = tokio::io::split(pipe_client);
-                    let read_half = StreamReader::NamedPipeProxy(r);
-                    let write_half = StreamWriter::NamedPipeProxy(w);
-                        // Plan Job 13 (Phase 4, 4.4): migrated onto spawn_telnet_writer -
-                        // mirrors the Unix-socket proxy block above; unverified in this
-                        // sandbox (no mingw toolchain to cross-check a #[cfg(windows)]
-                        // path - see the plan's Windows verification note).
-                        let cmd_tx = spawn_telnet_writer(write_half, settings.encoding);
-                        if !skip_auto_login {
-                            let user = settings.user.clone();
-                            let password = settings.password.clone();
-                            let auto_connect_type = settings.auto_connect_type;
-                            if !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                let tx = cmd_tx.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    let _ = tx.send(WriteCommand::Text(format!("connect {} {}", user, password))).await;
-                                });
-                            }
-                        }
-                        let event_tx_read = event_tx.clone();
-                        let world_name_read = world_name.clone();
-                        let reader_conn_id = connection_id;
-                        // Plan Job 5, 2.3: migrated onto spawn_telnet_reader. Gains over
-                        // the old hand-rolled loop: MCCP2 decompression (this proxy path
-                        // used to accept IAC DO MCCP2 and then render the compressed
-                        // stream as text — finding 1), TTYPE/CHARSET events, WontEchoSeen,
-                        // and the unified "Connection closed by server." message on EOF.
-                        let telnet_cfg = TelnetConfig {
-                            term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                            msp_enabled: settings.msp_enabled,
-                            mccp2_enabled: settings.mccp2_enabled,
-                            // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path - only
-                            // reached when use_ssl is true.
-                            is_tls: use_ssl,
-                ..TelnetConfig::default()
-                        };
-                        spawn_telnet_reader(
-                            read_half,
-                            cmd_tx.clone(),
-                            event_tx_read,
-                            TelnetTarget::World(world_name_read),
-                            reader_conn_id,
-                            telnet_cfg,
-                        );
-                        return Some((cmd_tx, None, true, Some(proxy_pid), Some(pipe_path)));
-                }
-                None => {
-                    kill_proxy_process(proxy_pid);
-                }
-            }
-        }
-        // Fall through to direct TLS
     }
 
     match TcpStream::connect(format!("{}:{}", host, port)).await {
@@ -3043,6 +2886,14 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     discord_guild: if is_owner { world.settings.discord_guild.clone() } else { String::new() },
                     discord_channel: if is_owner { world.settings.discord_channel.clone() } else { String::new() },
                     discord_dm_user: if is_owner { world.settings.discord_dm_user.clone() } else { String::new() },
+                    discord_channels: if is_owner { world.settings.discord_channels.clone() } else { String::new() },
+                    slack_app_token: String::new(),
+                    slack_channels: if is_owner { world.settings.slack_channels.clone() } else { String::new() },
+                    // Whether a token is set is fine to tell the owner (their editor shows
+                    // "(set)" instead of an empty box); never the token itself.
+                    has_discord_token: is_owner && !world.settings.discord_token.is_empty(),
+                    has_slack_token: is_owner && !world.settings.slack_token.is_empty(),
+                    has_slack_app_token: is_owner && !world.settings.slack_app_token.is_empty(),
                 },
                 last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),
@@ -3306,6 +3157,11 @@ pub async fn handle_multiuser_ws_message(
         WsMessage::SendCommand { world_index, command } => {
             // Send command to user's own connection
             if let Some(ref uname) = username {
+                // /chat on a chat world is handled here, not sent as chat text.
+                let owns = app.worlds.get(world_index).map(|w| w.owner.as_deref() == Some(uname.as_str())).unwrap_or(false);
+                if owns && app.multiuser_chat_command(world_index, uname, &command) {
+                    return;
+                }
                 let key = (world_index, uname.clone());
                 if let Some(conn) = app.user_connections.get(&key) {
                     if let Some(tx) = &conn.command_tx {

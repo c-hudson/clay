@@ -1900,6 +1900,9 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.discord_guild = settings.discord_guild.clone();
                     app.worlds[idx].settings.discord_channel = settings.discord_channel.clone();
                     app.worlds[idx].settings.discord_dm_user = settings.discord_dm_user.clone();
+                    app.worlds[idx].settings.discord_channels = settings.discord_channels.clone();
+                    app.worlds[idx].settings.slack_app_token = settings.slack_app_token.clone();
+                    app.worlds[idx].settings.slack_channels = settings.slack_channels.clone();
                     app.worlds[idx].settings.hostname = settings.hostname.clone();
                     app.worlds[idx].settings.port = settings.port.clone();
                     app.worlds[idx].settings.user = settings.user.clone();
@@ -1951,10 +1954,19 @@ pub(crate) fn handle_remote_client_key(
                         world_type: settings.world_type,
                         prompt_wait_ms: settings.prompt_wait_ms,
                         slack_token: settings.slack_token,
-                        slack_channel: settings.slack_channel,
-                        slack_workspace: settings.slack_workspace,
+                        slack_channel: settings.slack_channel.clone(),
+                        slack_workspace: settings.slack_workspace.clone(),
                         discord_token: settings.discord_token,
-                        discord_guild: settings.discord_guild,
+                        discord_guild: settings.discord_guild.clone(),
+                        chat: Some(crate::websocket::ChatSettingsUpdate {
+                            discord_guild: settings.discord_guild.clone(),
+                            discord_channel: settings.discord_channel.clone(),
+                            discord_channels: settings.discord_channels,
+                            slack_channel: settings.slack_channel.clone(),
+                            slack_channels: settings.slack_channels,
+                            slack_workspace: settings.slack_workspace.clone(),
+                            slack_app_token: settings.slack_app_token,
+                        }),
                         discord_channel: settings.discord_channel,
                         discord_dm_user: settings.discord_dm_user,
                     });
@@ -1963,6 +1975,11 @@ pub(crate) fn handle_remote_client_key(
             NewPopupAction::WorldEditorDelete(idx) => {
                 // Send delete request to daemon
                 let _ = ws_tx.send(WsMessage::DeleteWorld { world_index: idx });
+            }
+            NewPopupAction::WorldEditorChatLookup { world_index, world_type, token, app_token, server, request_id } => {
+                // Fetch runs on the server (it holds the stored tokens when the editor
+                // was sent blank ones); the reply is applied in the receive loop.
+                let _ = ws_tx.send(WsMessage::ChatLookup { request_id, world_index, world_type, token, app_token, server });
             }
             NewPopupAction::WorldEditorConnect(idx) => {
                 // Send connect request to daemon

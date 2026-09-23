@@ -790,6 +790,12 @@ impl PopupDefinition {
         self.buttons.iter().find(|b| b.id == id)
     }
 
+    /// Get a mutable button by ID (e.g. to enable/disable - a disabled button is
+    /// not drawn and not focusable, so this doubles as show/hide).
+    pub fn get_button_mut(&mut self, id: ButtonId) -> Option<&mut Button> {
+        self.buttons.iter_mut().find(|b| b.id == id)
+    }
+
     /// Get focusable field IDs in order
     pub fn focusable_fields(&self) -> Vec<FieldId> {
         self.fields

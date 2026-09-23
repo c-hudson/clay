@@ -119,6 +119,10 @@ pub enum WriteCommand {
     /// "the writer notices." See `spawn_telnet_writer`'s doc comment for the
     /// alternative this was weighed against.
     SetEncoding(crate::encoding::Encoding),
+    /// Slack/Discord only: change where typed text goes (or send once elsewhere),
+    /// in-band for the same ordering reason as `SetEncoding`. The telnet writer
+    /// ignores it. See `crate::chat`.
+    Chat(crate::chat::ChatOp),
 }
 
 /// Stream wrapper enums for supporting both plain TCP and TLS connections

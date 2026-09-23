@@ -57,6 +57,10 @@ Open with `/worlds -e` or edit from World Selector:
 | Port | Server port (e.g., 4000) |
 | Use SSL | Enable TLS/SSL connection |
 
+Slack and Discord worlds have their own fields instead (Token, Server/Workspace,
+Send To, Show Only, and a **Fetch** button that fills in pick lists); see the
+[Chat Worlds](#chat-worlds-discord-and-slack) chapter.
+
 ### Authentication Settings
 
 | Setting | Description |

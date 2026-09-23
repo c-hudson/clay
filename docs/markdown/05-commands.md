@@ -72,6 +72,13 @@ Disconnect the current world and close its log file.
 /dc
 ```
 
+### /chat (or /discord, /slack)
+
+Commands for Slack and Discord worlds: `/chat` shows status, `/chat channels` lists
+channels, `/chat to #channel` (or `@user`) changes where typing goes, and
+`/chat msg <target> <text>` sends one message. See the
+[Chat Worlds](#chat-worlds-discord-and-slack) chapter.
+
 ## Sending Commands
 
 ### /send

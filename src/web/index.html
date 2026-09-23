@@ -654,45 +654,75 @@
                         </div>
                     </div>
                     <div class="setting-row type-gated" id="world-edit-slack-token-field">
-                        <span class="setting-label">Token</span>
+                        <span class="setting-label">Bot Token</span>
                         <div class="setting-value">
-                            <input type="text" id="world-edit-slack-token" class="editor-input" autocomplete="off">
+                            <input type="text" id="world-edit-slack-token" class="editor-input" autocomplete="off" placeholder="xoxb-...">
                         </div>
                     </div>
-                    <div class="setting-row type-gated" id="world-edit-slack-channel-field">
-                        <span class="setting-label">Channel</span>
+                    <div class="setting-row type-gated" id="world-edit-slack-app-token-field">
+                        <span class="setting-label">App Token</span>
                         <div class="setting-value">
-                            <input type="text" id="world-edit-slack-channel" class="editor-input" autocomplete="off">
+                            <input type="text" id="world-edit-slack-app-token" class="editor-input" autocomplete="off" placeholder="xapp-...">
                         </div>
                     </div>
                     <div class="setting-row type-gated" id="world-edit-slack-workspace-field">
                         <span class="setting-label">Workspace</span>
                         <div class="setting-value">
-                            <input type="text" id="world-edit-slack-workspace" class="editor-input" autocomplete="off">
+                            <input type="text" id="world-edit-slack-workspace" class="editor-input" autocomplete="off" placeholder="(filled in by Fetch)">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-slack-channel-field">
+                        <span class="setting-label">Send To</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-slack-channel" class="editor-input" autocomplete="off" placeholder="#channel or @user">
+                            <select id="world-edit-slack-channel-pick" class="chat-pick"></select>
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-slack-channels-field">
+                        <span class="setting-label">Show Only</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-slack-channels" class="editor-input" autocomplete="off" placeholder="blank = all channels, or #general,#dev">
                         </div>
                     </div>
                     <div class="setting-row type-gated" id="world-edit-discord-token-field">
                         <span class="setting-label">Token</span>
                         <div class="setting-value">
-                            <input type="text" id="world-edit-discord-token" class="editor-input" autocomplete="off">
+                            <input type="text" id="world-edit-discord-token" class="editor-input" autocomplete="off" placeholder="bot token from the Developer Portal">
                         </div>
                     </div>
                     <div class="setting-row type-gated" id="world-edit-discord-guild-field">
-                        <span class="setting-label">Guild</span>
+                        <span class="setting-label">Server</span>
                         <div class="setting-value">
-                            <input type="text" id="world-edit-discord-guild" class="editor-input" autocomplete="off">
+                            <input type="text" id="world-edit-discord-guild" class="editor-input" autocomplete="off" placeholder="server name (or press Fetch)">
+                            <select id="world-edit-discord-server-pick" class="chat-pick"></select>
                         </div>
                     </div>
                     <div class="setting-row type-gated" id="world-edit-discord-channel-field">
-                        <span class="setting-label">Channel</span>
+                        <span class="setting-label">Send To</span>
                         <div class="setting-value">
-                            <input type="text" id="world-edit-discord-channel" class="editor-input" autocomplete="off">
+                            <input type="text" id="world-edit-discord-channel" class="editor-input" autocomplete="off" placeholder="#channel or @user">
+                            <select id="world-edit-discord-channel-pick" class="chat-pick"></select>
                         </div>
                     </div>
+                    <div class="setting-row type-gated" id="world-edit-discord-channels-field">
+                        <span class="setting-label">Show Only</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-discord-channels" class="editor-input" autocomplete="off" placeholder="blank = all channels, or #general,#dev">
+                        </div>
+                    </div>
+                    <!-- Legacy (pre-overhaul DM-only worlds); never shown - migration folds it
+                         into Send To / Show Only. Kept so a save round-trips it untouched. -->
                     <div class="setting-row type-gated" id="world-edit-discord-dm-user-field">
                         <span class="setting-label">DM User</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-discord-dm-user" class="editor-input" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-chat-fetch-field">
+                        <span class="setting-label"></span>
+                        <div class="setting-value">
+                            <button id="world-edit-chat-fetch-btn" class="btn" type="button">Fetch servers &amp; channels</button>
+                            <div id="world-edit-chat-status" class="chat-status"></div>
                         </div>
                     </div>
                 </div>

@@ -678,6 +678,31 @@ pub enum WsMessage {
         discord_channel: String,
         #[serde(default)]
         discord_dm_user: String,
+        /// Chat-world settings from a client that knows the overhauled model. When
+        /// present it is authoritative for the non-secret fields (an empty string
+        /// CLEARS - the legacy fields above can't express that), and carries the new
+        /// fields. Absent (older client): the legacy fields apply as before.
+        #[serde(default)]
+        chat: Option<ChatSettingsUpdate>,
+    },
+    /// World editor "Fetch": look up a chat world's servers/channels with the given
+    /// (possibly unsaved) tokens. Empty token = use the stored one. Reply:
+    /// `ChatLookupResult` to the requesting client only; the token is never echoed.
+    ChatLookup {
+        request_id: u64,
+        world_index: usize,
+        world_type: String,
+        #[serde(default)]
+        token: String,
+        #[serde(default)]
+        app_token: String,
+        #[serde(default)]
+        server: String,
+    },
+    ChatLookupResult {
+        request_id: u64,
+        world_index: usize,
+        result: ChatDirectoryMsg,
     },
     UpdateGlobalSettings {
         more_mode_enabled: bool,
@@ -1360,6 +1385,65 @@ pub struct WorldStateMsg {
     pub stats: Vec<crate::stats::StatEntry>,
 }
 
+/// Chat-world settings in `UpdateWorldSettings` (see its `chat` field).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ChatSettingsUpdate {
+    #[serde(default)]
+    pub discord_guild: String,
+    #[serde(default)]
+    pub discord_channel: String,
+    #[serde(default)]
+    pub discord_channels: String,
+    #[serde(default)]
+    pub slack_channel: String,
+    #[serde(default)]
+    pub slack_channels: String,
+    #[serde(default)]
+    pub slack_workspace: String,
+    /// Secret: empty = leave unchanged (same as the tokens in the legacy fields).
+    #[serde(default)]
+    pub slack_app_token: String,
+}
+
+/// One entry in a Fetch result list. `value` is what the editor writes into the
+/// text field when picked (`name (id)`, see `chat::spec::picker_value`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ChatPickItem {
+    pub id: String,
+    pub name: String,
+    pub label: String,
+    pub value: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub can_send: Option<bool>,
+}
+
+/// Result of a world editor Fetch (`chat::discord::lookup` / `chat::slack::lookup`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ChatDirectoryMsg {
+    pub ok: bool,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub bot_name: String,
+    /// Discord: an OAuth2 link that adds the bot to a server with the permissions
+    /// Clay needs. http(s) only; clients must still escape it.
+    #[serde(default)]
+    pub invite_url: String,
+    #[serde(default)]
+    pub servers: Vec<ChatPickItem>,
+    /// The `value` of the server the channel list belongs to.
+    #[serde(default)]
+    pub selected_server: String,
+    #[serde(default)]
+    pub channels: Vec<ChatPickItem>,
+    #[serde(default)]
+    pub users: Vec<ChatPickItem>,
+}
+
 /// World settings for WebSocket protocol
 /// Password is sent as plaintext to authenticated clients (stored encrypted in .dat file).
 /// has_password mirrors whether the password field is non-empty.
@@ -1435,6 +1519,20 @@ pub struct WorldSettingsMsg {
     pub discord_channel: String,
     #[serde(default)]
     pub discord_dm_user: String,
+    #[serde(default)]
+    pub discord_channels: String,
+    #[serde(default)]
+    pub slack_app_token: String,
+    #[serde(default)]
+    pub slack_channels: String,
+    /// Whether each token is set - for clients that were sent a blanked token
+    /// (multiuser non-owners), same idea as `has_password`.
+    #[serde(default)]
+    pub has_discord_token: bool,
+    #[serde(default)]
+    pub has_slack_token: bool,
+    #[serde(default)]
+    pub has_slack_app_token: bool,
 }
 
 /// Global settings for WebSocket protocol

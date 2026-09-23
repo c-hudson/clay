@@ -4,8 +4,9 @@
 
 use crate::popup::{
     Button, ButtonId, Field, FieldId, FieldKind, PopupDefinition, PopupId, PopupLayout,
-    SelectOption,
+    PopupState, SelectOption,
 };
+use crate::websocket::ChatDirectoryMsg;
 
 // Field IDs - common
 pub const WORLD_FIELD_NAME: FieldId = FieldId(1);
@@ -33,17 +34,29 @@ pub const WORLD_FIELD_MCCP2_ENABLED: FieldId = FieldId(25);
 pub const WORLD_FIELD_SLACK_TOKEN: FieldId = FieldId(30);
 pub const WORLD_FIELD_SLACK_CHANNEL: FieldId = FieldId(31);
 pub const WORLD_FIELD_SLACK_WORKSPACE: FieldId = FieldId(32);
+pub const WORLD_FIELD_SLACK_APP_TOKEN: FieldId = FieldId(33);
+pub const WORLD_FIELD_SLACK_CHANNELS: FieldId = FieldId(34);
+pub const WORLD_FIELD_SLACK_CHANNEL_PICK: FieldId = FieldId(35);
 // Field IDs - Discord
 pub const WORLD_FIELD_DISCORD_TOKEN: FieldId = FieldId(40);
 pub const WORLD_FIELD_DISCORD_GUILD: FieldId = FieldId(41);
 pub const WORLD_FIELD_DISCORD_CHANNEL: FieldId = FieldId(42);
+/// Legacy (pre-overhaul DM-only worlds); never shown - migration folds it into
+/// Send To / Show Only.
 pub const WORLD_FIELD_DISCORD_DM_USER: FieldId = FieldId(43);
+pub const WORLD_FIELD_DISCORD_CHANNELS: FieldId = FieldId(44);
+pub const WORLD_FIELD_DISCORD_SERVER_PICK: FieldId = FieldId(45);
+pub const WORLD_FIELD_DISCORD_CHANNEL_PICK: FieldId = FieldId(46);
+/// Fetch result / progress line for chat worlds (Slack and Discord share it).
+pub const WORLD_FIELD_CHAT_STATUS: FieldId = FieldId(47);
 
 // Button IDs
 pub const WORLD_BTN_SAVE: ButtonId = ButtonId(1);
 pub const WORLD_BTN_CANCEL: ButtonId = ButtonId(2);
 pub const WORLD_BTN_DELETE: ButtonId = ButtonId(3);
 pub const WORLD_BTN_CONNECT: ButtonId = ButtonId(4);
+/// Chat worlds only: look up the bot's servers/channels to fill the pick lists.
+pub const WORLD_BTN_FETCH: ButtonId = ButtonId(5);
 
 /// World type for the popup
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,12 +158,15 @@ pub struct WorldSettings {
     pub prompt_wait_ms: u64,
     // Slack
     pub slack_token: String,
+    pub slack_app_token: String,
     pub slack_channel: String,
+    pub slack_channels: String,
     pub slack_workspace: String,
     // Discord
     pub discord_token: String,
     pub discord_guild: String,
     pub discord_channel: String,
+    pub discord_channels: String,
     pub discord_dm_user: String,
 }
 
@@ -284,18 +300,33 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
         // Slack fields
         .with_field(Field::new(
             WORLD_FIELD_SLACK_TOKEN,
-            "Token",
+            "Bot Token",
             FieldKind::password(&settings.slack_token),
         ))
         .with_field(Field::new(
-            WORLD_FIELD_SLACK_CHANNEL,
-            "Channel",
-            FieldKind::text(&settings.slack_channel),
+            WORLD_FIELD_SLACK_APP_TOKEN,
+            "App Token",
+            FieldKind::password(&settings.slack_app_token),
         ))
         .with_field(Field::new(
             WORLD_FIELD_SLACK_WORKSPACE,
             "Workspace",
-            FieldKind::text(&settings.slack_workspace),
+            FieldKind::text_with_placeholder(&settings.slack_workspace, "(filled in by Fetch)"),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_SLACK_CHANNEL,
+            "Send To",
+            FieldKind::text_with_placeholder(&settings.slack_channel, "#channel or @user"),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_SLACK_CHANNEL_PICK,
+            "  pick",
+            FieldKind::select(vec![SelectOption::new("", "(press Fetch)")], 0),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_SLACK_CHANNELS,
+            "Show Only",
+            FieldKind::text_with_placeholder(&settings.slack_channels, "blank = all, or #general,#dev"),
         ))
         // Discord fields
         .with_field(Field::new(
@@ -305,18 +336,38 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
         ))
         .with_field(Field::new(
             WORLD_FIELD_DISCORD_GUILD,
-            "Guild",
-            FieldKind::text(&settings.discord_guild),
+            "Server",
+            FieldKind::text_with_placeholder(&settings.discord_guild, "server name (or Fetch)"),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_DISCORD_SERVER_PICK,
+            "  pick",
+            FieldKind::select(vec![SelectOption::new("", "(press Fetch)")], 0),
         ))
         .with_field(Field::new(
             WORLD_FIELD_DISCORD_CHANNEL,
-            "Channel",
-            FieldKind::text(&settings.discord_channel),
+            "Send To",
+            FieldKind::text_with_placeholder(&settings.discord_channel, "#channel or @user"),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_DISCORD_CHANNEL_PICK,
+            "  pick",
+            FieldKind::select(vec![SelectOption::new("", "(press Fetch)")], 0),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_DISCORD_CHANNELS,
+            "Show Only",
+            FieldKind::text_with_placeholder(&settings.discord_channels, "blank = all, or #general,#dev"),
         ))
         .with_field(Field::new(
             WORLD_FIELD_DISCORD_DM_USER,
             "DM User",
             FieldKind::text(&settings.discord_dm_user),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_CHAT_STATUS,
+            "",
+            FieldKind::label(""),
         ))
         // Buttons cycle left-to-right within each group: right-aligned group is
         // Save -> Cancel -> Connect; left-aligned group (after the ? help button
@@ -326,6 +377,7 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
         .with_button(Button::new(WORLD_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(WORLD_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
         .with_button(Button::new(WORLD_BTN_CONNECT, "Connect").with_shortcut('O'))
+        .with_button(Button::new(WORLD_BTN_FETCH, "Fetch").with_shortcut('F').left_align())
         .with_layout(PopupLayout {
             label_width: 12,
             min_width: 50,
@@ -358,6 +410,30 @@ fn world_editor_help_text() -> Vec<String> {
         "World: A unique name for this connection.",
         "",
         "Type: MUD (telnet game server), MUD - Timed Prompt, Slack, or Discord.",
+        "",
+        "--- Slack / Discord ---",
+        "",
+        "A Discord world is one server; a Slack world is one",
+        "workspace. Every channel the bot can read is shown,",
+        "each line tagged: #general <Alice> hello (DMs: @alice).",
+        "",
+        "Token (Discord): the bot token - Developer Portal,",
+        "  your application, Bot, Reset Token.",
+        "Bot Token / App Token (Slack): xoxb-... and xapp-...",
+        "  tokens from your Slack app (Socket Mode on).",
+        "",
+        "Fetch: asks Discord/Slack which servers and channels",
+        "  the bot can see and fills pick lists - no ids needed.",
+        "  It also warns about missing permissions and shows",
+        "  an invite link for adding the bot to a server.",
+        "",
+        "Server: which Discord server (a name works too).",
+        "Send To: where typed text goes (#channel or @user).",
+        "  Change it any time with /chat to <channel>.",
+        "Show Only: blank = every channel; or a list such as",
+        "  #general,#dev. Direct messages always show.",
+        "",
+        "Commands: /chat channels, /chat to, /chat help.",
         "",
         "--- MUD Settings ---",
         "",
@@ -434,19 +510,21 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT, WORLD_FIELD_USER, WORLD_FIELD_PASSWORD,
         WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_ENCODING,
         WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
-        WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_MSP_ENABLED,
+        WORLD_FIELD_MSP_ENABLED,
         WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED,
     ];
 
     // Slack fields
     let slack_fields = [
-        WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
+        WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_APP_TOKEN, WORLD_FIELD_SLACK_CHANNEL,
+        WORLD_FIELD_SLACK_CHANNELS, WORLD_FIELD_SLACK_WORKSPACE,
     ];
 
-    // Discord fields
+    // Discord fields (DM User is legacy and never shown; the pick lists are only
+    // shown once a Fetch has filled them - see `set_pick_visibility`).
     let discord_fields = [
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD,
-        WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
+        WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_CHANNELS,
     ];
 
     // Show/hide based on world type
@@ -468,9 +546,11 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         field.visible = world_type == WorldType::MudTimedPrompt;
     }
 
-    // Log file visible for all types
-    if let Some(field) = def.get_field_mut(WORLD_FIELD_LOG_ENABLED) {
-        field.visible = true;
+    // Log file and Reconnect are visible for all types (chat worlds reconnect too)
+    for id in [WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_AUTO_RECONNECT] {
+        if let Some(field) = def.get_field_mut(id) {
+            field.visible = true;
+        }
     }
 
     for id in slack_fields {
@@ -484,6 +564,160 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
             field.visible = world_type == WorldType::Discord;
         }
     }
+    if let Some(field) = def.get_field_mut(WORLD_FIELD_DISCORD_DM_USER) {
+        field.visible = false;
+    }
+    let is_chat = matches!(world_type, WorldType::Slack | WorldType::Discord);
+    if let Some(b) = def.get_button_mut(WORLD_BTN_FETCH) {
+        b.enabled = is_chat;
+    }
+    set_pick_visibility(def, world_type);
+}
+
+fn has_picks(def: &PopupDefinition, id: FieldId) -> bool {
+    matches!(def.get_field(id).map(|f| &f.kind), Some(FieldKind::Select { options, .. }) if options.len() > 1)
+}
+
+/// Pick lists and the status line show only for their world type, and only once a
+/// Fetch has put something in them.
+fn set_pick_visibility(def: &mut PopupDefinition, world_type: WorldType) {
+    for (id, ty) in [
+        (WORLD_FIELD_SLACK_CHANNEL_PICK, WorldType::Slack),
+        (WORLD_FIELD_DISCORD_SERVER_PICK, WorldType::Discord),
+        (WORLD_FIELD_DISCORD_CHANNEL_PICK, WorldType::Discord),
+    ] {
+        let show = world_type == ty && has_picks(def, id);
+        if let Some(f) = def.get_field_mut(id) {
+            f.visible = show;
+        }
+    }
+    let is_chat = matches!(world_type, WorldType::Slack | WorldType::Discord);
+    let has_status = matches!(def.get_field(WORLD_FIELD_CHAT_STATUS).map(|f| &f.kind), Some(FieldKind::Label { text }) if !text.is_empty());
+    if let Some(f) = def.get_field_mut(WORLD_FIELD_CHAT_STATUS) {
+        f.visible = is_chat && has_status;
+    }
+}
+
+/// Word-wrap `text` to `width` columns (for the status label, which does not wrap).
+fn wrap(text: &str, width: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// Set the chat status line (e.g. "Fetching...").
+pub fn set_chat_status(state: &mut PopupState, text: &str) {
+    if let Some(f) = state.definition.get_field_mut(WORLD_FIELD_CHAT_STATUS) {
+        if let FieldKind::Label { text: t } = &mut f.kind {
+            *t = if text.is_empty() {
+                String::new()
+            } else {
+                wrap(text, 56).lines().map(|l| format!(" {}", l)).collect::<Vec<_>>().join("\n")
+            };
+        }
+    }
+    let ty = WorldType::parse(state.get_selected(WORLD_FIELD_TYPE).unwrap_or("mud"));
+    set_pick_visibility(&mut state.definition, ty);
+}
+
+fn fill_select(state: &mut PopupState, id: FieldId, items: &[crate::websocket::ChatPickItem], current: &str) {
+    let current_spec = crate::chat::spec::parse(crate::chat::ChatKind::Discord, current)
+        .or_else(|| crate::chat::spec::parse(crate::chat::ChatKind::Slack, current));
+    let mut options = vec![SelectOption::new("", "(choose...)")];
+    let mut selected = 0;
+    for (i, it) in items.iter().enumerate() {
+        options.push(SelectOption::new(it.value.clone(), it.label.clone()));
+        if let Some(sp) = &current_spec {
+            let hit = sp.id.as_deref() == Some(it.id.as_str()) || (sp.id.is_none() && !sp.name.is_empty() && it.name.to_lowercase() == sp.name);
+            if hit && selected == 0 {
+                selected = i + 1;
+            }
+        }
+    }
+    if let Some(f) = state.definition.get_field_mut(id) {
+        f.kind = FieldKind::select(options, selected);
+    }
+}
+
+/// Apply a Fetch result to an open world editor: fill the pick lists (pre-selecting
+/// whatever the text fields already name), and show the bot/errors/warnings/invite
+/// link in the status line. Shared by the local console and the SSH remote console.
+pub fn apply_chat_directory(state: &mut PopupState, msg: &ChatDirectoryMsg) {
+    let ty = WorldType::parse(state.get_selected(WORLD_FIELD_TYPE).unwrap_or("mud"));
+    let mut status = Vec::new();
+    if !msg.error.is_empty() {
+        status.push(msg.error.clone());
+    } else if msg.ok {
+        let mut s = format!("Bot: {}", msg.bot_name);
+        if ty == WorldType::Discord {
+            s.push_str(&format!(" - in {} server(s), {} channel(s) listed.", msg.servers.len(), msg.channels.len()));
+        } else {
+            s.push_str(&format!(" - {} channel(s) listed.", msg.channels.len()));
+        }
+        status.push(s);
+    }
+    status.extend(msg.warnings.iter().cloned());
+    if !msg.invite_url.is_empty() {
+        status.push(format!("Invite link: {}", msg.invite_url));
+    }
+    match ty {
+        WorldType::Discord => {
+            let server = state.get_text(WORLD_FIELD_DISCORD_GUILD).unwrap_or("").to_string();
+            let server = if server.trim().is_empty() { msg.selected_server.clone() } else { server };
+            fill_select(state, WORLD_FIELD_DISCORD_SERVER_PICK, &msg.servers, &server);
+            let chan = state.get_text(WORLD_FIELD_DISCORD_CHANNEL).unwrap_or("").to_string();
+            fill_select(state, WORLD_FIELD_DISCORD_CHANNEL_PICK, &msg.channels, &chan);
+            // An empty Server with exactly one server: fill it in.
+            if state.get_text(WORLD_FIELD_DISCORD_GUILD).map(|s| s.trim().is_empty()).unwrap_or(false) && !msg.selected_server.is_empty() {
+                state.set_text(WORLD_FIELD_DISCORD_GUILD, msg.selected_server.clone());
+            }
+        }
+        WorldType::Slack => {
+            let chan = state.get_text(WORLD_FIELD_SLACK_CHANNEL).unwrap_or("").to_string();
+            fill_select(state, WORLD_FIELD_SLACK_CHANNEL_PICK, &msg.channels, &chan);
+            if !msg.selected_server.is_empty() {
+                state.set_text(WORLD_FIELD_SLACK_WORKSPACE, msg.selected_server.clone());
+            }
+        }
+        _ => {}
+    }
+    set_chat_status(state, &status.join("\n"));
+}
+
+/// After a Select changed: copy a pick into its text field. Returns true when the
+/// Discord server pick changed (its channel list is now stale - Fetch again).
+pub fn apply_pick(state: &mut PopupState, changed: FieldId) -> bool {
+    let target = match changed {
+        WORLD_FIELD_DISCORD_SERVER_PICK => WORLD_FIELD_DISCORD_GUILD,
+        WORLD_FIELD_DISCORD_CHANNEL_PICK => WORLD_FIELD_DISCORD_CHANNEL,
+        WORLD_FIELD_SLACK_CHANNEL_PICK => WORLD_FIELD_SLACK_CHANNEL,
+        _ => return false,
+    };
+    let value = state.get_selected(changed).unwrap_or("").to_string();
+    if value.is_empty() {
+        return false;
+    }
+    state.set_text(target, value);
+    if changed == WORLD_FIELD_DISCORD_SERVER_PICK {
+        if let Some(f) = state.definition.get_field_mut(WORLD_FIELD_DISCORD_CHANNEL_PICK) {
+            f.kind = FieldKind::select(vec![SelectOption::new("", "(press Fetch)")], 0);
+        }
+        set_chat_status(state, "Server changed - press Fetch to list its channels.");
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

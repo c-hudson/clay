@@ -123,6 +123,14 @@ keep_alive_type=nop
 keep_alive_cmd=
 ```
 
+Slack/Discord worlds use `discord_token`, `discord_guild` (Server), `discord_channel`
+(Send To), `discord_channels` (Show Only), `slack_token` (bot, `xoxb-`), `slack_app_token`
+(`xapp-`), `slack_workspace`, `slack_channel` and `slack_channels`; tokens are stored
+encrypted. `chat_settings_version` records which chat-settings model a world uses: a
+world without it is from before the server-per-world model and is upgraded once on load
+(its old channel becomes both Send To and Show Only, so it looks the same). The legacy
+`discord_dm_user` key is folded into Send To/Show Only by that upgrade.
+
 `world_type` is one of `mud`, `mud_timed_prompt`, `slack` or `discord` (absent means
 `mud`). `prompt_wait_ms` (default 1000) applies to `mud_timed_prompt` worlds and is
 written only when changed from the default.

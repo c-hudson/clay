@@ -359,9 +359,6 @@ impl WebValidation {
         Self { message: Some(msg.into()), blocks_save: true }
     }
 
-    fn warning(msg: impl Into<String>) -> Self {
-        Self { message: Some(msg.into()), blocks_save: false }
-    }
 }
 
 /// Pure validator for the Web Settings form — no `App`, no I/O, so it can be
@@ -424,10 +421,10 @@ pub fn validate_web_settings(
         return WebValidation::error("Remote lines must be a number.");
     }
 
-    if !allow_list.trim().is_empty() {
-        return WebValidation::warning("Allow list is set — addresses not listed are silently dropped.");
-    }
-
+    // A non-empty allow list is a normal configuration, not something to warn
+    // about on every open: what it does (addresses not listed are dropped at the
+    // TCP level) is explained under "WS Allow List" in the popup's help.
+    let _ = allow_list;
     WebValidation::ok()
 }
 
@@ -655,13 +652,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_nonempty_allow_list_warns_but_does_not_block() {
+    fn test_validate_nonempty_allow_list_is_not_a_warning() {
+        // A configured allow list used to put a permanent "Allow list is set" line in
+        // the popup; it is ordinary configuration, documented in the help instead.
         let v = validate_web_settings("9000", "9000", "secret", false, "", "", "192.168.1.*", "100");
-        assert!(!v.blocks_save);
-        assert_eq!(
-            v.message.as_deref(),
-            Some("Allow list is set — addresses not listed are silently dropped.")
-        );
+        assert_eq!(v, WebValidation { message: None, blocks_save: false });
     }
 
     #[test]

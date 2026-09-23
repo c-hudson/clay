@@ -618,6 +618,18 @@
         worldEditDiscordChannel: document.getElementById('world-edit-discord-channel'),
         worldEditDiscordDmUserField: document.getElementById('world-edit-discord-dm-user-field'),
         worldEditDiscordDmUser: document.getElementById('world-edit-discord-dm-user'),
+        worldEditSlackAppTokenField: document.getElementById('world-edit-slack-app-token-field'),
+        worldEditSlackAppToken: document.getElementById('world-edit-slack-app-token'),
+        worldEditSlackChannelsField: document.getElementById('world-edit-slack-channels-field'),
+        worldEditSlackChannels: document.getElementById('world-edit-slack-channels'),
+        worldEditSlackChannelPick: document.getElementById('world-edit-slack-channel-pick'),
+        worldEditDiscordChannelsField: document.getElementById('world-edit-discord-channels-field'),
+        worldEditDiscordChannels: document.getElementById('world-edit-discord-channels'),
+        worldEditDiscordServerPick: document.getElementById('world-edit-discord-server-pick'),
+        worldEditDiscordChannelPick: document.getElementById('world-edit-discord-channel-pick'),
+        worldEditChatFetchField: document.getElementById('world-edit-chat-fetch-field'),
+        worldEditChatFetchBtn: document.getElementById('world-edit-chat-fetch-btn'),
+        worldEditChatStatus: document.getElementById('world-edit-chat-status'),
         worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
         worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
@@ -1607,7 +1619,7 @@
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say',
-        'log', 'unworld',
+        'log', 'unworld', 'chat', 'discord', 'slack',
         'cd', 'pwd', 'runtime', 'ismacro', 'isvar', 'features', 'restrict', 'sys',
         'xtitle', 'more', 'wrap', 'limit', 'unlimit', 'relimit', 'result',
         'first', 'rest', 'last', 'nth', 'ver', 'man', 'nogag',
@@ -4154,6 +4166,13 @@
                     } else {
                         elements.prompt.textContent = '';
                     }
+                }
+                break;
+
+            case 'ChatLookupResult':
+                if (worldEditorPopupOpen && msg.world_index === worldEditorIndex
+                    && msg.request_id === chatLookupSeq) {
+                    applyChatDirectory(msg.result || {});
                 }
                 break;
 
@@ -7251,8 +7270,12 @@
             'HTTP Enabled: Starts a web server so you can open',
             '  Clay in a browser at http://yourhost:port.', '',
             'HTTP Port: The port number for the web server.', '',
-            'Allow List: Comma-separated IP addresses or',
-            '  subnets allowed to connect. Empty = allow all.', '',
+            'Allow List: Comma-separated IPs, IP wildcards or',
+            '  hostnames allowed to connect. Empty = allow all',
+            '  (password or Auth Key still required). When set,',
+            '  addresses NOT on the list are dropped at the TCP',
+            '  level: no page, no TLS handshake, no reply. Their',
+            '  only way in is the Android auth-key knock.', '',
             'TLS Cert/Key File: Paths to your TLS/SSL certificate',
             '  and private key files for secure connections.', '',
             'Remote Access: how other devices reach this Clay -',
@@ -7281,7 +7304,30 @@
             '  Turn off to decline compression - the connection',
             '  still works, just uncompressed. Toggling this on',
             '  a live connection asks the server to start/stop',
-            '  compressing immediately.'
+            '  compressing immediately.', '',
+            '--- Slack / Discord ---',
+            '',
+            'A Discord world is one server; a Slack world is one',
+            'workspace. Every channel the bot can read is shown,',
+            'each line tagged: #general <Alice> hello (DMs: @alice).',
+            '',
+            'Token (Discord): the bot token - Developer Portal,',
+            '  your application, Bot, Reset Token.',
+            'Bot Token / App Token (Slack): xoxb-... and xapp-...',
+            '  tokens from your Slack app (Socket Mode on).',
+            '',
+            'Fetch: asks Discord/Slack which servers and channels',
+            '  the bot can see and fills pick lists - no ids needed.',
+            '  It also warns about missing permissions and shows',
+            '  an invite link for adding the bot to a server.',
+            '',
+            'Server: which Discord server (a name works too).',
+            'Send To: where typed text goes (#channel or @user).',
+            '  Change it any time with /chat to <channel>.',
+            'Show Only: blank = every channel; or a list such as',
+            '  #general,#dev. Direct messages always show.',
+            '',
+            'Commands: /chat channels, /chat to, /chat help.'
         ],
         worldSelector: [
             'World Selector - Browse and Connect', '',
@@ -10898,10 +10944,8 @@
             return { message: 'Remote lines must be a number.', blocksSave: true };
         }
 
-        if (String(allowList).trim() !== '') {
-            return { message: 'Allow list is set — addresses not listed are silently dropped.', blocksSave: false };
-        }
-
+        // A non-empty allow list is ordinary configuration, not a warning; what it
+        // does is explained in the Web help (popupHelpTexts.web).
         return { message: null, blocksSave: false };
     }
 
@@ -11384,6 +11428,114 @@
     }
 
     // World Editor popup functions
+    // ---- Chat world (Slack/Discord) Fetch picker ----
+    // Fetch asks the server to look up the bot's servers/channels with the tokens as
+    // typed (blank = the stored ones); the answer (ChatLookupResult) fills native
+    // <select>s under the Server / Send To boxes. Names from Discord/Slack only ever
+    // reach the DOM through textContent / option text - never innerHTML.
+    let chatLookupSeq = 0;
+
+    function resetChatPicker() {
+        chatLookupSeq++;  // drop any answer still in flight for the old type/world
+        for (const sel of [elements.worldEditDiscordServerPick, elements.worldEditDiscordChannelPick, elements.worldEditSlackChannelPick]) {
+            if (!sel) continue;
+            sel.replaceChildren();
+            sel.classList.remove('visible');
+        }
+        if (elements.worldEditChatStatus) elements.worldEditChatStatus.replaceChildren();
+    }
+
+    function setChatStatus(lines, isError) {
+        const box = elements.worldEditChatStatus;
+        box.replaceChildren();
+        lines.forEach((line, i) => {
+            const div = document.createElement('div');
+            if (isError && i === 0) div.className = 'chat-status-error';
+            div.textContent = line;
+            box.appendChild(div);
+        });
+    }
+
+    function requestChatLookup() {
+        if (worldEditorIndex < 0) return;
+        const type = elements.worldEditTypeSelect.value;
+        if (type !== 'slack' && type !== 'discord') return;
+        const request_id = ++chatLookupSeq;
+        setChatStatus(['Fetching...'], false);
+        send({
+            type: 'ChatLookup',
+            request_id,
+            world_index: worldEditorIndex,
+            world_type: type,
+            token: (type === 'slack' ? elements.worldEditSlackToken : elements.worldEditDiscordToken).value.trim(),
+            app_token: type === 'slack' ? elements.worldEditSlackAppToken.value.trim() : '',
+            server: type === 'discord' ? elements.worldEditDiscordGuild.value.trim() : ''
+        });
+    }
+
+    // Does a text-box value ("#general", "general (123)", "123") name this pick item?
+    function chatSpecMatches(text, item) {
+        const t = (text || '').trim();
+        if (!t) return false;
+        const m = t.match(/\(([A-Za-z0-9]+)\)\s*$/);
+        if (m) return m[1] === item.id;
+        if (t === item.id) return true;
+        return t.replace(/^[#@]/, '').toLowerCase() === (item.name || '').toLowerCase();
+    }
+
+    function fillChatPick(sel, items, current) {
+        sel.replaceChildren();
+        const first = document.createElement('option');
+        first.value = '';
+        first.textContent = items.length ? '(choose from list...)' : '(none found)';
+        sel.appendChild(first);
+        let selected = 0;
+        items.forEach((it, i) => {
+            const opt = document.createElement('option');
+            opt.value = it.value;
+            opt.textContent = it.label;
+            sel.appendChild(opt);
+            if (!selected && chatSpecMatches(current, it)) selected = i + 1;
+        });
+        sel.selectedIndex = selected;
+        sel.classList.toggle('visible', items.length > 0);
+    }
+
+    function applyChatDirectory(r) {
+        const type = elements.worldEditTypeSelect.value;
+        const lines = [];
+        if (r.error) {
+            lines.push(r.error);
+        } else if (r.ok) {
+            lines.push(type === 'discord'
+                ? `Bot: ${r.bot_name} - in ${(r.servers || []).length} server(s), ${(r.channels || []).length} channel(s) listed.`
+                : `Bot: ${r.bot_name} - ${(r.channels || []).length} channel(s) listed.`);
+        }
+        (r.warnings || []).forEach(w => lines.push(w));
+        setChatStatus(lines, !!r.error);
+        if (r.invite_url && /^https:\/\//.test(r.invite_url)) {
+            const div = document.createElement('div');
+            div.append('Add the bot to a server: ');
+            const a = document.createElement('a');
+            a.href = r.invite_url;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.textContent = 'invite link';
+            div.appendChild(a);
+            elements.worldEditChatStatus.appendChild(div);
+        }
+        if (type === 'discord') {
+            if (!elements.worldEditDiscordGuild.value.trim() && r.selected_server) {
+                elements.worldEditDiscordGuild.value = r.selected_server;
+            }
+            fillChatPick(elements.worldEditDiscordServerPick, r.servers || [], elements.worldEditDiscordGuild.value);
+            fillChatPick(elements.worldEditDiscordChannelPick, r.channels || [], elements.worldEditDiscordChannel.value);
+        } else if (type === 'slack') {
+            if (r.selected_server) elements.worldEditSlackWorkspace.value = r.selected_server;
+            fillChatPick(elements.worldEditSlackChannelPick, r.channels || [], elements.worldEditSlackChannel.value);
+        }
+    }
+
     function openWorldEditorPopup(worldIndex) {
         // Block world editing in multiuser mode
         if (multiuserMode) {
@@ -11413,6 +11565,15 @@
         elements.worldEditDiscordGuild.value = world.settings?.discord_guild || '';
         elements.worldEditDiscordChannel.value = world.settings?.discord_channel || '';
         elements.worldEditDiscordDmUser.value = world.settings?.discord_dm_user || '';
+        elements.worldEditSlackAppToken.value = world.settings?.slack_app_token || '';
+        elements.worldEditSlackChannels.value = world.settings?.slack_channels || '';
+        elements.worldEditDiscordChannels.value = world.settings?.discord_channels || '';
+        // A server that blanks tokens (multiuser) says whether one is set.
+        const tokenHint = (has) => has ? '(set - leave blank to keep it)' : null;
+        elements.worldEditDiscordToken.placeholder = tokenHint(world.settings?.has_discord_token && !world.settings?.discord_token) || 'bot token from the Developer Portal';
+        elements.worldEditSlackToken.placeholder = tokenHint(world.settings?.has_slack_token && !world.settings?.slack_token) || 'xoxb-...';
+        elements.worldEditSlackAppToken.placeholder = tokenHint(world.settings?.has_slack_app_token && !world.settings?.slack_app_token) || 'xapp-...';
+        resetChatPicker();
         elements.worldEditHostname.value = world.settings?.hostname || '';
         elements.worldEditPort.value = world.settings?.port || '';
         elements.worldEditUser.value = world.settings?.user || '';
@@ -11499,15 +11660,17 @@
         'worldEditHostnameField', 'worldEditPortField', 'worldEditUserField',
         'worldEditPasswordField', 'worldEditSslField', 'worldEditAutoLoginField',
         'worldEditKeepAliveField', 'worldEditEncodingField', 'worldEditGmcpField',
-        'worldEditAutoReconnectField', 'worldEditMspEnabledField',
+        'worldEditMspEnabledField',
         'worldEditMcpEnabledField', 'worldEditMccp2EnabledField'
     ];
     const WORLD_EDIT_SLACK_FIELD_IDS = [
-        'worldEditSlackTokenField', 'worldEditSlackChannelField', 'worldEditSlackWorkspaceField'
+        'worldEditSlackTokenField', 'worldEditSlackAppTokenField', 'worldEditSlackWorkspaceField',
+        'worldEditSlackChannelField', 'worldEditSlackChannelsField'
     ];
+    // DM User is legacy and never shown (see index.html).
     const WORLD_EDIT_DISCORD_FIELD_IDS = [
         'worldEditDiscordTokenField', 'worldEditDiscordGuildField',
-        'worldEditDiscordChannelField', 'worldEditDiscordDmUserField'
+        'worldEditDiscordChannelField', 'worldEditDiscordChannelsField'
     ];
 
     // Show/hide World Editor rows for the currently selected Type - called on editor
@@ -11522,6 +11685,9 @@
         WORLD_EDIT_MUD_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isMud));
         WORLD_EDIT_SLACK_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isSlack));
         WORLD_EDIT_DISCORD_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isDiscord));
+        // Reconnect applies to every world type (chat worlds reconnect too).
+        elements.worldEditAutoReconnectField?.classList.add('visible');
+        elements.worldEditChatFetchField?.classList.toggle('visible', isSlack || isDiscord);
 
         // Prompt Wait only applies to Timed Prompt worlds - a plain MUD world never
         // infers a prompt from silence at all, same as the console's dedicated rule
@@ -11551,6 +11717,9 @@
         const discordGuild = elements.worldEditDiscordGuild.value;
         const discordChannel = elements.worldEditDiscordChannel.value;
         const discordDmUser = elements.worldEditDiscordDmUser.value;
+        const slackAppToken = elements.worldEditSlackAppToken.value.trim();
+        const slackChannels = elements.worldEditSlackChannels.value.trim();
+        const discordChannels = elements.worldEditDiscordChannels.value.trim();
 
         // Send update to server
         send({
@@ -11580,7 +11749,18 @@
             discord_token: discordToken,
             discord_guild: discordGuild,
             discord_channel: discordChannel,
-            discord_dm_user: discordDmUser
+            discord_dm_user: discordDmUser,
+            // Authoritative for the non-secret chat fields - an empty value clears
+            // (the legacy fields above mean "unchanged" when empty).
+            chat: {
+                discord_guild: discordGuild.trim(),
+                discord_channel: discordChannel.trim(),
+                discord_channels: discordChannels,
+                slack_channel: slackChannel.trim(),
+                slack_channels: slackChannels,
+                slack_workspace: slackWorkspace.trim(),
+                slack_app_token: slackAppToken
+            }
         });
 
         // Update local state
@@ -11614,7 +11794,10 @@
         world.settings.discord_token = discordToken;
         world.settings.discord_guild = discordGuild;
         world.settings.discord_channel = discordChannel;
-        world.settings.discord_dm_user = discordDmUser;
+        world.settings.discord_dm_user = '';
+        world.settings.discord_channels = discordChannels;
+        world.settings.slack_channels = slackChannels;
+        if (slackAppToken) world.settings.slack_app_token = slackAppToken;
 
         closeWorldEditorPopup();
     }
@@ -14819,6 +15002,20 @@
         };
         elements.worldEditTypeSelect.onchange = function() {
             updateWorldEditorTypeVisibility();
+            resetChatPicker();
+        };
+        elements.worldEditChatFetchBtn.onclick = () => requestChatLookup();
+        // A pick writes "name (id)" into its text box; a new server re-fetches its channels.
+        elements.worldEditDiscordServerPick.onchange = function() {
+            if (!this.value) return;
+            elements.worldEditDiscordGuild.value = this.value;
+            requestChatLookup();
+        };
+        elements.worldEditDiscordChannelPick.onchange = function() {
+            if (this.value) elements.worldEditDiscordChannel.value = this.value;
+        };
+        elements.worldEditSlackChannelPick.onchange = function() {
+            if (this.value) elements.worldEditSlackChannel.value = this.value;
         };
 
         elements.worldFilter.oninput = function() {
