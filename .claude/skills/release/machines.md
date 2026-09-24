@@ -201,27 +201,59 @@ cd clay && git checkout -- Cargo.lock && git pull && git rev-parse HEAD && set R
 - SCP back: `scp adrick@192.168.2.14:clay/target/release/clay.exe /tmp/clay-windows-x86_64.exe`
 - Static CRT (`+crt-static`) eliminates vcruntime140.dll dependency
 
-## Mac (192.168.2.12)
+## Mac (192.168.2.12) — retired from releases
 
-- User: `user`
-- SSH port: `22`
-- Path: `~/clay`
-- SSH command: `ssh user@192.168.2.12`
+The physical Mac (Intel i7-4790K, macOS 11.7 Big Sur, user `user`, checkout `~/clay`) is no
+longer used by `/release`; macOS release builds come only from the Mac VM below (decided
+2026-09-23). It is kept here for reference only.
 
-### macOS universal binary (x86_64 + aarch64)
+## Mac VM (localhost, QEMU/KVM) — the macOS release builder
+
+macOS 26.7 Tahoe (installed 2026-09-23) in QEMU/KVM with OpenCore (from https://github.com/kholia/OSX-KVM, checked out
+at `~/VMs/OSX-KVM`), running on this AMD host. It is the only macOS builder for `/release`
+(Step 6a); it is kept powered off and started on demand.
+
+- Control script: `~/VMs/macos/macvm.sh {start|stop|status|wait-ssh|ssh|screenshot|qmp}`
+  (disk `~/VMs/macos/mac_hdd.qcow2`, 100 GB sparse; VNC on `127.0.0.1:5905` for the GUI).
+- SSH: user `adrick`, `127.0.0.1` port **2222** (QEMU user-net forward), known-hosts file
+  `~/VMs/macos/known_hosts`. `macvm.sh ssh '<cmd>'` wraps the right options.
+- Toolchain: Xcode Command Line Tools 26.6 (no full Xcode), rustup stable with
+  `x86_64-apple-darwin` + `aarch64-apple-darwin`. Checkout at `~/clay`.
+- **Never run it at the same time as a VirtualBox VM** (the Windows VM): KVM and
+  VirtualBox both need AMD-V. `macvm.sh start` refuses while a VirtualBox VM is running.
+- **Stop it gracefully** with `macvm.sh stop`: it shuts macOS down over SSH (passwordless
+  `sudo shutdown`/`pmset`/`softwareupdate` are allowed in the VM by
+  `/etc/sudoers.d/clay-build`). macOS on OpenCore often halts *without* powering the virtual
+  machine off (vCPUs spin, QEMU stays up), so once SSH is gone the script waits until the
+  disk has taken no writes for 15 s and then quits QEMU - the equivalent of a real Mac
+  cutting power at the end of shutdown. ACPI powerdown is the fallback. Never kill QEMU
+  while macOS is up: a hard cut risks the same lost-writes problem as the Windows VM.
+- **Unattended boot:** normal starts use `~/VMs/macos/OpenCore-nopicker.qcow2`, a copy of
+  OSX-KVM's OpenCore image with `ShowPicker=false` and `ScanPolicy=17760515` (APFS on
+  SATA/NVMe only), because the stock picker never times out under QEMU (the virtual
+  tablet's pointer input cancels its countdown) and defaults to a non-bootable "EFI" entry.
+  `macvm.sh start --installer` uses the stock image plus the macOS installer disk
+  (`~/VMs/OSX-KVM/BaseSystem.img`), for reinstalling.
+- **GUI access** (rarely needed): `vncviewer localhost:5905` (tigervnc-viewer is installed),
+  or `macvm.sh screenshot /tmp/x.png`. The account stays at the login window; SSH builds
+  don't need a desktop session.
+- The host needs `kvm ignore_msrs=1` (`/etc/modprobe.d/kvm.conf`, installed from
+  OSX-KVM's `kvm_amd.conf`), or macOS crashes at boot.
+
+### macOS universal binary (Mac VM)
 ```bash
-cd ~/clay
-git pull
-cargo build --release --target x86_64-apple-darwin --features webview-gui,native-audio
-cargo build --release --target aarch64-apple-darwin --features webview-gui,native-audio
-lipo -create \
-    target/x86_64-apple-darwin/release/clay \
-    target/aarch64-apple-darwin/release/clay \
-    -output clay-macos-universal
+~/VMs/macos/macvm.sh ssh 'source ~/.cargo/env; cd ~/clay && git stash push -- Cargo.lock; git pull && git rev-parse HEAD'
+# compare the printed SHA to EXPECTED_SHA, then:
+~/VMs/macos/macvm.sh ssh 'source ~/.cargo/env; cd ~/clay && export MACOSX_DEPLOYMENT_TARGET=11.0 && set -e &&
+  cargo build --release --target x86_64-apple-darwin --features webview-gui,native-audio &&
+  cargo build --release --target aarch64-apple-darwin --features webview-gui,native-audio &&
+  lipo -create target/x86_64-apple-darwin/release/clay target/aarch64-apple-darwin/release/clay -output clay-macos-universal'
+scp -P 2222 -o UserKnownHostsFile=$HOME/VMs/macos/known_hosts adrick@127.0.0.1:clay/clay-macos-universal /tmp/clay-macos-universal
 ```
-- Binary: `~/clay/clay-macos-universal`
-- Release asset name: `clay-macos-universal`
-- SCP back: `scp user@192.168.2.12:~/clay/clay-macos-universal /tmp/clay-macos-universal`
+`MACOSX_DEPLOYMENT_TARGET=11.0` is required: the VM's SDK is macOS 26. Rust code already
+defaults to an old minimum, but C dependencies built by `cc`/clang (SQLite, ring, ...) default
+to the SDK's own version, which would stop the binary loading on older macOS. 11.0 matches
+what the physical Mac (Big Sur) produces, so users on Big Sur and later keep working.
 
 ## Termux (192.168.2.50)
 

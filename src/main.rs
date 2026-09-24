@@ -47,11 +47,13 @@ pub mod testharness;
 
 // Version information
 pub(crate) const VERSION: &str = "1.6.15";
-/// The last release whose Android app actually changed (bundled app.js/index.html,
-/// the `android/` native shell, or the bundled libclay server). Bump to the current
-/// `VERSION` ONLY when one of those changes. A phone whose installed APK version is
-/// at or above this is functionally current and is not nagged to reinstall, even
-/// against a newer server. Set to 1.6.10 because the Android app changed this release.
+/// The minimum Android app version this server considers fully compatible: the last
+/// release in which the Android app itself changed (the bundled web client in `src/web/`,
+/// or the native app in `android/app/`). `/release` sets it to the new `VERSION` exactly
+/// when `git diff <previous release>..HEAD` touches those paths (see the release skill).
+/// A phone whose app version (== the Clay version it was built from; `build.gradle` reads
+/// it from Cargo.toml) is older than this shows one "please update" warning per server
+/// version; one at or above it is current, even against a newer server.
 pub(crate) const ANDROID_APP_VERSION: &str = "1.6.15";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");

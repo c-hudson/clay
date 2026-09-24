@@ -1,6 +1,6 @@
 ---
 name: release
-description: Automated multi-platform build and GitHub release for Clay. Builds on local (Linux musl, Windows, Android) and remote (macOS, Termux) machines, uploads to GitHub.
+description: Automated multi-platform build and GitHub release for Clay. Builds locally (Linux musl, Termux cross-builds, Android, and macOS in a local QEMU VM) and on remote machines (Windows VM, Termux phone), uploads to GitHub.
 ---
 
 # /release — Automated Multi-Platform Build & GitHub Release
@@ -19,7 +19,7 @@ Parse `$ARGUMENTS` for the version and any platform flags:
 
 - **Version**: The first non-flag token. Prepend `v` if it doesn't start with `v`. Normalize (e.g., "1.0 beta" → "v1.0.0-beta"). If no version token, read from `Cargo.toml` line 3.
 - **Platform flags**: `--android`, `--mac`, `--linux` — at most one may be specified. If present, the release is limited to that platform only (see "Platform-limited release" below).
-- **Termux / Mac**: Reachability is auto-detected at Step 6 — do NOT ask the user about these. If a machine is unreachable, it is silently skipped.
+- **Termux**: Reachability is auto-detected at Step 6 — do NOT ask the user about it. If the phone is unreachable, it is silently skipped. (macOS is built on the local Mac VM, which is started on demand.)
 
 #### Platform-limited release (`--android` / `--mac` / `--linux`)
 
@@ -78,12 +78,27 @@ If the tree was already clean and fully pushed, skip this — there's nothing to
 
 Then update the version string (without the `v` prefix) in these three files:
 1. `Cargo.toml` line 3: `version = "X.Y.Z"`
-2. `src/main.rs` line 26: `const VERSION: &str = "X.Y.Z";`
-3. `android/app/build.gradle` line 14: `versionName "X.Y.Z"`
+2. `src/main.rs`: `pub(crate) const VERSION: &str = "X.Y.Z";`
 
-Also increment `versionCode` in `android/app/build.gradle` line 13 by 1 from its current value.
+The Android app's `versionName`/`versionCode` are **derived from `Cargo.toml` by
+`android/app/build.gradle`** (versionCode = major*1000000 + minor*1000 + patch), so the app
+always reports exactly the Clay version — do not edit them by hand.
 
-If the Android app changed this release (anything under `android/`, `src/web/`, or the bundled server), also set `ANDROID_APP_VERSION` in `src/main.rs` to the new version. If the release is server-only, leave it — that's what stops phones being nagged to reinstall unnecessarily.
+**`ANDROID_APP_VERSION` (`src/main.rs`)** is the minimum app version the server treats as fully
+compatible; an older app shows a one-time "please update the Android app" warning. Set it to
+the new version **iff the Android app changed since the previous release** — decide
+mechanically, don't guess:
+```bash
+git fetch --tags -q
+PREV=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')   # previous release tag
+git diff --quiet "$PREV"..HEAD -- src/web/ android/app/src/ android/app/build.gradle \
+  && echo "app unchanged: leave ANDROID_APP_VERSION" \
+  || echo "app changed: set ANDROID_APP_VERSION to X.Y.Z"
+```
+`src/web/` is the web client the APK bundles; `android/app/src/` and `build.gradle` are the
+native app. (The release-built `android/clay-android.apk` is deliberately not in that list —
+it changes every release.) A server-only release leaves it alone, which is what stops phones
+being told to update when nothing in the app changed.
 
 **Regenerate `Cargo.lock`** so the bump is committed together with its lock file:
 ```bash
@@ -97,7 +112,7 @@ cargo update -p clay --precise X.Y.Z 2>/dev/null || cargo check --quiet
 
 If any of the version files were actually modified in Step 3:
 ```bash
-git add Cargo.toml Cargo.lock src/main.rs android/app/build.gradle
+git add Cargo.toml Cargo.lock src/main.rs
 git commit -m "Bump version to vX.Y.Z"
 git push origin master
 ```
@@ -205,7 +220,7 @@ Before building on each remote machine, **probe reachability** to decide whether
 
 **Never run a bare `git pull && cargo build` on a remote.** A remote's working tree is routinely dirty (cargo rewrites `Cargo.lock`, stray scratch files accumulate). When the tree is dirty, `git pull` prints `Please commit your changes or stash them before you merge. Aborting` — and if you chained it with `&&` while tailing only the last line, the abort is easy to miss and **the build silently proceeds against the old checkout**. That has shipped stale binaries.
 
-Use this sequence on every **bash** remote (Mac, Termux — `<dir>` from machines.md):
+Use this sequence on every **bash** remote (Mac VM, Termux — `<dir>` from machines.md):
 ```bash
 cd <dir>
 git stash push -- Cargo.lock          # harmless: cargo regenerates it
@@ -229,19 +244,28 @@ strings /tmp/<asset> | grep -c '<string-added-in-this-release>'   # must be > 0
 ```
 A `0` means you built stale source: re-sync and rebuild. Do this for *every* asset before Step 8 — it is the only check that catches a silent stale build.
 
-#### 6a. Mac (192.168.2.12)
+#### 6a. Mac VM (localhost, QEMU/KVM)
 
-Probe SSH reachability:
-```bash
-ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no user@192.168.2.12 exit
-```
-- Exit 0 → machine is up, proceed with build.
-- Any other result (timeout, refused, host unreachable) → skip Mac build; mark as "Skipped (unreachable)" in summary.
+macOS is built **only** on the Mac VM (macOS 26 Tahoe, `~/VMs/macos`) — the physical Mac
+(192.168.2.12) is no longer used for releases. See machines.md's "Mac VM" section for every
+command. The VM needs AMD-V to itself, so it must never run at the same time as the Windows
+VirtualBox VM: finish 6a (including the stop) before starting 6b.
 
-If reachable:
-1. Sync per the **Syncing a remote** procedure above (stash lock → pull → assert SHA)
-2. Run the macOS universal build command from machines.md
-3. `scp` the binary back to `/tmp/clay-macos-universal`, then verify it contains this release's code
+1. Start it: `~/VMs/macos/macvm.sh start && ~/VMs/macos/macvm.sh wait-ssh 300`.
+   `start` refuses while a VirtualBox VM is running — stop that VM first. If SSH doesn't come
+   up, run `macvm.sh stop` and mark macOS "Skipped (Mac VM did not come up)".
+2. Sync per **Syncing a remote**, through `macvm.sh ssh '...'` (a bash remote, dir `~/clay`),
+   and assert `git rev-parse HEAD` equals `EXPECTED_SHA`.
+3. Run the Mac VM build command from machines.md (it exports `MACOSX_DEPLOYMENT_TARGET=11.0`,
+   builds both `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `lipo`s them).
+4. Copy it back:
+   `scp -P 2222 -o UserKnownHostsFile=$HOME/VMs/macos/known_hosts adrick@127.0.0.1:clay/clay-macos-universal /tmp/clay-macos-universal`,
+   then verify it contains this release's code, like any other asset.
+5. **Always** `~/VMs/macos/macvm.sh stop` afterwards, whether the build passed or failed
+   (graceful shutdown; never kill QEMU except as a last resort).
+
+If a build fails with a code issue: fix locally, commit, push, then re-sync the VM (step 2)
+and rebuild — the VM can stay up for the retry, just stop it at the end.
 
 #### 6b. Windows VM (192.168.2.14)
 
@@ -368,7 +392,7 @@ For a full release:
 | Linux GUI | `/tmp/clay-linux-x86_64-gui` | `clay-linux-x86_64-gui` |
 | Windows (if reachable) | `/tmp/clay-windows-x86_64.exe` | `clay-windows-x86_64.exe` |
 | Android | `android/clay-android.apk` | `clay-android.apk` |
-| Mac | `/tmp/clay-macos-universal` | `clay-macos-universal` |
+| Mac (Mac VM) | `/tmp/clay-macos-universal` | `clay-macos-universal` |
 | Termux GUI (if reachable) | `/tmp/clay-termux-aarch64` | `clay-termux-aarch64` |
 | Termux aarch64 no-GUI (cross-compiled locally) | `/tmp/clay-termux-aarch64-nogui` | `clay-termux-aarch64-nogui` |
 | Termux armv7 no-GUI (cross-compiled locally) | `/tmp/clay-termux-armv7-32bit-nogui` | `clay-termux-armv7-32bit-nogui` |
@@ -407,7 +431,7 @@ gh release create vX.Y.Z \
     /tmp/clay-linux-x86_64-gui#clay-linux-x86_64-gui \
     [/tmp/clay-windows-x86_64.exe#clay-windows-x86_64.exe if Windows was reachable] \
     android/clay-android.apk#clay-android.apk \
-    [/tmp/clay-macos-universal#clay-macos-universal if Mac was reachable] \
+    [/tmp/clay-macos-universal#clay-macos-universal if the Mac VM build succeeded] \
     [/tmp/clay-termux-aarch64#clay-termux-aarch64 if Termux was reachable] \
     /tmp/clay-termux-aarch64-nogui#clay-termux-aarch64-nogui \
     /tmp/clay-termux-armv7-32bit-nogui#clay-termux-armv7-32bit-nogui \
@@ -447,7 +471,7 @@ Release: https://github.com/user/repo/releases/tag/vX.Y.Z
 Assets uploaded: 8
 ```
 
-Example (full release, Windows VM unreachable, Termux SSH not running, Mac unreachable):
+Example (full release, Windows VM unreachable, Termux SSH not running, Mac VM did not come up):
 ```
 ## Release vX.Y.Z Summary
 
@@ -457,7 +481,7 @@ Example (full release, Windows VM unreachable, Termux SSH not running, Mac unrea
 | Linux GUI x86_64 | PASS | 18.5 MB | Yes |
 | Windows x86_64 (VM) | Skipped (unreachable) | — | No |
 | Android APK | PASS | 8.2 MB | Yes |
-| macOS universal | Skipped (unreachable) | — | No |
+| macOS universal | Skipped (Mac VM did not come up) | — | No |
 | Termux aarch64 (GUI) | Skipped (SSH not running) | — | No |
 | Termux aarch64 (no GUI) | PASS | 5.8 MB | Yes |
 | Termux armv7 (no GUI) | PASS | 6.1 MB | Yes |

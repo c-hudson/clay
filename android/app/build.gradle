@@ -34,6 +34,19 @@ task buildNativeServer(type: Exec) {
 }
 preBuild.dependsOn buildNativeServer
 
+// The app's version IS Clay's version: read it from Cargo.toml (the one place a release sets
+// it) instead of keeping a hand-maintained copy here that could drift. The app reports
+// versionName to the server (AuthRequest.client_version) and compares it with the server's
+// ANDROID_APP_VERSION to decide whether to ask for an update, so it must be exact.
+// versionCode is derived so it always increases with the version:
+// major*1_000_000 + minor*1_000 + patch (1.6.15 -> 1006015).
+def clayVersion = {
+    def m = (file('../../Cargo.toml').text =~ /(?m)^version\s*=\s*"([0-9]+)\.([0-9]+)\.([0-9]+)[^"]*"/)
+    if (!m.find()) throw new GradleException("Could not read version from Cargo.toml")
+    [name: "${m.group(1)}.${m.group(2)}.${m.group(3)}",
+     code: m.group(1).toInteger() * 1000000 + m.group(2).toInteger() * 1000 + m.group(3).toInteger()]
+}()
+
 android {
     namespace 'com.clay.mudclient'
     compileSdk 34
@@ -42,8 +55,8 @@ android {
         applicationId "com.clay.mudclient"
         minSdk 26
         targetSdk 34
-        versionCode 214
-        versionName "1.6.15"
+        versionCode clayVersion.code
+        versionName clayVersion.name
         ndk {
             abiFilters 'arm64-v8a'
         }

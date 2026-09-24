@@ -4273,10 +4273,10 @@ mod tests {
             w.settings.world_type = WorldType::Discord;
             w.settings.discord_channel = "#x".to_string();
             app2.worlds.push(w);
-            let tmp = std::env::temp_dir().join("clay_test_chat_version.dat");
-            save_settings_to_path(&app2, &tmp).unwrap();
-            out.extend(std::fs::read(&tmp).unwrap());
-            let _ = std::fs::remove_file(&tmp);
+            // In-memory writer, not save_settings_to_path: that records the process-wide
+            // SETTINGS_FILE_FINGERPRINT, which test_settings_fingerprint_survives_reload_state_roundtrip
+            // needs to itself while tests run in parallel.
+            write_settings_dat(&app2, &mut out, false).unwrap();
         }
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("chat_settings_version=2"), "{text}");

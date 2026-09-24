@@ -374,7 +374,12 @@
         let insertAt = 0;
         for (let i = world.output_lines.length - 1; i >= 0; i--) {
             const existing = world.output_lines[i];
-            if (existing._has_real_seq && existing.seq < firstSeq) {
+            // Same "real seq" predicate as every other seq walk here (`!== false` plus a
+            // numeric seq): only lines explicitly marked _has_real_seq === false carry a
+            // fake seq. Lines from InitialState/backfill never set the flag at all, and
+            // requiring `=== true` treated a whole restored buffer as seq-less, so a
+            // recovered gap-fill batch was spliced in at index 0 - above all of history.
+            if (existing && existing._has_real_seq !== false && typeof existing.seq === 'number' && existing.seq < firstSeq) {
                 insertAt = i + 1;
                 break;
             }
@@ -969,13 +974,28 @@
     // WS-AUTH. On Android the APK bundles its own copy of this file, so it can lag arbitrarily
     // far behind the server it talks to - which is exactly the ambiguity this resolves. A web
     // client is served by the server and so always matches it; empty is logged as "-".
+    //
+    // Exactly ONE definition of this function may exist in this file: there used to be two,
+    // and JS function hoisting silently made the later one (CLIENT_VERSION only) the only
+    // one that ever ran. Sources, in order:
+    // - Android: the APK's own versionName via the bridge (== the Clay version it was built
+    //   from; build.gradle reads it from Cargo.toml).
+    // - window.CLIENT_VERSION: substituted into index.html server-side (http.rs,
+    //   webview_gui.rs), or injected at runtime on Android (MainActivity's var injection).
+    //   The raw `{{CLIENT_VERSION}}` placeholder is a real possible value - it is what the
+    //   bundled asset contains before Android's onPageFinished injection runs, and it has
+    //   escaped once before - so it counts as unknown.
+    // Returns '' when unknown (AuthRequest logs it as "-"; callers treat '' as absent).
     function clientVersion() {
         try {
             if (window.Android && typeof window.Android.getAppVersion === 'function') {
-                return window.Android.getAppVersion() || '';
+                const a = window.Android.getAppVersion();
+                if (a) return String(a);
             }
         } catch (e) { /* fall through - reporting a version must never block auth */ }
-        return (typeof window.CLAY_VERSION === 'string') ? window.CLAY_VERSION : '';
+        const v = window.CLIENT_VERSION;
+        if (typeof v === 'string' && v.length > 0 && v.indexOf('{{') === -1) return v;
+        return '';
     }
 
     // Numeric dotted-version compare: "1.5.5" < "1.6.3" -> true. Used only for the
@@ -1214,6 +1234,20 @@
         // that found no usable socket, and if this only ran when one was open, awayMs would
         // be missing from exactly those reports.
         if (!visible) lastHiddenAt = Date.now();
+        if (visible) {
+            // Resume: everything queued while we were in the background (scroll/resize
+            // events, rAF callbacks) fires on the first frame back, typically while the
+            // keyboard opens and resync traffic lands. A following view re-pins after that
+            // settles - two frames, so the second runs after the first frame's queued work.
+            lastVisibleAt = performance.now();
+            noteScrollCause('resume');
+            if (followBottom) {
+                requestAnimationFrame(function() {
+                    if (followBottom) scrollToBottom();
+                    requestAnimationFrame(function() { if (followBottom) scrollToBottom(); });
+                });
+            }
+        }
         try {
             if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
                 const next = !!visible;
@@ -1480,16 +1514,47 @@
     let keyboardAlwaysVisible = true;  // Will be synced from server settings
     let hardwareKeyboardPresent = false;  // Set by Java via window.onHardwareKeyboardChanged
 
-    // Last at-bottom verdict as of the most recent scroll event on the output container.
-    // This is the *user's* scroll state, immune to the window between a viewport shrink and
-    // the resize handler's re-pin: when the Android IME opens (adjustResize), clientHeight
-    // shrinks immediately, so a raw isAtBottom() reads false for a user who is really
-    // sitting at the bottom until the resize handler scrolls them back down. Any handler
-    // deciding "was the user at the bottom?" mid-stream (the ScrollbackLines branches, the
-    // resize handlers) must consult isAtBottom() || lastScrollAtBottom, not isAtBottom()
-    // alone — reading the raw value in that window is what let a resume-replay gap-fill
-    // treat an at-the-bottom user as scrolled-up and "preserve" a position they weren't at.
-    let lastScrollAtBottom = true;
+    // Whether the view is following live output (pinned to the bottom). This is the one
+    // answer to "was the user at the bottom?", and ONLY THE USER turns it off: a scroll
+    // away from the bottom counts only if the user caused it (see noteUserScrollIntent).
+    // It turns back on whenever the view reaches the bottom by any means, and whenever
+    // code deliberately jumps there (scrollToBottom).
+    //
+    // Why not simply isAtBottom(): that is geometry at one instant, and it is wrong for a
+    // following user all the time - the Android IME shrinks clientHeight before any resize
+    // handler runs; lines appended between frames make the next (late-delivered) scroll
+    // event read "not at bottom"; a layout change (font, input height, tabs ribbon) reflows
+    // thousands of lines. And after a resume, every scroll/resize/rAF event queued while
+    // the app was in the background fires at once, while the keyboard opens and resync
+    // traffic lands. Deriving the user's state from those events (the old
+    // lastScrollAtBottom) let a code-caused scroll read as "the user scrolled up": it set
+    // more-mode's pause, stopped the resize handlers re-pinning, and let the render-window
+    // grow branch add 500 lines above the view - the "keyboard opens and it jumps up
+    // several hundred lines and stays there" report, three rounds of it
+    // (project_keyboard_scroll_jump_fix).
+    let followBottom = true;
+    // When the user last did something that scrolls the output (touch, wheel, scrollbar
+    // drag, a scroll key/action). A scroll event within USER_SCROLL_WINDOW_MS of that is
+    // the user's; any other scroll event is code-caused and never un-pins the view.
+    let lastUserScrollIntentAt = 0;
+    let outputPointerDown = false;
+    const USER_SCROLL_WINDOW_MS = 400;
+    function noteUserScrollIntent() {
+        lastUserScrollIntentAt = performance.now();
+    }
+    function userScrollRecent() {
+        return outputPointerDown || (performance.now() - lastUserScrollIntentAt) < USER_SCROLL_WINDOW_MS;
+    }
+    // Recent things that rebuilt or moved the output, for the SCROLL-JUMP diagnostic.
+    const scrollCauses = [];
+    function noteScrollCause(what) {
+        scrollCauses.push(what + '@' + Math.round(performance.now()));
+        if (scrollCauses.length > 8) scrollCauses.shift();
+    }
+    // When the page last became visible (resume), for the SCROLL-JUMP diagnostic.
+    let lastVisibleAt = performance.now();
+    // Throttle for the SCROLL-JUMP report (one per 10s is plenty to name a cause).
+    let lastScrollJumpReportAt = -Infinity;
 
     // MCMP (MUD Client Media Protocol) state
     let mcmpDefaultUrl = '';
@@ -3024,6 +3089,7 @@
                 break;
 
             case 'InitialState':
+                noteScrollCause('initial-state');
                 // Our ▶ ownership id for this session. Captured before the world hydration
                 // below so lineIsNew() is already correct for the first render.
                 myDisplayId = (typeof msg.your_display_id === 'number') ? msg.your_display_id : 0;
@@ -3609,28 +3675,41 @@
                 // its installed version is older than that. Non-Android clients, and Android
                 // talking to an older server that never sent the field, keep the original
                 // always-on server_version comparison.
+                //
+                // Shown ONCE PER VERSION, not once per app launch: the version it was shown
+                // for is remembered (localStorage, which persists in the Android WebView) and
+                // connecting again stays quiet. On Android that is the server's compatibility
+                // version (android_app_version), so only a server that raises the requirement
+                // warns again; elsewhere it is the server version.
                 try {
                     var localVersion = clientVersion();
                     var remoteVersion = msg.server_version;
                     var androidAppVersion = msg.android_app_version;
                     var androidAppVersionKnown = !!androidAppVersion && androidAppVersion.indexOf('{{') === -1;
-                    if (!versionMismatchShown && localVersion && remoteVersion &&
+                    var WARNED_KEY = 'clay-version-warning-shown-for';
+                    // What the warning is about: on Android the server's compatibility
+                    // version (a server-only release that keeps the same requirement must
+                    // not repeat the same "please update"), elsewhere the server version.
+                    var androidPath = !!(window.Android && androidAppVersionKnown);
+                    var warnedFor = androidPath ? androidAppVersion : remoteVersion;
+                    var alreadyWarned = false;
+                    try { alreadyWarned = localStorage.getItem(WARNED_KEY) === warnedFor; } catch (e) {}
+                    var warning = null;
+                    if (!versionMismatchShown && !alreadyWarned && localVersion && remoteVersion &&
                         remoteVersion.indexOf('{{') === -1) {
-                        if (window.Android && androidAppVersionKnown) {
+                        if (androidPath) {
                             if (versionLessThan(localVersion, androidAppVersion)) {
-                                appendClientLine(
-                                    `A newer Clay Android app is available (${androidAppVersion}) - reinstall to update.`,
-                                    currentWorldIndex, 'system'
-                                );
-                                versionMismatchShown = true;
+                                warning = `This Clay app (${localVersion}) is older than the version this server (${remoteVersion}) ` +
+                                    `needs for full compatibility (${androidAppVersion}) - please update the Android app.`;
                             }
                         } else if (localVersion !== remoteVersion) {
-                            appendClientLine(
-                                `Version mismatch: ${localVersion} (local) ≠ ${remoteVersion} (remote).`,
-                                currentWorldIndex, 'system'
-                            );
-                            versionMismatchShown = true;
+                            warning = `Version mismatch: ${localVersion} (local) ≠ ${remoteVersion} (remote).`;
                         }
+                    }
+                    if (warning) {
+                        appendClientLine(warning, currentWorldIndex, 'system');
+                        versionMismatchShown = true;
+                        try { localStorage.setItem(WARNED_KEY, warnedFor); } catch (e) {}
                     }
                 } catch (e) {
                     console.error('Clay: error checking client/server version mismatch', e);
@@ -4927,11 +5006,13 @@
                     // they're appended and deduped - handled entirely separately from the
                     // phase 1/2 backfill prepend logic below (a gap-fill is normally tiny and
                     // finishes in one or two requests).
-                    // lastScrollAtBottom: see its declaration — a bare isAtBottom() here
-                    // reads false for a user really at the bottom whenever this reply lands
-                    // while the Android IME is opening (clientHeight already shrunk, re-pin
-                    // not yet run), which routed them into the preserve-position branch.
-                    const wasBottom = isAtBottom() || lastScrollAtBottom;
+                    // followBottom, not isAtBottom(): see its declaration - the raw
+                    // geometry reads false for a user really at the bottom whenever this
+                    // reply lands while the Android IME is opening (clientHeight already
+                    // shrunk, re-pin not yet run), which routed them into the
+                    // preserve-position branch.
+                    const wasBottom = followBottom;
+                    noteScrollCause('gapfill');
                     let appended = false;
                     let droppedCount = 0;
 
@@ -5069,9 +5150,10 @@
                     //                     with the NEWEST N visible lines -> insert in seq
                     //                     order and mark as delivered
                     if (msg.lines && msg.lines.length > 0) {
-                        // isAtBottom() || lastScrollAtBottom, not isAtBottom() alone — see
-                        // the gap-fill branch above and lastScrollAtBottom's declaration.
-                        const wasBottom = isAtBottom() || lastScrollAtBottom;
+                        // followBottom, not isAtBottom() - see the gap-fill branch above
+                        // and followBottom's declaration.
+                        const wasBottom = followBottom;
+                        noteScrollCause('backfill');
 
                         if (kind === 'initial-fill') {
                             // Newest lines, not older history. Prepending them would bury the
@@ -5193,15 +5275,20 @@
 
         const visibleLines = getVisibleLineCount();
         const threshold = Math.max(1, visibleLines - 2);
+        // The line object itself (already in world.output_lines), so a full renderOutput()
+        // while it is held can recognise and skip it - see renderOutput's `held` set. An
+        // index would not do: prepended history (backfill, Page Up) shifts indices.
+        const heldWorld = worlds[worldIndex];
+        const obj = heldWorld && heldWorld.output_lines ? heldWorld.output_lines[lineIndex] : null;
 
         if (paused) {
             // Already paused, queue the line info
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
             updateStatusBar();
         } else if (moreModeEnabled && linesSincePause >= threshold) {
             // Trigger pause
             paused = true;
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
             // Scroll to bottom to show what we have so far
             scrollToBottom();
             updateStatusBar();
@@ -7187,22 +7274,6 @@
         return html;
     }
 
-    // This client's own bundled version, or null when it genuinely isn't known.
-    //
-    // `window.CLIENT_VERSION` is injected three different ways: substituted into index.html
-    // server-side for the browser (http.rs) and the desktop WebView (webview_gui.rs), but set
-    // at runtime on Android (MainActivity.buildVarInjectionScript, from the APK's versionName)
-    // because the page is loaded straight off `file:///android_asset/` where nothing rewrites
-    // the template. So the raw `{{CLIENT_VERSION}}` placeholder is a real possible value here
-    // - it is what the bundled asset literally contains before Android's onPageFinished
-    // injection runs, and it has escaped once before (see the InitialState version-mismatch
-    // check, which reuses this). Callers get null and show something sensible rather than
-    // printing braces at the user.
-    function clientVersion() {
-        const v = window.CLIENT_VERSION;
-        if (typeof v !== 'string' || v.length === 0 || v.indexOf('{{') !== -1) return null;
-        return v;
-    }
 
     function openHelpPopup() {
         helpPopupOpen = true;
@@ -7702,7 +7773,12 @@
             const totalHeld = world.output_lines ? world.output_lines.length : 0;
             const currentWindow = world._renderWindow || RENDER_WINDOW_INITIAL;
             const ceiling = Math.min(RENDER_WINDOW_MAX, totalHeld);
-            if (container.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && currentWindow < ceiling) {
+            // !followBottom: only a user who has scrolled back into history grows the
+            // window. A following view near the top can only be a code-caused drop (a
+            // cleared/rebuilding DOM, a reflow) - growing then would add 500 lines above it
+            // and strand it hundreds of lines up (the keyboard/resume jump).
+            if (!followBottom && container.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && currentWindow < ceiling) {
+                noteScrollCause('grow');
                 world._renderWindow = Math.min(currentWindow + RENDER_WINDOW_STEP, ceiling);
                 // Obey the same contract as every other preserveScroll rebuild (both
                 // ScrollbackLines branches already do this; this site was the one that
@@ -7785,6 +7861,7 @@
 
     function renderOutput(opts) {
         const preserveScroll = !!(opts && opts.preserveScroll);
+        noteScrollCause(preserveScroll ? 'render-keep' : 'render');
         const world = worlds[currentWorldIndex];
 
         // If no world selected (multiuser mode before connecting), show splash
@@ -7830,11 +7907,20 @@
         const renderWindow = world._renderWindow || RENDER_WINDOW_INITIAL;
         const startIdx = Math.max(0, searchEndIdx - renderWindow);
 
+        // Lines held back by more-mode are already in output_lines but must not be drawn
+        // until released: doReleasePending() appends them then, so drawing them here too
+        // showed every held line twice (once now, once on release).
+        const held = new Set();
+        for (const p of pendingLines) {
+            if (p.worldIndex === currentWorldIndex && p.obj) held.add(p.obj);
+        }
+
         // Build lines as HTML with explicit <br> line breaks
         const htmlParts = [];
         for (let i = startIdx; i < searchEndIdx; i++) {
             const lineObj = lines[i];
             if (lineObj === undefined || lineObj === null) continue;
+            if (held.size && held.has(lineObj)) continue;
 
             // Handle both old string format and new object format
             const rawLine = typeof lineObj === 'string' ? lineObj : lineObj.text;
@@ -9022,17 +9108,21 @@
 
     // Scroll to bottom
     function scrollToBottom() {
+        followBottom = true;
         elements.outputContainer.scrollTop = elements.outputContainer.scrollHeight;
     }
 
-    // Batched scroll-to-bottom via requestAnimationFrame (avoids forced layout per line)
+    // Batched scroll-to-bottom via requestAnimationFrame (avoids forced layout per line).
+    // Only while following: a user reading scrollback is not dragged back down by each
+    // arriving line (followBottom is re-checked in the frame, since the user may scroll
+    // away between the append and the frame).
     let scrollRafPending = false;
     function scheduleScrollToBottom() {
         if (!scrollRafPending) {
             scrollRafPending = true;
             requestAnimationFrame(() => {
                 scrollRafPending = false;
-                scrollToBottom();
+                if (followBottom) scrollToBottom();
             });
         }
     }
@@ -9169,8 +9259,8 @@
     // #output-container's flex-computed clientHeight - exactly the class of change the
     // Android keyboard-open fix (project_keyboard_scroll_jump_fix) already had to handle
     // for the visualViewport resize case. The existing window/visualViewport resize
-    // handlers below prove the fix: capture `isAtBottom() || lastScrollAtBottom` (see that
-    // variable's own doc comment for why the OR is required) BEFORE the height changes,
+    // handlers below prove the fix: capture `followBottom` (see that variable's own doc
+    // comment for why raw isAtBottom() is not enough) BEFORE the height changes,
     // mutate, then call scrollToBottom() iff that was true. If the user was mid-history,
     // scrollTop is left completely alone - a shrinking container only ever *increases* the
     // max scrollTop, so the browser has no reason to clamp the existing value, and the same
@@ -9197,7 +9287,7 @@
     }
 
     function withOutputScrollGuard(mutate) {
-        const wasBottom = isAtBottom() || lastScrollAtBottom;
+        const wasBottom = followBottom;
         mutate();
         if (wasBottom) {
             scrollToBottom();
@@ -9546,6 +9636,7 @@
 
     // Show/hide auth modal
     function showAuthModal(show) {
+        if (show) noteScrollCause('auth-modal');
         elements.authModal.className = 'modal' + (show ? ' visible' : '');
         forceRepaint(elements.authModal);
         if (show) {
@@ -12845,6 +12936,7 @@
 
             // Scrollback
             case 'scroll_page_up': {
+                noteUserScrollIntent();
                 const n = takeKbnum();
                 const pgH = elements.outputContainer.clientHeight;
                 const pgLH = (currentFontSize || 14) * 1.2;
@@ -12854,6 +12946,7 @@
                 return true;
             }
             case 'scroll_page_down': {
+                noteUserScrollIntent();
                 const n = takeKbnum();
                 const pgH = elements.outputContainer.clientHeight;
                 const pgLH = (currentFontSize || 14) * 1.2;
@@ -12879,6 +12972,7 @@
             // toward the bottom by default) - release pending output if any, else scroll
             // down. scroll_half_page_back (below) is the always-backward TF HPAGEBACK.
             case 'scroll_half_page': {
+                noteUserScrollIntent();
                 const n = takeKbnum();
                 const halfPage = Math.floor(elements.outputContainer.clientHeight / 2) * Math.max(1, Math.abs(n));
                 if (n >= 0) {
@@ -12893,6 +12987,7 @@
                 return true;
             }
             case 'scroll_half_page_back': {
+                noteUserScrollIntent();
                 const n = takeKbnum();
                 const halfPage = Math.floor(elements.outputContainer.clientHeight / 2) * Math.max(1, Math.abs(n));
                 elements.outputContainer.scrollBy(0, n >= 0 ? -halfPage : halfPage);
@@ -12900,12 +12995,14 @@
             }
             // TF LINE/LINEBACK: scroll by exactly one output line, kbnum-aware.
             case 'scroll_line_forward': {
+                noteUserScrollIntent();
                 const n = takeKbnum();
                 const amount = lineHeightPx() * Math.max(1, Math.abs(n));
                 elements.outputContainer.scrollBy(0, n >= 0 ? amount : -amount);
                 return true;
             }
             case 'scroll_line_back': {
+                noteUserScrollIntent();
                 const n = takeKbnum();
                 const amount = lineHeightPx() * Math.max(1, Math.abs(n));
                 elements.outputContainer.scrollBy(0, n >= 0 ? -amount : amount);
@@ -12943,6 +13040,7 @@
             case 'expand_line':
                 return true;
             case 'tab_key': {
+                noteUserScrollIntent();
                 // Try command completion first
                 if (performCompletion()) return true;
                 if (pendingTotal() > 0) {
@@ -13540,7 +13638,7 @@
         px = clampFontSize(px);
 
         // Check if we were at the bottom before changing size
-        const wasAtBottom = isAtBottom();
+        const wasAtBottom = followBottom;  // not raw isAtBottom() - see followBottom
 
         currentFontSize = px;
 
@@ -13853,12 +13951,14 @@
 
         // Page up/down buttons (nav bar)
         function handlePgUp() {
+            noteUserScrollIntent();
             const container = elements.outputContainer;
             const pageHeight = container.clientHeight * 0.9;
             container.scrollTop = Math.max(0, container.scrollTop - pageHeight);
             updateStatusBar();
         }
         function handlePgDn() {
+            noteUserScrollIntent();
             const container = elements.outputContainer;
             if (pendingTotal() > 0) {
                 releaseScreenful();
@@ -13980,11 +14080,73 @@
             });
         }
 
-        // Track whether we're at the bottom (for resize handling and the mid-resize
-        // at-bottom checks — see lastScrollAtBottom's declaration).
+        // Maintain followBottom (see its declaration). Reaching the bottom by any means
+        // means following; only a user-caused scroll leaves it. A code-caused scroll that
+        // moves a following view away from the bottom is drift - a late event, a reflow, a
+        // rebuild - so re-pin, and report it if it was big (the SCROLL-JUMP diagnostic, so
+        // a new variant of the keyboard/resume jump names its own cause in remote.log).
+        let lastSeenScrollTop = elements.outputContainer.scrollTop;
         elements.outputContainer.addEventListener('scroll', function() {
-            lastScrollAtBottom = isAtBottom();
+            const c = elements.outputContainer;
+            // Moved up since the last scroll event? Only an upward move can mean "the user
+            // is leaving the bottom". Content growing below (appends) leaves scrollTop where
+            // it was, and scrolling down or releasing output (PgDn, Tab) moves it down -
+            // neither may un-pin, even though both happen right after user input.
+            const movedUp = c.scrollTop < lastSeenScrollTop - 1;
+            lastSeenScrollTop = c.scrollTop;
+            if (isAtBottom()) {
+                followBottom = true;
+                return;
+            }
+            if (movedUp && userScrollRecent()) {
+                followBottom = false;
+                return;
+            }
+            if (followBottom) {
+                const away = c.scrollHeight - c.scrollTop - c.clientHeight;
+                if (away > c.clientHeight * 3 && performance.now() - lastScrollJumpReportAt > 10000) {
+                    lastScrollJumpReportAt = performance.now();
+                    recordClientEvent('SCROLL-JUMP', JSON.stringify({
+                        away_px: Math.round(away), st: Math.round(c.scrollTop), sh: c.scrollHeight,
+                        ch: c.clientHeight, dom: elements.output.childElementCount,
+                        win: (worlds[currentWorldIndex] || {})._renderWindow || null,
+                        paused: paused, since_visible_ms: Math.round(performance.now() - lastVisibleAt),
+                        vv: window.visualViewport ? Math.round(window.visualViewport.height) : null,
+                        causes: scrollCauses.join(','),
+                    }));
+                }
+                scrollToBottom();
+            }
         }, { passive: true });
+
+        // User scroll intent on the output (see noteUserScrollIntent). Pointer covers
+        // dragging the scrollbar with a mouse; touch and wheel cover everything else.
+        elements.outputContainer.addEventListener('touchstart', noteUserScrollIntent, { passive: true });
+        elements.outputContainer.addEventListener('touchmove', noteUserScrollIntent, { passive: true });
+        elements.outputContainer.addEventListener('wheel', noteUserScrollIntent, { passive: true });
+        elements.outputContainer.addEventListener('pointerdown', function() {
+            outputPointerDown = true;
+            noteUserScrollIntent();
+        }, { passive: true });
+        window.addEventListener('pointerup', function() {
+            if (outputPointerDown) noteUserScrollIntent();  // a fling may still be settling
+            outputPointerDown = false;
+        }, { passive: true });
+        window.addEventListener('pointercancel', function() { outputPointerDown = false; }, { passive: true });
+
+        // Keep a following view pinned through ANY layout change, in one place: the keyboard
+        // opening/closing, the input area or font or wrapspace changing, the tabs ribbon or
+        // icon bar appearing, a stats panel resizing, lines being appended. Each of those
+        // used to need its own guard, and the ones that lacked it (setInputHeight,
+        // applyWrapspace, the font settings, applyTabsMode, renderIconBar) could leave a
+        // following view thousands of lines up after a reflow.
+        if (window.ResizeObserver) {
+            const repinObserver = new ResizeObserver(function() {
+                if (followBottom) scrollToBottom();
+            });
+            repinObserver.observe(elements.outputContainer);
+            repinObserver.observe(elements.output);
+        }
 
         // Drag past the bottom to reveal pending output (see scheduleReveal above).
         //
@@ -14039,8 +14201,8 @@
 
         // Window resize handler to update separator fill and maintain scroll position
         window.addEventListener('resize', function() {
-            // If we were at the bottom before resize, stay at bottom
-            if (lastScrollAtBottom) {
+            // If we were following the bottom before resize, stay at bottom
+            if (followBottom) {
                 scrollToBottom();
             }
             updateStatusBar();
@@ -14051,8 +14213,8 @@
         // Handle mobile keyboard visibility
         if (window.visualViewport) {
             window.visualViewport.addEventListener('resize', function() {
-                // If we were at bottom before keyboard appeared, stay at bottom
-                if (lastScrollAtBottom) {
+                // If we were following the bottom before the keyboard appeared, stay there
+                if (followBottom) {
                     scrollToBottom();
                 }
                 updateStatusBar();
@@ -14207,8 +14369,10 @@
         // Scroll event to update status bar (for Hist indicator)
         elements.outputContainer.onscroll = function() {
             updateStatusBar();
-            // If user scrolls up, trigger pause (like console behavior)
-            if (moreModeEnabled && !paused && !isAtBottom()) {
+            // If the user scrolls up, trigger pause (like console behavior). followBottom,
+            // not raw isAtBottom(): a late or code-caused scroll event on a following view
+            // must never pause it - see followBottom's declaration.
+            if (moreModeEnabled && !paused && !followBottom && !isAtBottom()) {
                 paused = true;
                 updateStatusBar();
             }
