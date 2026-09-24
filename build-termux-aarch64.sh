@@ -9,11 +9,7 @@
 # namespace (unlike build-android-aarch64.sh's output, which runs as an ordinary app
 # subprocess and needs no rpath patching at all).
 #
-# The GUI variant (webview-gui: wry/tao/webkit2gtk/X11) is NOT built here — it requires
-# linking against Termux's own compiled GTK3/WebKit2GTK/X11 libraries at
-# /data/data/com.termux/files/usr/lib, which only exist inside the Termux userland (see
-# patches/apply-patches.sh). That one still has to build on-device; see machines.md's
-# "Termux aarch64 binary (with GUI, no audio)" section.
+# The GUI variant (webview-gui: wry/tao/WebKit2GTK/X11) is build-termux-aarch64-gui.sh.
 #
 # One-time setup (see .claude/skills/release/machines.md for details):
 #   - Android NDK r26d unpacked at $ANDROID_NDK_HOME (default: ~/Android/Sdk/ndk/26.3.11579264)

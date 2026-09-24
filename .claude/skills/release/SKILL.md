@@ -1,6 +1,6 @@
 ---
 name: release
-description: Automated multi-platform build and GitHub release for Clay. Builds locally (Linux musl, Termux cross-builds, Android, and macOS in a local QEMU VM) and on remote machines (Windows VM, Termux phone), uploads to GitHub.
+description: Automated multi-platform build and GitHub release for Clay. Builds locally (Linux musl, Termux cross-builds, Android, and macOS in a local QEMU VM) and on the Windows VM, uploads to GitHub.
 ---
 
 # /release — Automated Multi-Platform Build & GitHub Release
@@ -19,14 +19,13 @@ Parse `$ARGUMENTS` for the version and any platform flags:
 
 - **Version**: The first non-flag token. Prepend `v` if it doesn't start with `v`. Normalize (e.g., "1.0 beta" → "v1.0.0-beta"). If no version token, read from `Cargo.toml` line 3.
 - **Platform flags**: `--android`, `--mac`, `--linux` — at most one may be specified. If present, the release is limited to that platform only (see "Platform-limited release" below).
-- **Termux**: Reachability is auto-detected at Step 6 — do NOT ask the user about it. If the phone is unreachable, it is silently skipped. (macOS is built on the local Mac VM, which is started on demand.)
+- **No phone needed**: every Termux asset (GUI included) is cross-compiled locally in Step 5. macOS is built on the local Mac VM, which is started on demand.
 
 #### Platform-limited release (`--android` / `--mac` / `--linux`)
 
 When a platform flag is given:
 - Only build the specified platform (skip all others).
 - Only upload that platform's asset(s) to GitHub — do **not** delete or modify any other existing assets.
-- Skip the Termux question.
 - Still commit any pending work, do the version bump, commit, and push (Steps 3–4) so the binary matches the tagged version.
 
 Platform → assets built and uploaded:
@@ -39,8 +38,8 @@ Platform → assets built and uploaded:
 | `--windows` | Windows x86_64 via Windows VM (192.168.2.14) | `clay-windows-x86_64.exe` |
 
 Examples:
-- `/release 1.2.0` — Full release of v1.2.0, ask about Termux
-- `/release` — Full release using current Cargo.toml version, ask about Termux
+- `/release 1.2.0` — Full release of v1.2.0
+- `/release` — Full release using current Cargo.toml version
 - `/release 1.2.0 --android` — Build and upload only the Android APK for v1.2.0
 - `/release --mac` — Build and upload only macOS binary for current version
 - `/release --windows` — Build and upload only the Windows binary via the Windows VM
@@ -136,14 +135,14 @@ slow when you are watching it — but a *backgrounded* build that blocks can end
 running its remaining steps, and the shell still reports **exit 0**. In the v1.5.41 run the
 Termux chain was started while the Linux GUI build was still going; only armv7 built, the
 aarch64 binary and the APK stayed at the previous release's bytes, and nothing failed. Every
-local target below shares one `target/` dir — musl, GUI, both Termux cross-builds, and the
+local target below shares one `target/` dir — musl, GUI, the three Termux cross-builds, and the
 APK (whose `buildNativeServer` task shells out to cargo).
 
 Build in this order, each to completion before starting the next:
 
 1. **Linux musl** — see machines.md for exact command
 2. **Linux GUI+audio** — see machines.md for exact command
-3. **Termux armv7 / aarch64 cross-builds** — see below
+3. **Termux armv7 / aarch64 / aarch64-GUI cross-builds** — see below
 4. **Android APK** — see machines.md for build, align, and sign commands
 
 **A chain of local builds must fail loudly.** Do not string them together with newlines in
@@ -190,23 +189,28 @@ prior-run residue that caused `zipalign` to silently refuse to regenerate
 Signing section) — committing here closes that gap at the source rather than relying on
 the Step 7 freshness check to catch it after the fact.
 
-**Windows**: Built remotely on the Windows VM (see Step 6c). Do NOT cross-compile.
+**Windows**: Built remotely on the Windows VM (see Step 6b). Do NOT cross-compile.
 - Windows is never built as part of `--linux`, `--android`, or `--mac` partial releases.
 - Fallback: if the VM is unreachable *and* `clay.exe` exists in the project root, use it as a hand-built fallback (copy to `/tmp/clay-windows-x86_64.exe`). If it doesn't exist either, warn and skip Windows.
 
 **Termux armv7 (cross-compiled, no GUI)**: Built locally via the Android NDK — see machines.md.
 - Run `./build-termux-armv7.sh`; output lands at `/tmp/clay-termux-armv7-32bit-nogui`.
-- Unlike the Termux GUI build (Step 6c), this does not depend on the phone's reachability.
-- Skip for `--android`, `--mac`, `--linux`, and `--windows` partial releases — Termux assets (all of
-  them, aarch64 and armv7) are full-release only, consistent with Step 6c.
+- Skip for `--android`, `--mac`, `--linux`, and `--windows` partial releases — Termux assets (all
+  three) are full-release only.
 
 **Termux aarch64 (cross-compiled, no GUI)**: Built locally via the same Android NDK — see machines.md.
 - Run `./build-termux-aarch64.sh`; output lands at `/tmp/clay-termux-aarch64-nogui`.
-- Also does not depend on the phone's reachability (only the GUI variant still builds on-device,
-  in Step 6c — the no-GUI aarch64 build used to be phone-built too, but was moved here since
-  Termux's Bionic libc is ABI-compatible with a straight NDK cross-compile and this needs no
-  Termux-specific GTK3/WebKit2GTK/X11 libraries).
+- Termux's Bionic libc is exactly what the NDK targets, so no phone is involved.
 - Skip for `--android`, `--mac`, `--linux`, and `--windows` partial releases — same rule as armv7.
+
+**Termux aarch64 GUI (cross-compiled, webview GUI)**: Built locally — see machines.md.
+- Run `./build-termux-aarch64-gui.sh`; output lands at `/tmp/clay-termux-aarch64`.
+- It links against Termux's own aarch64 GTK3/WebKit2GTK/X11 packages, which
+  `tools/termux-sysroot.py` downloads into `~/.cache/clay-termux-sysroot` (cached; the first run
+  fetches ~160 packages). The tao/wry Termux patches are applied in a throwaway git worktree, so
+  the main checkout is never modified. This used to be built on the phone (192.168.2.50) and was
+  skipped whenever its sshd was down (v1.6.14-v1.6.16); the phone is now only for testing.
+- Same partial-release rule as armv7.
 
 If any build fails, read the error output, attempt to fix the code, commit and push the fix, then retry the failed build.
 
@@ -220,7 +224,7 @@ Before building on each remote machine, **probe reachability** to decide whether
 
 **Never run a bare `git pull && cargo build` on a remote.** A remote's working tree is routinely dirty (cargo rewrites `Cargo.lock`, stray scratch files accumulate). When the tree is dirty, `git pull` prints `Please commit your changes or stash them before you merge. Aborting` — and if you chained it with `&&` while tailing only the last line, the abort is easy to miss and **the build silently proceeds against the old checkout**. That has shipped stale binaries.
 
-Use this sequence on every **bash** remote (Mac VM, Termux — `<dir>` from machines.md):
+Use this sequence on every **bash** remote (the Mac VM — `<dir>` from machines.md):
 ```bash
 cd <dir>
 git stash push -- Cargo.lock          # harmless: cargo regenerates it
@@ -321,32 +325,6 @@ If a remote build fails:
 - If it's a code issue: fix the code locally, commit, push, start the VM again, then `git pull` on the VM and retry; shut down after retry
 - If it's an environment issue (missing tool, etc.): shut the VM down, report to the user and ask how to proceed
 
-#### 6c. Termux (192.168.2.50)
-
-The Termux host (a phone) may be powered on but have its SSH server stopped. Use `nc` to probe the SSH port so you can report a more useful status:
-```bash
-nc -z -w 5 192.168.2.50 8022
-```
-- Exit 0 → SSH port is open, proceed with build.
-- Exit non-zero with a quick "Connection refused" → host is up but SSH server is not running; skip and mark "Skipped (SSH not running)".
-- Exit non-zero after timeout → host is unreachable; skip and mark "Skipped (unreachable)".
-
-To distinguish refused vs timeout, capture the stderr or use a short timeout: a "Connection refused" arrives in under 1 s, while a timeout takes the full 5 s.
-
-If reachable, build the Termux **GUI** binary (the only Termux target still built on-device —
-the no-GUI aarch64 build is cross-compiled locally in Step 5 instead, since it needs no
-Termux-specific GTK3/WebKit2GTK/X11 libraries; see machines.md's "Termux aarch64 binary
-(cross-compiled, no GUI)" section for why):
-1. Sync per the **Syncing a remote** procedure (stash lock → pull → assert SHA)
-2. Run `./patches/apply-patches.sh` to patch tao/wry for Termux
-3. Run the Termux aarch64 **GUI** build command from machines.md
-4. `scp` the binary back to `/tmp/clay-termux-aarch64`, then verify it contains this release's code
-
-If a remote build fails:
-- Read the error output
-- If it's a code issue: fix the code locally, commit, push, then `git pull` on the remote and retry
-- If it's an environment issue (missing tool, etc.): report to the user and ask how to proceed
-
 ### Step 7: Collect Release Assets
 
 Gather only the assets being released. Omit any remote target that was skipped due to being unreachable.
@@ -365,7 +343,7 @@ including one whose shell reported success (see Step 5):
 BUMP_TS=$(git log -1 --format=%ct "$EXPECTED_SHA")
 for f in /tmp/clay-linux-x86_64-musl /tmp/clay-linux-x86_64-gui /tmp/clay-windows-x86_64.exe \
          android/clay-android.apk /tmp/clay-macos-universal \
-         /tmp/clay-termux-aarch64-nogui /tmp/clay-termux-armv7-32bit-nogui; do
+         /tmp/clay-termux-aarch64 /tmp/clay-termux-aarch64-nogui /tmp/clay-termux-armv7-32bit-nogui; do
   if [ -e "$f" ] && [ "$(stat -c %Y "$f")" -ge "$BUMP_TS" ]; then st=OK; else st=STALE; fi
   printf '  %-42s %s\n' "$(basename "$f")" "$st"
 done
@@ -393,7 +371,7 @@ For a full release:
 | Windows (if reachable) | `/tmp/clay-windows-x86_64.exe` | `clay-windows-x86_64.exe` |
 | Android | `android/clay-android.apk` | `clay-android.apk` |
 | Mac (Mac VM) | `/tmp/clay-macos-universal` | `clay-macos-universal` |
-| Termux GUI (if reachable) | `/tmp/clay-termux-aarch64` | `clay-termux-aarch64` |
+| Termux aarch64 GUI (cross-compiled locally) | `/tmp/clay-termux-aarch64` | `clay-termux-aarch64` |
 | Termux aarch64 no-GUI (cross-compiled locally) | `/tmp/clay-termux-aarch64-nogui` | `clay-termux-aarch64-nogui` |
 | Termux armv7 no-GUI (cross-compiled locally) | `/tmp/clay-termux-armv7-32bit-nogui` | `clay-termux-armv7-32bit-nogui` |
 
@@ -432,17 +410,15 @@ gh release create vX.Y.Z \
     [/tmp/clay-windows-x86_64.exe#clay-windows-x86_64.exe if Windows was reachable] \
     android/clay-android.apk#clay-android.apk \
     [/tmp/clay-macos-universal#clay-macos-universal if the Mac VM build succeeded] \
-    [/tmp/clay-termux-aarch64#clay-termux-aarch64 if Termux was reachable] \
+    /tmp/clay-termux-aarch64#clay-termux-aarch64 \
     /tmp/clay-termux-aarch64-nogui#clay-termux-aarch64-nogui \
     /tmp/clay-termux-armv7-32bit-nogui#clay-termux-armv7-32bit-nogui \
     --title "Clay vX.Y.Z" \
     --notes "Release vX.Y.Z"
 ```
 
-Note: `clay-termux-aarch64-nogui` and `clay-termux-armv7-32bit-nogui` are not bracketed above —
-both are built locally (Step 5), not gated on the phone's reachability, so they're always
-included in a full release. Only `clay-termux-aarch64` (the GUI variant) still depends on the
-phone.
+Note: the three Termux assets are not bracketed above — all are cross-compiled locally
+(Step 5), so they're always included in a full release.
 
 ### Step 9: Print Summary
 
@@ -471,7 +447,7 @@ Release: https://github.com/user/repo/releases/tag/vX.Y.Z
 Assets uploaded: 8
 ```
 
-Example (full release, Windows VM unreachable, Termux SSH not running, Mac VM did not come up):
+Example (full release, Windows VM unreachable, Mac VM did not come up):
 ```
 ## Release vX.Y.Z Summary
 
@@ -482,17 +458,13 @@ Example (full release, Windows VM unreachable, Termux SSH not running, Mac VM di
 | Windows x86_64 (VM) | Skipped (unreachable) | — | No |
 | Android APK | PASS | 8.2 MB | Yes |
 | macOS universal | Skipped (Mac VM did not come up) | — | No |
-| Termux aarch64 (GUI) | Skipped (SSH not running) | — | No |
+| Termux aarch64 (GUI) | PASS | 27.7 MB | Yes |
 | Termux aarch64 (no GUI) | PASS | 5.8 MB | Yes |
 | Termux armv7 (no GUI) | PASS | 6.1 MB | Yes |
 
 Release: https://github.com/user/repo/releases/tag/vX.Y.Z
-Assets uploaded: 5
+Assets uploaded: 6
 ```
-
-Note: `Termux aarch64 (no GUI)` and `Termux armv7 (no GUI)` are both built locally (Step 5), so
-they're unaffected by the Termux phone's SSH reachability — they still build and upload even
-when the GUI variant (still phone-built, Step 6c) is skipped.
 
 Example (--android only):
 ```

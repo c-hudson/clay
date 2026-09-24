@@ -38,7 +38,7 @@ cargo clippy                         # Lint
 
 ### Cross-Platform Builds
 
-- **Termux:** `cargo build --no-default-features --features rustls-backend,ssh-transport` (no musl target). GUI requires X11 patches via `./patches/apply-patches.sh`. No hot reload, TLS proxy, or Ctrl+Z on Android.
+- **Termux:** cross-compiled with the Android NDK, no phone needed: `./build-termux-aarch64.sh` / `./build-termux-armv7.sh` (no GUI) and `./build-termux-aarch64-gui.sh` (webview GUI - links against Termux's own packages unpacked by `tools/termux-sysroot.py`, applies the tao/wry X11 patches in a throwaway worktree). No hot reload, TLS proxy, or Ctrl+Z on Android.
 - **macOS:** `cargo build --no-default-features --features rustls-backend,ssh-transport` (no musl). Universal binary via `lipo` combining x86_64-apple-darwin and aarch64-apple-darwin targets.
 - **Windows:** `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo build --release --features webview-gui` (MSVC, not cross-compiled)
 

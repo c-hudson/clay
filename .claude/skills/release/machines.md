@@ -4,7 +4,7 @@ Single source of truth for all build targets and machine details.
 
 ## Remote checkouts are routinely dirty — sync deliberately
 
-Every remote (Mac, Windows VM, Termux) tends to carry a modified `Cargo.lock`,
+Every remote (Mac VM, Windows VM) tends to carry a modified `Cargo.lock`,
 because `cargo build` rewrites the `clay` version line whenever the committed lock file
 lags the bumped `Cargo.toml`. A dirty tree makes `git pull` **abort**, and a `git pull &&
 cargo build` chain then builds the *old* checkout without an obvious error — this has
@@ -18,7 +18,7 @@ No SSH required — commands run directly.
 
 **Every local build shares one `target/` directory**, so they cannot overlap: cargo takes an
 exclusive lock on it and a second build waits on `Blocking waiting for file lock on build
-directory`. That includes the two Termux cross-builds and the Android APK, whose
+directory`. That includes the three Termux cross-builds and the Android APK, whose
 `buildNativeServer` Gradle task shells out to cargo. Run them one at a time and check each
 artifact's mtime afterwards — a backgrounded build that blocks on the lock can end without
 running its remaining steps while the shell still reports success (this shipped a stale
@@ -93,11 +93,8 @@ Cross-compiled here on localhost via the same Android NDK as the armv7 build abo
 `aarch64-linux-android` instead. Termux doesn't ship its own libc — it links against Android's
 Bionic (`/system/lib64/libc.so`), the exact libc the NDK's `aarch64-linux-android24-clang`
 targets, so this cross-compile is ABI-compatible with the on-device Termux environment. No-GUI
-only (`rustls-backend`), same as armv7 — no tao/wry/X11 patches or libraries needed. This
-replaced building the no-GUI aarch64 binary on-device (see "Termux aarch64 binary (with GUI,
-no audio)" below, which still builds on-device — the GUI variant is not cross-compilable, it
-needs Termux's own compiled GTK3/WebKit2GTK/X11 libraries which only exist in the Termux
-userland).
+only (`rustls-backend`), same as armv7 — no tao/wry/X11 patches or libraries needed. The
+GUI variant is the next section.
 
 **One-time setup:** same as armv7 above (NDK + `patchelf` already covered) plus
 `rustup target add aarch64-linux-android`.
@@ -119,6 +116,36 @@ apply itself), and copies the result out.
   it to the Termux phone (192.168.2.50) and running it there directly — `--version` printed
   correctly, and a `--local-server` smoke test (bundled SQLite + socket bind + HTTP request)
   returned `HTTP 200`, both under the phone's real Bionic/Termux environment.
+
+### Termux aarch64 binary (cross-compiled, with webview GUI, no audio)
+
+Cross-compiled here with the same NDK clang as the no-GUI build. It links against Termux's
+own aarch64 GTK3/WebKit2GTK/libsoup/X11 libraries, taken from Termux's apt repositories:
+Termux builds every package by cross-compiling with the NDK, so its `.deb`s are a ready-made
+sysroot. `tools/termux-sysroot.py` resolves the dependency closure of `webkit2gtk-4.1`, `gtk3`
+and `libc++` from the `termux-main` and `termux-x11` indexes, downloads each package
+(SHA256-checked; cached in `~/.cache/clay-termux-sysroot/.debs`, ~160 packages, ~850 MB
+unpacked) and unpacks it with `dpkg-deb -x`. pkg-config is pointed at it via
+`PKG_CONFIG_SYSROOT_DIR`, since Termux's `.pc` files carry the on-device prefix.
+
+**Build:**
+```bash
+export PATH="$HOME/.local/bin:$PATH"   # patchelf, as for the other Termux builds
+./build-termux-aarch64-gui.sh
+```
+The tao/wry Termux patches (`patches/apply-patches.sh`) append `[patch.crates-io]` to
+`Cargo.toml`, so the script builds in a throwaway `git worktree` at HEAD
+(`target/termux-gui-wt`, removed afterwards) — the main checkout is never modified. Build
+output goes to `target/termux-gui/` so dependencies are reused between releases.
+- Binary: copied to `/tmp/clay-termux-aarch64`
+- Release asset name: `clay-termux-aarch64`
+- Verified 2026-09-24 (v1.6.16): its `NEEDED` list and RUNPATH are identical to the last
+  phone-built asset (v1.6.13), and it loads all 95 GTK/WebKit libraries and runs `--version`
+  on the x86_64 emulator under ARM translation. Emulator-test gotchas: `LD_LIBRARY_PATH` leaks
+  into the x86 translator (use a test copy with patchelf'd RUNPATH instead); `/system/lib64` there
+  holds x86 libs (drop it from the test copy's RUNPATH); and some Termux libs record NEEDED as
+  absolute `/data/data/com.termux/...` paths (fine on a phone; `patchelf --replace-needed` on the
+  test copies). Not yet launched as a window in Termux:X11 on the phone.
 
 ### Android APK
 ```bash
@@ -255,28 +282,10 @@ defaults to an old minimum, but C dependencies built by `cc`/clang (SQLite, ring
 to the SDK's own version, which would stop the binary loading on older macOS. 11.0 matches
 what the physical Mac (Big Sur) produces, so users on Big Sur and later keep working.
 
-## Termux (192.168.2.50)
+## Termux phone (192.168.2.50) — testing only
 
-- User: `adrick`
-- SSH port: `8022`
-- Path: `~/clay`
+No release target is built here any more (the GUI build moved to the local cross-build above
+on 2026-09-24). Use it to test the Termux binaries on a real device.
+
+- User: `adrick`, SSH port `8022`, checkout `~/clay`
 - SSH command: `ssh -p 8022 adrick@192.168.2.50`
-
-### Termux aarch64 binary (with GUI, no audio)
-
-This is the only Termux build still done on-device — it needs Termux's own compiled
-GTK3/WebKit2GTK/X11 libraries (`pkg install webkit2gtk-4.1 xorgproto`), which don't exist
-outside the Termux userland and can't be cross-compiled against (see
-`patches/apply-patches.sh`; the no-GUI aarch64 build was moved to the "Local Machine" section
-above once this stopped being true for it).
-
-```bash
-cd ~/clay
-git pull
-./patches/apply-patches.sh
-PKG_CONFIG_PATH=/data/data/com.termux/files/usr/lib/pkgconfig RUSTFLAGS="-L /system/lib64 -C link-arg=-Wl,-rpath,/system/lib64" cargo build --release --no-default-features --features rustls-backend,webview-gui,ssh-transport
-patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/release/clay
-```
-- Binary: `~/clay/target/release/clay`
-- Release asset name: `clay-termux-aarch64`
-- SCP back: `scp -P 8022 adrick@192.168.2.50:~/clay/target/release/clay /tmp/clay-termux-aarch64`
