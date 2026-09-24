@@ -46,7 +46,7 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-pub(crate) const VERSION: &str = "1.6.15";
+pub(crate) const VERSION: &str = "1.6.16";
 /// The minimum Android app version this server considers fully compatible: the last
 /// release in which the Android app itself changed (the bundled web client in `src/web/`,
 /// or the native app in `android/app/`). `/release` sets it to the new `VERSION` exactly
@@ -54,7 +54,7 @@ pub(crate) const VERSION: &str = "1.6.15";
 /// A phone whose app version (== the Clay version it was built from; `build.gradle` reads
 /// it from Cargo.toml) is older than this shows one "please update" warning per server
 /// version; one at or above it is current, even against a newer server.
-pub(crate) const ANDROID_APP_VERSION: &str = "1.6.15";
+pub(crate) const ANDROID_APP_VERSION: &str = "1.6.16";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
