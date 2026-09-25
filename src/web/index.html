@@ -6,6 +6,10 @@
     <title>Clay MUD Client</title>
     <link rel="stylesheet" href="style.css">
     <style id="theme-vars">:root { {{THEME_CSS_VARS}} }</style>
+    <!-- A dedicated note window (?note=N: the desktop GUI's note window, or a browser
+         tab) is marked before <body> is parsed, so style.css can keep the chat UI from
+         ever being painted - the window shows the theme background, then the note. -->
+    <script>if (/[?&]note=\d/.test(location.search)) document.documentElement.classList.add('note-window');</script>
 </head>
 <body>
     <div id="app">

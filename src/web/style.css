@@ -569,6 +569,14 @@ body.theme-light .icon-bar {
 
 /* ─── Note Editor (own window/tab, NOTE_MODE — see webview_gui.rs's
    WvEvent::NoteWindow) ─── */
+/* A dedicated note window (desktop GUI / ?note= tab, marked in index.html's <head>):
+   never show the chat UI - only the theme background until enterNoteMode() shows the
+   note editor. Dialogs (.modal: auth, connection log) stay usable. !important because
+   showAuthModal(false)/setupToolbars() restore the bars with inline style.display = ''. */
+html.note-window #app > :not(#note-editor-view):not(.modal) {
+    display: none !important;
+}
+
 .note-editor-view {
     display: none;   /* shown via JS only when NOTE_MODE is set */
     flex-direction: column;

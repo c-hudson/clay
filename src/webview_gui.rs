@@ -1222,6 +1222,10 @@ fn build_webview(
     reload_tx: &Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
     world_lock: Option<&str>,
     extra_js: Option<&str>,
+    // Query appended to the start URL (e.g. `note=3` for a note window, which
+    // index.html's <head> reads to keep the chat UI from ever being painted).
+    // The custom protocol serves by path, so it never changes which file loads.
+    start_query: Option<&str>,
 ) -> io::Result<wry::WebView> {
     // Build HTML with WS params baked into template placeholders
     let mut html_content = build_html(params);
@@ -1283,7 +1287,10 @@ fn build_webview(
                 .body(body)
                 .unwrap()
         })
-        .with_url("clay://localhost/index.html")
+        .with_url(match start_query {
+            Some(q) => format!("clay://localhost/index.html?{}", q),
+            None => "clay://localhost/index.html".to_string(),
+        })
         .with_clipboard(true)
         .with_devtools(cfg!(debug_assertions) || cfg!(target_os = "android"))
         .with_ipc_handler({
@@ -1421,7 +1428,7 @@ fn create_webview_window(
     let _stderr_guard = StderrSuppress::new();
 
     // Build the first webview (initial_world_lock is handled inside build_html via env var)
-    let webview = build_webview(&window, params, &proxy, &reload_tx, None, None)?;
+    let webview = build_webview(&window, params, &proxy, &reload_tx, None, None, None)?;
 
     #[cfg(unix)]
     drop(_stderr_guard);
@@ -1593,7 +1600,7 @@ fn create_webview_window(
 
                 let world_lock = world.as_deref();
                 let extra_js = spawned_window_js(None, auth);
-                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, extra_js.as_deref()) {
+                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, extra_js.as_deref(), None) {
                     Ok(wv) => {
                         let id = new_window.id();
                         windows.insert(id, new_window);
@@ -1625,7 +1632,7 @@ fn create_webview_window(
                 );
                 let world_lock = world.as_deref();
                 let extra_js = spawned_window_js(Some(grep_js), auth);
-                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, extra_js.as_deref()) {
+                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, extra_js.as_deref(), None) {
                     let id = new_window.id();
                     windows.insert(id, new_window);
                     webviews.insert(id, wv);
@@ -1649,7 +1656,8 @@ fn create_webview_window(
 
                 let note_js = format!("window.NOTE_MODE = {{ world_index: {} }};", world_index);
                 let extra_js = spawned_window_js(Some(note_js), auth);
-                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, None, extra_js.as_deref()) {
+                let note_query = format!("note={}", world_index);
+                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, None, extra_js.as_deref(), Some(&note_query)) {
                     let id = new_window.id();
                     windows.insert(id, new_window);
                     webviews.insert(id, wv);

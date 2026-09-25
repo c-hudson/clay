@@ -822,6 +822,9 @@
             noteMode = { world_index: noteWorldIndex };
         }
     }
+    // A note window/tab shows only the background until the note loads (see
+    // html.note-window in style.css); don't let a tab read "Clay MUD Client" meanwhile.
+    if (noteMode) document.title = 'Clay - Notes';
 
     // Login handed down by the window that spawned this one (note editor,
     // /window, /window --grep), so a spawned window doesn't re-prompt for a
