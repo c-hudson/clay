@@ -393,6 +393,7 @@ function connect() {
   ws = new WebSocket(url);
 
   ws.onopen = function() {
+    authChallenge = '';
     document.getElementById('authStatus').textContent = 'Enter password';
     document.getElementById('authPassword').focus();
   };
@@ -414,6 +415,8 @@ function wsSend(msg) {
 function handleWsMessage(msg) {
   switch (msg.type) {
     case 'ServerHello':
+      // Answer only this challenge: the bare hash is a replayable credential.
+      authChallenge = msg.challenge || '';
       break;
     case 'AuthResponse':
       if (msg.success) {
@@ -480,16 +483,25 @@ function normalizeActions() {
 // ============================================================
 // Auth
 // ============================================================
+// Challenge from this socket's ServerHello (challenge-response auth).
+let authChallenge = '';
+
 async function doAuth() {
   const password = document.getElementById('authPassword').value;
   if (!password) return;
   document.getElementById('authError').textContent = '';
-  try {
-    const hash = await hashPassword(password);
-    wsSend({ type: 'AuthRequest', password_hash: hash });
-  } catch (e) {
-    wsSend({ type: 'AuthRequest', password_hash: sha256Fallback(password) });
+  if (!authChallenge) {
+    // Never send the bare password hash: it is a replayable credential.
+    document.getElementById('authError').textContent = 'No authentication challenge from server yet - try again';
+    return;
   }
+  let response;
+  try {
+    response = await hashPassword((await hashPassword(password)) + authChallenge);
+  } catch (e) {
+    response = sha256Fallback(sha256Fallback(password) + authChallenge);
+  }
+  wsSend({ type: 'AuthRequest', password_hash: response, challenge_response: true });
 }
 
 async function hashPassword(password) {

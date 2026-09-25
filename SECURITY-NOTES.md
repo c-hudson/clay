@@ -214,3 +214,24 @@ web server from outside:
   only affects the Clay program; no port is opened for anything else.
 - **Look Up Public IP** contacts `checkip.amazonaws.com` when you press it, and never on
   its own.
+
+## Your Clay password on the network
+
+Clay's own login password (and the device auth key) is never sent across a network
+unencrypted, and never appears in a URL:
+
+- Remote clients always reach the server over TLS (`https`/`wss`), in every server mode —
+  the TUI, the desktop GUI, `-D` and `--multiuser`. Only connections from the same machine
+  (the local GUI, the Android on-device server, an SSH tunnel's local end) use plain `ws`.
+  Clay's clients will not fall back to plain `ws` for a remote host.
+- The login is a challenge-response: the password itself is never sent, only a one-time
+  answer to a random challenge. The server refuses a bare password hash or raw auth key
+  from anywhere but the same machine.
+- The server never sends its password to clients, not even to logged-in ones: the Web
+  settings show only that a password is set. Leave the field blank to keep it.
+- A new GUI window (note editor, `/window`) reuses the login of the window that opened it
+  inside the same process; nothing is written to disk or put in a URL.
+
+MUD world passwords are separate: they go to the MUD exactly as the MUD's own connection
+requires (unencrypted on a non-SSL world).
+

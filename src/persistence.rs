@@ -1044,7 +1044,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     // Backward compat: old single web_font_size sets all three
                     "web_font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            let clamped = s.clamp(8.0, 48.0);
+                            let clamped = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
                             app.settings.web_font_size_phone = clamped;
                             app.settings.web_font_size_tablet = clamped;
                             app.settings.web_font_size_desktop = clamped;
@@ -1052,17 +1052,17 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     }
                     "web_font_size_phone" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_phone = s.clamp(8.0, 48.0);
+                            app.settings.web_font_size_phone = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
                         }
                     }
                     "web_font_size_tablet" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_tablet = s.clamp(8.0, 48.0);
+                            app.settings.web_font_size_tablet = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
                         }
                     }
                     "web_font_size_desktop" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_desktop = s.clamp(8.0, 48.0);
+                            app.settings.web_font_size_desktop = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
                         }
                     }
                     "web_font_weight" => {
@@ -2840,7 +2840,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     // Backward compat: old single web_font_size sets all three
                     "web_font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            let clamped = s.clamp(8.0, 48.0);
+                            let clamped = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
                             app.settings.web_font_size_phone = clamped;
                             app.settings.web_font_size_tablet = clamped;
                             app.settings.web_font_size_desktop = clamped;
@@ -2848,17 +2848,17 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     }
                     "web_font_size_phone" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_phone = s.clamp(8.0, 48.0);
+                            app.settings.web_font_size_phone = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
                         }
                     }
                     "web_font_size_tablet" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_tablet = s.clamp(8.0, 48.0);
+                            app.settings.web_font_size_tablet = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
                         }
                     }
                     "web_font_size_desktop" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_desktop = s.clamp(8.0, 48.0);
+                            app.settings.web_font_size_desktop = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
                         }
                     }
                     "web_font_weight" => {

@@ -1187,7 +1187,8 @@ pub async fn start_https_server(
     let tls_acceptor = tokio_native_tls::TlsAcceptor::from(tls_acceptor);
     let tls_acceptor = Arc::new(tls_acceptor);
 
-    let addr = format!("0.0.0.0:{}", server.port);
+    // Loopback-only for --local-server (the on-device server), all interfaces otherwise.
+    let addr = format!("{}:{}", http_bind_host(), server.port);
     // Retry binding with delays — on reload, the previous process may still be releasing the port
     let listener = {
         let mut last_err = None;
@@ -1390,7 +1391,8 @@ pub async fn start_https_server(
 
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
 
-    let addr = format!("0.0.0.0:{}", server.port);
+    // Loopback-only for --local-server (the on-device server), all interfaces otherwise.
+    let addr = format!("{}:{}", http_bind_host(), server.port);
     // Retry binding with delays — on reload, the previous process may still be releasing the port
     let listener = {
         let mut last_err = None;

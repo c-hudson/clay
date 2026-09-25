@@ -87,6 +87,13 @@ pub(crate) async fn run_grep_client(
     } else {
         (format!("wss://{}", addr_with_port), true)
     };
+    // Plaintext ws:// only to this machine; see util::is_loopback_host.
+    let plaintext_ok = crate::util::is_loopback_host(crate::util::host_of_addr(&addr_with_port));
+    if ws_url.starts_with("ws://") && !plaintext_ok {
+        eprintln!("Refusing unencrypted ws:// to a remote host (the login would be sent in the clear). Use wss:// or --ssh.");
+        std::process::exit(1);
+    }
+    let try_fallback = try_fallback && plaintext_ok;
 
     let host_port_key = addr_with_port
         .trim_start_matches("wss://")
@@ -473,7 +480,8 @@ pub(crate) async fn run_grep_client(
 pub enum ImportClientError {
     /// The target didn't accept a TLS connection and `allow_insecure` was false. The caller
     /// should ask the user to confirm sending the password/auth-key in cleartext, then retry
-    /// with `allow_insecure: true`.
+    /// with `allow_insecure: true`. Only ever returned for a loopback target: a remote one
+    /// that refuses TLS is a `ConnectFailed`, never an offer to go plaintext.
     NeedsInsecureConfirm,
     /// Connected, but the target rejected the password/auth-key.
     AuthFailed(String),
@@ -539,6 +547,14 @@ pub(crate) async fn run_import_client(
                     return Err(ImportClientError::ConnectFailed(format!(
                         "TLS certificate for {} has changed (was {}, now {}) - refusing to connect",
                         mismatch.host, mismatch.old_fingerprint, mismatch.new_fingerprint
+                    )));
+                }
+                // Never offer plaintext to a remote host: the import sends the password
+                // or auth key, and the reply carries the target's secrets.
+                if !crate::util::is_loopback_host(crate::util::host_of_addr(&addr_with_port)) {
+                    return Err(ImportClientError::ConnectFailed(format!(
+                        "Secure (TLS) connection to {} failed: {} - not falling back to unencrypted ws:// for a remote host",
+                        addr_with_port, e
                     )));
                 }
                 if !allow_insecure {
@@ -736,9 +752,16 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
         let (ws_url, try_fallback) = if addr_with_port.starts_with("ws://") || addr_with_port.starts_with("wss://") {
             (addr_with_port.clone(), false)
         } else {
-            // Default to wss:// for security, will fall back to ws:// if it fails
+            // Default to wss:// for security; falls back to ws:// only for this machine
             (format!("wss://{}", addr_with_port), true)
         };
+        // Plaintext ws:// only to this machine; see util::is_loopback_host.
+        let plaintext_ok = crate::util::is_loopback_host(crate::util::host_of_addr(&addr_with_port));
+        if ws_url.starts_with("ws://") && !plaintext_ok {
+            eprintln!("Refusing unencrypted ws:// to a remote host (the login would be sent in the clear). Use wss:// or --ssh.");
+            return Ok(());
+        }
+        let try_fallback = try_fallback && plaintext_ok;
 
         println!("Connecting to {}...", ws_url);
 
@@ -1667,7 +1690,7 @@ pub(crate) fn handle_remote_client_key(
                     ws_port: 0,        // Legacy
                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                     ws_key_file: app.settings.websocket_key_file.clone(),
-                    ws_password: String::new(),  // Never send existing password to remote clients
+                    ws_password: String::new(),  // Empty = unchanged (see apply_remote_web_settings)
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
                     dictionary_path: app.settings.dictionary_path.clone(),
                     mouse_enabled: app.settings.mouse_enabled,
@@ -2782,7 +2805,9 @@ pub(crate) fn apply_remote_web_settings(
         ws_port: 0,         // Legacy
         ws_cert_file: app.settings.websocket_cert_file.clone(),
         ws_key_file: app.settings.websocket_key_file.clone(),
-        ws_password: String::new(),  // Never send existing password to remote clients
+        // Empty = unchanged (the server never sends us its password, so the popup's
+        // field starts blank); a value typed into the popup sets a new one.
+        ws_password: settings.ws_password.clone(),
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
         dictionary_path: app.settings.dictionary_path.clone(),
         mouse_enabled: app.settings.mouse_enabled,

@@ -1641,9 +1641,18 @@ pub struct GlobalSettingsMsg {
     /// Auth key value for display in web settings (only sent to authenticated clients)
     #[serde(default)]
     pub auth_key: String,
-    /// WebSocket password (plaintext, sent to authenticated clients for display in settings)
+    /// Legacy: once carried the plaintext WebSocket password for display in settings.
+    /// A server now always sends it empty (the password never leaves the server), and
+    /// reports only whether one is set via `ws_password_set`. Kept on the wire because
+    /// a client echoes it back in `UpdateGlobalSettings.ws_password`, where empty means
+    /// "unchanged" — an older server that still sends the real value gets it back
+    /// intact instead of having its password cleared.
     #[serde(default)]
     pub ws_password: String,
+    /// Whether the server has a WebSocket password configured (the value itself is
+    /// never sent). False from a server that predates it.
+    #[serde(default)]
+    pub ws_password_set: bool,
     /// The remote-access picture (`reach::ReachabilityInfo` as JSON): LAN/VPN/public
     /// addresses, Windows Firewall verdict, router (UPnP) mapping state and the "type
     /// this on the other device" hints. Display-only: clients render it, never
@@ -2690,6 +2699,20 @@ impl WebSocketServer {
     }
 }
 
+/// True for an address that can only be this machine (IPv4-mapped loopback included).
+pub fn is_loopback_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
+/// Whether an `AuthRequest` may carry a bare password hash / raw auth key (no
+/// challenge-response). Those replay, so they are accepted only from loopback.
+pub fn plain_credential_allowed(uses_challenge: bool, peer: &std::net::IpAddr) -> bool {
+    uses_challenge || is_loopback_ip(peer)
+}
+
 /// Hash a password using SHA-256
 pub fn hash_password(password: &str) -> String {
     let mut hasher = Sha256::new();
@@ -3277,6 +3300,23 @@ where
                             crate::http::log_remote_event("WS-AUTH", &client_ip,
                                 &format!("has_key={}, has_password={}, challenge={}", has_key, has_pw, uses_challenge));
 
+                            // Without challenge-response the client sent the bare password
+                            // hash or the raw auth key: replayable credentials, so anyone who
+                            // ever captured one could log in with it. Only the local machine
+                            // may do that (the local GUI's and the on-device server's
+                            // AUTO_PASSWORD; an SSH tunnel's end is local too, and encrypted).
+                            if !plain_credential_allowed(*uses_challenge, &client_addr.ip()) && (has_key || has_pw) {
+                                crate::http::log_remote_event("WS-REJECT", &client_ip,
+                                    "credential without challenge-response from a non-loopback address");
+                                try_send_local(&clients, client_id, &tx, &client_ip, WsMessage::AuthResponse {
+                                    success: false,
+                                    error: Some("Challenge-response authentication required".to_string()),
+                                    username: None,
+                                    multiuser_mode,
+                                });
+                                continue;
+                            }
+
                             // Try auth_key first (device key authentication)
                             // auth_key validation must happen in the app since keys are stored there
                             // So we forward to app and let it respond (include challenge for verification)
@@ -3287,8 +3327,12 @@ where
                                 continue;
                             }
 
-                            // Password-based auth: reject if no password is configured
-                            if !password_enabled {
+                            // Password-based auth: reject if no password is configured.
+                            // Single-user only: multiuser checks each user's own password
+                            // (the users map below), and never sets the global one - this
+                            // check used to reject every multiuser login unless a stray
+                            // global websocket_password happened to be in multiuser.dat.
+                            if !password_enabled && !multiuser_mode {
                                 crate::http::log_remote_event("WS-REJECT", &client_ip,
                                     "no password configured, auth key required");
                                 try_send_local(&clients, client_id, &tx, &client_ip, WsMessage::AuthResponse {

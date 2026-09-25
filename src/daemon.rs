@@ -120,21 +120,20 @@ pub async fn run_daemon_server() -> io::Result<()> {
         }
     };
 
-    // Start unified HTTP+WS server if enabled
+    // Start the unified HTTP+WS server if enabled. Always TLS for remote clients,
+    // like the TUI/GUI (see resolve_web_cert_files: a configured cert wins, else an
+    // auto-generated one); localhost is served plain by the accept loop itself. There
+    // is no plain-HTTP mode for remote clients any more: it sent the login and every
+    // settings message across the network unencrypted.
     if app.settings.http_enabled {
-        let has_cert = !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty();
-        let web_secure = app.settings.web_secure;
-
-        if web_secure && has_cert {
-            // Start HTTPS+WSS
-            #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
-            {
+        #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
+        match resolve_web_cert_files(&mut app) {
+            Some((cert_file, key_file)) => {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
                 match start_https_server(
                     &mut https_server,
-                    &app.settings.websocket_cert_file,
-                    &app.settings.websocket_key_file,
+                    &cert_file,
+                    &key_file,
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
@@ -150,20 +149,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     }
                 }
             }
-        } else {
-            // Start HTTP+WS
-            let mut http_server = HttpServer::new(app.settings.http_port);
-            match start_http_server(&mut http_server, ws_state.clone(), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), None, gate.clone()).await {
-                Ok(()) => {
-                    let protocol = if ws_state.is_some() { "HTTP+WS" } else { "HTTP" };
-                    println!("{}: http://0.0.0.0:{}", protocol, app.settings.http_port);
-                    app.http_server = Some(http_server);
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to start HTTP server: {}", e);
-                }
-            }
+            None => eprintln!("Error: no TLS certificate available; not starting the web server."),
         }
+        #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
+        eprintln!("Error: built without TLS support; not starting the web server.");
     }
 
     // Check if any servers are running
@@ -1946,18 +1935,33 @@ keep_alive_type=Generic
     let ws_state = Arc::new(server.connection_state(event_tx.clone()));
     app.ws_server = Some(server);
 
-    // Start unified HTTP+WS server
+    // Start the unified HTTPS+WSS server. Always TLS for remote clients (the plain
+    // HTTP server sent every user's login and settings across the network
+    // unencrypted); localhost is served plain by the accept loop itself. A cert set
+    // in multiuser.dat wins, else the auto-generated one.
     {
-        let mut http_server = HttpServer::new(app.settings.http_port);
-        match start_http_server(&mut http_server, Some(ws_state.clone()), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), None, gate.clone()).await {
-            Ok(()) => {
-                println!("HTTP+WS: http://0.0.0.0:{}", app.settings.http_port);
-                app.http_server = Some(http_server);
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to start HTTP+WS server: {}", e);
+        #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
+        {
+            let Some((cert_file, key_file)) = resolve_web_cert_files_multiuser(&mut app) else {
+                eprintln!("Error: no TLS certificate available; not starting the web server.");
                 return Ok(());
+            };
+            let mut https_server = HttpsServer::new(app.settings.http_port);
+            match start_https_server(&mut https_server, &cert_file, &key_file, Some(ws_state.clone()), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), gate.clone()).await {
+                Ok(()) => {
+                    println!("HTTPS+WSS: https://0.0.0.0:{}", app.settings.http_port);
+                    app.https_server = Some(https_server);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to start HTTPS+WSS server: {}", e);
+                    return Ok(());
+                }
             }
+        }
+        #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
+        {
+            eprintln!("Error: built without TLS support; not starting the web server.");
+            return Ok(());
         }
     }
 

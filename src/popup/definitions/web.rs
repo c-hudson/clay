@@ -302,6 +302,20 @@ fn update_web_visibility_def(def: &mut PopupDefinition) {
 /// `WEB_FIELD_VALIDATION_MSG` field (text + visibility). Returns
 /// `blocks_save` so the two visibility-updater entry points above can hand
 /// it straight to their own callers.
+/// `custom_data` key: the server already has a password that this (remote) popup
+/// was not sent, so an empty password field means "keep it", not "none".
+const PASSWORD_SET_KEY: &str = "ws_password_set";
+
+/// Mark a /web popup as editing a server whose password is set but not shown: the
+/// empty password field then means "unchanged" and doesn't block saving.
+pub fn mark_password_set_elsewhere(def: &mut PopupDefinition) {
+    def.custom_data.insert(PASSWORD_SET_KEY.to_string(), "1".to_string());
+    if let Some(field) = def.get_field_mut(WEB_FIELD_WS_PASSWORD) {
+        field.label = "Password (blank=keep)".to_string();
+    }
+    apply_validation(def);
+}
+
 fn apply_validation(def: &mut PopupDefinition) -> bool {
     let text_of = |def: &PopupDefinition, id: FieldId| -> String {
         def.get_field(id).and_then(|f| f.kind.get_text()).unwrap_or("").to_string()
@@ -312,7 +326,10 @@ fn apply_validation(def: &mut PopupDefinition) -> bool {
 
     let port_mode = selected_of(def, WEB_FIELD_PORT);
     let custom_port = text_of(def, WEB_FIELD_CUSTOM_PORT);
-    let password = text_of(def, WEB_FIELD_WS_PASSWORD);
+    let mut password = text_of(def, WEB_FIELD_WS_PASSWORD);
+    if password.is_empty() && def.custom_data.get(PASSWORD_SET_KEY).is_some_and(|v| v == "1") {
+        password = "(unchanged)".to_string(); // validation only; never saved
+    }
     let custom_cert = selected_of(def, WEB_FIELD_CUSTOM_CERT) == "yes";
     let cert_file = text_of(def, WEB_FIELD_WS_CERT_FILE);
     let key_file = text_of(def, WEB_FIELD_WS_KEY_FILE);
@@ -526,6 +543,18 @@ mod tests {
         // Port disabled: garbage everywhere else must not surface a message.
         let def = create_web_popup(false, 65535, "clay", "", "notanumber", "", "/only-cert", "", -5);
         assert!(!def.get_field(WEB_FIELD_VALIDATION_MSG).unwrap().visible);
+    }
+
+    #[test]
+    fn test_blank_password_allowed_when_set_on_server() {
+        let mut def = create_web_popup(true, 9000, "clay", "", "", "", "", "", 100);
+        assert!(def.get_field(WEB_FIELD_VALIDATION_MSG).unwrap().visible);
+        mark_password_set_elsewhere(&mut def);
+        assert!(!def.get_field(WEB_FIELD_VALIDATION_MSG).unwrap().visible);
+        let mut state = PopupState::new(def);
+        assert!(!update_web_visibility(&mut state));
+        // The placeholder used for validation is never the saved value.
+        assert_eq!(state.get_text(WEB_FIELD_WS_PASSWORD), Some(""));
     }
 
     #[test]

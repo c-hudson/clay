@@ -61,12 +61,12 @@ enum WvEvent {
     /// an independent master (remote GUI only — master GUI handles /connect server-side)
     RemoteRelaunch { addr: Option<String> },
     /// Open a new window (optionally locked to a world)
-    NewWindow(Option<String>),
+    NewWindow { world: Option<String>, auth: Option<InheritedAuth> },
     /// Open a grep results window (half height, no status/input, filtered output)
-    GrepWindow { pattern: String, world: Option<String>, use_regex: bool },
+    GrepWindow { pattern: String, world: Option<String>, use_regex: bool, auth: Option<InheritedAuth> },
     /// Open a note-editor window for a world's notes (own OS window, not a
     /// shell-out or in-page modal — see NOTE_MODE in web/app.js)
-    NoteWindow { world_index: usize, world_name: String },
+    NoteWindow { world_index: usize, world_name: String, auth: Option<InheritedAuth> },
     /// Close one specific spawned window (e.g. the note editor's Cancel
     /// button) without exiting the whole app — unlike Quit. Reuses the same
     /// removal logic as a native close (WindowEvent::CloseRequested).
@@ -75,6 +75,67 @@ enum WvEvent {
 
 use crate::theme::ThemeFile;
 use crate::websocket::hash_password;
+
+/// A login handed from the window that asked for a spawned window (note
+/// editor, /window, /window --grep) to that new window, so a remote GUI doesn't
+/// re-prompt for the password the user already typed. It travels only
+/// parent -> child inside this process (IPC in, injected JS out); the child
+/// still authenticates with the normal ServerHello challenge-response, so the
+/// server-side gates are unchanged. Master mode never sends one: every window
+/// there already gets AUTO_PASSWORD.
+#[derive(Clone, PartialEq)]
+struct InheritedAuth {
+    password: String,
+    username: Option<String>,
+}
+
+impl std::fmt::Debug for InheritedAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InheritedAuth")
+            .field("password", &"<redacted>")
+            .field("username", &self.username)
+            .finish()
+    }
+}
+
+/// Read the optional `auth` object from a spawned-window IPC payload.
+fn parse_inherited_auth(v: &serde_json::Value) -> Option<InheritedAuth> {
+    let password = v["auth"]["password"].as_str().filter(|p| !p.is_empty())?;
+    let username = v["auth"]["username"].as_str().filter(|u| !u.is_empty()).map(|u| u.to_string());
+    Some(InheritedAuth { password: password.to_string(), username })
+}
+
+/// Parse a `new-window:` payload: JSON `{world, auth}`, or the older bare
+/// world name (empty = not world-locked).
+fn parse_new_window_payload(rest: &str) -> (Option<String>, Option<InheritedAuth>) {
+    let rest = rest.trim();
+    if rest.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
+            let world = v["world"].as_str().filter(|w| !w.is_empty()).map(|w| w.to_string());
+            return (world, parse_inherited_auth(&v));
+        }
+    }
+    let world = if rest.is_empty() { None } else { Some(rest.to_string()) };
+    (world, None)
+}
+
+/// JS statement that hands `auth` to a new window's app.js (seedInheritedAuth).
+/// JSON is a valid JS literal; `<`, U+2028 and U+2029 are escaped as well so
+/// a password containing `</script>` can't end the inline script block.
+fn inherited_auth_js(auth: &InheritedAuth) -> String {
+    let json = serde_json::json!({ "password": auth.password, "username": auth.username }).to_string();
+    let json = json.replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
+    format!("window.INHERITED_AUTH = {};", json)
+}
+
+/// Combine a window's mode JS (GREP_MODE / NOTE_MODE) with an inherited login.
+fn spawned_window_js(mode_js: Option<String>, auth: &Option<InheritedAuth>) -> Option<String> {
+    let auth_js = auth.as_ref().map(inherited_auth_js);
+    match (mode_js, auth_js) {
+        (Some(m), Some(a)) => Some(format!("{}\n        {}", m, a)),
+        (m, a) => m.or(a),
+    }
+}
 
 /// Open a URL in the system's default browser (platform-specific).
 fn open_url_in_browser(url: &str) {
@@ -363,24 +424,14 @@ pub fn run_master_webgui() -> io::Result<()> {
         // Drop the test listener immediately — the real bind happens inside run_app_headless.
     }
 
-    // Generate a random password using time + pid as entropy
-    let random_bytes: [u8; 32] = {
-        let mut buf = [0u8; 32];
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let pid = std::process::id() as u64;
-        let mut state = seed ^ (pid << 32) ^ 0x517cc1b727220a95;
-        for byte in buf.iter_mut() {
-            // xorshift64
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *byte = state as u8;
-        }
-        buf
-    };
+    // Random session password from the OS CSPRNG (the server listens on all
+    // interfaces for remote clients, so this must not be guessable). Fail closed.
+    let mut random_bytes = [0u8; 32];
+    if let Err(e) = getrandom::getrandom(&mut random_bytes) {
+        let msg = format!("Could not generate a secure session password: {}", e);
+        show_error_dialog("Clay", &msg);
+        return Err(io::Error::other(msg));
+    }
     let password = hex::encode(random_bytes);
     let password_hash = hash_password(&password);
 
@@ -510,7 +561,7 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
                 let Ok((local_stream, _)) = tokio_listener.accept().await else { continue };
                 let target = target.clone();
                 tokio::spawn(async move {
-                    let _ = ws_proxy_bridge(local_stream, "", "", Some(target)).await;
+                    let _ = ws_proxy_bridge(local_stream, "", None, Some(target)).await;
                 });
             }
         });
@@ -550,8 +601,19 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
         (addr_stripped.to_string(), 9000)
     };
 
+    // Plaintext ws:// only to this machine: to anything else the login, the auth
+    // key and every settings message would cross the network unencrypted.
+    let plaintext_ok = crate::util::is_loopback_host(&host);
+    if explicit_protocol == Some("ws") && !plaintext_ok {
+        return Err(io::Error::other(
+            "Refusing unencrypted ws:// to a remote host (the login would be sent in the clear). Use wss:// or --ssh."));
+    }
+
     // Determine if we can connect directly via ws:// or need a proxy for wss://
-    let use_proxy = if explicit_protocol == Some("ws") {
+    let use_proxy = if !plaintext_ok {
+        // Remote host: always TLS, through the pinning proxy
+        true
+    } else if explicit_protocol == Some("ws") {
         // User explicitly requested ws://, connect directly
         false
     } else if explicit_protocol == Some("wss") {
@@ -573,7 +635,8 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
         let tokio_listener = tokio::net::TcpListener::from_std(local_listener)?;
 
         let remote_wss = format!("wss://{}:{}", host, port);
-        let remote_ws = format!("ws://{}:{}", host, port);
+        // Plain ws:// fallback only for a loopback host (see plaintext_ok above)
+        let remote_ws = if plaintext_ok { format!("ws://{}:{}", host, port) } else { String::new() };
 
         runtime.handle().spawn(async move {
             loop {
@@ -581,7 +644,8 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
                 let wss = remote_wss.clone();
                 let ws = remote_ws.clone();
                 tokio::spawn(async move {
-                    let _ = ws_proxy_bridge(local_stream, &wss, &ws, None).await;
+                    let ws_fallback = if ws.is_empty() { None } else { Some(ws.as_str()) };
+                    let _ = ws_proxy_bridge(local_stream, &wss, ws_fallback, None).await;
                 });
             }
         });
@@ -676,14 +740,15 @@ type BoxedRemoteSink = Box<dyn futures::Sink<tokio_tungstenite::tungstenite::Mes
 type BoxedRemoteSource = Box<dyn futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send>;
 
 /// Bridge a local WebSocket connection to a remote WebSocket server.
-/// Tries WSS first (with self-signed cert support), falls back to WS - unless
+/// Tries WSS first (with self-signed cert support), falls back to `ws_url` when
+/// given (the caller passes one only for a loopback host) - unless
 /// `ssh` is set, in which case the remote is reached through an SSH tunnel
 /// instead (see `crate::ssh`) and `wss_url`/`ws_url` are ignored.
 /// Forwards messages bidirectionally until either side disconnects.
 async fn ws_proxy_bridge(
     local_stream: tokio::net::TcpStream,
     wss_url: &str,
-    ws_url: &str,
+    ws_url: Option<&str>,
     ssh: Option<crate::ssh::SshTarget>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures::{SinkExt, StreamExt};
@@ -742,9 +807,12 @@ async fn ws_proxy_bridge(
                                 mismatch.host, mismatch.old_fingerprint, mismatch.new_fingerprint
                             ).into());
                         }
-                        let _ = e;
-                        // WSS failed for an ordinary reason (no listener, no rustls support, etc.), try plain WS
-                        tokio_tungstenite::connect_async(ws_url).await?.0
+                        // WSS failed for an ordinary reason (no listener, no rustls support, etc.):
+                        // plain WS only where the caller allowed it (a loopback host).
+                        match ws_url {
+                            Some(ws_url) => tokio_tungstenite::connect_async(ws_url).await?.0,
+                            None => return Err(e.into()),
+                        }
                     }
                 }
             }
@@ -753,7 +821,10 @@ async fn ws_proxy_bridge(
                 // Without rustls, try plain connect (handles both ws:// and wss://)
                 match tokio_tungstenite::connect_async(wss_url).await {
                     Ok((ws, _)) => ws,
-                    Err(_) => tokio_tungstenite::connect_async(ws_url).await?.0,
+                    Err(e) => match ws_url {
+                        Some(ws_url) => tokio_tungstenite::connect_async(ws_url).await?.0,
+                        None => return Err(e.into()),
+                    },
                 }
             }
         };
@@ -1039,23 +1110,24 @@ fn dispatch_ipc_message(
     if let Some(url) = body.strip_prefix("open-url:") {
         open_url_in_browser(url);
     } else if let Some(rest) = body.strip_prefix("new-window:") {
-        let world_name = rest.trim().to_string();
-        let world = if world_name.is_empty() { None } else { Some(world_name) };
-        let _ = proxy.send_event(WvEvent::NewWindow(world));
+        let (world, auth) = parse_new_window_payload(rest);
+        let _ = proxy.send_event(WvEvent::NewWindow { world, auth });
     } else if let Some(json_str) = body.strip_prefix("grep-window:") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
             let pattern = v["pattern"].as_str().unwrap_or("").to_string();
             let world = v["world"].as_str().map(|s| s.to_string());
             let use_regex = v["regex"].as_bool().unwrap_or(false);
+            let auth = parse_inherited_auth(&v);
             if !pattern.is_empty() {
-                let _ = proxy.send_event(WvEvent::GrepWindow { pattern, world, use_regex });
+                let _ = proxy.send_event(WvEvent::GrepWindow { pattern, world, use_regex, auth });
             }
         }
     } else if let Some(json_str) = body.strip_prefix("note-window:") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
             if let Some(world_index) = v["world_index"].as_u64() {
                 let world_name = v["world_name"].as_str().unwrap_or("").to_string();
-                let _ = proxy.send_event(WvEvent::NoteWindow { world_index: world_index as usize, world_name });
+                let auth = parse_inherited_auth(&v);
+                let _ = proxy.send_event(WvEvent::NoteWindow { world_index: world_index as usize, world_name, auth });
             }
         }
     } else if body == "quit" {
@@ -1503,7 +1575,7 @@ fn create_webview_window(
                     }
                 }
             }
-            Event::UserEvent(WvEvent::NewWindow(ref world)) => {
+            Event::UserEvent(WvEvent::NewWindow { ref world, ref auth }) => {
                 // Create a new window in the same process
                 let win_title = match world {
                     Some(ref w) => format!("Clay - {}", w),
@@ -1520,7 +1592,8 @@ fn create_webview_window(
                 };
 
                 let world_lock = world.as_deref();
-                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, None) {
+                let extra_js = spawned_window_js(None, auth);
+                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, extra_js.as_deref()) {
                     Ok(wv) => {
                         let id = new_window.id();
                         windows.insert(id, new_window);
@@ -1531,7 +1604,7 @@ fn create_webview_window(
                     }
                 }
             }
-            Event::UserEvent(WvEvent::GrepWindow { ref pattern, ref world, use_regex }) => {
+            Event::UserEvent(WvEvent::GrepWindow { ref pattern, ref world, use_regex, ref auth }) => {
                 // Create a half-height grep results window
                 let win_title = format!("Clay - grep: {}", pattern);
                 let new_window = match WindowBuilder::new()
@@ -1551,13 +1624,14 @@ fn create_webview_window(
                     escaped_pattern, use_regex
                 );
                 let world_lock = world.as_deref();
-                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, Some(&grep_js)) {
+                let extra_js = spawned_window_js(Some(grep_js), auth);
+                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, extra_js.as_deref()) {
                     let id = new_window.id();
                     windows.insert(id, new_window);
                     webviews.insert(id, wv);
                 }
             }
-            Event::UserEvent(WvEvent::NoteWindow { world_index, ref world_name }) => {
+            Event::UserEvent(WvEvent::NoteWindow { world_index, ref world_name, ref auth }) => {
                 // Create a note-editor window, sized for text editing rather
                 // than a full chat client (this is a small self-contained form,
                 // not world-locked — NOTE_MODE alone tells the client which
@@ -1574,7 +1648,8 @@ fn create_webview_window(
                 };
 
                 let note_js = format!("window.NOTE_MODE = {{ world_index: {} }};", world_index);
-                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, None, Some(&note_js)) {
+                let extra_js = spawned_window_js(Some(note_js), auth);
+                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, None, extra_js.as_deref()) {
                     let id = new_window.id();
                     windows.insert(id, new_window);
                     webviews.insert(id, wv);
@@ -1654,5 +1729,49 @@ mod tests {
             Some(v) => std::env::set_var("GTK_A11Y", v),
             None => std::env::remove_var("GTK_A11Y"),
         }
+    }
+}
+
+#[cfg(test)]
+mod inherited_auth_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_auth_js_cannot_break_out_of_the_script_block() {
+        let auth = InheritedAuth {
+            password: "a'b\"c\\d</script><b>\u{2028}".to_string(),
+            username: Some("bob".to_string()),
+        };
+        let js = inherited_auth_js(&auth);
+        assert!(!js.contains('<'), "raw '<' in {js}");
+        assert!(!js.contains('\u{2028}'));
+        let json = js.strip_prefix("window.INHERITED_AUTH = ").unwrap().strip_suffix(';').unwrap();
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["password"], auth.password.as_str());
+        assert_eq!(v["username"], "bob");
+    }
+
+    #[test]
+    fn new_window_payload_accepts_json_and_legacy_bare_name() {
+        assert_eq!(parse_new_window_payload(""), (None, None));
+        assert_eq!(parse_new_window_payload("MyWorld"), (Some("MyWorld".to_string()), None));
+        let (world, auth) = parse_new_window_payload(
+            r#"{"world":"MyWorld","auth":{"password":"pw","username":null}}"#);
+        assert_eq!(world.as_deref(), Some("MyWorld"));
+        assert_eq!(auth, Some(InheritedAuth { password: "pw".to_string(), username: None }));
+        // Master mode sends auth: null; an empty password is not a credential.
+        assert_eq!(parse_new_window_payload(r#"{"world":null,"auth":null}"#), (None, None));
+        let (_, auth) = parse_new_window_payload(r#"{"world":null,"auth":{"password":""}}"#);
+        assert_eq!(auth, None);
+    }
+
+    #[test]
+    fn spawned_window_js_combines_mode_and_auth() {
+        let auth = Some(InheritedAuth { password: "pw".to_string(), username: None });
+        assert_eq!(spawned_window_js(None, &None), None);
+        assert_eq!(spawned_window_js(Some("M;".into()), &None).as_deref(), Some("M;"));
+        let both = spawned_window_js(Some("M;".into()), &auth).unwrap();
+        assert!(both.starts_with("M;") && both.contains("window.INHERITED_AUTH"));
+        assert!(format!("{:?}", auth).contains("<redacted>") && !format!("{:?}", auth).contains("pw\""));
     }
 }

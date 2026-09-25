@@ -769,6 +769,8 @@
     let authKeyPending = false;  // True when trying key-based auth (to fall back to password on failure)
     let keyAuthFailed = false;   // Set after key rejection so reconnect skips key auth and shows password prompt
     let serverChallenge = '';  // Challenge from ServerHello for challenge-response auth
+    let serverHelloSeen = false;  // ServerHello arrived on the current socket (reset on open)
+    let sessionPassword = null;  // Password this session authenticated with; verifies the Android auth-key download locally (the server never sends its password)
     let worlds = [];
     let currentWorldIndex = 0;
     let versionMismatchShown = false;  // Warn on client/server version drift once per session, not every reconnect
@@ -820,6 +822,34 @@
             noteMode = { world_index: noteWorldIndex };
         }
     }
+
+    // Login handed down by the window that spawned this one (note editor,
+    // /window, /window --grep), so a spawned window doesn't re-prompt for a
+    // password the user already typed. Parent -> child only, never back: the
+    // desktop GUI injects INHERITED_AUTH via in-process IPC (webview_gui.rs's
+    // inherited_auth_js); a browser tab asks its same-origin opener directly
+    // (a cross-origin opener throws, which is the origin check). Seeds the
+    // same in-memory lastGoodPassword a reconnect uses, so it goes through the
+    // normal ServerHello challenge-response and is cleared on rejection.
+    (function seedInheritedAuth() {
+        var inherited = null;
+        if (window.INHERITED_AUTH) {
+            inherited = window.INHERITED_AUTH;
+            try { delete window.INHERITED_AUTH; } catch (e) { window.INHERITED_AUTH = null; }
+        } else {
+            try {
+                if (window.opener && window.opener !== window
+                        && typeof window.opener.__clayInheritAuth === 'function') {
+                    inherited = window.opener.__clayInheritAuth();
+                }
+            } catch (e) { inherited = null; }
+        }
+        if (inherited && typeof inherited.password === 'string' && inherited.password !== '') {
+            lastGoodPassword = inherited.password;
+            lastGoodUsername = (typeof inherited.username === 'string' && inherited.username !== '')
+                ? inherited.username : null;
+        }
+    })();
     // MCP simpleedit session (plan Job 15): unlike noteMode above, this is never a
     // separate window/tab and is never set at page load - it is entered in place
     // whenever a McpEditOpen push arrives (see enterMcpEditMode), reusing the exact
@@ -1329,7 +1359,8 @@
     let wsAllowList = '';
     let wsCertFile = '';
     let wsKeyFile = '';
-    let wsPassword = '';
+    let wsPassword = '';  // Legacy echo: only an older server sends its real password; a current one sends ''
+    let wsPasswordSet = false;  // Server has a password (GlobalSettingsMsg.ws_password_set); blank field = keep it
     let tlsConfigured = false;  // True if server has a custom (user-provided) TLS cert+key configured
     let serverAuthKey = '';  // Auth key from server (for display in web settings)
     // reach::ReachabilityInfo from the server (GlobalSettingsMsg.reachability_json): how other
@@ -1486,7 +1517,7 @@
     // World-switch dropdown (opened by clicking the world name on the status bar)
     let worldMenuOpen = false;
 
-    // Font size state: pixel value (9-20 range)
+    // Font size state: pixel value (7-20 range)
     let currentFontSize = 14;  // Default to 14px
 
     // Per-device font size tracking (saved separately for phone/tablet/desktop)
@@ -1498,7 +1529,7 @@
 
     // Clamp font size to valid range
     function clampFontSize(px) {
-        return Math.max(9, Math.min(20, Math.round(px)));
+        return Math.max(7, Math.min(20, Math.round(px)));  // 7 = MIN_WEB_FONT_SIZE (main.rs)
     }
 
     // Device mode: 'desktop', 'tablet', or 'phone'
@@ -2270,6 +2301,12 @@
         return [basePath() + '/ws'];
     }
 
+    // True for a hostname/address that can only mean this machine.
+    function isLoopbackHost(h) {
+        var host = String(h || '').toLowerCase().replace(/^\[|\]$/g, '');
+        return host === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host);
+    }
+
     // Build list of WebSocket candidates for this connect cycle.
     function buildCandidates() {
         const local = window.WS_LOCAL_HOST || window.WS_HOST || window.location.hostname;
@@ -2290,7 +2327,13 @@
         const paths = wsPathCandidates();
         const result = [];
         hosts.forEach(function(h) {
-            protos.forEach(function(p) {
+            // Plain ws:// only to this machine (the local GUI/on-device server, an SSH
+            // tunnel's or the GUI proxy's local end). To anything else it would carry
+            // the login and every settings message in cleartext - and a hostile network
+            // can answer it in the server's place - so a remote host is wss-only.
+            var hostProtos = isLoopbackHost(h) ? protos : protos.filter(function(p) { return p !== 'ws'; });
+            if (hostProtos.length === 0) hostProtos = ['wss'];
+            hostProtos.forEach(function(p) {
                 paths.forEach(function(wsPath) {
                     result.push({ proto: p, host: h, url: p + '://' + h + ':' + port + wsPath });
                 });
@@ -2302,6 +2345,9 @@
     // Post-open logic shared by native and browser WebSocket winners.
     function handleSocketOpen() {
         if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
+        // A challenge belongs to one socket; never answer a new one with a stale value.
+        serverChallenge = '';
+        serverHelloSeen = false;
         connectionFailures = 0;
         hideCertWarning();
         setTimeout(hideConnectionLog, 800);
@@ -2934,12 +2980,24 @@
             case 'ServerHello':
                 // Store challenge for challenge-response auth
                 serverChallenge = msg.challenge || '';
+                serverHelloSeen = true;
                 // Server tells us upfront if it's in multiuser mode
                 if (msg.multiuser_mode) {
                     enableMultiuserAuthUI();
                 }
                 // WebView auto-auth already sent from onopen; skip everything else
                 if (window.AUTO_PASSWORD) break;
+                // Every Clay server sends a challenge. Without one the only thing we could
+                // send is the bare password hash or raw auth key - replayable credentials -
+                // so something between us and the server is asking for them. Send nothing.
+                if (!serverChallenge) {
+                    deferredAutoLoginPassword = null;
+                    deferredAutoLoginUsername = null;
+                    recordClientEvent('authNoChallenge', '');
+                    showAuthModal(true);
+                    elements.authError.textContent = 'Server sent no authentication challenge - not sending credentials';
+                    break;
+                }
                 // Try auth key first (if not multiuser mode - keys are single-user only)
                 // Skip if keyAuthFailed: key was rejected this session, go straight to password
                 if (!msg.multiuser_mode && authKey && !keyAuthFailed && tryAuthWithKey()) {
@@ -2950,8 +3008,13 @@
                 // Handle deferred auto-login (Android saved password without username)
                 if (deferredAutoLoginPassword) {
                     const pwd = deferredAutoLoginPassword;
+                    const user = deferredAutoLoginUsername;
                     deferredAutoLoginPassword = null;
-                    if (msg.multiuser_mode) {
+                    deferredAutoLoginUsername = null;
+                    if (msg.multiuser_mode && user) {
+                        // Reconnect / inherited login with a known username
+                        authenticate(pwd, user);
+                    } else if (msg.multiuser_mode) {
                         // Server requires username but we don't have one saved
                         // Show auth modal with password pre-filled
                         showAuthModal(true);
@@ -2994,6 +3057,7 @@
                     if (window.Android && window.Android.saveUsername && pendingAuthUsername) {
                         window.Android.saveUsername(pendingAuthUsername);
                     }
+                    sessionPassword = pendingAuthPassword;
                     pendingAuthPassword = null;
                     pendingAuthUsername = null;
                     // Start Android foreground service to keep connection alive
@@ -3572,6 +3636,7 @@
                     if (msg.settings.ws_password !== undefined) {
                         wsPassword = msg.settings.ws_password;
                     }
+                    wsPasswordSet = !!(msg.settings.ws_password_set || msg.settings.ws_password);
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
                     }
@@ -4391,6 +4456,7 @@
                     if (msg.settings.ws_password !== undefined) {
                         wsPassword = msg.settings.ws_password;
                     }
+                    wsPasswordSet = !!(msg.settings.ws_password_set || msg.settings.ws_password);
                     if (msg.settings.console_theme !== undefined) {
                         consoleTheme = msg.settings.console_theme;
                     }
@@ -4753,7 +4819,7 @@
                 // In WebView mode, use IPC to spawn a new native WebView window
                 // (window.open doesn't produce a usable new window there).
                 if (window.WEBVIEW_MODE) {
-                    sendIpc('new-window:' + (msg.world || ''));
+                    sendIpc('new-window:' + JSON.stringify({ world: msg.world || null, auth: inheritableAuth() }));
                 } else {
                     var worldParam = msg.world ? '?world=' + encodeURIComponent(msg.world) : '';
                     // Use WS_HOST/WS_PORT if available (WebView uses custom protocol, not real host)
@@ -5890,16 +5956,14 @@
         debugLog('tryAuthWithKey: attempting key-based auth');
         authKeyPending = true;
         // Challenge-response: send SHA256(auth_key + challenge) instead of raw key
-        let keyValue = authKey;
-        let usesChallenge = false;
-        if (serverChallenge) {
-            try {
-                keyValue = await hashPassword(authKey + serverChallenge);
-                usesChallenge = true;
-            } catch (e) {
-                keyValue = sha256Fallback(authKey + serverChallenge);
-                usesChallenge = true;
-            }
+        // Never the raw key: without a challenge there is nothing safe to send.
+        if (!serverChallenge) { authKeyPending = false; return false; }
+        let keyValue;
+        const usesChallenge = true;
+        try {
+            keyValue = await hashPassword(authKey + serverChallenge);
+        } catch (e) {
+            keyValue = sha256Fallback(authKey + serverChallenge);
         }
         const msg = {
             type: 'AuthRequest',
@@ -5955,6 +6019,22 @@
             return;
         }
 
+        // Only ever answer a challenge: the bare SHA-256 is a replayable credential.
+        // Before this socket's ServerHello, queue it (the ServerHello handler sends it);
+        // after a ServerHello with no challenge, refuse (see that handler).
+        if (!serverChallenge) {
+            if (!serverHelloSeen) {
+                deferredAutoLoginPassword = password;
+                deferredAutoLoginUsername = usernameOverride ||
+                    (elements.authUsername && elements.authUsernameRow.style.display !== 'none'
+                        ? (elements.authUsername.value.trim() || null)
+                        : null);
+            } else {
+                elements.authError.textContent = 'Server sent no authentication challenge - not sending credentials';
+            }
+            return;
+        }
+
         // Store password for saving on success (Android auto-login)
         pendingAuthPassword = password;
 
@@ -5976,8 +6056,8 @@
         // Hash password with SHA-256, then apply challenge-response
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
-            const challengeHash = serverChallenge ? await hashPassword(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid };
+            const challengeHash = await hashPassword(hash + serverChallenge);
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid };
             if (username) {
                 msg.username = username;
             }
@@ -5989,8 +6069,8 @@
         }).catch(err => {
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
-            const challengeHash = serverChallenge ? sha256Fallback(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid };
+            const challengeHash = sha256Fallback(hash + serverChallenge);
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid };
             if (username) {
                 msg.username = username;
             }
@@ -6165,7 +6245,8 @@
                     sendIpc('grep-window:' + JSON.stringify({
                         pattern: grepPattern,
                         world: grepWorld,
-                        regex: grepRegexp
+                        regex: grepRegexp,
+                        auth: inheritableAuth()
                     }));
                 } else {
                     // Browser mode: open new tab with grep params in URL
@@ -7162,12 +7243,20 @@
     // command and the status-bar note icon (both should behave identically).
     // Only the no-args "current world" form is supported here; `/note -l` and
     // `/note <file>` remain console-only (see plan doc for why).
+    // The credential a spawned window may inherit (see seedInheritedAuth).
+    // Null in master GUI mode: every window there already gets AUTO_PASSWORD.
+    function inheritableAuth() {
+        if (window.AUTO_PASSWORD || !lastGoodPassword) return null;
+        return { password: lastGoodPassword, username: lastGoodUsername || null };
+    }
+    window.__clayInheritAuth = inheritableAuth;
+
     function openNoteEditor() {
         if (!worlds[currentWorldIndex]) return;
         if (window.Android) {
             enterNoteMode(currentWorldIndex);
         } else if (window.WEBVIEW_MODE) {
-            var notePayload = { world_index: currentWorldIndex, world_name: worlds[currentWorldIndex].name };
+            var notePayload = { world_index: currentWorldIndex, world_name: worlds[currentWorldIndex].name, auth: inheritableAuth() };
             sendIpc('note-window:' + JSON.stringify(notePayload));
         } else {
             var noteUrl = window.location.origin + basePath() + '/?note=' + currentWorldIndex;
@@ -10958,7 +11047,10 @@
 
         if (elements.webPath) elements.webPath.value = webPath;
         elements.webAllowList.value = wsAllowList;
-        if (elements.webWsPassword) elements.webWsPassword.value = wsPassword;
+        if (elements.webWsPassword) {
+            elements.webWsPassword.value = wsPassword;
+            elements.webWsPassword.placeholder = (!wsPassword && wsPasswordSet) ? 'Set - leave blank to keep' : '';
+        }
 
         // Custom Cert File select (use edit state)
         elements.webCustomCertSelect.value = editCustomCert ? 'yes' : 'no';
@@ -11059,7 +11151,8 @@
         var result = validateWebSettings(
             editPortMode,
             elements.webCustomPort ? elements.webCustomPort.value : '',
-            elements.webWsPassword ? elements.webWsPassword.value : '',
+            // A blank field over a password the server has but didn't send = keep it.
+            (elements.webWsPassword && elements.webWsPassword.value) || (wsPasswordSet ? '(unchanged)' : ''),
             editCustomCert,
             certVal,
             keyVal,
@@ -13627,12 +13720,13 @@
     function performLogout() {
         lastGoodPassword = null;
         lastGoodUsername = null;
+        sessionPassword = null;
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'Logout' }));
         }
     }
 
-    // Set font size by pixel value (9-20)
+    // Set font size by pixel value (7-20)
     // If sendToServer is true (default), save the font size to the server
     function setFontSize(px, sendToServer = true) {
         px = clampFontSize(px);
@@ -15447,7 +15541,7 @@
             updateFontPopupUI();
         };
         elements.fontPhoneMinus.onclick = function() {
-            fontEditSizePhone = Math.max(9, fontEditSizePhone - 1);
+            fontEditSizePhone = Math.max(7, fontEditSizePhone - 1);
             updateFontPopupUI();
         };
         elements.fontPhonePlus.onclick = function() {
@@ -15455,7 +15549,7 @@
             updateFontPopupUI();
         };
         elements.fontTabletMinus.onclick = function() {
-            fontEditSizeTablet = Math.max(9, fontEditSizeTablet - 1);
+            fontEditSizeTablet = Math.max(7, fontEditSizeTablet - 1);
             updateFontPopupUI();
         };
         elements.fontTabletPlus.onclick = function() {
@@ -15463,7 +15557,7 @@
             updateFontPopupUI();
         };
         elements.fontDesktopMinus.onclick = function() {
-            fontEditSizeDesktop = Math.max(9, fontEditSizeDesktop - 1);
+            fontEditSizeDesktop = Math.max(7, fontEditSizeDesktop - 1);
             updateFontPopupUI();
         };
         elements.fontDesktopPlus.onclick = function() {
@@ -15485,12 +15579,19 @@
                 var passEl = document.getElementById('cs-password');
                 var enteredPassword = (passEl ? passEl.value : '').trim();
                 var errEl = document.getElementById('cs-auth-key-error');
-                // Verify the entered password matches the server password
-                if (!wsPassword) {
-                    if (errEl) { errEl.textContent = 'Not connected — connect to server first'; errEl.style.display = ''; }
+                // Verify the entered password locally. The server never sends its password,
+                // so check against the one this session logged in with (or, for the
+                // on-device server, the hash it auto-logged in with).
+                var passwordOk;
+                if (sessionPassword) {
+                    passwordOk = enteredPassword === sessionPassword;
+                } else if (window.AUTO_PASSWORD) {
+                    passwordOk = sha256Fallback(enteredPassword) === window.AUTO_PASSWORD;
+                } else {
+                    if (errEl) { errEl.textContent = 'Log in with the password first'; errEl.style.display = ''; }
                     return;
                 }
-                if (enteredPassword !== wsPassword) {
+                if (!passwordOk) {
                     if (errEl) { errEl.textContent = 'Incorrect password'; errEl.style.display = ''; }
                     return;
                 }

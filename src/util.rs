@@ -7,6 +7,33 @@
 // comparison helper) so the same hardening lives in one place instead of being
 // re-implemented per call site.
 
+/// Host part of a Clay address: `ws://host:port/path`, `wss://...`, `host:port`,
+/// `host`, `[v6]:port`. Used to decide whether plaintext `ws://` is acceptable.
+pub fn host_of_addr(addr: &str) -> &str {
+    let rest = addr.trim();
+    let rest = rest.strip_prefix("wss://").or_else(|| rest.strip_prefix("ws://")).unwrap_or(rest);
+    let rest = rest.split('/').next().unwrap_or(rest);
+    if let Some(v6) = rest.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or(v6);
+    }
+    // A bare IPv6 literal has several colons and no port.
+    if rest.matches(':').count() > 1 {
+        return rest;
+    }
+    rest.split(':').next().unwrap_or(rest)
+}
+
+/// True when `host` can only mean this machine. Plaintext `ws://` is allowed only
+/// to such a host: anywhere else the login, the auth key and every settings
+/// message would cross the network unencrypted.
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if h == "localhost" {
+        return true;
+    }
+    h.parse::<std::net::IpAddr>().map(|ip| crate::websocket::is_loopback_ip(&ip)).unwrap_or(false)
+}
+
 /// Constant-time byte comparison — avoids leaking a secret's length or
 /// prefix-match progress via timing. Unlike a naive `a == b` (or a compare
 /// that early-returns on a length mismatch), this always walks the full
@@ -1128,6 +1155,17 @@ pub fn run_command_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plaintext_ws_only_to_loopback_hosts() {
+        for a in ["127.0.0.1:9000", "ws://127.0.0.1:9000/", "localhost", "LOCALHOST:1", "[::1]:9000", "ws://[::1]:9/x", "::1", "127.4.5.6"] {
+            assert!(is_loopback_host(host_of_addr(a)), "{a}");
+        }
+        for a in ["example.com:9000", "ws://192.168.1.5:9000", "10.0.0.1", "wss://evil.localhost.example:9000", "[fe80::1]:9000", "localhost.example.com"] {
+            assert!(!is_loopback_host(host_of_addr(a)), "{a}");
+        }
+    }
+
 
     // --- constant_time_eq ---
 

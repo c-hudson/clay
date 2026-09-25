@@ -54,6 +54,10 @@ pub(crate) const VERSION: &str = "1.6.16";
 /// A phone whose app version (== the Clay version it was built from; `build.gradle` reads
 /// it from Cargo.toml) is older than this shows one "please update" warning per server
 /// version; one at or above it is current, even against a newer server.
+/// Smallest web/GUI/Android output font size, in px. Must match `clampFontSize` and the
+/// font sliders' `min` in the web client (app.js / index.html).
+pub(crate) const MIN_WEB_FONT_SIZE: f32 = 7.0;
+
 pub(crate) const ANDROID_APP_VERSION: &str = "1.6.16";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
@@ -1419,6 +1423,21 @@ fn cert_needs_regeneration(cert_path: &std::path::Path) -> bool {
 /// machine's `secure.key` and gets silently regenerated — see persistence.rs).
 /// Returns `None` only if generation itself fails.
 fn resolve_web_cert_files(app: &mut App) -> Option<(String, String)> {
+    resolve_web_cert_files_inner(app, true)
+}
+
+/// `resolve_web_cert_files` for `--multiuser`: same cert choice, but never writes
+/// settings.dat — that App's settings come from multiuser.dat, and saving them
+/// would overwrite this machine's single-user settings. Status goes to stdout: the
+/// multiuser server is headless and may have no world to `add_output` into.
+fn resolve_web_cert_files_multiuser(app: &mut App) -> Option<(String, String)> {
+    resolve_web_cert_files_inner(app, false)
+}
+
+fn resolve_web_cert_files_inner(app: &mut App, persist: bool) -> Option<(String, String)> {
+    let report = |app: &mut App, msg: &str| {
+        if persist { app.add_output(msg) } else { println!("{}", msg) }
+    };
     if !app.settings.websocket_cert_file.is_empty() && !app.settings.websocket_key_file.is_empty() {
         return Some((app.settings.websocket_cert_file.clone(), app.settings.websocket_key_file.clone()));
     }
@@ -1439,14 +1458,14 @@ fn resolve_web_cert_files(app: &mut App) -> Option<(String, String)> {
     let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
     if needs_gen || needs_regen {
         if needs_regen {
-            app.add_output("IP address changed, regenerating TLS certificate...");
+            report(app, "IP address changed, regenerating TLS certificate...");
         }
         match generate_self_signed_cert(&cert_path, &key_path) {
             Ok(()) => {
-                app.add_output("Generated self-signed TLS certificate.");
+                report(app, "Generated self-signed TLS certificate.");
             }
             Err(e) => {
-                app.add_output(&format!("Failed to generate TLS certificate: {}", e));
+                report(app, &format!("Failed to generate TLS certificate: {}", e));
                 return None;
             }
         }
@@ -1462,7 +1481,7 @@ fn resolve_web_cert_files(app: &mut App) -> Option<(String, String)> {
         std::fs::read_to_string(&cert_path),
         std::fs::read_to_string(&key_path),
     ) {
-        if app.settings.web_cert_pem != cert_pem || app.settings.web_key_pem != key_pem {
+        if persist && (app.settings.web_cert_pem != cert_pem || app.settings.web_key_pem != key_pem) {
             app.settings.web_cert_pem = cert_pem;
             app.settings.web_key_pem = key_pem;
             let _ = persistence::save_settings(app);
@@ -4892,6 +4911,10 @@ pub struct App {
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     pub is_master: bool,
+    /// Remote console only: the master reported (GlobalSettingsMsg::ws_password_set) that
+    /// it has a WebSocket password. The value itself is never sent, so the /web popup
+    /// starts with a blank password field that means "keep the current one".
+    pub remote_ws_password_set: bool,
     /// Set to true after a web client authenticates, to trigger reconnects in the event loop.
     pub web_reconnect_needed: bool,
     /// Set to true when http_port/http_enabled/web_secure changes, to restart the HTTP server.
@@ -5137,6 +5160,7 @@ impl App {
             ws_client_worlds: std::collections::HashMap::new(),
             ws_client_owner_ids: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
+            remote_ws_password_set: false,
             web_reconnect_needed: false,
             web_restart_needed: false,
             is_reload: false, // Set to true in run_app if started from hot reload
@@ -5368,7 +5392,9 @@ impl App {
             keybindings_json: self.keybindings.to_json(),
             tf_bound_keys_json: self.tf_bound_keys_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
-            ws_password: self.settings.websocket_password.clone(),
+            // Never the password itself — see GlobalSettingsMsg::ws_password.
+            ws_password: String::new(),
+            ws_password_set: !self.settings.websocket_password.is_empty(),
             reachability_json: self.reachability_json(),
         }
     }
@@ -5415,9 +5441,12 @@ impl App {
         if !settings.ws_key_file.is_empty() {
             self.settings.websocket_key_file = settings.ws_key_file.clone();
         }
-        // WS password and auth key are sent by the master for display in /web; apply
-        // them so the remote's web-settings popup matches the master (previously dropped).
+        // The auth key is sent by the master for display in /web; the WS password is
+        // not (a current master sends it empty, so the popup's password field starts
+        // blank and saving it blank leaves the master's password unchanged). An older
+        // master still sends the real value, which is mirrored so it round-trips.
         self.settings.websocket_password = settings.ws_password.clone();
+        self.remote_ws_password_set = settings.ws_password_set || !settings.ws_password.is_empty();
         self.settings.websocket_auth_key = if settings.auth_key.is_empty() {
             None
         } else {
@@ -6009,7 +6038,7 @@ impl App {
             .as_ref()
             .map(|ak| ak.key.clone())
             .unwrap_or_default();
-        let def = create_web_popup(
+        let mut def = create_web_popup(
             self.settings.http_enabled,
             self.settings.http_port,
             &self.settings.web_path,
@@ -6020,6 +6049,10 @@ impl App {
             &auth_key_str,
             self.settings.remote_initial_lines as i64,
         );
+        // A remote console is never sent the master's password: a blank field keeps it.
+        if !self.is_master && self.settings.websocket_password.is_empty() && self.remote_ws_password_set {
+            popup::definitions::web::mark_password_set_elsewhere(&mut def);
+        }
         self.popup_manager.open(def);
 
         // Select first field
@@ -9213,9 +9246,9 @@ impl App {
         self.input.visible_height = self.input_height;
         self.settings.font_name = font_name;
         self.settings.font_size = font_size.clamp(8.0, 48.0);
-        self.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
-        self.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
-        self.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
+        self.settings.web_font_size_phone = web_font_size_phone.clamp(MIN_WEB_FONT_SIZE, 48.0);
+        self.settings.web_font_size_tablet = web_font_size_tablet.clamp(MIN_WEB_FONT_SIZE, 48.0);
+        self.settings.web_font_size_desktop = web_font_size_desktop.clamp(MIN_WEB_FONT_SIZE, 48.0);
         self.settings.web_font_weight = web_font_weight.clamp(1, 900);
         self.settings.web_font_line_height = web_font_line_height.clamp(0.5, 3.0);
         self.settings.web_font_letter_spacing = web_font_letter_spacing.clamp(-5.0, 10.0);
@@ -9225,10 +9258,16 @@ impl App {
         if let Some(ref server) = self.ws_server {
             server.update_allow_list(&ws_allow_list);
         }
-        // Update password (may be empty string to clear it)
-        self.settings.websocket_password = ws_password.clone();
-        if let Some(ref server) = self.ws_server {
-            server.update_password(&ws_password);
+        // Update password. Empty means "unchanged": clients are never sent the current
+        // password (GlobalSettingsMsg::ws_password is always empty), so a settings save
+        // that didn't touch the field echoes back "" — treating that as "clear" would
+        // switch password auth off on every unrelated save. Clearing the password is
+        // done from the server's own console.
+        if !ws_password.is_empty() {
+            self.settings.websocket_password = ws_password.clone();
+            if let Some(ref server) = self.ws_server {
+                server.update_password(&ws_password);
+            }
         }
         // Update web settings — flag a restart if server-affecting settings changed
         let sanitized_web_path = sanitize_web_path(&web_path);

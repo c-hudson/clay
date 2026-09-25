@@ -1747,6 +1747,10 @@ public class MainActivity extends AppCompatActivity {
         webSettings.setJavaScriptEnabled(true);
         webSettings.setDomStorageEnabled(true);
         webSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        // WebView's default minimum font size is 8px, which would silently floor the
+        // font slider's 7px setting (MIN_WEB_FONT_SIZE in main.rs).
+        webSettings.setMinimumFontSize(1);
+        webSettings.setMinimumLogicalFontSize(1);
 
         // Add JavaScript interface for Android communication
         webView.addJavascriptInterface(new AndroidInterface(), "Android");

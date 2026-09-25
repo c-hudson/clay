@@ -1188,6 +1188,70 @@
         server_task.abort();
     }
 
+    /// Regression: a multiuser server has no global password (password_enabled=false,
+    /// the real multiuser.dat state), and its users must still be able to log in.
+    /// Every other multiuser test passes password_enabled=true, which hid a check
+    /// that rejected all multiuser logins with "Password auth not available".
+    #[tokio::test]
+    async fn test_multiuser_login_without_global_password() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
+        use futures::{SinkExt, StreamExt};
+        use crate::websocket::{WsMessage, WsClientInfo, UserCredential, hash_with_challenge};
+        use std::sync::Arc;
+        use std::sync::RwLock;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let mut users_map = std::collections::HashMap::new();
+        users_map.insert("star".to_string(), UserCredential { password_hash: hash_password("xyzzy") });
+        let users = Arc::new(std::sync::RwLock::new(users_map));
+
+        let server_task = tokio::spawn(async move {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream, 1, clients, hash_password(""), false, // no global password
+                Arc::new(std::sync::RwLock::new(Vec::new())),
+                Arc::new(std::sync::RwLock::new(None)),
+                client_addr, event_tx,
+                true, // multiuser mode
+                users, BanList::new(),
+                false,
+            ).await.ok();
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let (ws, _) = connect_async(format!("ws://127.0.0.1:{}", port)).await.unwrap();
+        let (mut sink, mut source) = ws.split();
+        let challenge = match source.next().await {
+            Some(Ok(WsRawMessage::Text(t))) => match serde_json::from_str::<WsMessage>(&t).unwrap() {
+                WsMessage::ServerHello { challenge, .. } => challenge,
+                other => panic!("expected ServerHello, got {:?}", other),
+            },
+            other => panic!("expected ServerHello, got {:?}", other),
+        };
+        let auth = WsMessage::AuthRequest {
+            password_hash: hash_with_challenge(&hash_password("xyzzy"), &challenge),
+            username: Some("star".to_string()),
+            current_world: None, auth_key: None, request_key: false,
+            challenge_response: true,
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+        };
+        sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
+        match source.next().await {
+            Some(Ok(WsRawMessage::Text(t))) => match serde_json::from_str::<WsMessage>(&t).unwrap() {
+                WsMessage::AuthResponse { success, error, .. } =>
+                    assert!(success, "multiuser login rejected: {:?}", error),
+                other => panic!("expected AuthResponse, got {:?}", other),
+            },
+            other => panic!("expected AuthResponse, got {:?}", other),
+        }
+        server_task.abort();
+    }
+
     /// Test: Multiuser auth error messages don't reveal user existence
     /// Both invalid username and invalid password should return the same error.
     #[tokio::test]
@@ -9446,6 +9510,42 @@ third
         call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "newpassword");
         assert_eq!(app.settings.websocket_password, "newpassword",
             "ws_password must actually be applied - daemon's copy used to ignore this field entirely");
+    }
+
+    #[test]
+    fn test_update_global_settings_empty_ws_password_keeps_current() {
+        // Clients are never sent the password, so an unrelated settings save echoes back
+        // "" - that must not switch password auth off.
+        let mut app = App::new();
+        app.settings.websocket_password = "keepme".to_string();
+        call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "");
+        assert_eq!(app.settings.websocket_password, "keepme");
+    }
+
+    #[test]
+    fn test_global_settings_msg_never_carries_the_password() {
+        let mut app = App::new();
+        app.settings.websocket_password = "s3cret-pw".to_string();
+        let msg = app.build_global_settings_msg();
+        assert_eq!(msg.ws_password, "");
+        assert!(msg.ws_password_set);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("s3cret-pw"), "password leaked into GlobalSettingsMsg: {json}");
+        app.settings.websocket_password.clear();
+        assert!(!app.build_global_settings_msg().ws_password_set);
+    }
+
+    #[test]
+    fn test_plain_credentials_only_from_loopback() {
+        use crate::websocket::plain_credential_allowed;
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        for lo in ["127.0.0.1", "127.9.9.9", "::1", "::ffff:127.0.0.1"] {
+            assert!(plain_credential_allowed(false, &ip(lo)), "{lo}");
+        }
+        for remote in ["192.168.1.20", "10.0.0.1", "8.8.8.8", "fe80::1", "::ffff:192.168.1.20"] {
+            assert!(!plain_credential_allowed(false, &ip(remote)), "{remote}");
+            assert!(plain_credential_allowed(true, &ip(remote)), "{remote}");
+        }
     }
 
     // --- App::release_pending_lines / App::selective_flush ---
