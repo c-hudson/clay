@@ -577,6 +577,14 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
     display: none !important;
 }
 
+/* Before the login is resolved (index.html's <head> sets awaiting-auth; showAuthModal()
+   clears it on success and sets it again whenever the login dialog comes back): show
+   only the theme background and dialogs - the auth prompt, connection log, reconnect -
+   not the icon bar, status bar, output or input behind them. */
+html.awaiting-auth #app > :not(.modal) {
+    display: none !important;
+}
+
 .note-editor-view {
     display: none;   /* shown via JS only when NOTE_MODE is set */
     flex-direction: column;
@@ -1669,8 +1677,56 @@ body.device-phone #output-container { padding: 6px 10px; }
     font-size: 13px;
 }
 
+.actions-editor-modal-content {
+    /* Never taller than the window: the header and buttons stay put and the fields
+       (.actions-editor-body) scroll, however many patterns the action has. */
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 16px);
+    max-height: calc(100dvh - 16px);
+}
+
 .actions-editor-modal-content .popup-header {
     margin-bottom: 10px;
+    flex: none;
+}
+
+.actions-editor-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    /* room for the scrollbar so it doesn't sit on top of the inputs */
+    padding-right: 6px;
+    /* A visible scrollbar here, although style.css hides native ones app-wide
+       (::-webkit-scrollbar below): Firefox and current Chromium/WebView2 use these
+       standard properties, which also override that global hide there. */
+    scrollbar-width: thin;
+    scrollbar-color: var(--theme-fg-muted, #52525b) transparent;
+}
+
+/* WebKitGTK / WKWebView (Linux and macOS GUI) only read the -webkit- pseudo-elements. */
+.actions-editor-body::-webkit-scrollbar {
+    display: block;
+    width: 8px;
+}
+
+.actions-editor-body::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.actions-editor-body::-webkit-scrollbar-thumb {
+    background: var(--theme-fg-muted, #52525b);
+    border-radius: 4px;
+}
+
+.action-patterns-column {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+.actions-editor-modal-content .modal-buttons {
+    flex: none;
 }
 
 /* Action confirm delete popup */

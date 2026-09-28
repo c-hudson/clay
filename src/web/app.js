@@ -9731,6 +9731,8 @@
         if (show) noteScrollCause('auth-modal');
         elements.authModal.className = 'modal' + (show ? ' visible' : '');
         forceRepaint(elements.authModal);
+        // Nothing but the login dialog while logged out (see style.css "awaiting-auth").
+        document.documentElement.classList.toggle('awaiting-auth', show);
         if (show) {
             // Hide all UI elements when showing auth modal
             elements.output.innerHTML = '';
@@ -10500,6 +10502,9 @@
             // Focus the new input
             const rows = elements.actionPatternsContainer.querySelectorAll('input[type="text"]');
             if (rows.length > 0) rows[rows.length - 1].focus();
+            // Keep the button in view too, so repeated adds don't walk it off the bottom
+            // of the scrolling field area.
+            elements.actionAddPatternBtn.scrollIntoView({ block: 'nearest' });
         };
 
         // Store editPatterns reference so saveAction() can read it

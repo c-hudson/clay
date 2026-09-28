@@ -10,6 +10,10 @@
          tab) is marked before <body> is parsed, so style.css can keep the chat UI from
          ever being painted - the window shows the theme background, then the note. -->
     <script>if (/[?&]note=\d/.test(location.search)) document.documentElement.classList.add('note-window');</script>
+    <!-- Until the password is resolved only the login dialog is shown: style.css hides the
+         rest of the UI while <html> has awaiting-auth, and app.js's showAuthModal(false)
+         removes it on a successful login. Set here so the UI is never painted first. -->
+    <script>document.documentElement.classList.add('awaiting-auth');</script>
 </head>
 <body>
     <div id="app">
@@ -365,59 +369,67 @@
                     <span class="popup-title" id="action-editor-title">Edit Action</span>
                     <button id="actions-editor-close-btn" class="popup-close">&#10005;</button>
                 </div>
-                <div class="action-field">
-                    <label for="action-name">Name:</label>
-                    <input type="text" id="action-name" autocomplete="off">
+                <!-- Fields scroll between the pinned header and buttons, so an action with
+                     many patterns never pushes Save/Cancel past the bottom of the window. -->
+                <div class="actions-editor-body">
+                    <div class="action-field">
+                        <label for="action-name">Name:</label>
+                        <input type="text" id="action-name" autocomplete="off">
+                    </div>
+                    <div class="action-field">
+                        <label for="action-world">World:</label>
+                        <input type="text" id="action-world" autocomplete="off" placeholder="(empty = all worlds)">
+                    </div>
+                    <div class="action-field">
+                        <label for="action-match-type">Match Type:</label>
+                        <select id="action-match-type" class="form-select">
+                            <option value="Regexp">Regexp</option>
+                            <option value="Wildcard">Wildcard</option>
+                        </select>
+                    </div>
+                    <div class="action-field">
+                        <label>Patterns: <span style="font-size:11px;opacity:0.7">(any match fires; first supplies $1..$9)</span></label>
+                        <!-- Add Pattern sits under the last pattern, so it stays next to the
+                             row it adds rather than scrolling away above a long list. -->
+                        <div class="action-patterns-column">
+                            <div id="action-patterns-container" style="display:flex;flex-direction:column;gap:4px;"></div>
+                            <button id="action-add-pattern-btn" class="btn" style="margin-top:4px;font-size:11px;padding:2px 8px;">+ Add Pattern</button>
+                        </div>
+                    </div>
+                    <div class="action-field">
+                        <label for="action-enabled">Enabled:</label>
+                        <select id="action-enabled" class="form-select">
+                            <option value="yes">Yes</option>
+                            <option value="no">No</option>
+                        </select>
+                    </div>
+                    <div class="action-field">
+                        <label for="action-startup">Startup:</label>
+                        <select id="action-startup" class="form-select">
+                            <option value="no">No</option>
+                            <option value="yes">Yes</option>
+                        </select>
+                    </div>
+                    <div class="action-field" title="Show this action as a one-click shortcut tile in the web/GUI icon bar">
+                        <label for="action-gui-shortcut">GUI Menu Shortcut:</label>
+                        <select id="action-gui-shortcut" class="form-select">
+                            <option value="no">No</option>
+                            <option value="yes">Yes</option>
+                        </select>
+                    </div>
+                    <div class="action-field" title="Also hide up to 3 blank lines immediately following a matched line">
+                        <label for="action-suppress-blanks">Suppress Blanks:</label>
+                        <select id="action-suppress-blanks" class="form-select">
+                            <option value="no">No</option>
+                            <option value="yes">Yes</option>
+                        </select>
+                    </div>
+                    <div class="action-field">
+                        <label for="action-command">Command:</label>
+                        <textarea id="action-command" rows="3" autocomplete="off" placeholder="Commands (semicolon-separated)"></textarea>
+                    </div>
+                    <div id="action-error" class="error"></div>
                 </div>
-                <div class="action-field">
-                    <label for="action-world">World:</label>
-                    <input type="text" id="action-world" autocomplete="off" placeholder="(empty = all worlds)">
-                </div>
-                <div class="action-field">
-                    <label for="action-match-type">Match Type:</label>
-                    <select id="action-match-type" class="form-select">
-                        <option value="Regexp">Regexp</option>
-                        <option value="Wildcard">Wildcard</option>
-                    </select>
-                </div>
-                <div class="action-field">
-                    <label>Patterns: <span style="font-size:11px;opacity:0.7">(any match fires; first supplies $1..$9)</span></label>
-                    <div id="action-patterns-container" style="display:flex;flex-direction:column;gap:4px;"></div>
-                    <button id="action-add-pattern-btn" class="btn" style="margin-top:4px;font-size:11px;padding:2px 8px;">+ Add Pattern</button>
-                </div>
-                <div class="action-field">
-                    <label for="action-enabled">Enabled:</label>
-                    <select id="action-enabled" class="form-select">
-                        <option value="yes">Yes</option>
-                        <option value="no">No</option>
-                    </select>
-                </div>
-                <div class="action-field">
-                    <label for="action-startup">Startup:</label>
-                    <select id="action-startup" class="form-select">
-                        <option value="no">No</option>
-                        <option value="yes">Yes</option>
-                    </select>
-                </div>
-                <div class="action-field" title="Show this action as a one-click shortcut tile in the web/GUI icon bar">
-                    <label for="action-gui-shortcut">GUI Menu Shortcut:</label>
-                    <select id="action-gui-shortcut" class="form-select">
-                        <option value="no">No</option>
-                        <option value="yes">Yes</option>
-                    </select>
-                </div>
-                <div class="action-field" title="Also hide up to 3 blank lines immediately following a matched line">
-                    <label for="action-suppress-blanks">Suppress Blanks:</label>
-                    <select id="action-suppress-blanks" class="form-select">
-                        <option value="no">No</option>
-                        <option value="yes">Yes</option>
-                    </select>
-                </div>
-                <div class="action-field">
-                    <label for="action-command">Command:</label>
-                    <textarea id="action-command" rows="3" autocomplete="off" placeholder="Commands (semicolon-separated)"></textarea>
-                </div>
-                <div id="action-error" class="error"></div>
                 <div class="modal-buttons">
                     <button id="action-editor-help-btn" class="btn btn-help">?</button>
                     <button id="action-editor-delete-btn" class="btn btn-danger">Delete</button>
