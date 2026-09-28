@@ -110,6 +110,19 @@ body {
     letter-spacing: 0;
 }
 
+/* Block-element runs drawn by CSS instead of the font (app.js renderBlockElements):
+   exactly one line tall and N columns wide (width set inline), painted by their
+   inline background in the text colour. The glyphs stay (invisible) for copying. */
+.blk {
+    display: inline-block;
+    vertical-align: top;
+    height: 1em;
+    height: 1lh;
+    overflow: hidden;
+    white-space: pre;
+    -webkit-text-fill-color: transparent;
+}
+
 #output .line {
     line-height: 1.0;
     margin: 0;

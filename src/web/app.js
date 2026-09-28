@@ -8708,7 +8708,56 @@
         // These can appear when ANSI sequences are incomplete or corrupted
         result = result.replace(/[\x1b\u001b\u241b]/g, '');
 
-        return result;
+        return renderBlockElements(result);
+    }
+
+    // Block elements (U+2580-U+259F: FANSI/CP437 art's █▀▄▌▐░▒▓ and friends) are drawn
+    // by CSS instead of by the font. A font's block glyphs are rarely exactly one line
+    // tall and one column wide - the bundled JetBrains Mono has none at all, so they
+    // come from whatever fallback font the OS picks (on macOS: dark bands between art
+    // rows, and art drifting against the text around it). Each run of one block
+    // character becomes a span exactly N columns wide (ch) and one line tall (lh),
+    // painted in the text colour (currentColor) by gradients; the glyph stays in the
+    // span, invisible, so copying the text still gives the original characters.
+    // Runs only: never touches markup, since these characters can't appear in the tags
+    // parseAnsi builds.
+    const BLOCK_ELEMENT_BG = (function() {
+        const c = 'currentColor', t = 'transparent';
+        const pct = (n) => (n * 12.5) + '%';
+        const band = (dir, n) => 'linear-gradient(' + dir + ',' + c + ' ' + pct(n) + ',' + t + ' ' + pct(n) + ')';
+        // Quadrant layers: the top or bottom half of every column, left or right half of
+        // the column (one tile per column, so a run of several stays per-cell).
+        const quad = (side, y) => 'linear-gradient(to right,' + (side === 'L' ? c + ' 50%,' + t + ' 50%' : t + ' 50%,' + c + ' 50%') + ') 0 ' + y + ' / 1ch 50% repeat-x';
+        const UL = quad('L', '0'), UR = quad('R', '0'), LL = quad('L', '100%'), LR = quad('R', '100%');
+        const m = {};
+        m['\u2580'] = { bg: band('to bottom', 4) };            // upper half
+        for (let n = 1; n <= 7; n++) m[String.fromCharCode(0x2580 + n)] = { bg: band('to top', n) }; // lower n/8
+        m['\u2588'] = { bg: c };                               // full
+        for (let n = 7; n >= 1; n--) m[String.fromCharCode(0x2589 + 7 - n)] = { bg: band('to right', n), cell: true }; // left n/8
+        m['\u2590'] = { bg: band('to left', 4), cell: true };  // right half
+        m['\u2591'] = { bg: c, opacity: 0.25 };                // light shade
+        m['\u2592'] = { bg: c, opacity: 0.5 };                 // medium shade
+        m['\u2593'] = { bg: c, opacity: 0.75 };                // dark shade
+        m['\u2594'] = { bg: band('to bottom', 1) };            // upper 1/8
+        m['\u2595'] = { bg: band('to left', 1), cell: true };  // right 1/8
+        const quads = { '\u2596': [LL], '\u2597': [LR], '\u2598': [UL], '\u2599': [UL, LL, LR],
+            '\u259A': [UL, LR], '\u259B': [UL, UR, LL], '\u259C': [UL, UR, LR], '\u259D': [UR],
+            '\u259E': [UR, LL], '\u259F': [UR, LL, LR] };
+        for (const k in quads) m[k] = { bg: quads[k].join(',') };
+        return m;
+    })();
+
+    function renderBlockElements(html) {
+        if (!/[\u2580-\u259F]/.test(html)) return html;
+        return html.replace(/([\u2580-\u259F])\1*/g, function(run, ch) {
+            const spec = BLOCK_ELEMENT_BG[ch];
+            if (!spec) return run;
+            let style = 'width:' + run.length + 'ch;background:' + spec.bg + ';';
+            // Shapes that vary across a cell repeat once per column.
+            if (spec.cell) style += 'background-size:1ch 100%;background-repeat:repeat-x;';
+            if (spec.opacity) style += 'opacity:' + spec.opacity + ';';
+            return '<span class="blk" style="' + style + '">' + run + '</span>';
+        });
     }
 
     // Convert Discord custom emoji tags to images
