@@ -826,12 +826,20 @@
     // html.note-window in style.css); don't let a tab read "Clay MUD Client" meanwhile.
     if (noteMode) document.title = 'Clay - Notes';
 
-    // Settings window mode: the desktop GUI's own Settings window (webview_gui.rs's
-    // WvEvent::SettingsWindow injects SETTINGS_MODE). It shows only the Settings
-    // popup, and closing the popup closes the window. Browsers and Android never get
-    // this - they keep the in-page popup.
-    var settingsWindowMode = window.SETTINGS_MODE || null;
-    if (settingsWindowMode) document.title = 'Clay - Settings';
+    // Popup window mode: in the desktop GUI, Settings, Help, Actions and Worlds (world
+    // selector + editor) each open in their own OS window (webview_gui.rs's
+    // WvEvent::PopupWindow injects POPUP_MODE = {kind, arg}). Such a window shows only its
+    // popup(s) and closes when they close; the main window asks for one through
+    // openInPopupWindow(). Browsers and Android never get this - they keep in-page popups.
+    var popupWindowMode = window.POPUP_MODE ||
+        (window.SETTINGS_MODE ? { kind: 'settings', arg: window.SETTINGS_MODE.tab } : null);
+    var settingsWindowMode = popupWindowMode && popupWindowMode.kind === 'settings'
+        ? { tab: popupWindowMode.arg || 'general' } : null;
+    if (popupWindowMode) {
+        document.title = { settings: 'Clay - Settings', help: 'Clay - Help',
+            actions: 'Clay - Actions', worlds: 'Clay - Worlds' }[popupWindowMode.kind] || 'Clay';
+    }
+    let popupWindowBooted = false;
 
     // Login handed down by the window that spawned this one (note editor,
     // /window, /window --grep), so a spawned window doesn't re-prompt for a
@@ -1270,6 +1278,8 @@
     }
 
     function sendClientVisibility(visible) {
+        // Popup windows never show output, so never count as viewing a world.
+        if (popupWindowMode) visible = false;
         // Stamped before the socket check on purpose: the case worth measuring is a resume
         // that found no usable socket, and if this only ran when one was open, awayMs would
         // be missing from exactly those reports.
@@ -1350,6 +1360,9 @@
     let worldSelectorOnlyConnected = false;
     let worldEditorPopupOpen = false;
     let worldEditorIndex = -1;  // Index of world being edited
+    // Worlds window (desktop GUI): the editor was opened from the selector, so closing it
+    // returns there instead of closing the window.
+    let worldEditorFromSelector = false;
 
     // /import dialog state (see the worldEditorPopupOpen guard below for why this is needed)
     let importDialogOpen = false;
@@ -3888,10 +3901,14 @@
                     enterNoteMode(noteMode.world_index);
                 }
 
-                // Settings window: show the popup once the settings have arrived. Not
-                // again on a reconnect's InitialState, which would throw away edits.
-                if (settingsWindowMode && !settingsPopupOpen) {
-                    openSettingsPopup(settingsWindowMode.tab);
+                // Popup window: show its popup once the state has arrived. Not again on a
+                // reconnect's InitialState, which would throw away edits.
+                if (popupWindowMode && !popupWindowBooted) {
+                    popupWindowBooted = true;
+                    // Not a viewer: it never shows output, so it must not claim ▶ markers
+                    // or mark lines viewed (sendClientVisibility forces false here).
+                    sendClientVisibility(false);
+                    showPopupWindowArg(popupWindowMode.kind, popupWindowMode.arg);
                 }
 
                 // Handle pending reconnect command (resend after reconnection). T1.12/D3:
@@ -4305,7 +4322,24 @@
             case 'WorldCreated':
                 // Server created a new world at our request - open the editor
                 if (msg.world_index !== undefined && msg.world_index < worlds.length) {
+                    // Worlds window: Add kept the selector open for this reply; the editor
+                    // replaces it and returns to it on close.
+                    const fromSelector = popupWindowMode && popupWindowMode.kind === 'worlds' && worldSelectorPopupOpen;
+                    if (fromSelector) worldEditorFromSelector = true;
                     openWorldEditorPopup(msg.world_index);
+                    if (fromSelector) closeWorldSelectorPopup();
+                }
+                break;
+
+            case 'WorldSettingsUpdated':
+                // Another client (e.g. the GUI's Worlds window) saved a world's settings:
+                // keep this client's copy current (name in the status bar, world menus).
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    const w = worlds[msg.world_index];
+                    if (msg.name) w.name = msg.name;
+                    if (msg.settings) w.settings = Object.assign(w.settings || {}, msg.settings);
+                    updateStatusBar();
+                    if (worldSelectorPopupOpen) renderWorldSelectorList();
                 }
                 break;
 
@@ -5840,6 +5874,8 @@
         return 'clay_last_world_' + getServerIdentity();
     }
     function persistLastActiveWorld() {
+        // A popup window's current world isn't what the user is looking at.
+        if (popupWindowMode) return;
         const world = worlds[currentWorldIndex];
         const name = (world && world.name) || null;
         if (name === lastPersistedWorldName) return;
@@ -7314,6 +7350,93 @@
     }
     window.__clayInheritAuth = inheritableAuth;
 
+    // Desktop GUI: open popup `kind` in its own window instead of in this page. Returns
+    // true when it did (the caller then does nothing in-page). A window that already is
+    // that kind shows it in place; the web client and Android always do.
+    function openInPopupWindow(kind, arg) {
+        if (!window.WEBVIEW_MODE || window.Android) return false;
+        if (popupWindowMode && popupWindowMode.kind === kind) return false;
+        sendIpc('popup-window:' + JSON.stringify({ kind: kind, arg: arg === undefined ? null : arg, auth: inheritableAuth() }));
+        return true;
+    }
+
+    // A popup window closes once none of its popups is open any more. Deferred a tick so
+    // a close-then-open in one handler (editor -> confirm, list -> editor) never closes it.
+    function popupWindowCloseIfIdle() {
+        if (!popupWindowMode) return;
+        setTimeout(function() {
+            const open = {
+                settings: settingsPopupOpen,
+                help: helpPopupOpen,
+                actions: actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen,
+                worlds: worldSelectorPopupOpen || worldEditorPopupOpen || worldConfirmPopupOpen,
+            }[popupWindowMode.kind];
+            if (!open) sendIpc('close-window');
+        }, 0);
+    }
+
+    // Show what a popup window was opened for (at startup, and again when the main window
+    // asks an already-open one for something else - webview_gui.rs's __clayPopupArg).
+    function showPopupWindowArg(kind, arg) {
+        if (!popupWindowMode || popupWindowMode.kind !== kind) return;
+        if (kind === 'settings') {
+            if (settingsPopupOpen) switchSettingsTab(String(arg || 'general'));
+            else openSettingsPopup(String(arg || 'general'));
+        } else if (kind === 'help') {
+            if (!helpPopupOpen) openHelpPopup();
+        } else if (kind === 'actions') {
+            if (!actionsEditorPopupOpen) openActionsListPopup(arg || null);
+        } else if (kind === 'worlds') {
+            const byName = (n) => n ? worlds.findIndex(w => (w.name || '').toLowerCase() === String(n).toLowerCase()) : -1;
+            // The main window's world, so the selector highlights the right row.
+            const cur = byName(arg && arg.current);
+            if (cur >= 0) currentWorldIndex = cur;
+            if (arg && arg.edit) {
+                const idx = byName(arg.edit);
+                if (idx < 0) {
+                    // A world just created by the main window may not have arrived here
+                    // yet (WorldAdded): try again shortly.
+                    if ((arg._tries || 0) < 20) setTimeout(function() {
+                        showPopupWindowArg(kind, Object.assign({}, arg, { _tries: (arg._tries || 0) + 1 }));
+                    }, 100);
+                    return;
+                }
+                if (worldEditorPopupOpen && worldEditorIndex === idx) return;
+                if (worldSelectorPopupOpen) {
+                    worldEditorFromSelector = true;
+                    openWorldEditorPopup(idx);
+                    closeWorldSelectorPopup();
+                } else {
+                    openWorldEditorPopup(idx);
+                }
+            } else if (!worldSelectorPopupOpen && !worldEditorPopupOpen) {
+                openWorldSelectorPopup();
+            }
+        }
+    }
+    window.__clayPopupArg = showPopupWindowArg;
+
+    // Worlds window: picking a world switches (and maybe connects) the MAIN window, via
+    // webview_gui.rs's main-action relay, then this window closes. False elsewhere.
+    function relayWorldToMainWindow(name, connect) {
+        if (!popupWindowMode || popupWindowMode.kind !== 'worlds') return false;
+        sendIpc('main-action:' + JSON.stringify({ switchWorld: name, connect: !!connect }));
+        closeWorldSelectorPopup();
+        return true;
+    }
+
+    // Main window end of that relay: the same switch / connect the in-page selector does.
+    window.__clayMainAction = function(p) {
+        if (popupWindowMode || !p || typeof p !== 'object') return;
+        if (p.switchWorld) {
+            const idx = worlds.findIndex(w => (w.name || '').toLowerCase() === String(p.switchWorld).toLowerCase());
+            if (idx < 0) return;
+            selectedWorldIndex = idx;
+            if (p.connect) connectSelectedWorld();
+            else switchToSelectedWorld();
+        }
+    };
+
     function openNoteEditor() {
         if (!worlds[currentWorldIndex]) return;
         if (window.Android) {
@@ -7428,6 +7551,7 @@
 
 
     function openHelpPopup() {
+        if (openInPopupWindow('help', null)) return;
         helpPopupOpen = true;
         const baseUrl = getBaseUrl();
         // Name the build in the title bar - on web/GUI/Android this is the only place the
@@ -7458,6 +7582,7 @@
         helpPopupOpen = false;
         elements.helpModal.classList.remove('visible');
         elements.input.focus();
+        popupWindowCloseIfIdle();
     }
 
     // Popup-specific help texts
@@ -10063,6 +10188,7 @@
 
     // Open Actions List popup
     function openActionsListPopup(worldFilter = null) {
+        if (openInPopupWindow('actions', worldFilter || null)) return;
         actionsListPopupOpen = true;
         actionsWorldFilter = worldFilter || '';
         elements.actionFilter.value = '';
@@ -10087,6 +10213,7 @@
         elements.actionWorldFilterIndicator.textContent = '';
         elements.actionsListModal.className = 'modal';
         elements.input.focus();
+        popupWindowCloseIfIdle();
     }
 
     // Get indices of actions matching current filters
@@ -10669,6 +10796,7 @@
     function closeActionsConfirmPopup() {
         actionsConfirmPopupOpen = false;
         elements.actionConfirmModal.className = 'modal';
+        popupWindowCloseIfIdle();
     }
 
     // Confirm delete action
@@ -10821,12 +10949,9 @@
             appendClientLine('Web settings are disabled in multiuser mode.', currentWorldIndex, 'system');
             return;
         }
-        // The desktop GUI opens Settings in its own window (see settingsWindowMode);
+        // The desktop GUI opens Settings in its own window (see popupWindowMode);
         // the Settings window itself shows the popup in place.
-        if (window.WEBVIEW_MODE && !settingsWindowMode) {
-            sendIpc('settings-window:' + JSON.stringify({ tab: tab || 'general', auth: inheritableAuth() }));
-            return;
-        }
+        if (openInPopupWindow('settings', tab || 'general')) return;
         settingsPopupOpen = true;
         // Load general edit state
         setupMoreMode = moreModeEnabled;
@@ -10888,7 +11013,7 @@
         // The Settings window exists only to show this popup. Rust tells the other
         // windows to drop any font preview when it closes (a no-op after Save).
         if (settingsWindowMode) {
-            sendIpc('close-window');
+            popupWindowCloseIfIdle();
             return;
         }
         focusInputWithKeyboard();
@@ -11454,11 +11579,6 @@
         previewFontEdit();
     };
 
-    // Desktop GUI: /setup, /font etc. while the Settings window is already open
-    // focus it on the asked-for tab (webview_gui.rs).
-    window.__claySettingsTab = function(tab) {
-        if (settingsWindowMode && settingsPopupOpen) switchSettingsTab(String(tab || 'general'));
-    };
 
     // Put back the font settings the popup opened with (see fontPreviewSaved).
     function revertFontPreview() {
@@ -11666,6 +11786,7 @@
 
     // World selector popup functions (/worlds)
     function openWorldSelectorPopup() {
+        if (openInPopupWindow('worlds', { current: worlds[currentWorldIndex] ? worlds[currentWorldIndex].name : null })) return;
         worldSelectorPopupOpen = true;
         selectedWorldIndex = currentWorldIndex;
         elements.worldFilter.value = '';
@@ -11680,6 +11801,7 @@
         elements.worldSelectorModal.className = 'modal';
         elements.worldSelectorModal.style.display = 'none';
         elements.input.focus();
+        popupWindowCloseIfIdle();
     }
 
     function renderWorldSelectorList() {
@@ -11812,6 +11934,8 @@
 
     function switchToSelectedWorld() {
         if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length) {
+            // The Worlds window switches the main window, not itself.
+            if (relayWorldToMainWindow(worlds[selectedWorldIndex].name, false)) return;
             switchWorldLocal(selectedWorldIndex);
             closeWorldSelectorPopup();
         }
@@ -11820,6 +11944,7 @@
     function connectSelectedWorld() {
         if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length) {
             const world = worlds[selectedWorldIndex];
+            if (relayWorldToMainWindow(world.name, true)) return;
             // Switch to the world first
             switchWorldLocal(selectedWorldIndex);
             // Check if we have settings to connect
@@ -11859,11 +11984,14 @@
             type: 'CreateWorld',
             name: name
         });
-        closeWorldSelectorPopup();
+        // In the Worlds window the selector stays until WorldCreated turns the window
+        // into the editor - closing it now would close the window before the reply.
+        if (!(popupWindowMode && popupWindowMode.kind === 'worlds')) closeWorldSelectorPopup();
     }
 
     function editSelectedWorld() {
         if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length) {
+            worldEditorFromSelector = true;
             openWorldEditorPopup(selectedWorldIndex);
             closeWorldSelectorPopup();
         }
@@ -11985,6 +12113,9 @@
             return;
         }
         if (worldIndex < 0 || worldIndex >= worlds.length) return;
+        // Desktop GUI: the Worlds window hosts the editor (by name - indices are per-client).
+        if (openInPopupWindow('worlds', { edit: worlds[worldIndex].name,
+                current: worlds[currentWorldIndex] ? worlds[currentWorldIndex].name : null })) return;
 
         worldEditorPopupOpen = true;
         worldEditorIndex = worldIndex;
@@ -12136,7 +12267,15 @@
         window.visualViewport?.removeEventListener('resize', updateWorldEditorViewportHeight);
         elements.worldEditorModal.className = 'modal';
         elements.worldEditorModal.style.display = 'none';
+        // In the Worlds window an editor opened from the selector goes back to it.
+        if (popupWindowMode && popupWindowMode.kind === 'worlds' && worldEditorFromSelector) {
+            worldEditorFromSelector = false;
+            openWorldSelectorPopup();
+            return;
+        }
+        worldEditorFromSelector = false;
         focusInputWithKeyboard();
+        popupWindowCloseIfIdle();
     }
 
     // World editor field IDs (into `elements`) gated by World Type - mirrors
@@ -12344,6 +12483,7 @@
         worldConfirmPopupOpen = false;
         elements.worldConfirmModal.className = 'modal';
         elements.worldConfirmModal.style.display = 'none';
+        popupWindowCloseIfIdle();
     }
 
     // Confirm delete world

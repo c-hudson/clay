@@ -71,9 +71,14 @@ enum WvEvent {
     /// button) without exiting the whole app — unlike Quit. Reuses the same
     /// removal logic as a native close (WindowEvent::CloseRequested).
     CloseWindow(tao::window::WindowId),
-    /// Open the Settings popup in its own OS window (SETTINGS_MODE in web/app.js),
-    /// on `tab`; focuses the existing one instead if it is already open.
-    SettingsWindow { tab: String, auth: Option<InheritedAuth> },
+    /// Open one of the popups that the GUI shows as its own OS window (POPUP_MODE in
+    /// web/app.js): `kind` is one of POPUP_KINDS, `arg` the JSON handed to the page
+    /// (a tab, a world filter, a world to edit). One window per kind: a second request
+    /// focuses the existing one and hands it the new `arg`.
+    PopupWindow { kind: &'static str, arg: String, auth: Option<InheritedAuth> },
+    /// Something a popup window needs the main window to do (switch/connect a world):
+    /// `payload` is the JSON argument for app.js's `__clayMainAction`.
+    MainAction { payload: String },
     /// Relay the Settings window's live font preview to every other window
     /// (payload: the JSON argument for app.js's `__clayFontPreview`).
     FontPreview { payload: String, from: tao::window::WindowId },
@@ -152,13 +157,37 @@ fn settings_tab_name(v: &serde_json::Value) -> String {
     }
 }
 
+/// A JSON value as a JS literal safe to splice into evaluate_script / an inline
+/// <script>: `<`, U+2028 and U+2029 escaped.
+fn js_json(v: &serde_json::Value) -> String {
+    v.to_string().replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
+}
+
 /// JS that hands a font-preview payload to a window's app.js. The payload came
 /// from our own page, but it is parsed and re-serialized here so only well-formed
 /// JSON (a settings object, `null` = revert, `"commit"`) ever reaches evaluate_script.
 fn font_preview_js(payload: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let json = v.to_string().replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
-    Some(format!("window.__clayFontPreview && window.__clayFontPreview({});", json))
+    Some(format!("window.__clayFontPreview && window.__clayFontPreview({});", js_json(&v)))
+}
+
+/// Popups the GUI opens as their own windows (app.js `openInPopupWindow`).
+const POPUP_KINDS: [&str; 4] = ["settings", "help", "actions", "worlds"];
+
+/// The popup kind from a `popup-window:` payload, if it is one we open.
+fn popup_kind(v: &serde_json::Value) -> Option<&'static str> {
+    let k = v["kind"].as_str()?;
+    POPUP_KINDS.iter().copied().find(|p| *p == k)
+}
+
+/// Title and initial size of each popup window.
+fn popup_window_spec(kind: &str) -> (&'static str, f64, f64) {
+    match kind {
+        "settings" => ("Clay - Settings", 520.0, 680.0),
+        "help" => ("Clay - Help", 640.0, 720.0),
+        "actions" => ("Clay - Actions", 760.0, 620.0),
+        _ => ("Clay - Worlds", 640.0, 680.0),
+    }
 }
 
 /// Open a URL in the system's default browser (platform-specific).
@@ -1154,11 +1183,29 @@ fn dispatch_ipc_message(
                 let _ = proxy.send_event(WvEvent::NoteWindow { world_index: world_index as usize, world_name, auth });
             }
         }
-    } else if let Some(json_str) = body.strip_prefix("settings-window:") {
+    } else if let Some(json_str) = body.strip_prefix("popup-window:") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-            let tab = settings_tab_name(&v);
+            if let Some(kind) = popup_kind(&v) {
+                let arg = if kind == "settings" {
+                    // Only the popup's own tab ids ever reach the page / URL.
+                    js_json(&serde_json::Value::String(settings_tab_name(&serde_json::json!({ "tab": v["arg"] }))))
+                } else {
+                    js_json(&v["arg"])
+                };
+                let auth = parse_inherited_auth(&v);
+                let _ = proxy.send_event(WvEvent::PopupWindow { kind, arg, auth });
+            }
+        }
+    } else if let Some(json_str) = body.strip_prefix("settings-window:") {
+        // Older page: same as popup-window with kind "settings".
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let arg = js_json(&serde_json::Value::String(settings_tab_name(&v)));
             let auth = parse_inherited_auth(&v);
-            let _ = proxy.send_event(WvEvent::SettingsWindow { tab, auth });
+            let _ = proxy.send_event(WvEvent::PopupWindow { kind: "settings", arg, auth });
+        }
+    } else if let Some(payload) = body.strip_prefix("main-action:") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            let _ = proxy.send_event(WvEvent::MainAction { payload: js_json(&v) });
         }
     } else if let Some(payload) = body.strip_prefix("font-preview:") {
         let _ = proxy.send_event(WvEvent::FontPreview { payload: payload.to_string(), from: window_id });
@@ -1415,10 +1462,6 @@ fn build_webview(
     Ok(webview)
 }
 
-/// Create and run the WebView window with custom protocol to serve embedded web content.
-/// Uses custom protocol (clay://) instead of with_html() because with_html() loads
-/// content with a null origin, which blocks WebSocket connections on WebKit2GTK.
-/// Supports multiple windows within a single event loop.
 /// The Settings window closed: tell every other window to drop its font
 /// preview. After a Save the page has already sent "commit", which makes this a
 /// no-op there; after Cancel or a native close it puts the saved font back.
@@ -1428,6 +1471,26 @@ fn end_font_preview(webviews: &HashMap<WindowId, wry::WebView>) {
     }
 }
 
+/// A window closed: if it was a popup window, forget it; the Settings window also
+/// ends any font preview it was showing on the other windows.
+fn forget_popup_window(
+    popup_windows: &mut HashMap<&'static str, WindowId>,
+    closed: WindowId,
+    webviews: &HashMap<WindowId, wry::WebView>,
+) {
+    let kind = popup_windows.iter().find(|(_, id)| **id == closed).map(|(k, _)| *k);
+    if let Some(kind) = kind {
+        popup_windows.remove(kind);
+        if kind == "settings" {
+            end_font_preview(webviews);
+        }
+    }
+}
+
+/// Create and run the WebView window with custom protocol to serve embedded web content.
+/// Uses custom protocol (clay://) instead of with_html() because with_html() loads
+/// content with a null origin, which blocks WebSocket connections on WebKit2GTK.
+/// Supports multiple windows within a single event loop.
 fn create_webview_window(
     title: &str,
     params: &WebViewParams,
@@ -1495,8 +1558,8 @@ fn create_webview_window(
     // Clone params for use inside the event loop closure (needed for creating new windows)
     let params = params.clone();
 
-    // The Settings window, while one is open (there is at most one).
-    let mut settings_window: Option<WindowId> = None;
+    // The popup windows that are open, by kind (at most one of each).
+    let mut popup_windows: HashMap<&'static str, WindowId> = HashMap::new();
 
     event_loop.run(move |event, event_loop_target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -1510,10 +1573,7 @@ fn create_webview_window(
                 // Remove the closed window and its webview
                 windows.remove(&window_id);
                 webviews.remove(&window_id);
-                if settings_window == Some(window_id) {
-                    settings_window = None;
-                    end_font_preview(&webviews);
-                }
+                forget_popup_window(&mut popup_windows, window_id, &webviews);
                 if window_id == main_window_id {
                     // Same as WvEvent::Quit: hand back any UPnP mapping, then exit, which
                     // drops every remaining window with the event loop.
@@ -1728,45 +1788,51 @@ fn create_webview_window(
                 // but triggered from JS via IPC rather than the OS chrome.
                 windows.remove(&id);
                 webviews.remove(&id);
-                if settings_window == Some(id) {
-                    settings_window = None;
-                    end_font_preview(&webviews);
-                }
+                forget_popup_window(&mut popup_windows, id, &webviews);
                 if windows.is_empty() {
                     *control_flow = ControlFlow::Exit;
                 }
             }
-            Event::UserEvent(WvEvent::SettingsWindow { ref tab, ref auth }) => {
-                // One Settings window: a second request focuses it on the new tab.
-                if let Some(id) = settings_window {
+            Event::UserEvent(WvEvent::PopupWindow { kind, ref arg, ref auth }) => {
+                let kind_json = serde_json::Value::String(kind.to_string()).to_string();
+                // One window per kind: a second request focuses it and hands it the new arg.
+                if let Some(id) = popup_windows.get(kind).copied() {
                     if let (Some(w), Some(wv)) = (windows.get(&id), webviews.get(&id)) {
                         w.set_focus();
-                        let tab_json = serde_json::Value::String(tab.clone()).to_string();
                         let _ = wv.evaluate_script(&format!(
-                            "window.__claySettingsTab && window.__claySettingsTab({});", tab_json));
+                            "window.__clayPopupArg && window.__clayPopupArg({}, {});", kind_json, arg));
                         return;
                     }
-                    settings_window = None;
+                    popup_windows.remove(kind);
                 }
+                let (title, width, height) = popup_window_spec(kind);
                 let new_window = match WindowBuilder::new()
-                    .with_title("Clay - Settings")
+                    .with_title(title)
                     .with_theme(window_theme)
-                    .with_inner_size(tao::dpi::LogicalSize::new(520.0, 680.0))
+                    .with_inner_size(tao::dpi::LogicalSize::new(width, height))
                     .build(event_loop_target)
                 {
                     Ok(w) => w,
                     Err(_) => return,
                 };
-                let tab_json = serde_json::Value::String(tab.clone()).to_string();
-                let settings_js = format!("window.SETTINGS_MODE = {{ tab: {} }};", tab_json);
-                let extra_js = spawned_window_js(Some(settings_js), auth);
-                // `settings=` lets index.html's <head> hide the chat UI before first paint.
-                let query = format!("settings={}", tab);
+                let popup_js = format!("window.POPUP_MODE = {{ kind: {}, arg: {} }};", kind_json, arg);
+                let extra_js = spawned_window_js(Some(popup_js), auth);
+                // `popup=` lets index.html's <head> hide the chat UI before first paint.
+                let query = format!("popup={}", kind);
                 if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, None, extra_js.as_deref(), Some(&query)) {
                     let id = new_window.id();
                     windows.insert(id, new_window);
                     webviews.insert(id, wv);
-                    settings_window = Some(id);
+                    popup_windows.insert(kind, id);
+                }
+            }
+            Event::UserEvent(WvEvent::MainAction { ref payload }) => {
+                if let Some(wv) = webviews.get(&main_window_id) {
+                    let _ = wv.evaluate_script(&format!(
+                        "window.__clayMainAction && window.__clayMainAction({});", payload));
+                }
+                if let Some(w) = windows.get(&main_window_id) {
+                    w.set_focus();
                 }
             }
             Event::UserEvent(WvEvent::FontPreview { ref payload, from }) => {
@@ -1903,6 +1969,30 @@ mod settings_window_tests {
         assert_eq!(tab(r#"{"tab":"'); alert(1); ('"}"#), "general");
         assert_eq!(tab(r#"{"tab":""}"#), "general");
         assert_eq!(tab(r#"{}"#), "general");
+    }
+
+    #[test]
+    fn popup_kind_accepts_only_known_popups() {
+        let kind = |s: &str| popup_kind(&serde_json::from_str(s).unwrap());
+        assert_eq!(kind(r#"{"kind":"settings"}"#), Some("settings"));
+        assert_eq!(kind(r#"{"kind":"help"}"#), Some("help"));
+        assert_eq!(kind(r#"{"kind":"actions","arg":"W"}"#), Some("actions"));
+        assert_eq!(kind(r#"{"kind":"worlds","arg":{"edit":"X"}}"#), Some("worlds"));
+        // Anything else (it ends up in a URL query and injected JS) opens nothing.
+        assert_eq!(kind(r#"{"kind":"note"}"#), None);
+        assert_eq!(kind(r#"{"kind":"help&x=1"}"#), None);
+        assert_eq!(kind(r#"{}"#), None);
+        for k in POPUP_KINDS {
+            assert!(popup_window_spec(k).0.starts_with("Clay - "));
+        }
+    }
+
+    #[test]
+    fn js_json_cannot_break_out_of_a_script() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"edit":"</script><b>\u2028"}"#).unwrap();
+        let js = js_json(&v);
+        assert!(!js.contains('<') && !js.contains('\u{2028}'), "{js}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&js).unwrap(), v, "still the same JSON");
     }
 
     #[test]
