@@ -1468,21 +1468,69 @@
     // after Save), so closing without saving can undo previewFontEdit's live preview.
     let fontPreviewSaved = null;
 
-    // Font families (matching remote GUI FONT_FAMILIES)
+    // Font families offered in Settings > Font: [value saved as font_name, label].
+    // Covers Linux, macOS and Windows; renderFontFamilyList() shows only the ones this
+    // machine actually has (isFontAvailable), since a missing one silently falls back
+    // to the default stack and every entry would look the same.
     const FONT_FAMILIES = [
         ['', 'System Default'],
         ['Monospace', 'Monospace'],
+        ['JetBrains Mono', 'JetBrains Mono'],
+        ['ui-monospace', 'SF Mono'],
+        ['Menlo', 'Menlo'],
+        ['Monaco', 'Monaco'],
+        ['Andale Mono', 'Andale Mono'],
+        ['PT Mono', 'PT Mono'],
         ['DejaVu Sans Mono', 'DejaVu Sans Mono'],
         ['Liberation Mono', 'Liberation Mono'],
         ['Ubuntu Mono', 'Ubuntu Mono'],
+        ['Noto Sans Mono', 'Noto Sans Mono'],
         ['Fira Code', 'Fira Code'],
         ['Source Code Pro', 'Source Code Pro'],
-        ['JetBrains Mono', 'JetBrains Mono'],
         ['Hack', 'Hack'],
         ['Inconsolata', 'Inconsolata'],
-        ['Courier New', 'Courier New'],
+        ['Cascadia Code', 'Cascadia Code'],
         ['Consolas', 'Consolas'],
+        ['Lucida Console', 'Lucida Console'],
+        ['Courier New', 'Courier New'],
     ];
+    // CSS generic families: applied unquoted ('Monospace' quoted would name a font
+    // called "Monospace" and fall through to the default stack).
+    const GENERIC_FONT_FAMILIES = { 'monospace': true, 'ui-monospace': true };
+    // Shipped with Clay (style.css @font-face), so always available.
+    const BUNDLED_FONT_FAMILIES = { 'JetBrains Mono': true };
+
+    // CSS font-family value for a font_name setting ('' = the default stack).
+    function fontFamilyCss(name) {
+        if (!name) return '';
+        var lower = String(name).toLowerCase();
+        var first = GENERIC_FONT_FAMILIES[lower] ? lower : "'" + String(name).replace(/['"\\]/g, '') + "'";
+        return first + ', var(--mono)';
+    }
+
+    // Whether `name` renders as a font of its own here (not the fallback). Canvas
+    // measurement, because document.fonts.check() also answers true for a missing
+    // system font. A font counts as present if it changes the width of the test text
+    // against at least one of two different fallbacks.
+    var fontAvailabilityCache = {};
+    function isFontAvailable(name) {
+        if (!name || name.toLowerCase() === 'monospace' || BUNDLED_FONT_FAMILIES[name]) return true;
+        if (fontAvailabilityCache[name] !== undefined) return fontAvailabilityCache[name];
+        var available = true;
+        try {
+            var ctx = document.createElement('canvas').getContext('2d');
+            var text = 'mmmmmmmmmmlli1|WwQ@#0O';
+            var family = GENERIC_FONT_FAMILIES[name.toLowerCase()] ? name.toLowerCase() : "'" + name + "'";
+            available = ['monospace', 'serif'].some(function(fallback) {
+                ctx.font = '72px ' + fallback;
+                var base = ctx.measureText(text).width;
+                ctx.font = '72px ' + family + ', ' + fallback;
+                return ctx.measureText(text).width !== base;
+            });
+        } catch (e) { /* no canvas: show it rather than hide a real font */ }
+        fontAvailabilityCache[name] = available;
+        return available;
+    }
 
     // Help popup state (/help)
     let helpPopupOpen = false;
@@ -1666,13 +1714,9 @@
     // Apply font family to the interface
     function applyFontFamily(name) {
         fontName = name;
-        if (name && name !== '') {
-            document.documentElement.style.setProperty('--mono-override', "'" + name + "', var(--mono)");
-        } else {
-            document.documentElement.style.setProperty('--mono-override', 'var(--mono)');
-        }
+        const monoStyle = fontFamilyCss(name);
+        document.documentElement.style.setProperty('--mono-override', monoStyle || 'var(--mono)');
         // Apply to elements that use monospace fonts
-        const monoStyle = name && name !== '' ? "'" + name + "', var(--mono)" : '';
         elements.output.style.fontFamily = monoStyle || '';
         elements.input.style.fontFamily = monoStyle || '';
         if (elements.prompt) elements.prompt.style.fontFamily = monoStyle || '';
@@ -11226,14 +11270,22 @@
     function renderFontFamilyList() {
         const list = elements.fontFamilyList;
         list.innerHTML = '';
-        FONT_FAMILIES.forEach(function(entry) {
+        var entries = FONT_FAMILIES.filter(function(entry) {
+            return entry[0] === fontEditName || isFontAvailable(entry[0]);
+        });
+        // A saved font that isn't in the list at all still gets a row, so the
+        // selection is visible.
+        if (fontEditName && !entries.some(function(entry) { return entry[0] === fontEditName; })) {
+            entries.push([fontEditName, fontEditName]);
+        }
+        entries.forEach(function(entry) {
             const value = entry[0];
-            const label = entry[1];
+            const label = entry[1] + (value && !isFontAvailable(value) ? ' (not installed)' : '');
             const item = document.createElement('div');
             item.className = 'font-family-item' + (value === fontEditName ? ' selected' : '');
             item.textContent = label;
             if (value && value !== '') {
-                item.style.fontFamily = "'" + value + "', monospace";
+                item.style.fontFamily = fontFamilyCss(value);
             }
             item.addEventListener('click', function() {
                 fontEditName = value;

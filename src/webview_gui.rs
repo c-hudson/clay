@@ -1311,6 +1311,10 @@ fn build_webview(
                 "/style.css" => ("text/css", Cow::Owned(css_content.as_bytes().to_vec())),
                 "/app.js" => ("application/javascript", Cow::Owned(js_content.as_bytes().to_vec())),
                 "/clay2.png" => ("image/png", Cow::Borrowed(CLAY_LOGO_PNG)),
+                // Bundled fonts that style.css's @font-face rules load. Without these
+                // the GUI never had JetBrains Mono (the default) unless the OS did.
+                "/fonts/jetbrains-mono-latin-400.woff2" => ("font/woff2", Cow::Borrowed(crate::http::FONT_JETBRAINS_MONO)),
+                "/fonts/nunito-latin-400.woff2" => ("font/woff2", Cow::Borrowed(crate::http::FONT_NUNITO)),
                 _ => ("text/plain", Cow::Borrowed(b"Not Found")),
             };
             wry::http::Response::builder()

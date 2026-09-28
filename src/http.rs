@@ -135,8 +135,9 @@ const WEB_KEYBIND_EDITOR_HTML: &str = include_str!("web/keybind-editor.html");
 const WEB_ACTION_EDITOR_HTML: &str = include_str!("web/action-editor.html");
 
 /// Bundled fonts (latin subset, variable weight)
-const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("web/fonts/jetbrains-mono-latin-400.woff2");
-const FONT_NUNITO: &[u8] = include_bytes!("web/fonts/nunito-latin-400.woff2");
+/// (also served by the desktop GUI's clay:// handler, webview_gui.rs)
+pub(crate) const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("web/fonts/jetbrains-mono-latin-400.woff2");
+pub(crate) const FONT_NUNITO: &[u8] = include_bytes!("web/fonts/nunito-latin-400.woff2");
 
 /// Clay logo image. Same source `webview_gui.rs` embeds for the native desktop GUI's
 /// `clay://clay2.png` splash image — served here too so any HTTP-connected client (the
