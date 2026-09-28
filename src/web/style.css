@@ -577,13 +577,8 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
     display: none !important;
 }
 
-/* Before the login is resolved (index.html's <head> sets awaiting-auth; showAuthModal()
-   clears it on success and sets it again whenever the login dialog comes back): show
-   only the theme background and dialogs - the auth prompt, connection log, reconnect -
-   not the icon bar, status bar, output or input behind them. */
-html.awaiting-auth #app > :not(.modal) {
-    display: none !important;
-}
+/* Before the login is resolved, everything but dialogs is hidden by the awaiting-auth
+   rule inlined in index.html's <head> (not here: it must apply before this file does). */
 
 .note-editor-view {
     display: none;   /* shown via JS only when NOTE_MODE is set */
@@ -1695,8 +1690,17 @@ body.device-phone #output-container { padding: 6px 10px; }
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    /* room for the scrollbar so it doesn't sit on top of the inputs */
-    padding-right: 6px;
+    /* Room for the scrollbar so it never covers the patterns' X buttons. WebKitGTK
+       (Linux GUI) draws an overlay scrollbar that takes no layout space and sits on
+       top of the content's right edge, so this padding must hold the whole bar, not
+       just a gap beside a classic one. */
+    padding-right: 16px;
+    /* A classic (space-taking) scrollbar appears only after the popup's shrink-to-fit
+       width has been worked out, so WebKitGTK squeezed the fields by the bar's width
+       and pushed the X buttons under it until a later relayout (e.g. focusing another
+       window) corrected it. Reserving the gutter up front makes the first layout
+       already the right one. No effect with overlay scrollbars. */
+    scrollbar-gutter: stable;
     /* A visible scrollbar here, although style.css hides native ones app-wide
        (::-webkit-scrollbar below): Firefox and current Chromium/WebView2 use these
        standard properties, which also override that global hide there. */

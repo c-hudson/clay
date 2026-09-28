@@ -10,10 +10,18 @@
          tab) is marked before <body> is parsed, so style.css can keep the chat UI from
          ever being painted - the window shows the theme background, then the note. -->
     <script>if (/[?&]note=\d/.test(location.search)) document.documentElement.classList.add('note-window');</script>
-    <!-- Until the password is resolved only the login dialog is shown: style.css hides the
-         rest of the UI while <html> has awaiting-auth, and app.js's showAuthModal(false)
-         removes it on a successful login. Set here so the UI is never painted first. -->
+    <!-- Until the password is resolved only the login dialog is shown: the rest of the UI
+         is hidden while <html> has awaiting-auth, and app.js's showAuthModal(false) removes
+         it on a successful login. Both the class and the rule live here in <head>, not in
+         style.css: the GUI (WebKitGTK) could paint a first frame before style.css was
+         applied, showing the separator bar and icon bar before the password prompt.
+         `.modal` is hidden here too, since without style.css every dialog would show;
+         style.css's `.modal.visible` still wins over this for the open ones. -->
     <script>document.documentElement.classList.add('awaiting-auth');</script>
+    <style>
+        html.awaiting-auth #app > :not(.modal) { display: none !important; }
+        .modal { display: none; }
+    </style>
 </head>
 <body>
     <div id="app">
