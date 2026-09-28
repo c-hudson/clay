@@ -11826,14 +11826,59 @@
         // it reads both to decide what's visible.
         updateWorldEditorTypeVisibility();
 
+        setWorldEditorSection('server');
+        updateWorldEditorViewportHeight();
+        window.visualViewport?.addEventListener('resize', updateWorldEditorViewportHeight);
+
         elements.worldEditorModal.className = 'modal visible';
         elements.worldEditorModal.style.display = 'flex';
-        elements.worldEditName.focus();
+        // On a phone, focusing Name would open the keyboard over the editor before
+        // the user has asked to type anything.
+        // Blur the main input instead, so keystrokes can't land in it behind the editor.
+        if (!WORLD_EDIT_PHONE_MQ.matches) {
+            elements.worldEditName.focus();
+        } else if (document.activeElement === elements.input) {
+            elements.input.blur();
+        }
+    }
+
+    // World editor adaptive layout (style.css "World editor adaptive layout"): the
+    // rows are grouped into Server / Login / Options sections. Phones and tablets
+    // show one section at a time; desktop CSS shows all three and ignores this.
+    const WORLD_EDIT_PHONE_MQ = window.matchMedia('(max-width: 600px), (max-height: 560px)');
+
+    function worldEditorContent() {
+        return elements.worldEditorModal.querySelector('.world-editor-modal-content');
+    }
+
+    function setWorldEditorSection(name) {
+        worldEditorContent().dataset.weActive = name;
+        elements.worldEditorModal.querySelectorAll('[data-we-nav]').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.weNav === name);
+        });
+    }
+
+    // Size the editor to the visual viewport, which shrinks when the on-screen
+    // keyboard opens, so the header and Save/Connect footer stay on screen and
+    // only the fields scroll. Re-reveals the focused field after the shrink.
+    function updateWorldEditorViewportHeight() {
+        const content = worldEditorContent();
+        const vv = window.visualViewport;
+        if (vv) {
+            content.style.setProperty('--we-vvh', vv.height + 'px');
+        } else {
+            content.style.removeProperty('--we-vvh');
+        }
+        const active = document.activeElement;
+        if (worldEditorPopupOpen && active && content.contains(active) && active.closest('.popup-body')) {
+            requestAnimationFrame(() => active.scrollIntoView({ block: 'nearest' }));
+        }
     }
 
     function closeWorldEditorPopup() {
         worldEditorPopupOpen = false;
         worldEditorIndex = -1;
+        window.visualViewport?.removeEventListener('resize', updateWorldEditorViewportHeight);
         elements.worldEditorModal.className = 'modal';
         elements.worldEditorModal.style.display = 'none';
         focusInputWithKeyboard();
@@ -11875,6 +11920,10 @@
         // Reconnect applies to every world type (chat worlds reconnect too).
         elements.worldEditAutoReconnectField?.classList.add('visible');
         elements.worldEditChatFetchField?.classList.toggle('visible', isSlack || isDiscord);
+        // Chat worlds have no login - that section holds Send To / Show Only instead.
+        elements.worldEditorModal.querySelectorAll('.we-login-label').forEach(el => {
+            el.textContent = (isSlack || isDiscord) ? 'Channels' : 'Login';
+        });
 
         // Prompt Wait only applies to Timed Prompt worlds - a plain MUD world never
         // infers a prompt from silence at all, same as the console's dedicated rule
@@ -15243,6 +15292,15 @@
         elements.worldEditConnectBtn.onclick = saveAndConnectWorldEditor;
         elements.worldEditDeleteBtn.onclick = deleteWorldFromEditor;
         elements.worldEditCloseBtn.onclick = closeWorldEditorPopup;
+        elements.worldEditorModal.querySelectorAll('[data-we-nav]').forEach(btn => {
+            btn.onclick = () => setWorldEditorSection(btn.dataset.weNav);
+        });
+        // A field focused on a phone is about to have the keyboard open under it:
+        // keep it in view once the viewport has shrunk.
+        elements.worldEditorModal.addEventListener('focusin', (e) => {
+            if (!worldEditorPopupOpen || !e.target.closest('.popup-body')) return;
+            requestAnimationFrame(() => e.target.scrollIntoView({ block: 'nearest' }));
+        });
         elements.worldEditSslToggle.onclick = function() {
             this.classList.toggle('active');
         };

@@ -1219,7 +1219,7 @@ body.device-phone #output-container { padding: 6px 10px; }
    with `width: 100%` plus a `margin-top` it never asked for. That is exactly
    what flattened the emoji picker's tab strip into one full-width "All" tab
    with the rest scrolled off behind a hidden scrollbar. */
-.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell) {
+.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell):not(.we-nav-btn) {
     width: 100%;
     padding: 8px;
     margin-top: 6px;
@@ -1231,7 +1231,7 @@ body.device-phone #output-container { padding: 6px 10px; }
     font-size: inherit;
 }
 
-.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell):hover {
+.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell):not(.we-nav-btn):hover {
     background-color: var(--theme-bg-hover, #444);
 }
 
@@ -2228,8 +2228,6 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 .world-editor-modal-content {
-    width: 460px;
-    max-width: 90%;
     padding: 0;
     background: var(--theme-bg-elevated, #1a1a1f);
     border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
@@ -2406,6 +2404,245 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 .world-editor-modal-content .setting-row.type-gated.visible {
     display: flex;
+}
+
+/* World editor adaptive layout. The rows live in three .we-section groups
+   (Server / Login / Options). Three modes, chosen purely by viewport size:
+   - phone  (<=600px wide or <=560px tall): full screen, .we-seg segmented
+     control, one section at a time - the Android keyboard halves the viewport,
+     and the old one-long-dialog layout pushed the fields and buttons off-screen;
+   - tablet (default): centered dialog, .we-side icon sidebar, one section;
+   - desktop (>=900 x >=640): no navigation, all three sections in two columns.
+   In every mode the header, nav and footer are pinned and only .popup-body
+   scrolls. --we-vvh is the visual viewport height (app.js keeps it current
+   while the editor is open) so the keyboard never covers the footer. */
+.world-editor-modal-content {
+    display: flex;
+    flex-direction: column;
+    width: 600px;
+    max-width: 94vw;
+    max-height: min(88vh, var(--we-vvh, 100vh));
+    /* Keep the dialog from changing height as the tablet sidebar switches sections. */
+    min-height: min(400px, 88vh, var(--we-vvh, 100vh));
+    overflow: hidden;
+    text-align: left;
+}
+
+.world-editor-modal-content .popup-header,
+.world-editor-modal-content .popup-footer,
+.world-editor-modal-content .we-seg {
+    flex: none;
+}
+
+.world-editor-modal-content .we-mid {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+}
+
+.world-editor-modal-content .popup-body {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    gap: 6px;
+}
+
+.we-section {
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.world-editor-modal-content[data-we-active="server"] .we-section[data-we-section="server"],
+.world-editor-modal-content[data-we-active="login"] .we-section[data-we-section="login"],
+.world-editor-modal-content[data-we-active="options"] .we-section[data-we-section="options"] {
+    display: flex;
+}
+
+.we-section-title {
+    display: none;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #0891b2;
+    padding: 6px 0 2px 0;
+}
+
+.we-toggle-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+    padding-top: 4px;
+}
+
+.world-editor-modal-content .we-toggle-grid .setting-label {
+    width: auto;
+    flex: 1;
+}
+
+.world-editor-modal-content .we-toggle-grid .setting-value {
+    flex: none;
+}
+
+/* Segmented control (phone) */
+.we-seg {
+    display: none;
+    margin: 4px 12px 6px 12px;
+    padding: 3px;
+    gap: 2px;
+    background: var(--theme-bg, #08080a);
+    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
+    border-radius: 7px;
+}
+
+.we-seg .we-nav-btn {
+    flex: 1;
+    padding: 7px 0;
+    background: transparent;
+    border: none;
+    border-radius: 5px;
+    color: var(--theme-fg-secondary, #a1a1aa);
+    font-family: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+}
+
+.we-seg .we-nav-btn.active {
+    background: var(--theme-bg-hover, #222228);
+    color: var(--text-color);
+    box-shadow: inset 0 0 0 1px var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
+}
+
+/* Icon sidebar (tablet) - modelled on .settings-sidebar/.settings-tab-btn */
+.we-side {
+    width: 72px;
+    flex-shrink: 0;
+    background: var(--theme-bg-deep, #0e0e12);
+    border-right: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.06));
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 10px 0;
+    gap: 4px;
+}
+
+.we-side .we-nav-btn {
+    width: 60px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    padding: 7px 2px;
+    background: transparent;
+    border: none;
+    border-radius: 7px;
+    color: var(--theme-fg-muted, #52525b);
+    font-family: inherit;
+    font-size: 10px;
+    cursor: pointer;
+    position: relative;
+}
+
+.we-side .we-nav-btn:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--theme-fg-secondary, #a1a1aa);
+}
+
+.we-side .we-nav-btn.active {
+    background: rgba(8, 145, 178, 0.12);
+    color: #0891b2;
+}
+
+.we-side .we-nav-btn.active::before {
+    content: '';
+    position: absolute;
+    left: -6px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3px;
+    height: 16px;
+    background: #0891b2;
+    border-radius: 0 2px 2px 0;
+}
+
+/* Phone: full screen, segmented control */
+@media (max-width: 600px), (max-height: 560px) {
+    #world-editor-modal .world-editor-modal-content {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        max-width: none;
+        height: var(--we-vvh, 100vh);
+        max-height: none;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+    }
+
+    .we-seg {
+        display: flex;
+    }
+
+    .we-side {
+        display: none;
+    }
+
+    .world-editor-modal-content .setting-label {
+        width: 88px;
+        font-size: 12.5px;
+    }
+
+    .world-editor-modal-content .editor-input {
+        padding: 7px 10px;
+    }
+
+    .world-editor-modal-content .popup-footer {
+        gap: 6px;
+        padding: 10px 12px;
+    }
+
+    .world-editor-modal-content .popup-footer .btn {
+        width: 60px;
+    }
+
+    .world-editor-modal-content .popup-footer .btn-help {
+        width: 30px;
+    }
+}
+
+/* Desktop: everything visible in two columns, no navigation */
+@media (min-width: 900px) and (min-height: 640px) {
+    .world-editor-modal-content {
+        width: 880px;
+    }
+
+    .we-side {
+        display: none;
+    }
+
+    .world-editor-modal-content .popup-body {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        grid-template-areas: "server options" "login options";
+        align-content: start;
+        column-gap: 28px;
+        row-gap: 6px;
+    }
+
+    .world-editor-modal-content .we-section {
+        display: flex;
+    }
+
+    .we-section[data-we-section="server"] { grid-area: server; }
+    .we-section[data-we-section="login"] { grid-area: login; }
+    .we-section[data-we-section="options"] { grid-area: options; }
+
+    .we-section-title {
+        display: block;
+    }
 }
 
 /* ─── Setup popup ─── */
