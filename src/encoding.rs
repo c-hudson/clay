@@ -60,6 +60,43 @@ pub enum Encoding {
 /// here," not mangled bytes, a silently dropped character, or a panic.
 const ENCODE_SUBSTITUTE: u8 = b'?';
 
+/// FANSI (CP437) below 0x80: CP437 draws its control bytes as symbols (☺☻♥♦♣♠ ... ☼►◄
+/// ... ▲▼, and ⌂ for 0x7F), and FANSI MUDs send them as such - passed through as control
+/// characters, `decode`'s control filter silently dropped them (a `☼` never showed).
+/// The bytes that really are controls on a MUD connection stay controls: BEL (beeps, and
+/// the OSC terminator), BS, TAB, LF, CR, ESC, and 0x0E, which ends an ANSI music
+/// sequence (ansi_music.rs) - so no `•◘○◙♪♫←` from those.
+fn fansi_low_char(b: u8) -> char {
+    match b {
+        0x01 => '\u{263A}', // ☺
+        0x02 => '\u{263B}', // ☻
+        0x03 => '\u{2665}', // ♥
+        0x04 => '\u{2666}', // ♦
+        0x05 => '\u{2663}', // ♣
+        0x06 => '\u{2660}', // ♠
+        0x0B => '\u{2642}', // ♂
+        0x0C => '\u{2640}', // ♀
+        0x0F => '\u{263C}', // ☼
+        0x10 => '\u{25BA}', // ►
+        0x11 => '\u{25C4}', // ◄
+        0x12 => '\u{2195}', // ↕
+        0x13 => '\u{203C}', // ‼
+        0x14 => '\u{00B6}', // ¶
+        0x15 => '\u{00A7}', // §
+        0x16 => '\u{25AC}', // ▬
+        0x17 => '\u{21A8}', // ↨
+        0x18 => '\u{2191}', // ↑
+        0x19 => '\u{2193}', // ↓
+        0x1A => '\u{2192}', // →
+        0x1C => '\u{221F}', // ∟
+        0x1D => '\u{2194}', // ↔
+        0x1E => '\u{25B2}', // ▲
+        0x1F => '\u{25BC}', // ▼
+        0x7F => '\u{2302}', // ⌂
+        _ => b as char,
+    }
+}
+
 impl Encoding {
     pub fn decode(&self, bytes: &[u8]) -> String {
         let result = match self {
@@ -119,7 +156,7 @@ impl Encoding {
                     .iter()
                     .map(|&b| {
                         if b < 128 {
-                            b as char
+                            fansi_low_char(b)
                         } else {
                             // Complete CP437 high byte mapping (128-255)
                             match b {
@@ -334,11 +371,15 @@ impl Encoding {
     /// meaningful for the two table-based single-byte encodings; `Utf8`
     /// never calls this.
     fn build_encode_reverse_table(&self) -> std::collections::HashMap<char, u8> {
-        let mut reverse = std::collections::HashMap::with_capacity(128);
-        for b in 0x80u16..=0xFF {
+        let mut reverse = std::collections::HashMap::with_capacity(160);
+        // Below 0x80 only bytes that decode to a non-ASCII symbol (FANSI's CP437
+        // ☺..▼ and ⌂, see fansi_low_char) need an entry; ASCII maps to itself.
+        for b in 0x00u16..=0xFF {
             let b = b as u8;
             if let Some(c) = self.decode(&[b]).chars().next() {
-                reverse.entry(c).or_insert(b);
+                if b >= 0x80 || !c.is_ascii() {
+                    reverse.entry(c).or_insert(b);
+                }
             }
         }
         reverse
@@ -1266,6 +1307,22 @@ fn emoji_name_to_unicode(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fansi_decodes_cp437_low_symbols() {
+        // CP437 draws its control bytes as symbols; they used to be dropped as controls.
+        assert_eq!(Encoding::Fansi.decode(b"sun \x0f here"), "sun \u{263C} here");
+        assert_eq!(Encoding::Fansi.decode(b"\x03\x04\x05\x06\x10\x11\x1e\x1f\x7f"), "♥♦♣♠►◄▲▼⌂");
+        // Real controls keep their meaning: TAB/LF survive, ESC colours still parse,
+        // BEL/CR/BS are stripped as before, Ctrl-N stays for ANSI music.
+        assert_eq!(Encoding::Fansi.decode(b"a\tb\r\n"), "a\tb\n");
+        assert_eq!(Encoding::Fansi.decode(b"\x1b[31mred\x1b[0m"), "\x1b[31mred\x1b[0m");
+        assert_eq!(Encoding::Fansi.decode(b"x\x07\x08y"), "xy");
+        assert_eq!(Encoding::Fansi.decode(b"\x1b[MFcde\x0e"), "\x1b[MFcde\x0e");
+        // Other encodings are untouched.
+        assert_eq!(Encoding::Utf8.decode(b"a\x0fb"), "ab");
+        assert_eq!(Encoding::Latin1.decode(b"a\x0fb"), "ab");
+    }
 
     #[test]
     fn test_url_shortener_default_order_excludes_dagd() {
