@@ -1233,8 +1233,7 @@ async fn handle_daemon_ws_message_impl(
 
                             // In the background: awaiting the connect here froze this whole loop (and
                             // every client) until it finished - see App::spawn_world_connect.
-                            let skip_login = app.worlds[world_index].skip_auto_login;
-                            app.spawn_world_connect(world_index, skip_login, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
+                            app.spawn_world_connect(world_index, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
                         } else {
                             app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
@@ -1253,7 +1252,9 @@ async fn handle_daemon_ws_message_impl(
                         if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
                             // In the background - see App::spawn_world_connect. `/worlds -b` never
                             // reported a failure, so it still doesn't.
-                            app.spawn_world_connect(idx, false, crate::ConnectOrigin::Client { report_failure: false }, event_tx);
+                            // `/worlds -b` always logs in (handle_connection_success reads the flag).
+                            app.worlds[idx].skip_auto_login = false;
+                            app.spawn_world_connect(idx, crate::ConnectOrigin::Client { report_failure: false }, event_tx);
                         }
                     } else {
                         app.emit_client_text(world_index, &format!("World '{}' not found.", name), true);
@@ -1279,8 +1280,7 @@ async fn handle_daemon_ws_message_impl(
 
                             // In the background: awaiting the connect here froze this whole loop (and
                             // every client) until it finished - see App::spawn_world_connect.
-                            let skip_login = app.worlds[idx].skip_auto_login;
-                            app.spawn_world_connect(idx, skip_login, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
+                            app.spawn_world_connect(idx, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
                         }
                     } else {
                         app.emit_client_text(world_index, &format!("World '{}' not found.", name), true);
@@ -1320,8 +1320,7 @@ async fn handle_daemon_ws_message_impl(
                 // Attempt connection
                 // In the background: awaiting the connect here froze this whole loop (and
                 // every client) until it finished - see App::spawn_world_connect.
-                let skip_login = app.worlds[world_index].skip_auto_login;
-                app.spawn_world_connect(world_index, skip_login, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
+                app.spawn_world_connect(world_index, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
             }
         }
         WsMessage::DisconnectWorld { world_index } => {
@@ -1372,8 +1371,7 @@ async fn handle_daemon_ws_message_impl(
                 if !app.worlds[world_index].connected {
                     // In the background: awaiting the connect here froze this whole loop (and
                     // every client) until it finished - see App::spawn_world_connect.
-                    let skip_login = app.worlds[world_index].skip_auto_login;
-                    app.spawn_world_connect(world_index, skip_login, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
+                    app.spawn_world_connect(world_index, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
                 }
             }
         }

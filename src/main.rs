@@ -11838,8 +11838,7 @@ impl App {
             let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
             let msg = format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg);
             self.emit_reconnect_status(idx, &msg);
-            // skip_auto_login=true: handle_connection_success sends auto-login itself.
-            self.spawn_world_connect(idx, true, ConnectOrigin::AutoReconnect, event_tx);
+            self.spawn_world_connect(idx, ConnectOrigin::AutoReconnect, event_tx);
         }
     }
 
@@ -12225,7 +12224,11 @@ impl App {
     /// powered-off LAN host sends no RST, so it waits out an ARP timeout; the TLS-proxy
     /// path polls up to 2s for its socket), and the whole UI and every remote client
     /// freeze for that long. Auto-reconnect used to do exactly that on every retry.
-    pub(crate) fn spawn_world_connect(&mut self, idx: usize, skip_auto_login: bool, origin: ConnectOrigin, event_tx: &mpsc::Sender<AppEvent>) {
+    ///
+    /// Every successful outcome goes through `handle_connection_success`, which sends the
+    /// auto-login itself (honouring `World::skip_auto_login`, and deferring it for FANSI
+    /// client detection), so `connect_daemon_world` is always told not to send one.
+    pub(crate) fn spawn_world_connect(&mut self, idx: usize, origin: ConnectOrigin, event_tx: &mpsc::Sender<AppEvent>) {
         let settings = self.worlds[idx].settings.clone();
         let world_name = self.worlds[idx].name.clone();
         self.worlds[idx].connection_id += 1;
@@ -12234,7 +12237,7 @@ impl App {
         let event_tx = event_tx.clone();
         tokio::spawn(async move {
             let result = daemon::connect_daemon_world(
-                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, skip_auto_login,
+                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
                 tls_proxy_enabled,
             ).await;
             let _ = event_tx.send(AppEvent::WorldConnectResult(world_name, connection_id, origin, result)).await;
@@ -12267,7 +12270,11 @@ impl App {
         }
         let idx = idx.unwrap();
         match (origin, result) {
-            (ConnectOrigin::AutoReconnect | ConnectOrigin::Console, Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path))) => {
+            // A client (web/GUI/-D) connect gets the same treatment as the console's: it used
+            // to set the connected state by hand here, which skipped FANSI client detection
+            // (no CLIENT WEBCLIENT2, and a login sent before it), the log file and the TF
+            // CONNECT hook.
+            (ConnectOrigin::AutoReconnect | ConnectOrigin::Console | ConnectOrigin::Client { .. }, Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path))) => {
                 self.handle_connection_success(world_name, cmd_tx, socket_fd, is_tls);
                 if let Some(new_idx) = self.find_world_index(world_name) {
                     self.worlds[new_idx].proxy_pid = proxy_pid;
@@ -12287,23 +12294,6 @@ impl App {
                 } else {
                     self.emit_reconnect_status(idx, "Connection failed.");
                 }
-            }
-            (ConnectOrigin::Client { .. }, Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path))) => {
-                let w = &mut self.worlds[idx];
-                w.connected = true;
-                w.login_capture_guard = 6; // see World::login_capture_guard
-                w.command_tx = Some(cmd_tx);
-                w.was_connected = true;
-                w.skip_auto_login = false;
-                #[cfg(any(unix, windows))]
-                { w.socket_fd = socket_fd; }
-                w.is_tls = is_tls;
-                w.proxy_pid = proxy_pid;
-                w.proxy_socket_path = proxy_socket_path;
-                let now = std::time::Instant::now();
-                w.last_send_time = Some(now);
-                w.last_receive_time = Some(now);
-                self.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name: world_name.to_string() });
             }
             (ConnectOrigin::Console, None) => {
                 self.add_output_to_world(idx, "Connection failed.");

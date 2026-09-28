@@ -18881,3 +18881,65 @@ third
             Some(AppEvent::MultiuserDisconnected(0, _))
         ));
     }
+
+    /// A client-connected (web/GUI/-D) MUD world, as `spawn_world_connect` leaves it
+    /// just before its connect task reports back.
+    fn client_connect_app(encoding: Encoding) -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("Fansi");
+        w.settings.hostname = "127.0.0.1".to_string();
+        w.settings.port = "4000".to_string();
+        w.settings.user = "bob".to_string();
+        w.settings.password = "pw".to_string();
+        w.settings.encoding = encoding;
+        w.connection_id = 3;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        app
+    }
+
+    #[test]
+    fn test_client_connect_of_a_fansi_world_runs_client_detection() {
+        // The GUI/web connect path used to set the connected state by hand, skipping
+        // handle_connection_success - so a FANSI world connected from the GUI never
+        // answered "Detecting client..." with CLIENT WEBCLIENT2, while --console did.
+        let mut app = client_connect_app(Encoding::Fansi);
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
+        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
+            Some((tx, None, false, None, None)));
+        assert!(app.worlds[0].connected);
+        assert!(app.worlds[0].fansi_detect_until.is_some(), "detection window opened");
+        assert_eq!(app.worlds[0].fansi_login_pending.as_deref(), Some("connect bob pw"),
+            "login deferred until after the client response");
+        assert!(rx.try_recv().is_err(), "nothing sent before the MUD asks");
+
+        app.process_server_data(0, b"Detecting client...\r\n", 24, 80, false);
+        match rx.try_recv() {
+            Ok(WriteCommand::Text(t)) => assert_eq!(t, "CLIENT WEBCLIENT2"),
+            other => panic!("expected CLIENT WEBCLIENT2, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn test_client_connect_sends_auto_login_once() {
+        // connect_daemon_world no longer sends the login for a client connect;
+        // handle_connection_success does, exactly once.
+        let mut app = client_connect_app(Encoding::Utf8);
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
+        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
+            Some((tx, None, false, None, None)));
+        match rx.try_recv() {
+            Ok(WriteCommand::Text(t)) => assert_eq!(t, "connect bob pw"),
+            other => panic!("expected the auto-login, got {:?}", other.map(|_| ())),
+        }
+        assert!(rx.try_recv().is_err(), "sent once");
+
+        // /worlds -l (skip_auto_login) is honoured on the client path too.
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].skip_auto_login = true;
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
+        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
+            Some((tx, None, false, None, None)));
+        assert!(rx.try_recv().is_err(), "no login with -l");
+    }
