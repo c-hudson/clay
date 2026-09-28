@@ -177,10 +177,12 @@ the full list of changed defaults.
 |---|---|
 | `PageUp` | Scroll back (enables more-mode pause) |
 | `PageDown` | Scroll forward (unpauses at the bottom) |
+| `Alt-PageUp` / `Esc-PageUp` | Scroll back half a page |
+| `Alt-PageDown` / `Esc-PageDown` | Scroll forward half a page, or release half a screenful of pending output |
 | `Tab` | Release one screenful of pending output when paused; command completion when the input starts with `/`; otherwise pages like `PageDown` |
 | `Esc-j` | Jump to end, release all pending output |
 | `Esc-J` | Selective flush: keep highlighted pending lines, discard the rest |
-| `Esc-h` | Half-page scroll back, or release half a screenful of pending output |
+| `Esc-h` | Half-page scroll forward, or release half a screenful of pending output |
 | `Esc-^N` | Scroll forward one line (TF LINE) |
 | `Esc-^P` | Scroll back one line (TF LINEBACK) |
 | `Esc-^L` | Clear the view without dropping any lines — scrollback still holds them (TF CLEAR) |
@@ -333,6 +335,8 @@ you change a default, update both.
 | `Alt-Backspace` | `delete_word_backward_punct` |
 | `Alt-Down` | `input_shrink` |
 | `Alt-Left` | `world_socket_prev` |
+| `Alt-PageDown` | `scroll_half_page` |
+| `Alt-PageUp` | `scroll_half_page_back` |
 | `Alt-Right` | `world_socket_next` |
 | `Alt-Space` | `collapse_spaces` |
 | `Alt-Tab` | `completion` |
@@ -368,6 +372,8 @@ you change a default, update both.
 | `Esc-L` | `toggle_limit` |
 | `Esc-Left` | `world_socket_prev` |
 | `Esc-M` | `scramble_words` |
+| `Esc-PageDown` | `scroll_half_page` |
+| `Esc-PageUp` | `scroll_half_page_back` |
 | `Esc-Right` | `world_socket_next` |
 | `Esc-Space` | `collapse_spaces` |
 | `Esc-Tab` | `completion` |

@@ -285,6 +285,15 @@ impl KeyBindings {
         // Scrollback
         b.insert("PageUp".into(), "scroll_page_up".into());
         b.insert("PageDown".into(), "scroll_page_down".into());
+        // Alt-PgUp/PgDn: half a page back/forward (TF's HPAGEBACK/HPAGE actions). Alt, not
+        // Shift or Ctrl: terminals keep Shift-PgUp/PgDn for their own scrollback and
+        // terminals/browsers use Ctrl-PgUp/PgDn to switch tabs. Esc-PgUp/PgDn is the same
+        // keystroke from a terminal that sends Alt as an Esc prefix (macOS Terminal's
+        // "Option as Meta").
+        b.insert("Alt-PageUp".into(), "scroll_half_page_back".into());
+        b.insert("Alt-PageDown".into(), "scroll_half_page".into());
+        b.insert("Esc-PageUp".into(), "scroll_half_page_back".into());
+        b.insert("Esc-PageDown".into(), "scroll_half_page".into());
         b.insert("Esc-j".into(), "flush_output".into());
         b.insert("Esc-J".into(), "selective_flush".into());
         b.insert("Esc-h".into(), "scroll_half_page".into());
@@ -914,6 +923,10 @@ mod tests {
         // Scrollback
         ("PageUp", "scroll_page_up"),
         ("PageDown", "scroll_page_down"),
+        ("Alt-PageUp", "scroll_half_page_back"),
+        ("Alt-PageDown", "scroll_half_page"),
+        ("Esc-PageUp", "scroll_half_page_back"),
+        ("Esc-PageDown", "scroll_half_page"),
         ("Esc-j", "flush_output"),
         ("Esc-J", "selective_flush"),
         ("Esc-h", "scroll_half_page"),
@@ -1134,6 +1147,32 @@ mod tests {
     /// `Ctrl-Home`/`Ctrl-End`/`Ctrl-PageDown` defaults could never fire and `Shift-Tab`/
     /// `Ctrl-Delete` could never be bound at all. Table-driven so every one of the 8 affected
     /// codes gets the same Shift/Ctrl/Alt/none coverage the arrows already had.
+
+    #[test]
+    fn test_alt_page_keys_scroll_half_a_page() {
+        // Alt-PgUp/PgDn: half a page back/forward in every interface - the console and
+        // the SSH remote console resolve a live keypress through these defaults, and
+        // web/GUI get the same table as keybindings_json. A terminal that sends Alt as
+        // an Esc prefix produces Esc-PgUp/PgDn, bound the same.
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let kb = KeyBindings::defaults();
+        let up = key_event_to_name(KeyCode::PageUp, KeyModifiers::ALT).unwrap();
+        let down = key_event_to_name(KeyCode::PageDown, KeyModifiers::ALT).unwrap();
+        assert_eq!(up, "Alt-PageUp");
+        assert_eq!(down, "Alt-PageDown");
+        assert_eq!(kb.get_action(&up), Some("scroll_half_page_back"));
+        assert_eq!(kb.get_action(&down), Some("scroll_half_page"));
+        let esc_up = escape_key_to_name(KeyCode::PageUp, KeyModifiers::NONE).unwrap();
+        let esc_down = escape_key_to_name(KeyCode::PageDown, KeyModifiers::NONE).unwrap();
+        assert_eq!(kb.get_action(&esc_up), Some("scroll_half_page_back"));
+        assert_eq!(kb.get_action(&esc_down), Some("scroll_half_page"));
+        // Shift-PgUp/PgDn stay unbound (terminals keep them for their own scrollback).
+        assert_eq!(kb.get_action("Shift-PageUp"), None);
+        assert_eq!(kb.get_action("Shift-PageDown"), None);
+        // Plain PgUp/PgDn keep their full-page actions.
+        assert_eq!(kb.get_action("PageUp"), Some("scroll_page_up"));
+        assert_eq!(kb.get_action("PageDown"), Some("scroll_page_down"));
+    }
     #[test]
     fn test_key_event_to_name_modified_named_keys() {
         use crossterm::event::{KeyCode, KeyModifiers};

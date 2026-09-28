@@ -2547,7 +2547,8 @@ pub(crate) fn dispatch_remote_action(
                     count: half.max(1),
                 });
             } else {
-                app.move_viewport_up(half.max(1));
+                // Forward = toward newer output (TF HPAGE), same as the console and web.
+                app.move_viewport_down(half.max(1));
             }
         }
         // TF HPAGEBACK/LINE/LINEBACK (Job 19) - local viewport moves only, same fidelity

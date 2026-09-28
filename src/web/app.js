@@ -13377,7 +13377,9 @@
                 const halfPage = Math.floor(elements.outputContainer.clientHeight / 2) * Math.max(1, Math.abs(n));
                 if (n >= 0) {
                     if (pendingTotal() > 0) {
-                        releaseScreenful();
+                        // Half a screen of held output, like the console's release
+                        // (dokey_scroll_forward with half a page) - not a full screenful.
+                        releaseLines(Math.max(1, Math.floor((getVisibleLineCount() - 2) / 2)) * Math.max(1, Math.abs(n)));
                     } else {
                         elements.outputContainer.scrollBy(0, halfPage);
                     }
