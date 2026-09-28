@@ -261,8 +261,10 @@ at `~/VMs/OSX-KVM`), running on this AMD host. It is the only macOS builder for 
   tablet's pointer input cancels its countdown) and defaults to a non-bootable "EFI" entry.
   `macvm.sh start --installer` uses the stock image plus the macOS installer disk
   (`~/VMs/OSX-KVM/BaseSystem.img`), for reinstalling.
-- **GUI access** (rarely needed): `vncviewer localhost:5905` (tigervnc-viewer is installed),
-  or `macvm.sh screenshot /tmp/x.png`. The account stays at the login window; SSH builds
+- **GUI access** (rarely needed): `macvm.sh start --window` opens the screen in a local QEMU
+  GTK window (faster than VNC; needs a desktop session, VNC stays available too), or
+  `vncviewer localhost:5905` (tigervnc-viewer is installed), or `macvm.sh screenshot /tmp/x.png`.
+  `/release` always uses the plain headless `start`. The account stays at the login window; SSH builds
   don't need a desktop session.
 - The host needs `kvm ignore_msrs=1` (`/etc/modprobe.d/kvm.conf`, installed from
   OSX-KVM's `kvm_amd.conf`), or macOS crashes at boot.
