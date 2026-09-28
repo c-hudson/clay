@@ -8711,52 +8711,75 @@
         return renderBlockElements(result);
     }
 
-    // Block elements (U+2580-U+259F: FANSI/CP437 art's █▀▄▌▐░▒▓ and friends) are drawn
-    // by CSS instead of by the font. A font's block glyphs are rarely exactly one line
-    // tall and one column wide - the bundled JetBrains Mono has none at all, so they
-    // come from whatever fallback font the OS picks (on macOS: dark bands between art
-    // rows, and art drifting against the text around it). Each run of one block
-    // character becomes a span exactly N columns wide (ch) and one line tall (lh),
-    // painted in the text colour (currentColor) by gradients; the glyph stays in the
-    // span, invisible, so copying the text still gives the original characters.
-    // Runs only: never touches markup, since these characters can't appear in the tags
-    // parseAnsi builds.
-    const BLOCK_ELEMENT_BG = (function() {
+    // Block elements (U+2580-U+259F: FANSI/CP437 art's █▀▄▌▐░▒▓ and friends), and
+    // spaces on a coloured background, are drawn as exact cells instead of text.
+    //
+    // Two problems with drawing them as text, both visible on macOS as dark bands
+    // through FANSI art:
+    //  - a font's block glyphs are rarely exactly one line tall and one column wide
+    //    (the bundled JetBrains Mono has none, so they came from whatever fallback font
+    //    the OS picked, and the art drifted against the text around it);
+    //  - an inline span's background is painted over the font's glyph height, not the
+    //    line's: JetBrains Mono's is 1.32 lines, so every coloured run spilled ~3px into
+    //    the rows above and below, and since rows paint in order the next row's spill
+    //    covered the bottom of this row's art.
+    // So each run becomes a span exactly N columns (ch) wide and one line (lh) tall
+    // that paints its own background colour (inherited from the ANSI span around it)
+    // plus the block shape in the text colour, and is positioned (.blk in style.css) so
+    // it paints after every row's ordinary text and backgrounds - no neighbour's spill
+    // can cover it. The characters stay in the span, invisible, for copying.
+    const BLOCK_ELEMENT_LAYERS = (function() {
         const c = 'currentColor', t = 'transparent';
         const pct = (n) => (n * 12.5) + '%';
-        const band = (dir, n) => 'linear-gradient(' + dir + ',' + c + ' ' + pct(n) + ',' + t + ' ' + pct(n) + ')';
-        // Quadrant layers: the top or bottom half of every column, left or right half of
-        // the column (one tile per column, so a run of several stays per-cell).
-        const quad = (side, y) => 'linear-gradient(to right,' + (side === 'L' ? c + ' 50%,' + t + ' 50%' : t + ' 50%,' + c + ' 50%') + ') 0 ' + y + ' / 1ch 50% repeat-x';
+        // One background layer: [image, position, size, repeat].
+        const band = (dir, n, cell) => ['linear-gradient(' + dir + ',' + c + ' ' + pct(n) + ',' + t + ' ' + pct(n) + ')',
+            '0 0', cell ? '1ch 100%' : '100% 100%', cell ? 'repeat-x' : 'no-repeat'];
+        const solid = (mix) => ['linear-gradient(' + mix + ',' + mix + ')', '0 0', '100% 100%', 'no-repeat'];
+        // Quadrant: left or right half of every column, top or bottom half of the line.
+        const quad = (side, y) => ['linear-gradient(to right,' + (side === 'L' ? c + ' 50%,' + t + ' 50%' : t + ' 50%,' + c + ' 50%') + ')',
+            '0 ' + y, '1ch 50%', 'repeat-x'];
         const UL = quad('L', '0'), UR = quad('R', '0'), LL = quad('L', '100%'), LR = quad('R', '100%');
+        const shade = (p) => solid('color-mix(in srgb,' + c + ' ' + p + '%,' + t + ')');
         const m = {};
-        m['\u2580'] = { bg: band('to bottom', 4) };            // upper half
-        for (let n = 1; n <= 7; n++) m[String.fromCharCode(0x2580 + n)] = { bg: band('to top', n) }; // lower n/8
-        m['\u2588'] = { bg: c };                               // full
-        for (let n = 7; n >= 1; n--) m[String.fromCharCode(0x2589 + 7 - n)] = { bg: band('to right', n), cell: true }; // left n/8
-        m['\u2590'] = { bg: band('to left', 4), cell: true };  // right half
-        m['\u2591'] = { bg: c, opacity: 0.25 };                // light shade
-        m['\u2592'] = { bg: c, opacity: 0.5 };                 // medium shade
-        m['\u2593'] = { bg: c, opacity: 0.75 };                // dark shade
-        m['\u2594'] = { bg: band('to bottom', 1) };            // upper 1/8
-        m['\u2595'] = { bg: band('to left', 1), cell: true };  // right 1/8
-        const quads = { '\u2596': [LL], '\u2597': [LR], '\u2598': [UL], '\u2599': [UL, LL, LR],
-            '\u259A': [UL, LR], '\u259B': [UL, UR, LL], '\u259C': [UL, UR, LR], '\u259D': [UR],
-            '\u259E': [UR, LL], '\u259F': [UR, LL, LR] };
-        for (const k in quads) m[k] = { bg: quads[k].join(',') };
+        m['▀'] = [band('to bottom', 4)];                                  // upper half
+        for (let n = 1; n <= 7; n++) m[String.fromCharCode(0x2580 + n)] = [band('to top', n)]; // lower n/8
+        m['█'] = [solid(c)];                                              // full
+        for (let n = 7; n >= 1; n--) m[String.fromCharCode(0x2589 + 7 - n)] = [band('to right', n, true)]; // left n/8
+        m['▐'] = [band('to left', 4, true)];                              // right half
+        m['░'] = [shade(25)];                                             // light shade
+        m['▒'] = [shade(50)];                                             // medium shade
+        m['▓'] = [shade(75)];                                             // dark shade
+        m['▔'] = [band('to bottom', 1)];                                  // upper 1/8
+        m['▕'] = [band('to left', 1, true)];                              // right 1/8
+        const quads = { '▖': [LL], '▗': [LR], '▘': [UL], '▙': [UL, LL, LR],
+            '▚': [UL, LR], '▛': [UL, UR, LL], '▜': [UL, UR, LR], '▝': [UR],
+            '▞': [UR, LL], '▟': [UR, LL, LR] };
+        for (const k in quads) m[k] = quads[k];
         return m;
     })();
 
+    function cellSpan(text, layers) {
+        let style = 'width:' + text.length + 'ch;';
+        if (layers && layers.length) {
+            const col = (i) => layers.map(function(l) { return l[i]; }).join(',');
+            style += 'background-image:' + col(0) + ';background-position:' + col(1) +
+                ';background-size:' + col(2) + ';background-repeat:' + col(3) + ';';
+        }
+        return '<span class="blk" style="' + style + '">' + text + '</span>';
+    }
+
     function renderBlockElements(html) {
-        if (!/[\u2580-\u259F]/.test(html)) return html;
-        return html.replace(/([\u2580-\u259F])\1*/g, function(run, ch) {
-            const spec = BLOCK_ELEMENT_BG[ch];
-            if (!spec) return run;
-            let style = 'width:' + run.length + 'ch;background:' + spec.bg + ';';
-            // Shapes that vary across a cell repeat once per column.
-            if (spec.cell) style += 'background-size:1ch 100%;background-repeat:repeat-x;';
-            if (spec.opacity) style += 'opacity:' + spec.opacity + ';';
-            return '<span class="blk" style="' + style + '">' + run + '</span>';
+        // Spaces inside a span with a background (an ANSI bg colour or class): the
+        // art's solid-colour cells. Only text directly inside such a span is touched.
+        if (html.indexOf(' ') !== -1 && /background|ansi-bg-/.test(html)) {
+            html = html.replace(/(<span\b[^>]*(?:style="[^"]*background|class="[^"]*ansi-bg-)[^>]*>)([^<]+)/g, function(m, open, text) {
+                return open + text.replace(/ +/g, function(sp) { return cellSpan(sp, null); });
+            });
+        }
+        if (!/[▀-▟]/.test(html)) return html;
+        return html.replace(/([▀-▟])\1*/g, function(run, ch) {
+            const layers = BLOCK_ELEMENT_LAYERS[ch];
+            return layers ? cellSpan(run, layers) : run;
         });
     }
 

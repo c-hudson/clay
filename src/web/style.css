@@ -110,16 +110,22 @@ body {
     letter-spacing: 0;
 }
 
-/* Block-element runs drawn by CSS instead of the font (app.js renderBlockElements):
-   exactly one line tall and N columns wide (width set inline), painted by their
-   inline background in the text colour. The glyphs stay (invisible) for copying. */
+/* Block-element and coloured-space runs drawn as exact cells (app.js
+   renderBlockElements): one line tall, N columns wide (width set inline), painting
+   the surrounding ANSI background (inherit) under the block shape (inline
+   background-image layers in the text colour). position: relative paints them after
+   every row's ordinary text and backgrounds, so a neighbouring row's background -
+   painted over the font's glyph height, taller than the line - can't cover them.
+   The characters stay, invisible, for copying. */
 .blk {
     display: inline-block;
     vertical-align: top;
+    position: relative;
     height: 1em;
     height: 1lh;
     overflow: hidden;
     white-space: pre;
+    background-color: inherit;
     -webkit-text-fill-color: transparent;
 }
 
