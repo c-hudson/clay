@@ -10,6 +10,9 @@
          tab) is marked before <body> is parsed, so style.css can keep the chat UI from
          ever being painted - the window shows the theme background, then the note. -->
     <script>if (/[?&]note=\d/.test(location.search)) document.documentElement.classList.add('note-window');</script>
+    <!-- The desktop GUI's own Settings window (?settings=<tab>, SETTINGS_MODE in app.js):
+         same idea - only the Settings popup, filling the window, never the chat UI. -->
+    <script>if (/[?&]settings=/.test(location.search)) document.documentElement.classList.add('settings-window');</script>
     <!-- Until the password is resolved only the login dialog is shown: the rest of the UI
          is hidden while <html> has awaiting-auth, and app.js's showAuthModal(false) removes
          it on a successful login. Both the class and the rule live here in <head>, not in

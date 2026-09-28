@@ -71,6 +71,12 @@ enum WvEvent {
     /// button) without exiting the whole app — unlike Quit. Reuses the same
     /// removal logic as a native close (WindowEvent::CloseRequested).
     CloseWindow(tao::window::WindowId),
+    /// Open the Settings popup in its own OS window (SETTINGS_MODE in web/app.js),
+    /// on `tab`; focuses the existing one instead if it is already open.
+    SettingsWindow { tab: String, auth: Option<InheritedAuth> },
+    /// Relay the Settings window's live font preview to every other window
+    /// (payload: the JSON argument for app.js's `__clayFontPreview`).
+    FontPreview { payload: String, from: tao::window::WindowId },
 }
 
 use crate::theme::ThemeFile;
@@ -135,6 +141,24 @@ fn spawned_window_js(mode_js: Option<String>, auth: &Option<InheritedAuth>) -> O
         (Some(m), Some(a)) => Some(format!("{}\n        {}", m, a)),
         (m, a) => m.or(a),
     }
+}
+
+/// Settings tab name from a `settings-window:` payload: only the popup's own tab
+/// ids (lowercase letters and '-'), anything else falls back to "general".
+fn settings_tab_name(v: &serde_json::Value) -> String {
+    match v["tab"].as_str() {
+        Some(t) if !t.is_empty() && t.len() <= 32 && t.chars().all(|c| c.is_ascii_lowercase() || c == '-') => t.to_string(),
+        _ => "general".to_string(),
+    }
+}
+
+/// JS that hands a font-preview payload to a window's app.js. The payload came
+/// from our own page, but it is parsed and re-serialized here so only well-formed
+/// JSON (a settings object, `null` = revert, `"commit"`) ever reaches evaluate_script.
+fn font_preview_js(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let json = v.to_string().replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
+    Some(format!("window.__clayFontPreview && window.__clayFontPreview({});", json))
 }
 
 /// Open a URL in the system's default browser (platform-specific).
@@ -1130,6 +1154,14 @@ fn dispatch_ipc_message(
                 let _ = proxy.send_event(WvEvent::NoteWindow { world_index: world_index as usize, world_name, auth });
             }
         }
+    } else if let Some(json_str) = body.strip_prefix("settings-window:") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let tab = settings_tab_name(&v);
+            let auth = parse_inherited_auth(&v);
+            let _ = proxy.send_event(WvEvent::SettingsWindow { tab, auth });
+        }
+    } else if let Some(payload) = body.strip_prefix("font-preview:") {
+        let _ = proxy.send_event(WvEvent::FontPreview { payload: payload.to_string(), from: window_id });
     } else if body == "quit" {
         let _ = proxy.send_event(WvEvent::Quit);
     } else if body == "close-window" {
@@ -1383,6 +1415,15 @@ fn build_webview(
 /// Uses custom protocol (clay://) instead of with_html() because with_html() loads
 /// content with a null origin, which blocks WebSocket connections on WebKit2GTK.
 /// Supports multiple windows within a single event loop.
+/// The Settings window closed: tell every other window to drop its font
+/// preview. After a Save the page has already sent "commit", which makes this a
+/// no-op there; after Cancel or a native close it puts the saved font back.
+fn end_font_preview(webviews: &HashMap<WindowId, wry::WebView>) {
+    for wv in webviews.values() {
+        let _ = wv.evaluate_script("window.__clayFontPreview && window.__clayFontPreview(null);");
+    }
+}
+
 fn create_webview_window(
     title: &str,
     params: &WebViewParams,
@@ -1447,6 +1488,9 @@ fn create_webview_window(
     // Clone params for use inside the event loop closure (needed for creating new windows)
     let params = params.clone();
 
+    // The Settings window, while one is open (there is at most one).
+    let mut settings_window: Option<WindowId> = None;
+
     event_loop.run(move |event, event_loop_target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -1459,6 +1503,10 @@ fn create_webview_window(
                 // Remove the closed window and its webview
                 windows.remove(&window_id);
                 webviews.remove(&window_id);
+                if settings_window == Some(window_id) {
+                    settings_window = None;
+                    end_font_preview(&webviews);
+                }
                 // Only exit if all windows are closed
                 if windows.is_empty() {
                     *control_flow = ControlFlow::Exit;
@@ -1669,8 +1717,54 @@ fn create_webview_window(
                 // but triggered from JS via IPC rather than the OS chrome.
                 windows.remove(&id);
                 webviews.remove(&id);
+                if settings_window == Some(id) {
+                    settings_window = None;
+                    end_font_preview(&webviews);
+                }
                 if windows.is_empty() {
                     *control_flow = ControlFlow::Exit;
+                }
+            }
+            Event::UserEvent(WvEvent::SettingsWindow { ref tab, ref auth }) => {
+                // One Settings window: a second request focuses it on the new tab.
+                if let Some(id) = settings_window {
+                    if let (Some(w), Some(wv)) = (windows.get(&id), webviews.get(&id)) {
+                        w.set_focus();
+                        let tab_json = serde_json::Value::String(tab.clone()).to_string();
+                        let _ = wv.evaluate_script(&format!(
+                            "window.__claySettingsTab && window.__claySettingsTab({});", tab_json));
+                        return;
+                    }
+                    settings_window = None;
+                }
+                let new_window = match WindowBuilder::new()
+                    .with_title("Clay - Settings")
+                    .with_theme(window_theme)
+                    .with_inner_size(tao::dpi::LogicalSize::new(520.0, 680.0))
+                    .build(event_loop_target)
+                {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                let tab_json = serde_json::Value::String(tab.clone()).to_string();
+                let settings_js = format!("window.SETTINGS_MODE = {{ tab: {} }};", tab_json);
+                let extra_js = spawned_window_js(Some(settings_js), auth);
+                // `settings=` lets index.html's <head> hide the chat UI before first paint.
+                let query = format!("settings={}", tab);
+                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, None, extra_js.as_deref(), Some(&query)) {
+                    let id = new_window.id();
+                    windows.insert(id, new_window);
+                    webviews.insert(id, wv);
+                    settings_window = Some(id);
+                }
+            }
+            Event::UserEvent(WvEvent::FontPreview { ref payload, from }) => {
+                if let Some(js) = font_preview_js(payload) {
+                    for (id, wv) in webviews.iter() {
+                        if *id != from {
+                            let _ = wv.evaluate_script(&js);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1781,5 +1875,36 @@ mod inherited_auth_tests {
         let both = spawned_window_js(Some("M;".into()), &auth).unwrap();
         assert!(both.starts_with("M;") && both.contains("window.INHERITED_AUTH"));
         assert!(format!("{:?}", auth).contains("<redacted>") && !format!("{:?}", auth).contains("pw\""));
+    }
+}
+
+#[cfg(test)]
+mod settings_window_tests {
+    use super::*;
+
+    #[test]
+    fn settings_tab_name_accepts_only_tab_ids() {
+        let tab = |s: &str| settings_tab_name(&serde_json::from_str(s).unwrap());
+        assert_eq!(tab(r#"{"tab":"font"}"#), "font");
+        assert_eq!(tab(r#"{"tab":"clay-server"}"#), "clay-server");
+        // Anything else (it ends up in a URL query and injected JS) is "general".
+        assert_eq!(tab(r#"{"tab":"x&y=1"}"#), "general");
+        assert_eq!(tab(r#"{"tab":"'); alert(1); ('"}"#), "general");
+        assert_eq!(tab(r#"{"tab":""}"#), "general");
+        assert_eq!(tab(r#"{}"#), "general");
+    }
+
+    #[test]
+    fn font_preview_js_passes_only_well_formed_json() {
+        assert_eq!(font_preview_js("null").unwrap(),
+            "window.__clayFontPreview && window.__clayFontPreview(null);");
+        assert_eq!(font_preview_js(r#""commit""#).unwrap(),
+            r#"window.__clayFontPreview && window.__clayFontPreview("commit");"#);
+        let js = font_preview_js(r#"{"name":"</script><b> ","desktop":18}"#).unwrap();
+        assert!(!js.contains('<') && !js.contains('\u{2028}'), "{js}");
+        assert!(js.contains(r#""desktop":18"#));
+        // Not JSON (e.g. an attempt to smuggle a statement): nothing is evaluated.
+        assert!(font_preview_js("null); alert(1); (null").is_none());
+        assert!(font_preview_js("").is_none());
     }
 }

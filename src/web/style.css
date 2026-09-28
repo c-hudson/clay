@@ -2934,6 +2934,32 @@ body.device-phone .settings-content {
     min-height: 0; /* required for .settings-section.active's overflow-y:auto to work */
 }
 
+/* The desktop GUI's own Settings window (SETTINGS_MODE, see webview_gui.rs's
+   WvEvent::SettingsWindow; marked in index.html's <head>): no chat UI at all, and
+   the Settings popup fills the window with its sections scrolling between the
+   pinned header and footer. */
+html.settings-window #app > :not(.modal) {
+    display: none !important;
+}
+
+html.settings-window .settings-modal-content {
+    width: 100vw;
+    max-width: none;
+    height: 100vh;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+html.settings-window .settings-layout {
+    height: 100%;
+}
+
+html.settings-window .settings-content {
+    min-height: 0;
+}
+
 /* Web section inputs */
 .settings-modal-content .web-input {
     width: 100%;

@@ -826,6 +826,13 @@
     // html.note-window in style.css); don't let a tab read "Clay MUD Client" meanwhile.
     if (noteMode) document.title = 'Clay - Notes';
 
+    // Settings window mode: the desktop GUI's own Settings window (webview_gui.rs's
+    // WvEvent::SettingsWindow injects SETTINGS_MODE). It shows only the Settings
+    // popup, and closing the popup closes the window. Browsers and Android never get
+    // this - they keep the in-page popup.
+    var settingsWindowMode = window.SETTINGS_MODE || null;
+    if (settingsWindowMode) document.title = 'Clay - Settings';
+
     // Login handed down by the window that spawned this one (note editor,
     // /window, /window --grep), so a spawned window doesn't re-prompt for a
     // password the user already typed. Parent -> child only, never back: the
@@ -3835,6 +3842,12 @@
                 // the Android in-place equivalent (entered at runtime, not here).
                 if (noteMode) {
                     enterNoteMode(noteMode.world_index);
+                }
+
+                // Settings window: show the popup once the settings have arrived. Not
+                // again on a reconnect's InitialState, which would throw away edits.
+                if (settingsWindowMode && !settingsPopupOpen) {
+                    openSettingsPopup(settingsWindowMode.tab);
                 }
 
                 // Handle pending reconnect command (resend after reconnection). T1.12/D3:
@@ -10692,6 +10705,12 @@
             appendClientLine('Web settings are disabled in multiuser mode.', currentWorldIndex, 'system');
             return;
         }
+        // The desktop GUI opens Settings in its own window (see settingsWindowMode);
+        // the Settings window itself shows the popup in place.
+        if (window.WEBVIEW_MODE && !settingsWindowMode) {
+            sendIpc('settings-window:' + JSON.stringify({ tab: tab || 'general', auth: inheritableAuth() }));
+            return;
+        }
         settingsPopupOpen = true;
         // Load general edit state
         setupMoreMode = moreModeEnabled;
@@ -10720,11 +10739,7 @@
         }
         // Load font edit state, and remember the saved font so a cancel can undo the
         // live preview (previewFontEdit) the font tab applies while it's open.
-        fontPreviewSaved = {
-            name: fontName, phone: webFontSizePhone, tablet: webFontSizeTablet,
-            desktop: webFontSizeDesktop, weight: webFontWeight, lineHeight: webFontLineHeight,
-            letterSpacing: webFontLetterSpacing, wordSpacing: webFontWordSpacing
-        };
+        fontPreviewSaved = currentFontSettings();
         fontEditName = fontName;
         fontEditSizePhone = Math.round(webFontSizePhone);
         fontEditSizeTablet = Math.round(webFontSizeTablet);
@@ -10754,6 +10769,12 @@
         settingsPopupOpen = false;
         elements.settingsModal.className = 'modal';
         elements.settingsModal.style.display = 'none';
+        // The Settings window exists only to show this popup. Rust tells the other
+        // windows to drop any font preview when it closes (a no-op after Save).
+        if (settingsWindowMode) {
+            sendIpc('close-window');
+            return;
+        }
         focusInputWithKeyboard();
     }
 
@@ -11048,6 +11069,9 @@
         // not revert it
         _saveFontSettingsInline();
         fontPreviewSaved = null;
+        // The main window keeps the previewed font instead of reverting when this
+        // window closes; the server's GlobalSettingsUpdated then confirms it.
+        if (settingsWindowMode) sendIpc('font-preview:"commit"');
 
         // Send combined update to server
         if (settingsSynced) {
@@ -11267,13 +11291,57 @@
         // setFontSize records the size as this device's webFontSize*; the revert below
         // restores that along with everything else.
         if (clampFontSize(fontPx) !== currentFontSize) setFontSize(clampFontSize(fontPx), false);
+        // In the Settings window the preview belongs on the main window.
+        if (settingsWindowMode) {
+            sendIpc('font-preview:' + JSON.stringify({
+                name: fontEditName, phone: fontEditSizePhone, tablet: fontEditSizeTablet,
+                desktop: fontEditSizeDesktop, weight: fontEditWeight, lineHeight: fontEditLineHeight,
+                letterSpacing: fontEditLetterSpacing, wordSpacing: fontEditWordSpacing
+            }));
+        }
     }
+
+    function currentFontSettings() {
+        return {
+            name: fontName, phone: webFontSizePhone, tablet: webFontSizeTablet,
+            desktop: webFontSizeDesktop, weight: webFontWeight, lineHeight: webFontLineHeight,
+            letterSpacing: webFontLetterSpacing, wordSpacing: webFontWordSpacing
+        };
+    }
+
+    // Desktop GUI, main (and any other) window: the Settings window's live font
+    // preview, relayed by webview_gui.rs. A settings object previews it (the first
+    // one remembers this window's saved font); null puts the saved font back
+    // (Cancel, or the Settings window closed); "commit" keeps the preview (Save).
+    window.__clayFontPreview = function(p) {
+        if (settingsWindowMode) return;
+        if (p === null) { revertFontPreview(); return; }
+        if (p === 'commit') { fontPreviewSaved = null; return; }
+        if (!p || typeof p !== 'object') return;
+        if (!fontPreviewSaved) fontPreviewSaved = currentFontSettings();
+        fontEditName = String(p.name || '');
+        fontEditSizePhone = Number(p.phone) || fontEditSizePhone;
+        fontEditSizeTablet = Number(p.tablet) || fontEditSizeTablet;
+        fontEditSizeDesktop = Number(p.desktop) || fontEditSizeDesktop;
+        fontEditWeight = Number(p.weight) || fontEditWeight;
+        fontEditLineHeight = Number(p.lineHeight) || fontEditLineHeight;
+        fontEditLetterSpacing = Number(p.letterSpacing) || 0;
+        fontEditWordSpacing = Number(p.wordSpacing) || 0;
+        previewFontEdit();
+    };
+
+    // Desktop GUI: /setup, /font etc. while the Settings window is already open
+    // focus it on the asked-for tab (webview_gui.rs).
+    window.__claySettingsTab = function(tab) {
+        if (settingsWindowMode && settingsPopupOpen) switchSettingsTab(String(tab || 'general'));
+    };
 
     // Put back the font settings the popup opened with (see fontPreviewSaved).
     function revertFontPreview() {
         var saved = fontPreviewSaved;
         if (!saved) return;
         fontPreviewSaved = null;
+        if (settingsWindowMode) sendIpc('font-preview:null');
         webFontSizePhone = saved.phone;
         webFontSizeTablet = saved.tablet;
         webFontSizeDesktop = saved.desktop;
