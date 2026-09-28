@@ -1457,6 +1457,9 @@
     let fontEditLineHeight = 1.2;
     let fontEditLetterSpacing = 0;
     let fontEditWordSpacing = 0;
+    // The saved font settings while the Settings popup is open (null otherwise, and
+    // after Save), so closing without saving can undo previewFontEdit's live preview.
+    let fontPreviewSaved = null;
 
     // Font families (matching remote GUI FONT_FAMILIES)
     const FONT_FAMILIES = [
@@ -10715,7 +10718,13 @@
         if (elements.setupRemoteLinesInput) {
             elements.setupRemoteLinesInput.value = remoteInitialLines;
         }
-        // Load font edit state
+        // Load font edit state, and remember the saved font so a cancel can undo the
+        // live preview (previewFontEdit) the font tab applies while it's open.
+        fontPreviewSaved = {
+            name: fontName, phone: webFontSizePhone, tablet: webFontSizeTablet,
+            desktop: webFontSizeDesktop, weight: webFontWeight, lineHeight: webFontLineHeight,
+            letterSpacing: webFontLetterSpacing, wordSpacing: webFontWordSpacing
+        };
         fontEditName = fontName;
         fontEditSizePhone = Math.round(webFontSizePhone);
         fontEditSizeTablet = Math.round(webFontSizeTablet);
@@ -10739,6 +10748,9 @@
     }
 
     function closeSettingsPopup() {
+        // Closed without Save (Cancel, the X, Escape, another popup taking over):
+        // undo the font preview. saveSettingsAll clears fontPreviewSaved first.
+        revertFontPreview();
         settingsPopupOpen = false;
         elements.settingsModal.className = 'modal';
         elements.settingsModal.style.display = 'none';
@@ -11032,8 +11044,10 @@
             remoteInitialLines = Math.max(10, Math.min(5000, setupRemoteInitialLines));
         }
 
-        // Save font settings
+        // Save font settings - the preview becomes the real setting, so closing must
+        // not revert it
         _saveFontSettingsInline();
+        fontPreviewSaved = null;
 
         // Send combined update to server
         if (settingsSynced) {
@@ -11204,6 +11218,7 @@
                     el.classList.remove('selected');
                 });
                 item.classList.add('selected');
+                previewFontEdit();
             });
             list.appendChild(item);
         });
@@ -11229,6 +11244,49 @@
             adv.style.opacity = chk.checked ? '1' : '0.35';
             adv.style.pointerEvents = chk.checked ? '' : 'none';
         }
+        previewFontEdit();
+    }
+
+    // Show the font tab's edit values on the window right away, so the user sees a
+    // font before saving it. Display only: nothing is sent to the server
+    // (setFontSize(..., false)) - that happens on Save, via saveSettingsAll.
+    function previewFontEdit() {
+        if (!fontPreviewSaved) return;
+        applyFontFamily(fontEditName);
+        applyFontWeight(fontEditWeight);
+        var output = elements.output;
+        var input = elements.input;
+        output.style.lineHeight = fontEditLineHeight;
+        input.style.lineHeight = fontEditLineHeight;
+        output.style.letterSpacing = fontEditLetterSpacing ? fontEditLetterSpacing + 'px' : '';
+        input.style.letterSpacing = fontEditLetterSpacing ? fontEditLetterSpacing + 'px' : '';
+        output.style.wordSpacing = fontEditWordSpacing ? fontEditWordSpacing + 'px' : '';
+        input.style.wordSpacing = fontEditWordSpacing ? fontEditWordSpacing + 'px' : '';
+        var fontPx = deviceType === 'phone' ? fontEditSizePhone :
+                     deviceType === 'tablet' ? fontEditSizeTablet : fontEditSizeDesktop;
+        // setFontSize records the size as this device's webFontSize*; the revert below
+        // restores that along with everything else.
+        if (clampFontSize(fontPx) !== currentFontSize) setFontSize(clampFontSize(fontPx), false);
+    }
+
+    // Put back the font settings the popup opened with (see fontPreviewSaved).
+    function revertFontPreview() {
+        var saved = fontPreviewSaved;
+        if (!saved) return;
+        fontPreviewSaved = null;
+        webFontSizePhone = saved.phone;
+        webFontSizeTablet = saved.tablet;
+        webFontSizeDesktop = saved.desktop;
+        webFontWeight = saved.weight;
+        webFontLineHeight = saved.lineHeight;
+        webFontLetterSpacing = saved.letterSpacing;
+        webFontWordSpacing = saved.wordSpacing;
+        applyFontFamily(saved.name);
+        applyFontWeight(webFontWeight);
+        applyAdvancedFontSettings();
+        var fontPx = deviceType === 'phone' ? webFontSizePhone :
+                     deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
+        if (clampFontSize(fontPx) !== currentFontSize) setFontSize(clampFontSize(fontPx), false);
     }
 
     // saveFontSettings removed — merged into saveSettingsAll
