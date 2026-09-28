@@ -1482,6 +1482,9 @@ fn create_webview_window(
     let mut windows: HashMap<WindowId, tao::window::Window> = HashMap::new();
     let mut webviews: HashMap<WindowId, wry::WebView> = HashMap::new();
     let window_id = window.id();
+    // The first window is the app: closing it quits, even with spawned windows (Settings,
+    // notes, /window, grep) still open - those only make sense alongside it.
+    let main_window_id = window_id;
     windows.insert(window_id, window);
     webviews.insert(window_id, webview);
 
@@ -1511,8 +1514,12 @@ fn create_webview_window(
                     settings_window = None;
                     end_font_preview(&webviews);
                 }
-                // Only exit if all windows are closed
-                if windows.is_empty() {
+                if window_id == main_window_id {
+                    // Same as WvEvent::Quit: hand back any UPnP mapping, then exit, which
+                    // drops every remaining window with the event loop.
+                    crate::portmap::unmap_active_blocking();
+                    *control_flow = ControlFlow::Exit;
+                } else if windows.is_empty() {
                     *control_flow = ControlFlow::Exit;
                 }
             }
