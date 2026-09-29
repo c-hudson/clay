@@ -1511,6 +1511,18 @@ fn create_webview_window(
         .build(&event_loop)
         .map_err(|e| io::Error::other(format!("Failed to create window: {}", e)))?;
 
+    // Suppress WebKit/JSC stderr noise while WebKit starts up in this process - from
+    // the first WebKit call (the spell-checking WebContext just below) through the
+    // first webview. That start-up prints "Overriding existing handler for signal 10.
+    // Set JSC_SIGNAL_FOR_GC ..." because Clay owns SIGUSR1 (hot reload) and JSC's GC
+    // wants it; it is harmless (JSC_SIGNAL_FOR_GC itself can't be used - this WebKit
+    // rejects any unknown JSC_* variable with "ERROR: invalid option"). When the guard
+    // started after the WebContext call, the warning came back.
+    // Must not wrap EventLoopBuilder or WindowBuilder - GTK/tao panics there would be
+    // swallowed (54a3910); both are created above.
+    #[cfg(unix)]
+    let _stderr_guard = StderrSuppress::new();
+
     // Enable spell checking on Linux (WebKit2GTK)
     #[cfg(any(
         target_os = "linux",
@@ -1529,11 +1541,6 @@ fn create_webview_window(
 
     // Read initial world lock from env var (set by CLAY_WINDOW_WORLD for backward compat)
     let initial_world_lock: Option<String> = std::env::var("CLAY_WINDOW_WORLD").ok();
-
-    // Suppress WebKit/JSC stderr noise during WebView init only.
-    // Must not wrap EventLoopBuilder or WindowBuilder — GTK/tao panics there would be swallowed.
-    #[cfg(unix)]
-    let _stderr_guard = StderrSuppress::new();
 
     // Build the first webview (initial_world_lock is handled inside build_html via env var)
     let webview = build_webview(&window, params, &proxy, &reload_tx, None, None, None)?;
