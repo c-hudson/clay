@@ -1985,12 +1985,6 @@ body.device-phone #output-container { padding: 6px 10px; }
     font-size: 13px;
 }
 
-#worlds-table-container {
-    max-height: 300px;
-    overflow-y: auto;
-    margin-bottom: 8px;
-}
-
 #worlds-table {
     width: 100%;
     border-collapse: collapse;
@@ -2103,10 +2097,34 @@ body.device-phone #output-container { padding: 6px 10px; }
     border-color: var(--accent-color);
 }
 
-#world-selector-table-container {
+#world-selector-table-container,
+#worlds-table-container {
     max-height: 300px;
     overflow-y: auto;
     margin-bottom: 8px;
+    /* A visible scrollbar, although native ones are hidden app-wide (see
+       .actions-editor-body for the same override): the standard properties for
+       Firefox / Chromium / WebView2, the -webkit- pseudo-elements below for
+       WebKitGTK and WKWebView (Linux and macOS GUI). */
+    scrollbar-width: thin;
+    scrollbar-color: var(--theme-fg-muted, #52525b) transparent;
+}
+
+#world-selector-table-container::-webkit-scrollbar,
+#worlds-table-container::-webkit-scrollbar {
+    display: block;
+    width: 8px;
+}
+
+#world-selector-table-container::-webkit-scrollbar-track,
+#worlds-table-container::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#world-selector-table-container::-webkit-scrollbar-thumb,
+#worlds-table-container::-webkit-scrollbar-thumb {
+    background: var(--theme-fg-muted, #52525b);
+    border-radius: 4px;
 }
 
 #world-selector-table {
@@ -2126,6 +2144,11 @@ body.device-phone #output-container { padding: 6px 10px; }
 #world-selector-table th {
     color: var(--accent-color);
     font-weight: normal;
+    /* Keep the column headings in view while the list scrolls. */
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background-color: var(--theme-bg-elevated, #111);
 }
 
 #world-selector-table th:first-child {
@@ -2993,9 +3016,12 @@ html.popup-window #world-selector-modal .world-selector-modal-content > * {
     flex: none;
 }
 
+/* Each selector here must outrank the `> * { flex: none }` rule above, or the list
+   keeps its full height and pushes the footer out of the window (the Worlds window
+   once lost its scrollbar and its Connected toggle that way). */
 html.popup-window #help-modal .help-content,
 html.popup-window #actions-list-modal .actions-list,
-html.popup-window #world-selector-table-container {
+html.popup-window #world-selector-modal #world-selector-table-container {
     flex: 1 1 auto;
     min-height: 0;
     max-height: none;

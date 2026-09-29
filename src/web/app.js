@@ -11903,14 +11903,60 @@
             if (selectedItem && container) {
                 const containerRect = container.getBoundingClientRect();
                 const itemRect = selectedItem.getBoundingClientRect();
+                // The column headings are sticky (style.css), so the visible part of
+                // the list starts below them, not at the container's top edge.
+                const thead = container.querySelector('thead');
+                const top = containerRect.top + (thead ? thead.getBoundingClientRect().height : 0);
 
-                if (itemRect.top < containerRect.top) {
-                    selectedItem.scrollIntoView({ block: 'start', behavior: 'auto' });
+                if (itemRect.top < top) {
+                    container.scrollTop -= top - itemRect.top;
                 } else if (itemRect.bottom > containerRect.bottom) {
-                    selectedItem.scrollIntoView({ block: 'end', behavior: 'auto' });
+                    container.scrollTop += itemRect.bottom - containerRect.bottom;
                 }
             }
         });
+    }
+
+    // Move the world selector's selection one row up (step -1) or down (step 1)
+    // among the visible (filtered) worlds. The arrow keys wrap at the ends; the
+    // scroll wheel stops there, like the console's list popups (mouse_scroll_up/down).
+    function moveWorldSelectorSelection(step, wrap) {
+        const visibleWorlds = getFilteredWorldIndices();
+        if (visibleWorlds.length === 0) return;
+        const currentPos = visibleWorlds.indexOf(selectedWorldIndex);
+        let next;
+        if (currentPos < 0) {
+            next = step > 0 ? 0 : visibleWorlds.length - 1;
+        } else {
+            next = currentPos + step;
+            if (next < 0) next = wrap ? visibleWorlds.length - 1 : 0;
+            if (next >= visibleWorlds.length) next = wrap ? 0 : visibleWorlds.length - 1;
+        }
+        if (visibleWorlds[next] !== selectedWorldIndex) selectWorld(visibleWorlds[next]);
+    }
+
+    // Scroll wheel over the world list steps the selection, one row per notch.
+    // A mouse notch is one large delta (its size varies by engine: ~48-120px), so
+    // any delta that big is exactly one step; trackpads send many small deltas,
+    // which are accumulated into whole steps instead.
+    const WORLD_SELECTOR_WHEEL_STEP_PX = 40;
+    let worldSelectorWheelAccum = 0;
+    function handleWorldSelectorWheel(e) {
+        if (e.ctrlKey) return; // pinch-zoom
+        e.preventDefault();
+        const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+        if (px === 0) return;
+        if (Math.abs(px) >= WORLD_SELECTOR_WHEEL_STEP_PX) {
+            worldSelectorWheelAccum = 0;
+            moveWorldSelectorSelection(px > 0 ? 1 : -1, false);
+            return;
+        }
+        if (Math.sign(px) !== Math.sign(worldSelectorWheelAccum)) worldSelectorWheelAccum = 0;
+        worldSelectorWheelAccum += px;
+        if (Math.abs(worldSelectorWheelAccum) >= WORLD_SELECTOR_WHEEL_STEP_PX) {
+            moveWorldSelectorSelection(worldSelectorWheelAccum > 0 ? 1 : -1, false);
+            worldSelectorWheelAccum = 0;
+        }
     }
 
     // Get indices of worlds that match the current filter and "Only Connected" toggle
@@ -15360,24 +15406,10 @@
                     closeWorldSelectorPopup();
                 } else if (e.key === 'ArrowUp') {
                     e.preventDefault();
-                    // Move selection up
-                    const visibleWorlds = getFilteredWorldIndices();
-                    const currentPos = visibleWorlds.indexOf(selectedWorldIndex);
-                    if (currentPos > 0) {
-                        selectWorld(visibleWorlds[currentPos - 1]);
-                    } else if (visibleWorlds.length > 0) {
-                        selectWorld(visibleWorlds[visibleWorlds.length - 1]);
-                    }
+                    moveWorldSelectorSelection(-1, true);
                 } else if (e.key === 'ArrowDown') {
                     e.preventDefault();
-                    // Move selection down
-                    const visibleWorlds = getFilteredWorldIndices();
-                    const currentPos = visibleWorlds.indexOf(selectedWorldIndex);
-                    if (currentPos < visibleWorlds.length - 1) {
-                        selectWorld(visibleWorlds[currentPos + 1]);
-                    } else if (visibleWorlds.length > 0) {
-                        selectWorld(visibleWorlds[0]);
-                    }
+                    moveWorldSelectorSelection(1, true);
                 } else if (e.key === 'Enter') {
                     e.preventDefault();
                     connectSelectedWorld();
@@ -15669,6 +15701,10 @@
         elements.worldEditBtn.onclick = editSelectedWorld;
         elements.worldConnectBtn.onclick = connectSelectedWorld;
         elements.worldSelectorCancelBtn.onclick = closeWorldSelectorPopup;
+        const worldSelectorTableContainer = document.getElementById('world-selector-table-container');
+        if (worldSelectorTableContainer) {
+            worldSelectorTableContainer.addEventListener('wheel', handleWorldSelectorWheel, { passive: false });
+        }
         elements.worldSelectorOnlyConnected.onchange = function() {
             worldSelectorOnlyConnected = this.checked;
             // Update selection if current selection is filtered out
