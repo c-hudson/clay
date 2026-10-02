@@ -1,6 +1,6 @@
 # Clay TinyFugue Compatibility — Design Record
 
-**Status: implemented, 2026-09.** This document is the authoritative record of the
+**Status: implemented, 2026-09; drop-in replacement work (section D), 2026-10.** This document is the authoritative record of the
 rulings behind Clay's TinyFugue (TF) 5.0 compatibility layer (`src/tf/`), its keybinding
 grammar and dispatch order (`src/keynames.rs`, `src/chords.rs`, `src/keybindings.rs`),
 and the TF-script test suite (`tests/tf/`, `tools/tf-oracle.sh`) — the result of an
@@ -110,7 +110,7 @@ commands (alias, at, lisp, stack-q, textencode, textutil, map, speedwalk, tick, 
 quoter, watch, spell, psh, color) come from the real library itself once `/require`
 can find it — see "Loading TinyFugue's own library" below.
 
-## C. Engine Gaps (all reproduced against real TF, all fixed except the two noted)
+## C. Engine Gaps (all reproduced against real TF, all fixed)
 
 The investigation ran all 44 pure `tf-lib` scripts through Clay's engine, one per fresh
 process, and found every one of them failed at the time. Headline gaps, now fixed:
@@ -129,14 +129,10 @@ forms of `prompt eval def test`); TinyFugue does **not** expand `%var`/`$[]`/`$(
 a bare top-level line read from a file, but Clay used to unconditionally — see
 "Loading TinyFugue's own library" below for the rule this became.
 
-**Remaining known gaps** (tracked in `tests/tf/xfail.txt`, both small and isolated —
-neither blocks ordinary use):
-
-- `lib_testcolor` — `/echo`'s argument loses double-space fidelity once split into
-  positional parameters; real TF's own `getopts()`/`shift()` preserve original
-  argument-text spacing internally in a way Clay's macro-invocation plumbing doesn't
-  yet reproduce.
-- `lib_textutil` — TF's `%|` pipe operator (tfio streams) is unimplemented.
+**Remaining known gaps: none.** The two that were left (`lib_testcolor`: arguments lost
+their original spacing once split into positional parameters; `lib_textutil`: TF's `%|`
+pipe was unimplemented) were fixed by the drop-in work (section D), and
+`tests/tf/xfail.txt` is empty.
 
 Other gaps fixed but worth knowing about: `/set`/`/let` used to trim their value,
 losing meaningful leading/trailing whitespace; `:=` assignment always wrote the
@@ -158,6 +154,99 @@ match also sets; nested command-form `/for` loops could hang the engine; `LOADFA
 was parsed but never actually fired, so a gagged guard around an optional,
 legitimately-missing file (stdlib.tf's own `local.tf` guard) could never suppress its
 error.
+
+## D. A Drop-in Replacement (2026-10)
+
+The goal: a TinyFugue user's `~/.tfrc`, command line and habits work in Clay, while a
+plain `clay` with no `.tfrc` behaves as before. Clay's defaults changed only where the
+user ruled that TF wins (listed under "Changed Defaults"). Everything below was checked
+against real tf 5.0b8, mostly by driving it in a pty.
+
+- **Startup** (`src/tfstartup.rs`): TF's command line - `clay mymud`, `clay host port`,
+  `-f[file]`, `-c<cmd>`, `-L<dir>`, `-n`, `-l`, `-q` - and the first of `~/.tfrc`,
+  `~/tfrc`, `./.tfrc`, `./tfrc` (with `%TFLIBDIR/local.tf` and `~/.tinytalk`, as TF
+  loads them). Only at a cold start: a reload or crash restart carries the whole TF
+  state over instead (`src/tf/snapshot.rs`). `-v` stays "version"; nothing
+  auto-connects to the first world.
+- **Effects** (`src/tf/effects.rs`, `src/tfrun.rs`): a command's output, sends, Clay
+  commands, world definitions and the rest are applied in order, in every interface - a
+  macro body used to keep only its first Clay command, hooks dropped them all, and the
+  GUI/headless and `-D` paths dropped most of what triggers did. TF's current world
+  (`${world_name}` etc.) is the trigger's, hook's, timer's or client's.
+- **Loading files**: TF's rules - top-level lines never expanded, any `#` line a
+  comment, a plain-text line aborts the load, errors printed in place as
+  `% <file>, line N: ...`, `% Loading commands from <path>.`; `%TFPATH` (space-separated)
+  replaces `%TFLIBDIR`; `~user`.
+- **Language**: TF truthiness (a string is false unless it starts with a number; `&`/`|`
+  return an operand), arguments keep their spacing (`%*`, `%-N`), `%|` pipes, `/def`
+  priority 1 by default, `-P` partial attributes, hook lists (`-hCONNECT|LOGIN`).
+- **Special variables** (`src/tf/special_vars.rs`): TF's table with its defaults, where
+  seeding changes nothing Clay does. `more`, `wrapspace`, `isize`, `insert` and `visual`
+  stand for Clay's own settings (`/set more=on` turns Clay's more-paging on, in every
+  interface). Flag commands (`/quiet`, `/lp`, `/kecho`, ...) as stdlib.tf defines them.
+- **Worlds and login**: TF's `/connect` (Clay's remote attach is now `/server`),
+  temporary `/connect host port` worlds, `/addworld` idempotent and saved (a type `-T`
+  is a new world field, `tf_type`, editable in every UI; `lp`/`diku` worlds log in with
+  two lines - the new `Lines` login style), `%login`/`-l`/`-q`, the LOGIN hook, mfiles,
+  `/saveworld`, `/loadworld`, `/purgeworld`, TF's `/listworlds`.
+- **Display attributes**: a trigger's `-a`/`-P` attributes, `/hilite`, `/gag` and
+  `%hilite`/`%gag`/`%borg` reach the line itself (every UI, the archive, `/recall`);
+  `L` keeps a line out of the log, `A` keeps it from counting as activity, and `G`
+  (nohistory) keeps it out of the history: displayed as usual, but `/recall` and
+  `/quote #` never find it (not even with `-ag`) and it is never archived. `/echo -a`
+  and `/substitute -a` carry `g`/`G`/`L`/`A` too (`/echo -ag` keeps the line, hidden,
+  for `/recall -ag`). Attribute lists - `-a`, `/prompt -a`, `decode_attr()`'s second
+  argument - and inline `@{...}` codes are read with TF's grammar (`-aBu`, `@{BCgreen}`
+  is bold green): inline codes add up, `@{n}` resets, `@{x}` and `@{}` change nothing,
+  an unknown attribute is TF's error (`echo: invalid display attribute 'o'`); Clay's
+  older names (`red`, `bold,underline`) still work. `/recall -a<attrs>` shows lines
+  without those of their *own* attributes (a trigger's, `/echo -a`'s, `/substitute
+  -a`'s) and leaves attributes inside the text alone, as TF does.
+- **History**: `/recordline [-lig] [-w[<world>]] [-t<time>] [-a<attrs>] [-p]` records
+  a line without displaying, logging or archiving it (stored hidden, like captured
+  input): `-w` lines are found by `/recall -w`, `-l` by `-l`, `-g` (the default) only by
+  `-g`, `-i` lines by `-i` and the console's Up/Down history. Time-range `/recall`
+  checks each line's time, since a `-t` line can be out of order.
+- **Definitions**: a reserved word can't name a macro (`DEF: "set" is a reserved
+  word.`); a macro named like one of TF's builtins warns and fires CONFLICT; a `/let`
+  hiding a global warns and fires SHADOW. `%mecho` echoes what macros and files run,
+  as TF does. The DEFAULT world is saved with the other worlds.
+- **Output**: `%wrap`/`%wrapsize`, once a script sets them, are where output wraps -
+  console, web, GUI, Android and SSH console.
+- **Mail**: TF's mail check (`%TFMAILPATH`/`%MAIL`, `%maildelay`, the MAIL hook,
+  `nmail()`, `@mail`), once a script asks for it.
+- **Hooks**: CONNECT, LOGIN, WORLD, DISCONNECT, BGTEXT, BGTRIG, PREACTIVITY, ACTIVITY,
+  MORE, PROMPT (a matching hook takes the prompt over - `prompt()`), LOG, PROCESS,
+  PENDING, RESIZE, SHELL, MAIL, CONFLICT, SHADOW, SIGTERM/SIGHUP/SIGUSR1/SIGUSR2 (in
+  the console, the GUI and `-D`; a signal ignored at startup, as under `nohup`, stays
+  ignored), with `-w`/`-T` filters; a gagged hook's `-w`/`-T` are judged against the
+  event's world. DISCONNECT, CONFAIL and ICONFAIL get real tf's arguments (checked
+  against tf 5.0b8): `<world>` when the server closed the connection (a TLS close
+  without close_notify included), `<world> recv <error>` for a failed read, and
+  `<world> <address> <port>: <reason>` for a failed connect - ICONFAIL for each address
+  of a name that failed before the next was tried, on every connect path (the GUI's,
+  `-D`'s and auto-reconnect's too). Clay keeps its own messages ("Connection closed by
+  server.", "Disconnected.", "Connection failed: <reason>"), which a gagged hook hides.
+  `/dc` fires no DISCONNECT, as in tf. CONNECT gets the TLS cipher after the world's name,
+  named as tf's OpenSSL names it (`mud TLS_AES_256_GCM_SHA384`). PROXY never fires: Clay
+  has no `%proxy_host`.
+- **`%textdiv`**, once a script sets it: on switching to a world, the console (and the
+  web/GUI/Android client and SSH console, each for what it has shown) draws
+  `%textdiv_str` between what it had shown there and what arrived since (`on`), even
+  with nothing new (`always`), or a screen-high blank that takes the old text out of
+  view (`clear`); the divider goes when you switch away. Clay's ▶ markers are off while
+  it is set; `/unset textdiv` brings them back.
+- **Commands**: `/quote` is TF's (one background process per quote, paced by `%ptime`,
+  `-S`, `-P`/`%lpquote`, `-s<sub>`, `#` recall source, `\` escapes, stderr included,
+  run lines never expanded); `/ps` prints TF's table; `/sh` runs on Clay's own terminal
+  (elsewhere, in the background); `/suspend`; `/prompt`/`prompt()`; `/localecho`
+  negotiates telnet ECHO; real `columns()`, `lines()`, `moresize()`, `morepaused()`,
+  `nlog()`, `limit()`; `/help` falls back to TF's `tf-help` file.
+- **Status line** (`src/tf/status.rs`): `/status_add`, `/status_rm`, `/status_edit`,
+  `/status_defaults`, `/status_save`, `/status_restore`, `/clock`, `status_fields()`
+  and tfstatus.tf's formats. Clay keeps its own bar until a script changes the status
+  line; then TF's is drawn in the console, the web/GUI/Android client and the SSH
+  console, laid out to each one's width as TF draws it.
 
 ## The Script-Test Suite
 
@@ -197,15 +286,51 @@ test tf_script` for one case.
 ## Intentional Differences (kept, not bugs)
 
 See `docs/markdown/06-tf-commands.md`'s "Differences from TinyFugue" section for the
-user-facing version. Summary: `^Q`/`^R` stay at their Clay meanings; `Tab` keeps
-paging/more-mode priority (`Esc-Tab` does TF-style completion); the kill ring's `^Y`,
-the F-keys, `Shift-Up/Down`, and `Alt-Up/Down` are Clay-only additions; `/recall -D`,
-`/world -e`, `/watchdog -w<world>`, `/trigger -d`, `/repeat -p<priority>`, long-form
-`/def -a"gag"`, `#`/`# ` comments in `/load`, `/quote -A -P`, and `/tfhelp` are
-Clay-only extras kept alongside TF's own behavior; `/limit`/`/unlimit`/`/relimit` and
-`/xtitle` are console-only (no remote-filter wire message exists yet); the
-`expand_line` key action is a no-op on the plain web/GUI client (no safe wire path for
-a server to substitute a remote client's own input line).
+user-facing version, and `docs/markdown/22-switching-from-tinyfugue.md` for a TF user's.
+Summary: `^Q`/`^R` stay at their Clay meanings; `Tab` keeps paging/more-mode priority
+(`Esc-Tab` does TF-style completion); the kill ring's `^Y`, the F-keys,
+`Shift-Up/Down`, and `Alt-Up/Down` are Clay-only additions; `/recall -D`, `/world -e`,
+`/watchdog -w<world>`, `/trigger -d`, `/repeat -p<priority>`, long-form `/def -a"gag"`,
+`/quote -A`, and `/tfhelp` are Clay-only extras kept alongside TF's own behavior;
+`/limit`/`/unlimit`/`/relimit` and `/xtitle` are console-only (no remote-filter wire
+message exists yet); the `expand_line` key action is a no-op on the plain web/GUI client
+(no safe wire path for a server to substitute a remote client's own input line).
+
+From the drop-in work (user rulings, or what Clay's design allows):
+
+- `-v` on the command line is Clay's "version"; nothing connects to the first world on
+  its own.
+- Clay has no non-visual mode (user ruling): its console always draws its windows,
+  `%visual` always reads `on`, and `/visual off` / `/set visual=off` are refused with
+  `% Clay's console has no non-visual mode.`
+- `/unworld` deletes a world even while it is connected.
+- `/repeat` and `/quote` with no `-w` stay with the world they started in rather than
+  following the foreground world.
+- `/histsize` reports that Clay keeps whole histories (it has no capacity to change).
+- Clay's own status bar is shown until a script changes TF's status line; the web/GUI
+  status strip keeps its menu, notes and font controls beside TF's fields.
+- A `/sh` from a web, GUI or remote-console client, or in a Clay with no console (`-D`,
+  the GUI), runs in the background with its output shown when done; an interactive
+  shell is only available on Clay's own console.
+- `moresize()` counts the lines held at Clay's more prompt; its "n"/"l"/"a" flags change
+  nothing (Clay has no scrolled-back-but-seen lines below the window).
+- `%wrapsize`, `%clock_format` and mail checking are off until a script sets or asks for
+  them, so a plain `clay` keeps wrapping at the window's edge, keeps its 12-hour clock and
+  doesn't watch `$MAIL`.
+- `%textdiv` unset is Clay's own ▶ markers (when enabled), not TF's default divider.
+  Its "clear" is a blank block in the scrollback, which scrolling back passes before the
+  old text until you switch away; TF's divider also goes once it scrolls off the screen,
+  Clay's only when you switch away.
+- `/recordline -i` adds to the console's Up/Down history only; the web, desktop and
+  Android clients keep their own input histories.
+- `/dc` really closes the connection now - it used to leave the socket open, so the
+  server's text kept arriving in a world shown as disconnected.
+- A TLS server that closes without close_notify is reported as an ordinary close
+  (`DISCONNECT mud`); tf with OpenSSL 3 reports an SSL error there, and fires DISCONNECT
+  twice. CONNECT has no cipher for a connection made through Clay's TLS proxy or with
+  the native-tls backend, which don't expose it.
+- `/recall -a` can take a line's own attributes off only while Clay is running: after a
+  hot reload the line keeps them, drawn in.
 
 ## Changed Defaults — Release Note
 
@@ -238,6 +363,31 @@ pre-parity behavior:
   reordered.
 - **`/bind`** now defers substitution to keypress time (matching `/def`'s own body
   semantics) instead of substituting once, eagerly, when the binding was typed.
+
+From the drop-in work (2026-10):
+
+- **`/connect`** (attach to another Clay) is now **`/server`**; `/connect` connects a
+  world, as in TF.
+- **`~/.tfrc`** (or `~/tfrc`, `./.tfrc`, `./tfrc`) loads at startup; `-f` with no file
+  skips it.
+- **Typed lines are no longer `%`-expanded** (`%sub` is off, as in TF; `/sub full`
+  restores it). Top-level lines in loaded files are never expanded.
+- **`/repeat`** waits one interval before its first run (`-n`: at once); `/quote` and
+  `/repeat` pace by `%ptime` (1 second) when given no time; `-1:30` means 1 hour 30
+  minutes (it was read as minutes:seconds).
+- **`/quote`** is TF's: it needs a source (`'`, `!`, `` ` ``, `#`), runs in the background
+  unless `-S`, runs its lines as commands when there is a <pre>, and is a process `/ps`
+  lists and `/kill` stops. `/ps` prints TF's table.
+- **TF truthiness**: a non-numeric string is false; `&`/`|` return an operand.
+- **`/def`**'s default priority is 1.
+- **`/load`**: errors are reported in place, TF-style; a plain-text line aborts the load;
+  any `#` line is a comment.
+- **`/wrap <n>`** sets the wrap width (`%wrapsize`), not the hanging indent.
+- **`/hilite`**, **`/gag`** and bare **`/limit`** behave and print as in TF.
+- **`-T`** patterns match a world's TF type, or Clay's name for its type.
+- Saved all-capitals `[tf_globals]` entries (leaked environment variables) are removed
+  once.
+- **SIGTERM** quits cleanly, restoring the terminal.
 
 **If you want the old keys back**, add these lines under `[bindings]` in
 `~/.clay/keybindings.dat` (or set them the same way in the web keybind editor):

@@ -8,31 +8,6 @@ use super::macros;
 use super::hooks;
 use super::builtins;
 
-/// Split a macro-invocation argument string into positional parameters.
-///
-/// Real TF (`/help substitution`): "If called with the traditional
-/// '/name ...' command syntax, each space-separated word is a positional
-/// parameter" - a plain `split_whitespace()`, with no exception. This used
-/// to special-case a "rest of the args starts and ends with the same
-/// character" shape (meant for a "x...x"-delimited payload, e.g. Clay's own
-/// `/decrypt`/`{-1}` idiom in builtins.rs) and fold it into a single
-/// argument - but that heuristic fires on perfectly ordinary word lists
-/// too, by coincidence, whenever the last word happens to start and end
-/// with the same letter as the first remaining word (verified directly:
-/// lisp.tf's own "/remove a b a c b" chain, real args ["a","b","a","c","b"],
-/// was being collapsed to just ["a", "b a c b"] because the "rest" - "b a c
-/// b" - both starts and ends with 'b'). Real TF has no such rule; `{-1}`'s
-/// own "join remaining args with a single space" semantics already
-/// reconstructs a `/decrypt`-style payload correctly on its own, since
-/// `/encrypt`'s own output (builtins.rs's `makeprintable`) never contains a
-/// literal space in the first place (it encodes one as the two-character
-/// token "%b" specifically to survive ordinary word-splitting) - see
-/// `test_encrypt_decrypt_roundtrip`, which still passes without this
-/// heuristic.
-fn parse_macro_args(args: &str) -> Vec<&str> {
-    args.split_whitespace().collect()
-}
-
 /// Check if input is a TF command (starts with / prefix)
 pub fn is_tf_command(input: &str) -> bool {
     let trimmed = input.trim_start();
@@ -51,7 +26,9 @@ pub fn is_tf_command_name(cmd: &str) -> bool {
         }
     }
     matches!(cmd,
-        "help" |
+        "help" | "prompt" |
+        "status_add" | "status_rm" | "status_edit" | "status_defaults" | "status_save" |
+        "status_restore" | "clock" |
         "set" | "unset" | "let" | "setenv" | "listvar" |
         "echo" | "beep" | "quote" | "substitute" | "escape" | "hilite" | "nohilite" | "partial" | "export" |
         "expr" | "test" | "eval" |
@@ -63,24 +40,30 @@ pub fn is_tf_command_name(cmd: &str) -> bool {
         "fg" | "trigger" | "input" | "grab" | "gag" | "ungag" | "exit" | "shift" | "bamf" |
         // These are also TF commands (mapped to Clay equivalents)
         "say" |
-        "quit" | "dc" | "disconnect" | "world" | "listworlds" |
+        "quit" | "dc" | "disconnect" | "world" | "connect" | "listworlds" |
         "listsockets" | "connections" | "l" | "ban" | "addworld" | "version" |
+        "addtiny" | "addlp" | "addlpp" | "adddiku" | "addtelnet" |
         // Note: "send" maps to Clay's /send command, but TF's /send has different options
         // so we route it through TF to handle -w flag properly
         "send" |
         // Tier 1: Simple commands
         "toggle" | "return" | "result" | "not" | "suspend" | "dokey" | "histsize" |
+        "login" | "nologin" | "quiet" | "noquiet" | "quitdone" | "visual" | "lp" | "lpquote" |
+        "insert" | "borg" | "redef" | "shpause" | "sockmload" | "background" | "clearfull" |
+        "cleardone" | "gpri" | "hpri" | "isize" | "ptime" | "wrapspace" |
+        "kecho" | "mecho" | "qecho" |
         "localecho" | "sub" | "replace" | "tr" | "cat" | "paste" | "endpaste" |
         // Tier 2: Trigger shortcuts
         "trig" | "trigp" | "trigc" | "trigpc" | "untrig" |
         // Tier 3: World management
-        "unworld" | "purgeworld" | "saveworld" |
+        "unworld" | "purgeworld" | "saveworld" | "loadworld" |
         // Tier 4: Spam detection
         "watchdog" | "watchname" |
         // Tier 5: Stubs
         "telnet" | "finger" | "getfile" | "putfile" | "liststreams" |
-        "changes" | "tick" | "recordline" | "edit" |
+        "changes" | "tick" | "edit" |
         // Job 15: missing builtins + stdlib one-liners (plan section B, P1.14)
+        "recordline" |
         "ismacro" | "isvar" | "features" | "then" | "do" | "restrict" | "core" |
         "sys" | "xtitle" | "more" | "wrap" |
         "first" | "rest" | "last" | "nth" | "ver" | "man" | "nogag" |
@@ -90,19 +73,40 @@ pub fn is_tf_command_name(cmd: &str) -> bool {
 }
 
 /// Execute a TF command and return the result.
+///
+/// Runs in its own effect frame (see `super::effects`): everything the command did is
+/// folded into the returned result, in order.
 pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
-    execute_command_impl(engine, input, false)
+    run_in_frame(engine, |engine| execute_command_impl(engine, input, false))
 }
 
 /// Execute a TF command with pre-substituted input (skip variable substitution).
 /// Used by control_flow when it has already done substitution.
 pub fn execute_command_substituted(engine: &mut TfEngine, input: &str) -> TfCommandResult {
-    execute_command_impl(engine, input, true)
+    run_in_frame(engine, |engine| execute_command_impl(engine, input, true))
+}
+
+/// Run `f` in a fresh effect frame and fold the frame into one result. A control result
+/// (`/return`, `/exit`, ...) propagates as itself; the effects that preceded it move to the
+/// enclosing frame, whose own earlier effects were all emitted already, so order holds.
+pub(crate) fn run_in_frame(engine: &mut TfEngine, f: impl FnOnce(&mut TfEngine) -> TfCommandResult) -> TfCommandResult {
+    engine.begin_frame();
+    let result = f(engine);
+    let mut frame = engine.end_frame();
+    if result.is_control() {
+        for effect in frame {
+            engine.emit(effect);
+        }
+        return result;
+    }
+    super::effects::push_result_effects(result, &mut frame);
+    super::effects::effects_to_result(frame)
 }
 
 /// Internal implementation of execute_command.
 fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: bool) -> TfCommandResult {
-    let input = input.trim();
+    // Trailing space is part of the command's argument, as in TF (`/set kprefix=>> `).
+    let input = input.trim_start().trim_end_matches(['\r', '\n']);
 
     // Check for internal encoded commands (from control flow)
     // These use \x1F (unit separator) as delimiter to avoid conflicts with : in content
@@ -125,12 +129,14 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         return match result {
             ControlResult::Consumed => TfCommandResult::Success(None),
             ControlResult::Execute(commands) => {
-                // Execute the collected commands
-                let mut results = vec![];
+                // Execute the collected commands, emitting each one's effects as it finishes
                 for cmd in commands {
-                    results.push(execute_command(engine, &cmd));
+                    let result = execute_command(engine, &cmd);
+                    if let Some(control) = engine.emit_result(result) {
+                        return control;
+                    }
                 }
-                aggregate_results_with_engine(engine, results)
+                TfCommandResult::Success(None)
             }
             ControlResult::Error(e) => {
                 engine.control_state = ControlState::None;
@@ -188,8 +194,7 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         // "/tick" always won over a library's own same-named macro.
         if !force_builtin && !is_control_flow_keyword {
             if let Some(macro_def) = engine.macros.iter().find(|m| m.name.eq_ignore_ascii_case(&cmd_name)).cloned() {
-                let macro_args: Vec<&str> = parse_macro_args(args_str);
-                let results = super::macros::execute_macro(engine, &macro_def, &macro_args, None);
+                let results = super::macros::execute_macro_with_raw(engine, &macro_def, args_str, None);
                 return aggregate_results_with_engine(engine, results);
             }
         }
@@ -209,7 +214,8 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
 /// Execute a TF command by name with the given arguments.
 /// Handles variable substitution, control flow detection, and dispatch.
 fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_substitution: bool) -> TfCommandResult {
-    let rest_check = args.trim();
+    // Trailing space belongs to the arguments, as in TF (`/set kprefix=>> `).
+    let rest_check = args.trim_start();
     let lower_cmd = cmd_name.to_lowercase();
 
     // /if, /while and /for must never have their argument string substituted
@@ -287,15 +293,15 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
             let after_eq = &rest_check[eq_pos..];
             let substituted_before = super::variables::substitute_commands(engine, before_eq);
             substituted = format!("{}{}", substituted_before, after_eq);
-            substituted.trim()
+            substituted.trim_start()
         } else {
             // No body (just /def or /def with options but no =), substitute normally
             substituted = super::variables::substitute_commands(engine, rest_check);
-            substituted.trim()
+            substituted.trim_start()
         }
     } else {
         substituted = super::variables::substitute_commands(engine, rest_check);
-        substituted.trim()
+        substituted.trim_start()
     };
 
     match lower_cmd.as_str() {
@@ -336,13 +342,27 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         // or -ALL target typed at the console.
         "dc" | "disconnect" => TfCommandResult::ClayCommand(format!("/disconnect {}", args).trim_end().to_string()),
         "world" => cmd_world(args),
+        "connect" => builtins::cmd_connect(engine, args),
         "listworlds" => cmd_listworlds(engine, args),
+        "loadworld" => cmd_loadworld(engine, args),
         "listsockets" | "connections" | "l" => cmd_connections(engine, args),
         "ban" => cmd_banlist(engine, args),
-        "addworld" => cmd_addworld(args),
+        "addworld" => builtins::cmd_addworld(engine, args),
+        // stdlib.tf's typed shorthands: `/def -i addtiny = /addworld -T"tiny" %*` etc.
+        "addtiny" | "addlp" | "addlpp" | "adddiku" | "addtelnet" => {
+            builtins::cmd_addworld(engine, &format!("-T{} {}", &lower_cmd[3..], args))
+        }
 
         // Info commands
-        "help" => cmd_help(args),
+        "help" => cmd_help(engine, args),
+        "prompt" => cmd_prompt(engine, args),
+        "status_add" => super::status::cmd_status_add(engine, args),
+        "status_rm" => super::status::cmd_status_rm(engine, args),
+        "status_edit" => super::status::cmd_status_edit(engine, args),
+        "status_defaults" => super::status::cmd_status_defaults(engine),
+        "status_save" => super::status::cmd_status_save(engine, args),
+        "status_restore" => super::status::cmd_status_restore(engine, args),
+        "clock" => super::status::cmd_clock(engine, args),
         "version" => cmd_version(),
 
         // Control flow commands
@@ -399,7 +419,11 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "fg" => cmd_fg(engine, args),
 
         // Portal/bamf
-        "bamf" => cmd_bamf(engine, args),
+        "bamf" => builtins::cmd_flag_command(engine, "bamf", args),
+        // stdlib.tf's one-line `/def -i <name> = /set <name> %*` commands.
+        name if builtins::FLAG_COMMANDS.contains(&name) => builtins::cmd_flag_command(engine, name, args),
+        "nologin" | "noquiet" => builtins::cmd_flag_command(engine, &lower_cmd[2..], "off"),
+        "kecho" | "mecho" | "qecho" => builtins::cmd_echo_prefix(engine, &lower_cmd[..1], args),
 
         // Argument manipulation
         "shift" => cmd_shift(engine, args),
@@ -419,11 +443,11 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "return" => builtins::cmd_return(engine, args),
         "result" => builtins::cmd_result(engine, args),
         "not" => cmd_not(engine, args),
-        "suspend" => builtins::cmd_suspend(),
+        "suspend" => builtins::cmd_suspend(engine),
         "dokey" => builtins::cmd_dokey(engine, args),
         "histsize" => builtins::cmd_histsize(engine, args),
         "localecho" => builtins::cmd_localecho(engine, args),
-        "sub" => builtins::cmd_sub(engine, args),
+        "sub" => builtins::cmd_flag_command(engine, "sub", args),
         "replace" => builtins::cmd_replace(engine, args),
         "tr" => builtins::cmd_tr(engine, args),
         "cat" => TfCommandResult::Success(Some("% /cat not supported in Clay. Use bracketed paste instead.".to_string())),
@@ -439,8 +463,8 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
 
         // Tier 3: World management
         "unworld" => builtins::cmd_unworld(args),
-        "purgeworld" => TfCommandResult::Success(Some("% /purgeworld: Use /worlds to manage worlds in Clay.".to_string())),
-        "saveworld" => TfCommandResult::Success(Some("% /saveworld: Worlds are auto-saved in Clay.".to_string())),
+        "purgeworld" => cmd_purgeworld(engine, args),
+        "saveworld" => cmd_saveworld(engine, args),
 
         // Tier 4: Spam detection
         "watchdog" => builtins::cmd_watchdog(engine, args),
@@ -453,7 +477,7 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "liststreams" => TfCommandResult::Success(Some("% /liststreams: Streams not available in Clay.".to_string())),
         "changes" => TfCommandResult::Success(Some("% /changes: Not applicable in Clay. See /version.".to_string())),
         "tick" => TfCommandResult::Success(Some("% /tick: Use /repeat for timed commands in Clay.".to_string())),
-        "recordline" => TfCommandResult::Success(Some("% /recordline: Not available in Clay.".to_string())),
+        "recordline" => super::builtins::cmd_recordline(engine, args),
         "edit" => cmd_edit(engine, args),
 
         // Job 15: missing builtins + stdlib one-liners (plan section B, P1.14). Every
@@ -479,7 +503,7 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "last" => builtins::cmd_last(args),
         "nth" => builtins::cmd_nth(args),
         "ver" => builtins::cmd_ver(),
-        "man" => cmd_help(args),
+        "man" => cmd_help(engine, args),
         "nogag" => builtins::cmd_nogag(engine, args),
         "true" => builtins::cmd_true(engine, args),
         "false" => builtins::cmd_false(engine, args),
@@ -499,9 +523,7 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         _ => {
             // Look for a macro with this name (case-insensitive)
             if let Some(macro_def) = engine.macros.iter().find(|m| m.name.eq_ignore_ascii_case(&lower_cmd)).cloned() {
-                // Parse arguments for the macro with delimiter-aware splitting
-                let macro_args: Vec<&str> = parse_macro_args(args);
-                let results = macros::execute_macro(engine, &macro_def, &macro_args, None);
+                let results = macros::execute_macro_with_raw(engine, &macro_def, args, None);
                 aggregate_results_with_engine(engine, results)
             } else {
                 TfCommandResult::UnknownCommand(lower_cmd.to_string())
@@ -510,181 +532,17 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
     }
 }
 
-/// Aggregate multiple results into one, queuing SendToMud commands in the engine
+/// Emit a list of sub-results in order (see `TfEngine::emit_result`), stopping at the
+/// first control result (`/return`, `/result`, `/exit`, an unwinding `/break`), which is
+/// returned for the caller to act on. Nothing is folded or dropped here any more: every
+/// Clay command, send and line of output reaches the App, in the order it happened.
 pub(crate) fn aggregate_results_with_engine(engine: &mut super::TfEngine, results: Vec<TfCommandResult>) -> TfCommandResult {
-    let mut messages = vec![];
-    let mut has_error = false;
-    let mut pending_clay_commands = vec![];
-
     for result in results {
-        match result {
-            TfCommandResult::Success(Some(msg)) => messages.push(msg),
-            // A `/break` count that wasn't fully absorbed by an enclosing
-            // /while or /for in THIS block must keep propagating outward
-            // (see control_flow.rs's loop bodies, which only ever push this
-            // back into their own results when it still has levels left to
-            // unwind) - same "bounce it upward unresolved" treatment as
-            // Return/Result below, not a real error. Same caveat as that
-            // Return/Result arm's own doc comment too: any Success text
-            // collected earlier in THIS SAME aggregation (i.e. echoed during
-            // the one loop iteration that also triggered the multi-level
-            // break) is discarded here, not carried along with the marker -
-            // `TfCommandResult::Error` has no room for both. Side effects
-            // (variable state) are unaffected; only display text from that
-            // one iteration is lost. A `/break` with no count never reaches
-            // this arm at all (the loop that catches it absorbs it locally
-            // without ever pushing it into `results`), so this only matters
-            // for `/break N` with N > 1.
-            TfCommandResult::Error(e) if control_flow::parse_break_marker(&e).is_some() => return TfCommandResult::Error(e),
-            TfCommandResult::Error(e) => {
-                messages.push(format!("Error: {}", e));
-                has_error = true;
-            }
-            TfCommandResult::SendToMud(cmd) => {
-                // Queue the command to be sent by the main app
-                engine.pending_commands.push(super::TfCommand {
-                    command: cmd,
-                    world: None,
-                    no_eol: false,
-                });
-            }
-            TfCommandResult::ClayCommand(cmd) => {
-                // Collect clay commands to return (first one wins)
-                pending_clay_commands.push(cmd);
-            }
-            // A /return or /result nested inside an inline /if, /while or
-            // /for block (this aggregates one such block's collected
-            // per-line results - see aggregate_inline_results) must keep
-            // propagating outward as the SAME variant, not be absorbed into
-            // a plain Success here: macros::execute_macro's own
-            // per-command loop is the only place that sets %? and, for
-            // /result, decides whether to echo, and it can only do that if
-            // the Return/Result actually reaches it. This was finding
-            // C.5's second half - lib_factoral.tf's rfact()/ifact() both
-            // call /result from inside a nested /if/elseif/else branch.
-            //
-            // Any Success text collected earlier in THIS SAME block must
-            // still reach the screen, though (real tf: a /return does not
-            // retroactively erase what an earlier /echo in the same branch
-            // already printed) - at.tf's own usage-message branch is
-            // exactly this shape ("/echo -e %% Usage: ...%; ...%; /return
-            // 0"), and used to silently lose the whole usage line. There is
-            // no room for both a Return/Result's own %?-value payload and
-            // this accumulated display text in one `TfCommandResult`, so
-            // route it through the same "engine records, something drains
-            // it later" side channel `echo()` already uses
-            // (`engine.pending_outputs`, drained per top-level line by
-            // `builtins::load_lines` and once at the end of a probe line by
-            // `script_tests::run_script`/the App's own
-            // `commands::process_pending_tf_outputs`) instead of just
-            // dropping it.
-            r @ (TfCommandResult::Return(_) | TfCommandResult::Result(_)) => {
-                if !messages.is_empty() {
-                    engine.pending_outputs.push(super::TfOutput {
-                        text: messages.join("\n"),
-                        attrs: String::new(),
-                        world: None,
-                    });
-                }
-                return r;
-            }
-            // /exit during a /load must keep propagating outward the same way,
-            // all the way out to whichever /load actually catches it
-            // (`load_file_internal`'s own `exit_early` handling) - see
-            // `execute_macro_with_context`'s matching doc comment.
-            r @ TfCommandResult::ExitLoad(_) => return r,
-            // A /quote generated inside a macro body (e.g. TinyFugue's own grep.tf:
-            // "/quote -S /_fgrep `%-1", finding 14) used to just vanish here - this
-            // function has no App to resolve a world switch, a scheduled delay, or
-            // a backtick /recall against a World's output_lines, and the old `_ =>
-            // {}` catch-all silently swallowed the whole Quote instead. Anything
-            // this function genuinely cannot finish on its own (a scheduled delay,
-            // or a `/recall`-sourced quote) is bounced upward unresolved instead -
-            // exactly like a nested /return/Result above - so it keeps propagating
-            // out to whichever caller *can* finish it (ultimately the App, at the
-            // top level: see main.rs's own TfCommandResult::Quote handling, which
-            // never even reaches this function for a plain top-level /quote). A
-            // synchronous quote with a plain source, though, this function CAN
-            // finish itself: -dsend queues each line into `pending_commands` (same
-            // mechanism as a bare SendToMud, carrying the quote's own -w<world>
-            // through as that command's target); -decho becomes ordinary echoed
-            // text; -dexec runs each generated line back through the engine via
-            // `execute_command` (matching what the App's own
-            // `handle_ws_quote_result` does for the same disposition) and
-            // recursively folds THEIR results back into this same aggregation, so
-            // a quote-generated line that is itself a macro (grep.tf's `/_fgrep`)
-            // still surfaces its own echoed output correctly.
-            TfCommandResult::Quote { lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
-                if recall_opts.is_some() || delay_secs > 0.0 {
-                    return TfCommandResult::Quote { lines, disposition, world, delay_secs, recall_opts, strip_ansi };
-                }
-                match disposition {
-                    super::QuoteDisposition::Send => {
-                        for line in lines {
-                            engine.pending_commands.push(super::TfCommand {
-                                command: line,
-                                world: world.clone(),
-                                no_eol: false,
-                            });
-                        }
-                    }
-                    super::QuoteDisposition::Echo => {
-                        if !lines.is_empty() {
-                            messages.push(lines.join("\n"));
-                        }
-                    }
-                    super::QuoteDisposition::Exec => {
-                        let sub_results: Vec<TfCommandResult> = lines.iter()
-                            .map(|line| execute_command(engine, line))
-                            .collect();
-                        match aggregate_results_with_engine(engine, sub_results) {
-                            TfCommandResult::Success(Some(msg)) => messages.push(msg),
-                            TfCommandResult::Success(None) => {}
-                            TfCommandResult::Error(e) if control_flow::parse_break_marker(&e).is_some() => return TfCommandResult::Error(e),
-                            TfCommandResult::Error(e) => {
-                                messages.push(format!("Error: {}", e));
-                                has_error = true;
-                            }
-                            TfCommandResult::ClayCommand(cmd) => pending_clay_commands.push(cmd),
-                            // See the matching arm above (outer loop) - the
-                            // OUTER `messages` accumulated so far (from
-                            // before this Quote::Exec line ran) would
-                            // otherwise be silently dropped the same way.
-                            r @ (TfCommandResult::Return(_) | TfCommandResult::Result(_)) => {
-                                if !messages.is_empty() {
-                                    engine.pending_outputs.push(super::TfOutput {
-                                        text: messages.join("\n"),
-                                        attrs: String::new(),
-                                        world: None,
-                                    });
-                                }
-                                return r;
-                            }
-                            r @ TfCommandResult::ExitLoad(_) => return r,
-                            // Send/scheduling/recall surfaced from a nested exec
-                            // line - bounce upward the same way an unresolvable
-                            // top-level Quote does above.
-                            other => return other,
-                        }
-                    }
-                }
-            }
-            _ => {}
+        if let Some(control) = engine.emit_result(result) {
+            return control;
         }
     }
-
-    // If there are pending clay commands, return the first one
-    if let Some(clay_cmd) = pending_clay_commands.into_iter().next() {
-        return TfCommandResult::ClayCommand(clay_cmd);
-    }
-
-    if has_error {
-        TfCommandResult::Error(messages.join("\n"))
-    } else if messages.is_empty() {
-        TfCommandResult::Success(None)
-    } else {
-        TfCommandResult::Success(Some(messages.join("\n")))
-    }
+    TfCommandResult::Success(None)
 }
 
 
@@ -760,6 +618,15 @@ fn cmd_set(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         return TfCommandResult::Success(Some(lines.join("\n")));
     }
 
+    // `/set <name>` alone shows the variable (TF: "% name=value").
+    let trimmed = args.trim();
+    if !trimmed.contains(|c: char| c == '=' || c.is_whitespace()) {
+        return match engine.global_vars.get(trimmed) {
+            Some(v) => TfCommandResult::Success(Some(format!("% {}={}", trimmed, v.to_string_value()))),
+            None => TfCommandResult::Success(Some(format!("% {} not set globally", trimmed))),
+        };
+    }
+
     let (name, value) = split_set_or_let_value(args).unwrap_or((args, ""));
 
     // Validate variable name
@@ -770,8 +637,10 @@ fn cmd_set(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         ));
     }
 
-    engine.set_global(name, TfValue::from(value));
-    TfCommandResult::Success(None)
+    match engine.assign_global(name, TfValue::from(value)) {
+        Ok(()) => TfCommandResult::Success(None),
+        Err(e) => TfCommandResult::Error(e),
+    }
 }
 
 /// /unset varname - Remove a global variable
@@ -783,6 +652,11 @@ fn cmd_unset(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 
     if engine.unset_global(name) {
+        // A variable Clay applies (%wrapsize, %clock_format, %textdiv...) goes back to
+        // Clay's own behaviour once unset - the App has to hear about it, as for a /set.
+        if super::special_vars::APPLIED.contains(&name) {
+            engine.emit(super::effects::TfEffect::Setting(name.to_string(), super::TfValue::String(String::new())));
+        }
         TfCommandResult::Success(None)
     } else {
         TfCommandResult::Error(format!("Variable '{}' not found", name))
@@ -807,6 +681,18 @@ fn cmd_let(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
     let value = TfValue::from(value);
 
+    // TF warns when a new local hides a global of the same name (the SHADOW hook, which
+    // runs after the warning and can gag it).
+    let in_macro = !engine.local_vars_stack.is_empty();
+    let already_local = engine.local_vars_stack.last().is_some_and(|scope| scope.contains_key(name));
+    if in_macro && !already_local && engine.global_vars.contains_key(name) {
+        let selected = super::hooks::select_hooks(engine, TfHookEvent::Shadow, name);
+        if !selected.first().is_some_and(|m| m.attributes.gag) {
+            engine.emit(super::effects::TfEffect::error(format!(
+                "Warning:  Local variable \"{}\" overshadows global variable of same name.", name)));
+        }
+        let _ = super::hooks::run_selected_hooks(engine, selected, name);
+    }
     engine.set_local(name, value);
     TfCommandResult::Success(None)
 }
@@ -838,6 +724,54 @@ fn cmd_setenv(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     std::env::set_var(name, if parts.len() > 1 { parts[1] } else { "" });
 
     TfCommandResult::Success(None)
+}
+
+/// /prompt [-a<attrs>] [-p] <text> - TF's: the current world's prompt is now <text>,
+/// in <attrs> (`-p`: with its "@{<attr>}" codes applied). %? is 1, or 0 when there is
+/// no world. Most useful from a PROMPT hook, which leaves showing the prompt to it.
+fn cmd_prompt(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let mut remaining = args.trim_start();
+    let mut attrs = String::new();
+    let mut inline = false;
+    while let Some(rest) = remaining.strip_prefix('-') {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..end];
+        remaining = rest[end..].trim_start();
+        if token.is_empty() || token == "-" {
+            break;
+        }
+        if let Some(a) = token.strip_prefix('a') {
+            attrs = a.to_string();
+        } else if token.chars().all(|c| c == 'p') {
+            inline = true;
+        } else {
+            return TfCommandResult::Error(format!("PROMPT -{}: invalid option", token.chars().next().unwrap_or('?')));
+        }
+    }
+    let vars = AttrVars::of(engine);
+    let text = if inline { decode_inline_attrs(remaining, &vars, false).unwrap_or_default() } else { remaining.to_string() };
+    let text = match attr_list_sgr(&attrs, &vars) {
+        Ok(prefix) if !prefix.is_empty() => format!("{}{}\x1b[0m", prefix, text),
+        _ => text,
+    };
+    set_prompt(engine, text);
+    TfCommandResult::Success(None)
+}
+
+/// Make `text` the current world's prompt (`/prompt`, `prompt()`); %? says whether
+/// there was a world to do it for.
+pub(crate) fn set_prompt(engine: &mut TfEngine, text: String) -> bool {
+    match engine.context_world_name() {
+        Some(world) => {
+            engine.emit(super::effects::TfEffect::SetPrompt { text, world });
+            engine.set_global("?", TfValue::Integer(1));
+            true
+        }
+        None => {
+            engine.set_global("?", TfValue::Integer(0));
+            false
+        }
+    }
 }
 
 /// /echo [-a<attrs>] [-p] [-o|-e|-A|-r] [-w[<world>]] [--] message - Display message.
@@ -920,32 +854,48 @@ fn cmd_echo(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
     // @{attr} sequences: @{B} = bold, @{U} = underline, @{n} = normal/reset,
     // @{Crgb}/@{BCrgb} = foreground/background color - skipped entirely by -r.
+    let vars = AttrVars::of(engine);
     let message = if raw {
         remaining.to_string()
     } else {
-        process_attr_codes(remaining)
+        // TF prints an unknown attribute's error instead of the text.
+        match decode_inline_attrs(remaining, &vars, true) {
+            Ok(text) => text,
+            Err(e) => return TfCommandResult::Error(format!("echo: {}", e)),
+        }
     };
-    let message = if attrs.is_empty() {
-        message
-    } else {
-        let prefix = attrs_to_ansi_prefix(&attrs);
-        if prefix.is_empty() {
-            message
+    // TF's attribute grammar ("Bu", "Cred", "h") through the one attribute module, so a
+    // run of letters works as in TF (it used to be read as one unknown name and drawn
+    // plain); Clay's older comma-separated names ("red,bold") are still understood. The
+    // attributes are drawn in here, so a $() keeps them, as TF's does.
+    let plain = message.clone();
+    let (message, drawn) = if attrs.is_empty() {
+        (message, false)
+    } else if let Ok(mut parsed) = super::TfAttributes::parse(&attrs) {
+        parsed.expand(&vars.hilite, &vars.error, &vars.warning);
+        if parsed.to_sgr().is_empty() {
+            (message, false)
         } else {
-            format!("{}{}\x1b[0m", prefix, message)
+            (super::attrs::apply_to_line(&message, &parsed, &[]), true)
+        }
+    } else {
+        match attr_list_sgr(&attrs, &vars) {
+            Ok(prefix) if prefix.is_empty() => (message, false),
+            // Clay's older names: drawn, but not attributes TF could take off again.
+            Ok(prefix) => (format!("{}{}\x1b[0m", prefix, message), false),
+            Err(e) => return TfCommandResult::Error(format!("echo: {}", e)),
         }
     };
 
-    if let Some(world_name) = world {
-        if world_name.is_empty() {
-            // Bare -w: the current world, same as omitting -w entirely.
-            return TfCommandResult::Success(Some(message));
-        }
-        engine.pending_outputs.push(super::TfOutput {
-            text: message,
-            attrs: String::new(),
-            world: Some(world_name),
-        });
+    // Bare -w: the current world, same as omitting -w entirely. A line with attributes of
+    // its own travels with them - TF's g, G, L and A, which say nothing about how it
+    // looks, and the display ones it was drawn in (for /recall -a).
+    let world = world.filter(|w| !w.is_empty());
+    let has_flags = super::TfAttributes::parse(&attrs)
+        .is_ok_and(|a| a.gag || a.norecord || a.nolog || a.noactivity);
+    if world.is_some() || drawn || has_flags {
+        let (attrs, plain) = if drawn || has_flags { (attrs, drawn.then_some(plain)) } else { (String::new(), None) };
+        engine.emit(super::effects::TfEffect::Output { text: message, attrs, world, plain });
         return TfCommandResult::Success(None);
     }
 
@@ -1031,7 +981,7 @@ fn cmd_substitute(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 
     // Process TF attribute codes in the text
-    let text = process_attr_codes(remaining);
+    let text = decode_inline_attrs(remaining, &AttrVars::of(engine), false).unwrap_or_default();
 
     // Queue the substitution for main app to process
     engine.pending_substitution = Some(super::TfSubstitution {
@@ -1042,32 +992,108 @@ fn cmd_substitute(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(None)
 }
 
-/// Process TF attribute codes in text
-/// @{B} = bold, @{U} = underline, @{n} = normal/reset
-/// @{Crgb} = foreground color (where r,g,b are 0-5)
-/// @{BCrgb} = background color
-pub(crate) fn process_attr_codes(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
+/// What TF's "h", "E" and "W" attributes stand for: %hiliteattr, %error_attr and
+/// %warning_attr.
+pub(crate) struct AttrVars {
+    hilite: String,
+    error: String,
+    warning: String,
+}
 
-    while i < len {
-        if chars[i] == '@' && i + 1 < len && chars[i + 1] == '{' {
-            // Find closing brace
-            if let Some(end) = chars[i + 2..].iter().position(|&c| c == '}') {
-                let attr: String = chars[i + 2..i + 2 + end].iter().collect();
-                let ansi = attr_to_ansi(&attr);
-                result.push_str(&ansi);
-                i = i + 3 + end;
-                continue;
-            }
-        }
-        result.push(chars[i]);
-        i += 1;
+impl AttrVars {
+    pub(crate) fn of(engine: &TfEngine) -> Self {
+        let var = |name: &str| engine.get_var(name).map(|v| v.to_string_value()).unwrap_or_default();
+        AttrVars { hilite: var("hiliteattr"), error: var("error_attr"), warning: var("warning_attr") }
     }
 
-    result
+    /// TF's defaults, for a caller with no engine at hand.
+    #[cfg(test)]
+    pub(crate) fn tf_defaults() -> Self {
+        AttrVars { hilite: "B".to_string(), error: String::new(), warning: String::new() }
+    }
+}
+
+/// The SGR that shows a TF attribute list (`-a<attrs>`) as TF reads one - a run of letters
+/// ("Bu"), "C<color>", "h", comma lists - or, failing that, as Clay's older names ("red",
+/// "bold,underline", "BC123"). Err: TF's message for a list neither understands.
+pub(crate) fn attr_list_sgr(attrs: &str, vars: &AttrVars) -> Result<String, String> {
+    match super::TfAttributes::parse(attrs) {
+        Ok(mut parsed) => {
+            parsed.expand(&vars.hilite, &vars.error, &vars.warning);
+            Ok(parsed.to_sgr())
+        }
+        Err(e) => match attrs_to_ansi_prefix(attrs) {
+            legacy if legacy.is_empty() => Err(e),
+            legacy => Ok(legacy),
+        },
+    }
+}
+
+/// Decode TF's inline "@{<attrs>}" codes (`/echo -p`, `decode_attr()`) into SGR, as TF reads
+/// them (checked against tf 5.0b8): each code adds to the attributes in force ("@{B}x@{u}y"
+/// draws y bold and underlined), "@{n}" turns them all off, "@{x}" and "@{}" change
+/// nothing, and "@@" is "@". Attributes still in force at the end are turned off there.
+/// Err (only when `strict`): TF's message for an attribute it doesn't know, which TF prints
+/// instead of the text; otherwise such a code is dropped, as Clay always did.
+pub(crate) fn decode_inline_attrs(text: &str, vars: &AttrVars, strict: bool) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    // Attributes are in force, and text has been drawn in them since.
+    let mut active = false;
+    let mut drawn = false;
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        if at > 0 {
+            out.push_str(&rest[..at]);
+            drawn |= active;
+        }
+        let after = &rest[at + 1..];
+        if let Some(r) = after.strip_prefix('@') {
+            out.push('@');
+            drawn |= active;
+            rest = r;
+            continue;
+        }
+        if let Some(close) = after.strip_prefix('{').and_then(|b| b.find('}')) {
+            let spec = after[1..1 + close].trim();
+            rest = &after[close + 2..];
+            match spec {
+                "" | "x" => {}
+                "n" | "N" => {
+                    out.push_str("\x1b[0m");
+                    active = false;
+                    drawn = false;
+                }
+                spec => match attr_list_sgr(spec, vars) {
+                    Ok(sgr) if sgr.is_empty() => {}
+                    Ok(sgr) => {
+                        out.push_str(&sgr);
+                        active = true;
+                    }
+                    Err(e) if strict => return Err(e),
+                    Err(_) => {}
+                },
+            }
+            continue;
+        }
+        out.push('@');
+        drawn |= active;
+        rest = after;
+    }
+    if !rest.is_empty() {
+        out.push_str(rest);
+        drawn |= active;
+    }
+    if active && drawn {
+        out.push_str("\x1b[0m");
+    }
+    Ok(out)
+}
+
+/// `decode_inline_attrs` for a caller that doesn't report a bad code (it is dropped), with
+/// TF's own %hiliteattr.
+#[cfg(test)]
+pub(crate) fn process_attr_codes(text: &str) -> String {
+    decode_inline_attrs(text, &AttrVars::tf_defaults(), false).unwrap_or_else(|_| text.to_string())
 }
 
 /// Build an ANSI prefix for a comma-separated TF attribute list - the convention shared by
@@ -1475,17 +1501,10 @@ fn cmd_shift(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Decrement count
     engine.set_local("#", super::TfValue::Integer((argc - n) as i64));
 
-    // Rebuild %* from remaining args
-    let mut parts = Vec::new();
-    for i in 1..=(argc - n) {
-        if let Some(v) = engine.get_var(&i.to_string()) {
-            let s = v.to_string_value();
-            if !s.is_empty() {
-                parts.push(s);
-            }
-        }
-    }
-    engine.set_local("*", super::TfValue::String(parts.join(" ")));
+    // %* loses the shifted words, keeping the rest exactly as written (TF)
+    let raw = engine.get_var("*").map(|v| v.to_string_value()).unwrap_or_default();
+    let rest = super::variables::skip_words(&raw, n).to_string();
+    engine.set_local("*", super::TfValue::String(rest));
 
     TfCommandResult::Success(None)
 }
@@ -1506,119 +1525,223 @@ fn cmd_break(args: &str) -> TfCommandResult {
     TfCommandResult::Error(control_flow::break_marker(n))
 }
 
-/// /listworlds [-cus] [-m<style>] [-S<field>] [-T<type>] [name] - List world
-/// definitions (TF style).
-///
-/// TF options added in plan Job 14b (`/help listworlds`): `-u` (include
-/// unnamed temporary worlds) is accepted but not distinct - every Clay world,
-/// including the ones `/world <host> <port>` creates on the fly, always has a
-/// real `name` (there's no separate "unnamed" world class to include or
-/// exclude). `-m<style>` and `-T<type>` are now parsed as attached-value
-/// options (matching `-S<field>`'s own existing style) instead of being
-/// iterated character-by-character - previously `-Tmud` would feed 'm', 'u',
-/// 'd' back through the same per-char match as genuine short flags, so a type
-/// value happening to contain one of those letters silently changed the
-/// output. Neither is distinct: Clay has no per-world "type" field to filter
-/// by, and always matches `<name>`/`<type>` by substring (no glob/regexp style
-/// selector to switch). `-S<field>`'s "t" (type) is accepted and falls back to
-/// name-sort like any other unimplemented field, for the same reason.
-fn cmd_listworlds(engine: &TfEngine, args: &str) -> TfCommandResult {
-    let args = args.trim();
+/// One world as `/listworlds`, `/saveworld` and `/purgeworld` see it.
+struct WorldRow {
+    name: String,
+    tf_type: String,
+    host: String,
+    port: String,
+    character: String,
+    password: String,
+    file: String,
+    flags: String,
+    temporary: bool,
+}
+
+impl WorldRow {
+    /// TF's `/listworlds -c` line: `/test addworld("name", "type", ...)`, trailing empty
+    /// arguments left off (name and type always shown).
+    fn command_line(&self) -> String {
+        let fields = [&self.name, &self.tf_type, &self.host, &self.port, &self.character, &self.password, &self.file, &self.flags];
+        let used = fields.iter().rposition(|f| !f.is_empty()).map_or(2, |i| (i + 1).max(2));
+        let quoted: Vec<String> = fields[..used].iter()
+            .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect();
+        format!("/test addworld({})", quoted.join(", "))
+    }
+}
+
+/// The worlds, in the order they were defined, then the DEFAULT world if it has anything.
+fn world_rows(engine: &TfEngine) -> Vec<WorldRow> {
+    let mut rows: Vec<WorldRow> = engine.world_info_cache.iter().map(|w| WorldRow {
+        name: w.name.clone(),
+        tf_type: w.tf_type.clone(),
+        host: w.host.clone(),
+        port: w.port.clone(),
+        character: w.user.clone(),
+        password: w.password.clone(),
+        file: engine.world_files.get(&w.name.to_lowercase()).cloned().unwrap_or_default(),
+        flags: if w.use_ssl { "x".to_string() } else { String::new() },
+        temporary: w.is_temporary,
+    }).collect();
+    let (c, p, f) = (&engine.default_world_character, &engine.default_world_password, &engine.default_world_file);
+    if c.is_some() || p.is_some() || f.is_some() {
+        rows.push(WorldRow {
+            name: "DEFAULT".to_string(),
+            tf_type: String::new(),
+            host: String::new(),
+            port: String::new(),
+            character: c.clone().unwrap_or_default(),
+            password: p.clone().unwrap_or_default(),
+            file: f.clone().unwrap_or_default(),
+            flags: String::new(),
+            temporary: false,
+        });
+    }
+    rows
+}
+
+/// What `/listworlds`/`/purgeworld` select: their options, and the worlds matching them.
+struct WorldSelection {
+    short: bool,
+    command: bool,
+    rows: Vec<WorldRow>,
+}
+
+/// `[-cus] [-m<style>] [-S<field>] [-T<type>] [<name>]` (`/help listworlds`): name and
+/// type patterns use `-m` or %matching; temporary worlds only with -u; sorted by name
+/// (any case) unless -S says otherwise.
+fn select_worlds(engine: &TfEngine, args: &str) -> Result<WorldSelection, String> {
     let mut short = false;
-    let mut cmd_format = false;
-    let mut include_unnamed = false; // -u: accepted, not distinct - see doc comment
-    let mut sort_field = "name";
+    let mut command = false;
+    let mut unnamed = false;
+    let mut sort_field = 'n';
+    let mut style = macros::default_matching_style(engine);
+    let mut type_pattern: Option<String> = None;
     let mut name_pattern: Option<String> = None;
-
-    // Parse options
-    let mut i = 0;
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    while i < parts.len() {
-        let part = parts[i];
-        if let Some(flags) = part.strip_prefix('-') {
-            if let Some(rest) = flags.strip_prefix('S') {
-                sort_field = match rest.chars().next() {
-                    Some('n') => "name",
-                    Some('h') => "host",
-                    Some('p') => "port",
-                    Some('c') => "character",
-                    Some('-') => "-",
-                    _ => "name", // includes 't' (type): accepted, not distinct
-                };
-            } else if flags.starts_with('T') || flags.starts_with('m') {
-                // -T<type> / -m<style>: accepted, not distinct (see doc comment).
-            } else {
-                for c in flags.chars() {
-                    match c {
-                        's' => short = true,
-                        'c' => cmd_format = true,
-                        'u' => include_unnamed = true,
-                        _ => {}
-                    }
+    for word in args.split_whitespace() {
+        let Some(flags) = word.strip_prefix('-').filter(|f| !f.is_empty() && name_pattern.is_none()) else {
+            name_pattern = Some(word.to_string());
+            continue;
+        };
+        let mut rest = flags;
+        while let Some(c) = rest.chars().next() {
+            rest = &rest[c.len_utf8()..];
+            match c {
+                's' => short = true,
+                'c' => command = true,
+                'u' => unnamed = true,
+                'S' => {
+                    sort_field = rest.chars().next().unwrap_or('n');
+                    rest = "";
                 }
+                'm' => {
+                    style = super::TfMatchMode::parse(rest).ok_or_else(|| format!("invalid matching style: {}", rest))?;
+                    rest = "";
+                }
+                'T' => {
+                    type_pattern = Some(rest.to_string());
+                    rest = "";
+                }
+                other => return Err(format!("invalid option -{}", other)),
             }
-        } else {
-            name_pattern = Some(part.to_string());
         }
-        i += 1;
     }
-    let _ = include_unnamed; // accepted, not distinct (see doc comment)
-
-    let mut worlds: Vec<&super::WorldInfoCache> = engine.world_info_cache.iter().collect();
-
-    // Filter by name pattern
-    if let Some(ref pattern) = name_pattern {
-        let pat = pattern.to_lowercase();
-        worlds.retain(|w| w.name.to_lowercase().contains(&pat));
-    }
-
-    // Sort
-    match sort_field {
-        "host" => worlds.sort_by(|a, b| a.host.cmp(&b.host)),
-        "port" => worlds.sort_by(|a, b| a.port.cmp(&b.port)),
-        "character" => worlds.sort_by(|a, b| a.user.cmp(&b.user)),
-        "-" => {} // no sort
-        _ => worlds.sort_by(|a, b| a.name.cmp(&b.name)),
-    }
-
-    if worlds.is_empty() {
-        return TfCommandResult::Success(Some("No worlds defined.".to_string()));
-    }
-
-    if short {
-        // Short format: names only
-        let names: Vec<&str> = worlds.iter().map(|w| w.name.as_str()).collect();
-        return TfCommandResult::Success(Some(names.join("\n")));
-    }
-
-    if cmd_format {
-        // Command format: /test addworld("name", "type", "host", "port", "char", "pass")
-        let mut lines = Vec::new();
-        for w in &worlds {
-            lines.push(format!("/test addworld(\"{}\", \"\", \"{}\", \"{}\", \"{}\", \"{}\")",
-                w.name, w.host, w.port, w.user, w.password));
+    let matcher = |pattern: &str| -> Result<regex::Regex, String> {
+        let re = macros::compile_pattern(pattern, style)?.ok_or_else(|| "bad pattern".to_string())?;
+        match style {
+            super::TfMatchMode::Regexp => Ok(re),
+            _ => regex::Regex::new(&format!("^(?:{})$", re.as_str())).map_err(|e| e.to_string()),
         }
-        return TfCommandResult::Success(Some(lines.join("\n")));
+    };
+    let type_re = type_pattern.as_deref().map(matcher).transpose()?;
+    let name_re = name_pattern.as_deref().map(matcher).transpose()?;
+    let mut rows: Vec<WorldRow> = world_rows(engine).into_iter()
+        .filter(|w| unnamed || !w.temporary)
+        .filter(|w| type_re.as_ref().is_none_or(|re| re.is_match(&w.tf_type)))
+        .filter(|w| name_re.as_ref().is_none_or(|re| re.is_match(&w.name)))
+        .collect();
+    let key = |w: &WorldRow| -> String {
+        match sort_field {
+            't' => w.tf_type.to_lowercase(),
+            'h' => w.host.to_lowercase(),
+            'p' => w.port.clone(),
+            'c' => w.character.to_lowercase(),
+            _ => w.name.to_lowercase(),
+        }
+    };
+    if sort_field != '-' {
+        rows.sort_by_key(key);
     }
+    Ok(WorldSelection { short, command, rows })
+}
 
-    // Table format matching TF: NAME  TYPE  HOST PORT  CHARACTER
-    // TYPE is always empty (Clay doesn't have world types), right-aligned HOST
-    let mut lines = Vec::new();
-    let name_w = worlds.iter().map(|w| w.name.len()).max().unwrap_or(4).max(4).max(15);
-    let host_w = worlds.iter().map(|w| w.host.len()).max().unwrap_or(4).max(4);
-    let port_w = 5;
-
-    lines.push(format!("{:<name_w$} {:<16}{:>host_w$} {:<port_w$}  {}",
-        "NAME", "TYPE", "HOST", "PORT", "CHARACTER",
-        name_w=name_w, host_w=host_w, port_w=port_w));
-
-    for w in &worlds {
-        lines.push(format!("{:<name_w$} {:<16}{:>host_w$} {:<port_w$}  {}",
-            w.name, "", w.host, w.port, w.user,
-            name_w=name_w, host_w=host_w, port_w=port_w));
-    }
-
+/// /listworlds [-cus] [-m<style>] [-S<field>] [-T<type>] [<name>] - list world
+/// definitions in TF's format (`/help listworlds`); `%?` is how many.
+fn cmd_listworlds(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let selection = match select_worlds(engine, args) {
+        Ok(s) => s,
+        Err(e) => return TfCommandResult::Error(format!("LISTWORLDS: {}", e)),
+    };
+    engine.set_global("?", TfValue::Integer(selection.rows.len() as i64));
+    let lines: Vec<String> = if selection.short {
+        selection.rows.iter().map(|w| w.name.clone()).collect()
+    } else if selection.command {
+        selection.rows.iter().map(WorldRow::command_line).collect()
+    } else {
+        std::iter::once(format!("{:<15.15} {:<15.15} {:>22.22} {:<6.6} {}", "NAME", "TYPE", "HOST", "PORT", "CHARACTER"))
+            .chain(selection.rows.iter().map(|w| {
+                format!("{:<15.15} {:<15.15} {:>22.22} {:<6.6} {}", w.name, w.tf_type, w.host, w.port, w.character)
+            }))
+            .collect()
+    };
     TfCommandResult::Success(Some(lines.join("\n")))
+}
+
+/// /saveworld [-a] [<file>] - write every world definition to <file> (default: the
+/// WORLDFILE macro's body, else TF's ~/tiny.world) as `/test addworld(...)` lines, which
+/// /loadworld reads back; -a appends.
+fn cmd_saveworld(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if engine.restrict_level >= super::RestrictLevel::File {
+        return TfCommandResult::Error("SAVEWORLD: restricted".to_string());
+    }
+    let mut append = false;
+    let mut file = None;
+    for word in args.split_whitespace() {
+        match word {
+            "-a" if file.is_none() => append = true,
+            _ => file = Some(word.to_string()),
+        }
+    }
+    let file = file.unwrap_or_else(|| default_world_file(engine));
+    let path = engine.expand_tilde(&file);
+    let rows: Vec<WorldRow> = world_rows(engine).into_iter().filter(|w| !w.temporary).collect();
+    let mut text: String = rows.iter().map(|w| w.command_line() + "\n").collect();
+    if append {
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            text = existing + &text;
+        }
+    }
+    // The file holds passwords: owner-only, like every secret file Clay writes.
+    if let Err(e) = crate::util::write_secret_file(std::path::Path::new(&path), text.as_bytes()) {
+        return TfCommandResult::Error(format!("SAVEWORLD: {}: {}", file, e));
+    }
+    engine.set_global("?", TfValue::Integer(rows.len() as i64));
+    TfCommandResult::Success(Some(format!("% Writing world definitions to {}", path)))
+}
+
+/// TF's default world file: the WORLDFILE macro's body if there is one, else TF's own
+/// default (stdlib.tf: ~/tiny.world on Unix, ~/world.tf elsewhere).
+fn default_world_file(engine: &TfEngine) -> String {
+    engine.macros.iter().find(|m| m.name == "WORLDFILE").map(|m| m.body.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| if cfg!(unix) { "~/tiny.world".to_string() } else { "~/world.tf".to_string() })
+}
+
+/// /loadworld [<file>] - read world definitions back (stdlib.tf: `/load` of the file,
+/// default as for /saveworld).
+fn cmd_loadworld(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let file = args.trim();
+    let file = if file.is_empty() { default_world_file(engine) } else { file.to_string() };
+    builtins::cmd_load(engine, &file)
+}
+
+/// /purgeworld [-m<style>] [-T<type>] [<name>] - remove the matching world definitions
+/// (stdlib.tf: `/unworld $(/@listworlds -s %*)`); `%?` is how many.
+fn cmd_purgeworld(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let selection = match select_worlds(engine, args) {
+        Ok(s) => s,
+        Err(e) => return TfCommandResult::Error(format!("PURGEWORLD: {}", e)),
+    };
+    let names: Vec<String> = selection.rows.into_iter()
+        .filter(|w| w.name != "DEFAULT")
+        .map(|w| w.name)
+        .collect();
+    engine.set_global("?", TfValue::Integer(names.len() as i64));
+    if names.is_empty() {
+        return TfCommandResult::Success(None);
+    }
+    TfCommandResult::ClayCommand(format!("/unworld {}", names.join(" ")))
 }
 
 /// /connections, /listsockets, /l - List connected worlds with stats (unseen count,
@@ -1758,14 +1881,6 @@ fn cmd_banlist(engine: &TfEngine, _args: &str) -> TfCommandResult {
     TfCommandResult::Success(Some(lines.join("\n")))
 }
 
-fn cmd_addworld(args: &str) -> TfCommandResult {
-    // Pass through to Clay's /addworld command which handles the actual creation
-    if args.trim().is_empty() {
-        return TfCommandResult::Error("Usage: /addworld [-xe] [-Ttype] name [char pass] host port".to_string());
-    }
-    TfCommandResult::ClayCommand(format!("/addworld {}", args))
-}
-
 /// /help [topic] or /tfhelp [topic] - Display TF help
 /// `/help chat` (also shown by `/chat help`).
 pub(crate) fn chat_help() -> TfCommandResult {
@@ -1803,7 +1918,16 @@ for creating the bot."#
     ))
 }
 
-fn cmd_help(args: &str) -> TfCommandResult {
+/// What `/help <args>` shows - for the routes that answer a client's `/help` without
+/// running it as a command (so a topic like `%kecho` is never substituted).
+pub fn help_text(engine: &TfEngine, args: &str) -> String {
+    match cmd_help(engine, args) {
+        TfCommandResult::Success(Some(text)) => text,
+        _ => String::new(),
+    }
+}
+
+fn cmd_help(engine: &TfEngine, args: &str) -> TfCommandResult {
     let topic = args.trim().trim_start_matches('/').to_lowercase();
 
     if topic.is_empty() {
@@ -1998,27 +2122,30 @@ Examples:
   /trigger -hSEND greet bob"#.to_string()
             )),
             "repeat" => TfCommandResult::Success(Some(
-                r#"/repeat [-w[world]] {[-time]|-S|-P} count command
+                r#"/repeat [-w[world]] [-n] {[-time]|-S|-P} count command
 
-Repeat a command on a timer. First iteration runs immediately,
-then waits the interval before each subsequent iteration.
+Run command (a macro body: substituted each time it runs) count times, as a
+background process (/ps, /kill). The first run comes one interval after the
+/repeat, as in TF; -n runs it at once.
 
 Options:
-  -w[world]  Send to specific world (empty = current)
-  -S         Synchronous (execute all iterations now)
-  -P         Execute on prompt (not yet implemented)
-  -time      Interval: seconds, M:S, or H:M:S
+  -w[world]  Run it with <world> as the current world (bare -w: this one;
+             with no -w, Clay keeps the world it was started in)
+  -n         First run now instead of after one interval
+  -S         Synchronous: every run now, before the next command
+  -P         A run each time a prompt arrives (from <world>, with -w)
+  -time      Interval: seconds, H:M, or H:M:S; default %ptime (1 second)
 
-Count: integer or "i" for infinite
+Count: integer or "i" for infinite. %? is the new process's pid.
+With %lpquote on, every process runs on prompts instead of its timer.
 
 Examples:
-  /repeat -30 5 /echo hi        - Now, then every 30s, 5 times total
-  /repeat -0:30 i /echo hi      - Now, then every 30s, infinite
-  /repeat -1:0:0 1 /echo hourly - Once now (1 hour interval unused)
-  /repeat -S 3 /echo sync       - 3 times immediately"#.to_string()
+  /repeat -30 5 /echo hi        - every 30s, 5 times
+  /repeat -n -0:30 i /echo hi   - now, then every 30 minutes, forever
+  /repeat -S 3 /echo sync       - 3 times, right now"#.to_string()
             )),
             "ps" => TfCommandResult::Success(Some(
-                "/ps [-srq] [-w[<world>]] [<pid>]\n\nList background /repeat and /quote processes, or one specific <pid>.\nShows PID, interval, remaining count, and command.\n\nOptions:\n  -s           Short form: list PIDs only, no header\n  -r           List /repeats only\n  -q           List /quotes only\n  -w[<world>]  List only processes for <world> (bare -w: current world)".to_string()
+                "/ps [-srq] [-w[<world>]] [<pid>]\n\nList background /repeat and /quote processes, or one specific <pid>,\nas TF does: PID, NEXT (time to the next run, or P for on-prompt), T (q or r),\nD (a quote's disposition: s, e or x), WORLD, PTIME (the interval, when one\nwas given), COUNT (runs a /repeat has left) and COMMAND.\n\nOptions:\n  -s           Short form: the PIDs only, one a line\n  -r           List /repeats only\n  -q           List /quotes only\n  -w[<world>]  List only processes for <world> (bare -w: current world)".to_string()
             )),
             "kill" => TfCommandResult::Success(Some(
                 "/kill <pid>...\n\nKill each background process named by <pid>. Each pid is processed\nindependently - a bad pid doesn't stop the rest. Silent on success.\nUse /ps to see running processes.".to_string()
@@ -2029,20 +2156,23 @@ Examples:
 Load and execute commands from a TF script file.
 
 Options:
-  -q  Quiet mode - don't echo "% Loading commands from..." message
+  -q  Quiet mode - don't echo the "% Loading commands from..." message,
+      for this file or any file it loads
 
 The file may contain:
   - TF commands starting with / (e.g., /def, /set)
-  - Comments: lines starting with ; or single # followed by space
+  - Comments: lines starting with ; or # (in the first column)
   - Blank lines (ignored)
+Any other line (plain text) aborts the load. Errors are shown as
+"% <file>, line N: <message>" and loading continues.
 
 Line continuation: End a line with \ to continue on next line.
 Use %\ for a literal backslash at end of line.
 
 File search order (for relative paths):
   1. Current directory (from /lcd or actual cwd)
-  2. Directories in $TFPATH (colon-separated)
-  3. $TFLIBDIR
+  2. For a bare file name: the directories in %TFPATH (space-separated,
+     "\ " for a space in a name) - or, when %TFPATH is blank, %TFLIBDIR
 
 Use /exit to abort loading early.
 
@@ -2239,8 +2369,9 @@ Info Functions:
   columns()                - Screen width
   lines()                  - Screen height
   winlines()               - Output window height (lines() minus reserved rows)
-  moresize()               - Lines queued at more prompt
+  moresize([world])        - Lines waiting at the world's more prompt
   morepaused([world])      - 1 if world's output is paused by more/pause
+  nlog()                   - Number of worlds being logged
   getpid()                 - Process ID
   gethostname()            - Local host name
   systype()                - System type ("unix")
@@ -2260,6 +2391,7 @@ Macro Functions:
 Command Functions:
   echo(text [,attrs])      - Display local message (queues output)
   send(text [,world [,f]])  - Send text to MUD (f=0/"off": no EOL)
+  prompt(text)             - Make text the current world's prompt
   substitute(text [,attrs]) - Replace trigger line with text
   keycode(str)             - Key sequence for string (^X for ctrl)
 
@@ -2295,7 +2427,7 @@ Usage: $[function(args)] or in /expr//test"#.to_string()
                 r#"Commands (/help <command> for details)
 Clay:
   /setup  /web  /actions  /menu  /connections
-  /world  /connect  /disconnect  /dc  /addworld  /unworld
+  /world  /server  /disconnect  /dc  /addworld  /unworld
   /reload  /version  /quit  /remote  /ban  /unban
   /flush  /dump  /note  /tag  /notify  /import  /window
   /font  /update  /dict  /urban  /translate  /url  /testmusic
@@ -2311,12 +2443,17 @@ Macros & Triggers:
   /trig  /trigp  /trigc  /trigpc  /untrig
   /bind  /unbind  /hook  /unhook  /dokey  /ismacro  /isvar
 Output:
-  /echo  /send  /beep  /quote  /recall  /substitute
+  /echo  /send  /beep  /quote  /recall  /substitute  /prompt
   /hilite  /nohilite  /partial  /gag  /ungag  /nogag
   /escape  /replace  /tr  /first  /rest  /last  /nth
   /limit  /unlimit  /relimit  /xtitle
+Status line:
+  /status_add  /status_rm  /status_edit  /status_defaults
+  /status_save  /status_restore  /clock
 World:
-  /fg  /addworld  /dc  /world  /listworlds  /listsockets  /l
+  /fg  /addworld  /connect  /dc  /world  /listworlds  /listsockets  /l
+  /addtiny  /addlp  /addlpp  /adddiku  /addtelnet
+  /saveworld  /loadworld  /purgeworld  /unworld
   /watchdog  /watchname  /bamf
 Files & Scripts:
   /load  /require  /loaded  /save  /lcd  /cd  /pwd  /exit  /log  /sh  /sys
@@ -2324,12 +2461,15 @@ Process:
   /repeat  /ps  /kill
 Settings:
   /histsize  /localecho  /sub  /suspend  /time  /runtime  /shift
+  /login  /nologin  /quiet  /noquiet  /quitdone  /visual  /lp  /lpquote
+  /insert  /borg  /redef  /shpause  /sockmload  /background  /clearfull
+  /cleardone  /gpri  /hpri  /isize  /ptime  /wrapspace  /kecho  /mecho  /qecho
   /input  /grab  /trigger  /more  /wrap  /restrict  /core
   /features  /ver  /man  /say
 Legacy/stub (accepted for script compatibility; mapped to a Clay
 equivalent or a no-op - see /help <command>):
   /telnet  /finger  /getfile  /putfile  /liststreams  /changes
-  /tick  /recordline  /purgeworld  /saveworld  /cat  /paste  /endpaste
+  /tick  /recordline  /cat  /paste  /endpaste
 TinyFugue prefix escape (checked before the table above):
   /tfhelp  /tfgag"#.to_string()
             )),
@@ -2519,7 +2659,7 @@ See also: /help result, /help return, /help def, /help shift"#.to_string()
                 "/:\n\nThe null command: a no-op that always sets %?=1. No output.".to_string()
             )),
             "limit" => TfCommandResult::Success(Some(
-                "/limit [-v] [-a] [-m<style>] [<pattern>]\n\nOpen the F4 filter popup, showing only lines matching <pattern>\n(console only - see /help unlimit, /help relimit).\n\n  -v         show only lines that DON'T match <pattern>\n  -a         show only lines that have attributes\n  -m<style>  simple, glob or regexp instead of %matching's default\n\nWith no options or pattern, reports whether a limit is active.\n\nExample: /limit -v error".to_string()
+                "/limit [-v] [-a] [-m<style>] [<pattern>]\n\nOpen the F4 filter popup, showing only lines matching <pattern>\n(console only - see /help unlimit, /help relimit).\n\n  -v         show only lines that DON'T match <pattern>\n  -a         show only lines that have attributes\n  -m<style>  simple, glob or regexp instead of %matching's default\n\nWith no options or pattern, %? is 1 if a limit is in effect, 0 if not.\n\nExample: /limit -v error".to_string()
             )),
             "unlimit" => TfCommandResult::Success(Some(
                 "/unlimit\n\nClose the F4 filter popup opened by /limit. Console only.\n\nSee also: /help limit, /help relimit".to_string()
@@ -2527,17 +2667,46 @@ See also: /help result, /help return, /help def, /help shift"#.to_string()
             "relimit" => TfCommandResult::Success(Some(
                 "/relimit\n\nRe-apply the most recently applied /limit. Console only.\n\nSee also: /help limit, /help unlimit".to_string()
             )),
+            "status_add" | "status_rm" | "status_edit" | "status_defaults" | "status_save"
+            | "status_restore" | "clock" | "status" | "status line" => TfCommandResult::Success(Some(
+                r#"TF's status line: rows of fields, each name[:width[:attributes]].
+Clay draws its own bar until a script changes the status line (any of these
+commands, or setting a status_* variable); from then on it draws TF's, in
+every interface. %status_height says how many rows there are.
+
+  /status_add [-r<N>] [-A[<field>]] [-B[<field>]] [-s<N>] [-x] [-c] <field>...
+              add fields to row N (0): after <field> or at the end (-A),
+              before <field> or at the start (-B), -s<N> spaces from it,
+              -x only if not there already, -c after clearing the row
+  /status_rm [-r<N>] <name>      remove a field (and a pad beside it)
+  /status_edit [-r<N>] <field>   change a field's width or attributes
+  /status_defaults               TF's fields and formats for row 0
+  /status_save <name>, /status_restore <name>   keep and bring back row 0
+  /clock [on|off|<format>]       the @clock field, formatted by %clock_format
+  status_fields([<row>])         a row's fields
+
+Fields: "" (padding, :<width>), @more @world @read @active @log @mail @clock
+(shown by the expression in %status_int_<name>), a variable (shown by
+%status_var_<name>, else its value), or a "literal". One field may have no
+width: it takes what the others leave; a negative width right-justifies.
+%status_pad fills fields out; %status_attr colors the whole line.
+
+Example: /status_add -A@world hp:4"#.to_string()
+            )),
+            "prompt" => TfCommandResult::Success(Some(
+                "/prompt [-a<attrs>] [-p] <text>\nprompt(<text>)\n\nMake <text> the current world's prompt (shown in the input area),\nreplacing the one it has. -a<attrs> shows it in those attributes; -p\napplies \"@{<attr>}\" codes within <text>. %? (or the function's\nvalue) is 1, or 0 when there is no world.\n\nMost useful from a PROMPT hook, which takes the prompt over:\n  /def -h\"PROMPT *> \" catch_prompt = /test prompt({*})".to_string()
+            )),
             "suspend" => TfCommandResult::Success(Some(
-                "/suspend\n\nSuspend the process (equivalent to Ctrl+Z).".to_string()
+                "/suspend\n\nSuspend Clay, as ^Z does, if the shell it runs under has job control;\nits fg brings Clay back, redrawn. Clay's own console only.".to_string()
             )),
             "dokey" => TfCommandResult::Success(Some(
                 "/dokey keyname\n\nSimulate pressing a named edit key. Sets %? to TF's documented\nreturn value where that's cheap to compute (movement/deletion: new\ncursor position; otherwise 1).\n\nKey names:\n  BSPC/BACKSPACE     - Backspace\n  BWORD              - Delete previous word\n  DLINE/DELINE       - Delete entire line\n  REFRESH/REDRAW     - Redraw screen\n  LNEXT              - Treat the next key literally\n  UP                 - Cursor up (no history fallback - that's the key's job)\n  DOWN               - Cursor down (no history fallback)\n  LEFT/RIGHT         - Move cursor\n  HOME/END           - Start/end of line\n  NEWLINE/ENTER      - Submit input\n  RECALLB            - Previous history entry\n  RECALLF            - Next history entry\n  RECALLBEG          - First history entry\n  RECALLEND          - Last history entry\n  SEARCHB/SEARCHF    - Search history backward/forward\n  SOCKETB/SOCKETF    - Previous/next world\n  DWORD              - Delete next word\n  DCH/DELETE         - Delete character under cursor\n  CLEAR              - Clear the output view (scrollback refills it)\n  WLEFT/WRIGHT       - Word left/right\n  DEOL               - Delete to end of line\n  PAUSE              - Pause output\n  PAGE/PGDN          - Page forward\n  PAGEBACK/PGUP/PAGEUP - Page backward\n  HPAGE              - Half page forward\n  HPAGEBACK          - Half page backward\n  LINE               - Scroll forward one line\n  LINEBACK           - Scroll backward one line\n  FLUSH              - Jump to end, releasing all pending output\n  SELFLUSH           - Show highlighted pending lines, then jump to end".to_string()
             )),
             "histsize" => TfCommandResult::Success(Some(
-                "/histsize [-lig] [-w[<world>]] [<size>]\n\nGet or set the history buffer size (Clay tracks one shared value for\nall of -l/-i/-g; -i is Clay's own default). -w<world> validates the\nworld name but reports/sets the same shared value - Clay has no\nseparate per-world history limit.\n\nOptions:\n  -l          Local history\n  -i          Input history (Clay's default)\n  -g          Global history (real tf's own default)\n  -w<world>   World history (bare -w means the current world)\n\nExample: /histsize 500".to_string()
+                "/histsize [-lig] [-w[<world>]] [<size>]\n\nIn TF, the capacity of a history: -g global (the default), -l local,\n-i input, -w<world> a world's (bare -w: the current one). Clay's\nhistories have no capacity - it keeps a world's whole output (archived\nin scrollback.db) and the whole input history - so /histsize says so,\nand a <size> changes nothing but %{histsize} (%? is 0, TF's failure).".to_string()
             )),
             "localecho" => TfCommandResult::Success(Some(
-                "/localecho [on|off]\n\nGet or set local echo mode.\nWhen on, typed commands are displayed locally.".to_string()
+                "/localecho [on|off]\n\nWith no argument, %? is 1 if the current world's input is echoed\nlocally, 0 if the server echoes it (it negotiated telnet ECHO, as for a\npassword). ON asks the server to stop echoing (DONT ECHO), OFF asks it to\necho (DO ECHO); the change happens when it agrees. %? is 0 for a world\nthat isn't connected or doesn't speak telnet. Meant for library hooks\n(the telnet world type's), not for typing.".to_string()
             )),
             "sub" => TfCommandResult::Success(Some(
                 "/sub [off|on|full]\n\nGet or set the substitution mode.\n  off  - No variable substitution\n  on   - Normal substitution (default)\n  full - Full substitution".to_string()
@@ -2596,44 +2765,43 @@ See also: /help result, /help return, /help def, /help shift"#.to_string()
 /quote [options] [<pre>] !"<shell_cmd>"[<suf>]
 /quote [options] [<pre>] #"<recall_args>"[<suf>]
 
-Generates lines of text, one per line from a file, TF command, shell command,
-or /recall search, then sends/echoes/executes each one - the double quotes
-(and <suf>) may be omitted, and unquoted `` `/!/# `` sources run to the end of
-the line. With no source character at all, <text> itself is sent literally
-(no %var/$() substitution). <pre> is prepended to every generated line.
+Generates lines of text, one per line of a file, TF command, shell command or
+/recall search, puts <pre> before and <suf> after each, then sends, echoes or
+runs each one, as TF does. The double quotes (and <suf>) may be omitted: the
+source then runs to the end of the line. To use one of '`!# in <pre>, put a
+\ before it.
 
 Sources:
-  '<file>          Read lines from a file
-  `<TF_cmd>        Capture <TF_cmd>'s own output, one generated line per
-                   line of output (real TF command output only - a plain
-                   Clay-only command bounces through here with nothing to
-                   capture)
-  !<shell_cmd>     Run <shell_cmd> in the shell, capture its output
-  #<recall_args>   Capture /recall <recall_args>'s output (shorthand for
-                   `` `/recall <recall_args> ``)
+  '<file>          The lines of a file
+  `<TF_cmd>        The output of a TF command (expanded as a macro body
+                   unless -s says otherwise)
+  !<shell_cmd>     The output of a shell command, standard error included
+  #<recall_args>   The output of /recall <recall_args>
 
 Options:
-  -d<disp>    Disposition of generated text: "send" (to the socket, the
-              default when there is no <pre>), "echo" (to the screen), or
-              "exec" (as a TF command, the default when there IS a <pre>)
-  -w[<world>] Run generated commands with <world> as the current world (Clay
-              extension: -w also selects the source/destination world itself,
-              same convention /recall and /send already use)
-  -S          Run synchronously, with no delay between lines (also accepted:
-              a literal delay in seconds, or "H:M[:S]")
-  -P          Run whenever a prompt is received
-  -A          Keep ANSI/escape sequences in generated lines (Clay extension;
-              stripped by default)
+  -d<disp>    What is done with each line: "send" (to the world - the default
+              with no <pre>), "echo" (to the screen), or "exec" (run as a
+              command, never expanded - the default when there is a <pre>)
+  -w[<world>] The world the lines are sent to, or run for (bare -w: this one)
+  -<time>     A line every <time> (seconds, H:M or H:M:S), the first one after
+              that long; default %ptime (1 second). -0: all of them at once,
+              just after this command
+  -S          Synchronous: every line now, before the next command
+  -P          A line each time a prompt arrives (also: %lpquote on)
+  -s<sub>     Expand <TF_cmd> as %sub=<sub> would (off, on, full; default full)
+  -A          Keep escape sequences in the lines (Clay; removed by default)
+
+A background quote is a process (/ps, /kill) and %? is its pid. After -S, %?
+is the shell command's exit status, the TF command's value, or 1 for a file
+read (0 when it can't be).
 
 Examples:
-  /quote hello world             - Sends "hello world" literally
-  /quote '"/etc/motd"            - Sends each line of /etc/motd
-  /quote say '"/tmp/lines.txt"   - Sends "say <line>" for each line of the file
-  /quote think `"/version"       - Sends "think <TF version text>"
-  /quote -decho `"/connections"  - Displays the connections table locally
-  /quote -S /_fgrep `"/echo x"   - Executes "/_fgrep x" once, synchronously
-  /quote :heard: #-l/2 *spam*    - Sends the last 2 recalled lines matching "*spam*"
-  /quote !"ls -la"               - Sends the output of the shell "ls -la" command"#.to_string()
+  /quote -S '"/etc/motd"         - Sends each line of /etc/motd, now
+  /quote say '"/tmp/lines.txt"   - Runs "say <line>" for each line, 1 a second
+  /quote think `"/version"       - Sends "think <version>"
+  /quote -S -decho !ls           - Shows the output of ls
+  /quote -S /_fgrep `"/echo x"   - Runs "/_fgrep x" once, synchronously
+  /quote -0 :heard: #-wCave /2 *pages* - Sends the last 2 matching lines"#.to_string()
             )),
             "recall" => TfCommandResult::Success(Some(
                 r#"/recall [options] [#]range [pattern]
@@ -2721,6 +2889,31 @@ Examples:
             "dc" | "disconnect" => TfCommandResult::Success(Some(
                 "/dc [<world>|-ALL]\n\nDisconnect from the current world, a named world, or (with -ALL,\ncase-insensitive) every connected world.\n\nExamples:\n  /dc\n  /dc MyMUD\n  /dc -ALL".to_string()
             )),
+            "connect" => TfCommandResult::Success(Some(
+                r#"/connect [-lqxbf] [<world>]
+/connect [-lqxbf] <host> <port>
+
+Open a connection to <world> - the first defined world if none is named.
+Given a host and port instead, connect to a temporary world named
+"(unnamed<N>)", which is removed once it is disconnected and no longer
+in the foreground (it is never saved).
+
+Typed (or run for the foreground world), the world is brought to the
+foreground; run from a hook or trigger for a background world, it
+connects in the background.
+
+Options:
+  -l    No automatic login.
+  -q    Quiet login.
+  -x    Use SSL for this connection.
+  -b    Connect in the background.
+  -f    Connect in the foreground.
+
+Errors: "CONNECT: <name>: no such world",
+        "CONNECT: socket to <name> already exists".
+
+Clay's own command to attach to another Clay server is /server."#.to_string()
+            )),
             "world" => TfCommandResult::Success(Some(
                 r#"/world [-lqnxfb] [<name>]
 /world [-lqnxfb] <host> <port>
@@ -2747,17 +2940,19 @@ Examples:
             "listworlds" => TfCommandResult::Success(Some(
                 r#"/listworlds [-cus] [-m<style>] [-S<field>] [-T<type>] [<name>]
 
-List defined worlds (connected or not).
+List defined worlds (connected or not), in TinyFugue's format. %? is
+how many were listed.
 
 Options:
   -s          Short form: world names only.
-  -c          Command form: printable /addworld-style definitions
-              (includes passwords).
-  -S<field>   Sort by name/host/port/character/- (default: name).
-  -u, -m, -T  Accepted, not distinct - see /listsockets for the same
-              rulings (no "unnamed" world class, no glob/regexp match
-              style, no per-world type).
-  <name>      Only worlds whose name contains this text.
+  -c          Command form: /test addworld(...) lines (includes
+              passwords) - what /saveworld writes.
+  -u          Include temporary worlds (/connect <host> <port>).
+  -m<style>   Match <name> and <type> as simple, glob or regexp
+              (default: %matching).
+  -T<type>    Only worlds whose TF type matches (-T{} = untyped).
+  -S<field>   Sort by name/type/host/port/character/- (default: name).
+  <name>      Only worlds whose name matches.
 
 Examples:
   /listworlds
@@ -2862,7 +3057,7 @@ Examples:
                 "/log [-w[<world>]] [-i] [-l] [-g] [OFF|ON|<file>]\n\nStart, stop, or list per-world output logging.\n\nOptions:\n  -w<world>   Act on <world> (attached, no space; bare -w = current world)\n  -i          Also toggle the global \"log input\" setting\n  -l          Accepted; Clay's log already includes local (client) output\n  -g          Accepted; Clay logs per-world, not one combined stream\n\nArguments:\n  ON          Resume the target's normal log file\n  <file>      Log the target to this exact file instead\n  OFF         Stop logging the target\n  (none)      With a -wilg option: same as ON. Otherwise: list every\n              world that is currently logging.\n\nExamples:\n  /log                - List every world currently logging\n  /log ON             - Start logging the current world\n  /log ~/mud.log      - Log the current world to this file\n  /log -wOtherMUD OFF - Stop logging a different world\n  /log -i             - Start logging the current world, plus typed input".to_string()
             )),
             "sh" => TfCommandResult::Success(Some(
-                "/sh [-q] [<command>]\n\nExecute <command> and display its output. Environment variables set\nwith /setenv or /export are available. Without <command>, real tf\nspawns an interactive shell in place - Clay's TUI has no safe way to\ndo that, so bare /sh reports this instead of hanging.\n\n-q suppresses both the SHELL hook and the default\n\"Executing command: <command>\" message.\n\nExample: /sh ls -la".to_string()
+                "/sh [-q] [<command>]\n\nRun <command> with /bin/sh - or, with no <command>, an interactive\n%{SHELL} - on the terminal, as TF does: Clay's screen is put away, the\nshell runs, and the screen comes back (after a keypress, when %{shpause}\nis on). %? is the exit status, or -1 if it didn't exit normally.\nVariables from the environment or /setenv are passed to it. ^C and ^\\\nreach only the shell.\n\nOnly Clay's own console has a terminal to lend. From a web, GUI or\nremote-console client, or a Clay without a console (-D, the GUI), a\n<command> runs in the background instead and its output is shown when\nit finishes; an interactive shell isn't available there.\n\n-q leaves out the SHELL hook and TF's \"% Executing command: <command>\"\nline. For TF's /psh, /require psh.tf.\n\nExample: /sh ls -la".to_string()
             )),
             "time" => TfCommandResult::Success(Some(
                 "/time [<format>]\n/time /command\n\nWithout a /command argument, print the current time formatted by\n<format> (ftime()-style conversions: %Y %m %d %H %M %S %a %A %b %B ...);\nwithout <format>, uses %{time_format} (default \"%H:%M\"). Sets %? to the\nformatted string.\n\nWith a \"/command\" argument (Clay's own kept extension - see /runtime for\nTF's own real=/cpu= timing report), run <command> and report how long it\ntook.\n\nExamples:\n  /time\n  /time %Y-%m-%d\n  /time /load big_script.tf".to_string()
@@ -2895,10 +3090,10 @@ Examples:
                 "/cat and /paste are not supported in Clay.\nUse bracketed paste instead (paste normally into the input area).".to_string()
             )),
             "help" | "tfhelp" => TfCommandResult::Success(Some(
-                "/help [topic] or /tfhelp [topic]\n\nShow help on TF commands and features.\n\nTopics: set, echo, send, def, if, while, for, expr, test,\n  bind, hooks, repeat, load, recall, quote, gag, addworld,\n  watchdog, watchname, functions, and more.\n\nExample: /help def".to_string()
+                "/help [topic] or /tfhelp [topic]\n\nShow help on TF commands and features.\n\nTopics: set, echo, send, def, if, while, for, expr, test,\n  bind, hooks, repeat, load, recall, quote, gag, addworld,\n  watchdog, watchname, functions, and more.\n\nA topic Clay has no help of its own for is looked up in TinyFugue's\nhelp file (%TFHELP, else tf-help in %TFLIBDIR) when one is installed,\nas TF would: /help intro, /help special variables, /help kecho.\nThose topics are case-sensitive, as in TF.\n\nExample: /help def".to_string()
             )),
-            "purgeworld" | "saveworld" => TfCommandResult::Success(Some(
-                "/purgeworld and /saveworld are stubs.\nUse Clay's world management instead.".to_string()
+            "purgeworld" | "saveworld" | "loadworld" => TfCommandResult::Success(Some(
+                "/saveworld [-a] [<file>]\n  Write every world definition to <file> (default ~/tiny.world)\n  as /test addworld(...) lines; -a appends. The file holds passwords\n  and is written readable by you only.\n\n/loadworld [<file>]\n  Read world definitions back (a /load of the file).\n\n/purgeworld [-m<style>] [-T<type>] [<name>]\n  Remove the world definitions matching <name> and <type> (all of\n  them when neither is given) - Clay's saved worlds included.".to_string()
             )),
             "telnet" | "finger" => TfCommandResult::Success(Some(
                 "/telnet and /finger are not implemented.\nUse /sh to run system commands instead.\n\nExample: /sh telnet host port".to_string()
@@ -2916,7 +3111,7 @@ Examples:
                 "/tick\n\nTick timer (for MUD combat rounds). Not implemented in Clay.\nUse /repeat for periodic timers instead.".to_string()
             )),
             "recordline" => TfCommandResult::Success(Some(
-                "/recordline\n\nRecord a line to history. Not implemented in Clay.".to_string()
+                "/recordline [-lig] [-w[<world>]] [-t<time>] [-a<attrs>] [-p] [--] <text>\n\nRecord <text> into a history without displaying or logging it:\n/recall finds it there.\n\nOptions:\n  -w[<world>] <world>'s history (bare -w: the current world)\n  -l          local history (Clay's own output)\n  -g          global history (the default)\n  -i          input history (also the console's Up/Down history)\n  -t<time>    record it with this time (seconds, as /recall -t@ shows)\n  -a<attrs>   with these display attributes\n  -p          interpret \"@{attr}\" sequences inline\n\nExample:\n  /recordline -i look".to_string()
             )),
             "edit" => TfCommandResult::Success(Some(
                 r#"/edit [options] name [= body]
@@ -2940,11 +3135,13 @@ Examples:
 See also: /def, /list, /undef"#.to_string()
             )),
             _ => {
-                // Try Clay's help topics before giving up
+                // Clay's own topics, then TinyFugue's help file, as TF would answer.
                 if let Some(lines) = crate::popup::definitions::help::get_topic_help(topic.as_str()) {
                     TfCommandResult::Success(Some(lines.join("\n")))
+                } else if let Some(text) = super::help::lookup(engine, args) {
+                    TfCommandResult::Success(Some(text))
                 } else {
-                    TfCommandResult::Success(Some(format!("No help available for '{}'\nUse /help for a list of all commands.", topic)))
+                    TfCommandResult::Success(Some(format!("% Help on subject {} not found.", args.trim())))
                 }
             }
         }
@@ -3002,21 +3199,10 @@ fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         return TfCommandResult::Success(None);
     }
 
-    let substituted = if level == 0 {
-        text.to_string()
-    } else {
-        super::variables::substitute_commands(engine, text)
-    };
-    let substituted = substituted.trim();
-    if substituted.is_empty() {
-        return TfCommandResult::Success(None);
-    }
-
-    if substituted.starts_with('/') {
-        execute_command_substituted(engine, substituted)
-    } else {
-        TfCommandResult::SendToMud(substituted.to_string())
-    }
+    // TF evaluates the text "as a macro body" (`/help eval`): split into commands at %;
+    // and %| (pipes), each substituted as it runs - a /while's body once per iteration,
+    // not once up front - in the current scope (see macros::run_list).
+    macros::run_list(engine, text, level != 0)
 }
 
 /// /not [-s<level>] <command> - finding 13: run <command> as a command (identical
@@ -3182,10 +3368,8 @@ fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
 /// Aggregate results from inline control flow execution
 fn aggregate_inline_results(engine: &mut super::TfEngine, results: Vec<TfCommandResult>) -> TfCommandResult {
-    // Use the engine-aware version which properly handles SendToMud
-    // by queueing commands in engine.pending_commands.
-    // Inline control flow (while/for/if) can produce SendToMud results that
-    // must not be silently dropped.
+    // Emits each result's effects in order (sends included - inline control flow
+    // (while/for/if) must not silently drop them) and returns any control result.
     aggregate_results_with_engine(engine, results)
 }
 
@@ -3295,20 +3479,68 @@ fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 // =============================================================================
 
 /// /def [options] name = body - Define a macro
+/// Names real tf 5.0b8 will not give a macro (`DEF: "set" is a reserved word.`) - found by
+/// defining a macro of every command name in it.
+const TF_RESERVED_WORDS: &[&str] = &[
+    "break", "do", "done", "else", "elseif", "endif", "eval", "exit", "if", "let", "result",
+    "return", "set", "setenv", "test", "then", "while",
+];
+
+/// Real tf 5.0b8's builtin commands that a macro may shadow, with a warning and the CONFLICT
+/// hook (found the same way). Commands TF defines in its library instead (/echo, /send,
+/// /kecho, ...) are not among them: redefining those just redefines a macro.
+const TF_BUILTIN_COMMANDS: &[&str] = &[
+    "beep", "bind", "connect", "core", "dc", "def", "dokey", "edit", "export", "features", "fg",
+    "gag", "help", "hilite", "histsize", "hook", "input", "kill", "lcd", "limit", "list",
+    "listsockets", "liststreams", "listvar", "listworlds", "load", "localecho", "log", "ps",
+    "purge", "quit", "quote", "recall", "recordline", "relimit", "repeat", "restrict", "save",
+    "saveworld", "sh", "shift", "status_add", "status_edit", "status_rm", "suspend", "trigger",
+    "trigpc", "unbind", "undef", "undefn", "unlimit", "unset", "unworld", "version", "watchdog",
+    "watchname",
+];
+
 fn cmd_def(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.trim().is_empty() {
         // No args: list all macros
         return TfCommandResult::Success(Some(macros::list_macros(engine, None, false)));
     }
 
-    match macros::parse_def(args) {
+    // -m defaults to %matching (`/help def`)
+    match macros::parse_def_with_default(args, macros::default_matching_style(engine)) {
         Ok(mut macro_def) => {
             if let Err(e) = macros::resolve_priority_expr(engine, &mut macro_def) {
                 return TfCommandResult::Error(e);
             }
+            let name = macro_def.name.to_lowercase();
+            if TF_RESERVED_WORDS.contains(&name.as_str()) {
+                return TfCommandResult::Error(format!("DEF: \"{}\" is a reserved word.", macro_def.name));
+            }
+            // A new macro shadowing one of TF's builtins: TF's warning, unless a CONFLICT
+            // hook gags it (it runs after the warning).
+            if TF_BUILTIN_COMMANDS.contains(&name.as_str()) && !engine.macros.iter().any(|m| m.name == macro_def.name) {
+                let selected = super::hooks::select_hooks(engine, TfHookEvent::Conflict, &macro_def.name);
+                if !selected.first().is_some_and(|m| m.attributes.gag) {
+                    engine.emit(super::effects::TfEffect::error(format!(
+                        "DEF: warning: macro \"{}\" conflicts with the builtin command.", macro_def.name)));
+                }
+                let _ = super::hooks::run_selected_hooks(engine, selected, &macro_def.name);
+            }
+            expand_def_attributes(engine, &mut macro_def);
             apply_macro_def(engine, macro_def)
         }
         Err(e) => TfCommandResult::Error(e),
+    }
+}
+
+/// TF replaces "h", "E" and "W" in a macro's attributes with %hiliteattr,
+/// %error_attr and %warning_attr when the macro is defined (`/def -ah` lists as
+/// `-aB` - verified against real tf).
+pub(crate) fn expand_def_attributes(engine: &TfEngine, macro_def: &mut TfMacro) {
+    let var = |name: &str| engine.get_var(name).map(|v| v.to_string_value()).unwrap_or_default();
+    let (hilite, error, warning) = (var("hiliteattr"), var("error_attr"), var("warning_attr"));
+    macro_def.attributes.expand(&hilite, &error, &warning);
+    for partial in &mut macro_def.partials {
+        partial.attrs.expand(&hilite, &error, &warning);
     }
 }
 
@@ -3337,15 +3569,15 @@ fn apply_macro_def(engine: &mut TfEngine, macro_def: TfMacro) -> TfCommandResult
     // scan `engine.macros` directly (finding C.10 / plan step P1.9 removed the
     // old by-name `engine.hooks` registry this used to also populate).
 
-    // Register keybinding if present. A named macro is bound by re-injecting its
-    // bare name as if typed (see input_handler.rs's KeyAction::SendCommand); a
-    // nameless macro has no name to re-inject, so bind directly to its body
-    // instead - the same "runs the body" contract, just without a name in the way.
+    // Register keybinding if present. A binding's target runs as a macro body
+    // (input_handler.rs's KeyAction::RunBound): a named macro is bound as a call to
+    // it ("/name"); a nameless macro has no name to call, so bind directly to its
+    // body instead - the same "runs the body" contract, just without a name in the way.
     if let Some(ref keys) = macro_def.keybinding {
         let binding_target = if macro_def.name.is_empty() {
             macro_def.body.clone()
         } else {
-            macro_def.name.clone()
+            format!("/{}", macro_def.name)
         };
         engine.keybindings.insert(keys.clone(), binding_target);
     }
@@ -3423,7 +3655,8 @@ fn macro_definitions_equal(a: &TfMacro, b: &TfMacro) -> bool {
         && a.attributes == b.attributes
         && a.priority == b.priority
         && a.fall_through == b.fall_through
-        && a.partial_hilite == b.partial_hilite
+        && a.partials == b.partials
+        && a.extra_hooks == b.extra_hooks
         && a.one_shot == b.one_shot
         && a.condition == b.condition
         && a.probability == b.probability
@@ -3506,9 +3739,7 @@ fn cmd_edit(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         edited.shots_remaining = edit_def.one_shot;
     }
     // Attributes (apply if any are set)
-    if edit_def.attributes.gag || edit_def.attributes.bold || edit_def.attributes.underline ||
-       edit_def.attributes.reverse || edit_def.attributes.flash || edit_def.attributes.dim ||
-       edit_def.attributes.bell || edit_def.attributes.norecord || edit_def.attributes.hilite.is_some() {
+    if !edit_def.attributes.is_empty() {
         edited.attributes = edit_def.attributes;
     }
     // Condition
@@ -3524,8 +3755,8 @@ fn cmd_edit(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         edited.world = edit_def.world;
     }
     // Partial hilite
-    if edit_def.partial_hilite {
-        edited.partial_hilite = true;
+    if !edit_def.partials.is_empty() {
+        edited.partials = edit_def.partials;
     }
     // World type (-T)
     if edit_def.world_type.is_some() {
@@ -3925,25 +4156,6 @@ fn cmd_fg(engine: &TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::ClayCommand(format!("/worlds {}", world))
 }
 
-/// Set the bamf flag for portal handling
-fn cmd_bamf(engine: &mut TfEngine, args: &str) -> TfCommandResult {
-    let arg = args.trim().to_lowercase();
-    let value = match arg.as_str() {
-        "on" | "1" => "1",
-        "old" => "old",
-        "off" | "0" | "" => "0",
-        _ => {
-            return TfCommandResult::Error(format!("Usage: /bamf [off|on|old] (got '{}')", args.trim()));
-        }
-    };
-    engine.set_global("bamf", TfValue::from(value));
-    let state = match value {
-        "1" => "on (disconnect + reconnect)",
-        "old" => "old (reconnect without disconnect)",
-        _ => "off",
-    };
-    TfCommandResult::Success(Some(format!("bamf {}", state)))
-}
 
 /// /listvar [-m<matching>] [-gxsv] [<name> [<value>]] - list variables
 /// whose name and value match `<name>` and `<value>` under `<matching>`
@@ -4091,16 +4303,17 @@ fn cmd_trigger(engine: &mut TfEngine, args: &str) -> TfCommandResult {
             None => return TfCommandResult::Error(format!("Unknown hook event: {}", event_str)),
         };
 
-        let outcome = hooks::fire_hook(engine, event, text);
-        let mut all_results = Vec::new();
+        // The echo stands in for the hook's default message, which TF shows before any
+        // hooked macro runs - so decide it from the hooks about to fire, then run them.
+        let selected = hooks::select_hooks(engine, event, text);
         if !event.is_world_stream_event() && !text.is_empty() {
-            let gagged = outcome.first_fired_gagged.unwrap_or(false);
+            let gagged = selected.first().is_some_and(|m| m.attributes.gag);
             if !gagged {
-                all_results.push(TfCommandResult::Success(Some(text.to_string())));
+                engine.emit_output(text.to_string());
             }
         }
-        all_results.extend(outcome.results);
-        return aggregate_results_with_engine(engine, all_results);
+        let outcome = hooks::run_selected_hooks(engine, selected, text);
+        return aggregate_results_with_engine(engine, outcome.results);
     }
 
     // Parse the remaining flags (`/help /trigger`: "[-ln] [-g] [-w[<world>]] <text>"),
@@ -4233,7 +4446,8 @@ fn cmd_trigger(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let non_quiet_count = matched.iter().filter(|&&idx| !engine.macros[idx].quiet).count();
     engine.set_global("?", TfValue::Integer(non_quiet_count as i64));
 
-    let results = macros::process_triggers(engine, text, world_arg.as_deref(), None);
+    let clay_type = engine.world_types(world_arg.as_deref()).map(|(_, clay)| clay);
+    let results = macros::process_triggers(engine, text, world_arg.as_deref(), clay_type.as_deref());
     aggregate_results_with_engine(engine, results)
 }
 
@@ -4246,6 +4460,8 @@ fn collect_trigger_matches(engine: &TfEngine, text: &str, world: Option<&str>) -
     let mut indices: Vec<usize> = (0..engine.macros.len()).collect();
     indices.sort_by(|&a, &b| engine.macros[b].priority.cmp(&engine.macros[a].priority));
 
+    let types = engine.world_types(world);
+    let types = types.as_ref().map(|(tf, clay)| (tf.as_str(), clay.as_str()));
     let mut matched = Vec::new();
     for idx in indices {
         let m = &engine.macros[idx];
@@ -4258,10 +4474,8 @@ fn collect_trigger_matches(engine: &TfEngine, text: &str, world: Option<&str>) -
             }
         }
 
-        // -T world-type restriction: /trigger has no live world context to test the
-        // pattern against, so (same conservative choice as hooks::fire_hook) a
-        // -T-restricted macro is treated as never matching here.
-        if !macros::world_type_matches(m, None) {
+        // -T: the types of the world /trigger runs for (-w, else the current world).
+        if !macros::world_type_matches(m, types) {
             continue;
         }
 
@@ -4333,6 +4547,52 @@ mod tests {
     use super::*;
     use super::super::WorldInfoCache;
 
+    /// Inline "@{...}" attributes read as real tf reads them (checked against tf 5.0b8):
+    /// letters run together ("Bu"), each code adds to what's in force, "@{n}" resets,
+    /// "@{x}" and "@{}" change nothing, "@@" is "@", an unknown attribute is TF's error;
+    /// Clay's older names ("red") still work.
+    #[test]
+    fn test_inline_attributes_follow_tf() {
+        let vars = AttrVars::tf_defaults();
+        let d = |t: &str| decode_inline_attrs(t, &vars, true);
+        assert_eq!(d("A@{Bu}bu@{n}N").unwrap(), "A\x1b[1;4mbu\x1b[0mN");
+        assert_eq!(d("1@{B}b@{u}u@{n}N").unwrap(), "1\x1b[1mb\x1b[4mu\x1b[0mN", "codes add up");
+        assert_eq!(d("B@{Cred}r@{x}x@{n}n").unwrap(), "B\x1b[31mrx\x1b[0mn", "@{{x}} changes nothing");
+        assert_eq!(d("6@{rCgreen}rg@{}e").unwrap(), "6\x1b[7;32mrge\x1b[0m", "nor @{{}}; reset at the end");
+        assert_eq!(d("E@@F@{B}bold").unwrap(), "E@F\x1b[1mbold\x1b[0m");
+        assert_eq!(d("C@{h}hi@{n}D").unwrap(), "C\x1b[1mhi\x1b[0mD", "h is %hiliteattr");
+        assert_eq!(d("@{red}r").unwrap(), "\x1b[31mr\x1b[0m", "Clay's older names");
+        assert_eq!(d("5@{nonsense}z").unwrap_err(), "invalid display attribute 'o'");
+        assert_eq!(decode_inline_attrs("5@{nonsense}z", &vars, false).unwrap(), "5z", "dropped when not strict");
+
+        let mut engine = TfEngine::new();
+        match execute_command(&mut engine, "/echo -aBu hi") {
+            // The line carries its attributes along (for /recall -a), drawn in already.
+            TfCommandResult::Effects(effects) => match effects.as_slice() {
+                [super::super::effects::TfEffect::Output { text, attrs, plain, .. }] => {
+                    assert!(text.contains("\x1b[1;4m") && crate::util::strip_ansi_codes(text) == "hi", "{text:?}");
+                    assert_eq!((attrs.as_str(), plain.as_deref()), ("Bu", Some("hi")));
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        match execute_command(&mut engine, "/echo -p @{Bu}x") {
+            TfCommandResult::Success(Some(t)) => assert_eq!(t, "\x1b[1;4mx\x1b[0m"),
+            other => panic!("{other:?}"),
+        }
+        match execute_command(&mut engine, "/echo -p 5@{nonsense}z") {
+            TfCommandResult::Error(e) => assert_eq!(e, "echo: invalid display attribute 'o'"),
+            other => panic!("{other:?}"),
+        }
+        engine.set_global("hiliteattr", TfValue::String("u".to_string()));
+        assert_eq!(
+            crate::tf::expressions::evaluate(&mut engine, "decode_attr(\"@{h}x\", \"Bu\")").unwrap().to_string_value(),
+            "\x1b[1;4m\x1b[4mx\x1b[0m\x1b[0m",
+            "decode_attr: h follows %hiliteattr, and its attribute list is read as TF reads one"
+        );
+    }
+
     #[test]
     fn test_is_tf_command() {
         // Only / prefix is recognized as TF command
@@ -4357,23 +4617,26 @@ mod tests {
         // `dokey_<name>` dynamic-prefix rule is excluded - not a fixed literal, and
         // none of its 35 individual names need their own mention in the help text).
         const DISPATCH_COMMANDS: &[&str] = &[
-            ":", "addworld", "bamf", "ban", "beep", "bind", "break", "cat", "cd", "changes",
-            "connections", "core", "dc", "def", "disconnect", "do", "dokey", "done", "echo",
-            "edit", "else", "elseif", "endif", "endpaste", "escape", "eval", "exit", "export",
-            "expr", "false", "features", "fg", "finger", "first", "for", "gag", "getfile", "grab",
-            "help", "hilite", "histsize", "hook", "if", "input", "ismacro", "isvar", "kill", "l",
-            "last", "lcd", "let", "limit", "list", "listsockets", "liststreams", "listvar",
-            "listworlds", "load", "loaded", "localecho", "log", "man", "more", "nogag",
-            "nohilite", "not", "nth", "partial", "paste", "ps", "purge", "purgeworld", "putfile",
-            "pwd", "quit", "quote", "recall", "recordline", "relimit", "repeat", "replace",
-            "require", "rest", "restrict", "result", "return", "runtime", "save", "saveworld",
-            "say", "send", "set", "setenv", "sh", "shift", "sub", "substitute", "suspend", "sys",
-            "telnet", "test", "then", "tick", "time", "toggle", "tr", "trig", "trigc", "trigger",
-            "trigp", "trigpc", "true", "unbind", "undef", "undefn", "undeft", "ungag", "unhook",
-            "unlimit", "unset", "untrig", "unworld", "ver", "version", "watchdog", "watchname",
-            "while", "world", "wrap", "xtitle",
+            ":", "adddiku", "addlp", "addlpp", "addtelnet", "addtiny", "addworld", "background", "bamf", "ban",
+            "beep", "bind", "borg", "break", "cat", "cd", "changes", "cleardone", "clearfull", "clock", "connect",
+            "connections", "core", "dc", "def", "disconnect", "do", "dokey", "done", "echo", "edit",
+            "else", "elseif", "endif", "endpaste", "escape", "eval", "exit", "export", "expr", "false",
+            "features", "fg", "finger", "first", "for", "gag", "getfile", "gpri", "grab", "help",
+            "hilite", "histsize", "hook", "hpri", "if", "input", "insert", "isize", "ismacro", "isvar",
+            "kecho", "kill", "l", "last", "lcd", "let", "limit", "list", "listsockets", "liststreams",
+            "listvar", "listworlds", "load", "loaded", "loadworld", "localecho", "log", "login", "lp", "lpquote",
+            "man", "mecho", "more", "nogag", "nohilite", "nologin", "noquiet", "not", "nth", "partial",
+            "paste", "prompt", "ps", "ptime", "purge", "purgeworld", "putfile", "pwd", "qecho", "quiet", "quit",
+            "quitdone", "quote", "recall", "recordline", "redef", "relimit", "repeat", "replace", "require", "rest",
+            "restrict", "result", "return", "runtime", "save", "saveworld", "say", "send", "set", "setenv",
+            "sh", "shift", "shpause", "sockmload", "status_add", "status_defaults", "status_edit", "status_restore",
+            "status_rm", "status_save", "sub", "substitute", "suspend", "sys", "telnet", "test",
+            "then", "tick", "time", "toggle", "tr", "trig", "trigc", "trigger", "trigp", "trigpc",
+            "true", "unbind", "undef", "undefn", "undeft", "ungag", "unhook", "unlimit", "unset", "untrig",
+            "unworld", "ver", "version", "visual", "watchdog", "watchname", "while", "world", "wrap", "wrapspace",
+            "xtitle",
         ];
-        assert_eq!(DISPATCH_COMMANDS.len(), 130, "unexpected count - is_tf_command_name's own list changed size?");
+        assert_eq!(DISPATCH_COMMANDS.len(), 169, "unexpected count - is_tf_command_name's own list changed size?");
         for name in DISPATCH_COMMANDS {
             assert!(is_tf_command_name(name),
                 "{name:?} is pinned in DISPATCH_COMMANDS but is_tf_command_name doesn't \
@@ -4383,13 +4646,13 @@ mod tests {
         // Genuinely real Clay-native (non-TF) commands this text legitimately mentions
         // (reachable via `main.rs::parse_command`), plus the `/tf<name>` prefix escape.
         const CLAY_NATIVE_ONLY: &[&str] = &[
-            "actions", "chat", "connect", "dict", "dump", "flush", "font", "import",
-            "menu", "msdp", "mssp", "note", "notify", "reload", "remote", "setup", "stats", "tag",
+            "actions", "chat", "dict", "dump", "flush", "font", "import",
+            "menu", "msdp", "mssp", "note", "notify", "reload", "remote", "server", "setup", "stats", "tag",
             "testmusic", "tfgag", "tfhelp", "translate", "unban", "update",
             "urban", "url", "web", "window",
         ];
 
-        let help_text = match cmd_help("commands") {
+        let help_text = match cmd_help(&TfEngine::new(), "commands") {
             TfCommandResult::Success(Some(text)) => text,
             other => panic!("expected /help commands to return text, got {other:?}"),
         };
@@ -4536,10 +4799,16 @@ mod tests {
         }
     }
 
+    /// What `/echo <args>` shows: returned as its result, or - for a line carrying
+    /// attributes of its own (`-a`) - emitted as output with them.
     fn echo_text(engine: &mut TfEngine, args: &str) -> String {
         match cmd_echo(engine, args) {
             TfCommandResult::Success(Some(msg)) => msg,
-            other => panic!("Expected Success(Some) for {:?}, got {:?}", args, other),
+            TfCommandResult::Success(None) => match engine.take_effects().pop() {
+                Some(super::super::effects::TfEffect::Output { text, .. }) => text,
+                other => panic!("Expected output for {:?}, got {:?}", args, other),
+            },
+            other => panic!("Expected Success for {:?}, got {:?}", args, other),
         }
     }
 
@@ -4581,24 +4850,30 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_echo_w_world_queues_pending_output() {
+    fn test_cmd_echo_w_world_emits_targeted_output() {
+        use super::super::effects::TfEffect;
         let mut engine = TfEngine::new();
-        // -w<world> (attached): redirected via pending_outputs, NOT returned directly.
+        // -w<world> (attached): emitted as output for that world, NOT returned directly.
         let result = cmd_echo(&mut engine, "-wOtherMUD hello there");
         assert!(matches!(result, TfCommandResult::Success(None)));
-        assert_eq!(engine.pending_outputs.len(), 1);
-        assert_eq!(engine.pending_outputs[0].text, "hello there");
-        assert_eq!(engine.pending_outputs[0].world.as_deref(), Some("OtherMUD"));
+        let effects = engine.take_effects();
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            TfEffect::Output { text, world, .. } => {
+                assert_eq!(text, "hello there");
+                assert_eq!(world.as_deref(), Some("OtherMUD"));
+            }
+            other => panic!("Expected Output, got {:?}", other),
+        }
 
         // Bare -w (blank world) means the current world - same as omitting -w entirely,
-        // so it must NOT go through pending_outputs.
-        engine.pending_outputs.clear();
+        // so it is returned directly, not emitted for another world.
         let result = cmd_echo(&mut engine, "-w hello there");
         match result {
             TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "hello there"),
             other => panic!("Expected Success(Some), got {:?}", other),
         }
-        assert!(engine.pending_outputs.is_empty());
+        assert!(engine.take_effects().is_empty());
     }
 
     #[test]
@@ -4749,18 +5024,24 @@ mod tests {
     }
 
     #[test]
-    fn test_quote_send_disposition_inside_macro_body_queues_pending_command() {
+    fn test_quote_send_disposition_inside_macro_body_goes_to_the_app() {
+        // A -S quote's sends are the App's to make (it knows the world and %qecho).
         use super::super::TfMacro;
         let mut engine = TfEngine::new();
         engine.macros.push(TfMacro {
             name: "sayit".to_string(),
-            body: "/quote -dsend look".to_string(),
+            body: "/quote -S -dsend `/echo look".to_string(),
             ..Default::default()
         });
 
-        execute_command(&mut engine, "/sayit");
-        assert_eq!(engine.pending_commands.len(), 1);
-        assert_eq!(engine.pending_commands[0].command, "look");
+        match execute_command(&mut engine, "/sayit") {
+            TfCommandResult::Quote { lines, disposition, timing, .. } => {
+                assert_eq!(lines, vec!["look".to_string()]);
+                assert_eq!(disposition, super::super::QuoteDisposition::Send);
+                assert_eq!(timing, super::super::QuoteTiming::Sync);
+            }
+            other => panic!("Expected the quote to reach the App, got {:?}", other),
+        }
     }
 
     #[test]
@@ -4772,12 +5053,15 @@ mod tests {
         let mut engine = TfEngine::new();
         engine.macros.push(TfMacro {
             name: "delayed".to_string(),
-            body: "/quote -1 hello".to_string(),
+            body: "/quote -1 -decho `/echo hello".to_string(),
             ..Default::default()
         });
 
         match execute_command(&mut engine, "/delayed") {
-            TfCommandResult::Quote { delay_secs, .. } => assert_eq!(delay_secs, 1.0),
+            TfCommandResult::Quote { timing, pid, .. } => {
+                assert_eq!(timing, super::super::QuoteTiming::Every { interval: std::time::Duration::from_secs(1), given: true });
+                assert!(pid.is_some(), "a background quote is a process");
+            }
             other => panic!("Expected the unresolved Quote to bounce upward, got {:?}", other),
         }
     }
@@ -5018,6 +5302,31 @@ mod tests {
         assert!(list_output.contains("2: /def"), "List should contain sequence number 2");
     }
 
+    /// As real tf: a reserved word can't name a macro; one of TF's builtins can, with a
+    /// warning (a gagging CONFLICT hook hides it); a local hiding a global warns too
+    /// (SHADOW).
+    #[test]
+    fn test_reserved_conflict_and_shadow() {
+        use super::super::effects::TfEffect;
+        let mut engine = TfEngine::new();
+        match execute_command(&mut engine, "/def set = /echo x") {
+            TfCommandResult::Error(e) => assert_eq!(e, "DEF: \"set\" is a reserved word."),
+            other => panic!("{:?}", other),
+        }
+        assert!(!engine.macros.iter().any(|m| m.name == "set"));
+        let errors = |engine: &mut TfEngine, line: &str| -> Vec<String> {
+            engine.run(line).into_iter().filter_map(|e| match e { TfEffect::Error { msg, .. } => Some(msg), _ => None }).collect()
+        };
+        assert_eq!(errors(&mut engine, "/def dc = /echo x"), ["DEF: warning: macro \"dc\" conflicts with the builtin command."]);
+        assert!(errors(&mut engine, "/def kecho = /echo x").is_empty(), "/kecho is a TF library macro, not a builtin");
+        engine.execute("/def -ag -hCONFLICT quiet = /@echo hidden");
+        assert!(errors(&mut engine, "/def quit = /echo x").is_empty(), "a gagging CONFLICT hook hides it");
+
+        engine.set_global("gv", TfValue::Integer(1));
+        engine.execute("/def shadow = /let gv=2%; /let other=3");
+        assert_eq!(errors(&mut engine, "/shadow"), ["Warning:  Local variable \"gv\" overshadows global variable of same name."]);
+    }
+
     #[test]
     fn test_def_preserves_body() {
         let mut engine = TfEngine::new();
@@ -5025,12 +5334,12 @@ mod tests {
         // Define a macro with %R and other variables in the body
         // The body should be preserved literally for later substitution when executed
         execute_command(&mut engine, "/def random = /echo -- %R");
-        execute_command(&mut engine, "/def test = /echo %1 %* %L %myvar");
+        execute_command(&mut engine, "/def probe = /echo %1 %* %L %myvar");
 
         let random = engine.macros.iter().find(|m| m.name == "random").unwrap();
         assert_eq!(random.body, "/echo -- %R", "Body should preserve %R literally");
 
-        let test = engine.macros.iter().find(|m| m.name == "test").unwrap();
+        let test = engine.macros.iter().find(|m| m.name == "probe").unwrap();
         assert_eq!(test.body, "/echo %1 %* %L %myvar", "Body should preserve all variables");
 
         // When a macro is EXECUTED (not defined), variables are substituted
@@ -5069,11 +5378,11 @@ mod tests {
 
         assert_eq!(hooks::get_binding(&engine, "F5"), Some("/echo pressed".to_string()));
 
-        // A named macro's -b/-B binding, unaffected by this change, still binds to the
-        // macro's bare name.
+        // A named macro's -b/-B binding binds to a call of the macro (the binding runs
+        // as a macro body).
         let result = execute_command(&mut engine, r#"/def -B"F6" named = /echo named"#);
         assert!(matches!(result, TfCommandResult::Success(None)), "unexpected result: {:?}", result);
-        assert_eq!(hooks::get_binding(&engine, "F6"), Some("named".to_string()));
+        assert_eq!(hooks::get_binding(&engine, "F6"), Some("/named".to_string()));
     }
 
     #[test]
@@ -5096,12 +5405,15 @@ mod tests {
             other => panic!("Expected success with num output, got {:?}", other),
         }
 
-        // Also test with plain text (SendToMud) via pending_commands
+        // Also test with plain text (SendToMud), each send in order
         execute_command(&mut engine, "/def count2 =  /let i=1%;  /while (i <= {1})  think num: %{i}%;  /let i=$[i + 1]%; /done");
-        engine.pending_commands.clear();
-        execute_command(&mut engine, "/count2 10");
-        let cmds: Vec<String> = engine.pending_commands.iter().map(|c| c.command.clone()).collect();
-        assert_eq!(cmds.len(), 10, "Expected 10 pending commands, got {:?}", cmds);
+        let mut effects = Vec::new();
+        super::super::effects::push_result_effects(execute_command(&mut engine, "/count2 10"), &mut effects);
+        let cmds: Vec<String> = effects.into_iter().filter_map(|e| match e {
+            super::super::effects::TfEffect::Send { text, .. } => Some(text),
+            _ => None,
+        }).collect();
+        assert_eq!(cmds.len(), 10, "Expected 10 sends, got {:?}", cmds);
         for i in 1..=10 {
             assert_eq!(cmds[i - 1], format!("think num: {}", i));
         }
@@ -5518,7 +5830,7 @@ mod tests {
         let mut engine = TfEngine::new();
         engine.add_macro(macros::parse_def("-hCONNECT h = /echo connected").unwrap());
 
-        match cmd_trigger(&mut engine, "-hCONNECT somehost") {
+        match run_in_frame(&mut engine, |e| cmd_trigger(e, "-hCONNECT somehost")) {
             TfCommandResult::Success(Some(msg)) => {
                 // CONNECT is a "W"-tagged event (TfHookEvent::is_world_stream_event) -
                 // no local-echo of "somehost" under /trigger's simulation, only the
@@ -5534,7 +5846,7 @@ mod tests {
         let mut engine = TfEngine::new();
         engine.add_macro(macros::parse_def("-h\"SEND greet*\" h = /echo send-hook %*").unwrap());
 
-        match cmd_trigger(&mut engine, "-hSEND greet bob") {
+        match run_in_frame(&mut engine, |e| cmd_trigger(e, "-hSEND greet bob")) {
             TfCommandResult::Success(Some(msg)) => {
                 assert_eq!(msg, "greet bob\nsend-hook greet bob");
             }
@@ -5551,7 +5863,7 @@ mod tests {
         let mut engine = TfEngine::new();
         engine.add_macro(macros::parse_def("-ag -h\"SEND greet*\" h = /shift%; /echo greetings %1").unwrap());
 
-        match cmd_trigger(&mut engine, "-hSEND greet bob") {
+        match run_in_frame(&mut engine, |e| cmd_trigger(e, "-hSEND greet bob")) {
             TfCommandResult::Success(Some(msg)) => {
                 assert_eq!(msg, "greetings bob");
             }
@@ -5821,7 +6133,7 @@ mod tests {
         // Simulate being inside a file load (`builtins::load_lines` maintains
         // these two stacks in lockstep - see `TfEngine::diag_location_prefix`).
         engine.loading_files.push("/tmp/fixture.tf".to_string());
-        engine.loading_lines.push(9);
+        engine.loading_lines.push((9, 9));
         match execute_command(&mut engine, "/def a = /echo a3") {
             TfCommandResult::Success(Some(msg)) => {
                 assert_eq!(msg, "% /tmp/fixture.tf, line 9: DEF: Redefined macro a");
@@ -6037,14 +6349,18 @@ mod tests {
     #[test]
     fn test_cmd_listworlds_u_m_t_flags_dont_corrupt_output() {
         let mut engine = TfEngine::new();
-        engine.world_info_cache = vec![fake_world("Alpha", false)];
+        let mut w = fake_world("Alpha", false);
+        w.tf_type = "something".to_string();
+        engine.world_info_cache = vec![w];
 
         // -Tsomething must not be parsed char-by-char (an 's' in "something" would
         // otherwise wrongly enable -s's short form) - same regression class as
-        // cmd_connections above.
-        match cmd_listworlds(&engine, "-u -mglob -Tsomething -s") {
-            TfCommandResult::Success(Some(text)) => assert_eq!(text, "Alpha"),
-            other => panic!("expected short-form output, got {:?}", other),
+        // cmd_connections above. It is a type pattern, and this world has that type.
+        match cmd_listworlds(&mut engine, "-u -mglob -Tsomething") {
+            TfCommandResult::Success(Some(text)) => {
+                assert!(text.starts_with("NAME") && text.contains("Alpha"), "a table, not the short form: {text:?}");
+            }
+            other => panic!("expected table output, got {:?}", other),
         }
     }
 
@@ -6056,13 +6372,94 @@ mod tests {
         w.password = "secret".to_string();
         engine.world_info_cache = vec![w];
 
-        match cmd_listworlds(&engine, "-c") {
+        match cmd_listworlds(&mut engine, "-c") {
             TfCommandResult::Success(Some(text)) => {
                 assert!(text.contains("hero") && text.contains("secret"),
                     "-c must include character/password (TF: 'including passwords'): {text:?}");
             }
             other => panic!("expected Success(Some(...)), got {:?}", other),
         }
+    }
+
+    /// /listworlds in TF's exact formats (each line checked against real tf): the table's
+    /// column widths, -c with trailing empty fields left off, -T and name patterns
+    /// matched whole, temporary worlds only with -u, and %? the count.
+    #[test]
+    fn test_cmd_listworlds_matches_tf() {
+        let mut engine = TfEngine::new();
+        let world = |name: &str, tf_type: &str, host: &str, port: &str, user: &str, pass: &str| WorldInfoCache {
+            name: name.into(), tf_type: tf_type.into(), host: host.into(), port: port.into(),
+            user: user.into(), password: pass.into(), world_type: "mud".into(), ..Default::default()
+        };
+        engine.world_info_cache = vec![
+            world("averyveryverylongworldname", "tiny", "mud.example.com", "4000", "bob", "pw"),
+            world("short", "lp", "localhost", "23", "", ""),
+            world("plain", "", "h.example.org", "1234", "", ""),
+            world("nohost", "", "", "", "", ""),
+        ];
+        let mut temp = world("(unnamed1)", "", "127.0.0.1", "4000", "", "");
+        temp.is_temporary = true;
+        engine.world_info_cache.push(temp);
+        let out = |engine: &mut TfEngine, args: &str| match cmd_listworlds(engine, args) {
+            TfCommandResult::Success(Some(text)) => text,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(out(&mut engine, ""), [
+            "NAME            TYPE                              HOST PORT   CHARACTER",
+            "averyveryverylo tiny                   mud.example.com 4000   bob",
+            "nohost                                                        ",
+            "plain                                    h.example.org 1234   ",
+            "short           lp                           localhost 23     ",
+        ].join("\n"));
+        assert_eq!(engine.get_var("?").map(|v| v.to_string_value()).as_deref(), Some("4"));
+        assert_eq!(out(&mut engine, "-s -T{}"), "nohost\nplain");
+        assert_eq!(out(&mut engine, "-s s*"), "short");
+        assert_eq!(out(&mut engine, "-s -mregexp ^p"), "plain");
+        assert_eq!(out(&mut engine, "-s -Sh"), "nohost\nplain\nshort\naveryveryverylongworldname");
+        assert_eq!(out(&mut engine, "-s -u -T{}"), "(unnamed1)\nnohost\nplain");
+        assert_eq!(out(&mut engine, "-c short"), "/test addworld(\"short\", \"lp\", \"localhost\", \"23\")");
+        assert_eq!(out(&mut engine, "-c nohost"), "/test addworld(\"nohost\", \"\")");
+        engine.default_world_character = Some("dchar".into());
+        engine.default_world_password = Some("dpass".into());
+        assert_eq!(out(&mut engine, "-c DEFAULT"), "/test addworld(\"DEFAULT\", \"\", \"\", \"\", \"dchar\", \"dpass\")");
+    }
+
+    /// /saveworld writes the definitions (owner-only: they hold passwords), /loadworld
+    /// reads them back, /purgeworld removes the matching ones through Clay's /unworld.
+    #[test]
+    fn test_saveworld_loadworld_purgeworld() {
+        let mut engine = TfEngine::new();
+        engine.world_info_cache = vec![WorldInfoCache {
+            name: "foo".into(), tf_type: "lp".into(), host: "localhost".into(), port: "4001".into(),
+            user: "bob".into(), password: "secret".into(), use_ssl: true, world_type: "mud".into(), ..Default::default()
+        }];
+        let dir = std::env::temp_dir().join(format!("clay_saveworld_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("worlds.tf");
+        match cmd_saveworld(&mut engine, &file.display().to_string()) {
+            TfCommandResult::Success(Some(msg)) => assert_eq!(msg, format!("% Writing world definitions to {}", file.display())),
+            other => panic!("{other:?}"),
+        }
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(saved, "/test addworld(\"foo\", \"lp\", \"localhost\", \"4001\", \"bob\", \"secret\", \"\", \"x\")\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o077, 0, "world file holds passwords");
+        }
+        let effects = engine.run(&format!("/loadworld {}", file.display()));
+        let op = effects.iter().find_map(|e| match e {
+            crate::tf::effects::TfEffect::WorldOp(op) => Some(op.clone()),
+            _ => None,
+        }).expect("the saved definition is read back");
+        assert_eq!((op.name.as_str(), op.tf_type.as_deref(), op.host.as_deref(), op.use_ssl), ("foo", Some("lp"), Some("localhost"), true));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match cmd_purgeworld(&mut engine, "f*") {
+            TfCommandResult::ClayCommand(cmd) => assert_eq!(cmd, "/unworld foo"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(cmd_purgeworld(&mut engine, "zzz"), TfCommandResult::Success(None)));
     }
 
     #[test]

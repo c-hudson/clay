@@ -44,8 +44,9 @@ hand.
 
 **TinyFugue compatibility & scripting.** A full TF command layer (`/def`, `/set`, `/if`,
 `/while`, `/for`, `/load`, etc., with `#` as an alternate prefix), pattern-matching
-actions/triggers with regex or wildcards, auto-commands and startup actions, and direct
-import of an existing `.tfrc` — if you know TF, you already know Clay.
+actions/triggers with regex or wildcards, auto-commands and startup actions. Clay runs
+your existing `~/.tfrc` at startup and takes TF's command line (`clay mymud`) and status
+line — if you know TF, you already know Clay.
 
 **Customization.** Color themes and keybindings are fully configurable (INI files with
 browser-based editors for live preview), fonts and hanging-indent wrap spacing are
@@ -185,7 +186,8 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 | `/worlds -b <name>` | Connect to world in background without switching to it |
 | `/addworld <name> [host port]` | Add/update a world (TF-compatible) |
 | `/connections` or `/l` | List connected worlds |
-| `/connect [host port [ssl]]` | Connect to a server |
+| `/connect [-lqb] [world]` or `/connect <host> <port>` | Connect a world (TinyFugue's `/connect`) |
+| `/server <host[:port]>` | Attach this Clay to a remote Clay server as a client (`/server --close` detaches) |
 | `/disconnect` or `/dc` | Disconnect current world |
 | `/send [-w world] text` | Send text to a world |
 | `/flush` | Clear output buffer for current world |
@@ -256,21 +258,22 @@ for the full command set and `reference/tf-engine.md` for the engine reference.
 | `/for var start end ... /done` | For loop |
 | `/bind key = cmd` | Bind key to command |
 | `/load filename` | Load a TF script file |
-| `/tfhelp [topic]` | Show TF help |
+| `/tfhelp [topic]` | Show TF help (topics Clay doesn't cover come from TF's own help file) |
+| `/status_add`, `/status_rm`, `/clock` | Edit TF's status line |
 
 See `/tfhelp` or `/help commands` for the full command list. (A line starting
 with `;` or `#` is a comment, matching TinyFugue's own script convention —
 it is not a second command prefix; only `/` dispatches a command.)
 
-### Importing TinyFugue Worlds
+### Coming from TinyFugue
 
-If you have an existing TinyFugue configuration, you can import your worlds using `/load`:
-
-```bash
-/load ~/.tfrc
-```
-
-Clay will parse `/addworld` commands from your TF config file and create corresponding worlds. This makes migrating from TinyFugue seamless - your existing world definitions are automatically imported.
+Clay loads the first of `~/.tfrc`, `~/tfrc`, `./.tfrc` and `./tfrc` when it starts
+(`clay -f` skips it), and takes TF's command line: `clay mymud` or `clay host port`
+connects, `-c<command>` runs a command, `-L<dir>` sets the library directory. The
+rc's `/addworld` lines become Clay worlds (running it again only updates what changed),
+and its macros, triggers, hooks and bindings work as in TF. `/connect` is TF's;
+Clay's attach-to-another-Clay command is `/server`. See
+`docs/markdown/22-switching-from-tinyfugue.md`.
 
 ## Controls
 

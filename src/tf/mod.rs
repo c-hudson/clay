@@ -3,6 +3,9 @@
 //! This module provides TF-style commands using `/` prefix.
 //! Commands work alongside existing Clay commands for full coexistence.
 
+pub mod attrs;
+pub mod effects;
+pub mod special_vars;
 pub mod parser;
 pub mod variables;
 pub mod expressions;
@@ -11,12 +14,67 @@ pub mod macros;
 pub mod hooks;
 pub mod builtins;
 pub mod bridge;
+pub mod help;
+pub mod status;
+pub mod snapshot;
 #[cfg(test)]
 mod script_tests;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use regex::Regex;
+
+/// `%sub` - how typed lines are processed (see `TfEngine::run_typed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubMode {
+    Off,
+    On,
+    Full,
+}
+
+/// `/sub on`'s processing of a typed line (`/help sub`): "%;" and "%\" become newlines,
+/// "%%" becomes "%", and "\<n>" (decimal) becomes the character with code n.
+pub(crate) fn sub_on_expand(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '%' if i + 1 < chars.len() && (chars[i + 1] == ';' || chars[i + 1] == '\\') => {
+                out.push('\n');
+                i += 2;
+            }
+            '%' if i + 1 < chars.len() && chars[i + 1] == '%' => {
+                out.push('%');
+                i += 2;
+            }
+            '\\' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let digits: String = chars[i + 1..j].iter().collect();
+                match digits.parse::<u32>().ok().and_then(char::from_u32) {
+                    Some(c) => out.push(c),
+                    None => out.extend(&chars[i..j]),
+                }
+                i = j;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Globals the engine or Clay set as a side effect - a command's result (`?`), state
+/// mirrored from Clay's own input area (`kbnum`, `insert`), or the current event's data
+/// for a GMCP/MSDP hook. They are never written to settings.dat.
+pub(crate) const TRANSIENT_GLOBALS: &[&str] = &[
+    "?", "kbnum", "insert", "gmcp_package", "gmcp_data", "msdp_var", "msdp_val",
+];
 
 /// `$TFLIBDIR` if it names a real directory, else the system TinyFugue
 /// library location (Debian's `tf5` package installs it at
@@ -45,6 +103,10 @@ pub enum TfValue {
     String(String),
     Integer(i64),
     Float(f64),
+    /// An enumerated special variable as read in an expression: its number (in
+    /// arithmetic and as a truth value) and its name (when printed) - see
+    /// `special_vars::expr_value`.
+    Enum(i64, String),
 }
 
 /// Format a float the way real TF displays a computed "real" value: fixed
@@ -75,6 +137,7 @@ impl TfValue {
             TfValue::String(s) => s.clone(),
             TfValue::Integer(i) => i.to_string(),
             TfValue::Float(f) => format_tf_float(*f),
+            TfValue::Enum(_, name) => name.clone(),
         }
     }
 
@@ -84,6 +147,7 @@ impl TfValue {
             TfValue::Integer(i) => Some(*i),
             TfValue::Float(f) => Some(*f as i64),
             TfValue::String(s) => s.trim().parse().ok(),
+            TfValue::Enum(n, _) => Some(*n),
         }
     }
 
@@ -93,16 +157,104 @@ impl TfValue {
             TfValue::Float(f) => Some(*f),
             TfValue::Integer(i) => Some(*i as f64),
             TfValue::String(s) => s.trim().parse().ok(),
+            TfValue::Enum(n, _) => Some(*n as f64),
         }
     }
 
-    /// Convert to boolean (TF semantics: 0 or empty string is false)
-    pub fn to_bool(&self) -> bool {
+    /// TF's numeric reading of a value (`/help expressions`): a string is the number at
+    /// its start, after leading blanks - "12abc" is 12, "1.5x" is 1.5, " 7" is 7 - and a
+    /// string with no number there ("abc", "on", "") is 0. Verified against real tf.
+    pub fn tf_number(&self) -> TfValue {
         match self {
-            TfValue::Integer(i) => *i != 0,
-            TfValue::Float(f) => *f != 0.0,
-            TfValue::String(s) => !s.is_empty() && s != "0",
+            TfValue::Integer(i) => TfValue::Integer(*i),
+            TfValue::Float(f) => TfValue::Float(*f),
+            TfValue::String(s) => leading_number(s),
+            TfValue::Enum(n, _) => TfValue::Integer(*n),
         }
+    }
+
+    /// `tf_number` as an integer (a float is truncated).
+    pub fn tf_int(&self) -> i64 {
+        match self.tf_number() {
+            TfValue::Integer(i) | TfValue::Enum(i, _) => i,
+            TfValue::Float(f) => f as i64,
+            TfValue::String(_) => 0,
+        }
+    }
+
+    /// `tf_number` as a float.
+    pub fn tf_float(&self) -> f64 {
+        match self.tf_number() {
+            TfValue::Integer(i) | TfValue::Enum(i, _) => i as f64,
+            TfValue::Float(f) => f,
+            TfValue::String(_) => 0.0,
+        }
+    }
+
+    /// Truth value, TF's way: a value is true when its number (`tf_number`) is non-zero,
+    /// so a non-numeric string - "abc", "on", "off" - is false (verified against real tf:
+    /// `/set y=hello` then `/if (y)` takes the else branch).
+    pub fn to_bool(&self) -> bool {
+        match self.tf_number() {
+            TfValue::Integer(i) | TfValue::Enum(i, _) => i != 0,
+            TfValue::Float(f) => f != 0.0,
+            TfValue::String(_) => false,
+        }
+    }
+}
+
+/// The number at the start of `s` (after leading blanks), as an integer, or a float when
+/// it has a fractional part or exponent; 0 when `s` starts with no number at all.
+fn leading_number(s: &str) -> TfValue {
+    let t = s.trim_start();
+    let bytes = t.as_bytes();
+    let mut end = 0;
+    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+        end += 1;
+    }
+    let int_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let int_digits = end - int_start;
+    let mut is_float = false;
+    let mut frac_digits = 0;
+    if end < bytes.len() && bytes[end] == b'.' {
+        let mut j = end + 1;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        frac_digits = j - (end + 1);
+        if int_digits > 0 || frac_digits > 0 {
+            is_float = frac_digits > 0;
+            end = j;
+        }
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return TfValue::Integer(0);
+    }
+    // An exponent only counts when digits follow it ("1e5", not "1e" or "1ex").
+    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+        let mut j = end + 1;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        let exp_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > exp_start {
+            is_float = true;
+            end = j;
+        }
+    }
+    let num = &t[..end];
+    if is_float {
+        num.parse::<f64>().map(TfValue::Float).unwrap_or(TfValue::Integer(0))
+    } else {
+        num.trim_end_matches('.').parse::<i64>().map(TfValue::Integer)
+            .or_else(|_| num.parse::<f64>().map(TfValue::Float))
+            .unwrap_or(TfValue::Integer(0))
     }
 }
 
@@ -205,12 +357,10 @@ pub struct RecallOptions {
     pub timestamp_format: Option<String>,  // -t[format]
     pub show_line_numbers: bool,    // #
     pub show_gagged: bool,          // -a<attrs> containing 'g' (e.g. -ag)
-    /// The raw `-a<attrs>` value verbatim (comma-optional attribute letters, `/help
-    /// attributes`) - only 'g' (`show_gagged`, above) has a distinct effect in Clay's
-    /// recall today; every other letter is accepted (so a script using them doesn't error)
-    /// but otherwise a no-op, since Clay's history buffer doesn't track the rest of TF's
-    /// per-line display-attribute set. Kept for round-tripping/testability rather than
-    /// discarded the moment 'g' is checked.
+    /// The raw `-a<attrs>` value verbatim (`/help attributes`): 'g' shows gagged lines
+    /// (`show_gagged`, above); the display attributes are taken off each line's own
+    /// (`OutputLine::tf_attrs`) as it is shown, as TF does - not off attributes inside
+    /// the text, which TF leaves alone too.
     pub suppress_attrs: String,
     pub context_before: usize,      // -Bn
     pub context_after: usize,       // -An
@@ -218,11 +368,7 @@ pub struct RecallOptions {
 }
 
 /// Which command created a `TfProcess` - `/ps -r`/`-q` filter on this
-/// (`/help ps`: "-r list /repeats only. -q list /quotes only."). Real TF's
-/// own table also has a per-process "D" (disposition) column for quotes,
-/// which Clay doesn't track anywhere queryable, so `-r`/`-q` is as far as
-/// this job's `/ps` goes toward that grammar (plan Job 14c: "implement what
-/// maps onto Clay's TfProcess fields, accept the rest").
+/// (`/help ps`: "-r list /repeats only. -q list /quotes only.").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessKind {
     #[default]
@@ -230,12 +376,15 @@ pub enum ProcessKind {
     Quote,
 }
 
-/// A background repeat process
+/// A background /repeat or /quote (`/help processes`)
 #[derive(Debug)]
 pub struct TfProcess {
     pub id: u32,
+    /// A /repeat's body; for a /quote, what /ps shows for it (`!"cmd"`, `'"file"`...).
     pub command: String,
     pub interval: Duration,
+    /// The interval was given (`-<time>`), not %ptime - /ps shows only a given one.
+    pub interval_given: bool,
     pub count: Option<u32>,        // None = infinite ("i")
     pub remaining: Option<u32>,    // Counts down
     pub next_run: Instant,
@@ -243,7 +392,10 @@ pub struct TfProcess {
     pub synchronous: bool,         // -S flag
     pub on_prompt: bool,           // -P flag
     pub priority: i32,             // -p option (higher = runs first)
-    pub kind: ProcessKind,         // /repeat vs. a delayed /quote line - /ps -r/-q
+    pub kind: ProcessKind,         // /repeat vs. /quote - /ps -r/-q
+    /// A /quote's lines still to go, and what is done with each.
+    pub lines: std::collections::VecDeque<String>,
+    pub disposition: QuoteDisposition,
 }
 
 /// Disposition for /quote command output
@@ -256,6 +408,29 @@ pub enum QuoteDisposition {
     Echo,
     /// Execute each line as a TF command
     Exec,
+}
+
+impl QuoteDisposition {
+    /// /ps's D column.
+    pub fn letter(self) -> char {
+        match self {
+            QuoteDisposition::Send => 's',
+            QuoteDisposition::Echo => 'e',
+            QuoteDisposition::Exec => 'x',
+        }
+    }
+}
+
+/// When a /quote's lines are done (`/help quote`, `/help processes`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuoteTiming {
+    /// `-S`: all of them, before anything after the /quote runs.
+    Sync,
+    /// One every `interval` (`-<time>`, else %ptime), the first an interval after the
+    /// /quote; with no interval, all of them as soon as the /quote is done.
+    Every { interval: Duration, given: bool },
+    /// `-P`: one each time a prompt arrives.
+    Prompt,
 }
 
 /// Result of executing a TF command
@@ -278,11 +453,15 @@ pub enum TfCommandResult {
         lines: Vec<String>,
         disposition: QuoteDisposition,
         world: Option<String>,
-        delay_secs: f64,  // Delay between lines (0 = immediate)
+        timing: QuoteTiming,
         /// When backtick source is /recall, pass opts to caller for execution
         recall_opts: Option<(RecallOptions, String)>,  // (opts, prefix)
         /// Strip ANSI/escape sequences from lines (default true; -A disables)
         strip_ansi: bool,
+        /// The process id a background quote runs as (already its %?).
+        pid: Option<u32>,
+        /// What /ps shows for it.
+        label: String,
     },
     /// Return from macro execution with optional value for %?
     Return(String),
@@ -302,6 +481,9 @@ pub enum TfCommandResult {
     NotTfCommand,
     /// Unknown TF command
     UnknownCommand(String),
+    /// Several effects of different kinds, in the order they happened - what a command
+    /// whose body did more than one kind of thing folds to (see `effects`).
+    Effects(Vec<effects::TfEffect>),
 }
 
 /// Hook events that can trigger macros. All 31 of real TF's own events (see
@@ -439,6 +621,15 @@ pub enum TfMatchMode {
 }
 
 impl TfMatchMode {
+    /// TF's name for the style (`/def -m<name>`, `%matching`).
+    pub fn name(&self) -> &'static str {
+        match self {
+            TfMatchMode::Simple => "simple",
+            TfMatchMode::Glob => "glob",
+            TfMatchMode::Regexp => "regexp",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "simple" => Some(TfMatchMode::Simple),
@@ -449,19 +640,7 @@ impl TfMatchMode {
     }
 }
 
-/// Attributes for macro display/behavior
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct TfAttributes {
-    pub gag: bool,
-    pub norecord: bool,
-    pub bold: bool,
-    pub underline: bool,
-    pub reverse: bool,
-    pub flash: bool,
-    pub dim: bool,
-    pub bell: bool,
-    pub hilite: Option<String>,  // Color name or code
-}
+pub use attrs::TfAttributes;
 
 /// A trigger pattern with optional compiled regex
 #[derive(Debug, Clone)]
@@ -485,6 +664,9 @@ pub struct TfMacro {
     /// line - same `-m` style, same unanchored substring search, same capture
     /// groups (`hooks::fire_hook`) - see finding C.10 / plan step P1.9.
     pub hook_pattern: Option<String>,
+    /// Further events of a `-h"EVENT1|EVENT2 ..."` list (`hook` holds the first) - TF:
+    /// "<Event> may be a single event name or a list separated by '|'".
+    pub extra_hooks: Vec<TfHookEvent>,
     pub keybinding: Option<String>,
     pub attributes: TfAttributes,
     pub priority: i32,
@@ -500,7 +682,9 @@ pub struct TfMacro {
     /// resolved value by then.
     pub priority_expr: Option<String>,
     pub fall_through: bool,
-    pub partial_hilite: bool,   // -P: hilite only the matched portion, not the whole line
+    /// `-P[<part>]<attr>[;...]`: attributes for parts of a matched line (implies
+    /// regexp matching) - see `PartialSpec`.
+    pub partials: Vec<PartialSpec>,
     pub one_shot: Option<u32>,  // None = permanent, Some(n) = fire n times
     pub shots_remaining: Option<u32>,
     pub condition: Option<String>,  // Expression to evaluate before firing
@@ -512,12 +696,101 @@ pub struct TfMacro {
     pub world_type: Option<String>, // -T<type>: restrict trigger/hook matches to worlds of this type (glob/regexp per -m)
 }
 
+impl TfMacro {
+    /// The macro is hooked to `event` (its first or any further `-h` event).
+    pub fn has_hook(&self, event: TfHookEvent) -> bool {
+        self.hook == Some(event) || self.extra_hooks.contains(&event)
+    }
+
+    /// Every event the macro is hooked to, in the order given.
+    pub fn hook_events(&self) -> Vec<TfHookEvent> {
+        self.hook.into_iter().chain(self.extra_hooks.iter().copied()).collect()
+    }
+}
+
+/// Which part of a matched line a `-P` partial hilite colors (`/help def`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialPart {
+    /// "L": the text left of the match.
+    Left,
+    /// "R": the text right of the match.
+    Right,
+    /// "0": the whole match; "<n>": the nth parenthesized subexpression.
+    Group(usize),
+}
+
+/// One `[<part>]<attr>` of a `-P` option.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartialSpec {
+    pub part: PartialPart,
+    pub attrs: TfAttributes,
+}
+
+impl PartialSpec {
+    /// Parse a whole `-P` argument: `[<part>]<attr>` pairs separated by ';'; a missing
+    /// part is 0 (the whole match).
+    pub fn parse_list(text: &str) -> Result<Vec<PartialSpec>, String> {
+        let mut out = Vec::new();
+        for item in text.split(';') {
+            if item.is_empty() {
+                continue;
+            }
+            let (part, attrs) = if let Some(rest) = item.strip_prefix('L') {
+                (PartialPart::Left, rest)
+            } else if let Some(rest) = item.strip_prefix('R') {
+                (PartialPart::Right, rest)
+            } else {
+                let digits = item.chars().take_while(|c| c.is_ascii_digit()).count();
+                let n = if digits == 0 { 0 } else { item[..digits].parse::<usize>().map_err(|e| e.to_string())? };
+                (PartialPart::Group(n), &item[digits..])
+            };
+            out.push(PartialSpec { part, attrs: TfAttributes::parse(attrs)? });
+        }
+        Ok(out)
+    }
+
+    /// TF's spelling of a `-P` argument, as `/list` shows it.
+    pub fn format_list(specs: &[PartialSpec]) -> String {
+        specs.iter().map(|p| {
+            let part = match p.part {
+                PartialPart::Left => "L".to_string(),
+                PartialPart::Right => "R".to_string(),
+                PartialPart::Group(n) => n.to_string(),
+            };
+            format!("{}{}", part, p.attrs.canonical())
+        }).collect::<Vec<_>>().join(";")
+    }
+}
+
 /// Per-world watchdog configuration override
 #[derive(Debug, Clone)]
 pub struct WatchdogConfig {
     pub enabled: bool,
     pub n1: usize,
     pub n2: usize,
+}
+
+/// The home directory of system user `user`, for `~user` (see `TfEngine::expand_tilde`).
+#[cfg(unix)]
+fn user_home_dir(user: &str) -> Option<String> {
+    let name = std::ffi::CString::new(user).ok()?;
+    // SAFETY: getpwnam_r writes only into `pwd` and `buf`, both sized here and alive for
+    // the call; `pw_dir` points into `buf` and is copied out before `buf` is dropped.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut buf = vec![0 as libc::c_char; 16 * 1024];
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwnam_r(name.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut found);
+        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(pwd.pw_dir).to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(not(unix))]
+fn user_home_dir(_user: &str) -> Option<String> {
+    None
 }
 
 /// The TinyFugue scripting engine
@@ -529,6 +802,33 @@ pub struct TfEngine {
     pub local_vars_stack: Vec<HashMap<String, TfValue>>,
     /// Environment variables (exported to shell)
     pub env_vars: std::collections::HashSet<String>,
+    /// The process environment as imported into `global_vars` when the engine was
+    /// created (name -> value). An imported variable is never written to settings.dat
+    /// while its value is unchanged (see `persistable_globals`): the environment holds
+    /// secrets (tokens, SSH agent sockets) and machine-specific paths, and a stale saved
+    /// copy would otherwise override the live value on the next start.
+    pub env_imported: HashMap<String, String>,
+    /// Values the engine seeded itself (the TFLIBDIR default, maxpri, time_format, ...).
+    /// Like `env_imported`, never persisted while unchanged.
+    pub seed_values: HashMap<String, String>,
+    /// One frame of effects per `parser::execute_command` currently running (innermost
+    /// last) - see the `effects` module.
+    pub effect_frames: Vec<Vec<effects::TfEffect>>,
+    /// Effects emitted while no frame was open (a trigger or hook run directly by the App,
+    /// `echo()` evaluated outside any command). The App drains it with `take_effects`.
+    pub effects: Vec<effects::TfEffect>,
+    /// The world each running trigger, hook, timer or client command belongs to
+    /// (innermost last) - TF's "current world" for `${world_name}`, `world_info()`,
+    /// `is_connected()` and friends. Empty means the foreground world (`current_world`).
+    pub context_world: Vec<String>,
+    /// tfin for each running `%|` pipe (innermost last): the lines the previous command
+    /// wrote, read with `tfread()` (see macros::Pipe).
+    pub tfin: Vec<std::collections::VecDeque<String>>,
+    /// One entry per running macro body (innermost last): whether `tfclose("o")` closed
+    /// tfout for the rest of it. Output emitted while any is closed is discarded - TF:
+    /// "tfclose() can be used on the tfout stream (handle "o") within a macro body to
+    /// prevent further output from subsequent commands in that macro body".
+    pub tfout_closed: Vec<bool>,
     /// Macro definitions
     pub macros: Vec<TfMacro>,
     /// Compiled regex cache for performance
@@ -549,15 +849,22 @@ pub struct TfEngine {
     pub loaded_tokens: std::collections::HashSet<String>,
     /// Stack of files currently being loaded (for nested loads)
     pub loading_files: Vec<String>,
-    /// 1-based line number currently being processed in the matching entry of
-    /// `loading_files` (same stack depth - `builtins::load_lines` pushes/updates/
-    /// pops this in lockstep with `loading_files`). Used by `format_diag` to
-    /// reproduce real TF's "% <path>, line <N>: " location prefix on DEF/UNDEF/
-    /// UNDEFN diagnostics (finding 25) - empty outside of a file load, which is
-    /// exactly when real TF omits the prefix too.
-    pub loading_lines: Vec<usize>,
-    /// Pending world operations (addworld calls from expressions)
-    pub pending_world_ops: Vec<PendingWorldOp>,
+    /// The 1-based (first, last) lines of the command currently being processed in the
+    /// matching entry of `loading_files` (same stack depth - `builtins::load_lines`
+    /// pushes/updates/pops this in lockstep with `loading_files`); first < last for a
+    /// command continued over several lines. Used by `format_diag` to reproduce real
+    /// TF's "% <path>, line <N>: " / "% <path>, lines <A>-<B>: " location prefix on
+    /// DEF/UNDEF/UNDEFN diagnostics (finding 25) - empty outside of a file load, which
+    /// is exactly when real TF omits the prefix too.
+    pub loading_lines: Vec<(usize, usize)>,
+    /// How many `/load -q`s are running: TF's `-q` also quiets every load nested in it.
+    pub quiet_loads: u32,
+    /// Files that already warned, in this load of them, that they hold a readable
+    /// password (`/addworld`; TF warns once per file).
+    pub password_warned_files: std::collections::HashSet<String>,
+    /// How many typed lines are running (`run_typed`): what runs inside one is "in the
+    /// foreground" in TF's sense - `/connect` then brings its world to the foreground.
+    pub typed_depth: u32,
     /// Regex capture groups from last regmatch() call (%P0-%P9)
     pub regex_captures: Vec<String>,
     /// Open file handles for tfopen/tfclose (handle_id -> TfFileHandle)
@@ -577,10 +884,6 @@ pub struct TfEngine {
     pub keyboard_state: KeyboardBufferState,
     /// Pending keyboard operations to be processed by main app
     pub pending_keyboard_ops: Vec<PendingKeyboardOp>,
-    /// Pending commands to send (from send() function)
-    pub pending_commands: Vec<TfCommand>,
-    /// Pending echo outputs (from echo() function)
-    pub pending_outputs: Vec<TfOutput>,
     /// Pending substitution (from substitute() function)
     pub pending_substitution: Option<TfSubstitution>,
     /// Watchdog: suppress duplicate lines
@@ -628,21 +931,17 @@ pub struct TfEngine {
     /// own a terminal tab to rename, so that's not a missing feature, just a no-op
     /// there (see `cmd_xtitle`'s own doc comment).
     pub pending_xtitle: Option<String>,
-    /// `/more [on|off|1|0]` (Job 15) - queued for the same console-only drain as
-    /// `pending_xtitle`, which actually flips `Settings::more_mode_enabled` and
-    /// persists/broadcasts it. See `cmd_more`'s doc comment for why a bare `/more`
-    /// is an error (matches real tf) and why only `on` prints a message.
-    pub pending_more_mode: Option<bool>,
-    /// `/wrap <n>` (Job 15) - queued for the console drain, which applies it to
-    /// `Settings::wrapspace` (Clay's own real hang-indent wrap-width setting - see
-    /// `cmd_wrap`'s doc comment for why `on`/`off` have no Clay-side equivalent and
-    /// only update the TF-visible `%wrap` variable).
-    pub pending_wrapspace: Option<u8>,
     /// `/limit`/`/unlimit`/`/relimit` (Job 15) - queued for the console drain, which
     /// drives the existing F4 filter popup (`FilterPopup`, main.rs). See
     /// `PendingLimitOp` and `cmd_limit`'s doc comment for why this is console-only
     /// (finding 33 in the TF-parity plan).
     pub pending_limit_op: Option<PendingLimitOp>,
+    /// The App's screen (`ScreenInfo`).
+    pub screen: ScreenInfo,
+    /// TF's status area: its fields, and whether a script has made it its own.
+    pub status: status::StatusLayout,
+    /// How many of the mail files the App checks have unread mail (`nmail()`).
+    pub mail_count: usize,
     /// `/restrict [SHELL|FILE|WORLD]` (Job 15) - TF's own monotonic security ratchet;
     /// see `RestrictLevel` and `cmd_restrict`.
     pub restrict_level: RestrictLevel,
@@ -691,10 +990,6 @@ impl RestrictLevel {
 /// by construction - see `cmd_limit`'s doc comment and finding 33.
 #[derive(Debug, Clone)]
 pub enum PendingLimitOp {
-    /// Bare `/limit` (no options, no pattern): report whether a limit is active.
-    /// Real tf answers this silently via `%?`; Clay prints a short status line
-    /// instead (documented deviation - see `cmd_limit`).
-    Report,
     /// `/unlimit`: clear any active limit.
     Clear,
     /// `/relimit`: re-apply the most recently applied `/limit`.
@@ -709,15 +1004,26 @@ pub enum PendingLimitOp {
     },
 }
 
-/// A pending world operation to be processed by the main app
-#[derive(Debug, Clone)]
+/// A world definition from `/addworld` or `addworld()`, for the App to apply. A field
+/// left `None` (or empty) keeps the world's current value - re-running a .tfrc changes
+/// nothing it didn't name - and `use_ssl` can only turn SSL on, as in TF.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PendingWorldOp {
     pub name: String,
+    /// TF world type (`-T<type>`, `addworld()`'s 2nd argument).
+    pub tf_type: Option<String>,
     pub host: Option<String>,
     pub port: Option<String>,
     pub user: Option<String>,
     pub password: Option<String>,
+    /// The world's macro file (loaded on connect).
+    pub file: Option<String>,
+    /// `-x` / flag "x": connect with SSL.
     pub use_ssl: bool,
+    /// `-e` / flag "e": echo what is sent back as if received.
+    pub echo: bool,
+    /// `addworld()` is silent on success; `/addworld` says what it added or changed.
+    pub quiet: bool,
 }
 
 /// Cached world info for TF functions (fg_world, world_info, nactive) and for
@@ -745,6 +1051,43 @@ pub struct WorldInfoCache {
     /// last time the *user* sent something, matching Command::WorldsList's
     /// "Last" column (commands.rs uses world.last_user_command_time there).
     pub last_user_command_secs_ago: Option<i64>,
+    /// Clay's name for the world's type ("mud", "slack", ...).
+    pub world_type: String,
+    /// TF's type for the world (`/addworld -T`), "" when untyped.
+    pub tf_type: String,
+    /// A `/connect <host> <port>` world (listed only by `/listworlds -u`).
+    pub is_temporary: bool,
+    /// Automatic login is enabled for this world (`world_info(w, "login")`).
+    pub login: bool,
+    /// The server speaks telnet (it has negotiated something).
+    pub telnet: bool,
+    /// Typed input is echoed locally - the server hasn't taken echoing over (WILL ECHO).
+    pub local_echo: bool,
+    /// Output is paused at a more prompt (`morepaused()`), with this many lines waiting
+    /// (`moresize()`).
+    pub paused: bool,
+    pub more_lines: usize,
+    /// The world's output is being logged to a file (`nlog()`).
+    pub logging: bool,
+}
+
+/// The screen the App shows things on, for TF's columns(), lines(), winlines() and
+/// limit(); synced with the world info (`App::sync_tf_world_info`). Until then (a bare
+/// engine, in tests) it is TF's own 80x24.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScreenInfo {
+    pub columns: u16,
+    pub lines: u16,
+    /// The output window's lines (lines less the status and input rows).
+    pub winlines: u16,
+    /// A /limit is in effect.
+    pub limit: bool,
+}
+
+impl Default for ScreenInfo {
+    fn default() -> Self {
+        ScreenInfo { columns: 80, lines: 24, winlines: 22, limit: false }
+    }
 }
 
 /// Cached keyboard buffer state for TF functions (kbhead, kbtail, etc.)
@@ -890,6 +1233,8 @@ impl TfEngine {
             watchdog_n2: 5,
             watchname_n1: 4,
             watchname_n2: 5,
+            // TF's first process is pid 1 (and a pid of 0 means "failed").
+            next_process_id: 1,
             ..Default::default()
         };
 
@@ -915,12 +1260,14 @@ impl TfEngine {
             let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
                 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
             if valid {
+                engine.env_imported.insert(key.clone(), value.clone());
                 engine.set_global(&key, TfValue::String(value));
             }
         }
 
         // TFLIBDIR default - see `default_tflibdir`.
         if let Some(dir) = default_tflibdir() {
+            engine.seed_values.insert("TFLIBDIR".to_string(), dir.clone());
             engine.set_global("TFLIBDIR", TfValue::String(dir));
         }
 
@@ -935,7 +1282,46 @@ impl TfEngine {
         // out-of-the-box value instead of an empty string (finding B's `/time` ruling
         // and finding 25's `redef=off` ruling both depend on these).
         engine.set_global("time_format", TfValue::String("%H:%M".to_string()));
-        engine.set_global("redef", TfValue::Integer(1));
+        // TF's defaults for its special variables, where seeding them changes nothing
+        // Clay does by default (see special_vars::SPECIAL_VARS) - the environment wins.
+        for var in special_vars::SPECIAL_VARS {
+            if let Some(seed) = var.seed {
+                if !engine.env_imported.contains_key(var.name) {
+                    let value = match var.kind {
+                        special_vars::Kind::Int => TfValue::Integer(seed.parse().unwrap_or(0)),
+                        _ => TfValue::String(seed.to_string()),
+                    };
+                    engine.set_global(var.name, value);
+                }
+            }
+        }
+        if let Some(libdir) = engine.get_var("TFLIBDIR").map(|v| v.to_string_value()) {
+            for (name, file) in [("TFHELP", "tf-help"), ("TFLIBRARY", "stdlib.tf")] {
+                let path = format!("{}/{}", libdir.trim_end_matches('/'), file);
+                if !engine.env_imported.contains_key(name) && std::path::Path::new(&path).exists() {
+                    engine.set_global(name, TfValue::String(path));
+                }
+            }
+        }
+        engine.set_global("pi", TfValue::Float(std::f64::consts::PI));
+        engine.set_global("e", TfValue::Float(std::f64::consts::E));
+        status::seed(&mut engine);
+        let mut seeded: Vec<String> = special_vars::SPECIAL_VARS.iter()
+            .filter(|v| v.seed.is_some()).map(|v| v.name.to_string()).collect();
+        seeded.extend(["TFHELP", "TFLIBRARY", "pi", "e"].iter().map(|s| s.to_string()));
+        seeded.extend(status::seeded_names());
+        for name in &seeded {
+            if let Some(v) = engine.global_vars.get(name.as_str()) {
+                let v = v.to_string_value();
+                engine.seed_values.insert(name.clone(), v);
+            }
+        }
+        for name in ["maxpri", "time_format"] {
+            if let Some(v) = engine.global_vars.get(name) {
+                let v = v.to_string_value();
+                engine.seed_values.insert(name.to_string(), v);
+            }
+        }
 
         // TFPATH: the $TFPATH environment variable, if set (TF itself
         // leaves it unset by default; when it is set it's a colon-separated
@@ -946,7 +1332,92 @@ impl TfEngine {
             }
         }
 
+        // Unit tests: %HOME is the per-process test home, so a test's `/save ~/x`,
+        // `/log ~/x` or `/cd` can never reach the developer's real home directory.
+        #[cfg(test)]
+        {
+            let home = crate::get_home_dir();
+            engine.seed_values.insert("HOME".to_string(), home.clone());
+            engine.set_global("HOME", TfValue::String(home));
+        }
+
         engine
+    }
+
+    /// The TF globals worth writing to settings.dat, sorted by name: everything except
+    /// values that merely mirror the environment or the engine's own seeds (unchanged),
+    /// and transient engine-internal names. Real TF persists no variables at all; Clay
+    /// keeps a deliberate `/set` across restarts, but must never copy the environment
+    /// (secrets, stale TFLIBDIR/TFPATH) into the settings file.
+    pub fn persistable_globals(&self) -> Vec<(&String, &TfValue)> {
+        let mut out: Vec<(&String, &TfValue)> = self.global_vars.iter()
+            .filter(|(name, value)| {
+                if TRANSIENT_GLOBALS.contains(&name.as_str()) {
+                    return false;
+                }
+                let v = value.to_string_value();
+                if self.env_imported.get(name.as_str()).is_some_and(|e| *e == v) {
+                    return false;
+                }
+                if self.seed_values.get(name.as_str()).is_some_and(|s| *s == v) {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
+    }
+
+    /// The environment a child process (`/sh`, `/quote !`) gets on top of Clay's own: TF
+    /// exports every variable that came from the environment or was /setenv'd, with its
+    /// current value - or removes it, when it has been /unset.
+    pub fn child_env(&self) -> Vec<(String, Option<String>)> {
+        let mut names: Vec<&String> = self.env_imported.keys().chain(self.env_vars.iter()).collect();
+        names.sort();
+        names.dedup();
+        names.into_iter()
+            .filter(|name| !name.is_empty() && !name.contains('='))
+            .map(|name| (name.clone(), self.global_vars.get(name.as_str()).map(|v| v.to_string_value())))
+            .collect()
+    }
+
+    /// Give `cmd` the environment of `child_env`.
+    pub fn apply_child_env(&self, cmd: &mut std::process::Command) {
+        for (name, value) in self.child_env() {
+            match value {
+                Some(value) => { cmd.env(name, value); }
+                None => { cmd.env_remove(name); }
+            }
+        }
+    }
+
+    /// The home directory TF commands use for `~` and bare `/cd`: the `%HOME` variable
+    /// (TF's own rule - `/help environment`: "HOME ... used by /cd and filename
+    /// expansion"), falling back to Clay's own idea of the home directory when it is unset
+    /// or empty (Windows usually has no HOME in the environment).
+    pub fn home_dir(&self) -> String {
+        match self.get_var("HOME").map(|v| v.to_string_value()) {
+            Some(h) if !h.is_empty() => h,
+            _ => crate::get_home_dir(),
+        }
+    }
+
+    /// TF's filename expansion (`/help filenames`): a leading `~` up to the first `/` names
+    /// a user - empty means `home_dir()` (%HOME), otherwise that user's home directory
+    /// (Unix only; an unknown user, or `~user` elsewhere, is left as written).
+    pub fn expand_tilde(&self, path: &str) -> String {
+        let Some(rest) = path.strip_prefix('~') else {
+            return path.to_string();
+        };
+        let user_end = rest.find(|c: char| c == '/' || (cfg!(windows) && c == '\\')).unwrap_or(rest.len());
+        let (user, tail) = rest.split_at(user_end);
+        let home = if user.is_empty() { Some(self.home_dir()) } else { user_home_dir(user) };
+        match home {
+            Some(home) if tail.is_empty() => home,
+            Some(home) => format!("{}{}", home.trim_end_matches(['/', '\\']), tail),
+            None => path.to_string(),
+        }
     }
 
     /// Real TF's "% [<path>, line <N>: ]" location prefix for a DEF/UNDEF/UNDEFN-style
@@ -958,7 +1429,8 @@ impl TfEngine {
     /// loading a file, vs. plain `% DEF: Redefined macro a` typed at the prompt.
     pub fn diag_location_prefix(&self) -> String {
         match (self.loading_files.last(), self.loading_lines.last()) {
-            (Some(path), Some(line)) => format!("{}, line {}: ", path, line),
+            (Some(path), Some(&(first, last))) if first < last => format!("{}, lines {}-{}: ", path, first, last),
+            (Some(path), Some(&(_, line))) => format!("{}, line {}: ", path, line),
             _ => String::new(),
         }
     }
@@ -1009,12 +1481,47 @@ impl TfEngine {
     /// restored the variable by the time the op is drained - see that variant's doc
     /// comment.
     pub fn insert_mode(&self) -> bool {
-        self.get_var("insert").map(|v| v.to_bool()).unwrap_or(true)
+        self.get_var("insert").map(special_vars::flag_is_on).unwrap_or(true)
     }
 
     /// Set a global variable
     pub fn set_global(&mut self, name: &str, value: TfValue) {
         self.global_vars.insert(name.to_string(), value);
+    }
+
+    /// A user's assignment to a global (`/set`, `/toggle`): a special variable's value
+    /// is normalized the way TF does it (see `special_vars::normalize`), or refused with
+    /// TF's own message, leaving the old value.
+    pub fn assign_global(&mut self, name: &str, value: TfValue) -> Result<(), String> {
+        let value = match special_vars::lookup(name) {
+            Some(var) => special_vars::normalize(var, &value)?,
+            None => value,
+        };
+        if name.starts_with("status_") {
+            if let Some(error) = status::on_assign(self, name, &value.to_string_value()) {
+                return Err(error);
+            }
+        }
+        if name == "status_fields" {
+            // status::on_assign set row 0; the variable shows what it became.
+            return Ok(());
+        }
+        if special_vars::BOUND.contains(&name) || special_vars::APPLIED.contains(&name) {
+            self.emit(effects::TfEffect::Setting(name.to_string(), value.clone()));
+        }
+        self.set_global(name, value);
+        Ok(())
+    }
+
+    /// A user's `:=`, `++` or `--`: update the binding wherever it already lives (see
+    /// `set_existing_or_global`); a global special variable is normalized as by
+    /// `assign_global`.
+    pub fn assign_existing_or_global(&mut self, name: &str, value: TfValue) -> Result<(), String> {
+        if self.local_vars_stack.iter().any(|scope| scope.contains_key(name)) {
+            self.set_existing_or_global(name, value);
+            return Ok(());
+        }
+        self.assign_global(name, value)
     }
 
     /// Unset a global variable
@@ -1071,6 +1578,239 @@ impl TfEngine {
         parser::execute_command(self, input)
     }
 
+    /// Run one line and return everything it did, in order. Effects that happened while
+    /// no frame was open (from earlier trigger/hook runs) are not included - see
+    /// `take_effects`. A top-level `/result` echoes its value, as when typed.
+    pub fn run(&mut self, input: &str) -> Vec<effects::TfEffect> {
+        let result = parser::execute_command(self, input);
+        let mut out = Vec::new();
+        match result {
+            TfCommandResult::Result(v) if !v.is_empty() => {
+                out.push(effects::TfEffect::Output { text: v, attrs: String::new(), world: None, plain: None });
+            }
+            other => effects::push_result_effects(other, &mut out),
+        }
+        out
+    }
+
+    /// TF's "current world": the world of the trigger, hook, timer or client command
+    /// running now, else the foreground world.
+    pub fn context_world_name(&self) -> Option<String> {
+        self.context_world.last().cloned().or_else(|| self.current_world.clone())
+    }
+
+    /// The `-T` types of `world` (or of the current world): TF's own (`/addworld -T`)
+    /// and Clay's name for it - None when it isn't known.
+    pub fn world_types(&self, world: Option<&str>) -> Option<(String, String)> {
+        let name = match world {
+            Some(w) => w.to_string(),
+            None => self.context_world_name()?,
+        };
+        self.world_info_cache.iter()
+            .find(|w| w.name.eq_ignore_ascii_case(&name))
+            .map(|w| (w.tf_type.clone(), w.world_type.clone()))
+    }
+
+    /// Run `f` with `world` as TF's current world (see `context_world`).
+    pub fn with_context_world<R>(&mut self, world: Option<&str>, f: impl FnOnce(&mut Self) -> R) -> R {
+        match world {
+            Some(name) => {
+                self.context_world.push(name.to_string());
+                let result = f(self);
+                self.context_world.pop();
+                result
+            }
+            None => f(self),
+        }
+    }
+
+    /// One field of a world (`world_info()`, `${world_<field>}`): `world` None means the
+    /// current world (`context_world_name`). Character, password and macro file fall
+    /// back to the DEFAULT world's, as in TF. None when there is no such world.
+    pub fn world_field(&self, world: Option<&str>, field: &str) -> Option<String> {
+        let name = match world {
+            Some(w) => Some(w.to_string()),
+            None => self.context_world_name(),
+        };
+        let found = name.as_ref().and_then(|name| self.world_info_cache.iter().find(|w| w.name.eq_ignore_ascii_case(name)));
+        let Some(w) = found else {
+            // An explicitly named world that doesn't exist has nothing to say.
+            if world.is_some() {
+                return None;
+            }
+            // No current world: only the DEFAULT world's own fields can answer.
+            return match field.to_lowercase().as_str() {
+                "character" | "char" => self.default_world_character.clone(),
+                "password" | "pass" => self.default_world_password.clone(),
+                "file" | "mfile" => self.default_world_file.clone(),
+                _ => None,
+            };
+        };
+        let non_empty = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
+        Some(match field.to_lowercase().as_str() {
+            "name" => w.name.clone(),
+            "host" => w.host.clone(),
+            "port" => w.port.clone(),
+            "character" | "char" => non_empty(&w.user)
+                .or_else(|| self.default_world_character.clone()).unwrap_or_default(),
+            "password" | "pass" => non_empty(&w.password)
+                .or_else(|| self.default_world_password.clone()).unwrap_or_default(),
+            // TF's type when it has one, else Clay's name for it.
+            "type" => if w.tf_type.is_empty() { w.world_type.clone() } else { w.tf_type.clone() },
+            "login" => if w.login { "1" } else { "0" }.to_string(),
+            "proxy" => if w.is_proxy { "1" } else { "0" }.to_string(),
+            "ssl" | "secure" => if w.use_ssl { "1" } else { "0" }.to_string(),
+            "file" | "mfile" => self.world_files.get(&w.name.to_lowercase()).cloned()
+                .or_else(|| self.default_world_file.clone()).unwrap_or_default(),
+            _ => String::new(),
+        })
+    }
+
+    /// `%sub`: how a line the user types is processed (`/help sub`). Unset means off,
+    /// TF's default.
+    pub fn sub_mode(&self) -> SubMode {
+        match self.get_var("sub").map(|v| v.to_string_value().to_lowercase()).as_deref() {
+            Some("on") | Some("1") => SubMode::On,
+            Some("full") | Some("2") => SubMode::Full,
+            _ => SubMode::Off,
+        }
+    }
+
+    /// Run a line the user typed (or `-c` on the command line), the way TF does by
+    /// `%sub` (`/help sub`): off - a command runs exactly as typed, no `%`/`$[]`
+    /// substitution; on - `%;` and `%\` split it into lines, `%%` is `%` and `\<n>` the
+    /// character with code n; full - it runs as a macro body (full substitution).
+    /// Plain text (not a `/command`) is sent. Returns what it did, in order.
+    pub fn run_typed(&mut self, line: &str) -> Vec<effects::TfEffect> {
+        self.typed_depth += 1;
+        let out = self.run_typed_inner(line);
+        self.typed_depth -= 1;
+        out
+    }
+
+    fn run_typed_inner(&mut self, line: &str) -> Vec<effects::TfEffect> {
+        match self.sub_mode() {
+            SubMode::Full => self.run_body(line),
+            SubMode::On => {
+                let text = sub_on_expand(line);
+                let mut out = Vec::new();
+                for piece in text.split('\n') {
+                    out.extend(self.run_typed_piece(piece));
+                }
+                out
+            }
+            SubMode::Off => self.run_typed_piece(line),
+        }
+    }
+
+    fn run_typed_piece(&mut self, line: &str) -> Vec<effects::TfEffect> {
+        if !line.trim_start().starts_with('/') {
+            if line.is_empty() {
+                return Vec::new();
+            }
+            return vec![effects::TfEffect::Send { text: line.to_string(), world: None, no_eol: false }];
+        }
+        let result = parser::execute_command_substituted(self, line);
+        let mut out = Vec::new();
+        match result {
+            TfCommandResult::Result(v) if !v.is_empty() => {
+                out.push(effects::TfEffect::Output { text: v, attrs: String::new(), world: None, plain: None });
+            }
+            other => effects::push_result_effects(other, &mut out),
+        }
+        out
+    }
+
+    /// Run `body` the way a macro body runs - split on `%;`, each command substituted when
+    /// it runs, plain text sent - and return what it did, in order. TF runs a `/repeat`
+    /// body this way (`/help repeat`: "<command> may be any legal macro body ... undergoes
+    /// macro body substitution when it is executed").
+    pub fn run_body(&mut self, body: &str) -> Vec<effects::TfEffect> {
+        let body_macro = TfMacro { body: body.to_string(), ..Default::default() };
+        self.begin_frame();
+        let _ = macros::execute_macro(self, &body_macro, &[], None);
+        self.end_frame()
+    }
+
+    /// Emit an effect into the innermost open frame, or the top-level queue.
+    pub fn emit(&mut self, effect: effects::TfEffect) {
+        if matches!(effect, effects::TfEffect::Output { world: None, .. }) && self.tfout_closed.iter().any(|c| *c) {
+            return;
+        }
+        match self.effect_frames.last_mut() {
+            Some(frame) => frame.push(effect),
+            None => self.effects.push(effect),
+        }
+    }
+
+    /// Emit a line of tfout text.
+    pub fn emit_output(&mut self, text: String) {
+        self.emit(effects::TfEffect::Output { text, attrs: String::new(), world: None, plain: None });
+    }
+
+    /// Emit a sub-result's effects now, in order. A control result (`/return`, `/result`,
+    /// `/exit`, an unwinding `/break`) is handed back instead, for the caller to act on.
+    pub fn emit_result(&mut self, result: TfCommandResult) -> Option<TfCommandResult> {
+        if result.is_control() {
+            return Some(result);
+        }
+        let mut list = Vec::new();
+        effects::push_result_effects(result, &mut list);
+        for effect in list {
+            if let Some(control) = self.emit_effect(effect) {
+                return Some(control);
+            }
+        }
+        None
+    }
+
+    /// `emit`, for callers that also handle a control result. (A synchronous `/quote`
+    /// runs its lines itself, in place - `builtins::cmd_quote` - so nothing is left to
+    /// finish here.)
+    pub fn emit_effect(&mut self, effect: effects::TfEffect) -> Option<TfCommandResult> {
+        self.emit(effect);
+        None
+    }
+
+    /// %mecho's prefix for a command run now - %mprefix once per level of macro and file
+    /// nesting, as TF repeats it - or None when it isn't echoed: %mecho off, or "on" and
+    /// the macro running is invisible (`all` echoes those too).
+    pub fn mecho_prefix(&self, visible: bool) -> Option<String> {
+        let mode = self.get_var("mecho").map(|v| v.to_string_value().to_lowercase()).unwrap_or_default();
+        let on = match mode.as_str() {
+            "all" | "2" => true,
+            "on" | "1" => visible,
+            _ => false,
+        };
+        if !on {
+            return None;
+        }
+        let depth = self.macro_call_depth as usize + self.loading_lines.len();
+        let prefix = self.get_var("mprefix").map(|v| v.to_string_value()).unwrap_or_else(|| "+".to_string());
+        Some(prefix.repeat(depth.max(1)))
+    }
+
+    /// Run one line exactly as given - no `%` substitution, no `%;` split - as TF runs a
+    /// line `/quote` generates for `-dexec`: a command runs, plain text is sent.
+    pub fn run_unexpanded(&mut self, line: &str) -> Vec<effects::TfEffect> {
+        self.run_typed_piece(line)
+    }
+
+    /// Open a frame: effects emitted until the matching `end_frame` are collected there.
+    pub fn begin_frame(&mut self) {
+        self.effect_frames.push(Vec::new());
+    }
+
+    /// Close the innermost frame and return what it collected.
+    pub fn end_frame(&mut self) -> Vec<effects::TfEffect> {
+        self.effect_frames.pop().unwrap_or_default()
+    }
+
+    /// Take the effects emitted while no frame was open.
+    pub fn take_effects(&mut self) -> Vec<effects::TfEffect> {
+        std::mem::take(&mut self.effects)
+    }
+
     /// Perform variable substitution on a string
     /// Handles %{varname}, %varname, and {varname} in expressions
     pub fn substitute_vars(&self, text: &str) -> String {
@@ -1103,7 +1843,17 @@ mod tests {
         let s = TfValue::String("hello".to_string());
         assert_eq!(s.to_string_value(), "hello");
         assert_eq!(s.to_int(), None);
-        assert!(s.to_bool());
+        // TF: a string with no number at its start is false (and 0).
+        assert!(!s.to_bool());
+        assert_eq!(s.tf_int(), 0);
+        assert!(TfValue::String("12abc".to_string()).to_bool());
+        assert_eq!(TfValue::String(" 7x".to_string()).tf_int(), 7);
+        assert_eq!(TfValue::String("1.5x".to_string()).tf_float(), 1.5);
+        assert_eq!(TfValue::String("-3".to_string()).tf_int(), -3);
+        assert_eq!(TfValue::String("1e3".to_string()).tf_float(), 1000.0);
+        assert_eq!(TfValue::String("1ex".to_string()).tf_number(), TfValue::Integer(1));
+        assert!(!TfValue::String("on".to_string()).to_bool());
+        assert!(!TfValue::String("".to_string()).to_bool());
 
         let i = TfValue::Integer(42);
         assert_eq!(i.to_string_value(), "42");

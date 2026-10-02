@@ -30,6 +30,7 @@ pub const WORLD_FIELD_PROMPT_WAIT_MS: FieldId = FieldId(22);
 pub const WORLD_FIELD_MSP_ENABLED: FieldId = FieldId(23);
 pub const WORLD_FIELD_MCP_ENABLED: FieldId = FieldId(24);
 pub const WORLD_FIELD_MCCP2_ENABLED: FieldId = FieldId(25);
+pub const WORLD_FIELD_TF_TYPE: FieldId = FieldId(26);
 // Field IDs - Slack
 pub const WORLD_FIELD_SLACK_TOKEN: FieldId = FieldId(30);
 pub const WORLD_FIELD_SLACK_CHANNEL: FieldId = FieldId(31);
@@ -118,6 +119,7 @@ pub fn auto_connect_options() -> Vec<SelectOption> {
         SelectOption::new("connect", "Connect"),
         SelectOption::new("prompt", "Prompt"),
         SelectOption::new("moo_prompt", "MOO Prompt"),
+        SelectOption::new("lines", "Lines"),
         SelectOption::new("none", "None"),
     ]
 }
@@ -156,6 +158,8 @@ pub struct WorldSettings {
     /// Only meaningful for `world_type == "mud_timed_prompt"` - see the matching
     /// `WorldSettings::prompt_wait_ms` (main.rs) doc comment.
     pub prompt_wait_ms: u64,
+    /// TinyFugue world type (`/addworld -T`); empty = untyped.
+    pub tf_type: String,
     // Slack
     pub slack_token: String,
     pub slack_app_token: String,
@@ -189,7 +193,8 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
     let auto_connect_idx = match settings.auto_connect.as_str() {
         "prompt" => 1,
         "moo_prompt" => 2,
-        "none" => 3,
+        "lines" => 3,
+        "none" => 4,
         _ => 0,
     };
 
@@ -253,6 +258,11 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             WORLD_FIELD_AUTO_CONNECT,
             "Auto Login",
             FieldKind::select(auto_connect_options(), auto_connect_idx),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_TF_TYPE,
+            "TF Type",
+            FieldKind::text_with_placeholder(&settings.tf_type, "(none)"),
         ))
         .with_field(Field::new(
             WORLD_FIELD_PROMPT_WAIT_MS,
@@ -459,7 +469,12 @@ fn world_editor_help_text() -> Vec<String> {
         "  Connect: Send 'connect user password'.",
         "  Prompt: Wait for prompts, send user then password.",
         "  MOO Prompt: Like Prompt but for MOO-style servers.",
+        "  Lines: Send user and password as two lines (LP/Diku).",
         "  None: Don't auto-login.",
+        "",
+        "TF Type: The TinyFugue world type (/addworld -T), such",
+        "  as tiny, lp, diku or telnet. /def -T and hooks match",
+        "  it. Blank = untyped.",
         "",
         "Prompt Wait (ms): MUD - Timed Prompt worlds only. How long",
         "  to wait, after a line with no trailing newline stops",
@@ -509,7 +524,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
     let mud_fields = [
         WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT, WORLD_FIELD_USER, WORLD_FIELD_PASSWORD,
         WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_ENCODING,
-        WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
+        WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_TF_TYPE, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
         WORLD_FIELD_MSP_ENABLED,
         WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED,
     ];

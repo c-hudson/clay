@@ -203,7 +203,12 @@ enum ReaderEvent {
 fn app_event_to_reader_event(ev: AppEvent) -> Option<ReaderEvent> {
     match ev {
         AppEvent::ServerData(world_name, bytes) => Some(ReaderEvent::Data(world_name, bytes)),
-        AppEvent::Disconnected(world_name, _conn_id) => Some(ReaderEvent::Disconnected(world_name)),
+        // The close message arrives as text, as the App's close_notice makes it (no TF
+        // hooks run in this harness, so nothing gags it).
+        AppEvent::CloseNotice(world_name, _conn_id, reason) => {
+            Some(ReaderEvent::Data(world_name, format!("{}\n", reason.message()).into_bytes()))
+        }
+        AppEvent::Disconnected(world_name, _conn_id, _reason) => Some(ReaderEvent::Disconnected(world_name)),
         AppEvent::Prompt(world_name, bytes) => Some(ReaderEvent::Prompt(world_name, bytes)),
         // AppEvent::Telnet (plan Phase 2, Step 2.7) replaced the nine formerly-separate
         // single-user telnet AppEvent variants this bridge used to match directly; unwrap
@@ -675,7 +680,7 @@ pub async fn run_test_scenario(
                                             _ => None,
                                         }
                                     }
-                                    AutoConnectType::Connect | AutoConnectType::NoLogin => None,
+                                    AutoConnectType::Connect | AutoConnectType::NoLogin | AutoConnectType::Lines => None,
                                 };
 
                                 if let Some(cmd) = cmd_to_send {

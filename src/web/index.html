@@ -143,6 +143,7 @@
             <div class="status-btn status-menu-btn" id="menu-btn" title="Menu">
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect y="2" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="7.25" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="12.5" width="16" height="1.5" rx="0.75" fill="currentColor"/></svg>
             </div>
+            <div class="tf-status" id="tf-status" style="display:none"></div>
             <div class="status-item">
                 <div class="status-dot" id="status-dot"></div>
                 <span class="status-world" id="world-name"></span>
@@ -674,8 +675,15 @@
                                         <option value="Connect">Connect</option>
                                         <option value="Prompt">Prompt</option>
                                         <option value="MOO_prompt">MOO_prompt</option>
+                                        <option value="Lines">Lines</option>
                                         <option value="None">None</option>
                                     </select>
+                                </div>
+                            </div>
+                            <div class="setting-row type-gated" id="world-edit-tf-type-field">
+                                <span class="setting-label">TF Type</span>
+                                <div class="setting-value">
+                                    <input type="text" id="world-edit-tf-type" class="editor-input" autocomplete="off" placeholder="(none)">
                                 </div>
                             </div>
                             <div class="setting-row type-gated" id="world-edit-prompt-wait-field">

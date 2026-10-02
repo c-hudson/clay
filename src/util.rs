@@ -449,6 +449,14 @@ pub fn format_local_time(lt: &LocalTime, fmt: &str) -> String {
 }
 
 /// Get the current time in 12-hour format (H:MM)
+/// The time now in a TF/strftime `format` (`ftime()`'s formatting) - TF's %clock_format.
+pub fn format_clock(format: &str) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs() as i64;
+    let lt = local_time_from_epoch(secs);
+    crate::tf::expressions::format_tf_time(&lt, secs, now.subsec_nanos() as f64 / 1e9, format)
+}
+
 pub fn get_current_time_12hr() -> String {
     let lt = local_time_now();
 

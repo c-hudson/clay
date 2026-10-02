@@ -2650,6 +2650,7 @@ pub enum AutoConnectType {
     Prompt,    // Send username on 1st prompt, password on 2nd prompt
     MooPrompt, // Like Prompt but also send username on 3rd prompt
     NoLogin,   // No auto-login even if credentials are set
+    Lines,     // Send username and password as two lines after connection (TF's lp/diku)
 }
 
 impl AutoConnectType {
@@ -2659,6 +2660,7 @@ impl AutoConnectType {
             AutoConnectType::Prompt => "Prompt",
             AutoConnectType::MooPrompt => "MOO_prompt",
             AutoConnectType::NoLogin => "None",
+            AutoConnectType::Lines => "Lines",
         }
     }
 
@@ -2666,7 +2668,8 @@ impl AutoConnectType {
         match self {
             AutoConnectType::Connect => AutoConnectType::Prompt,
             AutoConnectType::Prompt => AutoConnectType::MooPrompt,
-            AutoConnectType::MooPrompt => AutoConnectType::NoLogin,
+            AutoConnectType::MooPrompt => AutoConnectType::Lines,
+            AutoConnectType::Lines => AutoConnectType::NoLogin,
             AutoConnectType::NoLogin => AutoConnectType::Connect,
         }
     }
@@ -2676,7 +2679,8 @@ impl AutoConnectType {
             AutoConnectType::Connect => AutoConnectType::NoLogin,
             AutoConnectType::Prompt => AutoConnectType::Connect,
             AutoConnectType::MooPrompt => AutoConnectType::Prompt,
-            AutoConnectType::NoLogin => AutoConnectType::MooPrompt,
+            AutoConnectType::Lines => AutoConnectType::MooPrompt,
+            AutoConnectType::NoLogin => AutoConnectType::Lines,
         }
     }
 
@@ -2684,8 +2688,33 @@ impl AutoConnectType {
         match name.to_lowercase().as_str() {
             "prompt" => AutoConnectType::Prompt,
             "moo_prompt" | "mooprompt" => AutoConnectType::MooPrompt,
+            "lines" => AutoConnectType::Lines,
             "none" | "nologin" | "no_login" => AutoConnectType::NoLogin,
             _ => AutoConnectType::Connect,
+        }
+    }
+
+    /// The lines this login style sends as soon as the connection is up; the prompt
+    /// styles answer the MUD's prompts instead and send nothing here.
+    pub fn connect_lines(&self, user: &str, password: &str) -> Vec<String> {
+        match self {
+            AutoConnectType::Connect => vec![format!("connect {} {}", user, password)],
+            AutoConnectType::Lines => vec![user.to_string(), password.to_string()],
+            AutoConnectType::Prompt | AutoConnectType::MooPrompt | AutoConnectType::NoLogin => Vec::new(),
+        }
+    }
+
+    /// The login TF's library gives a world of type `tf_type` (`/help addworld`): the
+    /// TinyMUD "connect <char> <pass>" line for an untyped or tiny world, the two lines
+    /// of an LP/Diku login, and the login:/password: prompts of telnet. Any other type
+    /// has no library login (a LOGIN hook of the user's own does it).
+    pub fn for_tf_type(tf_type: &str) -> Self {
+        let base = tf_type.split('.').next().unwrap_or("").to_lowercase();
+        match base.as_str() {
+            "" | "tiny" => AutoConnectType::Connect,
+            "lp" | "lpp" | "diku" | "aber" => AutoConnectType::Lines,
+            "telnet" => AutoConnectType::Prompt,
+            _ => AutoConnectType::NoLogin,
         }
     }
 }

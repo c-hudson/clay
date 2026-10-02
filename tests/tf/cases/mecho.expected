@@ -1,0 +1,24 @@
++ LOAD: /foo
+++ /foo: /test echo("hi")%; 
+hi
+++ /foo: /inner%; 
++++ /inner: /test echo("in")
+in
+++ /foo: /let v=1
++ LOAD: /hid
+hidden
++ LOAD: /set mprefix=>>
+>> LOAD: /foo
+>>>> /foo: /test echo("hi")%; 
+hi
+>>>> /foo: /inner%; 
+>>>>>> /inner: /test echo("in")
+in
+>>>> /foo: /let v=1
+>> LOAD: /set mecho=all
+>> LOAD: /hid
+>>>> /hid: /test echo("hidden")
+hidden
+>> LOAD: /set mecho=off
+hi
+in

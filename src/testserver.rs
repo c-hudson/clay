@@ -171,6 +171,28 @@ fn scenario_timed_output() -> PortScenario {
     }
 }
 
+/// A port for a test server to bind. Not one the kernel hands out for "port 0" or for an
+/// outgoing connection's own end (Linux uses 32768-60999 for those; Windows and macOS
+/// higher still): a test that took one of those, let it go and bound it again a moment
+/// later could find another test had been given it in between - "Address in use", at
+/// random, depending on what ran alongside. Below that range, ports come from a counter
+/// (no two tests in this process get the same one), offset by the process id so two test
+/// runs side by side keep apart, and each is checked free before it is handed out.
+#[cfg(test)]
+pub fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const SPAN: u16 = 400;
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 20000 + (std::process::id() % 30) as u16 * SPAN;
+    for _ in 0..SPAN {
+        let port = base + NEXT.fetch_add(1, Ordering::Relaxed) % SPAN;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free test port in {}..{}", base, base + SPAN);
+}
+
 /// Run a test server on the given port with the given scenario.
 /// Returns when all connections have been handled.
 pub async fn run_server_port(port: u16, scenario: PortScenario) {

@@ -19,7 +19,7 @@ use crate::actions::{action_commands_to_run,
 use crate::telnet_reader::{spawn_telnet_reader, TelnetTarget};
 use crate::telnet_writer::spawn_telnet_writer;
 use crate::commands::{execute_send_command, execute_log_command,
-    execute_disconnect_command, execute_add_world_command, execute_add_world_default_command,
+    execute_disconnect_command,
     execute_remove_world_command, prepare_world_connect_host_port,
     execute_mssp_command, execute_msdp_command, execute_stats_command,
     execute_send_gmcp, execute_send_msdp};
@@ -83,6 +83,11 @@ pub async fn run_daemon_server() -> io::Result<()> {
     }
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
+    app.tf_event_tx = Some(event_tx.clone());
+    // TF's SIGTERM/SIGHUP/SIGUSR2 hooks (and a clean end on TERM/HUP) - a SIGHUP that
+    // `nohup` ignored stays ignored.
+    #[cfg(all(unix, not(target_os = "android")))]
+    crate::spawn_tf_signal_handlers(&event_tx);
 
     // Create WebSocket server state (for client management, no standalone listener)
     let ws_state = if !app.settings.websocket_password.is_empty() {
@@ -167,6 +172,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
         println!("Allow list: {}", app.settings.websocket_allow_list);
     }
 
+    // TinyFugue's startup: the rc, -c, and the world named on the command line (stdout is
+    // fine here - -D draws no TUI).
+    crate::tfstartup::run_tf_startup_daemon(&mut app, &event_tx, false, true).await;
+
     println!("Daemon running. Press Ctrl+C to stop.");
 
     // Conditional timer: sleep far-future when no processes, reset to 1s when needed
@@ -203,81 +212,23 @@ pub async fn run_daemon_server() -> io::Result<()> {
         tokio::select! {
             // TF repeat process tick — only fires when processes exist
             _ = &mut process_tick_sleep => {
-                let now = std::time::Instant::now();
-                let mut to_remove = vec![];
-                let process_count = app.tf_engine.processes.len();
-                for i in 0..process_count {
-                    if app.tf_engine.processes[i].on_prompt { continue; }
-                    if app.tf_engine.processes[i].next_run <= now {
-                        let cmd = app.tf_engine.processes[i].command.clone();
-                        let process_world = app.tf_engine.processes[i].world.clone();
-                        app.sync_tf_world_info();
-                        let result = app.tf_engine.execute(&cmd);
-                        let target_idx = if let Some(ref wname) = process_world {
-                            if wname.is_empty() {
-                                Some(app.current_world_index)
-                            } else {
-                                app.find_world_index(wname)
-                            }
-                        } else {
-                            Some(app.current_world_index)
-                        };
-                        let world_idx = target_idx.unwrap_or(app.current_world_index);
-                        match result {
-                            tf::TfCommandResult::SendToMud(text) => {
-                                if let Some(idx) = target_idx {
-                                    app.send_to_world(idx, text);
-                                }
-                            }
-                            tf::TfCommandResult::Success(Some(msg)) => {
-                                app.emit_client_text(world_idx, &msg, true);
-                            }
-                            tf::TfCommandResult::Error(err) => {
-                                app.emit_tf_error(world_idx, &err, true);
-                            }
-                            tf::TfCommandResult::RepeatProcess(process) => {
-                                app.register_repeat_process(process);
-                            }
-                            tf::TfCommandResult::NotTfCommand => {
-                                // Plain text command - send to MUD (captured via
-                                // send_to_world - a /repeat body is exactly the
-                                // "/repeat batches" case /recall -i now covers).
-                                if let Some(idx) = target_idx {
-                                    app.send_to_world(idx, cmd.clone());
-                                }
-                            }
-                            _ => {}
-                        }
-                        let interval = app.tf_engine.processes[i].interval;
-                        app.tf_engine.processes[i].next_run += interval;
-                        if let Some(ref mut rem) = app.tf_engine.processes[i].remaining {
-                            *rem = rem.saturating_sub(1);
-                            if *rem == 0 {
-                                to_remove.push(i);
-                            }
-                        }
-                    }
+                for (ctx, effects) in app.tick_tf_processes(std::time::Instant::now(), true) {
+                    crate::tfrun::run_tf_effects_daemon(&mut app, 0, effects, ctx, &event_tx).await;
                 }
-                for i in to_remove.into_iter().rev() {
-                    app.tf_engine.processes.remove(i);
-                }
-                // Re-arm: tick again in 1s if processes remain
-                if !app.tf_engine.processes.is_empty() {
-                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
-                } else {
-                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
-                }
+                // Re-arm for the next process due, if any remain
+                let next = app.next_tf_process_due()
+                    .map(tokio::time::Instant::from_std)
+                    .unwrap_or_else(|| tokio::time::Instant::now() + FAR_FUTURE);
+                process_tick_sleep.as_mut().reset(next);
             }
             Some(event) = event_rx.recv() => {
-                let event = match event {
-                    // Slack/Discord: one shared handler for every loop; it may hand back an
-                    // event (chat lines as ServerData, a lost session as Disconnected) to be
-                    // handled below exactly as if it had arrived by itself.
-                    AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
-                        Some(e) => e,
-                        None => continue,
-                    },
-                    e => e,
+                // Slack/Discord events and connection-close notices: handled once, for every
+                // loop (App::preprocess_event). What comes back - chat lines or a close message
+                // as ServerData, a lost chat session as Disconnected - is handled below exactly
+                // as if it had arrived by itself.
+                let event = match app.preprocess_event(event) {
+                    Some(e) => e,
+                    None => continue,
                 };
                 match event {
                     AppEvent::ServerData(ref world_name, bytes) => {
@@ -296,33 +247,13 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             app.current_world_index = world_idx;
                             for cmd in commands {
                                 if cmd.starts_with('/') {
-                                    // Unified command system - route through TF parser
+                                    // Route through the TF parser and apply what the command
+                                    // did, in order (see tfrun): every Clay command now runs,
+                                    // not just /send, /notify and /say.
                                     app.sync_tf_world_info();
-                                    match app.tf_engine.execute(&cmd) {
-                                        tf::TfCommandResult::SendToMud(text) => {
-                                            app.send_to_world(world_idx, text);
-                                        }
-                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                            // Handle Clay-specific commands in daemon mode
-                                            let parsed = parse_command(&clay_cmd);
-                                            if let Command::Send { text, target_world, .. } = &parsed {
-                                                let target_idx = if let Some(w) = target_world {
-                                                    app.find_world_index(w)
-                                                } else {
-                                                    Some(world_idx)
-                                                };
-                                                if let Some(idx) = target_idx {
-                                                    app.send_to_world(idx, text.clone());
-                                                }
-                                            } else {
-                                                app.handle_triggered_notify_or_say(parsed, world_idx);
-                                            }
-                                        }
-                                        tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.register_repeat_process(process);
-                                        }
-                                        _ => {}
-                                    }
+                                    let effects = app.run_tf_in_world(world_idx, &cmd);
+                                    let ctx = crate::tfrun::TfEffectCtx::for_world(world_idx, true);
+                                    crate::tfrun::run_tf_effects_daemon(&mut app, 0, effects, ctx, &event_tx).await;
                                 } else {
                                     // Plain text - send to MUD (captured via send_to_world)
                                     app.send_to_world(world_idx, cmd);
@@ -331,7 +262,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             app.current_world_index = saved_current_world;
                         }
                     }
-                    AppEvent::Chat(..) => {} // handled by the prelude above
+                    AppEvent::Chat(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
                     AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
                         app.apply_chat_lookup_result(client_id, request_id, world_index, result);
                     }
@@ -347,7 +278,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
                         }
                     }
-                    AppEvent::Disconnected(ref world_name, conn_id) => {
+                    AppEvent::Disconnected(ref world_name, conn_id, ref reason) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             // Ignore stale disconnect from a previous connection
                             if conn_id != app.worlds[world_idx].connection_id {
@@ -358,7 +289,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             // unseen_lines, and (the part `-D` mode was missing entirely)
                             // schedules world.reconnect_at from auto_reconnect_secs. The
                             // reconnect_sleep re-arm below is what actually services it.
-                            app.handle_disconnected(world_idx);
+                            app.handle_disconnected(world_idx, reason);
                             if let Some(next) = app.next_reconnect_instant() {
                                 let dur = next.saturating_duration_since(std::time::Instant::now());
                                 reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
@@ -459,6 +390,20 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 seq: 0, end_seq: None,
                                 flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
+                        }
+                    }
+                    AppEvent::TfShellDone(world_idx, output, status) => {
+                        app.finish_tf_shell(world_idx, &output, status, true);
+                    }
+                    // SIGTERM/SIGHUP: TF's hook of that name, then the daemon ends (after a
+                    // moment for anything the hook sent to reach its world); SIGUSR2: the
+                    // hook only.
+                    AppEvent::TfSignal(event) => {
+                        app.fire_tf_hook(None, event, "", true);
+                        crate::tfrun::drain_deferred_tf_daemon(&mut app, &event_tx).await;
+                        if event != crate::tf::TfHookEvent::Sigusr2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            return Ok(());
                         }
                     }
                     AppEvent::Sigusr1Received => {
@@ -616,11 +561,19 @@ pub async fn run_daemon_server() -> io::Result<()> {
             stats_flush_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_millis(150));
         }
 
-        // Activate process tick sleep if processes were added during this iteration
-        if !app.tf_engine.processes.is_empty()
-            && process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2)
-        {
-            process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+        // TF effects that synchronous code (hooks, triggers) left for the loop
+        crate::tfrun::drain_deferred_tf_daemon(&mut app, &event_tx).await;
+        // TF's mail check, and its status area when a script has it, to the clients
+        app.check_tf_mail();
+        app.refresh_tf_status();
+
+        // Arm the process timer for the next process due (processes may have been added
+        // during this iteration)
+        if let Some(due) = app.next_tf_process_due() {
+            let due = tokio::time::Instant::from_std(due);
+            if process_tick_sleep.deadline() > due {
+                process_tick_sleep.as_mut().reset(due);
+            }
         }
 
         // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): fire a
@@ -655,7 +608,7 @@ pub async fn handle_daemon_ws_message(
     app.refresh_tf_bound_keys_if_changed();
 }
 
-async fn handle_daemon_ws_message_impl(
+pub(crate) async fn handle_daemon_ws_message_impl(
     app: &mut App,
     client_id: u64,
     msg: WsMessage,
@@ -689,9 +642,10 @@ async fn handle_daemon_ws_message_impl(
                 // dispatch below) unconditionally overwrites it from there.
                 let prev_kbnum = app.input.kbnum;
                 app.input.kbnum = kbnum;
-                Box::pin(handle_daemon_ws_message_impl(
-                    app, client_id, WsMessage::SendCommand { world_index, command: cmd }, event_tx,
-                )).await;
+                // A binding runs as a macro body (TF's rule for /bind), not as a typed line.
+                let effects = app.run_tf_body_in_world(world_index, &cmd);
+                let ctx = crate::tfrun::TfEffectCtx::for_world(world_index, true);
+                Box::pin(crate::tfrun::run_tf_effects_daemon(app, client_id, effects, ctx, event_tx)).await;
                 app.input.kbnum = prev_kbnum;
                 app.tf_engine.unset_global("kbnum");
             }
@@ -699,6 +653,22 @@ async fn handle_daemon_ws_message_impl(
             // silently, per the plan's own ruling.
         }
         WsMessage::SendCommand { world_index, command } => {
+            // TF's leading-slash forms (never at a password prompt): "//x" is "/x", "///x"
+            // sends "/x" as text. ("^old^new" needs the client's own history, so the client
+            // resolves it before sending.)
+            let masked = app.worlds.get(world_index).is_some_and(|w| w.protocol.echo_masked);
+            app.tf_echo_line(world_index, "kecho", "kprefix", &command);
+            let command = match crate::tfrun::typed_slash_form(&command) {
+                crate::tfrun::TypedSlashForm::SendText(text) if !masked => {
+                    if world_index < app.worlds.len() && app.send_to_world(world_index, text.to_string()) {
+                        app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                        app.worlds[world_index].clear_prompt_after_send();
+                    }
+                    return;
+                }
+                crate::tfrun::TypedSlashForm::Line(line) if !masked => line.to_string(),
+                _ => command,
+            };
             // Determine the current world name for action world-scoping.
             let world_name = app.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
             // Rewrite slash-less action invocations: "common" → "/common"
@@ -735,35 +705,16 @@ async fn handle_daemon_ws_message_impl(
                         } else {
                             let mut sent_to_server = false;
                             for cmd in action_commands_to_run(action, &args) {
-                                // Unified command system - route through TF parser
+                                // Unified command system - route through the TF parser and
+                                // apply what each command did, in order (see tfrun).
                                 if cmd.starts_with('/') {
-                                    match app.tf_engine.execute(&cmd) {
-                                        tf::TfCommandResult::Success(Some(msg)) => {
-                                            app.emit_client_text(world_index, &msg, true);
-                                        }
-                                        tf::TfCommandResult::Success(None) => {}
-                                        tf::TfCommandResult::Error(err) => {
-                                            app.emit_tf_error(world_index, &err, true);
-                                        }
-                                        tf::TfCommandResult::SendToMud(text) => {
-                                            // send_to_world captures via capture_sent_line -
-                                            // an action's command list is the "sent by
-                                            // triggers/actions" case /recall -i now covers.
-                                            if app.send_to_world(world_index, text) {
-                                                sent_to_server = true;
-                                            }
-                                        }
-                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                            app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
-                                        }
-                                        tf::TfCommandResult::Recall(opts) => {
-                                            app.emit_recall(&opts, world_index, true);
-                                        }
-                                        tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.register_repeat_process(process);
-                                        }
-                                        _ => {}
+                                    app.sync_tf_world_info();
+                                    let effects = app.run_tf_in_world(world_index, &cmd);
+                                    if effects.iter().any(|e| matches!(e, crate::tf::effects::TfEffect::Send { .. })) {
+                                        sent_to_server = true;
                                     }
+                                    let ctx = crate::tfrun::TfEffectCtx::for_world(world_index, true);
+                                    Box::pin(crate::tfrun::run_tf_effects_daemon(app, client_id, effects, ctx, event_tx)).await;
                                 } else {
                                     // Plain text - send to MUD server (captured via
                                     // send_to_world too).
@@ -777,46 +728,19 @@ async fn handle_daemon_ws_message_impl(
                             }
                         }
                     } else {
-                        // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
-                        app.sync_tf_world_info();
-                        match app.tf_engine.execute(&command) {
-                            tf::TfCommandResult::Success(Some(msg)) => {
-                                app.emit_client_text(world_index, &msg, true);
-                            }
-                            tf::TfCommandResult::Success(None) => {}
-                            tf::TfCommandResult::Error(err) => {
-                                app.emit_tf_error(world_index, &err, true);
-                            }
-                            tf::TfCommandResult::SendToMud(text) => {
-                                // send_to_world() itself captures this via capture_sent_line -
-                                // no separate record_user_input call needed (it would
-                                // double-record the same command).
-                                if app.send_to_world(world_index, text) {
-                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                }
-                            }
-                            tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
-                            }
-                            tf::TfCommandResult::Recall(opts) => {
-                                app.emit_recall(&opts, world_index, true);
-                            }
-                            tf::TfCommandResult::RepeatProcess(process) => {
-                                app.register_repeat_process(process);
-                            }
-                            _ => {
-                                app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                                    world_index,
-                                    data: format!("Unknown command: {}", name),
-                                    is_viewed: false,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0, end_seq: None,
-                                    flush: false, gagged: false, highlight_colors: Vec::new(),
-                                });
-                            }
-                        }
+                        // No matching action - try TF engine (handles /recall, /set, /echo,
+                        // etc.). A command TF doesn't know either comes back as a Clay command,
+                        // which tfrun reports as unknown rather than bouncing it around.
+                        let effects = app.run_typed_tf_in_world(world_index, &command);
+                        let ctx = crate::tfrun::TfEffectCtx::for_world(world_index, true);
+                        Box::pin(crate::tfrun::run_tf_effects_daemon(app, client_id, effects, ctx, event_tx)).await;
                     }
+                }
+                Command::NotACommand { text } if app.tf_engine.sub_mode() != crate::tf::SubMode::Off => {
+                    // With %sub on or full, typed plain text is TF's to process (`/help sub`).
+                    let effects = app.run_typed_tf_in_world(world_index, &text);
+                    let ctx = crate::tfrun::TfEffectCtx::for_world(world_index, true);
+                    Box::pin(crate::tfrun::run_tf_effects_daemon(app, client_id, effects, ctx, event_tx)).await;
                 }
                 Command::NotACommand { text } => {
                     // SEND hook: typed plain text about to go to the MUD. A matching
@@ -876,15 +800,12 @@ async fn handle_daemon_ws_message_impl(
                         "  Example: /url https://github.com/c-hudson/clay",
                     ], true);
                 }
-                Command::HelpTopic { ref topic } => {
+                Command::HelpTopic { ref topic, ref raw } => {
                     use crate::popup::definitions::help::get_topic_help;
                     let help_text = if let Some(lines) = get_topic_help(topic) {
                         lines.join("\n")
                     } else {
-                        match app.tf_engine.execute(&format!("#help {}", topic)) {
-                            crate::tf::TfCommandResult::Success(Some(msg)) => msg,
-                            _ => format!("No help available for '{}'", topic),
-                        }
+                        crate::tf::parser::help_text(&app.tf_engine, raw)
                     };
                     app.emit_client_text(world_index, &help_text, true);
                 }
@@ -1122,10 +1043,10 @@ async fn handle_daemon_ws_message_impl(
                 }
                 Command::RemoteAttach { .. } => {
                     // A headless daemon (-D) has no local console/GUI to relaunch into —
-                    // /connect only makes sense for an interactive master or client.
+                    // /server only makes sense for an interactive master or client.
                     app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                         world_index,
-                        data: "/connect is not available in daemon mode.".to_string(),
+                        data: "/server is not available in daemon mode.".to_string(),
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
@@ -1186,12 +1107,6 @@ async fn handle_daemon_ws_message_impl(
                     }
                 }
                 // AddWorld - add or update world definition
-                Command::AddWorld { name, host, port, user, password, use_ssl, file } => {
-                    execute_add_world_command(app, name, host, port, user, password, use_ssl, file, world_index, true);
-                }
-                Command::AddWorldDefault { character, password, file } => {
-                    execute_add_world_default_command(app, character, password, file, world_index, true);
-                }
                 Command::RemoveWorld { names } => {
                     execute_remove_world_command(app, &names, world_index, true);
                 }
@@ -1247,13 +1162,13 @@ async fn handle_daemon_ws_message_impl(
                         }
                     }
                 }
-                Command::WorldConnectBackground { ref name } => {
+                Command::WorldConnectBackground { ref name, no_login } => {
                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                         if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
                             // In the background - see App::spawn_world_connect. `/worlds -b` never
                             // reported a failure, so it still doesn't.
-                            // `/worlds -b` always logs in (handle_connection_success reads the flag).
-                            app.worlds[idx].skip_auto_login = false;
+                            // `/worlds -b` logs in unless -l (handle_connection_success reads the flag).
+                            app.worlds[idx].skip_auto_login = no_login;
                             app.spawn_world_connect(idx, crate::ConnectOrigin::Client { report_failure: false }, event_tx);
                         }
                     } else {
@@ -1324,10 +1239,10 @@ async fn handle_daemon_ws_message_impl(
             }
         }
         WsMessage::DisconnectWorld { world_index } => {
+            // The same disconnect as /dc: this used to drop only our sender, leaving the
+            // socket open and the server's text still arriving.
             if world_index < app.worlds.len() && app.worlds[world_index].connected {
-                app.worlds[world_index].connected = false;
-                app.worlds[world_index].command_tx = None;
-                app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
+                crate::commands::disconnect_world(app, world_index, true);
             }
         }
         // Was entirely absent from this handler (T40) - a daemon-mode client that hit a TLS
@@ -1377,8 +1292,14 @@ async fn handle_daemon_ws_message_impl(
         }
         WsMessage::SwitchWorld { world_index } => {
             if world_index < app.worlds.len() {
+                let changed = app.current_world_index != world_index;
                 app.current_world_index = world_index;
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
+                // TF's WORLD hook: the foreground world changed.
+                if changed {
+                    let name = app.worlds[world_index].name.clone();
+                    app.fire_tf_hook(Some(world_index), crate::tf::TfHookEvent::World, &name, true);
+                }
             }
         }
         WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
@@ -1761,12 +1682,12 @@ async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat } => {
             app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 msp_enabled, mcp_enabled, mccp2_enabled,
-                world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace,
+                world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                 discord_token, discord_guild, discord_channel, discord_dm_user, chat,
             );
         }
@@ -1989,90 +1910,28 @@ keep_alive_type=Generic
         tokio::select! {
             // TF repeat process tick — only fires when processes exist
             _ = &mut process_tick_sleep => {
-                let now = std::time::Instant::now();
-                let mut to_remove = vec![];
-                let process_count = app.tf_engine.processes.len();
-                for i in 0..process_count {
-                    if app.tf_engine.processes[i].on_prompt { continue; }
-                    if app.tf_engine.processes[i].next_run <= now {
-                        let cmd = app.tf_engine.processes[i].command.clone();
-                        let process_world = app.tf_engine.processes[i].world.clone();
-                        app.sync_tf_world_info();
-                        let result = app.tf_engine.execute(&cmd);
-                        let target_idx = if let Some(ref wname) = process_world {
-                            if wname.is_empty() {
-                                Some(app.current_world_index)
-                            } else {
-                                app.find_world_index(wname)
-                            }
-                        } else {
-                            Some(app.current_world_index)
-                        };
-                        let world_idx = target_idx.unwrap_or(app.current_world_index);
-                        match result {
-                            tf::TfCommandResult::SendToMud(text) => {
-                                if let Some(idx) = target_idx {
-                                    app.send_to_world(idx, text);
-                                }
-                            }
-                            tf::TfCommandResult::Success(Some(msg)) => {
-                                // This tick isn't actually per-user scoped - TF repeat
-                                // processes run against the shared app.tf_engine/app.worlds,
-                                // not any specific user's own UserConnection - so routing
-                                // through the regular gated path (like every other TF-result
-                                // site) is correct here, not the multiuser per-user broadcast
-                                // helpers. Was previously a raw ws.broadcast_to_all, fully
-                                // bypassing more-mode gating and never reaching output_lines
-                                // (so /recall could never find it, same bug class as the
-                                // original /recall fix).
-                                app.emit_client_text(world_idx, &msg, true);
-                            }
-                            tf::TfCommandResult::Error(err) => {
-                                app.emit_tf_error(world_idx, &err, true);
-                            }
-                            tf::TfCommandResult::RepeatProcess(process) => {
-                                app.register_repeat_process(process);
-                            }
-                            tf::TfCommandResult::NotTfCommand => {
-                                // Plain text command - send to MUD (captured via
-                                // send_to_world - a /repeat body is exactly the
-                                // "/repeat batches" case /recall -i now covers).
-                                if let Some(idx) = target_idx {
-                                    app.send_to_world(idx, cmd.clone());
-                                }
-                            }
-                            _ => {}
-                        }
-                        let interval = app.tf_engine.processes[i].interval;
-                        app.tf_engine.processes[i].next_run += interval;
-                        if let Some(ref mut rem) = app.tf_engine.processes[i].remaining {
-                            *rem = rem.saturating_sub(1);
-                            if *rem == 0 {
-                                to_remove.push(i);
-                            }
-                        }
-                    }
+                // This tick isn't per-user scoped - TF repeat processes run against the shared
+                // app.tf_engine/app.worlds, not any specific user's own UserConnection - so
+                // output goes through the regular gated path. Clay commands are not run here:
+                // there is no single user to run them for.
+                for (ctx, effects) in app.tick_tf_processes(std::time::Instant::now(), true) {
+                    let mut queue: std::collections::VecDeque<_> = effects.into();
+                    while app.apply_tf_effects_until_clay(&mut queue, &ctx).is_some() {}
                 }
-                for i in to_remove.into_iter().rev() {
-                    app.tf_engine.processes.remove(i);
-                }
-                // Re-arm: tick again in 1s if processes remain
-                if !app.tf_engine.processes.is_empty() {
-                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
-                } else {
-                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE_MU);
-                }
+                // Re-arm for the next process due, if any remain
+                let next = app.next_tf_process_due()
+                    .map(tokio::time::Instant::from_std)
+                    .unwrap_or_else(|| tokio::time::Instant::now() + FAR_FUTURE_MU);
+                process_tick_sleep.as_mut().reset(next);
             }
             Some(event) = event_rx.recv() => {
-                let event = match event {
-                    // Slack/Discord: one shared handler for every loop; it may hand back an
-                    // event (chat lines as ServerData, a lost session as Disconnected) to be
-                    // handled below exactly as if it had arrived by itself.
-                    AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
-                        Some(e) => e,
-                        None => continue,
-                    },
-                    e => e,
+                // Slack/Discord events and connection-close notices: handled once, for every
+                // loop (App::preprocess_event). What comes back - chat lines or a close message
+                // as ServerData, a lost chat session as Disconnected - is handled below exactly
+                // as if it had arrived by itself.
+                let event = match app.preprocess_event(event) {
+                    Some(e) => e,
+                    None => continue,
                 };
                 match event {
                     AppEvent::WsClientMessage(client_id, msg) => {
@@ -2285,11 +2144,20 @@ keep_alive_type=Generic
             }
         }
 
-        // Activate process tick sleep if processes were added during this iteration
-        if !app.tf_engine.processes.is_empty()
-            && process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2)
-        {
-            process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+        // TF effects that synchronous code left for the loop. Clay commands are not run in
+        // multiuser mode: there is no single user to run them for.
+        app.apply_stray_tf_effects(true);
+        while let Some((ctx, mut queue)) = app.deferred_tf.pop_front() {
+            while app.apply_tf_effects_until_clay(&mut queue, &ctx).is_some() {}
+        }
+
+        // Arm the process timer for the next process due (processes may have been added
+        // during this iteration)
+        if let Some(due) = app.next_tf_process_due() {
+            let due = tokio::time::Instant::from_std(due);
+            if process_tick_sleep.deadline() > due {
+                process_tick_sleep.as_mut().reset(due);
+            }
         }
 
         // mud-status-display.md Job 2 (plan D4): pull stats_flush_sleep's deadline in to
@@ -2321,7 +2189,13 @@ fn handle_multiuser_disconnect(app: &mut App, world_index: usize, username: &str
     let key = (world_index, username.to_string());
     if let Some(conn) = app.user_connections.get_mut(&key) {
         conn.connected = false;
-        conn.command_tx = None;
+        // Shut the writer down, which also stops the reader: dropping only this sender
+        // left the socket open (harmless when the server already closed it).
+        if let Some(tx) = conn.command_tx.take() {
+            if conn.chat.is_none() {
+                let _ = tx.try_send(WriteCommand::Shutdown);
+            }
+        }
         // Chat worlds: dropping the handle ends the session (see crate::chat).
         conn.chat = None;
         conn.chat_target = None;
@@ -2441,13 +2315,14 @@ pub async fn connect_multiuser_world(
             // Send auto-login if configured
             let user = settings.user.clone();
             let password = settings.password.clone();
-            let auto_connect_type = settings.auto_connect_type;
-            if !user.is_empty() && auto_connect_type == AutoConnectType::Connect {
+            let login_lines = settings.auto_connect_type.connect_lines(&user, &password);
+            if !user.is_empty() && !login_lines.is_empty() {
                 let tx = cmd_tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    let connect_cmd = format!("connect {} {}", user, password);
-                    let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
+                    for line in login_lines {
+                        let _ = tx.send(WriteCommand::Text(line)).await;
+                    }
                 });
             }
 
@@ -2555,11 +2430,14 @@ pub(crate) async fn connect_via_tls_proxy(
     if !skip_auto_login {
         let user = settings.user.clone();
         let password = settings.password.clone();
-        if !user.is_empty() && !password.is_empty() && settings.auto_connect_type == AutoConnectType::Connect {
+        let login_lines = settings.auto_connect_type.connect_lines(&user, &password);
+        if !user.is_empty() && !password.is_empty() && !login_lines.is_empty() {
             let tx = cmd_tx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                let _ = tx.send(WriteCommand::Text(format!("connect {} {}", user, password))).await;
+                for line in login_lines {
+                    let _ = tx.send(WriteCommand::Text(line)).await;
+                }
             });
         }
     }
@@ -2584,8 +2462,150 @@ pub(crate) async fn connect_via_tls_proxy(
     Ok((cmd_tx, proxy_pid, proxy_path))
 }
 
-/// `connect_daemon_world`'s result: (cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path).
-pub type DaemonConnectResult = Option<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool, Option<u32>, Option<std::path::PathBuf>)>;
+/// One address a connection attempt failed on, as TinyFugue shows it after the world's
+/// name in its ICONFAIL and CONFAIL hooks: "<address> <port>: <reason>". The address is
+/// the one tried, or the host name when it never resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddrFailure {
+    pub addr: String,
+    pub port: String,
+    pub reason: String,
+}
+
+impl AddrFailure {
+    pub fn new(addr: impl Into<String>, port: impl Into<String>, reason: impl Into<String>) -> Self {
+        AddrFailure { addr: addr.into(), port: port.into(), reason: reason.into() }
+    }
+
+    /// TF's text for it: "<address> <port>: <reason>".
+    pub fn tf_text(&self) -> String {
+        format!("{} {}: {}", self.addr, self.port, self.reason)
+    }
+}
+
+/// A connection attempt that failed: every address tried, in order - TF fires ICONFAIL
+/// for each but the last, then CONFAIL for the last (`App::report_connect_failure`).
+/// Never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectFailure {
+    pub attempts: Vec<AddrFailure>,
+}
+
+impl ConnectFailure {
+    pub fn at(addr: impl Into<String>, port: impl Into<String>, reason: impl Into<String>) -> Self {
+        ConnectFailure { attempts: vec![AddrFailure::new(addr, port, reason)] }
+    }
+
+    /// Where the attempt finally failed.
+    pub fn last(&self) -> &AddrFailure {
+        self.attempts.last().expect("a ConnectFailure is never empty")
+    }
+
+    /// Clay's own account of it: the first IPv4 address's error when one was tried (an
+    /// IPv6 fallback's "Network is unreachable" usually says less), else the last.
+    pub fn reason(&self) -> &str {
+        self.attempts.iter()
+            .find(|f| f.addr.parse::<std::net::Ipv4Addr>().is_ok())
+            .unwrap_or_else(|| self.last())
+            .reason.as_str()
+    }
+}
+
+/// The cipher a TLS connection settled on, named as TF names it (its OpenSSL's names):
+/// TF's CONNECT hook gets it after the world's name.
+#[cfg(feature = "rustls-backend")]
+pub(crate) fn tls_cipher_name(conn: &rustls::ClientConnection) -> Option<String> {
+    let suite = conn.negotiated_cipher_suite()?;
+    Some(openssl_cipher_name(&format!("{:?}", suite.suite())))
+}
+
+/// rustls's name for a cipher suite as OpenSSL - and so TF - names it: TLS 1.3 suites by
+/// their IANA names ("TLS_AES_256_GCM_SHA384"), TLS 1.2 ones the OpenSSL way
+/// ("ECDHE-RSA-AES256-GCM-SHA384"). A suite not listed keeps its own name.
+pub(crate) fn openssl_cipher_name(rustls_name: &str) -> String {
+    match rustls_name {
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => "ECDHE-ECDSA-AES128-GCM-SHA256".to_string(),
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => "ECDHE-ECDSA-AES256-GCM-SHA384".to_string(),
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => "ECDHE-ECDSA-CHACHA20-POLY1305".to_string(),
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => "ECDHE-RSA-AES128-GCM-SHA256".to_string(),
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => "ECDHE-RSA-AES256-GCM-SHA384".to_string(),
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => "ECDHE-RSA-CHACHA20-POLY1305".to_string(),
+        name => match name.strip_prefix("TLS13_") {
+            Some(rest) => format!("TLS_{}", rest),
+            None => name.to_string(),
+        },
+    }
+}
+
+/// A world's host field: "primary,fallback" names a second host to try once every address
+/// of the first has failed.
+pub(crate) fn split_host_list(raw: &str) -> (String, Option<String>) {
+    match raw.split_once(',') {
+        Some((primary, fallback)) => {
+            let fallback = fallback.trim();
+            (primary.trim().to_string(), (!fallback.is_empty()).then(|| fallback.to_string()))
+        }
+        None => (raw.trim().to_string(), None),
+    }
+}
+
+/// Connect to `host` (or, once all of its addresses have failed, `fallback` - saying so in
+/// `world`'s output) on `port`: every address a name resolves to, in turn, IPv4 first, as
+/// TF does. On success the addresses that failed first come back too: TF's ICONFAILs.
+pub(crate) async fn connect_tcp(
+    world: &str,
+    host: &str,
+    fallback: Option<&str>,
+    port: &str,
+    event_tx: &mpsc::Sender<AppEvent>,
+) -> Result<(TcpStream, Vec<AddrFailure>), ConnectFailure> {
+    let mut failures = Vec::new();
+    if let Some(stream) = connect_host(host, port, &mut failures).await {
+        return Ok((stream, failures));
+    }
+    if let Some(fallback) = fallback {
+        let primary = ConnectFailure { attempts: failures.clone() };
+        let _ = event_tx.send(AppEvent::ServerData(
+            world.to_string(),
+            format!("Primary host {} failed: {}, trying {}...\r\n", host, primary.reason(), fallback).into_bytes(),
+        )).await;
+        if let Some(stream) = connect_host(fallback, port, &mut failures).await {
+            return Ok((stream, failures));
+        }
+    }
+    Err(ConnectFailure { attempts: failures })
+}
+
+/// Try each address `host` resolves to (IPv4 first), recording every failure.
+async fn connect_host(host: &str, port: &str, failures: &mut Vec<AddrFailure>) -> Option<TcpStream> {
+    let mut addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+        Ok(addrs) => addrs.collect(),
+        Err(e) => {
+            failures.push(AddrFailure::new(host, port, crate::telnet_reader::error_text(&e)));
+            return None;
+        }
+    };
+    if addrs.is_empty() {
+        failures.push(AddrFailure::new(host, port, format!("Could not resolve {}", host)));
+        return None;
+    }
+    addrs.sort_by_key(|a| !a.is_ipv4());
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Some(stream),
+            Err(e) => failures.push(AddrFailure::new(
+                addr.ip().to_string(),
+                addr.port().to_string(),
+                crate::telnet_reader::error_text(&e),
+            )),
+        }
+    }
+    None
+}
+
+/// `connect_daemon_world`'s result: (cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path),
+/// or why it failed.
+pub type DaemonConnectResult = Result<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool, Option<u32>, Option<std::path::PathBuf>), ConnectFailure>;
 
 pub async fn connect_daemon_world(
     _world_index: usize,
@@ -2603,7 +2623,7 @@ pub async fn connect_daemon_world(
     let use_ssl = settings.use_ssl;
 
     if host.is_empty() || port.is_empty() {
-        return None;
+        return Err(ConnectFailure::at(host.as_str(), port.as_str(), "no host and port set"));
     }
 
     // TLS proxy path — a separate proxy process holds the TLS connection so it
@@ -2613,13 +2633,24 @@ pub async fn connect_daemon_world(
         if let Ok((cmd_tx, proxy_pid, proxy_path)) = connect_via_tls_proxy(
             &world_name, host, port, settings, event_tx.clone(), connection_id, skip_auto_login,
         ).await {
-            return Some((cmd_tx, None, true, Some(proxy_pid), Some(proxy_path)));
+            return Ok((cmd_tx, None, true, Some(proxy_pid), Some(proxy_path)));
         }
     }
 
-    match TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(tcp_stream) => {
+    let (host_name, fallback) = split_host_list(host);
+    match connect_tcp(&world_name, &host_name, fallback.as_deref(), port, &event_tx).await {
+        Ok((tcp_stream, failed_first)) => {
             let _ = tcp_stream.set_nodelay(true);
+            // Addresses that failed before this one: TF's ICONFAILs, before its CONNECT.
+            if !failed_first.is_empty() {
+                let _ = event_tx.send(AppEvent::ConnectAttemptsFailed(world_name.clone(), connection_id, failed_first)).await;
+            }
+            // Where a TLS failure happened, for TF's CONFAIL text.
+            let (peer_addr, peer_port) = match tcp_stream.peer_addr() {
+                Ok(a) => (a.ip().to_string(), a.port().to_string()),
+                Err(_) => (host_name.clone(), port.clone()),
+            };
+            let tls_failure = |reason: String| ConnectFailure::at(peer_addr.as_str(), peer_port.as_str(), reason);
 
             // Store the socket fd for hot reload (before splitting)
             #[cfg(unix)]
@@ -2649,20 +2680,20 @@ pub async fn connect_daemon_world(
                         .build()
                     {
                         Ok(c) => c,
-                        Err(_) => return None,
+                        Err(e) => return Err(tls_failure(format!("TLS error: {}", e))),
                     };
                     let connector = tokio_native_tls::TlsConnector::from(connector);
 
-                    match connector.connect(host, tcp_stream).await {
+                    match connector.connect(&host_name, tcp_stream).await {
                         Ok(tls_stream) => {
                             let peer_cert = tls_stream.get_ref().peer_certificate().ok().flatten();
-                            if crate::platform::check_native_tls_peer_pin(&format!("{}:{}", host, port), peer_cert).is_err() {
-                                return None;
+                            if let Err(msg) = crate::platform::check_native_tls_peer_pin(&format!("{}:{}", host_name, port), peer_cert) {
+                                return Err(tls_failure(msg));
                             }
                             let (r, w) = tokio::io::split(tls_stream);
                             (StreamReader::Tls(r), StreamWriter::Tls(w))
                         }
-                        Err(_) => return None,
+                        Err(e) => return Err(tls_failure(format!("SSL handshake failed: {}", e))),
                     }
                 }
 
@@ -2677,27 +2708,31 @@ pub async fn connect_daemon_world(
 
                     let config = rustls::ClientConfig::builder()
                         .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(crate::platform::danger_rustls::TofuVerifier::new(format!("{}:{}", host, port))))
+                        .with_custom_certificate_verifier(Arc::new(crate::platform::danger_rustls::TofuVerifier::new(format!("{}:{}", host_name, port))))
                         .with_no_client_auth();
 
                     let connector = TlsConnector::from(Arc::new(config));
-                    let server_name = match ServerName::try_from(host.clone()) {
+                    let server_name = match ServerName::try_from(host_name.clone()) {
                         Ok(sn) => sn,
-                        Err(_) => return None,
+                        Err(e) => return Err(tls_failure(format!("Invalid server name: {}", e))),
                     };
 
                     match connector.connect(server_name, tcp_stream).await {
                         Ok(tls_stream) => {
+                            // TF's CONNECT hook names the cipher.
+                            if let Some(cipher) = tls_cipher_name(tls_stream.get_ref().1) {
+                                let _ = event_tx.send(AppEvent::TlsCipher(world_name.clone(), connection_id, cipher)).await;
+                            }
                             let (r, w) = tokio::io::split(tls_stream);
                             (StreamReader::Tls(r), StreamWriter::Tls(w))
                         }
-                        Err(_) => return None,
+                        Err(e) => return Err(tls_failure(format!("SSL handshake failed: {}", e))),
                     }
                 }
 
                 #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
                 {
-                    return None;
+                    return Err(tls_failure("No TLS backend available".to_string()));
                 }
             } else {
                 is_tls = false;
@@ -2716,13 +2751,14 @@ pub async fn connect_daemon_world(
             if !skip_auto_login {
                 let user = settings.user.clone();
                 let password = settings.password.clone();
-                let auto_connect_type = settings.auto_connect_type;
-                if !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                let login_lines = settings.auto_connect_type.connect_lines(&user, &password);
+                if !user.is_empty() && !password.is_empty() && !login_lines.is_empty() {
                     let tx = cmd_tx.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let connect_cmd = format!("connect {} {}", user, password);
-                        let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
+                        for line in login_lines {
+                            let _ = tx.send(WriteCommand::Text(line)).await;
+                        }
                     });
                 }
             }
@@ -2758,9 +2794,9 @@ pub async fn connect_daemon_world(
                 telnet_cfg,
             );
 
-            Some((cmd_tx, final_socket_fd, is_tls, None, None))
+            Ok((cmd_tx, final_socket_fd, is_tls, None, None))
         }
-        Err(_) => None,
+        Err(failure) => Err(failure),
     }
 }
 
@@ -2879,6 +2915,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     // client the same as use_ssl/encoding above, owner or not.
                     world_type: world.settings.world_type.name().to_string(),
                     prompt_wait_ms: world.settings.prompt_wait_ms,
+                    tf_type: world.settings.tf_type.clone(),
                     // Tokens are credentials - never sent to any client, same as
                     // password above (not just owner-gated like hostname/keep_alive_cmd).
                     slack_token: String::new(),
@@ -2990,6 +3027,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         scrollback_push: false,
         emoji_json: crate::emoji::emoji_json(),
         emoji_categories_json: crate::emoji::emoji_categories_json(),
+        // Multiuser shows Clay's own status bar.
+        tf_status: Vec::new(),
     }
 }
 
@@ -4444,9 +4483,7 @@ mod multiuser_telnet_tests {
         use crate::testserver::{self, ServerAction, PortScenario};
         use crate::telnet::{TELNET_IAC, TELNET_WILL, TELNET_SB, TELNET_SE};
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = testserver::free_port();
 
         let mut raw = vec![TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP];
         raw.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_GMCP]);
@@ -4523,8 +4560,51 @@ mod telnet_reader_migration_tests {
     use crate::telnet::{TELNET_IAC, TELNET_WILL, TELNET_SB, TELNET_SE, TELNET_OPT_GMCP};
 
     fn find_free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+        crate::testserver::free_port()
+    }
+
+    /// TF's CONNECT hook names a TLS connection's cipher as OpenSSL does (checked against
+    /// tf 5.0b8: "tlsw TLS_AES_256_GCM_SHA384"): rustls's names, renamed to match.
+    #[test]
+    fn test_openssl_cipher_names() {
+        assert_eq!(openssl_cipher_name("TLS13_AES_256_GCM_SHA384"), "TLS_AES_256_GCM_SHA384");
+        assert_eq!(openssl_cipher_name("TLS13_CHACHA20_POLY1305_SHA256"), "TLS_CHACHA20_POLY1305_SHA256");
+        assert_eq!(openssl_cipher_name("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"), "ECDHE-RSA-AES256-GCM-SHA384");
+        assert_eq!(openssl_cipher_name("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"), "ECDHE-ECDSA-CHACHA20-POLY1305");
+        assert_eq!(openssl_cipher_name("SOMETHING_ELSE"), "SOMETHING_ELSE");
+    }
+
+    /// A failed connect names what real tf's ICONFAIL/CONFAIL text names: the address and
+    /// port tried and the system's reason, or the host name when it never resolved. A
+    /// fallback host is tried once the primary has failed, which is noted in the world and
+    /// kept for ICONFAIL.
+    #[tokio::test]
+    async fn connect_tcp_reports_each_address() {
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(8);
+        // Port 1 (tcpmux) has no listener, and only root could bind one.
+        let failure = connect_tcp("w", "127.0.0.1", None, "1", &event_tx).await.err().expect("nothing listens on port 1");
+        assert_eq!(failure.attempts, vec![AddrFailure::new("127.0.0.1", "1", "Connection refused")]);
+        assert_eq!(failure.last().tf_text(), "127.0.0.1 1: Connection refused");
+
+        let failure = connect_tcp("w", "nonexistent.invalid", None, "23", &event_tx).await.err().expect(".invalid never resolves");
+        assert_eq!(failure.last().addr, "nonexistent.invalid");
+        assert!(!failure.last().reason.starts_with("failed to lookup"), "{:?}", failure);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let (_stream, failed_first) = connect_tcp("w", "nonexistent.invalid", Some("127.0.0.1"), &port, &event_tx)
+            .await.expect("the fallback host answers");
+        assert_eq!(failed_first.len(), 1);
+        assert_eq!(failed_first[0].addr, "nonexistent.invalid");
+        match event_rx.try_recv() {
+            Ok(AppEvent::ServerData(world, bytes)) => {
+                assert_eq!(world, "w");
+                assert!(String::from_utf8_lossy(&bytes).starts_with("Primary host nonexistent.invalid failed: "));
+            }
+            _ => panic!("expected the note about trying the fallback host"),
+        }
+        assert_eq!(split_host_list("a.org, b.org"), ("a.org".to_string(), Some("b.org".to_string())));
+        assert_eq!(split_host_list(" a.org "), ("a.org".to_string(), None));
     }
 
     /// IAC WILL GMCP, then IAC SB GMCP Core.Hello {"foo":"bar"} IAC SE, as a single raw
@@ -4573,7 +4653,7 @@ mod telnet_reader_migration_tests {
             true,  // skip_auto_login - no login needed for this scenario
             false, // tls_proxy_enabled - plain TCP, exercises the direct-connect loop
         ).await;
-        assert!(conn.is_some(), "connect_daemon_world should have connected to the fake server");
+        assert!(conn.is_ok(), "connect_daemon_world should have connected to the fake server");
 
         // Drain events until both the negotiation mirror and the actual GMCP payload
         // have arrived, or time out.

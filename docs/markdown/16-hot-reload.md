@@ -10,6 +10,8 @@ The hot reload process:
    - Output buffers and pending lines
    - Scroll positions
    - Per-world settings (encoding, auto-login type, etc.)
+   - TinyFugue state: macros, triggers, hooks, key bindings, `/repeat`
+     processes (each resumes where its timer was) and `/set` variables
    - Connection file descriptors
 
 2. **Prepare sockets**: FD_CLOEXEC flag is cleared on socket file descriptors so they survive exec
@@ -20,7 +22,12 @@ The hot reload process:
 
 5. **Reconstruct connections**: TCP sockets are rebuilt from preserved file descriptors
 
-6. **Cleanup**: Inconsistent states are fixed
+6. **Startup actions**: they do not run again when the TinyFugue state came
+   through the reload — what they defined is already there, and running them twice
+   would define every unnamed trigger twice. (A reload from an older Clay, whose
+   saved state doesn't include it, runs them as before.)
+
+7. **Cleanup**: Inconsistent states are fixed
    - Worlds without working command channels marked disconnected
    - Pending lines cleared for disconnected worlds
    - Pause state cleared for disconnected worlds

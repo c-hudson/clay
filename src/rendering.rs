@@ -277,6 +277,9 @@ pub(crate) fn wrap_ansi_line(line: &str, max_width: usize, indent: usize) -> Vec
 pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let total_height = f.size().height.max(3);  // Minimum 3 lines for output + separator + input
 
+    // A world switch, however it happened: TF's %textdiv for the world now shown.
+    app.track_console_world();
+
     // Status display line (mud-status-display.md Job 4, plan D3): 0 or 1 rows, latched
     // via World::stats_line_shown rather than read live off World::current_stat_entries()
     // every frame. This is the entire point of the latch - see its own doc comment - and
@@ -293,8 +296,9 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     }
     let stats_line_height: u16 = if app.current_world().stats_line_shown { 1 } else { 0 };
 
-    // Layout: output area, status line (0 or 1), separator bar (1 line), input area
-    let separator_height = 1;
+    // Layout: output area, status line (0 or 1), separator bar (1 line - or TF's status
+    // area, when a script has it), input area
+    let separator_height = app.separator_rows();
     let input_total_height = app.input_height;
     let output_height = total_height.saturating_sub(separator_height + input_total_height + stats_line_height);
 
@@ -316,9 +320,12 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     }
     app.output_height = new_output_height;
     app.output_width = new_output_width;
+    app.screen_size = Some((f.size().width, f.size().height));
     // Send NAWS updates if terminal was resized
     if dimensions_changed {
         app.send_naws_to_all_worlds();
+        // TF's RESIZE hook, run from the event loop rather than in the middle of a draw.
+        app.tf_resize = Some((f.size().width, f.size().height));
     }
 
     let chunks = Layout::default()
@@ -563,11 +570,16 @@ pub(crate) fn display_wrapped_as(
     if text.is_empty() {
         return vec![String::new()];
     }
+    // TF's %wrapsize, when a script has set one, short of the window's edge.
+    let term_width = match settings.wrap_columns {
+        0 => term_width,
+        cols => term_width.min(cols),
+    };
     let width = display_wrap_width(
         term_width,
         marked_new,
         line.shows_archive_prefix(),
-        settings.new_line_indicator,
+        settings.nli_drawn(),
     );
     wrap_ansi_line(&text, width, settings.wrapspace as usize)
 }
@@ -608,6 +620,77 @@ pub(crate) struct Anchor {
     pub rows: usize,
 }
 
+/// TF's %textdiv divider as the console draws it (`console_divider`): the rows it takes
+/// (one divider row, or a screen-high blank for "clear"), above or below the line with
+/// seq `line_seq`. They count as that line's rows, so paging stays row-exact across it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DividerRows {
+    pub line_seq: u64,
+    pub below: bool,
+    pub rows: usize,
+    pub clear: bool,
+}
+
+/// Where `world`'s %textdiv divider goes on the console (`World::console_textdiv`), if
+/// anywhere: above the first line drawn after what the console had seen, else - for
+/// "always" and "clear" - below the last line drawn before it. A screen-high blank for
+/// "clear", which draws the old text out of view the way TF clears it.
+pub(crate) fn console_divider(world: &World, settings: &Settings, show_tags: bool, visible_height: usize) -> Option<DividerRows> {
+    let textdiv = world.console_textdiv?;
+    // The setting may have changed since the console arrived.
+    crate::TextDivMode::from_setting(&settings.textdiv)?;
+    let now = CachedNow::new();
+    let drawn = |l: &OutputLine| expand_for_display(l, show_tags, settings, &now).is_some();
+    let lines = &world.output_lines;
+    // output_lines is sorted by seq (see CLAUDE.md), so the new text is one tail.
+    let first_new = match textdiv.after_seq {
+        Some(seen) => lines.partition_point(|l| l.seq <= seen),
+        None => 0,
+    };
+    let clear = textdiv.mode == crate::TextDivMode::Clear;
+    let rows = if clear { visible_height.max(1) } else { 1 };
+    if let Some(line) = lines[first_new..].iter().find(|l| drawn(l)) {
+        return Some(DividerRows { line_seq: line.seq, below: false, rows, clear });
+    }
+    if textdiv.mode == crate::TextDivMode::On {
+        return None;
+    }
+    lines[..first_new].iter().rev().find(|l| drawn(l))
+        .map(|line| DividerRows { line_seq: line.seq, below: true, rows, clear })
+}
+
+/// The divider's own rows, to splice into `line`'s wrapped rows (`splice_divider`).
+fn divider_rows(divider: &DividerRows, settings: &Settings, term_width: usize) -> Vec<String> {
+    let text = if divider.clear {
+        String::new()
+    } else {
+        // One row, as RowMetrics counts it: cut to the width rather than wrapped.
+        crate::tf::status::cut_to(&settings.textdiv_str, term_width.max(1)).0
+    };
+    vec![text; divider.rows]
+}
+
+/// Add the console's %textdiv rows to `wrapped` (`line`'s rows, as the draw loop builds
+/// them) when the divider belongs to that line. Neutral rows: no ▶, 🛢️ or highlight.
+fn splice_divider(
+    wrapped: &mut Vec<(String, bool, Option<String>, bool, bool)>,
+    line: &OutputLine,
+    divider: Option<&DividerRows>,
+    settings: &Settings,
+    term_width: usize,
+) {
+    let Some(divider) = divider.filter(|d| d.line_seq == line.seq) else { return };
+    if wrapped.is_empty() {
+        return;
+    }
+    let rows = divider_rows(divider, settings, term_width).into_iter().map(|t| (t, false, None, false, false));
+    if divider.below {
+        wrapped.extend(rows);
+    } else {
+        wrapped.splice(0..0, rows);
+    }
+}
+
 /// Everything needed to measure how tall a line renders, bundled so the walking helpers below
 /// don't take six arguments each. Borrows only `Settings`, so callers can still hold a
 /// `&mut World` from a disjoint field of `App` at the same time.
@@ -616,16 +699,38 @@ pub(crate) struct RowMetrics<'a> {
     show_tags: bool,
     width: usize,
     now: CachedNow,
+    /// The console's %textdiv rows, counted as their line's (`for_console`).
+    divider: Option<DividerRows>,
 }
 
 impl<'a> RowMetrics<'a> {
     pub(crate) fn new(settings: &'a Settings, show_tags: bool, width: usize) -> Self {
-        RowMetrics { settings, show_tags, width: width.max(1), now: CachedNow::new() }
+        RowMetrics { settings, show_tags, width: width.max(1), now: CachedNow::new(), divider: None }
+    }
+
+    /// The console's own measure of its current world: as `new`, plus the rows TF's
+    /// %textdiv divider adds there - so Page Up/Down and the partial-line anchor agree with
+    /// what the console draws. Budgets for output that hasn't been drawn yet (more-mode)
+    /// and measures for other viewers' widths use `new`.
+    pub(crate) fn for_console(app: &'a App) -> Self {
+        RowMetrics::new(&app.settings, app.show_tags, (app.output_width as usize).max(1))
+            .with_divider(app.console_divider_rows())
+    }
+
+    /// These metrics with the console's %textdiv rows counted (`App::console_divider_rows`)
+    /// - for a caller that goes on to change the world, which `for_console` would hold.
+    pub(crate) fn with_divider(mut self, divider: Option<DividerRows>) -> Self {
+        self.divider = divider;
+        self
     }
 
     /// Rows this line occupies on screen; 0 if it isn't drawn at all.
     pub(crate) fn rows(&self, line: &OutputLine) -> usize {
-        display_rows(line, self.width, self.show_tags, self.settings, &self.now)
+        let rows = display_rows(line, self.width, self.show_tags, self.settings, &self.now);
+        match self.divider {
+            Some(d) if d.line_seq == line.seq && rows > 0 => rows + d.rows,
+            _ => rows,
+        }
     }
 
     /// Rows this line will occupy once `marked_new` is decided, for budgeting output that has
@@ -864,7 +969,7 @@ pub fn build_display_lines(
     term_width: usize,
     show_tags: bool,
 ) -> Vec<DisplayLine> {
-    let new_line_indicator = settings.new_line_indicator;
+    let new_line_indicator = settings.nli_drawn();
     let cached_now = CachedNow::new();
 
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool, bool)> {
@@ -891,6 +996,8 @@ pub fn build_display_lines(
 
     // Normal unfiltered rendering
     let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
+    // TF's %textdiv, when the console arrived at this world with a script's %textdiv set.
+    let divider = console_divider(world, settings, show_tags, visible_height);
 
     let mut rev_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::with_capacity(visible_height + 8);
     let mut first_line_idx = end_line;
@@ -902,6 +1009,7 @@ pub fn build_display_lines(
         // No highlight action matching in this pure function (would need compiled patterns)
         let highlight = false;
         let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+        splice_divider(&mut wrapped, line, divider.as_ref(), settings, term_width);
 
         if !applied_vlo && world.visual_line_offset > 0
            && !wrapped.is_empty() && wrapped.len() > world.visual_line_offset {
@@ -938,7 +1046,8 @@ pub fn build_display_lines(
         for line_idx in (end_line + 1)..world.output_lines.len() {
             let line = &world.output_lines[line_idx];
             let highlight = false;
-            let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+            let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+            splice_divider(&mut wrapped, line, divider.as_ref(), settings, term_width);
 
             for w in wrapped {
                 visual_lines.push(w);
@@ -1062,7 +1171,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
     // Cache "now" for timestamp formatting - compute once per frame, not per line
     let cached_now = CachedNow::new();
 
-    let new_line_indicator = app.settings.new_line_indicator;
+    let new_line_indicator = app.settings.nli_drawn();
     // Minimum old (non-new) context rows to pin at the top when new text has arrived.
     // Zero while the user is scrolled back: there is no new text to give context to, and
     // composing would discard rows out of the middle of the screen (see visible_row_ranges).
@@ -1143,6 +1252,8 @@ pub(crate) fn render_output_crossterm(app: &App) {
     } else if !world.output_lines.is_empty() {
         // Normal unfiltered rendering
         let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
+        // TF's %textdiv rows, as RowMetrics::for_console counts them.
+        let divider = console_divider(world, &app.settings, show_tags, visible_height);
 
         // Collect lines in reverse order, then reverse once (avoids O(n²) insert(0, ...))
         let mut rev_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::with_capacity(visible_height + 8);
@@ -1154,6 +1265,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
             let line = &world.output_lines[line_idx];
             let highlight = should_highlight(line);
             let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+            splice_divider(&mut wrapped, line, divider.as_ref(), &app.settings, term_width);
 
             // Partial line display: truncate the first visible line encountered from the end.
             // This may not be end_line itself if gagged lines were appended after the trigger.
@@ -1192,7 +1304,8 @@ pub(crate) fn render_output_crossterm(app: &App) {
             for line_idx in (end_line + 1)..world.output_lines.len() {
                 let line = &world.output_lines[line_idx];
                 let highlight = should_highlight(line);
-                let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+                let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+                splice_divider(&mut wrapped, line, divider.as_ref(), &app.settings, term_width);
 
                 for w in wrapped {
                     visual_lines.push(w);
@@ -1414,7 +1527,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
     // latch just flipped (ui() already updated app.output_height by the time this
     // crossterm pass runs after it).
     let stats_line_height: u16 = if app.current_world().stats_line_shown { 1 } else { 0 };
-    let input_area_y = app.output_height + stats_line_height + 1;
+    let input_area_y = app.output_height + stats_line_height + app.separator_rows();
     let input_area_width = term_width.max(1);
 
     if viewport_line < app.input_height as usize {
@@ -1652,7 +1765,7 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     //
     // Still crossterm-only, deliberately unchanged here: F8 highlight-action matching and
     // /highlight background painting, which this path has never drawn.
-    let new_line_indicator = app.settings.new_line_indicator;
+    let new_line_indicator = app.settings.nli_drawn();
     let display = build_display_lines(world, &app.settings, visible_height, area_width, app.show_tags);
     let wrapped_lines: Vec<String> = display
         .into_iter()
@@ -2026,6 +2139,19 @@ pub(crate) fn build_stats_line_text(entries: &[crate::stats::StatEntry], max_wid
 /// yet) or entries are empty (the world just disconnected and the latch hasn't caught
 /// up to that on this exact frame — better to render a blank reserved row for one
 /// frame than stale text).
+/// TF's status area (`tf::status`) in place of the separator bar: each row laid out to
+/// the screen's width as TF draws it.
+fn render_tf_status(f: &mut Frame, app: &App, view: &crate::tf::status::StatusView, area: Rect) {
+    let theme = app.settings.theme;
+    let base = Style::default().bg(theme.bg()).fg(theme.fg());
+    for (i, cells) in view.rows.iter().enumerate().take(area.height as usize) {
+        let row_area = Rect { x: area.x, y: area.y + i as u16, width: area.width, height: 1 };
+        let line = crate::tf::status::layout_row(cells, area.width as usize, &view.pad, &view.attr);
+        let text = ansi_to_tui::IntoText::into_text(&line).unwrap_or_else(|_| Text::raw(crate::util::strip_ansi_codes(&line)));
+        f.render_widget(Paragraph::new(text).style(base), row_area);
+    }
+}
+
 pub(crate) fn render_stats_line(f: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
@@ -2042,6 +2168,10 @@ pub(crate) fn render_stats_line(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(view) = app.tf_status.get(&app.current_world_index) {
+        render_tf_status(f, app, view, area);
+        return;
+    }
     let width = area.width as usize;
     let world = app.current_world();
     let theme = app.settings.theme;
@@ -2057,7 +2187,12 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // Build bar components
-    let time_str = get_current_time_12hr();
+    // Clay's 12-hour clock, or TF's %clock_format once a script has set one.
+    let time_str = if app.settings.clock_format.is_empty() {
+        get_current_time_12hr()
+    } else {
+        crate::util::format_clock(&app.settings.clock_format)
+    };
 
     // Status indicator - always reserve space for "More XXXX" or "Hist XXXX" (9 chars)
     // Priority: Hist (when scrolled back) > More (when paused) > underscores
@@ -2068,7 +2203,7 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         (format!("Hist {}", format_more_count(lines_back)), true)
     } else if let Some(count) = more_indicator_count(
         world,
-        &RowMetrics::new(&app.settings, app.show_tags, (app.output_width as usize).max(1)),
+        &RowMetrics::for_console(app),
     ) {
         // Show More indicator when paused with pending lines, or when
         // visual_line_offset truncation is hiding rows of the current world

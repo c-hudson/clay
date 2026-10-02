@@ -734,8 +734,12 @@
 # (keeping each scope's original, unsplit argument text alongside its
 # split `%1../%*` array, and having shift/getopts slice into it instead of
 # rejoining) touches macro-invocation plumbing broadly, not "one small
-# bug" - left for a future job. Not one of finding C's numbered gaps.
-lib_testcolor | echoed "Basic colors: ########", expected "Basic colors:  ########"
+# bug". Not one of finding C's numbered gaps.
+#
+# FIXED (TF drop-in plan, Phase 2.5): a macro call keeps its argument text as
+# written in %* (macros::execute_macro_with_raw), and %-N, %-L, /shift and
+# getopts() slice that text (variables::skip_words/take_words) instead of
+# rejoining words - lib_testcolor passes and is no longer listed.
 
 # Re-pointed (Job 8): /result now works (textencode/textdecode both reach
 # it and produce *a* value), but the value is wrong - not one of finding
@@ -769,7 +773,13 @@ lib_testcolor | echoed "Basic colors: ########", expected "Basic colors:  ######
 # connects one command's output to the next command's input - see the
 # file's own comment) isn't implemented at all, so /uniq never receives
 # dup3's piped output and passes its input through unchanged.
-lib_textutil | line 2: echoed "x", expected "y"
+#
+# FIXED (TF drop-in plan, Phase 2.6): "%|" pipes a command's output into the
+# next command's tfin (macros::Pipe, control_flow::split_list), tfread()/
+# tfwrite() take the tfin/tfout handles and return TF's values, expressions
+# gained +=/-=/*=/=, and /eval runs its text as a macro body (each command
+# substituted as it runs - /wc's /while body used to be expanded once, up
+# front). lib_textutil passes and is no longer listed.
 
 # Re-pointed (Job 10): C.10 is fixed (all 31 events parse case-insensitively,
 # including tintin.tf's lowercase "-h'send ^#...'" combined-pattern form).

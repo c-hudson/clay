@@ -23,12 +23,13 @@ TF_SCRIPT_CASE=strings cargo test tf_script
 
 For each `tests/tf/cases/<name>.tf`, the runner creates a fresh `TfEngine`,
 loads the whole file through the same internal function `/load` and
-`/require` use (`builtins::load_file_internal`), and records everything the
-file produced into a `Transcript`: text that would have been shown to the
-user (`echoed`), errors, text that would have been sent to a MUD
-(`sent`), and text routed to Clay's own non-TF command dispatcher
-(`clay_cmds` - `/quit` at the end of every case lands here, since a headless
-run has no App to hand it to).
+`/require` use (`builtins::load_file_internal`), and sorts the ordered
+`TfEffect`s the file produced (`src/tf/effects.rs` - what a real App would
+apply, in order) into a `Transcript`: text that would have been shown to the
+user (`echoed`; an output's final newline ends it, as `App::emit_client_text`
+splits it), errors, text that would have been sent to a MUD (`sent`), and
+anything only an App can do (`clay_cmds` - a Clay command such as the `/quit`
+at the end of every case, a `/connect`, a `/sh`, a process start).
 
 A case **passes** iff its `echoed` output exactly matches
 `tests/tf/cases/<name>.expected` (trailing whitespace trimmed per line,
@@ -162,12 +163,11 @@ its argument, then executes it). TinyFugue's own stdlib always wraps
 expansions this way; it never relies on a bare top-level line being
 expanded.
 
-Clay, by contrast, currently substitutes every top-level command's arguments
-unconditionally (see `execute_tf_command` in `src/tf/parser.rs`) - so a probe
-written as a bare top-level `/echo len=$[strlen("abc")]` happens to work in
-Clay today but would print the *literal*, unexpanded text under real `tf`.
-That would make the two engines' output diverge for a reason that has
-nothing to do with the thing actually being tested.
+Clay now does the same (`builtins::load_lines` runs each top-level line with
+`execute_command_substituted`, i.e. no substitution pass; `toplevel_nosub.tf`
+pins it), and a line the user types follows `%sub` the way TF's does
+(`TfEngine::run_typed` - with the default `sub=off`, nothing is expanded). A
+bare top-level `/echo len=$[strlen("abc")]` prints the *literal* text in both.
 
 So: **every probe that needs expansion must be wrapped**, either by putting
 it inside a macro body that the script then calls (as in `positional.tf`),
@@ -201,9 +201,8 @@ and `/require <name>.tf` (a bare filename, resolved by real `tf` via
 "Cannot find file: ..." (finding C.2); Job 6 implemented `/require`'s
 bare-filename search, and each case's own gap is now whatever it probes
 *after* that line loads successfully - see the "Current cases" table below
-for each file's live PASS/XFAIL status (most now pass outright; the
-remainder are tracked in `xfail.txt`, one small, already-diagnosed gap per
-file - see the ledger's own comments for what job each is assigned to).
+for each file's live PASS/XFAIL status (all of them pass now; `xfail.txt`
+is empty).
 
 | Case | Library macros probed |
 |---|---|
@@ -272,14 +271,23 @@ file - see the ledger's own comments for what job each is assigned to).
 | `lib_self.tf` | PASS | `/self` (a macro that prints its own body) (fixed Job 15b-i - `control_flow::split_percent_semi`'s "%;" splitting was quote-aware, but real tf's own body-splitting is NOT; see xfail.txt's own removed entry). |
 | `lib_spedwalk.tf` | PASS | `/speedwalk` toggled on then off (the file is really named `spedwalk.tf`, missing the first "e") (fixed Job 15b-i - `/ismacro` now forces `-i` the way real tf's own stdlib macro does, so it can see spedwalk.tf's own invisible hook macro; see xfail.txt's own removed entry). |
 | `lib_stack-q.tf` | PASS | `/push /pop /enqueue /dequeue` (fixed Job 15b-ii - same `$(...)`/`$[...]`-as-expression-operand fix as lib_lisp, plus a real-tf-verified unbraced "%N-default" form - `%1-queue` - in `variables::substitute_variables`'s digit-selector arm; see xfail.txt's own removed entry). |
-| `lib_testcolor.tf` | XFAIL | loading it directly (prints the colour tables as plain text once attributes are stripped) - progressed a great deal further in Job 15b-ii (oracle \r/redraw-marker fix restored the missing ruler header, `normalize_echoed_lines` fixed an ANSI-comparison harness gap, LOADFAIL + `;; preload: stdlib.tf` fixed the missing `_echo`, and a real getopts() bug - a bare "-" end-of-options marker wasn't being consumed - was fixed); remaining gap (a positional-parameter whitespace-fidelity architecture question, not "one small bug") tracked in xfail.txt. |
+| `lib_testcolor.tf` | PASS | loading it directly (prints the colour tables as plain text once attributes are stripped) (fixed by the drop-in work: arguments keep their original spacing - `%*`, `%-N` - as in TF). |
 | `lib_textencode.tf` | PASS | `/textencode /textdecode` (fixed Job 15b-ii - `regmatch()` now also updates the P0-P9/PL/PR LOCAL VARIABLES a trigger match sets, not just the separate array the "%P0" TEXT-substitution form reads - the bare `{P0}`/`{PL}`/`{PR}` EXPRESSION-brace form only ever checked locals; see xfail.txt's own removed entry). |
-| `lib_textutil.tf` | XFAIL | `%|` pipe operator via `/wc -w` and `/uniq` - see the file's own comment on why both use a macro rather than a bare command list - remaining gap tracked in xfail.txt (job 16 (%| pipe operator)). |
+| `lib_textutil.tf` | PASS | `%|` pipe operator via `/wc -w` and `/uniq` - see the file's own comment on why both use a macro rather than a bare command list (fixed by the drop-in work: `%|` pipes, tfin/tfout). |
 | `lib_tick.tf` | PASS | `/tick`, `/ticksize` |
 | `lib_tintin.tf` | PASS | `/showme`, `/math`, `/variable` - see the file's own comment on the one unavoidable `DEF: Redefined macro split` warning every load of this file produces (fixed Job 15b-ii - finding 34's LOADFAIL fix let `;; preload: stdlib.tf` finally complete cleanly, making tintin.tf's own "split" redefinition genuine; see xfail.txt's own removed entry). |
 | `lib_tools.tf` | PASS | `ismacro()` on `shl`, `name`, `xtitle`, `edmac` |
 | `lib_tr.tf` | PASS | `/tr` |
 | `lib_worldq.tf` | PASS | `/list_active_worlds` |
+| `toplevel_nosub.tf` | PASS | A top-level file line is never expanded; a macro body is (the C.12 rule). |
+| `truthiness.tf` | PASS | TF truthiness: a string is true only if it starts with a number; `&`/`|` return an operand; enum variables read as their names. |
+| `special_vars.tf` | PASS | TF's special variables and their defaults, as `/set` shows them. |
+| `argspace.tf` | PASS | Arguments keep their original spacing (`%*`, `%-N`, `{*}`). |
+| `pipes.tf` | PASS | `%|` pipes between commands, `tfread()`. |
+| `trailing_space.tf` | PASS | Trailing spaces in a command's arguments are kept (`/set kprefix=>> `). |
+| `help.tf` | PASS | `/help` on topics only TF's `tf-help` has: a section, a sub-topic with its section named, `/name` before `name`, and TF's not-found message (`;; requires-lib`). |
+| `quote.tf` | PASS | `/quote -S`: each source, <pre>/<suf> and `\` escapes, `-s`, run lines never expanded, and the values it returns. |
+| `status.tf` | PASS | The status line's fields as `status_fields()` shows them after `/status_add`, `/status_rm`, `/status_edit`, `/clock`, save/restore/defaults and `/set status_fields`. |
 | `stdlib_macros.tf` | PASS | stdlib.tf one-liners (`/first /rest /last /nth /escape /replace /toggle /not /expr`, `isvar()`) via `;; preload: stdlib.tf` rather than `/require` (fixed Job 15b-ii - finding 34: `load_file_internal` was already firing the LOADFAIL hook but discarding its `HookOutcome`, so stdlib.tf's own gagged guard around the optional, legitimately-missing `local.tf` could never suppress the error; preloading stdlib.tf now completes with zero errors end to end; see xfail.txt's own removed entry). |
 
 **`dokey.tf` was planned but is not included.** TinyFugue's own non-visual/quiet batch mode (`tf -n -v -q -f...`) still emits raw terminal control bytes - literal `\r` carriage-returns, runs of `\x08` backspaces, and `\a` bells - to keep an internal command-line "redraw" in sync every time `/input` or a buffer-changing `/dokey`/`/dokey_*` runs, even with no real terminal attached. Those bytes are stable and reproducible run-to-run, but they're pure terminal-redraw noise that Clay's headless, engine-only test harness (no `App`, no crossterm rendering) structurally can never emit itself, even after `/dokey` and `kb*()` state syncing are fully implemented (Phase 1/2) - so a fixture built on them could never move from XFAIL to PASS, which defeats the point of the ledger. `kbpoint()`/`kblen()`/`kbhead()`/`kbtail()` on a buffer nothing has ever touched are already covered as "Already working" in the plan's finding C and by existing engine tests, so a fixture limited to that baseline wouldn't add anything either. `lib_kbfunc.tf` (which probes the same library `dokey_home`/`dokey_end`/`kb_backward_kill_line` macros) hits the identical problem and was adapted the same way - see its own file comment.

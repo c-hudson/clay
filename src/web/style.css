@@ -147,6 +147,31 @@ body {
     text-indent: calc(var(--wrapspace, 0) * -1ch);
 }
 
+/* TF's %textdiv (textdivHtml() in app.js): the divider between text already shown and text
+   that arrived since, and for "clear" a blank as tall as the output area. Not selectable:
+   copying output must not pick them up. */
+#output .tf-textdiv {
+    line-height: 1.0;
+    min-height: 1em;
+    white-space: pre;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+#output .tf-textdiv-clear {
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+/* TF's %wrapsize, once a script sets it (applyWrapColumns() in app.js): lines wrap at that
+   many columns instead of the window's edge. The first row starts --wrapspace columns
+   left of the content box, so the box is that much narrower and every row, indented or
+   not, is --wrap-columns wide. */
+#output.wrap-capped .line {
+    max-width: calc((var(--wrap-columns, 80) - var(--wrapspace, 0)) * 1ch);
+}
+
 /* ─── Status/Vitals Panel (mud-status-display.md Job 3) ───
    A flex sibling of #output-container (see index.html), shown/hidden and
    populated by updateStatsPanel() in app.js only when the current world's
@@ -321,6 +346,23 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
     position: relative;
     z-index: 2;
 }
+
+/* TF's status area (/help status area), once a script has made it its own: its rows
+   take the place of the bar's own indicators; the controls stay. */
+#status-bar.tf-status-on { height: auto; min-height: var(--status-height); }
+#status-bar.tf-status-on > :not(.status-menu-btn):not(.tf-status):not(.status-note-btn):not(.status-font-slider) {
+    display: none !important;
+}
+.tf-status {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    font-family: var(--mono);
+    white-space: pre;
+    line-height: 1.2;
+    color: var(--theme-fg, #e8e4ec);
+}
+.tf-status-row { overflow: hidden; }
 
 .status-item {
     display: flex;

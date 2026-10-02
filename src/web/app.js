@@ -438,6 +438,7 @@
         statusScrollbackPct: document.getElementById('status-scrollback-pct'),
         statusTime: document.getElementById('status-time'),
         statusBar: document.getElementById('status-bar'),
+        tfStatus: document.getElementById('tf-status'),
         statusItem: document.querySelector('#status-bar .status-item'),
         // Status/vitals panel (mud-status-display.md Job 3)
         statsPanel: document.getElementById('stats-panel'),
@@ -590,6 +591,8 @@
         worldEditSslToggle: document.getElementById('world-edit-ssl-toggle'),
         worldEditAutoLoginField: document.getElementById('world-edit-auto-login-field'),
         worldEditAutoLoginSelect: document.getElementById('world-edit-auto-login-select'),
+        worldEditTfTypeField: document.getElementById('world-edit-tf-type-field'),
+        worldEditTfType: document.getElementById('world-edit-tf-type'),
         worldEditPromptWaitField: document.getElementById('world-edit-prompt-wait-field'),
         worldEditPromptWaitMs: document.getElementById('world-edit-prompt-wait-ms'),
         worldEditKeepAliveField: document.getElementById('world-edit-keep-alive-field'),
@@ -1166,8 +1169,8 @@
     // Server's activity count (number of worlds with unseen/pending output)
     let serverActivityCount = 0;
 
-    // Remote-WebView /connect confirm state - mirrors App::request_remote_attach's
-    // pending_remote_connect (main.rs): a second "/connect <same addr>" within 15s
+    // Remote-WebView /server confirm state - mirrors App::request_remote_attach's
+    // pending_remote_connect (main.rs): a second "/server <same addr>" within 15s
     // confirms the relaunch. Only used by the WEBVIEW_MODE && !AUTO_PASSWORD intercept.
     let pendingRemoteConnect = null; // { addr, requestedAt } or null
     const REMOTE_CONNECT_CONFIRM_WINDOW_MS = 15000;
@@ -1616,6 +1619,12 @@
     let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'edge')
     let ttsSpeakMode = 'all';  // 'all' or 'limit'
     let newLineIndicator = false;  // Will be synced from server settings
+    // TF's %textdiv, once a script has set it ('off', 'on', 'always' or 'clear'): what a
+    // world brought forward shows between text this client already showed and text that
+    // arrived since, in place of the ▶ markers ('' = Clay's own markers). textdivStr is
+    // the divider (%textdiv_str). Mirrors the console (rendering::console_divider).
+    let textdivMode = '';
+    let textdivStr = '=====';
     let keyboardAlwaysVisible = true;  // Will be synced from server settings
     let hardwareKeyboardPresent = false;  // Set by Java via window.onHardwareKeyboardChanged
 
@@ -1747,6 +1756,14 @@
         document.documentElement.style.setProperty('--wrapspace', String(value));
     }
 
+    // TF's %wrapsize, once a script sets it (GlobalSettingsMsg.wrap_columns): output wraps at
+    // that many columns rather than the window's edge, as in the console. 0: the edge.
+    function applyWrapColumns(value) {
+        const n = Number(value) || 0;
+        document.documentElement.style.setProperty('--wrap-columns', String(n));
+        elements.output.classList.toggle('wrap-capped', n > 0);
+    }
+
     function applyAdvancedFontSettings() {
         var output = elements.output;
         var input = elements.input;
@@ -1781,7 +1798,7 @@
     // work, listed in that test's tf_only_completion_commands allowlist.
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'reach', 'actions',
-        'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'import',
+        'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'server', 'import',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say',
@@ -3227,6 +3244,9 @@
                 // Our ▶ ownership id for this session. Captured before the world hydration
                 // below so lineIsNew() is already correct for the first render.
                 myDisplayId = (typeof msg.your_display_id === 'number') ? msg.your_display_id : 0;
+                // TF's status area, per world, once a script has it (see 'TfStatus').
+                tfStatusViews = {};
+                (msg.tf_status || []).forEach(function(e) { tfStatusViews[e.world_index] = e.view; });
                 // Preserve already-downloaded scrollback across a reconnect instead
                 // of discarding it: the WebSocket may drop and reconnect (network
                 // change, resume) while the JS heap survives (always true for
@@ -3255,6 +3275,8 @@
                 }
 
                 worlds = msg.worlds || [];
+                // TF's %textdiv: what this client is given now counts as already shown.
+                worlds.forEach(function(w) { if (w) w._seenSeq = lastLineSeq(w); });
 
                 // Which world should be focused after this InitialState? Resolved by
                 // world name (the stable identity used elsewhere, e.g. the scrollback
@@ -3731,6 +3753,11 @@
                         wrapspace = msg.settings.wrapspace;
                         applyWrapspace(wrapspace);
                     }
+                    applyWrapColumns(msg.settings.wrap_columns);
+                    clockFormat = msg.settings.clock_format || '';
+                    updateTime();
+                    textdivMode = msg.settings.textdiv || '';
+                    textdivStr = msg.settings.textdiv_str || '=====';
                     if (msg.settings.remote_initial_lines !== undefined) {
                         remoteInitialLines = msg.settings.remote_initial_lines;
                     }
@@ -4395,6 +4422,17 @@
                 }
                 break;
 
+            case 'TfStatus':
+                // TF's status area as a world shows it (the server's refresh_tf_status);
+                // no view: every world shows Clay's own bar again.
+                if (msg.view) {
+                    tfStatusViews[msg.world_index] = msg.view;
+                } else {
+                    tfStatusViews = {};
+                }
+                if (!msg.view || msg.world_index === currentWorldIndex) renderTfStatus();
+                break;
+
             case 'PromptUpdate':
                 // Always store the prompt in the world object
                 if (msg.world_index >= 0 && msg.world_index < worlds.length) {
@@ -4578,6 +4616,16 @@
                     if (msg.settings.wrapspace !== undefined) {
                         wrapspace = msg.settings.wrapspace;
                         applyWrapspace(wrapspace); // pure CSS reflow, no re-render needed
+                    }
+                    applyWrapColumns(msg.settings.wrap_columns);
+                    clockFormat = msg.settings.clock_format || '';
+                    updateTime();
+                    {
+                        const oldTextdiv = textdivMode + '\u0000' + textdivStr;
+                        textdivMode = msg.settings.textdiv || '';
+                        textdivStr = msg.settings.textdiv_str || '=====';
+                        // The ▶ markers come and go with it.
+                        if (oldTextdiv !== textdivMode + '\u0000' + textdivStr) renderOutput();
                     }
                     if (msg.settings.remote_initial_lines !== undefined) {
                         const remoteLinesChanged = remoteInitialLines !== msg.settings.remote_initial_lines;
@@ -5073,6 +5121,7 @@
                     // Same reason as in switchWorldLocal: claim before the paint so ▶ is
                     // there on the first frame rather than after MarkWorldSeen round-trips.
                     claimUnviewedLocally(msg.world_index);
+                    if (msg.world_index !== previousWorldIndex) arriveTextdiv(msg.world_index);
                     renderOutput();
                     // Send MarkWorldSeen since we're now viewing this world; tell the server
                     // which world we left so it can clear that world's indicators even across
@@ -6297,8 +6346,27 @@
     // Send command - all commands are sent to the server for parsing via Rust's
     // parse_command(). Server handles data commands directly and responds with
     // ExecuteLocalCommand for UI/popup commands.
+    // TF's "^old^new" history substitution, the same rule as the Rust side's
+    // InputArea::substitute_history: null when `cmd` isn't of that form; otherwise
+    // { line } - the most recent `history` entry containing "old", its first "old"
+    // replaced by "new" (everything after the second "^") - or { noMatch: true }.
+    function tfHistorySubstitute(cmd, history) {
+        if (!cmd.startsWith('^')) return null;
+        const caret = cmd.indexOf('^', 1);
+        if (caret < 0) return null;
+        const oldText = cmd.substring(1, caret);
+        const newText = cmd.substring(caret + 1);
+        for (let i = history.length - 1; i >= 0; i--) {
+            const at = history[i].indexOf(oldText);
+            if (at >= 0) {
+                return { line: history[i].substring(0, at) + newText + history[i].substring(at + oldText.length) };
+            }
+        }
+        return { noMatch: true };
+    }
+
     function sendCommand() {
-        const cmd = elements.input.value;
+        let cmd = elements.input.value;
         if (!authenticated) return;
 
         // Only release held output / reset more-mode state when following live output at
@@ -6316,6 +6384,27 @@
         if (worlds[currentWorldIndex] && worlds[currentWorldIndex].showing_splash) {
             worlds[currentWorldIndex].showing_splash = false;
             renderOutput();
+        }
+
+        // TF's "^old^new" (InputArea::substitute_history on the Rust side): re-run the
+        // most recent command containing "old", its first "old" replaced by "new". This
+        // client keeps its own history, so it is resolved here, before sending - never
+        // at a password prompt, and not in a chat world, where "^^" is just text. The
+        // new line, not the "^old^new" one, is what lands in history (below).
+        const subWorld = worlds[currentWorldIndex];
+        const subWorldType = (subWorld && subWorld.settings && subWorld.settings.world_type) || 'mud';
+        if (!(subWorld && subWorld.echo_masked) && (subWorldType === 'mud' || subWorldType === 'mud_timed_prompt')) {
+            const sub = tfHistorySubstitute(cmd, commandHistory);
+            if (sub && sub.noMatch) {
+                appendClientLine('% No match.');
+                historyIndex = -1;
+                elements.input.value = '';
+                return;
+            }
+            if (sub) {
+                cmd = sub.line;
+                appendClientLine(cmd);
+            }
         }
 
         const cmdTrimmed = cmd.trim();
@@ -6373,15 +6462,15 @@
             return;
         }
 
-        // Intercept /connect in remote WebView mode — this client attaches to/detaches
+        // Intercept /server in remote WebView mode — this client attaches to/detaches
         // from remote Clay servers directly; never forwarded to the currently-attached
-        // server (the master WebView's /connect is handled server-side instead).
+        // server (the master WebView's /server is handled server-side instead).
         if (window.WEBVIEW_MODE && !window.AUTO_PASSWORD &&
-            (cmdTrimmed === '/connect' || cmdTrimmed.startsWith('/connect '))) {
+            (cmdTrimmed === '/server' || cmdTrimmed.startsWith('/server '))) {
             elements.input.value = '';
-            var connectArgs = cmdTrimmed.length > 9 ? cmdTrimmed.substring(9).trim().split(/\s+/).filter(Boolean) : [];
+            var connectArgs = cmdTrimmed.length > 8 ? cmdTrimmed.substring(8).trim().split(/\s+/).filter(Boolean) : [];
             if (connectArgs.length === 0) {
-                appendClientLine('Usage: /connect host:port  (or)  /connect host port  (or)  /connect --close');
+                appendClientLine('Usage: /server host:port  (or)  /server host port  (or)  /server --close');
             } else if (connectArgs[0] === '--close') {
                 pendingRemoteConnect = null;
                 sendIpc('connect-close');
@@ -6390,7 +6479,7 @@
                     pendingRemoteConnect = null;
                     appendClientLine('Cancelled.');
                 } else {
-                    appendClientLine('No pending /connect to cancel.');
+                    appendClientLine('No pending /server to cancel.');
                 }
             } else {
                 var connectAddr = connectArgs.length > 1 ? (connectArgs[0] + ':' + connectArgs[1]) : connectArgs[0];
@@ -6402,8 +6491,8 @@
                 } else {
                     pendingRemoteConnect = { addr: connectAddr, requestedAt: now };
                     appendClientLine('This will disconnect from the current server and attach to ' +
-                        connectAddr + ' instead. Run /connect ' + connectAddr +
-                        ' again within 15s to confirm, or /connect --cancel.');
+                        connectAddr + ' instead. Run /server ' + connectAddr +
+                        ' again within 15s to confirm, or /server --cancel.');
                 }
             }
             return;
@@ -6977,6 +7066,56 @@
         // deep-scroll session left it - keeps per-world DOM cost bounded across
         // multiple world visits, not just within one.
         if (oldWorld) oldWorld._renderWindow = RENDER_WINDOW_INITIAL;
+        // TF's %textdiv: shown up to here; the divider of this visit goes with it.
+        if (oldWorld) {
+            const seen = lastLineSeq(oldWorld);
+            if (seen !== null) oldWorld._seenSeq = seen;
+            oldWorld._textdiv = null;
+        }
+    }
+
+    // The seq of a world's newest line, or null.
+    function lastLineSeq(world) {
+        const lines = world && world.output_lines;
+        if (!lines) return null;
+        for (let i = lines.length - 1; i >= 0; i--) {
+            const l = lines[i];
+            if (l && typeof l === 'object' && typeof l.seq === 'number' && !l.from_archive) return l.seq;
+        }
+        return null;
+    }
+
+    // Arriving at a world: TF's %textdiv divider for this visit, when a script has set one
+    // ("on" only when something arrived since this client last showed it). Same rule as
+    // the console's App::track_console_world.
+    function arriveTextdiv(index) {
+        const world = worlds[index];
+        if (!world) return;
+        world._textdiv = null;
+        if (textdivMode !== 'on' && textdivMode !== 'always' && textdivMode !== 'clear') return;
+        const afterSeq = (typeof world._seenSeq === 'number') ? world._seenSeq : null;
+        const last = lastLineSeq(world);
+        const hasNew = last !== null && (afterSeq === null || last > afterSeq);
+        if (textdivMode !== 'on' || hasNew) {
+            world._textdiv = { afterSeq: afterSeq, mode: textdivMode };
+        }
+    }
+
+    // Clay's ▶ new-text markers are drawn: the setting is on and TF's %textdiv, which takes
+    // their place, is not set (Settings::nli_drawn).
+    function nliDrawn() {
+        return newLineIndicator && !textdivMode;
+    }
+
+    // The divider element: TF's %textdiv_str, or for "clear" a blank as tall as the output
+    // area, which takes the old text out of view the way TF clears it (scrolling back still
+    // shows it). Not a .line, so nothing that counts rendered lines counts it.
+    function textdivHtml(mode) {
+        if (mode === 'clear') {
+            const h = elements.outputContainer ? elements.outputContainer.clientHeight : 0;
+            return '<div class="tf-textdiv-clear" style="height:' + h + 'px"></div>';
+        }
+        return '<div class="tf-textdiv">' + escapeHtml(textdivStr) + '</div>';
     }
 
     // Switch world locally (does not affect console)
@@ -7024,6 +7163,7 @@
             // round-trips - otherwise this render shows the text bare and the markers appear
             // a moment later. The ClaimedNew that MarkWorldSeen triggers reconciles it.
             claimUnviewedLocally(index);
+            arriveTextdiv(index);
             renderOutput();
             updateStatusBar();
             // Update prompt to show new world's prompt
@@ -7156,9 +7296,9 @@
             { l: '/addworld [-x] name host port', r: 'Create a new world' },
             { l: '/disconnect (or /dc)', r: 'Disconnect from server' },
             { l: '/connections (or /l)', r: 'List connected worlds' },
-            { l: '/connect &lt;host[:port]&gt;', r: 'Attach to a remote Clay server' },
-            { l: '/connect --close', r: 'Detach and become an independent master' },
-            { l: '/connect --cancel', r: 'Cancel a pending confirmation' },
+            { l: '/server &lt;host[:port]&gt;', r: 'Attach to a remote Clay server' },
+            { l: '/server --close', r: 'Detach and become an independent master' },
+            { l: '/server --cancel', r: 'Cancel a pending confirmation' },
             { heading: 'Communication' },
             { l: '/send [-W] [-w&lt;world&gt;] [-n] &lt;text&gt;', r: 'Send text to world(s)' },
             { l: '', r: '-W=all worlds, -n=no newline' },
@@ -8028,7 +8168,8 @@
     // past RENDER_WINDOW_MAX, and a capped "grow" then still leaves the rebuild dropping
     // the surplus off the top — the exact loss this function exists to prevent.
     function growRenderWindowToDom(world) {
-        const domLines = elements.output.childElementCount;
+        // Lines only: a %textdiv divider is a child element too, but not a line.
+        const domLines = elements.output.querySelectorAll(':scope > .line').length;
         const current = world._renderWindow || RENDER_WINDOW_INITIAL;
         if (domLines > current) {
             world._renderWindow = domLines;
@@ -8192,6 +8333,12 @@
             if (p.worldIndex === currentWorldIndex && p.obj) held.add(p.obj);
         }
 
+        // TF's %textdiv: above the first line shown that arrived after what this client had
+        // shown, else ("always"/"clear") after the last line. Not in a filtered view.
+        const divider = (world._textdiv && (textdivMode === 'on' || textdivMode === 'always' || textdivMode === 'clear')
+            && !(filterPopupOpen && filterText.length > 0) && !grepRegex) ? world._textdiv : null;
+        let dividerPlaced = false;
+
         // Build lines as HTML with explicit <br> line breaks
         const htmlParts = [];
         for (let i = startIdx; i < searchEndIdx; i++) {
@@ -8248,7 +8395,7 @@
             const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
             // Skip Discord emoji conversion when showTags is enabled so users can see original text
             const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
-            const newLinePrefix = (newLineIndicator && lineMarkedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
+            const newLinePrefix = (nliDrawn() && lineMarkedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
             const archivePrefix = (lineFromArchive || lineArchiveSourced) ? '🛢️ ' : '';
             let html = tsPrefix + newLinePrefix + archivePrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
@@ -8262,7 +8409,15 @@
                 html = `<span class="action-highlight">${html}</span>`;
             }
 
+            if (divider && !dividerPlaced && typeof lineObj === 'object' && typeof lineObj.seq === 'number'
+                && !lineObj.from_archive && (divider.afterSeq === null || lineObj.seq > divider.afterSeq)) {
+                htmlParts.push(textdivHtml(divider.mode));
+                dividerPlaced = true;
+            }
             htmlParts.push(`<span class="line" data-line-idx="${i}">${html}</span>`);
+        }
+        if (divider && !dividerPlaced && divider.mode !== 'on') {
+            htmlParts.push(textdivHtml(divider.mode));
         }
 
         // Each line is its own block-level element (the "line" class, see style.css) so
@@ -8336,7 +8491,7 @@
         const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
         // Skip Discord emoji conversion when showTags is enabled so users can see original text
         const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
-        const newLinePrefix = (newLineIndicator && markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
+        const newLinePrefix = (nliDrawn() && markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
         // Without this the line would render with ✨ on arrival and only become 🛢️ on the
         // next full renderOutput() - the flash this path has produced before.
         const archivePrefix = archiveSourced ? '🛢️ ' : '';
@@ -9886,6 +10041,7 @@
         updateStatsPanel();
 
         updateScrollbackProgress();
+        renderTfStatus();
         renderTabsRibbon();
         renderIconBar();
         // Keep an open world-switch dropdown live - e.g. a disconnected
@@ -9895,9 +10051,156 @@
         if (worldMenuOpen) renderWorldMenu();
     }
 
-    // Update time (12-hour format H:MM, no AM/PM)
+    // TF's status area (/help status area). Once a script has made it its own, the server
+    // sends each world's fields (TfStatus: rows of {text, width, flex, right}, the pad
+    // character and the area's attributes) and this lays them out to the bar's own width,
+    // exactly as tf::status::layout_row does for the console, in place of the bar's own
+    // indicators.
+    let tfStatusViews = {};
+    let tfStatusCharPx = 0;
+    let tfStatusCharFont = '';
+
+    // Columns a character takes (unicode-width's answer for the common cases).
+    function tfCharCols(cp) {
+        if (cp === 0x200B || (cp >= 0x0300 && cp <= 0x036F) || (cp >= 0xFE00 && cp <= 0xFE0F) || cp === 0x200D) return 0;
+        if ((cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) || (cp >= 0xAC00 && cp <= 0xD7A3)
+            || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF00 && cp <= 0xFF60)
+            || (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1F64F) || (cp >= 0x1F900 && cp <= 0x1F9FF)
+            || (cp >= 0x20000 && cp <= 0x3FFFD)) return 2;
+        return 1;
+    }
+
+    // `text` cut to `max` columns, every escape sequence kept; and its columns.
+    function tfCutToColumns(text, max) {
+        let out = '';
+        let cols = 0;
+        let cut = false;
+        const chars = Array.from(text || '');
+        for (let i = 0; i < chars.length; i++) {
+            const c = chars[i];
+            if (c === '\x1b') {
+                out += c;
+                if (chars[i + 1] === '[') {
+                    out += chars[++i];
+                    while (i + 1 < chars.length) {
+                        const d = chars[++i];
+                        out += d;
+                        if (/[A-Za-z]/.test(d)) break;
+                    }
+                }
+                continue;
+            }
+            const w = tfCharCols(c.codePointAt(0));
+            if (cut || cols + w > max) { cut = true; continue; }
+            out += c;
+            cols += w;
+        }
+        return [out, cols];
+    }
+
+    // One row in `width` columns, as TF draws it (tf::status::layout_row): fixed fields
+    // take their width, the flexible one what is left, text cut to fit and filled out
+    // with the pad (right-justified where asked), the rest of the row padded, all of it
+    // cut at the edge, the whole row in `attr`.
+    function layoutTfStatusRow(cells, width, pad, attr) {
+        const padChar = Array.from(pad || '')[0] || ' ';
+        let fixed = 0;
+        for (const c of cells) if (!c.flex) fixed += c.width || 0;
+        const flexWidth = Math.max(0, width - fixed);
+        let out = attr || '';
+        let used = 0;
+        for (const cell of cells) {
+            if (used >= width) break;
+            const cols = Math.min(cell.flex ? flexWidth : (cell.width || 0), width - used);
+            const [text, textCols] = tfCutToColumns(cell.text, cols);
+            const fill = padChar.repeat(cols - textCols);
+            const resume = text.indexOf('\x1b') >= 0 ? (attr || '') : '';
+            out += cell.right ? fill + text + resume : text + resume + fill;
+            used += cols;
+        }
+        out += padChar.repeat(Math.max(0, width - used));
+        if (attr) out += '\x1b[0m';
+        return out;
+    }
+
+    // How many characters fit across the strip, in its own font.
+    function tfStatusColumns(box) {
+        const font = getComputedStyle(box).font;
+        if (!tfStatusCharPx || font !== tfStatusCharFont) {
+            const probe = document.createElement('span');
+            probe.textContent = '0123456789'.repeat(4);
+            probe.style.cssText = 'visibility:hidden;position:absolute;white-space:pre';
+            box.appendChild(probe);
+            tfStatusCharPx = probe.getBoundingClientRect().width / 40 || 7;
+            box.removeChild(probe);
+            tfStatusCharFont = font;
+        }
+        return Math.max(1, Math.floor(box.clientWidth / tfStatusCharPx));
+    }
+
+    function renderTfStatus() {
+        const view = tfStatusViews[currentWorldIndex];
+        const bar = elements.statusBar;
+        const box = elements.tfStatus;
+        if (!box) return;
+        if (!view) {
+            if (bar.classList.contains('tf-status-on')) {
+                bar.classList.remove('tf-status-on');
+                box.style.display = 'none';
+                box.innerHTML = '';
+            }
+            return;
+        }
+        bar.classList.add('tf-status-on');
+        box.style.display = '';
+        const cols = tfStatusColumns(box);
+        let html = '';
+        for (const cells of (view.rows || [])) {
+            html += '<div class="tf-status-row">' + parseAnsi(layoutTfStatusRow(cells, cols, view.pad, view.attr)) + '</div>';
+        }
+        box.innerHTML = sanitizeHtml(html);
+    }
+
+    // TF's %clock_format, once a script sets it (GlobalSettingsMsg.clock_format): the clock
+    // reads as ftime() would show it. Empty: Clay's own 12-hour clock.
+    let clockFormat = '';
+
+    // ftime()/strftime for the common conversions (%H %M %S %I %p %a %b %d %m %y %Y ...).
+    function tfFormatTime(fmt, d) {
+        const p2 = n => String(n).padStart(2, '0');
+        const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
+            'September', 'October', 'November', 'December'];
+        const h12 = d.getHours() % 12 || 12;
+        const start = new Date(d.getFullYear(), 0, 1);
+        const yday = Math.floor((d - start) / 86400000) + 1;
+        const conv = {
+            a: () => days[d.getDay()].slice(0, 3), A: () => days[d.getDay()],
+            b: () => months[d.getMonth()].slice(0, 3), h: () => months[d.getMonth()].slice(0, 3),
+            B: () => months[d.getMonth()], C: () => p2(Math.floor(d.getFullYear() / 100)),
+            d: () => p2(d.getDate()), e: () => String(d.getDate()).padStart(2, ' '),
+            D: () => `${p2(d.getMonth() + 1)}/${p2(d.getDate())}/${p2(d.getFullYear() % 100)}`,
+            F: () => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`,
+            H: () => p2(d.getHours()), I: () => p2(h12), j: () => String(yday).padStart(3, '0'),
+            k: () => String(d.getHours()).padStart(2, ' '), l: () => String(h12).padStart(2, ' '),
+            m: () => p2(d.getMonth() + 1), M: () => p2(d.getMinutes()), n: () => '\n',
+            p: () => (d.getHours() < 12 ? 'AM' : 'PM'), P: () => (d.getHours() < 12 ? 'am' : 'pm'),
+            r: () => `${p2(h12)}:${p2(d.getMinutes())}:${p2(d.getSeconds())} ${d.getHours() < 12 ? 'AM' : 'PM'}`,
+            R: () => `${p2(d.getHours())}:${p2(d.getMinutes())}`, S: () => p2(d.getSeconds()),
+            t: () => '\t', T: () => `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`,
+            u: () => String(d.getDay() || 7), w: () => String(d.getDay()),
+            y: () => p2(d.getFullYear() % 100), Y: () => String(d.getFullYear()), '%': () => '%',
+        };
+        return fmt.replace(/%(.)/g, (m, c) => (conv[c] ? conv[c]() : m));
+    }
+
+    // Update time (Clay's 12-hour H:MM, no AM/PM - or %clock_format)
     function updateTime() {
         const now = new Date();
+        if (clockFormat) {
+            elements.statusTime.textContent = tfFormatTime(clockFormat, now);
+            return;
+        }
         let hours = now.getHours() % 12;
         if (hours === 0) hours = 12;
         const minutes = now.getMinutes().toString().padStart(2, '0');
@@ -12177,6 +12480,7 @@
         // valid wait, not "unset".
         const promptWaitMs = Number(world.settings?.prompt_wait_ms);
         elements.worldEditPromptWaitMs.value = Number.isFinite(promptWaitMs) ? promptWaitMs : 1000;
+        if (elements.worldEditTfType) elements.worldEditTfType.value = world.settings?.tf_type || '';
         elements.worldEditSlackToken.value = world.settings?.slack_token || '';
         elements.worldEditSlackChannel.value = world.settings?.slack_channel || '';
         elements.worldEditSlackWorkspace.value = world.settings?.slack_workspace || '';
@@ -12330,7 +12634,7 @@
     // gated (visible for every type, same as the console's WORLD_FIELD_LOG_ENABLED).
     const WORLD_EDIT_MUD_FIELD_IDS = [
         'worldEditHostnameField', 'worldEditPortField', 'worldEditUserField',
-        'worldEditPasswordField', 'worldEditSslField', 'worldEditAutoLoginField',
+        'worldEditPasswordField', 'worldEditSslField', 'worldEditAutoLoginField', 'worldEditTfTypeField',
         'worldEditKeepAliveField', 'worldEditEncodingField', 'worldEditGmcpField',
         'worldEditMspEnabledField',
         'worldEditMcpEnabledField', 'worldEditMccp2EnabledField'
@@ -12384,6 +12688,7 @@
         // Number.isFinite (not `|| 1000`) so an explicit 0 survives - 0 is a real,
         // valid wait, not "unset" (see investigate-differences-between-tinyfugu-
         // fluffy-stallman.md Job B).
+        const tfType = elements.worldEditTfType ? elements.worldEditTfType.value.trim() : '';
         const promptWaitMsRaw = Number(elements.worldEditPromptWaitMs.value);
         const promptWaitMs = Number.isFinite(promptWaitMsRaw) ? Math.max(0, Math.trunc(promptWaitMsRaw)) : 1000;
         const slackToken = elements.worldEditSlackToken.value;
@@ -12419,6 +12724,7 @@
             mccp2_enabled: elements.worldEditMccp2EnabledToggle.classList.contains('active'),
             world_type: worldType,
             prompt_wait_ms: promptWaitMs,
+            tf_type: tfType,
             slack_token: slackToken,
             slack_channel: slackChannel,
             slack_workspace: slackWorkspace,
@@ -12464,6 +12770,7 @@
         world.settings.mccp2_enabled = elements.worldEditMccp2EnabledToggle.classList.contains('active');
         world.settings.world_type = worldType;
         world.settings.prompt_wait_ms = promptWaitMs;
+        world.settings.tf_type = tfType;
         world.settings.slack_token = slackToken;
         world.settings.slack_channel = slackChannel;
         world.settings.slack_workspace = slackWorkspace;
@@ -14731,6 +15038,12 @@
         // following view thousands of lines up after a reflow.
         if (window.ResizeObserver) {
             const repinObserver = new ResizeObserver(function() {
+                // TF's %textdiv "clear" blank stays as tall as the output area. Set only on
+                // a change, so this can't feed back into itself.
+                const h = elements.outputContainer.clientHeight + 'px';
+                elements.output.querySelectorAll(':scope > .tf-textdiv-clear').forEach(function(el) {
+                    if (el.style.height !== h) el.style.height = h;
+                });
                 if (followBottom) scrollToBottom();
             });
             repinObserver.observe(elements.outputContainer);

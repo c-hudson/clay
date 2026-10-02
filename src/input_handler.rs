@@ -76,6 +76,9 @@ pub(crate) fn save_editor_content(app: &mut App) -> KeyAction {
 pub(crate) enum KeyAction {
     Quit,
     SendCommand(String),
+    /// A key bound by `/bind`/`/def -b` (or a `key_<name>` macro): its command runs as a
+    /// macro body - TF's rule for bindings - not as a typed line.
+    RunBound(String),
     Connect, // Trigger connection from settings popup
     Redraw,  // Force screen redraw + drop client-generated lines (TF-parity plan: action
              // `redraw_server_only`, Clay's historical ^L behavior)
@@ -919,6 +922,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                     app.worlds[idx].settings.world_type = new_world_type;
                     app.worlds[idx].settings.prompt_wait_ms = settings.prompt_wait_ms;
+                    app.worlds[idx].settings.tf_type = settings.tf_type.clone();
 
                     // Update MUD settings
                     app.worlds[idx].settings.hostname = settings.hostname;
@@ -947,6 +951,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.auto_connect_type = match settings.auto_connect.as_str() {
                         "prompt" => AutoConnectType::Prompt,
                         "moo_prompt" => AutoConnectType::MooPrompt,
+                        "lines" => AutoConnectType::Lines,
                         "none" => AutoConnectType::NoLogin,
                         _ => AutoConnectType::Connect,
                     };
@@ -1296,7 +1301,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     // (see keynames.rs and tf::hooks::bind_key), so no separate translation is needed here.
     if let Some(ref name) = key_name {
         if let Some(cmd) = chords::resolve_bound_command(app, name) {
-            return KeyAction::SendCommand(cmd);
+            return KeyAction::RunBound(cmd);
         }
     }
 
@@ -1540,7 +1545,7 @@ pub(crate) fn perform_completion(app: &mut App) -> bool {
             // Unified / commands: Clay commands + TF commands + manual actions + macros
             let internal_commands = vec![
                 // Clay-specific commands
-                "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections",
+                "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections", "/server",
                 "/setup", "/web", "/actions", "/reload", "/update", "/quit", "/gag",
                 "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify",
                 // TF commands (now available with / prefix)
@@ -1550,7 +1555,7 @@ pub(crate) fn perform_completion(app: &mut App) -> bool {
                 "/undeft", "/list", "/purge", "/bind", "/unbind", "/load", "/save",
                 "/lcd", "/time", "/version", "/ps", "/kill", "/sh", "/recall",
                 "/setenv", "/listvar", "/repeat", "/fg", "/trigger", "/input",
-                "/grab", "/ungag", "/exit", "/addworld",
+                "/grab", "/ungag", "/exit", "/addworld", "/connect",
                 // TF-specific versions (for conflicting commands)
                 "/tfhelp", "/tfgag",
             ];

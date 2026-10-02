@@ -1,0 +1,9 @@
+defaults sub=off login=on matching=glob ptime=1.0
+a=on b=on c=1 d=0
+e=on
+f=regexp g=regexp h=20
+i=7
+j=0:01
+k=off
+l=0
+m=on

@@ -1,0 +1,4 @@
+tf=%H:%M:%S
+x=[%{time_format}]
+show=[%{time_format}]
+y=$[1+2]

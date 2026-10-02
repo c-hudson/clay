@@ -57,8 +57,8 @@ enum WvEvent {
     UpdateStatus(String),
     /// Hot reload: exec a new binary (remote GUI only)
     Reload,
-    /// /connect: relaunch attached to a different server, or (addr=None) detach and become
-    /// an independent master (remote GUI only — master GUI handles /connect server-side)
+    /// /server: relaunch attached to a different server, or (addr=None) detach and become
+    /// an independent master (remote GUI only — master GUI handles /server server-side)
     RemoteRelaunch { addr: Option<String> },
     /// Open a new window (optionally locked to a world)
     NewWindow { world: Option<String>, auth: Option<InheritedAuth> },
@@ -1278,8 +1278,8 @@ fn dispatch_ipc_message(
             let _ = proxy.send_event(WvEvent::Reload);
         }
     } else if body == "connect-close" {
-        // /connect --close: only meaningful for a remote GUI (detach and become a master).
-        // The master webview never sends this — its /connect is handled server-side.
+        // /server --close: only meaningful for a remote GUI (detach and become a master).
+        // The master webview never sends this — its /server is handled server-side.
         if !is_master {
             let _ = proxy.send_event(WvEvent::RemoteRelaunch { addr: None });
         }
@@ -1696,7 +1696,7 @@ fn create_webview_window(
                 }
             }
             Event::UserEvent(WvEvent::RemoteRelaunch { ref addr }) => {
-                // Remote GUI /connect: relaunch attached elsewhere, or (addr=None) detach
+                // Remote GUI /server: relaunch attached elsewhere, or (addr=None) detach
                 // and become an independent master. No state to save — a remote client's
                 // state lives on whichever server it's attached to.
                 if let Err(e) = crate::platform::exec_relaunch(addr.as_deref(), true) {

@@ -21,6 +21,8 @@
   - **LastRecv**: Time since last data received from server
   - **LastNOP**: Time since last NOP keepalive was sent
   - **NextNOP**: Time until next NOP keepalive
+- `/connect [-lqb] [<world>]`, `/connect <host> <port>` - Connect a world (TinyFugue's; a host/port makes a temporary world)
+- `/server <host:port>` (`--close`, `--cancel`) - Attach this console to another Clay (formerly `/connect`)
 - `/reload` - Hot reload: exec new binary while preserving TCP connections
 - `/testmusic` - Play a test ANSI music sequence (C-D-E-F-G) to verify audio works
 - `/notify <message>` - Send notification to Android app (works from input or action commands)

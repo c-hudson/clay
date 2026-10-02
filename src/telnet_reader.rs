@@ -82,16 +82,82 @@ fn make_server_data_event(target: &TelnetTarget, bytes: Vec<u8>) -> AppEvent {
     }
 }
 
-/// Build the `AppEvent` that reports the connection closing for `target`.
-/// `conn_id` is only meaningful for `World` (`AppEvent::Disconnected`'s
-/// second field, used to ignore a stale reader's disconnect after a
-/// reconnect); `AppEvent::MultiuserDisconnected` carries no connection id at
-/// all, so it is simply not passed through on that arm.
-fn make_disconnected_event(target: &TelnetTarget, conn_id: u64) -> AppEvent {
+/// Why a connection ended - carried to the App so TF's DISCONNECT hook gets its reason
+/// and Clay's own message can be hidden by a gagged hook (`App::close_notice`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The server closed it (an EOF, or a TLS close without close_notify).
+    ByServer,
+    /// A read failed, with the system's text for why.
+    ReadError(String),
+    /// The connection's writer stopped: `/dc` shut it down (the report is then stale), or
+    /// a write to the server failed.
+    SendFailed,
+    /// The MCCP2 stream was corrupt.
+    Compression(String),
+    /// A Slack/Discord session ended, with its reason.
+    Chat(String),
+}
+
+impl CloseReason {
+    /// Clay's own message for the world's output.
+    pub fn message(&self) -> String {
+        match self {
+            CloseReason::ByServer => "Connection closed by server.".to_string(),
+            CloseReason::ReadError(text) => format!("Read error: {}", text),
+            CloseReason::SendFailed => "Connection lost: sending failed.".to_string(),
+            CloseReason::Compression(detail) => format!("MCCP2 stream corrupt ({}); disconnecting.", detail),
+            CloseReason::Chat(text) => text.clone(),
+        }
+    }
+
+    /// TF's DISCONNECT hook argument text for `world`: the world alone when the server
+    /// closed it, `<world> recv <error>` for a failed read (as real tf), else the world
+    /// and Clay's description.
+    pub fn hook_args(&self, world: &str) -> String {
+        match self {
+            CloseReason::ByServer => world.to_string(),
+            CloseReason::ReadError(text) => format!("{} recv {}", world, text),
+            CloseReason::SendFailed => format!("{} send failed", world),
+            CloseReason::Compression(detail) => format!("{} MCCP2 stream corrupt ({})", world, detail),
+            CloseReason::Chat(text) => format!("{} {}", world, text),
+        }
+    }
+}
+
+/// An I/O error's text as TF shows one (`strerror`/`gai_strerror`): without Rust's
+/// " (os error N)" suffix, the "failed to lookup address information: " a failed name
+/// lookup is prefixed with, or the documentation link rustls appends to its own errors.
+pub fn error_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    let text = text.strip_prefix("failed to lookup address information: ").unwrap_or(&text);
+    let text = match text.find(": https://") {
+        Some(i) => &text[..i],
+        None => text,
+    };
+    match text.rfind(" (os error ") {
+        Some(i) if text.ends_with(')') => text[..i].to_string(),
+        _ => text.to_string(),
+    }
+}
+
+/// Report the connection ending. A single-user world gets `CloseNotice` (Clay's message,
+/// decided by the App so a gagged DISCONNECT hook can hide it) then `Disconnected`, both
+/// carrying `conn_id` so a stale reader's report is ignored after a reconnect or `/dc`.
+/// Multiuser has no TF hooks and no connection id: its message goes out as plain server
+/// text, as it always has, except when the writer stopped (a disconnect asked for).
+async fn report_close(event_tx: &mpsc::Sender<AppEvent>, target: &TelnetTarget, conn_id: u64, reason: CloseReason) {
     match target {
-        TelnetTarget::World(name) => AppEvent::Disconnected(name.clone(), conn_id),
+        TelnetTarget::World(name) => {
+            let _ = event_tx.send(AppEvent::CloseNotice(name.clone(), conn_id, reason.clone())).await;
+            let _ = event_tx.send(AppEvent::Disconnected(name.clone(), conn_id, reason)).await;
+        }
         TelnetTarget::Multiuser { world_index, username } => {
-            AppEvent::MultiuserDisconnected(*world_index, username.clone())
+            if reason != CloseReason::SendFailed {
+                let text = format!("{}\n", reason.message()).into_bytes();
+                let _ = event_tx.send(AppEvent::MultiuserServerData(*world_index, username.clone(), text)).await;
+            }
+            let _ = event_tx.send(AppEvent::MultiuserDisconnected(*world_index, username.clone())).await;
         }
     }
 }
@@ -268,9 +334,15 @@ pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> 
 ///
 /// Unifies one behavioural difference the plan calls out by name: of the
 /// thirteen existing reader loops, four print "Connection closed by
-/// server.\n" on a clean EOF and nine silently do not. This reader always
-/// prints it — a proxy or MUD disconnect going unremarked in the transcript
-/// is the bug, not a feature worth keeping either variant of.
+/// server.\n" on a clean EOF and nine silently do not. Every close is
+/// reported now (`report_close`, with a `CloseReason`) — a proxy or MUD
+/// disconnect going unremarked in the transcript is the bug. For a
+/// single-user world the App prints the message (`App::close_notice`), so
+/// that a gagged TF DISCONNECT hook can hide it.
+///
+/// The reader also stops as soon as its writer does (`cmd_tx.closed()`):
+/// `/dc` shuts the writer down, and a reader left running would keep the
+/// socket open and keep delivering the server's text to the world.
 ///
 /// Runs the mandatory idle flush described on `IDLE_FLUSH_INTERVAL`: a
 /// `tokio::select!` between the socket read and a resettable timer, reset on
@@ -302,20 +374,26 @@ pub fn spawn_telnet_reader(
             tokio::select! {
                 result = read_half.read(&mut buffer) => {
                     match result {
+                        // A clean EOF - or a TLS peer that closed without close_notify,
+                        // which rustls reports as an error although many MUDs close
+                        // exactly that way.
                         Ok(0) => {
-                            // Clean EOF. Release whatever text was still held
-                            // back rather than losing it (this is exactly
-                            // what flush_eof is for), then the unified close
-                            // message and disconnect event.
+                            // Release whatever text was still held back rather than
+                            // losing it (this is exactly what flush_eof is for), then the
+                            // close report.
                             let outcome = session.flush_eof();
                             if !outcome.text.is_empty() {
                                 let _ = event_tx.send(make_server_data_event(&target, outcome.text)).await;
                             }
-                            let _ = event_tx.send(make_server_data_event(
-                                &target,
-                                b"Connection closed by server.\n".to_vec(),
-                            )).await;
-                            let _ = event_tx.send(make_disconnected_event(&target, conn_id)).await;
+                            report_close(&event_tx, &target, conn_id, CloseReason::ByServer).await;
+                            return;
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            let outcome = session.flush_eof();
+                            if !outcome.text.is_empty() {
+                                let _ = event_tx.send(make_server_data_event(&target, outcome.text)).await;
+                            }
+                            report_close(&event_tx, &target, conn_id, CloseReason::ByServer).await;
                             return;
                         }
                         Ok(n) => {
@@ -373,9 +451,7 @@ pub fn spawn_telnet_reader(
                                 if !eof.text.is_empty() {
                                     let _ = event_tx.send(make_server_data_event(&target, eof.text)).await;
                                 }
-                                let msg = format!("MCCP2 stream corrupt ({reason}); disconnecting.\n");
-                                let _ = event_tx.send(make_server_data_event(&target, msg.into_bytes())).await;
-                                let _ = event_tx.send(make_disconnected_event(&target, conn_id)).await;
+                                report_close(&event_tx, &target, conn_id, CloseReason::Compression(reason)).await;
                                 return;
                             }
 
@@ -407,12 +483,22 @@ pub fn spawn_telnet_reader(
                             if !eof.text.is_empty() {
                                 let _ = event_tx.send(make_server_data_event(&target, eof.text)).await;
                             }
-                            let msg = format!("Read error: {}", e);
-                            let _ = event_tx.send(make_server_data_event(&target, msg.into_bytes())).await;
-                            let _ = event_tx.send(make_disconnected_event(&target, conn_id)).await;
+                            report_close(&event_tx, &target, conn_id, CloseReason::ReadError(error_text(&e))).await;
                             return;
                         }
                     }
+                }
+                // The writer is gone: `/dc` shut the connection down (this connection is
+                // then already stale, so the report is ignored), or a write failed. Either
+                // way nothing more may be read from it - a reader that carried on would
+                // keep feeding a disconnected (or since reconnected) world.
+                _ = cmd_tx.closed() => {
+                    let eof = session.flush_eof();
+                    if !eof.text.is_empty() {
+                        let _ = event_tx.send(make_server_data_event(&target, eof.text)).await;
+                    }
+                    report_close(&event_tx, &target, conn_id, CloseReason::SendFailed).await;
+                    return;
                 }
                 _ = &mut idle_timer => {
                     let text = session.take_idle_flushable_text();
@@ -1164,9 +1250,9 @@ mod tests {
 
         assert!(matches!(
             h.next_event().await,
-            AppEvent::ServerData(n, b) if n == "w" && b == b"Connection closed by server.\n".to_vec()
+            AppEvent::CloseNotice(n, 42, CloseReason::ByServer) if n == "w"
         ));
-        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, id) if n == "w" && id == 42));
+        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, 42, CloseReason::ByServer) if n == "w"));
     }
 
     #[tokio::test]
@@ -1186,9 +1272,9 @@ mod tests {
         ));
         assert!(matches!(
             h.next_event().await,
-            AppEvent::ServerData(n, b) if n == "w" && b == b"Connection closed by server.\n".to_vec()
+            AppEvent::CloseNotice(n, _, CloseReason::ByServer) if n == "w"
         ));
-        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, _) if n == "w"));
+        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, _, _) if n == "w"));
     }
 
     // ==================================================================
@@ -1280,9 +1366,9 @@ mod tests {
         h.close_server();
         assert!(matches!(
             h.next_event().await,
-            AppEvent::ServerData(n, b) if n == "proxyworld" && b == b"Connection closed by server.\n".to_vec()
+            AppEvent::CloseNotice(n, _, CloseReason::ByServer) if n == "proxyworld"
         ));
-        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, _) if n == "proxyworld"));
+        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, _, _) if n == "proxyworld"));
     }
 
     // ==================================================================
@@ -1320,15 +1406,15 @@ mod tests {
             AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::CompressionFailed(_)) if n == "corruptworld"
         ));
         match h.next_event().await {
-            AppEvent::ServerData(n, b) => {
+            AppEvent::CloseNotice(n, _, reason @ CloseReason::Compression(_)) => {
                 assert_eq!(n, "corruptworld");
-                let text = String::from_utf8_lossy(&b);
+                let text = reason.message();
                 assert!(text.contains("MCCP2 stream corrupt"), "got: {text}");
                 assert!(text.contains("disconnecting"), "got: {text}");
             }
-            _ => panic!("expected ServerData with the corruption message"),
+            _ => panic!("expected the corruption CloseNotice"),
         }
-        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, _) if n == "corruptworld"));
+        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, _, CloseReason::Compression(_)) if n == "corruptworld"));
 
         // The reader task returned: the channel closes, nothing more is ever sent.
         assert!(h.event_rx.recv().await.is_none(), "reader task must have returned");
@@ -1371,13 +1457,74 @@ mod tests {
             AppEvent::ServerData(n, b) if n == "w" && b == b"Login: ".to_vec()
         ));
         match next(&mut event_rx).await {
-            AppEvent::ServerData(n, b) => {
+            AppEvent::CloseNotice(n, _, reason) => {
                 assert_eq!(n, "w");
-                assert_eq!(String::from_utf8_lossy(&b), "Read error: connection reset");
+                assert_eq!(reason, CloseReason::ReadError("connection reset".to_string()));
+                assert_eq!(reason.message(), "Read error: connection reset");
+                assert_eq!(reason.hook_args("w"), "w recv connection reset");
             }
-            _ => panic!("expected the read-error ServerData"),
+            _ => panic!("expected the read-error CloseNotice"),
         }
-        assert!(matches!(next(&mut event_rx).await, AppEvent::Disconnected(n, _) if n == "w"));
+        assert!(matches!(next(&mut event_rx).await, AppEvent::Disconnected(n, _, CloseReason::ReadError(_)) if n == "w"));
+    }
+
+    /// A TLS server that closes without close_notify reaches rustls as UnexpectedEof - an
+    /// error, but an ordinary close for most MUDs, so it is reported as the server
+    /// closing the connection, not as a read error with rustls's documentation link.
+    #[tokio::test]
+    async fn tls_close_without_close_notify_is_a_server_close() {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        )));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let _handle = spawn_telnet_reader(
+            StreamReader::Scripted(queue),
+            cmd_tx,
+            event_tx,
+            TelnetTarget::World("w".to_string()),
+            3,
+            test_cfg(),
+        );
+        assert!(matches!(event_rx.recv().await, Some(AppEvent::CloseNotice(n, 3, CloseReason::ByServer)) if n == "w"));
+        assert!(matches!(event_rx.recv().await, Some(AppEvent::Disconnected(n, 3, CloseReason::ByServer)) if n == "w"));
+    }
+
+    /// When its writer stops (`/dc` shuts it down), the reader stops too - reporting the
+    /// close (which the App then finds stale) - instead of keeping the socket open and
+    /// delivering the server's text to a disconnected world.
+    #[tokio::test]
+    async fn reader_stops_when_its_writer_is_gone() {
+        let mut h = Harness::spawn_with_conn_id(TelnetTarget::World("w".to_string()), 9);
+        h.send(b"before\n").await;
+        assert!(matches!(h.next_event().await, AppEvent::ServerData(n, _) if n == "w"));
+        h.cmd_rx.close();
+        assert!(matches!(h.next_event().await, AppEvent::CloseNotice(n, 9, CloseReason::SendFailed) if n == "w"));
+        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, 9, CloseReason::SendFailed) if n == "w"));
+        // Gone for good: the reader returned (dropping its half of the socket), so nothing
+        // the server sends afterwards is read.
+        assert!(h.event_rx.recv().await.is_none(), "the reader task must have returned");
+    }
+
+    /// Error texts as TF shows them: no " (os error N)", no getaddrinfo prefix, no
+    /// rustls documentation link; and the DISCONNECT arguments for each reason.
+    #[test]
+    fn test_error_text_and_hook_args() {
+        assert_eq!(error_text(&std::io::Error::from_raw_os_error(104)), "Connection reset by peer");
+        assert_eq!(
+            error_text(&std::io::Error::other("failed to lookup address information: Name or service not known")),
+            "Name or service not known"
+        );
+        assert_eq!(
+            error_text(&std::io::Error::other("peer closed connection without sending TLS close_notify: https://docs.rs/x")),
+            "peer closed connection without sending TLS close_notify"
+        );
+        assert_eq!(CloseReason::ByServer.hook_args("mud"), "mud");
+        assert_eq!(CloseReason::ReadError("Connection reset by peer".into()).hook_args("mud"), "mud recv Connection reset by peer");
+        assert_eq!(CloseReason::SendFailed.hook_args("mud"), "mud send failed");
+        assert_eq!(CloseReason::ByServer.message(), "Connection closed by server.");
     }
 
     // ==================================================================

@@ -275,6 +275,13 @@ fn record_settings_fingerprint(path: &std::path::Path) {
     if path != get_settings_path().as_path() {
         return;
     }
+    // Under test the canonical path is the per-process test home, which many App-level
+    // tests save to in parallel; recording here would race
+    // test_settings_fingerprint_survives_reload_state_roundtrip, the one test that owns
+    // this global.
+    if cfg!(test) {
+        return;
+    }
     let fp = std::fs::read(path).ok().map(|b| fingerprint_settings_bytes(&b));
     *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = fp;
 }
@@ -400,6 +407,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
 
     // Save global settings
     writeln!(file, "[global]")?;
+    // [tf_globals] format version: 2 = environment and seed values are no longer
+    // written (see load_settings_from_str's one-time cleanup of older files).
+    writeln!(file, "tf_globals_version={}", TF_GLOBALS_VERSION)?;
     writeln!(file, "more_mode={}", app.settings.more_mode_enabled)?;
     writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
     writeln!(file, "temp_convert={}", app.settings.temp_convert_enabled)?;
@@ -500,6 +510,11 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if !has_mud_config && !has_slack_config && !has_discord_config && world.is_initial_world {
             continue; // unconfigured auto-created placeholder only
         }
+        // TF's /connect <host> <port> world lives only as long as its connection (it
+        // does survive a /reload, through the reload state).
+        if world.is_temporary {
+            continue;
+        }
         writeln!(file)?;
         writeln!(file, "[world:{}]", world.name)?;
         // Stable archive identity; see World::world_id. Written only once assigned,
@@ -547,6 +562,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         // convention as `auto_reconnect_secs` above (default `DEFAULT_PROMPT_WAIT_MS`).
         if world.settings.prompt_wait_ms != crate::DEFAULT_PROMPT_WAIT_MS {
             writeln!(file, "prompt_wait_ms={}", world.settings.prompt_wait_ms)?;
+        }
+        if !world.settings.tf_type.is_empty() {
+            writeln!(file, "tf_type={}", world.settings.tf_type)?;
         }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
@@ -636,17 +654,36 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
 
     // Note: bans are in-memory only and not persisted
 
-    // Save TF global variables
-    if !app.tf_engine.global_vars.is_empty() {
+    // TF's DEFAULT world (`/addworld DEFAULT <char> <pass> [<file>]`): the character,
+    // password and macro file a world without its own uses. The password is encrypted at
+    // rest like every world's.
+    let (dchar, dpass, dfile) = (
+        &app.tf_engine.default_world_character,
+        &app.tf_engine.default_world_password,
+        &app.tf_engine.default_world_file,
+    );
+    if dchar.is_some() || dpass.is_some() || dfile.is_some() {
+        writeln!(file)?;
+        writeln!(file, "[world_default]")?;
+        if let Some(c) = dchar {
+            writeln!(file, "character={}", c)?;
+        }
+        if let Some(pw) = dpass {
+            writeln!(file, "password={}", secret(pw))?;
+        }
+        if let Some(f) = dfile {
+            writeln!(file, "file={}", f)?;
+        }
+    }
+
+    // Save TF global variables - only deliberate ones, never the imported environment
+    // or the engine's own seeds (see TfEngine::persistable_globals).
+    let globals = app.tf_engine.persistable_globals();
+    if !globals.is_empty() {
         writeln!(file)?;
         writeln!(file, "[tf_globals]")?;
-        for (name, value) in &app.tf_engine.global_vars {
-            // Escape special characters in value
-            let val_str = value.to_string_value()
-                .replace('\\', "\\\\")
-                .replace('=', "\\e")
-                .replace('\n', "\\n");
-            writeln!(file, "{}={}", name, val_str)?;
+        for (name, value) in globals {
+            writeln!(file, "{}={}", name, escape_tf_global_value(&value.to_string_value()))?;
         }
     }
 
@@ -844,6 +881,12 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
     let mut current_action: Option<usize> = None;
     let mut in_banned_hosts = false;
     let mut in_tf_globals = false;
+    let mut in_world_default = false;
+    // [global] precedes [tf_globals], but a pre-scan keeps this independent of order.
+    let tf_globals_v2 = content.lines()
+        .filter_map(|l| l.trim().strip_prefix("tf_globals_version="))
+        .any(|v| v.parse::<u32>().unwrap_or(0) >= TF_GLOBALS_VERSION);
+    let mut dropped_tf_globals: Vec<String> = Vec::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -857,6 +900,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
             current_action = None;
             in_banned_hosts = false;
             in_tf_globals = false;
+            in_world_default = false;
             continue;
         }
 
@@ -865,6 +909,16 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
             current_action = None;
             in_banned_hosts = true;
             in_tf_globals = false;
+            in_world_default = false;
+            continue;
+        }
+
+        if line.starts_with("[world_default]") {
+            current_world = None;
+            current_action = None;
+            in_banned_hosts = false;
+            in_tf_globals = false;
+            in_world_default = true;
             continue;
         }
 
@@ -873,6 +927,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
             current_action = None;
             in_banned_hosts = false;
             in_tf_globals = true;
+            in_world_default = false;
             continue;
         }
 
@@ -886,6 +941,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
             current_action = None;
             in_banned_hosts = false;
             in_tf_globals = false;
+            in_world_default = false;
             continue;
         }
 
@@ -894,6 +950,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
             current_world = None;
             in_banned_hosts = false;
             in_tf_globals = false;
+            in_world_default = false;
             let section_content = &line[8..line.len() - 1]; // Extract between "[action:" and "]"
 
             // Unescape the section content (for new format names with special chars)
@@ -934,14 +991,39 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                 continue;
             }
 
+            // TF's DEFAULT world
+            if in_world_default {
+                match key {
+                    "character" => app.tf_engine.default_world_character = Some(value.to_string()),
+                    "password" => app.tf_engine.default_world_password = Some(decrypt_password(value)),
+                    "file" => app.tf_engine.default_world_file = Some(value.to_string()),
+                    _ => {}
+                }
+                continue;
+            }
+
             // Check for TF globals section
             if in_tf_globals {
-                // Unescape the value
-                let unescaped = value
-                    .replace("\\\\", "\x00")
-                    .replace("\\n", "\n")
-                    .replace("\\e", "=")
-                    .replace("\x00", "\\");
+                let unescaped = unescape_tf_global_value(value);
+                // The live environment always wins over a saved copy (TFLIBDIR, TFPATH,
+                // PATH, ...): the saved value is from another session, possibly another
+                // machine.
+                if app.tf_engine.env_imported.contains_key(key) {
+                    continue;
+                }
+                // One-time cleanup of a file written before tf_globals_version=2, which
+                // saved every global: the whole imported environment (secrets included)
+                // and the engine's own seeds. Environment variable names are all
+                // capitals; a seed is recognised by its unchanged value.
+                if !tf_globals_v2 {
+                    let is_env_name = key.chars().any(|c| c.is_ascii_uppercase())
+                        && key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                    let is_seed = app.tf_engine.seed_values.get(key).is_some_and(|s| *s == unescaped);
+                    if is_env_name || is_seed || crate::tf::TRANSIENT_GLOBALS.contains(&key) {
+                        dropped_tf_globals.push(key.to_string());
+                        continue;
+                    }
+                }
                 app.tf_engine.set_global(key, tf::TfValue::from(unescaped));
                 continue;
             }
@@ -1284,6 +1366,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                             world.settings.prompt_wait_ms =
                                 value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
                         }
+                        "tf_type" => world.settings.tf_type = value.to_string(),
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -1333,7 +1416,54 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
     for world in &mut app.worlds {
         migrate_chat_settings(&mut world.settings);
     }
+    // A saved %wrapsize, %clock_format or %textdiv (a [tf_globals] entry) applies from the
+    // start.
+    app.apply_tf_wrap();
+    app.apply_tf_clock_format(None);
+    app.apply_tf_textdiv();
     *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
+    if !dropped_tf_globals.is_empty() {
+        // Names only - the values may be secrets.
+        debug_log(true, &format!(
+            "settings: dropped {} environment/seed entries from an old [tf_globals] section: {}",
+            dropped_tf_globals.len(), dropped_tf_globals.join(", ")));
+    }
+}
+
+/// `[tf_globals]` format version written to `[global]` (see `TfEngine::persistable_globals`).
+pub(crate) const TF_GLOBALS_VERSION: u32 = 2;
+
+/// Escape a TF global's value for one `name=value` line of `[tf_globals]`. Besides `\`,
+/// `=` and newlines, spaces at either end are escaped (`\s`): the loader trims every
+/// line, which used to lose them.
+pub(crate) fn escape_tf_global_value(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('=', "\\e")
+        .replace('\n', "\\n");
+    let leading = escaped.len() - escaped.trim_start_matches(' ').len();
+    let trailing = escaped.len() - escaped.trim_end_matches(' ').len();
+    if leading == 0 && trailing == 0 {
+        return escaped;
+    }
+    if leading == escaped.len() {
+        return "\\s".repeat(leading);
+    }
+    format!("{}{}{}",
+        "\\s".repeat(leading),
+        &escaped[leading..escaped.len() - trailing],
+        "\\s".repeat(trailing))
+}
+
+/// Inverse of `escape_tf_global_value`. A `\s` can only be an escaped space: a literal
+/// backslash is always written doubled, and doubled backslashes are resolved first.
+pub(crate) fn unescape_tf_global_value(value: &str) -> String {
+    value
+        .replace("\\\\", "\x00")
+        .replace("\\n", "\n")
+        .replace("\\e", "=")
+        .replace("\\s", " ")
+        .replace('\x00', "\\")
 }
 
 /// Merges a remote Clay instance's exported settings.dat text into `app` — remote-wins on
@@ -1671,6 +1801,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                             world.settings.prompt_wait_ms =
                                 value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
                         }
+                        "tf_type" => world.settings.tf_type = value.to_string(),
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -1843,6 +1974,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             writeln!(file, "mcp_enabled={}", world.settings.mcp_enabled)?;
             writeln!(file, "mccp2_enabled={}", world.settings.mccp2_enabled)?;
             writeln!(file, "prompt_wait_ms={}", world.settings.prompt_wait_ms)?;
+            if !world.settings.tf_type.is_empty() {
+                writeln!(file, "tf_type={}", world.settings.tf_type)?;
+            }
             writeln!(file, "encoding={}", world.settings.encoding.name())?;
             writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
             writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
@@ -1980,6 +2114,10 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
     writeln!(file, "remote_initial_lines={}", app.settings.remote_initial_lines)?;
     writeln!(file, "url_shorteners={}", crate::encoding::UrlShortener::list_to_string(&app.settings.url_shorteners))?;
+    // The TF engine's own state - macros, bindings, hooks, /repeats, variables - so a
+    // reload doesn't lose a .tfrc's worth of definitions (see tf::snapshot). A key of
+    // [reload] rather than a section of its own: an older Clay reading this ignores it.
+    writeln!(file, "tf_state={}", tf::snapshot::TfStateSnapshot::capture(&app.tf_engine, std::time::Instant::now()).encode())?;
     // Fingerprint of settings.dat as we last read/wrote it. The restore compares it
     // against the file on disk so a hand edit made while Clay was running survives the
     // reload - see reapply_externally_edited_settings.
@@ -2081,6 +2219,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         writeln!(file)?;
         writeln!(file, "[world_state:{}]", idx)?;
         writeln!(file, "name={}", world.name.replace('=', "\\e"))?;
+        if world.is_temporary {
+            writeln!(file, "is_temporary=true")?;
+        }
         writeln!(file, "scroll_offset={}", world.scroll_offset)?;
         writeln!(file, "connected={}", world.connected)?;
         writeln!(file, "unseen_lines={}", world.unseen_lines)?;
@@ -2273,6 +2414,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         if world.settings.prompt_wait_ms != crate::DEFAULT_PROMPT_WAIT_MS {
             writeln!(file, "prompt_wait_ms={}", world.settings.prompt_wait_ms)?;
         }
+        if !world.settings.tf_type.is_empty() {
+            writeln!(file, "tf_type={}", world.settings.tf_type)?;
+        }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
             writeln!(file, "slack_token={}", world.settings.slack_token.replace('=', "\\e"))?;
@@ -2363,6 +2507,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     // already been on somebody's screen and can never be claimed as ▶ again). `display_id`
     // is deliberately NOT persisted: a reload has no live clients, so every marker restores
     // as unowned, and an unviewed line is simply re-claimable by whoever displays it first.
+    // h, W, L, G: the line's place in TF's history (`LineHistory::flags`).
     for (idx, world) in app.worlds.iter().enumerate() {
         writeln!(file)?;
         writeln!(file, "[output:{}]", idx)?;
@@ -2373,6 +2518,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             if line.gagged { flags.push('g'); }
             if line.is_input { flags.push('i'); }
             if line.viewed { flags.push('v'); }
+            flags.push_str(&line.hist.flags());
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -2384,6 +2530,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             if line.gagged { flags.push('g'); }
             if line.is_input { flags.push('i'); }
             if line.viewed { flags.push('v'); }
+            flags.push_str(&line.hist.flags());
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -2520,6 +2667,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         /// stays `false`, the same as any freshly-constructed `World`.
         mccp2_resume_after_reload: bool,
         was_connected: bool,
+        is_temporary: bool,
         showing_splash: bool,
         telnet_mode: bool,
         negotiated_encoding: Option<Encoding>,
@@ -2594,6 +2742,8 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         archive_sourced: false,
                         viewed: flags.contains('v'),
                         display_id: None,
+                        hist: crate::LineHistory::from_flags(flags),
+                        tf_attrs: None,
                     };
                 } else if parts.len() == 3 {
                     // Older format: timestamp|flags|text (no seq) - predates is_input, but
@@ -2617,6 +2767,8 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         archive_sourced: false,
                         viewed: flags.contains('v'),
                         display_id: None,
+                        hist: crate::LineHistory::from_flags(flags),
+                        tf_attrs: None,
                     };
                 } else {
                     // Old format: timestamp|text (assume from_server=true for compatibility)
@@ -2636,6 +2788,8 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         archive_sourced: false,
                         viewed: true,
                         display_id: None,
+                        hist: crate::LineHistory::default(),
+                        tf_attrs: None,
                     };
                 }
             }
@@ -2679,6 +2833,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         mccp2_active: false,
                         mccp2_resume_after_reload: false,
                         was_connected: false,
+                        is_temporary: false,
                         showing_splash: false,
                         telnet_mode: false,
                         negotiated_encoding: None,
@@ -2910,6 +3065,17 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         // the built-in order rather than disabling /url.
                         app.settings.url_shorteners = crate::encoding::UrlShortener::parse_list(value);
                     }
+                    "tf_state" => {
+                        // An unreadable snapshot is no snapshot: TF starts cold, as it
+                        // did before snapshots existed.
+                        if let Some(snapshot) = tf::snapshot::TfStateSnapshot::decode(value) {
+                            snapshot.restore(&mut app.tf_engine, std::time::Instant::now());
+                            app.tf_state_restored = true;
+                            app.apply_tf_wrap();
+                            app.apply_tf_clock_format(None);
+                            app.apply_tf_textdiv();
+                        }
+                    }
                     "settings_fingerprint" => {
                         // What settings.dat looked like when we last read/wrote it, so
                         // load_reload_state can spot a hand edit made while we ran.
@@ -3083,6 +3249,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "mccp2_active" => tw.mccp2_active = value == "true",
                             "mccp2_resume_after_reload" => tw.mccp2_resume_after_reload = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
+                            "is_temporary" => tw.is_temporary = value == "true",
                             "showing_splash" => tw.showing_splash = value == "true",
                             "telnet_mode" => tw.telnet_mode = value == "true",
                             "negotiated_encoding" => tw.negotiated_encoding = Encoding::from_iana_name(value),
@@ -3136,6 +3303,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                                 tw.settings.prompt_wait_ms =
                                     value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
                             }
+                            "tf_type" => tw.settings.tf_type = value.to_string(),
                             "encoding" => {
                                 tw.settings.encoding = match value {
                                     "latin1" => Encoding::Latin1,
@@ -3286,6 +3454,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.protocol.mccp2_active = tw.mccp2_active;
         world.mccp2_resume_after_reload = tw.mccp2_resume_after_reload;
         world.was_connected = tw.was_connected;
+        world.is_temporary = tw.is_temporary;
         world.showing_splash = tw.showing_splash;
         world.telnet_mode = tw.telnet_mode;
         world.protocol.negotiated_encoding = tw.negotiated_encoding;
@@ -3479,6 +3648,26 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
 mod tests {
     use super::*;
 
+    /// TF's DEFAULT world (`/addworld DEFAULT <char> <pass> <file>`) survives a save and
+    /// a load, its password encrypted on disk like every world's.
+    #[test]
+    fn test_default_world_round_trip() {
+        let mut app = App::new();
+        app.tf_engine.default_world_character = Some("bob".to_string());
+        app.tf_engine.default_world_password = Some("s3cret pw".to_string());
+        app.tf_engine.default_world_file = Some("~/mud.tf".to_string());
+        let mut buf = Vec::new();
+        write_settings_dat(&app, &mut buf, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("[world_default]") && !text.contains("s3cret pw"), "{text}");
+        let mut fresh = App::new();
+        load_settings_from_str(&mut fresh, &text);
+        assert_eq!(fresh.tf_engine.default_world_character.as_deref(), Some("bob"));
+        assert_eq!(fresh.tf_engine.default_world_password.as_deref(), Some("s3cret pw"));
+        assert_eq!(fresh.tf_engine.default_world_file.as_deref(), Some("~/mud.tf"));
+        assert!(fresh.worlds.iter().all(|w| w.name != "world_default"), "not a world of its own");
+    }
+
     /// Helper: set ALL Settings fields to non-default values.
     /// Uses explicit struct construction — if a new field is added to Settings,
     /// this function will fail to compile until updated here AND in the assertions.
@@ -3496,6 +3685,10 @@ mod tests {
             gui_transparency: 0.7,             // default: 1.0
             color_offset_percent: 42,          // default: 0
             wrapspace: 7,                      // default: 0
+            wrap_columns: 0,                   // not saved: %wrapsize is a TF variable
+            clock_format: String::new(),       // not saved: %clock_format is a TF variable
+            textdiv: String::new(),            // not saved: %textdiv is a TF variable
+            textdiv_str: "=====".to_string(),
             remote_initial_lines: 250,         // default: 100
             // default: [IsGd, VGd, TinyUrl] — different services AND different order
             url_shorteners: vec![
@@ -3598,6 +3791,7 @@ mod tests {
             mcp_enabled: false,                            // default: true
             mccp2_enabled: false,                          // default: true
             prompt_wait_ms: 2500,                          // default: 1000
+            tf_type: "lp.diku".to_string(),                // default: ""
         }
     }
 
@@ -3701,6 +3895,7 @@ mod tests {
         assert_eq!(a.mcp_enabled, b.mcp_enabled, "{context}: mcp_enabled");
         assert_eq!(a.mccp2_enabled, b.mccp2_enabled, "{context}: mccp2_enabled");
         assert_eq!(a.prompt_wait_ms, b.prompt_wait_ms, "{context}: prompt_wait_ms");
+        assert_eq!(a.tf_type, b.tf_type, "{context}: tf_type");
     }
 
     /// A connectionless world (`/addworld <name>` with no host, the web client's "add
@@ -4304,7 +4499,7 @@ mod tests {
             String::new(), false, false,
             "utf8".to_string(), "connect".to_string(), "nop".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
-            "discord".to_string(), 1000, String::new(), String::new(), String::new(),
+            "discord".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), "Guild".to_string(), "#dev".to_string(), String::new(),
             Some(chat),
         );
@@ -4486,6 +4681,34 @@ mod tests {
         load_reload_state_from_str(&mut reloaded, &content).expect("load");
         assert_eq!(reloaded.input.buffer, "@set me=foo\nsecond \\ line");
         assert_eq!(reloaded.input.cursor_position, reloaded.input.buffer.len());
+    }
+
+    /// A line's place in TF's history - `G` (nohistory), or recorded by /recordline -
+    /// survives a hot reload, so /recall still leaves the one out and finds the other.
+    #[test]
+    fn test_history_marks_survive_a_hot_reload() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = crate::World::new("H");
+        world.showing_splash = false;
+        let mut g = OutputLine::new("kept out".to_string(), 0);
+        g.hist.nohistory = true;
+        let mut rec = OutputLine::new_client("recorded".to_string(), 1);
+        rec.gagged = true;
+        rec.hist.recorded = Some(crate::RecordScope::Global);
+        world.output_lines = vec![g, rec, OutputLine::new("plain".to_string(), 2)];
+        world.next_seq = 3;
+        app.worlds.push(world);
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save");
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &String::from_utf8(buf).unwrap()).expect("load");
+        let lines = &reloaded.worlds[0].output_lines;
+        assert!(lines[0].hist.nohistory && lines[0].hist.recorded.is_none());
+        assert_eq!(lines[1].hist.recorded, Some(crate::RecordScope::Global));
+        assert!(lines[1].gagged);
+        assert_eq!(lines[2].hist, crate::LineHistory::default());
     }
 
     #[test]
@@ -5092,5 +5315,120 @@ MyHost.Example:9000=AABBCC
         assert!(!map.contains_key("MyHost.Example:9000"));
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Unit tests must never reach the real ~/.clay: the settings path (and everything
+    /// else under clay_config_dir) lives in the per-process test home.
+    #[test]
+    fn test_settings_path_is_in_test_home() {
+        let path = get_settings_path();
+        assert!(path.starts_with(crate::test_home_dir()), "settings path {path:?} escaped the test home");
+        if let Some(real) = home::home_dir() {
+            assert_ne!(path, real.join(".clay").join("settings.dat"));
+            assert_ne!(path, real.join("clay").join("settings.dat"));
+        }
+    }
+
+    /// An App-level save (the kind a TF command like /more triggers) writes to the test
+    /// home, where it can be read back.
+    #[test]
+    fn test_save_settings_writes_into_test_home() {
+        let mut app = App::new();
+        app.tf_engine.set_global("clay_test_home_marker", tf::TfValue::from("yes".to_string()));
+        save_settings(&app).expect("save");
+        let written = std::fs::read_to_string(get_settings_path()).expect("read back");
+        assert!(written.contains("clay_test_home_marker=yes"));
+    }
+
+    fn tf_globals_section(content: &str) -> Vec<String> {
+        content.lines()
+            .skip_while(|l| l.trim() != "[tf_globals]")
+            .skip(1)
+            .take_while(|l| !l.trim().starts_with('['))
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// The imported environment and the engine's own seeds are never written to
+    /// settings.dat while unchanged; a deliberate /set is, and so is a changed env value.
+    #[test]
+    fn test_tf_globals_skip_environment_and_seeds() {
+        let mut app = App::new();
+        app.tf_engine.env_imported.insert("CLAY_TEST_SECRET_TOKEN".into(), "s3cret".into());
+        app.tf_engine.set_global("CLAY_TEST_SECRET_TOKEN", tf::TfValue::from("s3cret".to_string()));
+        app.tf_engine.env_imported.insert("CLAY_TEST_CHANGED".into(), "old".into());
+        app.tf_engine.set_global("CLAY_TEST_CHANGED", tf::TfValue::from("new".to_string()));
+        app.tf_engine.set_global("myvar", tf::TfValue::from("hello".to_string()));
+        app.tf_engine.set_global("?", tf::TfValue::Integer(1));
+
+        let tmp = std::env::temp_dir().join(format!("clay_test_tf_globals_env_{}.dat", std::process::id()));
+        save_settings_to_path(&app, &tmp).expect("save");
+        let content = std::fs::read_to_string(&tmp).expect("read");
+        let _ = std::fs::remove_file(&tmp);
+
+        let section = tf_globals_section(&content);
+        assert!(content.contains("tf_globals_version=2"));
+        assert!(section.contains(&"myvar=hello".to_string()), "{section:?}");
+        assert!(section.contains(&"CLAY_TEST_CHANGED=new".to_string()), "{section:?}");
+        for skipped in ["CLAY_TEST_SECRET_TOKEN", "maxpri", "time_format", "redef", "TFLIBDIR", "HOME", "?"] {
+            assert!(!section.iter().any(|l| l.starts_with(&format!("{skipped}="))),
+                "{skipped} must not be persisted: {section:?}");
+        }
+        // Nothing from the real environment leaks either.
+        assert!(!section.iter().any(|l| l.starts_with("PATH=") || l.starts_with("CARGO_")), "{section:?}");
+    }
+
+    /// A settings.dat written before tf_globals_version=2 saved every global, including
+    /// the environment. Loading it drops environment-style and seed entries once; the
+    /// next save no longer contains them. A deliberate lower-case variable survives.
+    #[test]
+    fn test_old_tf_globals_section_is_cleaned_once() {
+        let old = "[global]\nmore_mode=true\n\n[tf_globals]\nCLAY_TEST_LEAKED_TOKEN=abc\nmaxpri=2147483647\ntime_format=%H:%M\nmyvar=keep\n?=1\n";
+        let mut app = App::new();
+        load_settings_from_str(&mut app, old);
+        assert!(app.tf_engine.get_var("CLAY_TEST_LEAKED_TOKEN").is_none());
+        assert_eq!(app.tf_engine.get_var("myvar").map(|v| v.to_string_value()), Some("keep".to_string()));
+
+        let tmp = std::env::temp_dir().join(format!("clay_test_tf_globals_cleanup_{}.dat", std::process::id()));
+        save_settings_to_path(&app, &tmp).expect("save");
+        let content = std::fs::read_to_string(&tmp).expect("read");
+        let _ = std::fs::remove_file(&tmp);
+        let section = tf_globals_section(&content);
+        assert_eq!(section, vec!["myvar=keep".to_string()]);
+
+        // Once the file is version 2, an all-capitals variable is the user's own and stays.
+        let v2 = "[global]\ntf_globals_version=2\n\n[tf_globals]\nMYVAR=1\n";
+        let mut app2 = App::new();
+        load_settings_from_str(&mut app2, v2);
+        assert_eq!(app2.tf_engine.get_var("MYVAR").map(|v| v.to_string_value()), Some("1".to_string()));
+    }
+
+    /// The live environment wins over a saved copy (a stale TFLIBDIR from another
+    /// session or machine must not override $TFLIBDIR).
+    #[test]
+    fn test_live_environment_wins_over_saved_tf_global() {
+        let mut app = App::new();
+        app.tf_engine.env_imported.insert("CLAY_TEST_LIBDIR".into(), "/live".into());
+        app.tf_engine.set_global("CLAY_TEST_LIBDIR", tf::TfValue::from("/live".to_string()));
+        load_settings_from_str(&mut app, "[global]\ntf_globals_version=2\n\n[tf_globals]\nCLAY_TEST_LIBDIR=/stale\n");
+        assert_eq!(app.tf_engine.get_var("CLAY_TEST_LIBDIR").map(|v| v.to_string_value()), Some("/live".to_string()));
+    }
+
+    /// Values keep spaces at either end, and the escapes round-trip.
+    #[test]
+    fn test_tf_global_value_escaping_round_trips() {
+        for v in ["  padded  ", " ", "a=b", "x\\sy", "line1\nline2", "  \\  ", "plain", ""] {
+            assert_eq!(unescape_tf_global_value(&escape_tf_global_value(v)), v, "value {v:?}");
+        }
+        let mut app = App::new();
+        app.tf_engine.set_global("pad", tf::TfValue::from("  a b  ".to_string()));
+        let tmp = std::env::temp_dir().join(format!("clay_test_tf_globals_pad_{}.dat", std::process::id()));
+        save_settings_to_path(&app, &tmp).expect("save");
+        let content = std::fs::read_to_string(&tmp).expect("read");
+        let _ = std::fs::remove_file(&tmp);
+        let mut app2 = App::new();
+        load_settings_from_str(&mut app2, &content);
+        assert_eq!(app2.tf_engine.get_var("pad").map(|v| v.to_string_value()), Some("  a b  ".to_string()));
     }
 }

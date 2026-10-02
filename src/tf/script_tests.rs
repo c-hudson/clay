@@ -52,25 +52,13 @@ pub(crate) fn run_script(engine: &mut TfEngine, path: &Path) -> Transcript {
 
     let path_str = path.to_string_lossy().to_string();
     let result = super::builtins::load_file_internal(engine, &path_str, true);
+
+    // No effect frame is open here, so everything the load did is in the engine's
+    // top-level queue, in the order it happened (see `super::effects`).
+    for effect in engine.take_effects() {
+        record_effect(&mut transcript, effect);
+    }
     record_result(&mut transcript, result);
-
-    // Anything send()/SendToMud queued during the load - drain it into `sent`
-    // regardless of whether it also happened to surface directly in `result`
-    // (in practice it never does: load_file_internal always queues it here).
-    for cmd in engine.pending_commands.drain(..) {
-        transcript.sent.push(cmd.command);
-    }
-
-    // Anything the echo() expression function queued (finding 14's grep.tf: TF library
-    // macros like /_fgrep rely on echo({*})'s side effect to print a matching line) - see
-    // commands::process_pending_tf_outputs, this harness's App-less equivalent. Order
-    // relative to `result`'s own echoed text is not preserved (both are per-top-level-line
-    // in load_lines, but pending_outputs is a single flat accumulator drained once here) -
-    // fine for every case in this corpus (each has at most one echo()-producing line), but
-    // a future multi-echo()-line case would need per-line draining in load_lines instead.
-    for output in engine.pending_outputs.drain(..) {
-        transcript.echoed.push(super::parser::process_attr_codes(&output.text));
-    }
 
     // Don't let a script's keyboard manipulation (kbgoto, kbdel, ...) leak
     // into whatever case runs next - each case gets a fresh TfEngine, but
@@ -100,69 +88,58 @@ pub(crate) fn run_script(engine: &mut TfEngine, path: &Path) -> Transcript {
 /// `/require` line permanently mismatching a `.expected` file that (via the
 /// oracle) never contains it.
 fn is_load_noise_line(line: &str) -> bool {
-    line.starts_with("Loading commands from ")
+    line.starts_with("% Loading commands from ")
 }
 
-/// True for the "Loaded '<path>' with N error(s)" summary line
-/// `builtins::load_file_internal`'s error path always starts its own combined
-/// text with (see finding 22 / plan step P1.9 there) - used to split that
-/// combined text back apart into the file's own successfully-echoed lines
-/// (everything before this line) and its error summary + details (this line
-/// onward), so each half lands in the `Transcript` bucket a real App would
-/// have routed it to instead of the whole thing landing in `errors`.
-fn is_load_error_summary_line(line: &str) -> bool {
-    line.starts_with("Loaded '") && line.contains("' with ") && line.ends_with("error(s)")
-}
-
-/// Sort one `TfCommandResult` into the right `Transcript` bucket. Mirrors how
-/// the App's own dispatch sites (see e.g. `commands.rs`'s `ActionCommand`
-/// handler) treat each variant, since this harness has no App to hand them to.
-fn record_result(transcript: &mut Transcript, result: TfCommandResult) {
-    match result {
-        TfCommandResult::Success(Some(msg)) => {
+/// Sort one effect into the right `Transcript` bucket - the buckets a real App/TUI
+/// routes each effect to (see `tfrun`), since this harness has no App to hand them to.
+fn record_effect(transcript: &mut Transcript, effect: super::effects::TfEffect) {
+    use super::effects::TfEffect;
+    match effect {
+        TfEffect::Output { text, .. } => {
+            // Split as `App::emit_client_text` does: a final newline ends the text, it
+            // doesn't add an empty line.
             transcript.echoed.extend(
-                msg.split('\n')
+                text.strip_suffix('\n').unwrap_or(&text).split('\n')
                     .map(|s| s.to_string())
                     .filter(|line| !is_load_noise_line(line)),
             );
         }
-        TfCommandResult::Success(None) => {}
-        TfCommandResult::Error(msg) => {
-            // Finding 22: a loaded file's error text may now carry its own
-            // successfully-echoed lines ahead of the "Loaded ... with N
-            // error(s)" summary (see is_load_error_summary_line) - split them
-            // back into `echoed` rather than dumping the whole blob into
-            // `errors`, so a case that legitimately has both isn't forced to
-            // choose between checking its output and checking its errors.
-            let lines: Vec<&str> = msg.split('\n').collect();
-            match lines.iter().position(|l| is_load_error_summary_line(l)) {
-                Some(split_at) => {
-                    transcript.echoed.extend(
-                        lines[..split_at]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .filter(|line| !is_load_noise_line(line)),
-                    );
-                    transcript.errors.extend(lines[split_at..].iter().map(|s| s.to_string()));
-                }
-                None => transcript.errors.extend(lines.into_iter().map(|s| s.to_string())),
-            }
+        TfEffect::Error { msg, at } => {
+            let msg = match at { Some(at) => format!("{}: {}", at, msg), None => msg };
+            transcript.errors.extend(msg.split('\n').map(|s| s.to_string()))
         }
-        TfCommandResult::SendToMud(cmd) => transcript.sent.push(cmd),
-        TfCommandResult::ClayCommand(cmd) => transcript.clay_cmds.push(cmd),
-        TfCommandResult::Quote { lines, disposition, .. } => match disposition {
-            super::QuoteDisposition::Echo => transcript.echoed.extend(lines),
-            super::QuoteDisposition::Send => transcript.sent.extend(lines),
-            super::QuoteDisposition::Exec => transcript.clay_cmds.extend(lines),
+        TfEffect::Send { text, .. } => transcript.sent.push(text),
+        TfEffect::Clay { cmd, .. } => transcript.clay_cmds.push(cmd),
+        TfEffect::Quote(q) => match q.disposition {
+            super::QuoteDisposition::Echo => transcript.echoed.extend(q.lines),
+            super::QuoteDisposition::Send => transcript.sent.extend(q.lines),
+            super::QuoteDisposition::Exec => transcript.clay_cmds.extend(q.lines),
         },
-        TfCommandResult::UnknownCommand(cmd) => {
-            transcript.errors.push(format!("Unknown command: {}", cmd));
-        }
-        TfCommandResult::Recall(_) => transcript.clay_cmds.push("<recall>".to_string()),
-        TfCommandResult::RepeatProcess(process) => {
+        TfEffect::Unknown(cmd) => transcript.errors.push(format!("Unknown command: {}", cmd)),
+        TfEffect::Recall(_) => transcript.clay_cmds.push("<recall>".to_string()),
+        TfEffect::StartProcess(process) => {
             transcript.clay_cmds.push(format!("<repeat process {}>", process.id));
         }
-        TfCommandResult::Return(_) | TfCommandResult::Result(_) | TfCommandResult::ExitLoad(_) | TfCommandResult::NotTfCommand => {}
+        TfEffect::WorldOp(op) => transcript.clay_cmds.push(format!("<addworld {}>", op.name)),
+        TfEffect::Connect(req) => transcript.clay_cmds.push(format!("<connect {:?}>", req)),
+        TfEffect::Setting(..) => {}
+        TfEffect::Shell { command } => transcript.clay_cmds.push(format!("<sh {}>", command.unwrap_or_default())),
+        TfEffect::Suspend => transcript.clay_cmds.push("<suspend>".to_string()),
+        TfEffect::SetPrompt { text, .. } => transcript.clay_cmds.push(format!("<prompt {}>", text)),
+        TfEffect::LocalEcho { on, .. } => transcript.clay_cmds.push(format!("<localecho {}>", on)),
+        TfEffect::RecordLine { text, target, .. } => transcript.clay_cmds.push(format!("<recordline {:?} {}>", target, text)),
+    }
+}
+
+/// Sort a load's own returned result. Everything it did arrives as effects
+/// (`record_effect`); what's left here is a control result with nothing to record, or
+/// a plain result from a caller that ran a single command.
+fn record_result(transcript: &mut Transcript, result: TfCommandResult) {
+    let mut effects = Vec::new();
+    super::effects::push_result_effects(result, &mut effects);
+    for effect in effects {
+        record_effect(transcript, effect);
     }
 }
 
@@ -219,8 +196,14 @@ fn preload_directives(directives: &[String]) -> Vec<String> {
 fn apply_preloads(engine: &mut TfEngine, lib_dir: &str, preloads: &[String], errors: &mut Vec<String>) {
     for file in preloads {
         let full_path = format!("{}/{}", lib_dir, file);
-        if let TfCommandResult::Error(e) = super::builtins::load_file_internal(engine, &full_path, true) {
-            errors.push(format!("preload: {}", e));
+        let _ = super::builtins::load_file_internal(engine, &full_path, true);
+        for effect in engine.take_effects() {
+            if let super::effects::TfEffect::Error { msg, at } = effect {
+                match at {
+                    Some(at) => errors.push(format!("preload: {}: {}", at, msg)),
+                    None => errors.push(format!("preload: {}", msg)),
+                }
+            }
         }
     }
 }
@@ -694,8 +677,8 @@ fn tf_script_finding_22_echoed_lines_survive_a_later_error() {
     let _ = fs::remove_file(&path);
 
     assert_eq!(transcript.echoed, vec!["one".to_string(), "two".to_string()]);
-    // The summary line, plus one indented detail line for the single error.
-    assert_eq!(transcript.errors.len(), 2, "errors: {:?}", transcript.errors);
-    assert!(transcript.errors[0].contains("with 1 error(s)"), "errors: {:?}", transcript.errors);
-    assert!(transcript.errors[1].contains("123bad"), "errors: {:?}", transcript.errors);
+    // One error, reported where it happened (line 3), as the line ran.
+    assert_eq!(transcript.errors.len(), 1, "errors: {:?}", transcript.errors);
+    assert!(transcript.errors[0].contains(", line 3: ") && transcript.errors[0].contains("123bad"),
+        "errors: {:?}", transcript.errors);
 }

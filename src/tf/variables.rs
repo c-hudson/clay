@@ -3,42 +3,17 @@
 use super::TfEngine;
 
 /// Get special built-in variable value (world_*, etc.)
-fn get_special_var(engine: &TfEngine, name: &str) -> Option<String> {
+pub(crate) fn get_special_var(engine: &TfEngine, name: &str) -> Option<String> {
     match name {
-        // Current world info
-        "world_name" => engine.current_world.clone(),
-        "world_host" => {
-            let current = engine.current_world.as_ref()?;
-            engine.world_info_cache.iter()
-                .find(|w| &w.name == current)
-                .map(|w| w.host.clone())
-        }
-        "world_port" => {
-            let current = engine.current_world.as_ref()?;
-            engine.world_info_cache.iter()
-                .find(|w| &w.name == current)
-                .map(|w| w.port.clone())
-        }
-        // Real TF: "If a normal world is defined without a <character>, <pass>,
-        // ... then that world will use the corresponding field of the 'default'
-        // world if there is one." Clay keeps DEFAULT's character/password as
-        // engine globals (`/addworld DEFAULT ...`, finding 31) rather than a
-        // real world entry, so the fallback happens here instead of in
-        // world_info_cache itself.
-        "world_character" | "world_char" => {
-            let from_world = engine.current_world.as_ref()
-                .and_then(|current| engine.world_info_cache.iter().find(|w| &w.name == current))
-                .map(|w| w.user.clone())
-                .filter(|v| !v.is_empty());
-            from_world.or_else(|| engine.default_world_character.clone())
-        }
-        "world_password" | "world_pass" => {
-            let from_world = engine.current_world.as_ref()
-                .and_then(|current| engine.world_info_cache.iter().find(|w| &w.name == current))
-                .map(|w| w.password.clone())
-                .filter(|v| !v.is_empty());
-            from_world.or_else(|| engine.default_world_password.clone())
-        }
+        // The current world's fields (`/help worlds`: "World information can be
+        // accessed with the macro expansion ${world_fieldname}") - the world of the
+        // running trigger, hook, timer or client command, else the foreground world.
+        // Character/password/mfile fall back to the DEFAULT world's (see
+        // TfEngine::world_field).
+        "world_name" => engine.context_world_name(),
+        "world_char" => engine.world_field(None, "character"),
+        "world_pass" => engine.world_field(None, "password"),
+        name if name.starts_with("world_") => engine.world_field(None, &name["world_".len()..]),
         // Process info
         "pid" => Some(std::process::id().to_string()),
         // Time
@@ -96,6 +71,43 @@ fn positional_arg(engine: &TfEngine, idx: usize) -> String {
 /// backwards - see this job's report): for arguments "a b c d", `{-1}` is
 /// "b c d" (except the first one), not "d" - `-N` is never "Nth from end"
 /// singular, that's what `LN` means.
+/// `raw` without its first `n` whitespace-separated words (and the blanks after them),
+/// keeping the rest exactly as written - TF's "%-N": for `/f a   b    c`, "%-1" is
+/// "b    c" (verified against real tf).
+pub(crate) fn skip_words(raw: &str, n: usize) -> &str {
+    let mut rest = raw.trim_start();
+    for _ in 0..n {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = rest[end..].trim_start();
+    }
+    rest
+}
+
+/// The first `n` whitespace-separated words of `raw`, with the spacing between them as
+/// written - TF's "%-LN" (all but the last N) for a macro's raw argument text.
+pub(crate) fn take_words(raw: &str, n: usize) -> &str {
+    let text = raw.trim_start();
+    let mut end = 0;
+    let mut rest = text;
+    for _ in 0..n {
+        let trimmed = rest.trim_start();
+        let start = text.len() - trimmed.len();
+        let word_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        end = start + word_end;
+        rest = &trimmed[word_end..];
+    }
+    &text[..end]
+}
+
+/// The running macro's raw argument text (`%*`), or - outside a macro call, where
+/// only positional parameters may be set - those joined by single spaces.
+fn raw_args(engine: &TfEngine) -> String {
+    match engine.get_var("*") {
+        Some(v) => v.to_string_value(),
+        None => (1..=arg_count(engine)).map(|i| positional_arg(engine, i)).collect::<Vec<_>>().join(" "),
+    }
+}
+
 pub(crate) fn resolve_extended_selector(engine: &TfEngine, selector: &str) -> Option<String> {
     let argc = arg_count(engine);
 
@@ -111,7 +123,7 @@ pub(crate) fn resolve_extended_selector(engine: &TfEngine, selector: &str) -> Op
             return Some(String::new());
         }
         let keep = argc - n;
-        return Some((1..=keep).map(|i| positional_arg(engine, i)).collect::<Vec<_>>().join(" "));
+        return Some(take_words(&raw_args(engine), keep).to_string());
     }
 
     if let Some(rest) = selector.strip_prefix('-') {
@@ -126,7 +138,7 @@ pub(crate) fn resolve_extended_selector(engine: &TfEngine, selector: &str) -> Op
             if n >= argc {
                 return Some(String::new());
             }
-            return Some((n + 1..=argc).map(|i| positional_arg(engine, i)).collect::<Vec<_>>().join(" "));
+            return Some(skip_words(&raw_args(engine), n).to_string());
         }
         return None;
     }
@@ -842,6 +854,9 @@ pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
                         }
                         if let Some(value) = engine.get_var(&var_name) {
                             result.push_str(&value.to_string_value());
+                        } else if let Some(value) = get_special_var(engine, &var_name) {
+                            // ${world_name} and the rest of TF's built-in expansions
+                            result.push_str(&value);
                         } else if let Some(macro_def) = engine.macros.iter().find(|m|
                             m.name == var_name && m.trigger.is_none() && m.hook.is_none()
                         ) {
@@ -964,10 +979,21 @@ pub(crate) fn substitute_dollar_braces(engine: &TfEngine, text: &str) -> String 
                         super::TfValue::Integer(n) => {
                             result.push_str(&n.to_string());
                         }
+                        super::TfValue::Enum(_, name) => {
+                            result.push('"');
+                            result.push_str(&name.replace('"', "\\\""));
+                            result.push('"');
+                        }
                         super::TfValue::Float(f) => {
                             result.push_str(&f.to_string());
                         }
                     }
+                } else if let Some(value) = get_special_var(engine, &var_name) {
+                    // ${world_name} and the rest of TF's built-in expansions, quoted
+                    let escaped = value.replace('"', "\\\"");
+                    result.push('"');
+                    result.push_str(&escaped);
+                    result.push('"');
                 } else {
                     // Fall back to simple macros (no trigger, no hook)
                     if let Some(macro_def) = engine.macros.iter().find(|m|
@@ -1022,16 +1048,21 @@ pub(crate) fn execute_for_substitution(engine: &mut TfEngine, cmd: &str) -> Stri
         // command" rule (see builtins::cmd_result's doc comment).
         super::TfCommandResult::Result(val) => val,
         super::TfCommandResult::Error(e) => format!("[error: {}]", e),
-        super::TfCommandResult::SendToMud(text) => {
-            // Queue this to be sent later
-            engine.pending_commands.push(super::TfCommand {
-                command: text,
-                world: None,
-                no_eol: false,
-            });
+        // Output is what $() captures; everything else the command did (sends, Clay
+        // commands, errors, ...) still happens, in order.
+        super::TfCommandResult::Effects(list) => {
+            let (text, rest) = super::effects::split_output(list);
+            for effect in rest {
+                engine.emit_effect(effect);
+            }
+            text.join("\n")
+        }
+        other => {
+            if !other.is_control() {
+                engine.emit_result(other);
+            }
             String::new()
         }
-        _ => String::new(),
     };
 
     output

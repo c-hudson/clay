@@ -41,13 +41,19 @@ List variables matching a pattern.
 ## Output Commands
 
 ### /echo
-Display a local message (not sent to the MUD). Variable substitution runs
-before `/echo` ever sees the text.
+Display a local message (not sent to the MUD). Inside a macro body the text
+is substituted first; a line you type is not (see "Typed Lines").
 
 ```
 /echo Hello, world!
-/echo Your HP is %{hp}
+/def hp = /echo Your HP is %{hp}
+/echo -aBu Bold and underlined
+/echo -p Your @{Cred}HP@{n} is low
 ```
+
+Attributes are TF's: letters run together (`-aBu`), `C<color>` for a color (`@{BCgreen}`
+is bold green), `h` for `%hiliteattr`; inline `@{...}` codes add up until `@{n}`.
+`/echo -ag` keeps the line in the history without showing it.
 
 ### /send
 Send text to the MUD, bypassing macro/alias expansion.
@@ -64,15 +70,109 @@ Ring the terminal bell.
 /beep
 ```
 
-### /quote
-Generate and dispatch text from a file, another command's output, a shell
-command, or literal text.
+### /recordline
+Put a line into a history without showing it - `/recall` finds it there, and it is
+never logged or archived. `-w[<world>]` the world's history, `-l` local, `-g` global
+(the default), `-i` input (which also feeds the console's Up/Down history);
+`-t<time>` gives it a time (seconds, as `/recall -t@` shows), `-a<attrs>`
+attributes, `-p` interprets `@{...}` inline.
 
 ```
-/quote say '"/tmp/lines.txt"       Send "say <line>" for each line in the file
-/quote think `"/version"           Send the output of /version to the MUD
-/quote !"ls -la"                   Send the output of a shell command
+/recordline -i north
+/recordline -w -t1696000000 an old line
 ```
+
+A line with the `G` (nohistory) attribute is the opposite: shown, but never in the
+history - `/def -aG -t"*whispers*" quiet`, `/echo -aG`, `/substitute -aG`.
+
+### /quote
+Generate lines from a file (`'`), a shell command (`!`, standard error
+included), a TF command (`` ` ``) or `/recall` (`#`), put an optional
+<pre> before and <suf> after each, and send, echo or run them, as TF does:
+sent when there is no <pre>, run as commands (never expanded) when there is.
+Unless `-S`, a quote is a background process: one line every `%ptime` (1
+second; `-<time>` to change it, `-0` for all at once), or one per prompt with
+`-P`. `/ps` lists it and `/kill` stops it.
+
+```
+/quote -S '"/tmp/lines.txt"        Send each line of the file, now
+/quote say '"/tmp/lines.txt"       Run "say <line>" for each line, one a second
+/quote think `"/version"           Send "think <the /version text>"
+/quote -S -decho !ls -la           Show the output of a shell command
+/quote -P /send `/echo n%;/echo w   Send "n", then "w" at the next prompt
+```
+
+## Processes
+
+`/repeat` and background `/quote`s are processes. `/repeat -30 5 /echo hi`
+runs `/echo hi` five times, the first time 30 seconds from now (`-n`: now;
+no `-<time>`: `%ptime`). `-P` runs on prompts; with `%lpquote` on, every
+process does. `/ps` lists them in TF's table (`-s` just the pids, `-r`/`-q`
+only repeats/quotes), `/kill <pid>` stops one.
+
+## Shell
+
+`/sh <command>` runs a command with /bin/sh, and plain `/sh` an interactive
+`%SHELL`, on the terminal: Clay's screen is put away while it runs and comes
+back after a keypress (`%shpause`). `%?` is its exit status. `^C` reaches
+only the shell. From the web/GUI client, or a Clay with no console, a command
+runs in the background and its output is shown when it finishes. `/suspend`
+stops Clay as `^Z` does. TF's `/psh` comes with `/require psh.tf`.
+
+## Prompts
+
+`/prompt [-a<attrs>] [-p] <text>` (or `prompt(<text>)`) makes <text> the
+current world's prompt. A PROMPT hook that matches takes the prompt over and
+shows its own:
+
+```
+/def -h"PROMPT *> " catch_prompt = /test prompt({*})
+```
+
+## The Status Line
+
+TF's status line is rows of fields, each `name[:width[:attributes]]`:
+padding (`:2`), an internal state (`@more @world @read @active @log @mail
+@clock`, shown by the expression in `%status_int_<name>`), a variable (shown
+by `%status_var_<name>`, else its value) or a "literal". One field may have
+no width and takes what the others leave; a negative width right-justifies.
+
+```
+/status_add -A@world hp:4         Show %hp after the world name
+/status_rm @mail                  Remove the mail field
+/status_edit @log:1               Make the log field one column
+/set status_height=2              Two rows (status_add -r1 ... fills row 1)
+/clock %I:%M                      A 12-hour clock
+/status_defaults                  TF's own fields again
+```
+
+Clay shows its own status bar until a script changes the status line (any of
+these commands, or setting a `status_*` variable). From then on TF's is drawn
+instead - in the console, the web/GUI/Android client (beside its menu, notes
+and font controls) and the SSH console, laid out to each one's width.
+`status_fields([row])` lists a row's fields; `/status_save` and
+`/status_restore` keep and bring back row 0.
+
+## Visual Mode
+
+Clay's console always draws its windows: there is no non-visual mode.
+`/visual off` (or `/set visual=off`) answers `% Clay's console has no
+non-visual mode.`, and `%visual` always reads `on`.
+
+## New Text on a World Switch
+
+Once a script sets `%textdiv`, switching to a world shows TF's divider:
+
+```
+/set textdiv=on        %textdiv_str (=====) between what you'd seen and what's new
+/set textdiv=always    ...even when nothing new arrived
+/set textdiv=clear     the old text taken out of view instead
+/set textdiv=off       nothing
+/unset textdiv         back to Clay's own ▶ markers
+```
+
+The console, the web/GUI/Android client and the SSH console each track what they
+have shown you; the divider goes when you switch away.
 
 ## Expressions
 
@@ -264,7 +364,21 @@ KILL LOAD LOADFAIL LOG LOGIN MAIL MORE NOMACRO PENDING PREACTIVITY PROCESS
 PROMPT PROXY REDEF RESIZE SEND SHADOW SHELL SIGHUP SIGTERM SIGUSR1 SIGUSR2
 WORLD` — see `/help hooks` or `reference/tf-engine.md` for what argument
 text each one carries and the SEND/LOADFAIL hooks' special suppression
-behavior.
+behavior. PROXY never fires (Clay has no `%proxy_host`).
+
+The connection hooks carry TF's own arguments:
+
+```
+CONNECT     mud TLS_AES_256_GCM_SHA384            a TLS connection names its cipher
+DISCONNECT  mud                                   the server closed the connection
+DISCONNECT  mud recv Connection reset by peer     a read failed
+CONFAIL     mud 127.0.0.1 4000: Connection refused
+ICONFAIL    mud ::1 4000: Network is unreachable  one address of several failed
+```
+
+`/dc` fires no DISCONNECT. A gagged hook (`/def -ag -hDISCONNECT ...`) hides
+Clay's own message ("Connection closed by server.", "Disconnected.",
+"Connection failed: ...").
 
 ## Key Bindings
 
@@ -295,17 +409,36 @@ for it (`key_f5`, `key_ctrl_left`, `key_esc_left`). Checked after any
 ## File Operations
 
 ### /load
-Load a TF script file. Comments: a line starting with `;`, a bare `#`, or
-`#` followed by a space (see "A note on `#`" below).
+Load a TF script file, with TinyFugue's own rules:
+
+- A line starting with `;` or `#` is a comment — in the first column only
+  (see "A note on `#`" below).
+- A line ending in `\` continues on the next line, whose leading spaces are
+  dropped; `%\` is a literal backslash.
+- Every other non-blank line must be a `/command`. A line of plain text stops
+  the load: `% <file>, line N: Invalid command. Aborting.`
+- An indented line that starts a new command is probably missing the previous
+  line's trailing `\`, so it draws `% <file>: line N: Warning: possibly missing
+  trailing \` (naming the previous command's line) — and still runs.
+- Errors are shown where they happen, as `% <file>, line N: <message>`
+  (`lines A-B` for a command continued over several lines), and loading goes on.
+- Lines are run exactly as written: `%var`, `$[...]` and `$(...)` are expanded
+  only inside macro bodies and by `/eval`.
+- `-q` drops the `% Loading commands from <file>.` message — for this file and
+  every file it loads in turn.
+
+A relative file name is looked for in the current directory (`/lcd`), then — for
+a bare name with no `/` in it — in each directory of `%{TFPATH}` (space-separated;
+write a space inside a name as `\ `), or in `%{TFLIBDIR}` when `%{TFPATH}` is
+blank. `~` is your home directory and `~user` another user's.
 
 ```
 /load scripts/my_triggers.tf
 ```
 
 ### /require
-Like `/load`, but a file that's already registered a `/loaded` token isn't
-read again — and, unlike `/load`, a *bare filename* (no `/` in it) is also
-searched for along `%{TFPATH}` and then `%{TFLIBDIR}`.
+Like `/load` (same search), but a file that's already registered a `/loaded`
+token isn't read again.
 
 ```
 /require lisp.tf
@@ -331,7 +464,7 @@ TinyFugue ships a library of general-purpose macros (`lisp.tf`, `alias.tf`,
 `kbfunc.tf`/`kbbind.tf`, `stdlib.tf`, and more) under `tf-lib/`. **Nothing
 GPL-licensed ships with Clay** — Clay never bundles or vendors this library.
 Instead, `/require somefile.tf` resolves a bare filename by searching
-`%{TFPATH}` and then `%{TFLIBDIR}`, and `%{TFLIBDIR}` defaults to
+`%{TFPATH}`, or `%{TFLIBDIR}` when `%{TFPATH}` is blank, and `%{TFLIBDIR}` defaults to
 `$TFLIBDIR` if set, else `/usr/share/tf5/tf-lib` if that directory exists —
 the path the `tf5` distro package (Debian/Ubuntu: `apt install tf5`)
 installs the real library to. On a machine with `tf5` installed,
@@ -368,17 +501,50 @@ Use `%{varname}` or `%varname` in commands:
 
 **TinyFugue does not expand `%var`/`$[...]`/`$(...)` on a bare top-level
 line read from a file** — only inside a macro body, or via `/eval`'s own
-substitution pass. Clay matches this. If a script-level probe needs
+substitution pass. Clay matches this: `/set time_format=%H:%M:%S` in a
+loaded file stores the format itself. If a script-level probe needs
 expansion, wrap it in a macro or prefix it with `/eval`.
+
+**A line you type follows `%sub`**, as in TinyFugue (`/help sub`). With the
+default `/sub off`, a command runs exactly as typed — `/echo %{foo}` prints
+`%{foo}`. `/sub on` turns `%;` (and `%\`) into line breaks and `%%` into `%`;
+`/sub full` processes the whole line like a macro body, so `%{foo}`,
+`$[...]` and `$(...)` expand. Key bindings (`/bind`, `/def -b`, `key_<name>`)
+always run as macro bodies, and Clay actions keep expanding their commands
+as before.
+
+## Typed Lines
+
+Two more TinyFugue input forms work in every interface (console, web, GUI,
+Android, and the remote console):
+
+- **`^old^new`** finds the most recent line in your input history that
+  contains `old`, replaces the first `old` in it with `new`, shows the result
+  and runs it (`% No match.` if no line contains `old`). The new line, not the
+  `^old^new` one, goes into history. `^^text` puts `text` in front of the last
+  line. Not used in Slack/Discord worlds, where `^^` is ordinary chat, and never
+  at a password prompt.
+- **Leading slashes**: `/cmd` and `//cmd` both run `/cmd`; three or more
+  slashes send the line to the world as text, less two slashes — type
+  `///who` to send `/who` to the MUD.
 
 ## A note on `#`
 
-Real TinyFugue's comment character is `;`; Clay additionally treats a bare
-`#`, or `#` followed by a space, as a comment too (in a loaded file, and in
-loop/`/if` bodies) — this is a superset of TF's own convention, not a
-second way to *invoke* a command. Only `/` dispatches a command; typing
-`#version` at the console just sends the literal text `#version` to the
-current world, it does not run `/version`.
+In a loaded file, a line starting with `;` or `#` is a comment, as in
+TinyFugue — in the first column only: an indented `;` or `#` line is not a
+comment, and (like any line that isn't a `/command`) stops the load. Inside a
+multi-line `/if`, `/while` or `/for` block written without `\` continuations
+(a Clay extension), an indented comment is allowed. `#` is not a second way
+to *invoke* a command: only `/` dispatches one; typing `#version` at the
+console just sends the literal text `#version` to the current world, it does
+not run `/version`.
+
+## Help
+
+`/help <topic>` answers from Clay's own help first; a topic it doesn't cover
+comes from TinyFugue's help file when `tf` is installed (`%TFHELP`, else
+`tf-help` in `%TFLIBDIR`), as TF would show it - `/help intro`, `/help
+special variables`, `/help kecho`. Those topics are case-sensitive, as in TF.
 
 ## Differences from TinyFugue (intentional)
 
@@ -397,8 +563,19 @@ per-key/per-command ruling tables this was decided from.
   archive), `/world -e` (open the world editor), `/watchdog -w<world>`
   (spam detection), the `/connections` table, `/trigger -d` (delete
   matching triggers), `/repeat -p<priority>`, long-form `/def -a"gag"`,
-  `#`/`# ` comments in `/load`, and `/tfhelp` are all Clay extras kept
-  alongside TF's own behavior.
+  `/quote -A` (keep escape sequences) and `/tfhelp` are all Clay extras kept
+  alongside TF's own behavior. Clay's remote attach is `/server`; `/connect`
+  is TF's.
+- **Startup**: `-v` is Clay's "version" (Clay's console is always visual), and
+  nothing connects to the first world unless named on the command line
+  (`clay mymud`). See "Switching from TinyFugue".
+- **No non-visual mode**: `/visual off` is refused; `%visual` is always `on`.
+- **Histories**: Clay keeps a world's whole output (and archives it), so
+  `/histsize` has nothing to change.
+- **Off until asked for**: `%wrapsize` (Clay wraps at the window's edge until a
+  script sets it) and mail checking (until a MAIL hook, `@mail` on a changed
+  status line, or a mail path set by the user).
+- **`/repeat`, `/quote`** with no `-w` stay with the world they started in.
 - **`replace()`** now takes TF's own argument order, `replace(old, new,
   str)` — Clay's `/replace` command already used this order; only the
   *function* changed. A release note, since this is a real behavior change
@@ -407,14 +584,15 @@ per-key/per-command ruling tables this was decided from.
   the same nameless macro `/def -b"key" = cmd` would), matching `/def`'s own
   body semantics — a plain `/bind` used to substitute eagerly, once, at
   bind-registration time.
-- **`/histsize`, `/quote`, `/repeat`, `/eval`/`/trigger`/`/undefn`/`/not`**
+- **`/quote`, `/repeat`, `/ps`, `/eval`/`/trigger`/`/undefn`/`/not`**
   now match TF's own semantics and option sets exactly (see
   `reference/tf-engine.md` and `/help <command>` for each); `/purge` and
   `/undef` are silent on success like real TF, and a redefinition prints
   TF's own `% Redefined macro X` message unless a REDEF hook gags it.
   `/list`/`/purge`'s own filter semantics are otherwise unchanged from
   Clay's pre-parity behavior.
-- **Console-only**: `/limit`/`/unlimit`/`/relimit` (drive the console's own
+- **Console-only**: an interactive `/sh`,
+  `/suspend`, `/limit`/`/unlimit`/`/relimit` (drive the console's own
   F4 filter popup — a remote client's `/limit` reaches the shared engine
   but nothing drains it until the console next processes a typed command),
   `/xtitle` (sets the *terminal's* title), and the `expand_line` key action

@@ -39,6 +39,8 @@ pub mod tts;
 pub mod scrollback;
 pub mod stats;
 pub mod protocol_state;
+pub mod tfrun;
+mod tfstartup;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
 pub mod testserver;
@@ -1056,49 +1058,6 @@ impl Default for EditorState {
     }
 }
 
-/// Apply TF attributes to text for /substitute command.
-/// Attribute string format: C<color> for foreground, B for bold, etc.
-/// Examples: "Cred" = red, "Cbold" = bold, "Cgreen" = green
-fn apply_tf_attrs(text: &str, attrs: &str) -> String {
-    let mut result = String::new();
-    let mut has_attr = false;
-
-    // Parse attributes - Cred, Cgreen, Cbold, etc.
-    let attrs_lower = attrs.to_lowercase();
-    if attrs_lower.contains("cred") || attrs_lower.contains("red") {
-        result.push_str("\x1b[1;31m");  // Bold red
-        has_attr = true;
-    } else if attrs_lower.contains("cgreen") || attrs_lower.contains("green") {
-        result.push_str("\x1b[1;32m");  // Bold green
-        has_attr = true;
-    } else if attrs_lower.contains("cyellow") || attrs_lower.contains("yellow") {
-        result.push_str("\x1b[1;33m");  // Bold yellow
-        has_attr = true;
-    } else if attrs_lower.contains("cblue") || attrs_lower.contains("blue") {
-        result.push_str("\x1b[1;34m");  // Bold blue
-        has_attr = true;
-    } else if attrs_lower.contains("cmagenta") || attrs_lower.contains("magenta") {
-        result.push_str("\x1b[1;35m");  // Bold magenta
-        has_attr = true;
-    } else if attrs_lower.contains("ccyan") || attrs_lower.contains("cyan") {
-        result.push_str("\x1b[1;36m");  // Bold cyan
-        has_attr = true;
-    } else if attrs_lower.contains("cwhite") || attrs_lower.contains("white") {
-        result.push_str("\x1b[1;37m");  // Bold white
-        has_attr = true;
-    } else if attrs_lower.contains("cbold") || attrs_lower.contains("bold") {
-        result.push_str("\x1b[1m");  // Bold
-        has_attr = true;
-    }
-
-    result.push_str(text);
-
-    if has_attr {
-        result.push_str("\x1b[0m");  // Reset
-    }
-
-    result
-}
 
 /// Result of running both Clay action triggers and TF triggers on a line.
 struct TriggerProcessingResult {
@@ -1106,14 +1065,25 @@ struct TriggerProcessingResult {
     pub is_gagged: bool,
     /// The matching action asked for the following blank lines to be gagged too.
     pub suppress_blanks: bool,
-    /// Commands to send to the MUD server
+    /// Clay action commands to run (sends or /commands)
     pub send_commands: Vec<String>,
-    /// Clay commands to execute (e.g. /connect, /worlds)
-    pub clay_commands: Vec<String>,
-    /// Messages to display locally (from /echo, substitution, etc.)
-    pub messages: Vec<String>,
+    /// What the TF triggers did, in order (see `tf::effects`)
+    pub tf_effects: Vec<tf::effects::TfEffect>,
+    /// Messages to display locally (a /substitute's replacement text)
+    pub messages: Vec<TfMessage>,
     /// Highlight color from action triggers
     pub highlight_color: Option<String>,
+    /// The line as TF's display attributes show it, when a trigger gave it any.
+    pub attributed: Option<String>,
+    /// A TF trigger without -q fired (for BGTRIG).
+    pub tf_fired: bool,
+    /// A TF trigger gave the line `L` (don't log it), `A` (no activity) or `G` (keep it out
+    /// of the history).
+    pub nolog: bool,
+    pub noactivity: bool,
+    pub nohistory: bool,
+    /// The line's own TF attributes, as `attributed` drew them (for /recall -a).
+    pub line_attrs: Option<Box<LineAttrs>>,
 }
 
 /// Parsed BAMF portal information
@@ -1184,9 +1154,15 @@ fn process_triggers(
         is_gagged: false,
         suppress_blanks: false,
         send_commands: Vec::new(),
-        clay_commands: Vec::new(),
+        tf_effects: Vec::new(),
         messages: Vec::new(),
         highlight_color: None,
+        attributed: None,
+        tf_fired: false,
+        nolog: false,
+        noactivity: false,
+        nohistory: false,
+        line_attrs: None,
     };
 
     // Check Clay action triggers
@@ -1199,20 +1175,46 @@ fn process_triggers(
 
     // Check TF triggers
     let tf_result = tf::bridge::process_line(tf_engine, line, Some(world_name), Some(world_type));
-    result.send_commands.extend(tf_result.send_commands);
-    result.clay_commands.extend(tf_result.clay_commands);
-    result.messages.extend(tf_result.messages);
+    result.tf_effects = tf_result.effects;
     result.is_gagged = result.is_gagged || tf_result.should_gag;
+    result.tf_fired = tf_result.matched_non_quiet;
+    result.nolog = tf_result.attrs.nolog;
+    result.noactivity = tf_result.attrs.noactivity;
+    result.nohistory = tf_result.attrs.norecord;
+    // Their display attributes (/def -a, /hilite, -P parts) go into the line itself, as
+    // ANSI codes, so every interface - and the archive, /recall, the log - shows them.
+    if !tf_result.attrs.to_sgr().is_empty() || !tf_result.partials.is_empty() {
+        result.attributed = Some(tf::attrs::apply_to_line(line, &tf_result.attrs, &tf_result.partials));
+        result.line_attrs = Some(Box::new(LineAttrs {
+            plain: line.to_string(),
+            attrs: tf_result.attrs.clone(),
+            partials: tf_result.partials.clone(),
+        }));
+    }
 
     // Handle substitution: gag original, output substitute with attributes
     if let Some((sub_text, sub_attrs)) = tf_result.substitution {
         result.is_gagged = true;
-        let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
-            apply_tf_attrs(&sub_text, &sub_attrs)
-        } else {
-            sub_text
+        let mut sub_own_attrs = None;
+        let sub_with_attrs = match tf::TfAttributes::parse(&sub_attrs) {
+            Ok(mut attrs) if !sub_attrs.is_empty() => {
+                let var = |name: &str| tf_engine.get_var(name).map(|v| v.to_string_value()).unwrap_or_default();
+                attrs.expand(&var("hiliteattr"), &var("error_attr"), &var("warning_attr"));
+                let drawn = tf::attrs::apply_to_line(&sub_text, &attrs, &[]);
+                if !attrs.to_sgr().is_empty() {
+                    sub_own_attrs = Some((sub_text, attrs));
+                }
+                drawn
+            }
+            _ => sub_text,
         };
-        result.messages.push(sub_with_attrs);
+        // `G`/`L`/`A` from the /substitute's own attributes or the trigger's.
+        let mut marks = LineMarks::parse(&sub_attrs);
+        let own = LineMarks::from_attrs(&tf_result.attrs);
+        marks.nohistory |= own.nohistory;
+        marks.nolog |= own.nolog;
+        marks.noactivity |= own.noactivity;
+        result.messages.push((sub_with_attrs, marks, sub_own_attrs));
     }
 
     result
@@ -1492,9 +1494,46 @@ fn resolve_web_cert_files_inner(app: &mut App, persist: bool) -> Option<(String,
 }
 
 pub fn get_home_dir() -> String {
-    home::home_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string())
+    // Unit tests never see the real home: every `~/.clay` file (settings.dat, keybindings,
+    // known_hosts, scrollback.db, logs, ...) is derived from this, and App-level tests save
+    // settings as a side effect - which used to overwrite the developer's own settings.dat.
+    #[cfg(test)]
+    {
+        test_home_dir().to_string_lossy().to_string()
+    }
+    #[cfg(not(test))]
+    {
+        home::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string())
+    }
+}
+
+/// The per-process home directory unit tests use instead of the real one (see
+/// `get_home_dir`). Created once; leftovers from earlier test processes that are no
+/// longer running are removed at the same time, so runs don't accumulate in /tmp.
+#[cfg(test)]
+pub fn test_home_dir() -> &'static PathBuf {
+    static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    TEST_HOME.get_or_init(|| {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        #[cfg(target_os = "linux")]
+        if let Ok(entries) = std::fs::read_dir(&tmp) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(old_pid) = name.strip_prefix("clay-test-home-").and_then(|p| p.parse::<u32>().ok()) {
+                    if old_pid != pid && !std::path::Path::new(&format!("/proc/{}", old_pid)).exists() {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+        let dir = tmp.join(format!("clay-test-home-{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
 }
 
 /// Returns a dot-prefixed filename on Unix, plain filename on Windows.
@@ -1738,6 +1777,19 @@ pub struct Settings {
     // row of a wrapped output line (0 = disabled/current behavior, unlike TF's own default).
     // Width-aware-clamped inside wrap_ansi_line/visual_line_count, not here — see their docs.
     wrapspace: u8,
+    // TF's %wrapsize, once a script sets it (and %wrap isn't off): the column output wraps
+    // at, short of the window's edge (0 = the window's edge, Clay's own). Not saved here -
+    // it is a TF variable (`App::apply_tf_wrap`).
+    pub wrap_columns: usize,
+    // TF's %clock_format, once a script sets it: how the status bar's clock reads (empty =
+    // Clay's own 12-hour clock). Not saved here - it is a TF variable.
+    pub clock_format: String,
+    // TF's %textdiv, once a script sets it ("off", "on", "always" or "clear"): what a world
+    // brought forward shows between text already seen and new text, in place of Clay's ▶
+    // markers (empty = Clay's own). `textdiv_str` is the divider (%textdiv_str). Not saved
+    // here - they are TF variables (`App::apply_tf_textdiv`).
+    pub textdiv: String,
+    pub textdiv_str: String,
     // Remote GUI font settings
     font_name: String,
     font_size: f32,
@@ -1824,6 +1876,14 @@ pub struct Settings {
     pub url_shorteners: Vec<encoding::UrlShortener>,
 }
 
+impl Settings {
+    /// Clay's ▶ new-text markers are drawn: the setting is on, and no script has set TF's
+    /// %textdiv, which takes their place (`App::apply_tf_textdiv`).
+    pub(crate) fn nli_drawn(&self) -> bool {
+        self.new_line_indicator && self.textdiv.is_empty()
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -1839,6 +1899,10 @@ impl Default for Settings {
             gui_transparency: 1.0,
             color_offset_percent: 0,   // 0 = disabled, 1-100 = adjustment percentage
             wrapspace: 0,   // 0 = no hanging indent (current behavior); TF itself defaults differently
+            wrap_columns: 0,
+            clock_format: String::new(),
+            textdiv: String::new(),
+            textdiv_str: "=====".to_string(),
             font_name: String::new(),  // Empty means use system default
             font_size: 14.0,
             // Web interface font sizes (per device type)
@@ -2029,6 +2093,11 @@ pub struct WorldSettings {
     /// investigate-differences-between-tinyfugu-fluffy-stallman.md). Default
     /// `DEFAULT_PROMPT_WAIT_MS`.
     pub prompt_wait_ms: u64,
+    /// TinyFugue's world type (`/addworld -T<type>`, `addworld()`'s 2nd argument): free
+    /// text such as "tiny", "lp.diku" or "telnet" that `/def -T` and `-hEVENT` patterns
+    /// match against, as in TF. Empty means untyped. Setting it with `/addworld -T` also
+    /// picks the login style and prompt handling TF's library gives that type.
+    pub tf_type: String,
 }
 
 impl Default for WorldSettings {
@@ -2064,6 +2133,7 @@ impl Default for WorldSettings {
             mcp_enabled: true,
             mccp2_enabled: true,
             prompt_wait_ms: DEFAULT_PROMPT_WAIT_MS,
+            tf_type: String::new(),
         }
     }
 }
@@ -2295,8 +2365,11 @@ pub enum LogAction {
 pub enum Command {
     /// /help [topic] - show help popup (or topic-specific help)
     Help,
-    /// /help <topic> - show help for a specific topic
-    HelpTopic { topic: String },
+    /// /help <topic> - show help for a specific topic. `topic` is the first word,
+    /// lower-cased, for Clay's own topics; `raw` is everything after /help as typed,
+    /// for TinyFugue's help file, whose topics are case-sensitive and can be several
+    /// words ("special variables").
+    HelpTopic { topic: String, raw: String },
     /// /version - show version info
     Version,
     /// /reach [--refresh|-r] [--lookup|-l] - how other devices can reach this Clay
@@ -2322,8 +2395,8 @@ pub enum Command {
     WorldEdit { name: Option<String> },
     /// /worlds -l <name> - connect without auto-login
     WorldConnectNoLogin { name: String },
-    /// /worlds -b <name> - connect to world in background (no switch)
-    WorldConnectBackground { name: String },
+    /// /worlds -b <name> - connect to world in background (no switch); `-l` too: no login
+    WorldConnectBackground { name: String, no_login: bool },
     /// /worlds <name> - switch to or connect to named world
     WorldSwitch { name: String },
     /// /worlds <host> <port> (also /world) - TF's own host+port form: create-or-
@@ -2334,9 +2407,9 @@ pub enum Command {
     /// `use_ssl` (from `-x`) is honored here (there's no pre-existing world
     /// setting to fall back to, unlike the named-world form).
     WorldConnectHostPort { host: String, port: String, use_ssl: bool, no_login: bool, background: bool },
-    /// /connect [host port [ssl]] - connect to server (internal use by buttons/TF)
+    /// /__connect [host port [ssl]] - connect to server (internal use by buttons/TF)
     Connect { host: Option<String>, port: Option<String>, ssl: bool },
-    /// /connect host:port | host port | --close | --cancel - attach to/detach from a remote
+    /// /server host:port | host port | --close | --cancel - attach to/detach from a remote
     /// Clay server instance (relaunches this process as a remote client, or back to master)
     RemoteAttach { addr: String, close: bool, cancel: bool },
     /// /import host[:port] - download settings/theme/keybindings from another Clay instance
@@ -2418,30 +2491,6 @@ pub enum Command {
     MsdpUsage,
     /// /notify <message> - send notification to mobile clients
     Notify { message: String },
-    /// /addworld - add or update a world definition
-    AddWorld {
-        name: String,
-        host: Option<String>,
-        port: Option<String>,
-        user: Option<String>,
-        password: Option<String>,
-        use_ssl: bool,
-        /// `[<file>]` - per-world script loaded on connect (finding 31 / plan
-        /// Job 14b). Kept in the TF engine's own memory only
-        /// (`TfEngine::world_files`), never persisted to settings.dat - see
-        /// `commands::execute_add_world_command`.
-        file: Option<String>,
-    },
-    /// /addworld [-T<type>] DEFAULT [<char> <pass> [<file>]] - set the fallback
-    /// character/password/file used by any world that has none of its own
-    /// (`${world_character}`, `${world_password}`, `world_info(name, "file")`).
-    /// Stored as TF engine globals rather than a real world entry, so it never
-    /// shows up in /listworlds - see finding 31 / plan Job 14b.
-    AddWorldDefault {
-        character: Option<String>,
-        password: Option<String>,
-        file: Option<String>,
-    },
     /// /unworld <name>... - remove the definition of each named world
     /// (`/help unworld`, plan Job 14c / finding 32). A native `Command` for
     /// the same dispatch-order reason `/addworld` already is: an actual
@@ -2504,7 +2553,10 @@ pub fn parse_command(input: &str) -> Command {
     match cmd.as_str() {
         "/help" => {
             if !args.is_empty() {
-                Command::HelpTopic { topic: args[0].to_lowercase() }
+                Command::HelpTopic {
+                    topic: args[0].to_lowercase(),
+                    raw: trimmed[parts[0].len()..].trim().to_string(),
+                }
             } else {
                 Command::Help
             }
@@ -2533,7 +2585,8 @@ pub fn parse_command(input: &str) -> Command {
         "/connections" | "/l" => Command::WorldsList,
         "/worlds" | "/world" => parse_world_command(args),
         "/__connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
-        "/connect" => parse_remote_attach_command(args),
+        // Clay's remote attach. ("/connect" is TinyFugue's: connect a world.)
+        "/server" => parse_remote_attach_command(args),
         "/import" => parse_import_command(args),
         "/disconnect" | "/dc" => {
             let world = if args.is_empty() { None } else { Some(args.join(" ")) };
@@ -2594,7 +2647,6 @@ pub fn parse_command(input: &str) -> Command {
                 Command::Notify { message: args.join(" ") }
             }
         }
-        "/addworld" => parse_addworld_command(args),
         // /unworld <name>... (finding 32/Job 14c): each name is processed
         // independently by `execute_remove_world_command`, so they're all
         // forwarded together rather than only taking args[0].
@@ -2690,7 +2742,7 @@ pub fn parse_command(input: &str) -> Command {
 /// `cmd_fg`'s own `-n` doc comment for why that's a no-op in Clay). Clay has
 /// no single generic "connect with these flags" entry point, so the connect-
 /// side letters collapse onto the existing granular Commands below:
-///   -b            -> WorldConnectBackground (background always wins)
+///   -b            -> WorldConnectBackground (background always wins; carries -l)
 ///   -l (no -b)    -> WorldConnectNoLogin
 ///   neither       -> WorldSwitch (Clay's default: foreground and connect)
 /// `-f` is accepted, not distinct: it's already WorldSwitch's default when
@@ -2752,7 +2804,7 @@ fn parse_world_command(args: &[&str]) -> Command {
 
     let name = rest.join(" ");
     if background {
-        Command::WorldConnectBackground { name }
+        Command::WorldConnectBackground { name, no_login }
     } else if no_login {
         Command::WorldConnectNoLogin { name }
     } else {
@@ -2760,7 +2812,213 @@ fn parse_world_command(args: &[&str]) -> Command {
     }
 }
 
-/// Parse /connect command
+/// A Timed Prompt world waits its own `prompt_wait_ms`; with TF's %lp on (`lp_wait`),
+/// any other MUD world waits that. None: the world doesn't infer prompts from silence.
+fn timed_prompt_wait_for(world: &World, lp_wait: Option<Duration>) -> Option<Duration> {
+    if world.settings.world_type == WorldType::MudTimedPrompt {
+        Some(Duration::from_millis(world.settings.prompt_wait_ms))
+    } else if world.settings.world_type.is_mud() {
+        lp_wait
+    } else {
+        None
+    }
+}
+
+/// What only Clay's own console can do, because it needs the terminal itself: TF's
+/// /sh and /suspend. `tfrun` queues them (`App::pending_terminal_ops`) and the console
+/// loop runs them (`run_terminal_ops`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TerminalOp {
+    /// /sh: `command` with /bin/sh, or with None an interactive %SHELL; %? gets its
+    /// status. `world_idx` is where anything to say about it goes.
+    Shell { command: Option<String>, world_idx: usize },
+    /// /suspend, or ^Z.
+    Suspend,
+}
+
+/// Lend the terminal out (TF's "fix the screen first, and restore it after"): leave raw
+/// mode and the alternate screen, run `f`, then take the terminal back and redraw it.
+fn with_terminal_released<T>(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    f: impl FnOnce(&mut App) -> T,
+) -> io::Result<T> {
+    if app.mouse_capture_active {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
+    let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    let result = f(app);
+    enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    if app.mouse_capture_active {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    }
+    terminal.clear()?;
+    app.needs_output_redraw = true;
+    Ok(result)
+}
+
+/// Stop Clay as ^Z does, the terminal restored meanwhile (TF's /suspend).
+fn suspend_console(app: &mut App, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        with_terminal_released(app, terminal, |_| unsafe {
+            libc::kill(libc::getpid(), libc::SIGTSTP);
+        })
+    }
+    #[cfg(any(target_os = "android", not(unix)))]
+    {
+        let _ = terminal;
+        app.add_output("Process suspension (Ctrl+Z) is not available on this platform.");
+        Ok(())
+    }
+}
+
+/// Run what `App::pending_terminal_ops` holds. The caller has stopped its keyboard
+/// reader first: keystrokes belong to the shell while it runs.
+fn run_terminal_ops(app: &mut App, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    while let Some(op) = app.pending_terminal_ops.pop_front() {
+        match op {
+            TerminalOp::Suspend => suspend_console(app, terminal)?,
+            TerminalOp::Shell { command, world_idx } => {
+                let flag_on = |app: &App, name: &str, unset: bool| {
+                    app.tf_engine.get_var(name).map_or(unset, tf::special_vars::flag_is_on)
+                };
+                // TF waits for a key afterwards when %shpause and %interactive are on (a
+                // console is interactive unless the user says it isn't).
+                let pause = flag_on(app, "shpause", false) && flag_on(app, "interactive", true);
+                let outcome = with_terminal_released(app, terminal, |app| {
+                    let status = run_shell_on_terminal(app, command.as_deref());
+                    if pause {
+                        let _ = execute!(std::io::stdout(), crossterm::style::Print("\r\n% Press any key to continue.\r\n"));
+                        if enable_raw_mode().is_ok() {
+                            while let Ok(event) = crossterm::event::read() {
+                                if matches!(event, Event::Key(k) if k.kind == KeyEventKind::Press) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    status
+                })?;
+                match outcome {
+                    Ok(status) => app.tf_engine.set_global("?", tf::TfValue::Integer(status as i64)),
+                    Err(e) => {
+                        app.tf_engine.set_global("?", tf::TfValue::Integer(-1));
+                        let idx = world_idx.min(app.worlds.len().saturating_sub(1));
+                        app.emit_tf_error(idx, &format!("SH: {}", e), false);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// /sh on Clay's own console: `command` (or, with None, an interactive %SHELL) runs on
+/// the terminal and returns its exit status (-1 if it didn't exit normally). Clay
+/// ignores ^C and ^\ meanwhile, so they reach only the shell - as system(3) does.
+#[cfg(unix)]
+fn run_shell_on_terminal(app: &App, command: Option<&str>) -> Result<i32, String> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = match command {
+        Some(command) => {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(command);
+            cmd
+        }
+        None => {
+            let shell = app.tf_engine.get_var("SHELL").map(|v| v.to_string_value())
+                .filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".to_string());
+            std::process::Command::new(shell)
+        }
+    };
+    if let Some(ref dir) = app.tf_engine.current_dir {
+        cmd.current_dir(dir);
+    }
+    app.tf_engine.apply_child_env(&mut cmd);
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut default: libc::sigaction = std::mem::zeroed();
+            default.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(libc::SIGINT, &default, std::ptr::null_mut());
+            libc::sigaction(libc::SIGQUIT, &default, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+    let mut old_int: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut old_quit: libc::sigaction = unsafe { std::mem::zeroed() };
+    unsafe {
+        let mut ignore: libc::sigaction = std::mem::zeroed();
+        ignore.sa_sigaction = libc::SIG_IGN;
+        libc::sigaction(libc::SIGINT, &ignore, &mut old_int);
+        libc::sigaction(libc::SIGQUIT, &ignore, &mut old_quit);
+    }
+    let status = cmd.status();
+    unsafe {
+        libc::sigaction(libc::SIGINT, &old_int, std::ptr::null_mut());
+        libc::sigaction(libc::SIGQUIT, &old_quit, std::ptr::null_mut());
+    }
+    status.map(|s| s.code().unwrap_or(-1)).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn run_shell_on_terminal(app: &App, command: Option<&str>) -> Result<i32, String> {
+    let mut cmd = std::process::Command::new(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
+    if let Some(command) = command {
+        cmd.arg("/C").arg(command);
+    }
+    if let Some(ref dir) = app.tf_engine.current_dir {
+        cmd.current_dir(dir);
+    }
+    app.tf_engine.apply_child_env(&mut cmd);
+    cmd.status().map(|s| s.code().unwrap_or(-1)).map_err(|e| e.to_string())
+}
+
+/// Turn SIGTERM, SIGHUP and SIGUSR2 into `AppEvent::TfSignal`s (see that variant). A signal
+/// that was ignored when Clay started stays ignored, as TF leaves it: `nohup clay -D` must
+/// survive its terminal closing.
+#[cfg(all(unix, not(target_os = "android")))]
+pub(crate) fn spawn_tf_signal_handlers(event_tx: &mpsc::Sender<AppEvent>) {
+    for (kind, signum, event) in [
+        (SignalKind::terminate(), libc::SIGTERM, tf::TfHookEvent::Sigterm),
+        (SignalKind::hangup(), libc::SIGHUP, tf::TfHookEvent::Sighup),
+        (SignalKind::user_defined2(), libc::SIGUSR2, tf::TfHookEvent::Sigusr2),
+    ] {
+        // SAFETY: a query (null new action) of the current disposition.
+        let ignored = unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signum, std::ptr::null(), &mut current) == 0 && current.sa_sigaction == libc::SIG_IGN
+        };
+        if ignored {
+            continue;
+        }
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            let Ok(mut stream) = signal(kind) else { return };
+            while stream.recv().await.is_some() {
+                let _ = tx.send(AppEvent::TfSignal(event)).await;
+            }
+        });
+    }
+}
+
+/// How many lines a quiet login gags at most (TF: 25).
+const QUIET_LOGIN_LINES: u32 = 25;
+
+/// The character and password a world logs in with: its own, else - field by field - the
+/// DEFAULT world's (`/addworld DEFAULT <char> <pass>`), as in TF.
+fn login_credentials(settings: &WorldSettings, default_char: Option<&str>, default_pass: Option<&str>) -> (String, String) {
+    let pick = |own: &str, default: Option<&str>| {
+        if own.is_empty() { default.unwrap_or("").to_string() } else { own.to_string() }
+    };
+    (pick(&settings.user, default_char), pick(&settings.password, default_pass))
+}
+
+/// Parse /__connect command (the Connect buttons' internal command)
 fn parse_connect_command(args: &[&str]) -> Command {
     if args.is_empty() {
         return Command::Connect { host: None, port: None, ssl: false };
@@ -2773,13 +3031,13 @@ fn parse_connect_command(args: &[&str]) -> Command {
     Command::Connect { host, port, ssl }
 }
 
-/// Parse /connect command (attach to / detach from a remote Clay server instance)
+/// Parse /server command (attach to / detach from a remote Clay server instance)
 ///
 /// Formats:
-///   /connect host:port
-///   /connect host port
-///   /connect --close    (detach and become an independent master)
-///   /connect --cancel   (cancel a pending confirmation)
+///   /server host:port
+///   /server host port
+///   /server --close    (detach and become an independent master)
+///   /server --cancel   (cancel a pending confirmation)
 fn parse_remote_attach_command(args: &[&str]) -> Command {
     if args.first().map(|a| a.eq_ignore_ascii_case("--close")).unwrap_or(false) {
         return Command::RemoteAttach { addr: String::new(), close: true, cancel: false };
@@ -2812,106 +3070,6 @@ fn parse_import_command(args: &[&str]) -> Command {
     Command::Import { addr }
 }
 
-/// Parse /addworld command (TF-compatible world creation, `/help addworld`)
-///
-/// Formats:
-///   /addworld [-pxe] [-T<type>] [-s<srchost>] <name> [<char> <pass>] <host> <port> [<file>]
-///   /addworld [-T<type>] [-s<srchost>] <name>
-///   /addworld [-T<type>] DEFAULT [<char> <pass> [<file>]]
-///
-/// Options:
-///   -x  Use SSL/TLS
-///   -e  Echo (ignored)
-///   -p  No proxy (ignored)
-///   -T<type>  World type (ignored, defaults to MUD)
-///   -s<srchost>  Local bind address for the connection - accepted, not
-///                persisted: `WorldSettings` has no such field, same
-///                treatment as -e/-p/-T's existing no-ops. `-T`/`-s` take the
-///                REST of their own token as an attached value (never
-///                bundled with other short flags) - critical for `-s`, since
-///                an unbundled per-char scan would misread a srchost value
-///                containing 'x'/'e'/'p' as those boolean flags.
-///   [<file>]  Per-world script loaded on connect - kept in the TF engine's
-///             own memory only (`world_info(name, "file")`), never a
-///             persisted `Command::AddWorld` field (finding 31 / plan Job
-///             14b). Stripped out here per stdlib.tf's own `/addworld`
-///             wrapper mapping (verified against its source): {#}<=4 tokens
-///             -> name,host,port,[file]; {#}>4 -> name,char,pass,host,port,
-///             [file].
-///   DEFAULT   Fallback character/password/file for any world missing its
-///             own (`Command::AddWorldDefault`, see its own doc comment).
-fn parse_addworld_command(args: &[&str]) -> Command {
-    if args.is_empty() {
-        return Command::Unknown { cmd: "/addworld".to_string() };
-    }
-
-    let mut use_ssl = false;
-    let mut remaining_args: Vec<&str> = Vec::new();
-
-    // Parse options
-    for arg in args {
-        if let Some(flags) = arg.strip_prefix('-') {
-            if flags.starts_with('T') || flags.starts_with('s') {
-                continue; // -T<type> / -s<srchost>: attached value, discarded (see doc comment)
-            }
-            for c in flags.chars() {
-                match c {
-                    'x' => use_ssl = true,
-                    'e' | 'p' => {} // Ignored: echo, proxy
-                    _ => {}
-                }
-            }
-        } else {
-            remaining_args.push(arg);
-        }
-    }
-
-    if remaining_args.is_empty() {
-        return Command::Unknown { cmd: "/addworld".to_string() };
-    }
-
-    // /addworld [-T<type>] DEFAULT [<char> <pass> [<file>]]
-    if remaining_args[0].eq_ignore_ascii_case("default") {
-        let rest = &remaining_args[1..];
-        let (character, password, file) = match rest.len() {
-            0 => (None, None, None),
-            1 => (Some(rest[0].to_string()), None, None),
-            2 => (Some(rest[0].to_string()), Some(rest[1].to_string()), None),
-            _ => (Some(rest[0].to_string()), Some(rest[1].to_string()), Some(rest[2..].join(" "))),
-        };
-        return Command::AddWorldDefault { character, password, file };
-    }
-
-    let name = remaining_args[0];
-
-    // Trailing [<file>], per stdlib.tf's own /addworld wrapper mapping (see
-    // doc comment): exactly 4 raw tokens -> name,host,port,file; 6 or more ->
-    // name,char,pass,host,port,file. Everything else is unchanged from
-    // before (`core` is just `remaining_args` verbatim).
-    let (core, file): (&[&str], Option<String>) = match remaining_args.len() {
-        4 => (&remaining_args[..3], Some(remaining_args[3].to_string())),
-        n if n >= 6 => (&remaining_args[..5], Some(remaining_args[5..].join(" "))),
-        _ => (&remaining_args[..], None),
-    };
-
-    // core.len() interpretation (matches the pre-Job-14b mapping exactly,
-    // just parameterized over `core` instead of `remaining_args`):
-    // 1: name (connectionless)   2: name host   3: name host port
-    // 5+: name char pass host port
-    let (host, port, user, password) = match core.len() {
-        1 => (None, None, None, None),
-        2 => (Some(core[1].to_string()), None, None, None),
-        3 => (Some(core[1].to_string()), Some(core[2].to_string()), None, None),
-        _ => (
-            Some(core[3].to_string()),
-            Some(core[4].to_string()),
-            Some(core[1].to_string()),
-            Some(core[2].to_string()),
-        ),
-    };
-
-    Command::AddWorld { name: name.to_string(), host, port, user, password, use_ssl, file }
-}
 
 /// Parse /send command with flags
 fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
@@ -3142,6 +3300,170 @@ pub struct OutputLine {
     /// (`marked_new`), but as a bare bool with no owner - which is why a client leaving a
     /// world could never tell the others to stop drawing it. The owner id is that fix.
     pub display_id: Option<u64>,
+    /// What TF's history (`/recall`, `/quote #`) makes of this line. Server-side only:
+    /// `/recall` always runs on the server, so no client needs it.
+    pub hist: LineHistory,
+    /// The line's own TF display attributes, when it has any (a trigger's `-a`, `/echo
+    /// -a`): `text` already shows them; these let `/recall -a<attrs>` show it without some.
+    pub tf_attrs: Option<Box<LineAttrs>>,
+}
+
+/// A line's own TF display attributes, kept apart from the text they were drawn into, so
+/// `/recall -a<attrs>` can show the line without some of them, as TF does. `plain` is the
+/// text before they were applied, `attrs` what was drawn (`h` already expanded, as TF
+/// expands it in a definition); partial (`-P`) attributes belong to the text itself, which
+/// TF's /recall -a leaves alone. In memory only: after a hot reload the lines keep their
+/// attributes, just no longer separably.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineAttrs {
+    pub plain: String,
+    pub attrs: tf::TfAttributes,
+    pub partials: Vec<(usize, usize, tf::TfAttributes)>,
+}
+
+impl LineAttrs {
+    /// The line drawn without the attributes in `suppress` (a /recall -a list); None when
+    /// that changes nothing.
+    pub(crate) fn without(&self, suppress: &tf::TfAttributes) -> Option<String> {
+        let mut attrs = self.attrs.clone();
+        let before = attrs.clone();
+        if suppress.bold { attrs.bold = false; }
+        if suppress.underline { attrs.underline = false; }
+        if suppress.reverse { attrs.reverse = false; }
+        if suppress.hilite { attrs.hilite = false; }
+        if suppress.error { attrs.error = false; }
+        if suppress.warning { attrs.warning = false; }
+        if suppress.fg.is_some() { attrs.fg = None; }
+        if suppress.bg.is_some() { attrs.bg = None; }
+        if attrs == before {
+            return None;
+        }
+        Some(tf::attrs::apply_to_line(&self.plain, &attrs, &self.partials))
+    }
+}
+
+/// A line's place in TF's history (`OutputLine::hist`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LineHistory {
+    /// TF's `G` (nohistory) attribute: shown as usual, but `/recall` and `/quote #` leave
+    /// it out, and it is never written to the scrollback archive.
+    pub nohistory: bool,
+    /// Put there by `/recordline`: in that history, never displayed (the line is gagged),
+    /// logged or archived.
+    pub recorded: Option<RecordScope>,
+}
+
+/// Which history `/recordline` put a line in: the world's (`-w`, found by `/recall -w`),
+/// local (`-l`, Clay's own output) or global (`-g`, only `/recall -g` shows it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordScope {
+    World,
+    Local,
+    Global,
+}
+
+/// TF's %textdiv, when a script has set it to show something: "on" (a divider above
+/// text that arrived while the console was elsewhere), "always" (a divider even with no
+/// new text) or "clear" (the old text not drawn: a screen-high blank instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextDivMode {
+    On,
+    Always,
+    Clear,
+}
+
+impl TextDivMode {
+    /// From `Settings::textdiv`: None for Clay's own markers ("") and for "off".
+    pub(crate) fn from_setting(value: &str) -> Option<Self> {
+        match value {
+            "on" => Some(TextDivMode::On),
+            "always" => Some(TextDivMode::Always),
+            "clear" => Some(TextDivMode::Clear),
+            _ => None,
+        }
+    }
+}
+
+/// A world's %textdiv divider on the console for one visit: it divides lines up to
+/// `after_seq` (the newest the console had shown; None: nothing yet) from the rest.
+/// Where it is drawn is worked out as the console draws (`rendering::console_divider`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConsoleTextDiv {
+    pub after_seq: Option<u64>,
+    pub mode: TextDivMode,
+}
+
+/// A line a trigger's `/substitute` shows: its text (attributes drawn in), its `G`/`L`/`A`,
+/// and - when it has display attributes of its own - its plain text with them.
+pub(crate) type TfMessage = (String, LineMarks, Option<(String, tf::TfAttributes)>);
+
+/// TF's per-line attributes that aren't about how a line looks: `G` (keep it out of the
+/// history), `L` (don't log it), `A` (no activity). A trigger's reach a server line through
+/// the `World::tf_*` marks `add_output` consumes; Clay's own text (`/echo -a`, a
+/// `/substitute -a`) carries them with `App::emit_client_text_marked`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LineMarks {
+    /// `g`: kept (in the history, for /recall -ag) but not shown.
+    pub gag: bool,
+    pub nohistory: bool,
+    pub nolog: bool,
+    pub noactivity: bool,
+}
+
+impl LineMarks {
+    pub(crate) fn from_attrs(attrs: &tf::TfAttributes) -> Self {
+        LineMarks { gag: attrs.gag, nohistory: attrs.norecord, nolog: attrs.nolog, noactivity: attrs.noactivity }
+    }
+
+    /// The marks in an attribute string such as `/echo -a` takes ("BG", "nohistory").
+    pub(crate) fn parse(attrs: &str) -> Self {
+        if attrs.is_empty() {
+            return LineMarks::default();
+        }
+        tf::TfAttributes::parse(attrs).map(|a| LineMarks::from_attrs(&a)).unwrap_or_default()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == LineMarks::default()
+    }
+}
+
+/// The lines TF's history holds: all but those with the `G` (nohistory) attribute. Done
+/// before /recall counts or ranges anything, since TF never recorded them at all.
+pub(crate) fn in_history(mut lines: Vec<OutputLine>) -> Vec<OutputLine> {
+    lines.retain(|l| !l.hist.nohistory);
+    lines
+}
+
+impl LineHistory {
+    /// Its letters in the hot-reload state file's line flags: `h` (nohistory), and `W`,
+    /// `L` or `G` for a line `/recordline` recorded.
+    pub(crate) fn flags(&self) -> String {
+        let mut flags = String::new();
+        if self.nohistory {
+            flags.push('h');
+        }
+        match self.recorded {
+            Some(RecordScope::World) => flags.push('W'),
+            Some(RecordScope::Local) => flags.push('L'),
+            Some(RecordScope::Global) => flags.push('G'),
+            None => {}
+        }
+        flags
+    }
+
+    pub(crate) fn from_flags(flags: &str) -> Self {
+        let recorded = if flags.contains('W') {
+            Some(RecordScope::World)
+        } else if flags.contains('L') {
+            Some(RecordScope::Local)
+        } else if flags.contains('G') {
+            Some(RecordScope::Global)
+        } else {
+            None
+        };
+        LineHistory { nohistory: flags.contains('h'), recorded }
+    }
 }
 
 /// Display/log marker for captured user input. Applied at RENDER time only (in
@@ -3215,6 +3537,8 @@ impl OutputLine {
             archive_seq: None,
             viewed: false,
             display_id: None,
+            hist: LineHistory::default(),
+            tf_attrs: None,
         }
     }
 
@@ -3241,6 +3565,8 @@ impl OutputLine {
             archive_seq: None,
             viewed: false,
             display_id: None,
+            hist: LineHistory::default(),
+            tf_attrs: None,
         }
     }
 
@@ -3258,11 +3584,13 @@ impl OutputLine {
             archive_seq: None,
             viewed: false,
             display_id: None,
+            hist: LineHistory::default(),
+            tf_attrs: None,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false, archive_sourced: false, archive_seq: None, viewed: false, display_id: None }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false, archive_sourced: false, archive_seq: None, viewed: false, display_id: None, hist: LineHistory::default(), tf_attrs: None }
     }
 
     /// A user-typed command captured on its way to the MUD. `gagged: true` is what makes it
@@ -3282,6 +3610,8 @@ impl OutputLine {
             archive_seq: None,
             viewed: false,
             display_id: None,
+            hist: LineHistory::default(),
+            tf_attrs: None,
         }
     }
 
@@ -3312,6 +3642,23 @@ pub struct World {
     pub connected: bool,
     pub command_tx: Option<mpsc::Sender<WriteCommand>>,
     pub unseen_lines: usize,
+    /// Lines of the packet being added that a TF trigger gave the `L` (nolog), `A`
+    /// (noactivity) or `G` (nohistory) attribute, by text: `add_output` doesn't log them /
+    /// count them unseen / put them in the history (`/recall`) or the archive.
+    pub(crate) tf_nolog: Vec<String>,
+    pub(crate) tf_noactivity: Vec<String>,
+    pub(crate) tf_nohistory: Vec<String>,
+    /// Lines of the packet being added that carry their own TF attributes, by text, with
+    /// those attributes (`OutputLine::tf_attrs`).
+    pub(crate) tf_line_attrs: Vec<(String, Box<LineAttrs>)>,
+    /// The cipher the current TLS connection settled on, when known (TF's CONNECT hook).
+    pub(crate) tls_cipher: Option<String>,
+    /// The newest line this instance's console had shown of this world when it last
+    /// left it (None: none yet) - what TF's %textdiv divides new text from. Runtime only.
+    pub(crate) console_seen_seq: Option<u64>,
+    /// TF's %textdiv divider for this visit of the console's to this world, when a script
+    /// has set %textdiv (`App::track_console_world`); dropped as the console leaves.
+    pub(crate) console_textdiv: Option<ConsoleTextDiv>,
     pub paused: bool,
     pub search_active: bool,  // true while the F5 search popup is open for this world
     pub pending_lines: Vec<OutputLine>,
@@ -3395,6 +3742,19 @@ pub struct World {
     pub is_initial_world: bool,      // True for the auto-created world before first connection
     pub was_connected: bool,         // True if world has ever been connected (for world cycling)
     pub skip_auto_login: bool,       // True to skip auto-login on next connect (for /worlds -l)
+    /// TF's `/connect <host> <port>` world, "(unnamed<N>)": never saved to settings.dat,
+    /// and removed once disconnected and not in the foreground (`App::reap_temporary_world`).
+    pub(crate) is_temporary: bool,
+    /// `/connect -q`: the next login is a quiet one.
+    pub(crate) quiet_login: bool,
+    /// `/connect -x`: use SSL for the next connection even though the world doesn't.
+    pub(crate) force_ssl_once: bool,
+    /// When `/connect` started connecting this temporary world (it is not reaped while
+    /// that may still be going on).
+    pub(crate) temp_connect_started: Option<std::time::Instant>,
+    /// A quiet login (`/connect -q`, %quiet) in progress: how many more lines to gag
+    /// before giving up waiting for the MUD's end-of-intro marker.
+    pub(crate) quiet_login_lines: Option<u32>,
     pub showing_splash: bool,        // True when showing startup splash (for centering)
     needs_redraw: bool,          // True when terminal needs full redraw (after splash clear)
     pending_since: Option<std::time::Instant>, // When pending output first appeared (for Alt-w)
@@ -3635,6 +3995,13 @@ impl World {
             connected: false,
             command_tx: None,
             unseen_lines: 0,
+            tf_nolog: Vec::new(),
+            tf_nohistory: Vec::new(),
+            tf_line_attrs: Vec::new(),
+            tls_cipher: None,
+            console_seen_seq: None,
+            console_textdiv: None,
+            tf_noactivity: Vec::new(),
             paused: false,
             search_active: false,
             pending_lines: Vec::new(),
@@ -3670,6 +4037,11 @@ impl World {
             is_initial_world: false,
             was_connected: false,
             skip_auto_login: false,
+            is_temporary: false,
+            quiet_login: false,
+            force_ssl_once: false,
+            temp_connect_started: None,
+            quiet_login_lines: None,
             showing_splash: show_splash,
             needs_redraw: false,
             pending_since: None,
@@ -3797,6 +4169,7 @@ impl World {
         self.chat_target = None;
         self.command_tx = None;
         self.connected = false;
+        self.tls_cipher = None;
         self.socket_fd = None;
         self.telnet_mode = false;
         // Job 9 (T3.2): every telnet protocol mirror (negotiated_encoding, naws_enabled/
@@ -3832,6 +4205,7 @@ impl World {
         self.skip_auto_login = false;
         self.fansi_detect_until = None;
         self.fansi_login_pending = None;
+        self.quiet_login_lines = None;
         // Clear timing fields so /connections doesn't show stale times
         self.last_send_time = None;
         self.last_receive_time = None;
@@ -4120,18 +4494,27 @@ impl World {
             .is_ok()
     }
 
-    pub(crate) fn record_input_line(&mut self, text: &str, log_input: bool, viewed: bool) -> (u64, bool) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
+    /// A captured input line (`OutputLine::is_input`) for `text`, written to the log file
+    /// first when `log_input`; the caller adds it (`App::push_hidden_line`).
+    pub(crate) fn input_line(&mut self, text: &str, log_input: bool, viewed: bool) -> OutputLine {
         if log_input {
             self.write_log_line(&format!("{}{}", INPUT_LINE_PREFIX, text));
         }
-        let mut line = OutputLine::new_input(text.to_string(), seq);
+        let mut line = OutputLine::new_input(text.to_string(), 0);
         // Born viewed when somebody is watching, same rule as add_output. A captured input
         // line is `from_server: false` so it can never own a ▶ marker anyway (claim_unviewed
         // skips those), but `viewed` must still be accurate to keep unviewed lines a
         // contiguous tail, which claim_unviewed's backwards scan relies on.
         line.viewed = viewed;
+        line
+    }
+
+    /// Add a line that is in the buffer but never drawn (captured input, a /recordline):
+    /// it gets the next seq; returns that and whether it landed in `output_lines`.
+    pub(crate) fn push_hidden_line(&mut self, mut line: OutputLine) -> (u64, bool) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        line.seq = seq;
         // Same seq-ordering rule as process_server_data's hold_gagged_in_pending: while
         // paused with a backlog, pushing straight into output_lines would jump this line
         // ahead of lower-seq pending lines and break the sorted-by-seq invariant that
@@ -4257,7 +4640,12 @@ impl World {
                 // TCP reads was updated on screen and never written to the archive
                 // at all — a silent, permanent hole proportional to how chatty the
                 // MUD is. Only archive once the line is actually complete.
-                let completed_archive_seq = if ends_with_newline && from_server {
+                // A TF trigger's `G` keeps it out of the history and the archive.
+                let completed_nohistory = match self.tf_nohistory.iter().position(|m| m == completed_line) {
+                    Some(i) => { self.tf_nohistory.remove(i); true }
+                    None => false,
+                };
+                let completed_archive_seq = if ends_with_newline && from_server && !completed_nohistory {
                     self.archive_line(completed_line, false)
                 } else {
                     None
@@ -4266,12 +4654,14 @@ impl World {
                 if partial_was_in_pending {
                     if let Some(i) = self.last_visible_pending_idx() {
                         self.pending_lines[i].text = completed_line.to_string();
+                        self.pending_lines[i].hist.nohistory |= completed_nohistory;
                         if completed_archive_seq.is_some() {
                             self.pending_lines[i].archive_seq = completed_archive_seq;
                         }
                     }
                 } else if let Some(i) = self.last_visible_output_idx() {
                     self.output_lines[i].text = completed_line.to_string();
+                    self.output_lines[i].hist.nohistory |= completed_nohistory;
                     if completed_archive_seq.is_some() {
                         self.output_lines[i].archive_seq = completed_archive_seq;
                     }
@@ -4319,9 +4709,19 @@ impl World {
 
         // Process remaining lines
         let line_count = lines.len();
+        // A line a TF trigger marked `L` isn't logged, one marked `A` isn't counted unseen.
+        let take_mark = |marks: &mut Vec<String>, line: &str| match marks.iter().position(|m| m == line) {
+            Some(i) => { marks.remove(i); true }
+            None => false,
+        };
         for (i, line) in lines.iter().enumerate().skip(start_idx) {
             let is_last = i == line_count - 1;
             let is_partial = is_last && !ends_with_newline;
+            let nolog = take_mark(&mut self.tf_nolog, line);
+            let noactivity = take_mark(&mut self.tf_noactivity, line);
+            let nohistory = take_mark(&mut self.tf_nohistory, line);
+            let line_attrs = self.tf_line_attrs.iter().position(|(m, _)| m == line)
+                .map(|i| self.tf_line_attrs.remove(i).1);
             // Durable archive sequence for this line, filled in below iff it is
             // actually archived. Stamped onto the OutputLine so /recall -D can
             // tell which archive rows the live buffer already covers.
@@ -4338,9 +4738,12 @@ impl World {
 
             // Write to log file if enabled (only for complete lines)
             if !is_partial {
-                self.write_log_line(line);
-                // Archive server lines to long-term scrollback
-                if from_server {
+                if !nolog {
+                    self.write_log_line(line);
+                }
+                // Archive server lines to long-term scrollback (not TF's `G` ones:
+                // that attribute keeps a line out of the history)
+                if from_server && !nohistory {
                     // Unbounded queue; a refusal is counted in ArchiveStats rather
                     // than vanishing the way try_send's dropped Result did.
                     archive_seq = self.archive_line(line, false);
@@ -4373,6 +4776,8 @@ impl World {
             // predicate, unchanged - it still drives more-mode budgeting above too.
             new_line.viewed = is_current;
             new_line.archive_seq = archive_seq;
+            new_line.hist.nohistory = nohistory;
+            new_line.tf_attrs = line_attrs;
 
             // Built before measuring, so the budget can be taken off the real OutputLine
             // through the same path the renderer wraps with (`RowMetrics`) rather than off the
@@ -4397,7 +4802,7 @@ impl World {
                 }
 
                 self.pending_lines.push(new_line);
-                if !is_current { self.unseen_lines += 1; }
+                if !is_current && !noactivity { self.unseen_lines += 1; }
                 if is_partial {
                     self.partial_line = line.to_string();
                     self.partial_in_pending = true;
@@ -4406,7 +4811,7 @@ impl World {
                 // Line fits on screen (single-line or small overflow) — add to output then pause
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
-                if !is_current {
+                if !is_current && !noactivity {
                     if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
                         self.first_unseen_at = Some(std::time::Instant::now());
                     }
@@ -4429,7 +4834,7 @@ impl World {
             } else {
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
-                if !is_current {
+                if !is_current && !noactivity {
                     // Track when first unseen output arrived
                     if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
                         self.first_unseen_at = Some(std::time::Instant::now());
@@ -4911,6 +5316,35 @@ pub struct App {
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     pub is_master: bool,
+    /// TF effects that synchronous code (a hook, a trigger) could not finish because they
+    /// reached a Clay command - run by the event loop, in order (see `tfrun`).
+    pub(crate) deferred_tf: std::collections::VecDeque<(tfrun::TfEffectCtx, std::collections::VecDeque<tf::effects::TfEffect>)>,
+    /// The last N used for a temporary world "(unnamed<N>)" (`/connect <host> <port>`).
+    pub(crate) last_temp_world: u32,
+    /// The console was resized to (columns, lines): TF's RESIZE hook is still to run.
+    pub(crate) tf_resize: Option<(u16, u16)>,
+    /// This is Clay's own console (the TUI in `run_app`), which has a terminal to lend.
+    pub(crate) console_tui: bool,
+    /// The world the console drew last (by name), to tell a world switch as it is drawn
+    /// (`track_console_world`), however the switch happened.
+    pub(crate) console_drawn_world: Option<String>,
+    /// The console's terminal size (columns, lines), as last drawn.
+    pub(crate) screen_size: Option<(u16, u16)>,
+    /// TF's status area per world, once a script has made it its own (`tf::status`):
+    /// evaluated by `refresh_tf_status` (or, on a remote console, sent by the server).
+    /// Empty: Clay's own status bar.
+    pub(crate) tf_status: std::collections::HashMap<usize, tf::status::StatusView>,
+    /// When `refresh_tf_status` last evaluated, and the layout it evaluated.
+    pub(crate) tf_status_at: Option<(std::time::Instant, tf::status::StatusLayout)>,
+    /// TF's mail check (`App::check_tf_mail`): when it is next due, and what each file
+    /// looked like at the last one.
+    pub(crate) tf_mail_due: Option<std::time::Instant>,
+    pub(crate) tf_mail_files: std::collections::HashMap<String, tfrun::MailFile>,
+    /// /sh and /suspend waiting for the console loop, which owns the terminal.
+    pub(crate) pending_terminal_ops: std::collections::VecDeque<TerminalOp>,
+    /// Where a background `/sh <command>` reports back (`AppEvent::TfShellDone`); set by
+    /// every event loop that handles that event.
+    pub(crate) tf_event_tx: Option<mpsc::Sender<AppEvent>>,
     /// Remote console only: the master reported (GlobalSettingsMsg::ws_password_set) that
     /// it has a WebSocket password. The value itself is never sent, so the /web popup
     /// starts with a blank password field that means "keep the current one".
@@ -4921,6 +5355,10 @@ pub struct App {
     pub web_restart_needed: bool,
     /// True if this session started from a hot reload (suppress server startup messages)
     pub is_reload: bool,
+    /// The reload state carried the TF engine's state (`tf::snapshot`) and it was
+    /// restored: the macros, bindings and variables startup would build are already here,
+    /// so startup actions (and the TF rc) must not run again.
+    pub tf_state_restored: bool,
     /// True if the output area needs to be redrawn (optimization to avoid unnecessary redraws)
     pub needs_output_redraw: bool,
     /// True if terminal needs full clear (for Ctrl+L redraw in --console mode)
@@ -4981,7 +5419,7 @@ pub struct App {
     /// currently deferred - true almost all of the time.
     #[cfg(not(target_os = "android"))]
     pub mccp2_reload_deadline: Option<std::time::Instant>,
-    /// Master mode: pending /connect confirmation (target addr, requested at). Cleared on
+    /// Master mode: pending /server confirmation (target addr, requested at). Cleared on
     /// confirm/cancel or when superseded by a different target.
     pub pending_remote_connect: Option<(String, std::time::Instant)>,
     /// Console TUI: credentials from the last /import attempt (addr, password, auth_key),
@@ -4990,9 +5428,9 @@ pub struct App {
     /// than NeedsInsecureConfirm, or if the confirm dialog is cancelled. See
     /// handle_import_result and plan i-d-like-to-make-snuggly-rain.md.
     pub pending_console_import: Option<(String, Option<String>, Option<String>)>,
-    /// Remote client mode: pending /connect --close request (re-exec as independent master)
+    /// Remote client mode: pending /server --close request (re-exec as independent master)
     pub pending_remote_detach: bool,
-    /// Remote client mode: pending /connect host:port request (re-exec attached elsewhere)
+    /// Remote client mode: pending /server host:port request (re-exec attached elsewhere)
     pub pending_remote_switch: Option<String>,
     /// Activity count from server (used in remote client mode, i.e. --console)
     pub server_activity_count: usize,
@@ -5087,7 +5525,7 @@ pub struct App {
 enum WsAsyncAction {
     /// Message was fully handled synchronously.
     Done,
-    /// Need to run /connect for world_index. prev_index is the world to restore after.
+    /// Need to connect world_index (as /__connect does). prev_index is the world to restore after.
     /// broadcast = true means broadcast WorldConnected on success.
     Connect { world_index: usize, prev_index: usize, broadcast: bool },
     /// Need to run /disconnect for world_index. prev_index is the world to restore after.
@@ -5160,10 +5598,23 @@ impl App {
             ws_client_worlds: std::collections::HashMap::new(),
             ws_client_owner_ids: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
+            deferred_tf: std::collections::VecDeque::new(),
+            last_temp_world: 0,
+            tf_resize: None,
+            console_tui: false,
+            console_drawn_world: None,
+            screen_size: None,
+            tf_status: std::collections::HashMap::new(),
+            tf_status_at: None,
+            tf_mail_due: None,
+            tf_mail_files: std::collections::HashMap::new(),
+            pending_terminal_ops: std::collections::VecDeque::new(),
+            tf_event_tx: None,
             remote_ws_password_set: false,
             web_reconnect_needed: false,
             web_restart_needed: false,
             is_reload: false, // Set to true in run_app if started from hot reload
+            tf_state_restored: false, // Set by the reload-state loader
             needs_output_redraw: true, // Start with true to ensure initial render
             needs_terminal_clear: false, // Set to true by Ctrl+L in --console mode
             mouse_capture_active: false, // Toggled dynamically when popups open/close
@@ -5355,6 +5806,10 @@ impl App {
             gui_transparency: self.settings.gui_transparency,
             color_offset_percent: self.settings.color_offset_percent,
             wrapspace: self.settings.wrapspace,
+            wrap_columns: self.settings.wrap_columns,
+            clock_format: self.settings.clock_format.clone(),
+            textdiv: self.settings.textdiv.clone(),
+            textdiv_str: self.settings.textdiv_str.clone(),
             remote_initial_lines: self.settings.remote_initial_lines,
             input_height: self.input_height,
             font_name: self.settings.font_name.clone(),
@@ -5416,6 +5871,10 @@ impl App {
         self.settings.gui_transparency = settings.gui_transparency;
         self.settings.color_offset_percent = settings.color_offset_percent;
         self.settings.wrapspace = settings.wrapspace;
+        self.settings.wrap_columns = settings.wrap_columns;
+        self.settings.clock_format = settings.clock_format.clone();
+        self.settings.textdiv = settings.textdiv.clone();
+        self.settings.textdiv_str = settings.textdiv_str.clone();
         self.settings.remote_initial_lines = settings.remote_initial_lines;
         self.input_height = settings.input_height;
         self.input.visible_height = self.input_height;
@@ -5579,8 +6038,25 @@ impl App {
                 next_nop_secs,
                 buffer_size: world.output_lines.len() + world.pending_lines.len(),
                 last_user_command_secs_ago: world.last_user_command_time.map(|t| now.duration_since(t).as_secs() as i64),
+                world_type: world.settings.world_type.name().to_string(),
+                tf_type: world.settings.tf_type.clone(),
+                is_temporary: world.is_temporary,
+                login: world.settings.auto_connect_type != AutoConnectType::NoLogin,
+                telnet: world.telnet_mode,
+                local_echo: !world.protocol.echo_masked,
+                paused: world.paused,
+                more_lines: world.pending_lines.len(),
+                logging: world.log_handle.is_some(),
             });
         }
+        let (columns, lines) = self.screen_size
+            .unwrap_or((self.output_width, self.output_height.saturating_add(self.input_height).saturating_add(1)));
+        self.tf_engine.screen = tf::ScreenInfo {
+            columns,
+            lines,
+            winlines: self.output_height,
+            limit: self.filter_popup.visible,
+        };
 
         // Sync keyboard buffer state
         self.tf_engine.keyboard_state = tf::KeyboardBufferState {
@@ -5596,8 +6072,14 @@ impl App {
         // of %kbnum"). The reverse sync - reading back whatever the command left them at,
         // and unconditionally clearing kbnum - happens in `process_pending_keyboard_ops`,
         // called right after `execute()` at this function's own call site.
-        self.tf_engine.set_global("kbnum", tf::TfValue::Integer(self.input.kbnum.unwrap_or(0)));
-        self.tf_engine.set_global("insert", tf::TfValue::Integer(if self.input.insert { 1 } else { 0 }));
+        // Unset when no prefix is pending, as in TF (a status line's kbnum field is blank).
+        match self.input.kbnum {
+            Some(n) => self.tf_engine.set_global("kbnum", tf::TfValue::Integer(n)),
+            None => { self.tf_engine.unset_global("kbnum"); }
+        }
+        self.tf_engine.set_global("insert", tf::TfValue::String(if self.input.insert { "on" } else { "off" }.to_string()));
+        // %more, %wrapspace, %isize: Clay's own settings (special_vars::BOUND).
+        self.sync_tf_bound_settings();
 
         // Sync ban list snapshot for TF's own /ban (cmd_banlist) - see ban_info_cache's
         // doc comment. get_ban_info() is a few RwLock reads over what's normally an empty
@@ -6079,6 +6561,7 @@ impl App {
             AutoConnectType::Connect => "connect",
             AutoConnectType::Prompt => "prompt",
             AutoConnectType::MooPrompt => "moo_prompt",
+            AutoConnectType::Lines => "lines",
             AutoConnectType::NoLogin => "none",
         };
 
@@ -6109,6 +6592,7 @@ impl App {
             mcp_enabled: world.settings.mcp_enabled,
             mccp2_enabled: world.settings.mccp2_enabled,
             prompt_wait_ms: world.settings.prompt_wait_ms,
+            tf_type: world.settings.tf_type.clone(),
             slack_token: world.settings.slack_token.clone(),
             slack_channel: world.settings.slack_channel.clone(),
             slack_workspace: world.settings.slack_workspace.clone(),
@@ -6452,6 +6936,15 @@ impl App {
                     world.prompt = prompt;
                 }
             }
+            // TF's status area (the server's `refresh_tf_status`), drawn in place of the
+            // separator bar; None: back to Clay's bar for every world.
+            WsMessage::TfStatus { world_index, view } => {
+                match view {
+                    Some(view) => { self.tf_status.insert(world_index, view); }
+                    None => self.tf_status.clear(),
+                }
+                self.needs_output_redraw = true;
+            }
             WsMessage::UnseenCleared { world_index } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     world.unseen_lines = 0;
@@ -6563,6 +7056,8 @@ impl App {
                             archive_sourced: tl.archive_sourced,
                             viewed: false,
                             display_id: None,
+                            hist: LineHistory::default(),
+                            tf_attrs: None,
                         });
                         if tl.seq > 0 {
                             world.max_received_seq = tl.seq;
@@ -6675,7 +7170,7 @@ impl App {
                     Command::Help => {
                         self.open_help_popup_new();
                     }
-                    Command::HelpTopic { ref topic } => {
+                    Command::HelpTopic { ref topic, .. } => {
                         use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
                         if let Some(lines) = get_topic_help(topic) {
                             self.popup_manager.open(create_topic_help_popup(lines));
@@ -6745,6 +7240,8 @@ impl App {
                             archive_sourced: line.archive_sourced,
                             viewed: false,
                             display_id: None,
+                            hist: LineHistory::default(),
+                            tf_attrs: None,
                         };
                         world.output_lines.push(output_line);
                         if line.seq >= world.next_seq {
@@ -6830,6 +7327,8 @@ impl App {
                                     archive_sourced: line.archive_sourced,
                                     viewed: false,
                                     display_id: None,
+                                    hist: LineHistory::default(),
+                                    tf_attrs: None,
                                 }).collect();
                             let insert_at = insert_at.min(world.output_lines.len());
                             let inserted = new_lines.len();
@@ -6864,6 +7363,8 @@ impl App {
                             archive_sourced: line.archive_sourced,
                             viewed: false,
                             display_id: None,
+                            hist: LineHistory::default(),
+                            tf_attrs: None,
                         }
                     }).collect();
                     let prepended_count = new_lines.len();
@@ -7009,6 +7510,7 @@ impl App {
                     }
                     w.settings.world_type = new_type;
                     w.settings.prompt_wait_ms = settings.prompt_wait_ms;
+                    w.settings.tf_type = settings.tf_type;
                     w.settings.slack_token = settings.slack_token;
                     w.settings.slack_channel = settings.slack_channel;
                     w.settings.slack_workspace = settings.slack_workspace;
@@ -7085,6 +7587,8 @@ impl App {
                 archive_sourced: tl.archive_sourced,
                 viewed: false,
                 display_id: None,
+                hist: LineHistory::default(),
+                tf_attrs: None,
             }
         }).collect();
         // Update next_seq to continue from highest seq in output_lines
@@ -7111,6 +7615,8 @@ impl App {
                 archive_sourced: tl.archive_sourced,
                 viewed: false,
                 display_id: None,
+                hist: LineHistory::default(),
+                tf_attrs: None,
             }
         }).collect();
         // Update next_seq if pending_lines have higher seq values
@@ -7165,6 +7671,7 @@ impl App {
             // leg either.
             world_type: WorldType::from_name(&w.settings.world_type),
             prompt_wait_ms: w.settings.prompt_wait_ms,
+            tf_type: w.settings.tf_type.clone(),
             slack_token: w.settings.slack_token,
             slack_channel: w.settings.slack_channel,
             slack_workspace: w.settings.slack_workspace,
@@ -7351,7 +7858,7 @@ impl App {
             let db_path = clay_config_path("scrollback.db");
             if !db_path.exists() {
                 // The live half still works; only the archive half is missing.
-                return Ok(live);
+                return Ok(in_history(live));
             }
             // Cut the archive at the oldest line the live buffer already holds, so the
             // overlap (every live line was archived as it arrived) isn't listed twice.
@@ -7405,7 +7912,9 @@ impl App {
                 line.archive_seq = sl.wseq;
                 line
             }).collect();
-            lines.extend(live);
+            // The cut above is computed first, from every live line: dropping TF's `G`
+            // lines before it could only move it to an older line and list some twice.
+            lines.extend(in_history(live));
             return Ok(lines);
         }
 
@@ -7415,7 +7924,49 @@ impl App {
                 .ok_or_else(|| format!("No world named '{}'", name))?,
             tf::RecallWorld::Current => fallback_idx,
         };
-        Ok(self.worlds[idx].output_lines.clone())
+        Ok(in_history(self.worlds[idx].output_lines.clone()))
+    }
+
+    /// Called as the console draws, the master console and the SSH console alike: when it
+    /// shows a different world than it drew last, it has seen the world it left up to that
+    /// world's newest line, and the world it came to gets TF's %textdiv divider when a
+    /// script has set one ("on" only when something arrived meanwhile). Done here rather
+    /// than in each way of switching worlds, which differ between the two consoles.
+    pub(crate) fn track_console_world(&mut self) {
+        let Some(now) = self.worlds.get(self.current_world_index).map(|w| w.name.clone()) else { return };
+        match self.console_drawn_world.as_deref() {
+            Some(prev) if prev == now => return,
+            None => {
+                // The first draw since starting (or a reload): what's there counts as seen.
+                for world in &mut self.worlds {
+                    world.console_seen_seq = world.output_lines.last().map(|l| l.seq);
+                }
+            }
+            Some(prev) => {
+                if let Some(left) = self.worlds.iter_mut().find(|w| w.name == prev) {
+                    if let Some(seq) = left.output_lines.last().map(|l| l.seq) {
+                        left.console_seen_seq = Some(seq);
+                    }
+                    left.console_textdiv = None;
+                }
+                let mode = TextDivMode::from_setting(&self.settings.textdiv);
+                let world = &mut self.worlds[self.current_world_index];
+                world.console_textdiv = mode.and_then(|mode| {
+                    let after_seq = world.console_seen_seq;
+                    let is_new = |l: &OutputLine| after_seq.is_none_or(|seen| l.seq > seen);
+                    let has_new = world.output_lines.last().is_some_and(is_new) || world.pending_lines.iter().any(is_new);
+                    (mode != TextDivMode::On || has_new).then_some(ConsoleTextDiv { after_seq, mode })
+                });
+            }
+        }
+        self.console_drawn_world = Some(now);
+    }
+
+    /// Where TF's %textdiv divider is on the console's current world, and its rows
+    /// (`rendering::console_divider`); None without one.
+    pub(crate) fn console_divider_rows(&self) -> Option<rendering::DividerRows> {
+        let world = self.worlds.get(self.current_world_index)?;
+        rendering::console_divider(world, &self.settings, self.show_tags, (self.output_height as usize).max(1))
     }
 
     pub fn switch_world(&mut self, index: usize) {
@@ -7444,6 +7995,13 @@ impl App {
             self.broadcast_activity();
             // Restart active media for the new world
             self.restart_world_media(index);
+            // TF's WORLD hook: the foreground world changed.
+            let name = self.worlds[index].name.clone();
+            self.fire_tf_hook(Some(index), tf::TfHookEvent::World, &name, false);
+            // TF's %sockmload: a world's macro file loads again as it comes forward.
+            if self.tf_engine.get_var("sockmload").is_some_and(tf::special_vars::flag_is_on) {
+                self.load_world_mfile(index);
+            }
         }
     }
 
@@ -8432,14 +8990,14 @@ impl App {
         self.needs_output_redraw = true;
     }
 
-    /// Handle a `/connect host:port` request from a master instance. Returns true if the
+    /// Handle a `/server host:port` request from a master instance. Returns true if the
     /// caller should proceed with the relaunch now, false if it printed a message instead
     /// (usage error, or a confirmation warning that requires repeating the command).
     ///
-    /// A second `/connect <same addr>` within ~15 seconds confirms and returns true.
+    /// A second `/server <same addr>` within ~15 seconds confirms and returns true.
     fn request_remote_attach(&mut self, addr: &str) -> bool {
         if addr.is_empty() {
-            self.add_output("Usage: /connect host:port  (or)  /connect host port  (or)  /connect --close");
+            self.add_output("Usage: /server host:port  (or)  /server host port  (or)  /server --close");
             return false;
         }
 
@@ -8454,7 +9012,7 @@ impl App {
         self.pending_remote_connect = Some((addr.to_string(), std::time::Instant::now()));
         self.add_output(&format!(
             "This will disconnect this instance's server (and {} connected world{}) and attach \
-             to {} as a remote client. Run /connect {} again within 15s to confirm, or /connect --cancel.",
+             to {} as a remote client. Run /server {} again within 15s to confirm, or /server --cancel.",
             connected_count,
             if connected_count == 1 { "" } else { "s" },
             addr,
@@ -8804,48 +9362,89 @@ impl App {
         self.emit_client_lines(world_idx, &lines, is_daemon_mode);
     }
 
+    /// `emit_client_text` with TF's non-display line attributes (`LineMarks`): through the
+    /// same `World::tf_*` marks a trigger's attributes use, which `add_output` consumes as
+    /// it adds each line. Whatever this text didn't consume is dropped again, so a mark
+    /// can't land on some later line that happens to read the same.
+    /// `own`: the display attributes the text was drawn in, with the text before them -
+    /// kept on each line (`OutputLine::tf_attrs`) for `/recall -a`.
+    pub(crate) fn emit_client_text_marked(
+        &mut self,
+        world_idx: usize,
+        text: &str,
+        is_daemon_mode: bool,
+        marks: LineMarks,
+        own: Option<(String, tf::TfAttributes)>,
+    ) {
+        if (marks.is_empty() && own.is_none()) || world_idx >= self.worlds.len() {
+            self.emit_client_text(world_idx, text, is_daemon_mode);
+            return;
+        }
+        let lines: Vec<String> = text.strip_suffix('\n').unwrap_or(text).split('\n').map(str::to_string).collect();
+        // Each line's own attributes, its plain text beside it.
+        let own_lines: Vec<Option<Box<LineAttrs>>> = match &own {
+            Some((plain, attrs)) => {
+                let plain_lines: Vec<&str> = plain.strip_suffix('\n').unwrap_or(plain).split('\n').collect();
+                (0..lines.len()).map(|i| {
+                    plain_lines.get(i).map(|p| Box::new(LineAttrs { plain: p.to_string(), attrs: attrs.clone(), partials: Vec::new() }))
+                }).collect()
+            }
+            None => vec![None; lines.len()],
+        };
+        // `g` (`/echo -ag`): TF keeps the line - /recall -ag shows it - but doesn't show it.
+        if marks.gag {
+            for (line, own) in lines.into_iter().zip(own_lines) {
+                let mut hidden = OutputLine::new_client(line, 0);
+                hidden.hist.nohistory = marks.nohistory;
+                hidden.tf_attrs = own;
+                hidden.viewed = true;
+                self.push_hidden_line(world_idx, hidden);
+            }
+            return;
+        }
+        let world = &mut self.worlds[world_idx];
+        let before = (world.tf_nohistory.len(), world.tf_nolog.len(), world.tf_noactivity.len(), world.tf_line_attrs.len());
+        for (line, own) in lines.iter().zip(own_lines) {
+            if marks.nohistory { world.tf_nohistory.push(line.clone()); }
+            if marks.nolog { world.tf_nolog.push(line.clone()); }
+            if marks.noactivity { world.tf_noactivity.push(line.clone()); }
+            if let Some(own) = own { world.tf_line_attrs.push((line.clone(), own)); }
+        }
+        self.emit_client_lines(world_idx, &lines, is_daemon_mode);
+        let world = &mut self.worlds[world_idx];
+        world.tf_nohistory.truncate(before.0);
+        world.tf_nolog.truncate(before.1);
+        world.tf_noactivity.truncate(before.2);
+        world.tf_line_attrs.truncate(before.3);
+    }
+
     /// `TfCommandResult::Error(err)` rendering. Centralizes the "Error: "
     /// wording most error arms already used independently.
     pub(crate) fn emit_tf_error(&mut self, world_idx: usize, err: &str, is_daemon_mode: bool) {
         self.emit_client_text(world_idx, &format!("Error: {}", err), is_daemon_mode);
     }
 
-    /// Fire a TF hook event with `arg` as its argument text, and dispatch
-    /// whatever the matching macro(s) produced through the same channels every
-    /// other TF-result dispatch site uses: messages/errors via
-    /// `emit_client_text`/`emit_tf_error`, `SendToMud` forwarded to
-    /// `world_idx`'s own connection, `ClayCommand` run back through the TF
-    /// engine. This is the ONE shared helper every hook-firing call site uses
-    /// (CLAUDE.md: "prefer one shared helper over patching a copy") - the
-    /// pre-Job-10 CONNECT/DISCONNECT call sites each hand-rolled this dispatch
-    /// 3-4 times, and every one of those copies silently dropped `messages`/
-    /// `errors` (a `/def -hCONNECT foo = /echo hi` never showed "hi" on a real
-    /// connect) - see finding C.10 / plan step P1.9.
+    /// Fire a TF hook event with `arg` as its argument text and apply what the matching
+    /// macro(s) did, in order, for `world_idx` (see `tfrun`): output and sends at once; a
+    /// Clay command, and anything after it, on the event loop's next turn. This is the ONE
+    /// shared helper every hook-firing call site uses (CLAUDE.md: "prefer one shared
+    /// helper over patching a copy") - see finding C.10 / plan step P1.9.
     ///
-    /// `world_idx`: `None` when there is no live world context at all (GMCP/
-    /// MSDP can fire before any world exists) - messages/errors/sends are
-    /// simply skipped in that case, only `clay_commands` still run.
+    /// `world_idx`: `None` when there is no live world context at all (GMCP/MSDP can fire
+    /// before any world exists) - the current world stands in.
     ///
-    /// Returns whether a non-quiet macro matched - SEND callers use this to
-    /// decide whether the original text should still be sent (see `/help
-    /// hooks`'s SEND rule).
+    /// Returns whether a non-quiet macro matched - SEND callers use this to decide whether
+    /// the original text should still be sent (see `/help hooks`'s SEND rule).
     pub(crate) fn fire_tf_hook(&mut self, world_idx: Option<usize>, event: tf::TfHookEvent, arg: &str, is_daemon_mode: bool) -> bool {
-        let hook_result = tf::bridge::fire_event(&mut self.tf_engine, event, arg);
-        if let Some(idx) = world_idx {
-            for msg in &hook_result.messages {
-                self.emit_client_text(idx, msg, is_daemon_mode);
-            }
-            for err in &hook_result.errors {
-                self.emit_tf_error(idx, err, is_daemon_mode);
-            }
-            for cmd in &hook_result.send_commands {
-                // send_to_world captures via capture_sent_line - this is exactly the
-                // "TF hooks" case /recall -i now covers.
-                self.send_to_world(idx, cmd.clone());
-            }
-        }
-        for cmd in &hook_result.clay_commands {
-            let _ = self.tf_engine.execute(cmd);
+        // The hook runs with its event's world as TF's current world (${world_name} etc.)
+        self.sync_tf_world_info();
+        let world_name = world_idx.and_then(|i| self.worlds.get(i)).map(|w| w.name.clone());
+        let hook_result = self.tf_engine.with_context_world(world_name.as_deref(), |engine| {
+            tf::bridge::fire_event(engine, event, arg)
+        });
+        if !hook_result.effects.is_empty() && !self.worlds.is_empty() {
+            let idx = world_idx.unwrap_or(self.current_world_index).min(self.worlds.len() - 1);
+            self.apply_tf_effects_now(hook_result.effects, tfrun::TfEffectCtx::for_world(idx, is_daemon_mode));
         }
         hook_result.matched_non_quiet
     }
@@ -8864,7 +9463,10 @@ impl App {
     /// dispatch site — trivial today, but keeps any future change (dedup, a process-count
     /// cap, logging) from needing to land in sync across all of them.
     pub(crate) fn register_repeat_process(&mut self, process: tf::TfProcess) {
+        let pid = process.id;
         self.tf_engine.processes.push(process);
+        // TF's PROCESS hook: a process started.
+        self.fire_tf_hook(None, tf::TfHookEvent::Process, &pid.to_string(), false);
     }
 
     /// `WsMessage::CreateWorld` handling — shared by master-WS and daemon (T36). Creates a new
@@ -8874,6 +9476,68 @@ impl App {
         let new_world = World::new(name);
         self.worlds.push(new_world);
         let idx = self.worlds.len() - 1;
+        self.broadcast_world_added(idx);
+        let _ = persistence::save_settings(self);
+        self.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
+    }
+
+    /// A world's settings as clients see them; `with_password` includes the password.
+    pub(crate) fn world_settings_msg(&self, idx: usize, with_password: bool) -> WorldSettingsMsg {
+        let world = &self.worlds[idx];
+        WorldSettingsMsg {
+            hostname: world.settings.hostname.clone(),
+            port: world.settings.port.clone(),
+            user: world.settings.user.clone(),
+            // Readable in every editor (CLAUDE.md); a settings-update broadcast carries none.
+            password: if with_password {
+                let p = persistence::decrypt_password(&world.settings.password);
+                if p.starts_with("ENC:") { String::new() } else { p }
+            } else {
+                String::new()
+            },
+            has_password: !world.settings.password.is_empty(),
+            use_ssl: world.settings.use_ssl,
+            log_enabled: world.settings.log_enabled,
+            encoding: world.settings.encoding.name().to_string(),
+            auto_connect_type: world.settings.auto_connect_type.name().to_string(),
+            keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+            keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+            gmcp_packages: world.settings.gmcp_packages.clone(),
+            auto_reconnect_secs: world.settings.auto_reconnect_display(),
+            has_notes: !world.settings.notes.is_empty(),
+            msp_enabled: world.settings.msp_enabled,
+            mcp_enabled: world.settings.mcp_enabled,
+            mccp2_enabled: world.settings.mccp2_enabled,
+            world_type: world.settings.world_type.name().to_string(),
+            prompt_wait_ms: world.settings.prompt_wait_ms,
+            tf_type: world.settings.tf_type.clone(),
+            slack_token: world.settings.slack_token.clone(),
+            slack_channel: world.settings.slack_channel.clone(),
+            slack_workspace: world.settings.slack_workspace.clone(),
+            discord_token: world.settings.discord_token.clone(),
+            discord_guild: world.settings.discord_guild.clone(),
+            discord_channel: world.settings.discord_channel.clone(),
+            discord_dm_user: world.settings.discord_dm_user.clone(),
+            discord_channels: world.settings.discord_channels.clone(),
+            slack_app_token: world.settings.slack_app_token.clone(),
+            slack_channels: world.settings.slack_channels.clone(),
+            has_discord_token: !world.settings.discord_token.is_empty(),
+            has_slack_token: !world.settings.slack_token.is_empty(),
+            has_slack_app_token: !world.settings.slack_app_token.is_empty(),
+            }
+    }
+
+    /// Tell every client that world `idx`'s settings changed (`WorldSettingsUpdated`).
+    pub(crate) fn broadcast_world_settings(&mut self, idx: usize) {
+        let settings = self.world_settings_msg(idx, false);
+        let name = self.worlds[idx].name.clone();
+        self.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index: idx, settings, name });
+    }
+
+    /// Tell every client about the world just added at `idx` (`WorldAdded`), however it
+    /// was created - the world editor, `/addworld`, `addworld()`, or `/connect`'s
+    /// temporary world.
+    pub(crate) fn broadcast_world_added(&mut self, idx: usize) {
         let world = &self.worlds[idx];
         let world_state = WorldStateMsg {
             index: idx,
@@ -8887,43 +9551,7 @@ impl App {
             scroll_offset: 0,
             paused: false,
             unseen_lines: 0,
-            settings: WorldSettingsMsg {
-                hostname: world.settings.hostname.clone(),
-                port: world.settings.port.clone(),
-                user: world.settings.user.clone(),
-                password: {
-                    let p = persistence::decrypt_password(&world.settings.password);
-                    if p.starts_with("ENC:") { String::new() } else { p }
-                },
-                has_password: !world.settings.password.is_empty(),
-                use_ssl: world.settings.use_ssl,
-                log_enabled: world.settings.log_enabled,
-                encoding: world.settings.encoding.name().to_string(),
-                auto_connect_type: world.settings.auto_connect_type.name().to_string(),
-                keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
-                gmcp_packages: world.settings.gmcp_packages.clone(),
-                auto_reconnect_secs: world.settings.auto_reconnect_display(),
-                has_notes: !world.settings.notes.is_empty(),
-                msp_enabled: world.settings.msp_enabled,
-                mcp_enabled: world.settings.mcp_enabled,
-                mccp2_enabled: world.settings.mccp2_enabled,
-                world_type: world.settings.world_type.name().to_string(),
-                prompt_wait_ms: world.settings.prompt_wait_ms,
-                slack_token: world.settings.slack_token.clone(),
-                slack_channel: world.settings.slack_channel.clone(),
-                slack_workspace: world.settings.slack_workspace.clone(),
-                discord_token: world.settings.discord_token.clone(),
-                discord_guild: world.settings.discord_guild.clone(),
-                discord_channel: world.settings.discord_channel.clone(),
-                discord_dm_user: world.settings.discord_dm_user.clone(),
-                discord_channels: world.settings.discord_channels.clone(),
-                slack_app_token: world.settings.slack_app_token.clone(),
-                slack_channels: world.settings.slack_channels.clone(),
-                has_discord_token: !world.settings.discord_token.is_empty(),
-                has_slack_token: !world.settings.slack_token.is_empty(),
-                has_slack_app_token: !world.settings.slack_app_token.is_empty(),
-            },
+            settings: self.world_settings_msg(idx, true),
             last_send_secs: None,
             last_recv_secs: None,
             last_nop_secs: None,
@@ -8944,8 +9572,6 @@ impl App {
             stats: Vec::new(),
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
-        let _ = persistence::save_settings(self);
-        self.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
     }
 
     /// Fix up `current_world_index`/`previous_world_index` after a world at `world_index`
@@ -9020,6 +9646,7 @@ impl App {
         mccp2_enabled: bool,
         world_type: String,
         prompt_wait_ms: u64,
+        tf_type: Option<String>,
         slack_token: String,
         slack_channel: String,
         slack_workspace: String,
@@ -9079,6 +9706,10 @@ impl App {
             self.worlds[world_index].settings.world_type = new_type;
         }
         self.worlds[world_index].settings.prompt_wait_ms = prompt_wait_ms;
+        // None: a client that predates the field - leave it.
+        if let Some(t) = tf_type {
+            self.worlds[world_index].settings.tf_type = t.trim().to_string();
+        }
         // Slack/Discord fields follow the same "leave unchanged when empty" contract as
         // world_type/password above - a save that never touched these (e.g. a MUD world's
         // editor, or an older client) must not wipe a configured Slack/Discord world's
@@ -9141,6 +9772,7 @@ impl App {
             // what's actually stored now, not what was (or wasn't) sent.
             world_type: self.worlds[world_index].settings.world_type.name().to_string(),
             prompt_wait_ms: self.worlds[world_index].settings.prompt_wait_ms,
+            tf_type: self.worlds[world_index].settings.tf_type.clone(),
             slack_token: self.worlds[world_index].settings.slack_token.clone(),
             slack_channel: self.worlds[world_index].settings.slack_channel.clone(),
             slack_workspace: self.worlds[world_index].settings.slack_workspace.clone(),
@@ -9594,12 +10226,28 @@ impl App {
         if let Some(tx) = self.worlds.get(world_idx).and_then(|w| w.command_tx.as_ref()) {
             let sent = tx.try_send(WriteCommand::Text(text.clone())).is_ok();
             if sent {
+                self.tf_echo_line(world_idx, "secho", "sprefix", &text);
                 self.capture_sent_line(world_idx, &text);
             }
             true
         } else {
             false
         }
+    }
+
+    /// TF's %kecho / %secho / %qecho (off unless a script turns them on): show a line
+    /// typed / sent / quoted, behind its %kprefix / %sprefix / %qprefix - never a line
+    /// sent at a password prompt or in the login window, which nothing records either.
+    pub(crate) fn tf_echo_line(&mut self, world_idx: usize, flag: &str, prefix_var: &str, text: &str) {
+        if !self.tf_engine.get_var(flag).is_some_and(tf::special_vars::flag_is_on) {
+            return;
+        }
+        let Some(world) = self.worlds.get(world_idx) else { return };
+        if world.protocol.echo_masked || world.login_capture_guard > 0 {
+            return;
+        }
+        let prefix = self.tf_engine.get_var(prefix_var).map(|v| v.to_string_value()).unwrap_or_default();
+        self.emit_client_text(world_idx, &format!("{}{}", prefix, text), false);
     }
 
     /// `TfCommandResult::SendToMud(text)` handling for the single-command (non-loop) sites that
@@ -9663,22 +10311,34 @@ impl App {
             return;
         }
         let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
-        let was_at_bottom = self.worlds[world_idx].is_at_bottom();
         for part in text.split('\n') {
             if part.is_empty() {
                 continue;
             }
-            let (seq, in_output) = self.worlds[world_idx].record_input_line(part, self.settings.log_input_enabled, is_current);
-            if !in_output {
-                continue; // held in pending_lines; rides the release batch via broadcast_released_lines
-            }
-            let ws_data = part.replace('\r', "") + "\n";
+            let line = self.worlds[world_idx].input_line(part, self.settings.log_input_enabled, is_current);
+            self.push_hidden_line(world_idx, line);
+        }
+    }
+
+    /// Add `line` to `world_idx`'s buffer without drawing it (it is made gagged): captured
+    /// input, a /recordline. Broadcast like every line in `output_lines`, as gagged, so
+    /// clients keep it too and skip it unless F2 shows gagged lines.
+    pub(crate) fn push_hidden_line(&mut self, world_idx: usize, mut line: OutputLine) {
+        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let was_at_bottom = self.worlds[world_idx].is_at_bottom();
+        line.gagged = true;
+        let ws_data = line.text.replace('\r', "") + "\n";
+        let from_server = line.from_server;
+        let ts = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (seq, in_output) = self.worlds[world_idx].push_hidden_line(line);
+        // A line held in pending_lines rides the release batch (broadcast_released_lines).
+        if in_output {
             self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                 world_index: world_idx,
                 data: ws_data,
                 is_viewed: is_current,
-                ts: current_timestamp_secs(),
-                from_server: false,
+                ts,
+                from_server,
                 // `end_seq: Some(seq)`, never None - see push_and_broadcast_line's doc
                 // comment. A bare `seq` with no end_seq reads as "not a real seq" on the
                 // client whenever it happens to be 0 (a world's very first line), so that
@@ -9701,6 +10361,40 @@ impl App {
             self.worlds[world_idx].scroll_to_bottom();
             self.worlds[world_idx].visual_line_offset = saved_vlo;
         }
+    }
+
+    /// TF's /recordline (`TfEffect::RecordLine`): `text` goes into a history - found by
+    /// /recall, never drawn, logged or archived. World, local and global lines live in
+    /// the world's buffer (marked with their history); input lines become captured input
+    /// there too, and join the console's Up/Down history (the web and GUI clients keep
+    /// their own).
+    pub(crate) fn record_tf_line(&mut self, world_idx: usize, text: String, target: tf::effects::RecordTarget, time: Option<f64>) {
+        use tf::effects::RecordTarget;
+        if world_idx >= self.worlds.len() {
+            return;
+        }
+        let mut line = match target {
+            RecordTarget::Input => {
+                self.input.history.push(text.clone());
+                OutputLine::new_input(text, 0)
+            }
+            RecordTarget::World => {
+                let mut line = OutputLine::new(text, 0);
+                line.hist.recorded = Some(RecordScope::World);
+                line
+            }
+            RecordTarget::Local | RecordTarget::Global => {
+                let mut line = OutputLine::new_client(text, 0);
+                line.hist.recorded = Some(if target == RecordTarget::Local { RecordScope::Local } else { RecordScope::Global });
+                line
+            }
+        };
+        if let Some(secs) = time.filter(|t| t.is_finite() && *t >= 0.0) {
+            line.timestamp = UNIX_EPOCH + Duration::from_secs_f64(secs);
+        }
+        // Never displayed, so never anybody's ▶ new text either.
+        line.viewed = true;
+        self.push_hidden_line(world_idx, line);
     }
 
     /// Handles the `Notify`/`Say` cases of a `TfCommandResult::ClayCommand` produced by an
@@ -11234,10 +11928,20 @@ impl App {
             // watching, same as add_output does for non-gagged lines. Bypasses add_output
             // entirely so this must be set by hand.
             output_line.viewed = is_current;
+            let attrs_marks = &mut self.worlds[world_idx].tf_line_attrs;
+            output_line.tf_attrs = attrs_marks.iter().position(|(m, _)| m == line).map(|i| attrs_marks.remove(i).1);
+            // A TF trigger's `G` (nohistory) keeps it out of /recall and the archive.
+            let marks = &mut self.worlds[world_idx].tf_nohistory;
+            output_line.hist.nohistory = match marks.iter().position(|m| m == line) {
+                Some(i) => { marks.remove(i); true }
+                None => false,
+            };
             // Archive gagged server lines to long-term scrollback (with gagged=true) -
             // unconditional on which buffer it lands in, since archiving is a timestamped
             // log, not a seq-ordered live buffer other code indexes into.
-            output_line.archive_seq = self.worlds[world_idx].archive_line(line, true);
+            if !output_line.hist.nohistory {
+                output_line.archive_seq = self.worlds[world_idx].archive_line(line, true);
+            }
             if hold_gagged_in_pending {
                 self.worlds[world_idx].pending_lines.push(output_line);
                 // Not broadcast here - it goes out with the pending release batch via
@@ -11301,10 +12005,12 @@ impl App {
                     }
                 }
             } else {
-                // Detection window expired — send deferred login now
+                // Detection window expired — send deferred login now (one line each)
                 if let Some(login_cmd) = self.worlds[world_idx].fansi_login_pending.take() {
                     if let Some(tx) = &self.worlds[world_idx].command_tx {
-                        let _ = tx.try_send(WriteCommand::Text(login_cmd));
+                        for line in login_cmd.split('\n') {
+                            let _ = tx.try_send(WriteCommand::Text(line.to_string()));
+                        }
                     }
                 }
                 self.worlds[world_idx].fansi_detect_until = None;
@@ -11371,13 +12077,15 @@ impl App {
 
         // Process action triggers on complete lines
         // Track lines with gagged flag and highlight color: (line, is_gagged, highlight_color)
-        let mut processed_lines: Vec<(&str, bool, Option<String>)> = Vec::new();
+        let mut processed_lines: Vec<(std::borrow::Cow<'_, str>, bool, Option<String>)> = Vec::new();
+        // A non-quiet TF trigger fired on this packet (TF's BGTRIG, for a background world).
+        let mut tf_trigger_fired = false;
         let mut commands_to_execute: Vec<String> = mcp_replies;
         for event in mcp_events {
             self.handle_mcp_event(world_idx, event);
         }
-        let mut tf_commands_to_execute: Vec<String> = Vec::new();
-        let mut tf_messages: Vec<String> = Vec::new();
+        let mut tf_effects: Vec<tf::effects::TfEffect> = Vec::new();
+        let mut tf_messages: Vec<TfMessage> = Vec::new();
         let ends_with_newline = combined_data.ends_with('\n');
         let lines: Vec<&str> = combined_data.lines().collect();
         let line_count = lines.len();
@@ -11401,7 +12109,7 @@ impl App {
                 // Don't drop the idler echo — gag it so F2 (show_tags) can reveal it like
                 // any other gagged line, on console/web/GUI.
                 if !is_partial {
-                    processed_lines.push((line, true, None));
+                    processed_lines.push((std::borrow::Cow::Borrowed(*line), true, None));
                 }
                 continue;
             }
@@ -11419,6 +12127,16 @@ impl App {
                 self.worlds[world_idx].trigger_partial_line = line.to_string();
                 has_partial = true;
             } else {
+                // A quiet login (`/connect -q`, %quiet) gags what follows the login until the
+                // MUD sends "Use the WHO command" or "### end of messages ###", or for 25
+                // lines (TF's own rule, `/help quiet`). Gagged like /gag: F2 shows it.
+                if let Some(left) = self.worlds[world_idx].quiet_login_lines {
+                    let plain = strip_ansi_for_watchdog(line);
+                    let done = left <= 1 || plain.contains("Use the WHO command") || plain.contains("### end of messages ###");
+                    self.worlds[world_idx].quiet_login_lines = if done { None } else { Some(left - 1) };
+                    processed_lines.push((std::borrow::Cow::Borrowed(*line), true, None));
+                    continue;
+                }
                 // Gag the blank run that follows an action with "Suppress Blanks" set. Placed
                 // ahead of the trigger sweep deliberately: a suppressed line needs no pattern
                 // matching at all, so this is cheaper than the status quo rather than an
@@ -11426,7 +12144,7 @@ impl App {
                 // reveals it, matching how /gag already behaves.
                 if suppress_blanks_remaining > 0 && is_visually_empty(line) {
                     suppress_blanks_remaining -= 1;
-                    processed_lines.push((line, true, None));
+                    processed_lines.push((std::borrow::Cow::Borrowed(*line), true, None));
                     continue;
                 }
                 // Any visible line ends the run, even if fewer than the cap were consumed.
@@ -11472,25 +12190,42 @@ impl App {
                 let world_type_for_triggers = self.worlds[world_idx].settings.world_type.name();
                 let tr = process_triggers(line, &world_name_for_triggers, world_type_for_triggers, &actions, &mut self.tf_engine);
                 commands_to_execute.extend(tr.send_commands);
-                tf_commands_to_execute.extend(tr.clay_commands);
+                tf_effects.extend(tr.tf_effects);
                 tf_messages.extend(tr.messages);
                 if tr.suppress_blanks {
                     suppress_blanks_remaining = SUPPRESS_BLANKS_MAX;
                 }
-                processed_lines.push((line, tr.is_gagged || watchdog_gagged, tr.highlight_color));
+                let shown = match tr.attributed {
+                    Some(text) => std::borrow::Cow::Owned(text),
+                    None => std::borrow::Cow::Borrowed(*line),
+                };
+                if tr.nolog {
+                    self.worlds[world_idx].tf_nolog.push(shown.to_string());
+                }
+                if tr.nohistory {
+                    self.worlds[world_idx].tf_nohistory.push(shown.to_string());
+                }
+                if let Some(line_attrs) = tr.line_attrs {
+                    self.worlds[world_idx].tf_line_attrs.push((shown.to_string(), line_attrs));
+                }
+                if tr.noactivity {
+                    self.worlds[world_idx].tf_noactivity.push(shown.to_string());
+                }
+                tf_trigger_fired |= tr.tf_fired;
+                processed_lines.push((shown, tr.is_gagged || watchdog_gagged, tr.highlight_color));
             }
         }
 
         // BAMF portal detection: #### Please reconnect to name@addr (host) port NNN ####
         let bamf_val = self.tf_engine.get_var("bamf").map(|v| v.to_string_value()).unwrap_or_default();
-        if is_mud && (bamf_val == "1" || bamf_val == "old") {
+        if is_mud && (bamf_val == "1" || bamf_val.eq_ignore_ascii_case("on") || bamf_val == "old") {
             for (line, _, _) in &processed_lines {
                 if let Some(portal) = parse_bamf_portal(line) {
                     let world_name = self.worlds[world_idx].name.clone();
                     let user = self.worlds[world_idx].settings.user.clone();
                     let password = self.worlds[world_idx].settings.password.clone();
                     self.emit_client_text(world_idx, &format!("Portal detected: {} ({}:{})", portal.name, portal.host, portal.port), is_daemon_mode);
-                    if bamf_val == "1" {
+                    if bamf_val == "1" || bamf_val.eq_ignore_ascii_case("on") {
                         // Disconnect current world first
                         commands_to_execute.push(format!("/disconnect {}", world_name));
                     }
@@ -11512,15 +12247,16 @@ impl App {
                     } else {
                         (None, None)
                     };
-                    commands::execute_add_world_command(
+                    commands::apply_world_definition(
                         self,
-                        portal.name.clone(),
-                        Some(portal.host.clone()),
-                        Some(portal.port.clone()),
-                        cred_user,
-                        cred_pass,
-                        false,
-                        None,
+                        tf::PendingWorldOp {
+                            name: portal.name.clone(),
+                            host: Some(portal.host.clone()),
+                            port: Some(portal.port.clone()),
+                            user: cred_user,
+                            password: cred_pass,
+                            ..Default::default()
+                        },
                         world_idx,
                         is_daemon_mode,
                     );
@@ -11552,8 +12288,9 @@ impl App {
         // packet's arrival, and a packet that completes the line (`has_partial` false)
         // must disarm promotion immediately rather than leave a stale deadline for text
         // that already displayed normally.
+        let infers_prompts = self.timed_prompt_wait(&self.worlds[world_idx]).is_some();
         self.worlds[world_idx].timed_prompt_since =
-            if has_partial && self.worlds[world_idx].settings.world_type == WorldType::MudTimedPrompt {
+            if has_partial && infers_prompts {
                 Some(std::time::Instant::now())
             } else {
                 None
@@ -11573,9 +12310,9 @@ impl App {
         for (line, gagged, highlight) in &processed_lines {
             match runs.last_mut() {
                 Some((run_gagged, items)) if *run_gagged == *gagged => {
-                    items.push((*line, highlight.clone()));
+                    items.push((line.as_ref(), highlight.clone()));
                 }
-                _ => runs.push((*gagged, vec![(*line, highlight.clone())])),
+                _ => runs.push((*gagged, vec![(line.as_ref(), highlight.clone())])),
             }
         }
 
@@ -11583,7 +12320,7 @@ impl App {
         // a packet as a single utterance, so it must not be run per-run.
         let non_gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
             .filter(|(_, gagged, _)| !gagged)
-            .map(|(line, _, highlight)| (*line, highlight.clone()))
+            .map(|(line, _, highlight)| (line.as_ref(), highlight.clone()))
             .collect();
 
         // Clear the splash once for the whole packet, rather than letting the first VISIBLE
@@ -11606,6 +12343,8 @@ impl App {
         // underneath it.
         let was_at_bottom = self.worlds[world_idx].is_at_bottom();
 
+        let unseen_before = self.worlds[world_idx].unseen_lines;
+        let paused_before = self.worlds[world_idx].paused;
         let run_count = runs.len();
         for (run_idx, (gagged, run)) in runs.iter().enumerate() {
             let flush = std::mem::take(&mut pending_flush);
@@ -11622,6 +12361,32 @@ impl App {
                     world_idx, run, is_current,
                     console_height, console_width, is_daemon_mode, append_newline, flush,
                 );
+            }
+        }
+
+        // Marks for lines that didn't reach add_output (gagged ones) go with the packet.
+        self.worlds[world_idx].tf_nolog.clear();
+        self.worlds[world_idx].tf_noactivity.clear();
+        self.worlds[world_idx].tf_nohistory.clear();
+        self.worlds[world_idx].tf_line_attrs.clear();
+
+        // TF's MORE hook: this packet filled the screen and paused the world.
+        if !paused_before && self.worlds[world_idx].paused {
+            self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::More, "", is_daemon_mode);
+        }
+
+        // TF's background-world hooks: text arrived (BGTEXT), a trigger fired (BGTRIG), and -
+        // the first time since the world was last looked at - activity (PREACTIVITY, then
+        // ACTIVITY). Clay's own activity indicator already shows it, so no default message.
+        if !is_current && !non_gagged_lines.is_empty() {
+            let name = self.worlds[world_idx].name.clone();
+            self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::BgText, &name, is_daemon_mode);
+            if tf_trigger_fired {
+                self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Bgtrig, &name, is_daemon_mode);
+            }
+            if unseen_before == 0 && self.worlds[world_idx].unseen_lines > 0 {
+                self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Preactivity, &name, is_daemon_mode);
+                self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Activity, &name, is_daemon_mode);
             }
         }
 
@@ -11675,13 +12440,17 @@ impl App {
             self.worlds[world_idx].visual_line_offset = saved_vlo;
         }
 
-        // Display TF trigger messages (from /echo commands)
-        for msg in tf_messages {
-            self.emit_client_text(world_idx, &msg, is_daemon_mode);
+        // Display /substitute replacement text
+        for (msg, marks, own) in tf_messages {
+            self.emit_client_text_marked(world_idx, &msg, is_daemon_mode, marks, own);
         }
 
-        // Merge TF commands into commands_to_execute
-        commands_to_execute.extend(tf_commands_to_execute);
+        // What the TF triggers did, in order, for this world: output and sends now; from
+        // the first Clay command on, the event loop runs the rest (see tfrun).
+        if !tf_effects.is_empty() {
+            self.apply_tf_effects_now(tf_effects, tfrun::TfEffectCtx::for_world(world_idx, is_daemon_mode));
+        }
+
         commands_to_execute
     }
 
@@ -11690,12 +12459,21 @@ impl App {
     // ========================================================================
 
     /// Handle Disconnected event for a world.
-    fn handle_disconnected(&mut self, world_idx: usize) {
-        // Fire TF DISCONNECT hook before cleaning up - see /help hooks:
-        // "DISCONNECT world, reason". Clay doesn't track a disconnect reason
-        // string yet, so the world name is the whole argument text for now.
+    pub(crate) fn handle_disconnected(&mut self, world_idx: usize, reason: &telnet_reader::CloseReason) {
+        // TF's DISCONNECT hook, before cleaning up ("DISCONNECT world, reason", in real
+        // tf's shape - see CloseReason::hook_args). A gagged one hides Clay's
+        // "Disconnected." too, as it hid the reason line (close_notice).
         let world_name = self.worlds[world_idx].name.clone();
-        self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Disconnect, &world_name, false);
+        let hook_args = reason.hook_args(&world_name);
+        let gagged = self.tf_hook_gagged_for(Some(world_idx), tf::TfHookEvent::Disconnect, &hook_args);
+        self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Disconnect, &hook_args, false);
+        // TF's %quitdone: quit once the last connection is gone - on the event loop's
+        // next turn, through the ordinary /quit.
+        let others_connected = self.worlds.iter().enumerate().any(|(i, w)| i != world_idx && w.connected);
+        if !others_connected && self.tf_engine.get_var("quitdone").is_some_and(tf::special_vars::flag_is_on) {
+            let ctx = tfrun::TfEffectCtx::for_world(world_idx, false);
+            self.deferred_tf.push_back((ctx, std::collections::VecDeque::from([tf::effects::TfEffect::clay("/quit")])));
+        }
 
         let more_mode = self.settings.more_mode_enabled;
         // Push prompt to output before clearing (a chat world's "prompt" is only its
@@ -11713,44 +12491,46 @@ impl App {
             self.push_and_broadcast_line(world_idx, prompt_line, more_mode);
         }
         self.worlds[world_idx].clear_connection_state(true, true);
-        // Show disconnection message
-        let seq = self.worlds[world_idx].next_seq;
-        self.worlds[world_idx].next_seq += 1;
-        let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
-        let disconnect_msg_displayed = self.worlds[world_idx].push_line_respecting_pending(disconnect_msg.clone(), more_mode);
+        if !gagged {
+            // Show disconnection message
+            let seq = self.worlds[world_idx].next_seq;
+            self.worlds[world_idx].next_seq += 1;
+            let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
+            let disconnect_msg_displayed = self.worlds[world_idx].push_line_respecting_pending(disconnect_msg.clone(), more_mode);
 
-        // If this is not the current world, increment unseen_lines for activity indicator
-        if world_idx != self.current_world_index {
-            if self.worlds[world_idx].unseen_lines == 0 {
-                self.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
+            // If this is not the current world, increment unseen_lines for activity indicator
+            if world_idx != self.current_world_index {
+                if self.worlds[world_idx].unseen_lines == 0 {
+                    self.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
+                }
+                self.worlds[world_idx].unseen_lines += 1;
             }
-            self.worlds[world_idx].unseen_lines += 1;
-        }
 
-        // Mark output for redraw if this is the current world
-        if world_idx == self.current_world_index {
-            self.needs_output_redraw = true;
-        }
+            // Mark output for redraw if this is the current world
+            if world_idx == self.current_world_index {
+                self.needs_output_redraw = true;
+            }
 
-        // Broadcast disconnect message to WebSocket clients viewing this world - but only if
-        // it was actually displayed (push_line_respecting_pending returned true). If the world
-        // was already paused with a backlog, this line's real seq went into pending_lines
-        // instead, still waiting behind older, lower-seq content; broadcasting it here anyway
-        // would advance a client's dedup high-water-mark past that still-queued content,
-        // making it look like an already-seen duplicate once actually released later via
-        // broadcast_released_lines - which is exactly what used to silently swallow a paused
-        // world's pending output after a disconnect/reconnect. Deferred messages ride along
-        // with the rest of the backlog on release instead, same as every other pending line.
-        if disconnect_msg_displayed {
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
-                world_index: world_idx,
-                data: "Disconnected.\n".to_string(),
-                is_viewed: true,
-                ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                from_server: false,
-                seq, end_seq: Some(seq),
-                flush: false, gagged: false, highlight_colors: Vec::new(),
-            });
+            // Broadcast disconnect message to WebSocket clients viewing this world - but only if
+            // it was actually displayed (push_line_respecting_pending returned true). If the world
+            // was already paused with a backlog, this line's real seq went into pending_lines
+            // instead, still waiting behind older, lower-seq content; broadcasting it here anyway
+            // would advance a client's dedup high-water-mark past that still-queued content,
+            // making it look like an already-seen duplicate once actually released later via
+            // broadcast_released_lines - which is exactly what used to silently swallow a paused
+            // world's pending output after a disconnect/reconnect. Deferred messages ride along
+            // with the rest of the backlog on release instead, same as every other pending line.
+            if disconnect_msg_displayed {
+                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
+                    world_index: world_idx,
+                    data: "Disconnected.\n".to_string(),
+                    is_viewed: true,
+                    ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    from_server: false,
+                    seq, end_seq: Some(seq),
+                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                });
+            }
         }
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
 
@@ -11959,6 +12739,60 @@ impl App {
         }
     }
 
+    /// What every event loop does with an event before its own `match`: Slack/Discord
+    /// events and connection-close notices are handled here, once, and may hand back an
+    /// event (chat lines or a close message as `ServerData`, a lost chat session as
+    /// `Disconnected`) for the loop to handle as if it had arrived by itself. `None`: the
+    /// event is fully handled.
+    pub(crate) fn preprocess_event(&mut self, event: AppEvent) -> Option<AppEvent> {
+        match event {
+            AppEvent::Chat(owner, conn_id, ev) => self.handle_chat_event(owner, conn_id, ev),
+            AppEvent::CloseNotice(world_name, conn_id, reason) => self.close_notice(&world_name, conn_id, &reason),
+            AppEvent::TlsCipher(world_name, conn_id, cipher) => {
+                if let Some(idx) = self.find_world_index(&world_name) {
+                    if self.worlds[idx].connection_id == conn_id {
+                        self.worlds[idx].tls_cipher = Some(cipher);
+                    }
+                }
+                None
+            }
+            AppEvent::ConnectAttemptsFailed(world_name, conn_id, failures) => {
+                if let Some(idx) = self.find_world_index(&world_name) {
+                    if self.worlds[idx].connection_id == conn_id {
+                        self.fire_iconfails(idx, &failures);
+                    }
+                }
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    /// A world's connection ended (`telnet_reader::report_close`): Clay's message for it,
+    /// as server text so triggers, the archive and the log see it exactly as they always
+    /// have - unless TF's DISCONNECT hook is gagged, which hides it. A partial line still
+    /// held for its trigger check is completed first, so neither glues onto the other.
+    /// Nothing for a stale connection (one `/dc` or a reconnect already replaced).
+    fn close_notice(&mut self, world_name: &str, conn_id: u64, reason: &telnet_reader::CloseReason) -> Option<AppEvent> {
+        let idx = self.find_world_index(world_name)?;
+        if self.worlds[idx].connection_id != conn_id || !self.worlds[idx].connected {
+            return None;
+        }
+        let gagged = self.tf_hook_gagged_for(Some(idx), tf::TfHookEvent::Disconnect, &reason.hook_args(world_name));
+        let mut text = String::new();
+        if !self.worlds[idx].trigger_partial_line.is_empty() {
+            text.push('\n');
+        }
+        if !gagged {
+            text.push_str(&reason.message());
+            text.push('\n');
+        }
+        if text.is_empty() {
+            return None;
+        }
+        Some(AppEvent::ServerData(world_name.to_string(), text.into_bytes()))
+    }
+
     /// The one consumer of `AppEvent::Chat`, shared by every event loop. Returns an
     /// event for the loop to handle as if it had arrived itself: chat `Lines` become
     /// `ServerData` (so they get triggers, gags, highlights, logging, the archive,
@@ -12021,14 +12855,18 @@ impl App {
                 None
             }
             chat::ChatEvent::Closed { reason, fatal } => {
-                self.add_output_to_world(idx, &reason);
+                let close = telnet_reader::CloseReason::Chat(reason.clone());
+                // A gagged DISCONNECT hook hides the reason line, as for a MUD world.
+                if !(connected && self.tf_hook_gagged_for(Some(idx), tf::TfHookEvent::Disconnect, &close.hook_args(&world_name))) {
+                    self.add_output_to_world(idx, &reason);
+                }
                 if connected {
                     if fatal {
-                        self.handle_disconnected(idx);
+                        self.handle_disconnected(idx, &close);
                         self.worlds[idx].reconnect_at = None;
                         None
                     } else {
-                        Some(AppEvent::Disconnected(world_name, conn_id))
+                        Some(AppEvent::Disconnected(world_name, conn_id, close))
                     }
                 } else {
                     // Never got as far as connected: a failed connect.
@@ -12229,7 +13067,14 @@ impl App {
     /// auto-login itself (honouring `World::skip_auto_login`, and deferring it for FANSI
     /// client detection), so `connect_daemon_world` is always told not to send one.
     pub(crate) fn spawn_world_connect(&mut self, idx: usize, origin: ConnectOrigin, event_tx: &mpsc::Sender<AppEvent>) {
-        let settings = self.worlds[idx].settings.clone();
+        let mut settings = self.worlds[idx].settings.clone();
+        // TF's PENDING hook: a connection is being tried.
+        let pending_arg = format!("{} {} {}", self.worlds[idx].name, settings.hostname, settings.port);
+        self.fire_tf_hook(Some(idx), tf::TfHookEvent::Pending, &pending_arg, false);
+        // `/connect -x`: SSL for this connection only.
+        if std::mem::take(&mut self.worlds[idx].force_ssl_once) {
+            settings.use_ssl = true;
+        }
         let world_name = self.worlds[idx].name.clone();
         self.worlds[idx].connection_id += 1;
         let connection_id = self.worlds[idx].connection_id;
@@ -12255,7 +13100,7 @@ impl App {
             None => true,
         };
         if stale {
-            if let Some((cmd_tx, _, _, proxy_pid, _)) = result {
+            if let Ok((cmd_tx, _, _, proxy_pid, _)) = result {
                 // Close the socket we won't use (its reader's events carry the old
                 // connection_id and are ignored); a proxy process would outlive it.
                 let _ = cmd_tx.try_send(WriteCommand::Shutdown);
@@ -12274,7 +13119,7 @@ impl App {
             // to set the connected state by hand here, which skipped FANSI client detection
             // (no CLIENT WEBCLIENT2, and a login sent before it), the log file and the TF
             // CONNECT hook.
-            (ConnectOrigin::AutoReconnect | ConnectOrigin::Console | ConnectOrigin::Client { .. }, Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path))) => {
+            (ConnectOrigin::AutoReconnect | ConnectOrigin::Console | ConnectOrigin::Client { .. }, Ok((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path))) => {
                 self.handle_connection_success(world_name, cmd_tx, socket_fd, is_tls);
                 if let Some(new_idx) = self.find_world_index(world_name) {
                     self.worlds[new_idx].proxy_pid = proxy_pid;
@@ -12284,26 +13129,64 @@ impl App {
                     }
                 }
             }
-            (ConnectOrigin::AutoReconnect, None) => {
-                let secs = self.worlds[idx].settings.auto_reconnect_secs;
-                if secs > 0 {
-                    self.worlds[idx].reconnect_at = Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
-                    );
-                    self.emit_reconnect_status(idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
-                } else {
-                    self.emit_reconnect_status(idx, "Connection failed.");
-                }
+            (ConnectOrigin::AutoReconnect, Err(failure)) => {
+                self.report_connect_failure(idx, &failure, true, true);
             }
-            (ConnectOrigin::Console, None) => {
-                self.add_output_to_world(idx, "Connection failed.");
+            (ConnectOrigin::Console, Err(failure)) => {
+                self.report_connect_failure(idx, &failure, true, false);
             }
-            (ConnectOrigin::Client { report_failure }, None) => {
+            (ConnectOrigin::Client { report_failure }, Err(failure)) => {
                 self.worlds[idx].skip_auto_login = false;
-                if report_failure {
-                    self.emit_client_text(idx, "Connection failed.", true);
-                }
+                self.report_connect_failure(idx, &failure, report_failure, false);
             }
+        }
+    }
+
+    /// A connect attempt for world `idx` failed - on every path, so TF scripts see the
+    /// same thing however the connect was started (tf-lib's /retry is a CONFAIL hook).
+    /// TF's ICONFAIL for each address that failed before the last, then CONFAIL, with
+    /// real tf's "<world> <address> <port>: <reason>"; Clay's "Connection failed:
+    /// <reason>" when `say` and the CONFAIL hook isn't gagged; then, when `reconnect` and
+    /// the world reconnects on its own, the next try. Not after a certificate mismatch,
+    /// though: retrying would just fail again until the user trusts the new certificate,
+    /// so the mismatch is returned for a console to offer exactly that.
+    pub(crate) fn report_connect_failure(
+        &mut self,
+        idx: usize,
+        failure: &daemon::ConnectFailure,
+        say: bool,
+        reconnect: bool,
+    ) -> Option<platform::danger::CertMismatch> {
+        let name = self.worlds[idx].name.clone();
+        let (last, earlier) = failure.attempts.split_last().expect("a ConnectFailure is never empty");
+        self.fire_iconfails(idx, earlier);
+        let args = format!("{} {}", name, last.tf_text());
+        let gagged = self.tf_hook_gagged_for(Some(idx), tf::TfHookEvent::Confail, &args);
+        self.fire_tf_hook(Some(idx), tf::TfHookEvent::Confail, &args, false);
+        if say && !gagged {
+            self.add_output_to_world(idx, &format!("Connection failed: {}", failure.reason()));
+        }
+        let mismatch = self.check_and_broadcast_cert_mismatch(idx);
+        if mismatch.is_none() && reconnect {
+            let secs = self.worlds[idx].settings.auto_reconnect_secs;
+            if secs > 0 {
+                self.worlds[idx].reconnect_at = Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                );
+                self.add_output_to_world(idx, &format!("Reconnecting in {} seconds...", secs));
+            }
+        }
+        mismatch
+    }
+
+    /// TF's ICONFAIL ("<world> <address> <port>: <reason>") for each address a connect
+    /// attempt failed on before trying the next. Clay prints nothing of its own here: it
+    /// never reported individual addresses.
+    fn fire_iconfails(&mut self, idx: usize, failures: &[daemon::AddrFailure]) {
+        let name = self.worlds[idx].name.clone();
+        for failure in failures {
+            let args = format!("{} {}", name, failure.tf_text());
+            self.fire_tf_hook(Some(idx), tf::TfHookEvent::Iconfail, &args, false);
         }
     }
 
@@ -12692,7 +13575,29 @@ impl App {
             return;
         }
 
-        self.worlds[world_idx].prompt = prompt_normalized.clone();
+        // A prompt is what /quote -P and /repeat -P (every process, with %lpquote) wait
+        // for: the last command is done (`/help processes`).
+        for (ctx, effects) in self.run_prompt_processes(world_idx, false) {
+            self.apply_tf_effects_now(effects, ctx);
+        }
+
+        // TF's PROMPT hook: a script that matches the prompt handles it itself (TF: the
+        // hook's macro shows it with prompt() or /echo), unless it is a -q one.
+        // The auto-login still counts it.
+        if self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Prompt, prompt_normalized.trim_end(), false) {
+            self.advance_auto_login(world_idx);
+            return;
+        }
+
+        self.set_world_prompt(world_idx, prompt_normalized);
+
+        self.advance_auto_login(world_idx);
+    }
+
+    /// `prompt` is now this world's prompt (a server's, or TF's /prompt): shown in the
+    /// input area here and by every client.
+    pub(crate) fn set_world_prompt(&mut self, world_idx: usize, prompt: String) {
+        self.worlds[world_idx].prompt = prompt.clone();
         // The prompt line lives in the input area, so a new prompt has to repaint even
         // though no output changed. A marker prompt usually rides in on the same packet as
         // the text before it and gets a repaint for free; an idle-detected one arrives
@@ -12704,10 +13609,8 @@ impl App {
         }
         self.ws_broadcast(WsMessage::PromptUpdate {
             world_index: world_idx,
-            prompt: prompt_normalized,
+            prompt,
         });
-
-        self.advance_auto_login(world_idx);
     }
 
     /// Count one prompt against this world and send the next auto-login step if one is
@@ -12727,8 +13630,8 @@ impl App {
         }
 
         let auto_type = world.settings.auto_connect_type;
-        let user = world.settings.user.clone();
-        let password = world.settings.password.clone();
+        let (user, password) = login_credentials(&world.settings,
+            self.tf_engine.default_world_character.as_deref(), self.tf_engine.default_world_password.as_deref());
         let prompt_num = world.prompt_count;
 
         if !user.is_empty() && !password.is_empty() {
@@ -12748,7 +13651,7 @@ impl App {
                         _ => None,
                     }
                 }
-                AutoConnectType::Connect | AutoConnectType::NoLogin => None,
+                AutoConnectType::Connect | AutoConnectType::NoLogin | AutoConnectType::Lines => None,
             };
 
             if let Some(cmd) = cmd_to_send {
@@ -12773,10 +13676,10 @@ impl App {
         // `self.worlds.iter_mut()` is still borrowing here - the same borrow-deferral
         // idiom the wont-echo block above uses.
         let mut due: Vec<(usize, String)> = Vec::new();
+        let lp_wait = self.tf_lp_wait();
         for (world_idx, world) in self.worlds.iter_mut().enumerate() {
-            if world.settings.world_type != WorldType::MudTimedPrompt
-                || !world.connected
-                || world.protocol.seen_prompt_marker {
+            let Some(wait) = timed_prompt_wait_for(world, lp_wait) else { continue };
+            if !world.connected || world.protocol.seen_prompt_marker {
                 continue;
             }
             let Some(since) = world.timed_prompt_since else { continue };
@@ -12787,7 +13690,6 @@ impl App {
                 world.timed_prompt_since = None;
                 continue;
             }
-            let wait = Duration::from_millis(world.settings.prompt_wait_ms);
             if now.duration_since(since) >= wait {
                 due.push((world_idx, std::mem::take(&mut world.trigger_partial_line)));
                 world.timed_prompt_since = None;
@@ -12804,14 +13706,34 @@ impl App {
     /// becomes due for promotion - for `pull_in_deadline` to clamp the shared
     /// `prompt_check_sleep` timer to. `None` means no world is currently waiting.
     fn next_timed_prompt_deadline(&self) -> Option<std::time::Instant> {
+        let lp_wait = self.tf_lp_wait();
         self.worlds.iter()
-            .filter(|w| w.settings.world_type == WorldType::MudTimedPrompt
-                && w.connected
+            .filter(|w| w.connected
                 && !w.protocol.seen_prompt_marker
                 && !w.trigger_partial_line.is_empty())
-            .filter_map(|w| w.timed_prompt_since
-                .map(|since| since + Duration::from_millis(w.settings.prompt_wait_ms)))
+            .filter_map(|w| {
+                let wait = timed_prompt_wait_for(w, lp_wait)?;
+                w.timed_prompt_since.map(|since| since + wait)
+            })
             .min()
+    }
+
+    /// TF's %lp: while on, every MUD world infers prompts from silence the way a Timed
+    /// Prompt world does, after %prompt_wait (TF's default 0.25s).
+    fn tf_lp_wait(&self) -> Option<Duration> {
+        let on = self.tf_engine.get_var("lp").is_some_and(tf::special_vars::flag_is_on);
+        on.then(|| {
+            let secs = self.tf_engine.get_var("prompt_wait")
+                .and_then(|v| tf::special_vars::dtime_secs(&v.to_string_value()))
+                .unwrap_or(0.25);
+            Duration::from_secs_f64(secs)
+        })
+    }
+
+    /// How long `world` waits before taking a silent partial line as its prompt, if it
+    /// infers prompts at all (see `timed_prompt_wait_for`).
+    fn timed_prompt_wait(&self, world: &World) -> Option<Duration> {
+        timed_prompt_wait_for(world, self.tf_lp_wait())
     }
 
     // handle_gmcp_negotiated removed in Job 9 (T3.2): its body now lives in
@@ -12838,12 +13760,8 @@ impl App {
         if self.worlds[world_idx].gmcp_user_enabled {
             self.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.to_string()));
             self.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.to_string()));
-            let outcome = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Gmcp, package);
-            for r in outcome.results {
-                if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                    self.send_to_world(world_idx, text);
-                }
-            }
+            // Everything the hook does is applied for this world (it used to keep only sends).
+            self.fire_tf_hook(Some(world_idx), crate::tf::TfHookEvent::Gmcp, package, false);
         }
     }
 
@@ -12855,12 +13773,8 @@ impl App {
     fn handle_msdp_received_extras(&mut self, world_idx: usize, variable: &str, value_json: &str) {
         self.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.to_string()));
         self.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.to_string()));
-        let outcome = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Msdp, variable);
-        for r in outcome.results {
-            if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                self.send_to_world(world_idx, text);
-            }
-        }
+        // Everything the hook does is applied for this world (it used to keep only sends).
+        self.fire_tf_hook(Some(world_idx), crate::tf::TfHookEvent::Msdp, variable, false);
     }
 
     // request_msdp_reports removed in Job 9 (T3.2): its body now lives in
@@ -13683,11 +14597,20 @@ impl App {
                 }
             }
 
-            // Fire TF CONNECT hook - see /help hooks: "CONNECT world, cipher".
-            // Clay doesn't track a cipher name, so the world name is the whole
-            // argument text.
+            // TF's connect sequence (`/help connect`): the world's macro file is loaded,
+            // then the CONNECT hook runs, then - with %login on - the login and the LOGIN
+            // hook.
+            self.worlds[world_idx].temp_connect_started = None;
+            self.load_world_mfile(world_idx);
+            // TF's CONNECT hook ("CONNECT world, cipher"): a TLS connection's cipher after
+            // the world's name, as tf has it ("mud TLS_AES_256_GCM_SHA384"). Not known for
+            // a connection made through the TLS proxy, nor with native-tls.
             let world_name_for_hook = self.worlds[world_idx].name.clone();
-            self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Connect, &world_name_for_hook, false);
+            let connect_args = match &self.worlds[world_idx].tls_cipher {
+                Some(cipher) => format!("{} {}", world_name_for_hook, cipher),
+                None => world_name_for_hook.clone(),
+            };
+            self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Connect, &connect_args, false);
 
             // Auto-login and FANSI detection are MUD things. A chat world's User/Password
             // fields may still hold values from when it was a MUD world; "connect user
@@ -13696,25 +14619,47 @@ impl App {
                 self.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: self.worlds[world_idx].name.clone() });
                 return;
             }
-            // Send auto-login if configured
+            // Send auto-login if configured. TF's %login (on unless a script turns it off)
+            // gates it, prompt-answering styles included.
+            let login_enabled = self.tf_engine.get_var("login").is_none_or(tf::special_vars::flag_is_on);
+            if !login_enabled {
+                self.worlds[world_idx].skip_auto_login = true;
+            }
             let skip_login = self.worlds[world_idx].skip_auto_login;
-            let user = self.worlds[world_idx].settings.user.clone();
-            let password = self.worlds[world_idx].settings.password.clone();
+            let (user, password) = login_credentials(&self.worlds[world_idx].settings,
+                self.tf_engine.default_world_character.as_deref(), self.tf_engine.default_world_password.as_deref());
             let auto_connect_type = self.worlds[world_idx].settings.auto_connect_type;
-            // Only clear skip flag here for Connect type; Prompt/MooPrompt check it later in handle_prompt
-            if auto_connect_type == AutoConnectType::Connect {
+            // `/connect -q` or %quiet: gag what follows the login (see quiet_login_lines).
+            let quiet = std::mem::take(&mut self.worlds[world_idx].quiet_login)
+                || self.tf_engine.get_var("quiet").is_some_and(tf::special_vars::flag_is_on);
+            if quiet && !skip_login && !user.is_empty() && auto_connect_type != AutoConnectType::NoLogin {
+                self.worlds[world_idx].quiet_login_lines = Some(QUIET_LOGIN_LINES);
+            }
+            // Only clear skip flag here for the connect-time styles; Prompt/MooPrompt check
+            // it later in handle_prompt
+            let login_lines = if !user.is_empty() && !password.is_empty() {
+                auto_connect_type.connect_lines(&user, &password)
+            } else {
+                Vec::new()
+            };
+            if matches!(auto_connect_type, AutoConnectType::Connect | AutoConnectType::Lines) {
                 self.worlds[world_idx].skip_auto_login = false;
             }
             // FANSI worlds: always set up client detection window
             if self.worlds[world_idx].settings.encoding == Encoding::Fansi {
                 self.worlds[world_idx].fansi_detect_until = Some(std::time::Instant::now() + Duration::from_secs(2));
-                if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                    let connect_cmd = format!("connect {} {}", user, password);
-                    self.worlds[world_idx].fansi_login_pending = Some(connect_cmd);
+                if !skip_login && !login_lines.is_empty() {
+                    self.worlds[world_idx].fansi_login_pending = Some(login_lines.join("\n"));
                 }
-            } else if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                let connect_cmd = format!("connect {} {}", user, password);
-                let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
+            } else if !skip_login {
+                for line in login_lines {
+                    let _ = cmd_tx.try_send(WriteCommand::Text(line));
+                }
+            }
+            // TF's LOGIN hook: a script's own login for a world with a character - after
+            // Clay's, which stands in for the library hooks TF ships for the world types.
+            if !skip_login && !user.is_empty() {
+                self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Login, &world_name_for_hook, false);
             }
 
             // Broadcast connection status
@@ -13722,36 +14667,28 @@ impl App {
         }
     }
 
-    /// Handle a `TfCommandResult::ClayCommand` produced while executing a command on behalf of
-    /// a WebSocket client (web/Android/remote console). The master owns the sockets, so
-    /// world-switch/connect commands must be connected here rather than merely bounced back to
-    /// the client for local (view-only) handling — otherwise remote clients can "switch" to a
-    /// world without ever actually connecting it (e.g. an action like `/common` that loops over
-    /// worlds emitting `/worlds <name>` for each one). All other ClayCommands keep the existing
-    /// bounce-to-client behavior unchanged.
-    fn dispatch_ws_clay_command(&mut self, client_id: u64, clay_cmd: String, event_tx: &mpsc::Sender<AppEvent>) {
-        match parse_command(&clay_cmd) {
-            Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
-                if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                    // Tell the client to switch its local view, same as before.
-                    self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd.clone() });
-                    // Connect server-side if needed. handle_ws_send_command is synchronous and
-                    // can only return one WsAsyncAction, but an action like /common can target
-                    // many worlds, so we enqueue an async connect request per world instead.
-                    if !self.worlds[idx].connected && self.worlds[idx].settings.has_connection_settings() {
-                        if matches!(parse_command(&clay_cmd), Command::WorldConnectNoLogin { .. }) {
-                            self.worlds[idx].skip_auto_login = true;
-                        }
-                        let _ = event_tx.try_send(AppEvent::ConnectWorldRequest(idx, String::new()));
-                    }
-                    return;
-                }
-                // Unknown world name - fall back to the existing bounce behavior.
-                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
-            }
-            _ => {
-                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
-            }
+    /// Whether the first hook `event`/`arg` would run for `world_idx` is gagged - TF's way
+    /// of hiding the event's default message (`/help hooks`). Hooks are chosen with that
+    /// world as TF's current one, as `fire_tf_hook` runs them: a `-w`/`-T` hook is judged
+    /// against the world the event is about, not whichever world is in the foreground.
+    pub(crate) fn tf_hook_gagged_for(&mut self, world_idx: Option<usize>, event: tf::TfHookEvent, arg: &str) -> bool {
+        self.sync_tf_world_info();
+        let world_name = world_idx.and_then(|i| self.worlds.get(i)).map(|w| w.name.clone());
+        self.tf_engine.with_context_world(world_name.as_deref(), |engine| {
+            tf::hooks::select_hooks(engine, event, arg).first().is_some_and(|m| m.attributes.gag)
+        })
+    }
+
+    /// TF loads a world's macro file (`/addworld ... <file>`, else the DEFAULT world's) as
+    /// it connects, before its CONNECT hook - with the LOAD hook, as any /load.
+    fn load_world_mfile(&mut self, world_idx: usize) {
+        let key = self.worlds[world_idx].name.to_lowercase();
+        let file = self.tf_engine.world_files.get(&key).cloned()
+            .or_else(|| self.tf_engine.default_world_file.clone())
+            .filter(|f| !f.trim().is_empty());
+        if let Some(file) = file {
+            let effects = self.run_tf_in_world(world_idx, &format!("/load {}", file));
+            self.apply_tf_effects_now(effects, tfrun::TfEffectCtx::for_world(world_idx, false));
         }
     }
 
@@ -13771,6 +14708,22 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     fn handle_ws_send_command_impl(&mut self, client_id: u64, world_index: usize, command: &str, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
+        // TF's leading-slash forms (never at a password prompt): "//x" is "/x", "///x"
+        // sends "/x" as text. ("^old^new" needs the client's own history, so the client
+        // resolves it before sending.)
+        let masked = self.worlds.get(world_index).is_some_and(|w| w.protocol.echo_masked);
+        self.tf_echo_line(world_index, "kecho", "kprefix", command);
+        let command = match tfrun::typed_slash_form(command) {
+            tfrun::TypedSlashForm::SendText(text) if !masked => {
+                if world_index < self.worlds.len() && self.send_to_world(world_index, text.to_string()) {
+                    self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                    self.worlds[world_index].clear_prompt_after_send();
+                }
+                return WsAsyncAction::Done;
+            }
+            tfrun::TypedSlashForm::Line(line) if !masked => line,
+            _ => command,
+        };
         // Determine the current world name for action world-scoping.
         let world_name = self.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
         // For slash-less input, rewrite "name args" → "/name args" when "name" matches an
@@ -13790,40 +14743,22 @@ impl App {
                         return WsAsyncAction::Done;
                     }
                     let mut sent_to_server = false;
+                    let mut async_action = WsAsyncAction::Done;
                     for cmd in action_commands_to_run(action, &args) {
-                            // Unified command system - route through TF parser
+                            // Unified command system - route through the TF parser and apply
+                            // what each command did, in order (see tfrun).
                             if cmd.starts_with('/') {
                                 self.sync_tf_world_info();
-                                match self.tf_engine.execute(&cmd) {
-                                    tf::TfCommandResult::Success(Some(msg)) => {
-                                        self.emit_client_text(world_index, &msg, false);
-                                    }
-                                    tf::TfCommandResult::Success(None) => {}
-                                    tf::TfCommandResult::Error(err) => {
-                                        self.emit_tf_error(world_index, &err, false);
-                                    }
-                                    tf::TfCommandResult::SendToMud(text) => {
-                                        // send_to_world captures this via capture_sent_line -
-                                        // an action's command list is exactly the "sent by
-                                        // triggers/actions" case /recall -i now covers.
-                                        if self.send_to_world(world_index, text) {
-                                            sent_to_server = true;
-                                        }
-                                    }
-                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                        self.dispatch_ws_clay_command(client_id, clay_cmd, event_tx);
-                                    }
-                                    tf::TfCommandResult::Recall(opts) => {
-                                        self.emit_recall(&opts, world_index, false);
-                                    }
-                                    tf::TfCommandResult::RepeatProcess(process) => {
-                                        self.register_repeat_process(process);
-                                    }
-                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
-                                        self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts, strip_ansi);
-                                        if disposition == tf::QuoteDisposition::Send && !lines.is_empty() {
-                                            sent_to_server = true;
-                                        }
+                                let effects = self.run_tf_in_world(world_index, &cmd);
+                                if effects.iter().any(|e| matches!(e, tf::effects::TfEffect::Send { .. })) {
+                                    sent_to_server = true;
+                                }
+                                let ctx = tfrun::TfEffectCtx::for_world(world_index, false);
+                                match self.run_tf_effects_client(client_id, effects, ctx, event_tx) {
+                                    WsAsyncAction::Done => {}
+                                    other if matches!(async_action, WsAsyncAction::Done) => async_action = other,
+                                    WsAsyncAction::Connect { world_index: idx, .. } => {
+                                        let _ = event_tx.try_send(AppEvent::ConnectWorldRequest(idx, String::new()));
                                     }
                                     _ => {}
                                 }
@@ -13839,50 +14774,22 @@ impl App {
                         if sent_to_server {
                             self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
                         }
+                        return async_action;
                 } else {
-                    // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
-                    self.sync_tf_world_info();
-                    match self.tf_engine.execute(command) {
-                        tf::TfCommandResult::Success(Some(msg)) => {
-                            self.emit_client_text(world_index, &msg, false);
-                        }
-                        tf::TfCommandResult::Success(None) => {}
-                        tf::TfCommandResult::Error(err) => {
-                            self.emit_tf_error(world_index, &err, false);
-                        }
-                        tf::TfCommandResult::SendToMud(text) => {
-                            // send_to_world() itself captures this via capture_sent_line -
-                            // no separate record_user_input call needed (it would double-
-                            // record the same command; see send_to_world's doc comment).
-                            if self.send_to_world(world_index, text) {
-                                self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                            }
-                        }
-                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                            self.dispatch_ws_clay_command(client_id, clay_cmd, event_tx);
-                        }
-                        tf::TfCommandResult::Recall(opts) => {
-                            self.emit_recall(&opts, world_index, false);
-                        }
-                        tf::TfCommandResult::RepeatProcess(process) => {
-                            self.register_repeat_process(process);
-                        }
-                        tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
-                            self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts, strip_ansi);
-                        }
-                        _ => {
-                            self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                                world_index,
-                                data: format!("Unknown command: {}", name),
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
-                            });
-                        }
-                    }
+                    // No matching action - try TF engine (handles /recall, /set, /echo, etc.),
+                    // as a typed line (by %sub). A command TF doesn't know either comes back
+                    // as a Clay command, which tfrun reports as unknown rather than bouncing
+                    // it around.
+                    let effects = self.run_typed_tf_in_world(world_index, command);
+                    let ctx = tfrun::TfEffectCtx::for_world(world_index, false);
+                    return self.run_tf_effects_client(client_id, effects, ctx, event_tx);
                 }
+            }
+            Command::NotACommand { text } if self.tf_engine.sub_mode() != tf::SubMode::Off => {
+                // With %sub on or full, typed plain text is TF's to process (`/help sub`).
+                let effects = self.run_typed_tf_in_world(world_index, &text);
+                let ctx = tfrun::TfEffectCtx::for_world(world_index, false);
+                return self.run_tf_effects_client(client_id, effects, ctx, event_tx);
             }
             Command::NotACommand { text } => {
                 // Regular text - send to MUD. Routed through send_to_world (rather than a
@@ -13940,7 +14847,7 @@ impl App {
                 if !is_local_gui_master {
                     self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                         world_index,
-                        data: "/connect is only available from the local console or GUI.".to_string(),
+                        data: "/server is only available from the local console or GUI.".to_string(),
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
@@ -13951,7 +14858,7 @@ impl App {
                     if self.pending_remote_connect.take().is_some() {
                         self.add_output("Cancelled.");
                     } else {
-                        self.add_output("No pending /connect to cancel.");
+                        self.add_output("No pending /server to cancel.");
                     }
                 } else if close {
                     // This process is already an independent master; nothing to detach from.
@@ -14176,7 +15083,7 @@ impl App {
                 return WsAsyncAction::Reload;
             }
             Command::Help => {
-                self.handle_ws_help_via_tf(client_id, world_index, "/help");
+                self.handle_ws_help_via_tf(client_id, world_index, "");
             }
             // UI popup commands - send back to client for local handling
             Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
@@ -14209,12 +15116,6 @@ impl App {
                 }
             }
             // AddWorld - add or update world definition
-            Command::AddWorld { name, host, port, user, password, use_ssl, file } => {
-                execute_add_world_command(self, name, host, port, user, password, use_ssl, file, world_index, false);
-            }
-            Command::AddWorldDefault { character, password, file } => {
-                execute_add_world_default_command(self, character, password, file, world_index, false);
-            }
             Command::RemoveWorld { names } => {
                 execute_remove_world_command(self, &names, world_index, false);
             }
@@ -14244,9 +15145,10 @@ impl App {
                     }
                 }
             }
-            Command::WorldConnectBackground { ref name } => {
+            Command::WorldConnectBackground { ref name, no_login } => {
                 if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                     if !self.worlds[idx].connected && self.worlds[idx].settings.has_connection_settings() {
+                        self.worlds[idx].skip_auto_login = no_login;
                         let prev_index = self.current_world_index;
                         self.current_world_index = idx;
                         return WsAsyncAction::Connect { world_index: idx, prev_index, broadcast: false };
@@ -14319,8 +15221,8 @@ impl App {
                     "  Example: /url https://github.com/c-hudson/clay",
                 ], false);
             }
-            Command::HelpTopic { ref topic } => {
-                // Try Clay help first, then TF help via engine
+            Command::HelpTopic { ref topic, ref raw } => {
+                // Clay's help first, then the TF engine's (which ends in TF's help file)
                 use popup::definitions::help::get_topic_help;
                 if let Some(lines) = get_topic_help(topic) {
                     let help_text = lines.join("\n");
@@ -14332,7 +15234,7 @@ impl App {
                         });
                     }
                 } else {
-                    self.handle_ws_help_via_tf(client_id, world_index, &format!("/help {}", topic));
+                    self.handle_ws_help_via_tf(client_id, world_index, raw);
                 }
             }
         }
@@ -14343,12 +15245,11 @@ impl App {
     /// world - deliberately not routed through emit_client_text/emit_client_lines,
     /// which broadcast to every client viewing the world; help output must stay
     /// private to whoever asked).
-    fn handle_ws_help_via_tf(&mut self, client_id: u64, world_index: usize, cmd: &str) {
-        self.sync_tf_world_info();
-        let help_text = match self.tf_engine.execute(cmd) {
-            tf::TfCommandResult::Success(Some(msg)) => msg,
-            _ => "No help available. Try /help commands".to_string(),
-        };
+    ///
+    /// `topic` is what followed /help, as typed. It is looked up, never run, so a topic
+    /// like `%kecho` is not substituted on the way.
+    fn handle_ws_help_via_tf(&mut self, client_id: u64, world_index: usize, topic: &str) {
+        let help_text = tf::parser::help_text(&self.tf_engine, topic);
         // One message for the whole block instead of one ws_send_to_client per
         // line - matches the "single broadcast per block" pattern used elsewhere
         // (emit_client_lines) without changing the single-client targeting.
@@ -14362,157 +15263,62 @@ impl App {
         });
     }
 
-    /// Resolves a `TfCommandResult::Quote`'s `recall_opts`/`world`/`delay_secs` into what
-    /// should actually be sent: executes a backtick `/recall` substitution if present,
-    /// resolves the target world by name (falling back to `world_index`), and if `delay_secs`
-    /// calls for scheduling multiple lines as delayed processes, does that directly and
-    /// returns `None` — there's nothing left for the caller to send immediately. Otherwise
-    /// returns `Some((target_idx, lines))` for the caller to dispatch per-disposition
-    /// (Send/Echo/Exec) itself — that final dispatch differs enough by transport (sync
-    /// `try_send` vs async `.send().await`, full `handle_command` recursion vs a narrower
-    /// inline TF-engine call for `Exec`) that it's kept separate rather than folded in here.
-    /// This is also what brings console's `/quote` up to feature parity with web/GUI's — it
-    /// used to silently ignore `world`/`delay_secs`/`recall_opts`/`strip_ansi` entirely.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn resolve_quote_lines(
-        &mut self,
-        mut lines: Vec<String>,
-        world: &Option<String>,
-        delay_secs: f64,
-        recall_opts: Option<(tf::RecallOptions, String)>,
-        strip_ansi: bool,
-        world_index: usize,
-        disposition: tf::QuoteDisposition,
-        is_daemon_mode: bool,
-    ) -> Option<(usize, Vec<String>)> {
-        // If this is a /quote with backtick /recall, execute the recall now
-        if let Some((opts, recall_prefix)) = recall_opts {
+    /// Start a /quote the TF engine prepared (`tf::builtins::cmd_quote`): a `#` source's
+    /// lines come from the world's history (`/recall`); then a `-S` quote's lines are
+    /// handed back, with the world they go to, to be done now, and any other quote
+    /// becomes one background process doing them a line at a time (`/help processes`).
+    pub(crate) fn start_quote(&mut self, q: tf::effects::QuoteRequest, world_index: usize) -> Option<(usize, Vec<String>)> {
+        let mut lines = q.lines;
+        if let Some((opts, recall_prefix)) = q.recall_opts {
             if world_index < self.worlds.len() {
                 match self.recall_matches(&opts, world_index) {
+                    // Provenance is a display concern only; the text is what's quoted.
                     Ok(matches) => {
-                        // /quote feeds the recalled text to the MUD; provenance is a
-                        // display concern only, so it's dropped here.
                         lines = matches.iter()
                             .map(|(line, _archived)| {
                                 let raw = format!("{}{}", recall_prefix, line);
-                                if strip_ansi { strip_ansi_codes(&raw) } else { raw }
+                                if q.strip_ansi { strip_ansi_codes(&raw) } else { raw }
                             })
                             .collect();
-                        if lines.is_empty() {
-                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                            self.emit_client_text(world_index, &format!("(no recall matches for '{}')", pattern_str), is_daemon_mode);
-                        }
                     }
                     Err(e) => {
-                        self.emit_tf_error(world_index, &e, is_daemon_mode);
+                        self.emit_tf_error(world_index, &e, false);
+                        return None;
                     }
                 }
             }
         }
 
-        // Determine target world index
-        let target_idx = if let Some(world_name) = world {
-            self.worlds.iter().position(|w| w.name == *world_name).unwrap_or(world_index)
-        } else {
-            world_index
+        let target_idx = q.world.as_deref()
+            .and_then(|name| self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)))
+            .unwrap_or(world_index);
+        let (interval, interval_given, on_prompt) = match q.timing {
+            tf::QuoteTiming::Sync => return Some((target_idx, lines)),
+            tf::QuoteTiming::Every { interval, given } => (interval, given, false),
+            tf::QuoteTiming::Prompt => (std::time::Duration::ZERO, false, true),
         };
-        let target_world_name = self.worlds.get(target_idx).map(|w| w.name.clone());
-
-        if delay_secs > 0.0 && lines.len() > 1 {
-            // Schedule as processes with delays
-            let delay = std::time::Duration::from_secs_f64(delay_secs);
-            let now = std::time::Instant::now();
-            for (i, line) in lines.into_iter().enumerate() {
-                let cmd = match disposition {
-                    tf::QuoteDisposition::Send => line,
-                    tf::QuoteDisposition::Echo => format!("/echo {}", line),
-                    tf::QuoteDisposition::Exec => line,
-                };
-                let id = self.tf_engine.next_process_id;
-                self.tf_engine.next_process_id += 1;
-                self.register_repeat_process(tf::TfProcess {
-                    id,
-                    command: cmd,
-                    interval: delay,
-                    count: Some(1),
-                    remaining: Some(1),
-                    next_run: now + delay * i as u32,
-                    world: target_world_name.clone(),
-                    synchronous: false,
-                    on_prompt: false,
-                    priority: 0,
-                    kind: tf::ProcessKind::Quote,
-                });
-            }
-            None
-        } else {
-            Some((target_idx, lines))
-        }
-    }
-
-    /// Handle TfCommandResult::Quote from a WebSocket client command. Uses
-    /// `resolve_quote_lines` for the transport-agnostic part; the immediate-send loop below is
-    /// master-WS-specific (sync `try_send`, and a narrower inline TF-engine call for `Exec`
-    /// rather than full `handle_command` recursion — see `resolve_quote_lines`'s doc comment).
-    #[allow(clippy::too_many_arguments)]
-    fn handle_ws_quote_result(
-        &mut self,
-        world_index: usize,
-        lines: &mut Vec<String>,
-        disposition: tf::QuoteDisposition,
-        world: &Option<String>,
-        delay_secs: f64,
-        recall_opts: Option<(tf::RecallOptions, String)>,
-        strip_ansi: bool,
-    ) {
-        let Some((target_idx, resolved_lines)) = self.resolve_quote_lines(
-            std::mem::take(lines), world, delay_secs, recall_opts, strip_ansi, world_index, disposition, false,
-        ) else {
-            return;
-        };
-
-        // Echo lines are buffered and flushed as a single emit_client_lines
-        // call after the loop, rather than one broadcast per line - one
-        // block, one budget computation, one broadcast (same reasoning as
-        // emit_recall). Send/Exec still act per-line since each can have
-        // its own side effect (a MUD write, a nested TF command).
-        let mut echo_batch: Vec<String> = Vec::new();
-        for line in resolved_lines {
-            match disposition {
-                tf::QuoteDisposition::Send => {
-                    if target_idx < self.worlds.len() {
-                        if self.worlds[target_idx].connected {
-                            self.send_to_world_and_mark_sent(target_idx, line);
-                        } else {
-                            self.emit_client_text(world_index, "Not connected", false);
-                            break;
-                        }
-                    }
-                }
-                tf::QuoteDisposition::Echo => {
-                    echo_batch.push(line);
-                }
-                tf::QuoteDisposition::Exec => {
-                    // Execute each line as a TF command
-                    let result = self.tf_engine.execute(&line);
-                    match result {
-                        tf::TfCommandResult::SendToMud(text) => {
-                            self.send_to_world_and_mark_sent(target_idx, text);
-                        }
-                        tf::TfCommandResult::Success(Some(msg)) => {
-                            self.emit_client_text(world_index, &msg, false);
-                        }
-                        tf::TfCommandResult::Error(err) => {
-                            self.emit_tf_error(world_index, &err, false);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if !echo_batch.is_empty() {
-            self.emit_client_lines(world_index, &echo_batch, false);
-        }
+        let id = q.pid.unwrap_or_else(|| {
+            let id = self.tf_engine.next_process_id;
+            self.tf_engine.next_process_id += 1;
+            id
+        });
+        self.register_repeat_process(tf::TfProcess {
+            id,
+            command: q.label,
+            interval,
+            interval_given,
+            count: None,
+            remaining: None,
+            next_run: std::time::Instant::now() + interval,
+            world: self.worlds.get(target_idx).map(|w| w.name.clone()),
+            synchronous: false,
+            on_prompt,
+            priority: 0,
+            kind: tf::ProcessKind::Quote,
+            lines: lines.into(),
+            disposition: q.disposition,
+        });
+        None
     }
 
     /// Handle a full WsMessage from a client. Returns WsAsyncAction for operations
@@ -14599,7 +15405,11 @@ impl App {
                     // event-loop thread, so no keypress can interleave in between).
                     let prev_kbnum = self.input.kbnum;
                     self.input.kbnum = kbnum;
-                    let async_action = self.handle_ws_send_command(client_id, world_index, &cmd, event_tx);
+                    // A binding runs as a macro body (TF's rule for /bind), not as a typed line.
+                    let effects = self.run_tf_body_in_world(world_index, &cmd);
+                    let ctx = tfrun::TfEffectCtx::for_world(world_index, false);
+                    let async_action = self.run_tf_effects_client(client_id, effects, ctx, event_tx);
+                    self.refresh_tf_bound_keys_if_changed();
                     self.input.kbnum = prev_kbnum;
                     // tf-help #kbnum: "kbnum is cleared after the keybinding has run" -
                     // unconditionally, whether or not the bound command actually consumed it.
@@ -14728,12 +15538,12 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                     msp_enabled, mcp_enabled, mccp2_enabled,
-                    world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace,
+                    world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
@@ -15452,6 +16262,7 @@ impl App {
                     mccp2_enabled: world.settings.mccp2_enabled,
                     world_type: world.settings.world_type.name().to_string(),
                     prompt_wait_ms: world.settings.prompt_wait_ms,
+                    tf_type: world.settings.tf_type.clone(),
                     slack_token: world.settings.slack_token.clone(),
                     slack_channel: world.settings.slack_channel.clone(),
                     slack_workspace: world.settings.slack_workspace.clone(),
@@ -15516,6 +16327,9 @@ impl App {
             scrollback_push: false,
             emoji_json: crate::emoji::emoji_json(),
             emoji_categories_json: crate::emoji::emoji_categories_json(),
+            tf_status: self.tf_status.iter()
+                .map(|(&world_index, view)| websocket::TfStatusEntry { world_index, view: view.clone() })
+                .collect(),
         }
     }
 
@@ -16058,7 +16872,8 @@ impl App {
     pub(crate) fn move_viewport_up(&mut self, rows: usize) -> bool {
         let visible_height = (self.output_height as usize).max(1);
         let world_idx = self.current_world_index;
-        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1));
+        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1))
+            .with_divider(self.console_divider_rows());
         let world = &mut self.worlds[world_idx];
         let Some(anchor) = metrics.anchor_of(world) else { return false };
         let Some(top) = metrics.top_anchor(world, visible_height) else { return false };
@@ -16072,7 +16887,8 @@ impl App {
     /// needs older lines from somewhere else (the local archive, or the daemon).
     pub(crate) fn viewport_at_top(&self) -> bool {
         let visible_height = (self.output_height as usize).max(1);
-        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1));
+        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1))
+            .with_divider(self.console_divider_rows());
         let world = &self.worlds[self.current_world_index];
         match metrics.anchor_of(world) {
             Some(anchor) => metrics.at_top(world, anchor, visible_height),
@@ -16088,7 +16904,8 @@ impl App {
     /// newest row.
     pub(crate) fn move_viewport_down(&mut self, rows: usize) {
         let world_idx = self.current_world_index;
-        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1));
+        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1))
+            .with_divider(self.console_divider_rows());
         let world = &mut self.worlds[world_idx];
         let Some(anchor) = metrics.anchor_of(world) else { return };
         let Some(bottom) = metrics.bottom_anchor(world) else { return };
@@ -16125,7 +16942,6 @@ impl App {
     fn release_pending_up_to(&mut self, mut visual_budget: usize) {
         let output_width = self.output_width as usize;
         let world_idx = self.current_world_index;
-        let width = output_width.max(1);
 
         // If we have a partially-shown line, first reveal more of it
         if self.worlds[world_idx].visual_line_offset > 0 {
@@ -16141,7 +16957,8 @@ impl App {
                 // directly against visual_line_offset, which is also the viewport's
                 // row-exact bottom anchor. A disagreement here between the budget and what
                 // the renderer draws shows up as a skipped or repeated row.
-                let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, width);
+                let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1))
+            .with_divider(self.console_divider_rows());
                 let total_vl = metrics.rows(&self.worlds[world_idx].output_lines[partial_idx]);
                 let remaining = total_vl.saturating_sub(self.worlds[world_idx].visual_line_offset);
                 if remaining > visual_budget {
@@ -16242,7 +17059,13 @@ pub enum ConnectOrigin {
 
 pub enum AppEvent {
     ServerData(String, Vec<u8>),  // world_name, raw bytes
-    Disconnected(String, u64),     // world_name, connection_id
+    /// A world's connection ended: world_name, connection_id, why. Preceded by a
+    /// `CloseNotice` from the same reader.
+    Disconnected(String, u64, telnet_reader::CloseReason),
+    /// What to say about a connection ending (`App::close_notice` turns it into the
+    /// world's message, unless TF's DISCONNECT hook gags it): world_name,
+    /// connection_id, why. Handled before each loop's match (`App::preprocess_event`).
+    CloseNotice(String, u64, telnet_reader::CloseReason),
     Prompt(String, Vec<u8>),      // world_name, prompt bytes (from telnet GA)
     /// One telnet negotiation/data event for a single-user world (plan Phase 2, Step 2.7).
     /// Replaces the nine formerly-separate variants (`TelnetDetected`, `WontEchoSeen`,
@@ -16270,9 +17093,23 @@ pub enum AppEvent {
     /// (0 = the console), request id, world index, result.
     ChatLookupResult(u64, u64, usize, websocket::ChatDirectoryMsg),
     Sigusr1Received,             // SIGUSR1 received - trigger hot reload (not available on Android)
+    /// SIGTERM, SIGHUP or SIGUSR2: TF's hook of that name runs; TERM and HUP then quit
+    /// (cleanly, the terminal restored), USR2 does nothing more.
+    TfSignal(tf::TfHookEvent),
+    /// A `/sh <command>` run in the background finished (`App::start_tf_shell`): the
+    /// world it was for, its output (standard error included), its exit status.
+    TfShellDone(usize, String, i32),
     // Background connection events
     ConnectionSuccess(String, mpsc::Sender<WriteCommand>, Option<SocketFd>, bool),  // world_name, cmd_tx, socket_fd, is_tls
-    ConnectionFailed(String, String),  // world_name, error_message
+    /// A connect attempt failed: world_name, connection_id, every address tried.
+    ConnectionFailed(String, u64, daemon::ConnectFailure),
+    /// The cipher a world's TLS connection settled on (TF's CONNECT hook names it):
+    /// world_name, connection_id, the cipher. Handled in `App::preprocess_event`.
+    TlsCipher(String, u64, String),
+    /// A connect that went on to succeed (or is still trying) failed on these addresses
+    /// first: TF's ICONFAIL for each. world_name, connection_id. Handled in
+    /// `App::preprocess_event`.
+    ConnectAttemptsFailed(String, u64, Vec<daemon::AddrFailure>),
     /// Outcome of a background world connect (`App::spawn_world_connect`): world_name,
     /// the connection_id it was started under, who asked, and the connect result.
     WorldConnectResult(String, u64, ConnectOrigin, daemon::DaemonConnectResult),
@@ -16665,6 +17502,7 @@ pub(crate) struct WorldEditorSettings {
     /// Only meaningful for `world_type == "mud_timed_prompt"` - see
     /// `WorldSettings::prompt_wait_ms`'s doc comment.
     pub(crate) prompt_wait_ms: u64,
+    pub(crate) tf_type: String,
     // Slack fields
     pub(crate) slack_token: String,
     pub(crate) slack_channel: String,
@@ -16757,7 +17595,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
         WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_PROMPT_WAIT_MS,
-        WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED,
+        WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_TF_TYPE,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
         WORLD_FIELD_DISCORD_CHANNELS, WORLD_FIELD_SLACK_APP_TOKEN, WORLD_FIELD_SLACK_CHANNELS,
@@ -18350,6 +19188,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     prompt_wait_ms: state.get_text(WORLD_FIELD_PROMPT_WAIT_MS)
                         .and_then(|s| s.trim().parse::<u64>().ok())
                         .unwrap_or(DEFAULT_PROMPT_WAIT_MS),
+                    tf_type: state.get_text(WORLD_FIELD_TF_TYPE).unwrap_or("").trim().to_string(),
                     slack_token: state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
                     slack_channel: state.get_text(WORLD_FIELD_SLACK_CHANNEL).unwrap_or("").to_string(),
                     slack_workspace: state.get_text(WORLD_FIELD_SLACK_WORKSPACE).unwrap_or("").to_string(),
@@ -18708,7 +19547,14 @@ async fn main() -> io::Result<()> {
     // =========================================================================
     // CLI argument parsing - single structured pass with validation
     // =========================================================================
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // TinyFugue's own options and world come out first (see tfstartup); the rest is Clay's.
+    let (tf_startup_opts, args) = match tfstartup::split_tf_cli(&std::env::args().skip(1).collect::<Vec<String>>()) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!("Error: {}. Use -h for help.", e);
+            std::process::exit(1);
+        }
+    };
 
     let mut show_version = false;
     let mut show_help = false;
@@ -18802,11 +19648,29 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    // TinyFugue's startup options belong to a local session that runs TF: not to a remote
+    // client, the multiuser server, or the one-shot tools.
+    if tf_startup_opts.given {
+        let clash = if matches!(console_arg, Some(Some(_))) { Some("--console=") }
+            else if matches!(gui_arg, Some(Some(_))) { Some("--gui=") }
+            else if multiuser_mode { Some("--multiuser") }
+            else if grep_arg.is_some() || grep_archive_mode { Some("--grep") }
+            else if dump_mode { Some("--dump") }
+            else if local_server_mode { Some("--local-server") }
+            else if ssh_proxy_mode { Some("--ssh-proxy") }
+            else { None };
+        if let Some(flag) = clash {
+            eprintln!("Error: TinyFugue options and world names can't be used with {}. Use -h for help.", flag);
+            std::process::exit(1);
+        }
+    }
+    tfstartup::set_startup_opts(tf_startup_opts);
+
     // Handle -h / --help
     if show_help {
         println!("Clay MUD Client v{}", VERSION);
         println!();
-        println!("Usage: clay [OPTIONS]");
+        println!("Usage: clay [OPTIONS] [<world> | <host> <port>]");
         println!();
         println!("Options:");
         println!("    --console            Run in console (TUI) mode");
@@ -18848,6 +19712,19 @@ async fn main() -> io::Result<()> {
         println!("                         Default output directory: current working directory");
         println!("    -v, --version        Show version and build information");
         println!("    -h, --help           Show this help message");
+        println!();
+        println!("TinyFugue compatibility (a local console/GUI session, or -D):");
+        println!("    <world>              Connect to <world> once started");
+        println!("    <host> <port>        Connect to a temporary world at that address");
+        println!("    -f<file>             Load <file> as the startup rc instead of the first of");
+        println!("                         ~/.tfrc, ~/tfrc, ./.tfrc, ./tfrc that exists");
+        println!("    -f                   Load no rc");
+        println!("    -c<cmd>              Run <cmd> after the rc, as if typed");
+        println!("    -L<dir>              TinyFugue library directory for this session");
+        println!("    -l                   No automatic login for <world>");
+        println!("    -q                   Quiet login for <world>");
+        println!("    -n                   Accepted; Clay never connects at startup by itself");
+        println!("    (TinyFugue's -v is Clay's version option; Clay's console is always visual)");
         println!();
         println!("Defaults:");
         println!("    Windows/macOS: --gui");
@@ -19547,6 +20424,10 @@ pub async fn run_app_headless(
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
     app.event_tx = Some(event_tx.clone());
+    app.tf_event_tx = Some(event_tx.clone());
+    // TF's SIGTERM/SIGHUP/SIGUSR2 hooks (and a clean end on TERM/HUP).
+    #[cfg(all(unix, not(target_os = "android")))]
+    spawn_tf_signal_handlers(&event_tx);
 
     // Reconstruct connections from saved fds if in reload/crash mode
     #[cfg(any(unix, windows))]
@@ -19995,30 +20876,12 @@ pub async fn run_app_headless(
         });
     }
 
-    // Run startup actions (including on reload/crash recovery)
-    // Note: In headless mode, we only support TF commands (#...) for startup actions
-    // since handle_command isn't compatible with spawned tasks
-    {
-        let startup_actions: Vec<String> = app.settings.actions.iter()
-            .filter(|a| a.startup && a.enabled)
-            .map(|a| a.command.clone())
-            .collect();
-        for cmd_str in startup_actions {
-            // Split by semicolons and execute each command
-            for single_cmd in cmd_str.split(';') {
-                let single_cmd = single_cmd.trim();
-                if single_cmd.is_empty() { continue; }
-                if single_cmd.starts_with('/') {
-                    // Unified command system - route through TF parser
-                    app.sync_tf_world_info();
-                    let _ = app.tf_engine.execute(single_cmd);
-                } else {
-                    // Plain text can't be run at startup in headless mode
-                    debug_log(is_debug_enabled(), &format!("[Startup] Skipped command (headless): {}", single_cmd));
-                }
-            }
-        }
-    }
+    // TinyFugue's startup (the rc, -c, the world named on the command line) and Clay's
+    // startup actions - not again after a reload or crash restart that carried the TF
+    // state over (tf::snapshot): that would define every unnamed trigger a second time.
+    // An embedded --local-server only runs the startup actions, as before.
+    let local_server = LOCAL_SERVER_LOOPBACK_ONLY.load(Ordering::SeqCst);
+    tfstartup::run_tf_startup_daemon(&mut app, &event_tx, true, !local_server).await;
 
     debug_log(is_debug_enabled(), "HEADLESS: Entering main event loop");
 
@@ -20030,15 +20893,13 @@ pub async fn run_app_headless(
         tokio::select! {
             // App events (server data, disconnects, WS client messages)
             Some(event) = event_rx.recv() => {
-                let event = match event {
-                    // Slack/Discord: one shared handler for every loop; it may hand back an
-                    // event (chat lines as ServerData, a lost session as Disconnected) to be
-                    // handled below exactly as if it had arrived by itself.
-                    AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
-                        Some(e) => e,
-                        None => continue,
-                    },
-                    e => e,
+                // Slack/Discord events and connection-close notices: handled once, for every
+                // loop (App::preprocess_event). What comes back - chat lines or a close message
+                // as ServerData, a lost chat session as Disconnected - is handled below exactly
+                // as if it had arrived by itself.
+                let event = match app.preprocess_event(event) {
+                    Some(e) => e,
+                    None => continue,
                 };
                 match event {
                     AppEvent::ServerData(ref world_name, ref bytes) => {
@@ -20064,47 +20925,22 @@ pub async fn run_app_headless(
                             app.current_world_index = world_idx;
                             for cmd in commands {
                                 if cmd.starts_with('/') {
-                                    // Unified command system - route through TF parser
+                                    // Route through the TF parser and apply what the command
+                                    // did, in order (see tfrun): every Clay command now runs,
+                                    // not just /send, /notify and /say.
                                     app.sync_tf_world_info();
-                                    match app.tf_engine.execute(&cmd) {
-                                        tf::TfCommandResult::SendToMud(text) => {
-                                            app.send_to_world(world_idx, text);
-                                        }
-                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                            // Handle Clay-specific commands in daemon mode
-                                            let parsed = parse_command(&clay_cmd);
-                                            if let Command::Send { text, target_world, .. } = &parsed {
-                                                let target_idx = if let Some(w) = target_world {
-                                                    app.find_world_index(w)
-                                                } else { Some(world_idx) };
-                                                if let Some(idx) = target_idx {
-                                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                                        if tx.send(WriteCommand::Text(text.clone())).await.is_ok() {
-                                                            // async .send().await, not send_to_world's
-                                                            // sync try_send - captured directly.
-                                                            app.capture_sent_line(idx, text);
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                app.handle_triggered_notify_or_say(parsed, world_idx);
-                                            }
-                                        }
-                                        tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.register_repeat_process(process);
-                                        }
-                                        _ => {}
-                                    }
+                                    let effects = app.run_tf_in_world(world_idx, &cmd);
+                                    let ctx = tfrun::TfEffectCtx::for_world(world_idx, true);
+                                    tfrun::run_tf_effects_daemon(&mut app, 0, effects, ctx, &event_tx).await;
                                 } else {
-                                    // Plain text - a triggered action/hook's command with no
-                                    // leading '/'. Via send_to_world so it captures too.
+                                    // Plain text - send to MUD (captured via send_to_world)
                                     app.send_to_world(world_idx, cmd);
                                 }
                             }
                             app.current_world_index = saved_current_world;
                         }
                     }
-                    AppEvent::Chat(..) => {} // handled by the prelude above
+                    AppEvent::Chat(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
                     AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
                         app.apply_chat_lookup_result(client_id, request_id, world_index, result);
                     }
@@ -20120,10 +20956,10 @@ pub async fn run_app_headless(
                             reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
                         }
                     }
-                    AppEvent::Disconnected(ref world_name, conn_id) => {
+                    AppEvent::Disconnected(ref world_name, conn_id, ref reason) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             if conn_id != app.worlds[world_idx].connection_id { continue; }
-                            app.handle_disconnected(world_idx);
+                            app.handle_disconnected(world_idx, reason);
                             if let Some(next) = app.next_reconnect_instant() {
                                 let dur = next.saturating_duration_since(std::time::Instant::now());
                                 reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
@@ -20172,6 +21008,20 @@ pub async fn run_app_headless(
                     AppEvent::WsKeyRevoke(_client_id, key) => {
                         app.handle_ws_key_revoke(&key);
                     }
+                    AppEvent::TfShellDone(world_idx, output, status) => {
+                        app.finish_tf_shell(world_idx, &output, status, true);
+                    }
+                    // SIGTERM/SIGHUP: TF's hook of that name, then Clay ends (after a
+                    // moment for anything the hook sent to reach its world); SIGUSR2: the
+                    // hook only.
+                    AppEvent::TfSignal(event) => {
+                        app.fire_tf_hook(None, event, "", true);
+                        tfrun::drain_deferred_tf_daemon(&mut app, &event_tx).await;
+                        if event != tf::TfHookEvent::Sigusr2 {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            std::process::exit(0);
+                        }
+                    }
                     AppEvent::SystemMessage(msg) => {
                         // Add to current world's output and broadcast. Routed through
                         // push_and_broadcast_line so the broadcast carries the line's REAL
@@ -20211,23 +21061,13 @@ pub async fn run_app_headless(
                     AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
                         app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
                     }
-                    AppEvent::ConnectionFailed(world_name, error) => {
+                    AppEvent::ConnectionFailed(world_name, conn_id, failure) => {
+                        // CONFAIL (and ICONFAIL) hooks, the message and the reconnect; a
+                        // certificate mismatch is offered through the CertMismatch dialog
+                        // report_connect_failure broadcasts.
                         if let Some(world_idx) = app.find_world_index(&world_name) {
-                            // CONFAIL hook - see /help hooks: "CONFAIL world, reason".
-                            app.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Confail, &format!("{} {}", world_name, error), false);
-                            app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
-                            // A pin mismatch needs the user to explicitly trust the new
-                            // certificate (via the web/WebView CertMismatch dialog this
-                            // broadcasts) before reconnecting — auto-retrying against the
-                            // same mismatched cert would just fail again silently.
-                            if app.check_and_broadcast_cert_mismatch(world_idx).is_none() {
-                                let secs = app.worlds[world_idx].settings.auto_reconnect_secs;
-                                if secs > 0 {
-                                    app.worlds[world_idx].reconnect_at = Some(
-                                        std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
-                                    );
-                                    app.add_output_to_world(world_idx, &format!("Reconnecting in {} seconds...", secs));
-                                }
+                            if app.worlds[world_idx].connection_id == conn_id {
+                                app.report_connect_failure(world_idx, &failure, true, true);
                             }
                         }
                     }
@@ -20461,8 +21301,9 @@ pub async fn run_app_headless(
                                 // Handle auto-login
                                 if !world.skip_auto_login {
                                     let auto_type = world.settings.auto_connect_type;
-                                    let user = world.settings.user.clone();
-                                    let password = world.settings.password.clone();
+                                    let (user, password) = login_credentials(&world.settings,
+                                        app.tf_engine.default_world_character.as_deref(),
+                                        app.tf_engine.default_world_password.as_deref());
                                     let prompt_num = world.prompt_count;
 
                                     if !user.is_empty() && !password.is_empty() {
@@ -20482,7 +21323,7 @@ pub async fn run_app_headless(
                                                     _ => None,
                                                 }
                                             }
-                                            AutoConnectType::Connect | AutoConnectType::NoLogin => None,
+                                            AutoConnectType::Connect | AutoConnectType::NoLogin | AutoConnectType::Lines => None,
                                         };
 
                                         if let Some(cmd) = cmd_to_send {
@@ -20519,7 +21360,9 @@ pub async fn run_app_headless(
                         if now_fansi >= deadline {
                             if let Some(login_cmd) = world.fansi_login_pending.take() {
                                 if let Some(tx) = &world.command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(login_cmd));
+                                    for line in login_cmd.split('\n') {
+                                        let _ = tx.try_send(WriteCommand::Text(line.to_string()));
+                                    }
                                 }
                             }
                             world.fansi_detect_until = None;
@@ -20545,71 +21388,14 @@ pub async fn run_app_headless(
 
             // TF repeat process tick — only fires when processes exist
             _ = &mut process_tick_sleep => {
-                let now = std::time::Instant::now();
-                let mut to_remove = vec![];
-                let process_count = app.tf_engine.processes.len();
-                for i in 0..process_count {
-                    if app.tf_engine.processes[i].on_prompt { continue; }
-                    if app.tf_engine.processes[i].next_run <= now {
-                        let cmd = app.tf_engine.processes[i].command.clone();
-                        let process_world = app.tf_engine.processes[i].world.clone();
-                        // Sync world info before executing process command
-                        app.sync_tf_world_info();
-                        let result = app.tf_engine.execute(&cmd);
-                        let target_idx = if let Some(ref wname) = process_world {
-                            if wname.is_empty() {
-                                Some(app.current_world_index)
-                            } else {
-                                app.find_world_index(wname)
-                            }
-                        } else {
-                            Some(app.current_world_index)
-                        };
-                        let world_idx = target_idx.unwrap_or(app.current_world_index);
-                        match result {
-                            tf::TfCommandResult::SendToMud(text) => {
-                                if let Some(idx) = target_idx {
-                                    app.send_to_world(idx, text);
-                                }
-                            }
-                            tf::TfCommandResult::Success(Some(msg)) => {
-                                app.emit_client_text(world_idx, &msg, true);
-                            }
-                            tf::TfCommandResult::Error(err) => {
-                                app.emit_tf_error(world_idx, &err, true);
-                            }
-                            tf::TfCommandResult::RepeatProcess(process) => {
-                                app.register_repeat_process(process);
-                            }
-                            tf::TfCommandResult::NotTfCommand => {
-                                // Plain text command - send to MUD (captured via
-                                // send_to_world - a /repeat body is exactly the
-                                // "/repeat batches" case /recall -i now covers).
-                                if let Some(idx) = target_idx {
-                                    app.send_to_world(idx, cmd.clone());
-                                }
-                            }
-                            _ => {}
-                        }
-                        let interval = app.tf_engine.processes[i].interval;
-                        app.tf_engine.processes[i].next_run += interval;
-                        if let Some(ref mut rem) = app.tf_engine.processes[i].remaining {
-                            *rem = rem.saturating_sub(1);
-                            if *rem == 0 {
-                                to_remove.push(i);
-                            }
-                        }
-                    }
+                for (ctx, effects) in app.tick_tf_processes(std::time::Instant::now(), true) {
+                    tfrun::run_tf_effects_daemon(&mut app, 0, effects, ctx, &event_tx).await;
                 }
-                for i in to_remove.into_iter().rev() {
-                    app.tf_engine.processes.remove(i);
-                }
-                // Re-arm: tick again in 1s if processes remain
-                if !app.tf_engine.processes.is_empty() {
-                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
-                } else {
-                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
-                }
+                // Re-arm for the next process due, if any remain
+                let next = app.next_tf_process_due()
+                    .map(tokio::time::Instant::from_std)
+                    .unwrap_or_else(|| tokio::time::Instant::now() + FAR_FUTURE);
+                process_tick_sleep.as_mut().reset(next);
             }
 
             // GUI reload check — polls atomic flag set by WebView IPC handler
@@ -20689,11 +21475,19 @@ pub async fn run_app_headless(
             }
         }
 
-        // Activate process tick sleep if processes were added during this iteration
-        if !app.tf_engine.processes.is_empty()
-            && process_tick_sleep.deadline() > tokio::time::Instant::now() + Duration::from_secs(2)
-        {
-            process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
+        // TF effects that synchronous code (hooks, triggers) left for the loop
+        tfrun::drain_deferred_tf_daemon(&mut app, &event_tx).await;
+        // TF's mail check, and its status area when a script has it, to the clients
+        app.check_tf_mail();
+        app.refresh_tf_status();
+
+        // Arm the process timer for the next process due (processes may have been added
+        // during this iteration)
+        if let Some(due) = app.next_tf_process_due() {
+            let due = tokio::time::Instant::from_std(due);
+            if process_tick_sleep.deadline() > due {
+                process_tick_sleep.as_mut().reset(due);
+            }
         }
 
         // mud-status-display.md Job 2 (plan D4): pull prompt_check_sleep's deadline in to
@@ -20764,6 +21558,7 @@ fn perform_terminal_redraw(app: &mut App, terminal: &mut Terminal<CrosstermBacke
 
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let mut app = App::new();
+    app.console_tui = true;
 
     // Check if we're in reload mode (via --reload command line argument)
     let is_reload = std::env::args().any(|a| a == "--reload");
@@ -20865,6 +21660,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     debug_log(is_debug_enabled(), "STARTUP: Creating event channel...");
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
     app.event_tx = Some(event_tx.clone());
+    app.tf_event_tx = Some(event_tx.clone());
 
     // If in reload or crash recovery mode, reconstruct connections from saved fds
     #[cfg(any(unix, windows))]
@@ -21413,6 +22209,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let _ = sigusr1_tx.send(AppEvent::Sigusr1Received).await;
             }
         });
+        spawn_tf_signal_handlers(&event_tx);
     }
 
     // Reset terminal state after reload — clear stale mouse capture, etc.
@@ -21427,6 +22224,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     terminal.draw(|f| ui(f, &mut app))?;
     // Render output with crossterm (needed after reload when ratatui early-returns)
     render_output_crossterm(&app);
+    app.needs_output_redraw = false;
     // Flush stdout to ensure everything is displayed
     std::io::Write::flush(&mut std::io::stdout())?;
 
@@ -21480,44 +22278,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Track if we've cleared the crash count after successful user input
     let mut crash_count_cleared = false;
 
-    // Run startup actions (including on reload/crash recovery)
-    {
-        let startup_actions: Vec<String> = app.settings.actions.iter()
-            .filter(|a| a.startup && a.enabled)
-            .map(|a| a.command.clone())
-            .collect();
-        for cmd_str in startup_actions {
-            // Split by semicolons and execute each command
-            for single_cmd in cmd_str.split(';') {
-                let single_cmd = single_cmd.trim();
-                if single_cmd.is_empty() { continue; }
-                if single_cmd.starts_with('/') {
-                    // Unified command system - route through TF parser
-                    app.sync_tf_world_info();
-                    match app.tf_engine.execute(single_cmd) {
-                        tf::TfCommandResult::Success(Some(msg)) => {
-                            let world_idx = app.current_world_index;
-                            app.emit_client_text(world_idx, &msg, false);
-                        }
-                        tf::TfCommandResult::Error(err) => {
-                            let world_idx = app.current_world_index;
-                            app.emit_tf_error(world_idx, &err, false);
-                        }
-                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                            handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
-                        }
-                        tf::TfCommandResult::RepeatProcess(process) => {
-                            app.register_repeat_process(process);
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Text to send to server - but we're not connected yet
-                    // Just add it to output as a note
-                    app.add_output(&format!("[Startup] Would send: {}", single_cmd));
-                }
-            }
-        }
+    // TinyFugue's startup (the rc, -c, the world named on the command line) and Clay's
+    // startup actions - not again after a reload or crash restart that carried the TF
+    // state over (tf::snapshot): that would define every unnamed trigger a second time.
+    if tfstartup::run_tf_startup_console(&mut app, &event_tx).await {
+        return Ok(());
+    }
+    // What the startup printed (the rc's "% Loading commands from ..." and any error in
+    // it) is shown now, not at the first keypress.
+    if app.needs_output_redraw {
+        terminal.clear()?;
+        terminal.draw(|f| ui(f, &mut app))?;
+        render_output_crossterm(&app);
+        app.needs_output_redraw = false;
+        std::io::Write::flush(&mut std::io::stdout())?;
     }
 
     debug_log(is_debug_enabled(), "STARTUP: Entering main event loop");
@@ -21662,35 +22436,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         KeyAction::Suspend => {
-                            // Process suspension not available on Android or Windows
-                            #[cfg(all(unix, not(target_os = "android")))]
-                            {
-                                // Restore terminal to normal mode before suspending
-                                if app.mouse_capture_active {
-                                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                                }
-                                let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-                                disable_raw_mode()?;
-                                execute!(std::io::stdout(), LeaveAlternateScreen)?;
-
-                                // Send SIGTSTP to self to suspend
-                                unsafe {
-                                    libc::kill(libc::getpid(), libc::SIGTSTP);
-                                }
-
-                                // When we resume (after fg), re-enter raw mode and redraw
-                                enable_raw_mode()?;
-                                execute!(std::io::stdout(), EnterAlternateScreen, crossterm::event::EnableBracketedPaste)?;
-                                if app.mouse_capture_active {
-                                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                                }
-                                terminal.clear()?;
-                                app.needs_output_redraw = true;
-                            }
-                            #[cfg(any(target_os = "android", not(unix)))]
-                            {
-                                app.add_output("Process suspension (Ctrl+Z) is not available on this platform.");
-                            }
+                            suspend_console(&mut app, terminal)?;
                         }
                         KeyAction::SendCommand(mut cmd) => {
                             // Clear splash on first user input (same as server data)
@@ -21713,6 +22459,37 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.spell_state.reset();
                             app.suggestion_message = None;
 
+                            // TF's typed-line forms, never applied at a password prompt:
+                            // "^old^new" re-runs the last line containing "old" with it
+                            // replaced (MUD worlds only - in a chat world "^^" is just
+                            // text), and three or more leading slashes send the line as
+                            // text (see tfrun::typed_slash_form).
+                            let mut send_as_text = false;
+                            let kecho_world = app.current_world_index;
+                            app.tf_echo_line(kecho_world, "kecho", "kprefix", &cmd);
+                            if !app.current_world().protocol.echo_masked {
+                                if app.current_world().settings.world_type.is_mud() {
+                                    match app.input.substitute_history(&cmd) {
+                                        input::HistorySub::NoMatch => {
+                                            app.add_output("% No match.");
+                                            continue;
+                                        }
+                                        input::HistorySub::Substituted(line) => {
+                                            app.add_output(&line);
+                                            cmd = line;
+                                        }
+                                        input::HistorySub::NotSubstitution => {}
+                                    }
+                                }
+                                match tfrun::typed_slash_form(&cmd) {
+                                    tfrun::TypedSlashForm::SendText(text) => {
+                                        cmd = text.to_string();
+                                        send_as_text = true;
+                                    }
+                                    tfrun::TypedSlashForm::Line(line) => cmd = line.to_string(),
+                                }
+                            }
+
                             // Rewrite slash-less action invocations: "common" → "/common"
                             // Respects the action's world field so only eligible actions match.
                             let current_world_name = app.current_world().name.clone();
@@ -21721,7 +22498,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
 
                             // Check for TF-style /N pattern shorthand (e.g., /10 *combat*)
-                            if cmd.starts_with('/') && cmd.len() > 1 {
+                            if !send_as_text && cmd.starts_with('/') && cmd.len() > 1 {
                                 let rest = &cmd[1..];
                                 // Check if it starts with a number followed by space and pattern
                                 if let Some(space_pos) = rest.find(char::is_whitespace) {
@@ -21729,19 +22506,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
                                         let pattern = rest[space_pos..].trim();
                                         if !pattern.is_empty() {
-                                            // Convert to /recall /N pattern - sync world info first
-                                            app.sync_tf_world_info();
+                                            // Convert to /recall /N pattern
                                             let recall_cmd = format!("/recall /{} {}", num_part, pattern);
-                                            match app.tf_engine.execute(&recall_cmd) {
-                                                tf::TfCommandResult::Recall(opts) => {
-                                                    let world_idx = app.current_world_index;
-                                                    app.emit_recall(&opts, world_idx, false);
-                                                }
-                                                tf::TfCommandResult::Error(err) => {
-                                                    let world_idx = app.current_world_index;
-                                                    app.emit_tf_error(world_idx, &err, false);
-                                                }
-                                                _ => {}
+                                            if tfrun::run_tf_line_console(&mut app, &recall_cmd, &event_tx).await {
+                                                return Ok(());
                                             }
                                             continue;
                                         }
@@ -21749,149 +22517,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
 
-                            if cmd.starts_with('/') {
-                                // Unified command system - route through TF parser first
-                                // TF parser will return ClayCommand for Clay-specific commands
-                                app.sync_tf_world_info();
-                                match app.tf_engine.execute(&cmd) {
-                                    tf::TfCommandResult::Success(Some(msg)) => {
-                                        let world_idx = app.current_world_index;
-                                        app.emit_client_text(world_idx, &msg, false);
-                                    }
-                                    tf::TfCommandResult::Success(None) => {
-                                        // Silent success
-                                    }
-                                    tf::TfCommandResult::Error(err) => {
-                                        let world_idx = app.current_world_index;
-                                        app.emit_tf_error(world_idx, &err, false);
-                                    }
-                                    tf::TfCommandResult::SendToMud(text) => {
-                                        if app.current_world().connected {
-                                            if let Some(tx) = &app.current_world().command_tx {
-                                                let world_idx_for_record = app.current_world_index;
-                                                let text_for_record = text.clone();
-                                                if tx.send(WriteCommand::Text(text)).await.is_err() {
-                                                    app.add_tf_output("Failed to send command");
-                                                } else {
-                                                    let now = std::time::Instant::now();
-                                                    app.current_world_mut().last_send_time = Some(now);
-                                                    app.current_world_mut().last_user_command_time = Some(now);
-                                                    app.current_world_mut().clear_prompt_after_send();
-                                                    // Reset more-mode counter after successfully sending
-                                                    app.current_world_mut().lines_since_pause = 0;
-                                                    app.record_user_input(world_idx_for_record, &text_for_record);
-                                                }
-                                            }
-                                        } else {
-                                            app.add_output("Not connected. Use /worlds to connect.");
-                                        }
-                                    }
-                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                        if handle_command(&clay_cmd, &mut app, event_tx.clone()).await {
-                                            return Ok(());
-                                        }
-                                    }
-                                    tf::TfCommandResult::Recall(opts) => {
-                                        let world_idx = app.current_world_index;
-                                        app.emit_recall(&opts, world_idx, false);
-                                    }
-                                    tf::TfCommandResult::RepeatProcess(process) => {
-                                        let id = process.id;
-                                        let interval = format_duration_short(process.interval);
-                                        let count_str = process.count.map_or("infinite".to_string(), |c| c.to_string());
-                                        let cmd = process.command.clone();
-                                        app.register_repeat_process(process);
-                                        app.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
-                                    }
-                                    tf::TfCommandResult::Quote { lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
-                                        let world_idx = app.current_world_index;
-                                        if let Some((target_idx, resolved_lines)) = app.resolve_quote_lines(
-                                            lines, &world, delay_secs, recall_opts, strip_ansi, world_idx, disposition, false,
-                                        ) {
-                                            // Send immediately (no delay or single line). Async .send().await
-                                            // (not sync try_send) since this context can afford to await
-                                            // backpressure - see resolve_quote_lines's doc comment.
-                                            for line in resolved_lines {
-                                                match disposition {
-                                                    tf::QuoteDisposition::Send => {
-                                                        if app.worlds[target_idx].connected {
-                                                            if let Some(tx) = &app.worlds[target_idx].command_tx {
-                                                                if tx.send(WriteCommand::Text(line.clone())).await.is_ok() {
-                                                                    // async .send().await, not send_to_world's sync
-                                                                    // try_send - captured directly.
-                                                                    app.capture_sent_line(target_idx, &line);
-                                                                }
-                                                            }
-                                                        } else {
-                                                            app.add_output("Not connected");
-                                                            break;
-                                                        }
-                                                    }
-                                                    tf::QuoteDisposition::Echo => {
-                                                        app.add_output(&line);
-                                                    }
-                                                    tf::QuoteDisposition::Exec => {
-                                                        // Execute each line as a TF command
-                                                        let result = app.tf_engine.execute(&line);
-                                                        match result {
-                                                            tf::TfCommandResult::SendToMud(text) => {
-                                                                if let Some(tx) = &app.worlds[target_idx].command_tx {
-                                                                    if tx.send(WriteCommand::Text(text.clone())).await.is_ok() {
-                                                                        app.capture_sent_line(target_idx, &text);
-                                                                    }
-                                                                }
-                                                            }
-                                                            tf::TfCommandResult::Success(Some(msg)) => {
-                                                                let world_idx = app.current_world_index;
-                                                                app.emit_client_text(world_idx, &msg, false);
-                                                            }
-                                                            tf::TfCommandResult::Error(err) => {
-                                                                let world_idx = app.current_world_index;
-                                                                app.emit_tf_error(world_idx, &err, false);
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    tf::TfCommandResult::NotTfCommand => {
-                                        // Shouldn't happen since we checked for /
-                                        app.add_output("Internal error: not a command");
-                                    }
-                                    tf::TfCommandResult::UnknownCommand(cmd_name) => {
-                                        // NOMACRO hook: "name (% <name>: No such command or macro)" -
-                                        // see /help hooks and finding C.10 / plan step P1.9.
-                                        let world_idx_for_hook = app.current_world_index;
-                                        app.fire_tf_hook(Some(world_idx_for_hook), tf::TfHookEvent::Nomacro, &cmd_name, false);
-                                        // Show the command with its original prefix
-                                        let prefix = if cmd_name.starts_with("//") { "" } else { "/" };
-                                        app.add_output(&format!("Unknown command: {}{}", prefix, cmd_name));
-                                    }
-                                    tf::TfCommandResult::ExitLoad(_) => {
-                                        // ExitLoad from command line means nothing (not in a file load)
-                                        // This shouldn't normally happen since cmd_exit checks loading_files
-                                    }
-                                    tf::TfCommandResult::Return(_) => {
-                                        // Return outside of macro execution - no-op
-                                    }
-                                    tf::TfCommandResult::Result(val) => {
-                                        // Typed directly (not inside a macro), /result is being
-                                        // "called as a command" exactly like any other top-level
-                                        // command - see builtins::cmd_result's doc comment.
-                                        if !val.is_empty() {
-                                            let world_idx = app.current_world_index;
-                                            app.emit_client_text(world_idx, &val, false);
-                                        }
-                                    }
+                            if !send_as_text && (cmd.starts_with('/') || app.tf_engine.sub_mode() != tf::SubMode::Off) {
+                                // Unified command system - route through the TF parser and apply
+                                // everything the line did, in order (see tfrun): TF hands back a
+                                // Clay command for Clay-specific commands, which runs through
+                                // handle_command. With %sub on or full, plain text is TF's to
+                                // process too (`/help sub`).
+                                if tfrun::run_tf_line_console(&mut app, &cmd, &event_tx).await {
+                                    return Ok(());
                                 }
-                                // Process any pending world operations from TF functions like addworld()
-                                process_pending_world_ops(&mut app);
-                                // Process any pending commands from TF macro execution
-                                process_pending_tf_commands(&mut app);
-                                // Process any text queued by TF's echo() expression function
-                                process_pending_tf_outputs(&mut app);
                                 // Process /xtitle, /more, /wrap and the /limit family
                                 // (Job 15) - console-only, see its own doc comment.
                                 apply_pending_tf_console_ops(&mut app);
@@ -21919,6 +22553,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         KeyAction::Refresh => {
                                             perform_terminal_redraw(&mut app, &mut *terminal)?;
                                         }
+                                        KeyAction::RunBound(body) => {
+                                            if tfrun::run_tf_binding_console(&mut app, &body, &event_tx).await {
+                                                return Ok(());
+                                            }
+                                        }
                                         // UnseenCleared is already broadcast by switch_world() itself.
                                         KeyAction::SwitchedWorld(_) => {}
                                         KeyAction::None
@@ -21939,6 +22578,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let world_idx_for_hook = app.current_world_index;
                                 let suppressed = app.fire_tf_hook(Some(world_idx_for_hook), tf::TfHookEvent::Send, &cmd, false);
                                 if !suppressed {
+                                    let world_idx_for_echo = app.current_world_index;
+                                    app.tf_echo_line(world_idx_for_echo, "secho", "sprefix", &cmd);
                                     if let Some(tx) = &app.current_world().command_tx {
                                         let world_idx_for_record = app.current_world_index;
                                         let cmd_for_record = cmd.clone();
@@ -21960,6 +22601,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.add_output("Not connected. Use /worlds to connect.");
                             }
                         }
+                        KeyAction::RunBound(body) => {
+                            // A /bind or key_<name> binding: its command runs as a macro body
+                            if tfrun::run_tf_binding_console(&mut app, &body, &event_tx).await {
+                                return Ok(());
+                            }
+                            apply_pending_tf_console_ops(&mut app);
+                        }
                         KeyAction::SwitchedWorld(_world_index) => {
                             // UnseenCleared is now broadcast by switch_world() itself
                         }
@@ -21979,15 +22627,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Server events (data from MUD connections)
             Some(event) = event_rx.recv() => {
                 needs_draw = true;
-                let event = match event {
-                    // Slack/Discord: one shared handler for every loop; it may hand back an
-                    // event (chat lines as ServerData, a lost session as Disconnected) to be
-                    // handled below exactly as if it had arrived by itself.
-                    AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
-                        Some(e) => e,
-                        None => continue,
-                    },
-                    e => e,
+                // Slack/Discord events and connection-close notices: handled once, for every
+                // loop (App::preprocess_event). What comes back - chat lines or a close message
+                // as ServerData, a lost chat session as Disconnected - is handled below exactly
+                // as if it had arrived by itself.
+                let event = match app.preprocess_event(event) {
+                    Some(e) => e,
+                    None => continue,
                 };
                 match event {
                     AppEvent::ServerData(ref world_name, bytes) => {
@@ -22029,19 +22675,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.current_world_index = world_idx;
                             for cmd in commands {
                                 if cmd.starts_with('/') {
-                                    // Unified command system - route through TF parser
+                                    // Unified command system - route through the TF parser and
+                                    // apply what the command did, in order (see tfrun).
                                     app.sync_tf_world_info();
-                                    match app.tf_engine.execute(&cmd) {
-                                        tf::TfCommandResult::SendToMud(text) => {
-                                            app.send_to_world(world_idx, text);
-                                        }
-                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                            handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
-                                        }
-                                        tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.register_repeat_process(process);
-                                        }
-                                        _ => {}
+                                    let effects = app.run_tf_in_world(world_idx, &cmd);
+                                    let ctx = tfrun::TfEffectCtx::for_world(world_idx, false);
+                                    if tfrun::run_tf_effects_console(&mut app, effects, ctx, &event_tx).await {
+                                        return Ok(());
                                     }
                                 } else {
                                     // Plain text - send to MUD (captured via send_to_world)
@@ -22049,9 +22689,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                             app.current_world_index = saved_current_world;
+                            // What the TF triggers left for the loop (their Clay commands)
+                            if tfrun::drain_deferred_tf_console(&mut app, &event_tx).await {
+                                return Ok(());
+                            }
                         }
                     }
-                    AppEvent::Chat(..) => {} // handled by the prelude above
+                    AppEvent::Chat(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
                     AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
                         app.apply_chat_lookup_result(client_id, request_id, world_index, result);
                     }
@@ -22067,10 +22711,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
                         }
                     }
-                    AppEvent::Disconnected(ref world_name, conn_id) => {
+                    AppEvent::Disconnected(ref world_name, conn_id, ref reason) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             if conn_id != app.worlds[world_idx].connection_id { continue; }
-                            app.handle_disconnected(world_idx);
+                            app.handle_disconnected(world_idx, reason);
                             if let Some(next) = app.next_reconnect_instant() {
                                 let dur = next.saturating_duration_since(std::time::Instant::now());
                                 reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
@@ -22103,10 +22747,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::Sigusr1Received => {
                         // SIGUSR1 received - trigger hot reload (only on non-Android)
                         debug_log(is_debug_enabled(), "LOOP: Received SIGUSR1 via event channel");
+                        app.fire_tf_hook(None, tf::TfHookEvent::Sigusr1, "", false);
                         app.add_output("Received SIGUSR1, performing hot reload...");
                         if handle_command("/reload", &mut app, event_tx.clone()).await {
                             return Ok(());
                         }
+                    }
+                    AppEvent::TfSignal(event) => {
+                        app.fire_tf_hook(None, event, "", false);
+                        if event != tf::TfHookEvent::Sigusr2
+                            && handle_command("/quit", &mut app, event_tx.clone()).await
+                        {
+                            return Ok(());
+                        }
+                    }
+                    AppEvent::TfShellDone(world_idx, output, status) => {
+                        app.finish_tf_shell(world_idx, &output, status, false);
                     }
                     // ConnectWorldRequest: a remote/WebSocket client executed a world-switch or
                     // connect ClayCommand (e.g. via an action like /common); the master must
@@ -22221,25 +22877,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
                         app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
                     }
-                    AppEvent::ConnectionFailed(world_name, error) => {
+                    AppEvent::ConnectionFailed(world_name, conn_id, failure) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
-                            // CONFAIL hook - see /help hooks: "CONFAIL world, reason".
-                            app.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Confail, &format!("{} {}", world_name, error), false);
-                            app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
-                            if let Some(mismatch) = app.check_and_broadcast_cert_mismatch(world_idx) {
-                                // Don't clobber a popup the user already has open; the
-                                // error line above and the web/WebView CertMismatch dialog
-                                // still surface it.
-                                if app.popup_manager.current().is_none() {
-                                    app.open_cert_mismatch_confirm(world_idx, &mismatch);
-                                }
-                            } else {
-                                let secs = app.worlds[world_idx].settings.auto_reconnect_secs;
-                                if secs > 0 {
-                                    app.worlds[world_idx].reconnect_at = Some(
-                                        std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
-                                    );
-                                    app.add_output_to_world(world_idx, &format!("Reconnecting in {} seconds...", secs));
+                            if app.worlds[world_idx].connection_id == conn_id {
+                                if let Some(mismatch) = app.report_connect_failure(world_idx, &failure, true, true) {
+                                    // Don't clobber a popup the user already has open; the
+                                    // error line and the web/WebView CertMismatch dialog still
+                                    // surface it.
+                                    if app.popup_manager.current().is_none() {
+                                        app.open_cert_mismatch_confirm(world_idx, &mismatch);
+                                    }
                                 }
                             }
                         }
@@ -22472,8 +23119,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Handle auto-login (same logic as AppEvent::Prompt handler)
                                 if !world.skip_auto_login {
                                     let auto_type = world.settings.auto_connect_type;
-                                    let user = world.settings.user.clone();
-                                    let password = world.settings.password.clone();
+                                    let (user, password) = login_credentials(&world.settings,
+                                        app.tf_engine.default_world_character.as_deref(),
+                                        app.tf_engine.default_world_password.as_deref());
                                     let prompt_num = world.prompt_count;
 
                                     if !user.is_empty() && !password.is_empty() {
@@ -22493,7 +23141,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     _ => None,
                                                 }
                                             }
-                                            AutoConnectType::Connect | AutoConnectType::NoLogin => None,
+                                            AutoConnectType::Connect | AutoConnectType::NoLogin | AutoConnectType::Lines => None,
                                         };
 
                                         if let Some(cmd) = cmd_to_send {
@@ -22530,7 +23178,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if now_fansi >= deadline {
                             if let Some(login_cmd) = world.fansi_login_pending.take() {
                                 if let Some(tx) = &world.command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(login_cmd));
+                                    for line in login_cmd.split('\n') {
+                                        let _ = tx.try_send(WriteCommand::Text(line.to_string()));
+                                    }
                                 }
                             }
                             world.fansi_detect_until = None;
@@ -22559,77 +23209,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // TF repeat process tick — only fires when processes exist
             _ = &mut process_tick_sleep => {
                 needs_draw = true; // Process may produce output
-                let now = std::time::Instant::now();
-                let mut to_remove = vec![];
-                let process_count = app.tf_engine.processes.len();
-                for i in 0..process_count {
-                    if app.tf_engine.processes[i].on_prompt { continue; }
-                    if app.tf_engine.processes[i].next_run <= now {
-                        let cmd = app.tf_engine.processes[i].command.clone();
-                        let process_world = app.tf_engine.processes[i].world.clone();
-                        // Sync world info before executing process command
-                        app.sync_tf_world_info();
-                        let result = app.tf_engine.execute(&cmd);
-                        // Determine target world for this process
-                        let target_idx = if let Some(ref wname) = process_world {
-                            if wname.is_empty() {
-                                Some(app.current_world_index)
-                            } else {
-                                app.find_world_index(wname)
-                            }
-                        } else {
-                            Some(app.current_world_index)
-                        };
-                        let world_idx = target_idx.unwrap_or(app.current_world_index);
-                        match result {
-                            tf::TfCommandResult::SendToMud(text) => {
-                                if let Some(idx) = target_idx {
-                                    app.send_to_world(idx, text);
-                                }
-                            }
-                            tf::TfCommandResult::Success(Some(msg)) => {
-                                app.emit_client_text(world_idx, &msg, false);
-                            }
-                            tf::TfCommandResult::Error(err) => {
-                                app.emit_tf_error(world_idx, &err, false);
-                            }
-                            tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                if handle_command(&clay_cmd, &mut app, event_tx.clone()).await {
-                                    return Ok(());
-                                }
-                            }
-                            tf::TfCommandResult::RepeatProcess(process) => {
-                                app.register_repeat_process(process);
-                            }
-                            tf::TfCommandResult::NotTfCommand => {
-                                // Plain text command - send to MUD (captured via
-                                // send_to_world - a /repeat body is exactly the
-                                // "/repeat batches" case /recall -i now covers).
-                                if let Some(idx) = target_idx {
-                                    app.send_to_world(idx, cmd.clone());
-                                }
-                            }
-                            _ => {}
-                        }
-                        let interval = app.tf_engine.processes[i].interval;
-                        app.tf_engine.processes[i].next_run += interval;
-                        if let Some(ref mut rem) = app.tf_engine.processes[i].remaining {
-                            *rem = rem.saturating_sub(1);
-                            if *rem == 0 {
-                                to_remove.push(i);
-                            }
-                        }
+                for (ctx, effects) in app.tick_tf_processes(std::time::Instant::now(), false) {
+                    if tfrun::run_tf_effects_console(&mut app, effects, ctx, &event_tx).await {
+                        return Ok(());
                     }
                 }
-                for i in to_remove.into_iter().rev() {
-                    app.tf_engine.processes.remove(i);
-                }
-                // Re-arm: tick again in 1s if processes remain
-                if !app.tf_engine.processes.is_empty() {
-                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
-                } else {
-                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
-                }
+                // Re-arm for the next process due, if any remain
+                let next = app.next_tf_process_due()
+                    .map(tokio::time::Instant::from_std)
+                    .unwrap_or_else(|| tokio::time::Instant::now() + FAR_FUTURE);
+                process_tick_sleep.as_mut().reset(next);
             }
 
             // Pending count update — only fires when worlds have pending lines
@@ -22692,15 +23281,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         let drain_deadline = std::time::Instant::now() + Duration::from_millis(16);
         while let Ok(event) = event_rx.try_recv() {
             needs_draw = true;
-            let event = match event {
-                // Slack/Discord: one shared handler for every loop; it may hand back an
-                // event (chat lines as ServerData, a lost session as Disconnected) to be
-                // handled below exactly as if it had arrived by itself.
-                AppEvent::Chat(owner, conn_id, ev) => match app.handle_chat_event(owner, conn_id, ev) {
-                    Some(e) => e,
-                    None => continue,
-                },
-                e => e,
+            // Slack/Discord events and connection-close notices: handled once, for every
+            // loop (App::preprocess_event). What comes back - chat lines or a close message
+            // as ServerData, a lost chat session as Disconnected - is handled below exactly
+            // as if it had arrived by itself.
+            let event = match app.preprocess_event(event) {
+                Some(e) => e,
+                None => continue,
             };
             match event {
                 AppEvent::ServerData(ref world_name, bytes) => {
@@ -22736,18 +23323,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.current_world_index = world_idx;
                         for cmd in commands {
                             if cmd.starts_with('/') {
+                                // Route through the TF parser and apply what the command
+                                // did, in order (see tfrun).
                                 app.sync_tf_world_info();
-                                match app.tf_engine.execute(&cmd) {
-                                    tf::TfCommandResult::SendToMud(text) => {
-                                        app.send_to_world(world_idx, text);
-                                    }
-                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                        handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
-                                    }
-                                    tf::TfCommandResult::RepeatProcess(process) => {
-                                        app.register_repeat_process(process);
-                                    }
-                                    _ => {}
+                                let effects = app.run_tf_in_world(world_idx, &cmd);
+                                let ctx = tfrun::TfEffectCtx::for_world(world_idx, false);
+                                if tfrun::run_tf_effects_console(&mut app, effects, ctx, &event_tx).await {
+                                    return Ok(());
                                 }
                             } else {
                                 // Plain text - send to MUD (captured via send_to_world)
@@ -22757,7 +23339,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.current_world_index = saved_current_world;
                     }
                 }
-                AppEvent::Chat(..) => {} // handled by the prelude above
+                AppEvent::Chat(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
                 AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
                     app.apply_chat_lookup_result(client_id, request_id, world_index, result);
                 }
@@ -22773,10 +23355,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
                     }
                 }
-                AppEvent::Disconnected(ref world_name, conn_id) => {
+                AppEvent::Disconnected(ref world_name, conn_id, ref reason) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         if conn_id != app.worlds[world_idx].connection_id { continue; }
-                        app.handle_disconnected(world_idx);
+                        app.handle_disconnected(world_idx, reason);
                         if let Some(next) = app.next_reconnect_instant() {
                             let dur = next.saturating_duration_since(std::time::Instant::now());
                             if reconnect_sleep.deadline() > tokio::time::Instant::now() + dur {
@@ -22838,6 +23420,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::MultiuserTelnetDetected(_, _) => {}
                 AppEvent::MultiuserPrompt(_, _, _) => {}
                 AppEvent::Sigusr1Received => {}
+                // Handled by the main select arm; a batch never holds one long.
+                AppEvent::TfSignal(event) => {
+                    app.fire_tf_hook(None, event, "", false);
+                    if event != tf::TfHookEvent::Sigusr2
+                        && handle_command("/quit", &mut app, event_tx.clone()).await
+                    {
+                        return Ok(());
+                    }
+                }
+                AppEvent::TfShellDone(world_idx, output, status) => {
+                    app.finish_tf_shell(world_idx, &output, status, false);
+                }
                 AppEvent::UpdateResult(result) => {
                     match result {
                         Ok(success) => {
@@ -22939,14 +23533,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                 }
                 // Background connection failed
-                AppEvent::ConnectionFailed(world_name, error) => {
+                AppEvent::ConnectionFailed(world_name, conn_id, failure) => {
+                    // Same as the main arm: this copy used to skip the reconnect.
                     if let Some(world_idx) = app.find_world_index(&world_name) {
-                        // CONFAIL hook - see /help hooks: "CONFAIL world, reason".
-                        app.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Confail, &format!("{} {}", world_name, error), false);
-                        app.emit_reconnect_status(world_idx, &format!("Connection failed: {}", error));
-                        if let Some(mismatch) = app.check_and_broadcast_cert_mismatch(world_idx) {
-                            if app.popup_manager.current().is_none() {
-                                app.open_cert_mismatch_confirm(world_idx, &mismatch);
+                        if app.worlds[world_idx].connection_id == conn_id {
+                            if let Some(mismatch) = app.report_connect_failure(world_idx, &failure, true, true) {
+                                if app.popup_manager.current().is_none() {
+                                    app.open_cert_mismatch_confirm(world_idx, &mismatch);
+                                }
                             }
                         }
                     }
@@ -22992,11 +23586,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
 
         // Now draw with the most up-to-date state
-        // Activate process tick sleep if processes were added during this iteration
-        if !app.tf_engine.processes.is_empty() {
-            // Only reset if the sleep is far-future (avoid resetting an already-short timer)
-            if process_tick_sleep.deadline() > tokio::time::Instant::now() + Duration::from_secs(2) {
-                process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
+        // TF effects that synchronous code (hooks, triggers) left for the loop
+        if tfrun::drain_deferred_tf_console(&mut app, &event_tx).await {
+            return Ok(());
+        }
+
+        // /sh and /suspend want the terminal itself. Keystrokes belong to the shell while
+        // it runs, so this loop's reader stops first (a new one starts reading when the
+        // loop next waits for input).
+        if !app.pending_terminal_ops.is_empty() {
+            drop(std::mem::replace(&mut event_stream, EventStream::new()));
+            run_terminal_ops(&mut app, terminal)?;
+        }
+        // TF's mail check, and its status area when a script has it: drawn in place of
+        // the separator bar, and sent to the clients
+        app.check_tf_mail();
+        app.refresh_tf_status();
+
+        // Arm the process timer for the next process due (processes may have been added
+        // during this iteration)
+        if let Some(due) = app.next_tf_process_due() {
+            let due = tokio::time::Instant::from_std(due);
+            if process_tick_sleep.deadline() > due {
+                process_tick_sleep.as_mut().reset(due);
             }
         }
 

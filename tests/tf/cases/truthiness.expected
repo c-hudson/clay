@@ -1,0 +1,9 @@
+a=0 b=1 c=0 d=0 e=0 f=0 g=1 h=1 i=1
+foonot=1 fooq=0
+barnot=1 barq=0 barneg=0
+cmp1=1 cmp2=1 cmp3=1 cmp4=1
+andstr=abc orstr=def or0= and3=3
+not1=0 notabc=1 notempty=1
+plus=13 plus2=1 plus3=2.5 mul=6
+y-false
+z-true

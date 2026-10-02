@@ -35,7 +35,16 @@ use super::control_flow;
 ///   -q           Quiet: see TfMacro::quiet
 ///   -f           Same as -a, for backward compatibility
 pub fn parse_def(args: &str) -> Result<TfMacro, String> {
-    let mut macro_def = TfMacro::default();
+    parse_def_with_default(args, TfMatchMode::default())
+}
+
+/// `parse_def`, with `default_mode` as the matching style when `-m` is not given - TF's
+/// %matching (`/help def`: "If omitted, the value of %{matching} ("glob" by default)
+/// is used, unless -P is also given, in which case "regexp" is used").
+pub fn parse_def_with_default(args: &str, default_mode: TfMatchMode) -> Result<TfMacro, String> {
+    // TF's default priority is 1 (`/help def` -p: "Default: 1").
+    let mut macro_def = TfMacro { priority: 1, ..TfMacro::default() };
+    let mut explicit_mode = false;
     let mut remaining = args.trim();
 
     // Parse options. Each '-'-prefixed token may be a *cluster* of bundled
@@ -49,6 +58,9 @@ pub fn parse_def(args: &str) -> Result<TfMacro, String> {
         let mut cluster = &remaining[1..];
         loop {
             let (opt, rest) = parse_option_char(cluster)?;
+            if matches!(opt, DefOption::MatchMode(_)) {
+                explicit_mode = true;
+            }
             apply_def_option(&mut macro_def, opt);
             if rest.is_empty() || rest.starts_with(char::is_whitespace) {
                 remaining = rest.trim_start();
@@ -87,10 +99,39 @@ pub fn parse_def(args: &str) -> Result<TfMacro, String> {
         macro_def.name = name.to_string();
     }
 
+    // The matching style -m didn't set: regexp with -P, else %matching. It also governs a
+    // hook pattern and -T, so a macro with either but no -t carries it in an empty
+    // trigger (an empty pattern never matches a line - see process_triggers).
+    if !explicit_mode {
+        let mode = if macro_def.partials.is_empty() { default_mode } else { TfMatchMode::Regexp };
+        match macro_def.trigger {
+            Some(ref mut trigger) => trigger.match_mode = mode,
+            None if macro_def.hook_pattern.is_some() || macro_def.world_type.is_some() => {
+                macro_def.trigger = Some(TfTrigger { pattern: String::new(), match_mode: mode, compiled: None });
+            }
+            None => {}
+        }
+    }
+
     // Compile trigger pattern if present
     if let Some(ref mut trigger) = macro_def.trigger {
         if !trigger.pattern.is_empty() {
             trigger.compiled = compile_pattern(&trigger.pattern, trigger.match_mode)?;
+        }
+    }
+
+    // Each -P part must exist in the trigger (TF: "-P2: trigger has only 0 subexpressions").
+    if !macro_def.partials.is_empty() {
+        let groups = macro_def.trigger.as_ref()
+            .and_then(|t| t.compiled.as_ref())
+            .map(|re| re.captures_len().saturating_sub(1))
+            .unwrap_or(0);
+        for p in &macro_def.partials {
+            if let super::PartialPart::Group(n) = p.part {
+                if n > groups {
+                    return Err(format!("-P{}: trigger has only {} subexpressions", n, groups));
+                }
+            }
         }
     }
 
@@ -126,7 +167,7 @@ fn apply_def_option(macro_def: &mut TfMacro, opt: DefOption) {
         DefOption::Priority(p) => macro_def.priority = p,
         DefOption::PriorityExpr(expr) => macro_def.priority_expr = Some(expr),
         DefOption::FallThrough => macro_def.fall_through = true,
-        DefOption::PartialHilite => macro_def.partial_hilite = true,
+        DefOption::Partials(specs) => macro_def.partials = specs,
         DefOption::OneShot => {
             macro_def.one_shot = Some(1);
             macro_def.shots_remaining = Some(1);
@@ -139,8 +180,10 @@ fn apply_def_option(macro_def: &mut TfMacro, opt: DefOption) {
         DefOption::Condition(expr) => macro_def.condition = Some(expr),
         DefOption::Probability(p) => macro_def.probability = Some(p),
         DefOption::World(w) => macro_def.world = Some(w),
-        DefOption::Hook(event, pattern) => {
-            macro_def.hook = Some(event);
+        DefOption::Hook(events, pattern) => {
+            let mut events = events.into_iter();
+            macro_def.hook = events.next();
+            macro_def.extra_hooks = events.collect();
             macro_def.hook_pattern = pattern;
         }
         DefOption::KeyBinding(keys) => macro_def.keybinding = Some(keys),
@@ -178,7 +221,8 @@ enum DefOption {
     /// `TfMacro::priority_expr`'s doc comment.
     PriorityExpr(String),
     FallThrough,
-    PartialHilite,
+    /// `-P[<part>]<attr>[;...]`
+    Partials(Vec<super::PartialSpec>),
     OneShot,
     ShotCount(u32),
     Attributes(TfAttributes),
@@ -188,7 +232,7 @@ enum DefOption {
     /// `-h<event>` or `-h"<event> <pattern>"`/`-h'<event> <pattern>'` (finding
     /// C.10 / plan step P1.9). `None` pattern: bare event name, matches every
     /// occurrence (see `/help hook`'s "pattern will default to *").
-    Hook(TfHookEvent, Option<String>),
+    Hook(Vec<TfHookEvent>, Option<String>),
     KeyBinding(String),
     Invisible,
     Quiet,
@@ -249,8 +293,9 @@ fn parse_option_char(input: &str) -> Result<(DefOption, &str), String> {
             Ok((DefOption::FallThrough, &input[1..]))
         }
         'P' => {
-            // -P (partial hilite)
-            Ok((DefOption::PartialHilite, &input[1..]))
+            // -P[<part>]<attr>[;[<part>]<attr>]... (partial hilite) - takes an argument
+            let (value, rest) = parse_quoted_or_word(&input[1..])?;
+            Ok((DefOption::Partials(super::PartialSpec::parse_list(&value)?), rest))
         }
         '1' => {
             // -1 (one-shot)
@@ -275,14 +320,15 @@ fn parse_option_char(input: &str) -> Result<(DefOption, &str), String> {
             Ok((DefOption::Condition(value), rest))
         }
         'c' => {
-            // -cCHANCE
+            // -c<chance>: TF's percent probability of running the body (`/help def`:
+            // "Default: 100%"), stored as a 0.0..=1.0 fraction.
             let (value, rest) = parse_word(&input[1..]);
             let chance: f32 = value.parse()
                 .map_err(|_| format!("Invalid probability: {}", value))?;
-            if !(0.0..=1.0).contains(&chance) {
-                return Err("Probability must be between 0.0 and 1.0".to_string());
+            if !(0.0..=100.0).contains(&chance) {
+                return Err("Probability must be between 0 and 100".to_string());
             }
-            Ok((DefOption::Probability(chance), rest))
+            Ok((DefOption::Probability(chance / 100.0), rest))
         }
         'w' => {
             // -w"world"
@@ -320,9 +366,14 @@ fn parse_option_char(input: &str) -> Result<(DefOption, &str), String> {
             let pattern = parts.next()
                 .map(|p| p.trim_start().to_string())
                 .filter(|p| !p.is_empty());
-            let event = TfHookEvent::parse(event_str)
-                .ok_or_else(|| format!("Unknown hook event: {}", event_str))?;
-            Ok((DefOption::Hook(event, pattern), rest))
+            // "<Event> may be a single event name or a list separated by '|'"
+            let mut events = Vec::new();
+            for name in event_str.split('|') {
+                let event = TfHookEvent::parse(name)
+                    .ok_or_else(|| format!("Unknown hook event: {}", name))?;
+                events.push(event);
+            }
+            Ok((DefOption::Hook(events, pattern), rest))
         }
         'b' => {
             // -b"keys" - a literal character sequence, normalised through the
@@ -411,93 +462,16 @@ fn parse_word(input: &str) -> (String, &str) {
     (input[..end].to_string(), &input[end..])
 }
 
-/// Parse %{hiliteattr} variable value into TfAttributes.
-/// Default is "B" (bold). Supports TF single-letter codes like "B", "Cred", etc.
+/// Parse %{hiliteattr} into attributes ("B", bold, when it doesn't parse).
 pub fn parse_hiliteattr(hiliteattr: &str) -> super::TfAttributes {
-    match parse_attributes(hiliteattr) {
-        Ok(mut attrs) => {
-            // If no explicit hilite/bold/underline was set, default to hilite marker
-            if attrs.hilite.is_none() && !attrs.bold && !attrs.underline {
-                attrs.hilite = Some("hilite".to_string());
-            }
-            attrs
-        }
-        Err(_) => {
-            // Fallback to default bold hilite
-            super::TfAttributes {
-                hilite: Some("hilite".to_string()),
-                ..Default::default()
-            }
-        }
-    }
+    super::TfAttributes::parse(hiliteattr)
+        .unwrap_or_else(|_| super::TfAttributes { bold: true, ..Default::default() })
 }
 
-/// Parse attribute string (e.g., "gag,bold,hilite:red")
+/// Parse an attribute list (TF's letters, or Clay's older long names) - see
+/// `super::attrs`.
 fn parse_attributes(attrs: &str) -> Result<TfAttributes, String> {
-    let mut result = TfAttributes::default();
-
-    for attr in attrs.split(',') {
-        let attr = attr.trim();
-
-        if attr.is_empty() {
-            continue;
-        }
-
-        // Check for long-form names first (case-insensitive)
-        let lower = attr.to_lowercase();
-        if let Some(color) = lower.strip_prefix("hilite:") {
-            result.hilite = Some(color.to_string());
-            continue;
-        }
-        match lower.as_str() {
-            "gag" => { result.gag = true; continue; }
-            "norecord" | "nohistory" => { result.norecord = true; continue; }
-            "nolog" => { continue; } // Accepted but not tracked
-            "noactivity" => { continue; } // Accepted but not tracked
-            "bold" => { result.bold = true; continue; }
-            "underline" => { result.underline = true; continue; }
-            "reverse" => { result.reverse = true; continue; }
-            "flash" => { result.flash = true; continue; }
-            "dim" => { result.dim = true; continue; }
-            "bell" => { result.bell = true; continue; }
-            _ => {}
-        }
-
-        // Parse TF single-letter attribute codes: g, G, L, A, u, r, B, b, h, n, x, C, E, W, d, f
-        // Multiple codes can be concatenated (e.g., "gB" = gag + bold)
-        let chars: Vec<char> = attr.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            match chars[i] {
-                'n' => {} // normal/none - reset (we just don't set anything)
-                'x' => {} // exclusive - accepted but not tracked separately
-                'g' => result.gag = true,
-                'G' => result.norecord = true, // nohistory
-                'L' => {} // nolog - accepted but not tracked
-                'A' => {} // noactivity - accepted but not tracked
-                'u' => result.underline = true,
-                'r' => result.reverse = true,
-                'B' => result.bold = true,
-                'b' => result.bell = true,
-                'h' => result.hilite = Some("hilite".to_string()),
-                'd' | 'f' => {} // dim/flash - accepted for compat
-                'E' | 'W' => {} // error/warning attrs - accepted but not tracked
-                'C' => {
-                    // Color: "Cname" or "Cbgname" - consume rest as color
-                    let color: String = chars[i+1..].iter().collect();
-                    if !color.is_empty() {
-                        result.hilite = Some(color);
-                    }
-                    i = chars.len(); // consumed all remaining
-                    continue;
-                }
-                _ => return Err(format!("Unknown attribute: {}", attr)),
-            }
-            i += 1;
-        }
-    }
-
-    Ok(result)
+    TfAttributes::parse(attrs)
 }
 
 /// Compile a trigger pattern into a regex. `pub(crate)`: also used by
@@ -634,14 +608,22 @@ fn glob_to_regex_chars(chars: &[char]) -> String {
 /// context - a `-T`-restricted macro never matches: this is the documented safe default for
 /// a pattern (like TF's own `-T{tiny|tiny.*}`) that doesn't match any of Clay's own world
 /// types, generalised to "can't be verified, so don't fire". See finding C.1/C.9.
-pub fn world_type_matches(macro_def: &TfMacro, current_type: Option<&str>) -> bool {
+pub fn world_type_matches(macro_def: &TfMacro, types: Option<(&str, &str)>) -> bool {
     let Some(ref pattern) = macro_def.world_type else { return true; };
-    let Some(current_type) = current_type else { return false; };
+    let Some((tf_type, clay_type)) = types else { return false; };
     let mode = macro_def.trigger.as_ref().map(|t| t.match_mode).unwrap_or_default();
-    match compile_pattern(pattern, mode) {
-        Ok(Some(re)) => re.is_match(current_type),
-        _ => false,
-    }
+    // A type is matched whole, as TF matches it - so stdlib.tf's `-T{}` means "untyped"
+    // and `-T{tiny|tiny.*}` doesn't match "notiny" (a regexp is a regexp: unanchored).
+    let re = match mode {
+        TfMatchMode::Regexp => compile_pattern(pattern, mode),
+        _ => compile_pattern(pattern, mode).map(|re| re.and_then(|re| Regex::new(&format!("^(?:{})$", re.as_str())).ok())),
+    };
+    let Ok(Some(re)) = re else { return false };
+    // TF's own type (`/addworld -T`), else Clay's name for the type - "mud" for either
+    // kind of MUD world, so `-Tmud` keeps working on a timed-prompt one.
+    re.is_match(tf_type)
+        || re.is_match(clay_type)
+        || (clay_type == "mud_timed_prompt" && re.is_match("mud"))
 }
 
 /// Match a line against a trigger and return captures if matched
@@ -679,7 +661,15 @@ pub fn match_trigger<'a>(trigger: &TfTrigger, line: &'a str) -> Option<TriggerMa
 /// This handles cases like:
 ///   /if (cond) cmd1%;/else cmd2%;/endif
 /// Which should be treated as ONE control flow block, not split by %;
+#[cfg(test)]
 fn split_body_preserving_control_flow(body: &str) -> Vec<String> {
+    split_body_list(body).into_iter().map(|(cmd, _)| cmd).collect()
+}
+
+/// `split_body_preserving_control_flow`, with each command's "piped into the next one"
+/// flag - TF's `%|` (see `control_flow::split_list`). A pipe inside a control-flow block
+/// stays part of that block's text.
+pub(crate) fn split_body_list(body: &str) -> Vec<(String, bool)> {
     let mut result = Vec::new();
     let mut current = String::new();
     let mut control_depth = 0;  // Track nesting of /if//while//for blocks
@@ -693,9 +683,10 @@ fn split_body_preserving_control_flow(body: &str) -> Vec<String> {
     // relying on the idiom: lib_self.tf's own %%;-based quine, and
     // tick.tf's /repeat bodies (e.g. "/set _tick_pid1=0%%;/tick_warn" must
     // stay one piece, passed whole to /repeat, not split at the %%;).
-    let parts = control_flow::split_percent_semi(body);
+    let parts = control_flow::split_list(body);
 
-    for part in &parts {
+    for (part, piped) in &parts {
+        let piped = *piped;
         let trimmed = part.trim();
         if trimmed.is_empty() {
             continue;
@@ -711,7 +702,7 @@ fn split_body_preserving_control_flow(body: &str) -> Vec<String> {
                 current = trimmed.to_string();
             } else {
                 // Regular command, add directly
-                result.push(trimmed.to_string());
+                result.push((trimmed.to_string(), piped));
             }
         } else {
             // Inside a control flow block
@@ -726,14 +717,14 @@ fn split_body_preserving_control_flow(body: &str) -> Vec<String> {
             if control_depth <= 0 {
                 control_depth = 0;
                 // End of control flow block, emit it
-                result.push(std::mem::take(&mut current));
+                result.push((std::mem::take(&mut current), piped));
             }
         }
     }
 
     // If there's remaining content (unclosed control flow), add it anyway
     if !current.is_empty() {
-        result.push(current);
+        result.push((current, false));
     }
 
     result
@@ -800,6 +791,19 @@ pub fn execute_macro(
     execute_macro_with_context(engine, macro_def, args, trigger_match, false)
 }
 
+/// `execute_macro` for a call with argument text as written (`/name a   b`, a trigger's
+/// line, a hook's argument): `%*` and `%-N` keep its spacing - TF's own rule (`/f a   b`
+/// gives `%*` = "a   b", verified against real tf).
+pub fn execute_macro_with_raw(
+    engine: &mut TfEngine,
+    macro_def: &TfMacro,
+    raw_args: &str,
+    trigger_match: Option<&TriggerMatch>,
+) -> Vec<TfCommandResult> {
+    let words: Vec<&str> = raw_args.split_whitespace().collect();
+    run_macro(engine, macro_def, &words, Some(raw_args.trim()), trigger_match, false)
+}
+
 /// Execute a macro, distinguishing whether it was called as a command
 /// (`called_as_function = false`) or as a function (`name(args)` inside an
 /// expression; `called_as_function = true`). The only behavioural
@@ -817,6 +821,17 @@ pub fn execute_macro_with_context(
     trigger_match: Option<&TriggerMatch>,
     called_as_function: bool,
 ) -> Vec<TfCommandResult> {
+    run_macro(engine, macro_def, args, None, trigger_match, called_as_function)
+}
+
+fn run_macro(
+    engine: &mut TfEngine,
+    macro_def: &TfMacro,
+    args: &[&str],
+    raw_args: Option<&str>,
+    trigger_match: Option<&TriggerMatch>,
+    called_as_function: bool,
+) -> Vec<TfCommandResult> {
     let mut results = Vec::new();
 
     // Check condition if present
@@ -828,7 +843,7 @@ pub fn execute_macro_with_context(
                 }
             }
             Err(e) => {
-                results.push(TfCommandResult::Error(format!("Condition error: {}", e)));
+                engine.emit(super::effects::TfEffect::error(format!("Condition error: {}", e)));
                 return results;
             }
         }
@@ -847,7 +862,7 @@ pub fn execute_macro_with_context(
     // count as a stack frame), before the scope push below so a rejected
     // call leaves the depth counter untouched.
     if engine.macro_call_depth >= MAX_MACRO_RECURSION {
-        results.push(TfCommandResult::Error(format!(
+        engine.emit(super::effects::TfEffect::error(format!(
             "{}: recursion count exceeded max_recur ({})",
             macro_def.name, MAX_MACRO_RECURSION
         )));
@@ -857,14 +872,16 @@ pub fn execute_macro_with_context(
 
     // Push a local scope for macro execution
     engine.push_scope();
+    engine.tfout_closed.push(false);
 
     // Set positional parameters
     for (i, arg) in args.iter().enumerate() {
         engine.set_local(&format!("{}", i + 1), TfValue::String(arg.to_string()));
     }
 
-    // Set special variables
-    engine.set_local("*", TfValue::String(args.join(" ")));
+    // Set special variables - %* is the argument text as written when we have it
+    let all_args = raw_args.map(str::to_string).unwrap_or_else(|| args.join(" "));
+    engine.set_local("*", TfValue::String(all_args));
     engine.set_local("#", TfValue::Integer(args.len() as i64));
     // %0 - "the name of the executing macro" (`/help substitution`),
     // verified directly against real tf. at.tf's own usage message
@@ -892,12 +909,21 @@ pub fn execute_macro_with_context(
     }
 
     // Split body into execution units, preserving control flow blocks as units
-    let commands = split_body_preserving_control_flow(&body);
+    let commands = split_body_list(&body);
+    let mut pipe = Pipe::default();
+    let count = commands.len();
 
-    for cmd in commands {
+    for (i, (cmd, pipes_out)) in commands.into_iter().enumerate() {
         let cmd = cmd.trim();
         if cmd.is_empty() {
             continue;
+        }
+        // %mecho: each command as the body has it, before it is expanded, as TF echoes it
+        // ("++ /foo: /echo hi%; ").
+        if let Some(prefix) = engine.mecho_prefix(!macro_def.invisible) {
+            let name = if macro_def.name.is_empty() { format!("#{}", macro_def.sequence_number) } else { macro_def.name.clone() };
+            let more = if i + 1 < count { "%; " } else { "" };
+            engine.emit_output(format!("{} /{}: {}{}", prefix, name, cmd, more));
         }
 
         // Check if this is a control flow block - if so, don't substitute here.
@@ -914,11 +940,7 @@ pub fn execute_macro_with_context(
         // `/def loopmac = /for i 1 3 /echo n=%i` then `/loopmac` requires
         // "%i" to reach /for's own substitution unresolved, not be
         // pre-emptied here to "" before the loop variable ever exists.
-        let lower = cmd.to_lowercase();
-        let is_control_flow = lower.starts_with("/while ") || lower.starts_with("/while\n")
-            || lower.starts_with("/for ") || lower.starts_with("/for\n")
-            || lower.starts_with("/if ") || lower.starts_with("/if\n")
-            || lower.starts_with("/if(");
+        let is_control_flow = starts_control_flow(cmd);
 
         let cmd = if is_control_flow {
             // Pass control flow blocks directly without substitution
@@ -934,10 +956,20 @@ pub fn execute_macro_with_context(
         // Execute the command (already substituted above)
         // / prefixed commands are routed through the TF engine,
         // which returns ClayCommand for Clay-specific commands like /notify
+        pipe.begin(engine, pipes_out);
         let result = if cmd.starts_with('/') {
             super::parser::execute_command_substituted(engine, cmd)
         } else {
             TfCommandResult::SendToMud(cmd.to_string())
+        };
+
+        // Everything the command did is emitted now, in order (see `super::effects`);
+        // only a control result (/return, /result, /break, /exit) comes back to act on.
+        let control = engine.emit_result(result);
+        pipe.end(engine);
+        let result = match control {
+            None => continue,
+            Some(control) => control,
         };
 
         // Check for /return - stop executing body, set %? to return value.
@@ -954,12 +986,8 @@ pub fn execute_macro_with_context(
         if let TfCommandResult::Result(ref val) = result {
             let val_str = val.clone();
             engine.set_global("?", TfValue::from(val_str.as_str()));
-            if !called_as_function {
-                results.push(TfCommandResult::Success(if val_str.is_empty() {
-                    None
-                } else {
-                    Some(val_str)
-                }));
+            if !called_as_function && !val_str.is_empty() {
+                engine.emit_output(val_str);
             }
             break;
         }
@@ -986,21 +1014,166 @@ pub fn execute_macro_with_context(
             results.push(result);
             break;
         }
-
-        results.push(result);
     }
 
     // Pop the local scope
     engine.pop_scope();
+    engine.tfout_closed.pop();
     engine.macro_call_depth -= 1;
 
     results
 }
 
+/// A command that opens a /while, /for or /if block - substituted by the block's own
+/// pass, not up front.
+fn starts_control_flow(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    lower.starts_with("/while ") || lower.starts_with("/while\n")
+        || lower.starts_with("/for ") || lower.starts_with("/for\n")
+        || lower.starts_with("/if ") || lower.starts_with("/if\n")
+        || lower.starts_with("/if(")
+}
+
+/// TF's `%|` between two commands of a list (`/help pipes`): the output of a command
+/// piped into the next one becomes that command's tfin, which it reads with `tfread()`.
+#[derive(Default)]
+struct Pipe {
+    /// What the previous command wrote, for the next one to read.
+    input: Option<Vec<String>>,
+    reading: bool,
+    capturing: bool,
+}
+
+impl Pipe {
+    /// Before a command runs: give it the piped input, if any, and capture its output if
+    /// it pipes into the next command.
+    fn begin(&mut self, engine: &mut TfEngine, pipes_out: bool) {
+        self.reading = false;
+        if let Some(lines) = self.input.take() {
+            engine.tfin.push(lines.into());
+            self.reading = true;
+        }
+        self.capturing = pipes_out;
+        if pipes_out {
+            engine.begin_frame();
+        }
+    }
+
+    /// After it ran: its captured output is the next command's input; everything else
+    /// it did happens as usual.
+    fn end(&mut self, engine: &mut TfEngine) {
+        if self.capturing {
+            let frame = engine.end_frame();
+            let (output, rest) = super::effects::split_output(frame);
+            for effect in rest {
+                engine.emit(effect);
+            }
+            self.input = Some(output.iter().flat_map(|t| t.split('\n')).map(str::to_string).collect());
+            self.capturing = false;
+        }
+        if self.reading {
+            engine.tfin.pop();
+            self.reading = false;
+        }
+    }
+}
+
+/// Run `text` as a list of commands in the current scope - `/eval`'s text, which TF
+/// evaluates "as a macro body": split at `%;` and `%|` (with pipes), each command
+/// substituted when it runs (when `substitute`), a control-flow block left for its own
+/// per-iteration pass - exactly as `execute_macro`'s loop does, minus the new scope.
+/// Returns a control result, if one stopped the list.
+pub(crate) fn run_list(engine: &mut TfEngine, text: &str, substitute: bool) -> TfCommandResult {
+    let mut pipe = Pipe::default();
+    for (cmd, pipes_out) in split_body_list(text) {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            continue;
+        }
+        let substituted;
+        let cmd = if substitute && !starts_control_flow(cmd) {
+            substituted = variables::substitute_commands(engine, cmd);
+            substituted.trim()
+        } else {
+            cmd
+        };
+        pipe.begin(engine, pipes_out);
+        let result = if cmd.starts_with('/') {
+            super::parser::execute_command_substituted(engine, cmd)
+        } else {
+            TfCommandResult::SendToMud(cmd.to_string())
+        };
+        let control = engine.emit_result(result);
+        pipe.end(engine);
+        if let Some(control) = control {
+            return control;
+        }
+    }
+    TfCommandResult::Success(None)
+}
+
 /// Find and execute all macros that match a line
 pub fn process_triggers(engine: &mut TfEngine, line: &str, world: Option<&str>, world_type: Option<&str>) -> Vec<TfCommandResult> {
+    process_triggers_outcome(engine, line, world, world_type).results
+}
+
+/// What the triggers that fired on a line did to it.
+#[derive(Debug, Default)]
+pub struct TriggerOutcome {
+    /// What their bodies did.
+    pub results: Vec<TfCommandResult>,
+    /// Their attributes, combined in the order they fired (TF: an "x" one drops the
+    /// display attributes before it): gag, bell, nolog, ... and what to show the line in.
+    pub attrs: TfAttributes,
+    /// `-P` parts: (start, end) in characters of the line, and their attributes.
+    pub partials: Vec<(usize, usize, TfAttributes)>,
+    /// A macro without -q fired (what BGTRIG and /trigger count).
+    pub fired_non_quiet: bool,
+}
+
+/// The parts of `line` a fired macro's -P covers: each match's groups (0 = the whole
+/// match), or the text left/right of the first match.
+fn partial_ranges(macro_def: &TfMacro, line: &str) -> Vec<(usize, usize, TfAttributes)> {
+    let Some(regex) = macro_def.trigger.as_ref().and_then(|t| t.compiled.as_ref()) else { return Vec::new() };
+    let to_char = |byte: usize| line[..byte].chars().count();
+    let mut out = Vec::new();
+    let matches: Vec<regex::Captures> = regex.captures_iter(line).collect();
+    for spec in &macro_def.partials {
+        match spec.part {
+            super::PartialPart::Group(n) => {
+                for caps in &matches {
+                    if let Some(m) = caps.get(n) {
+                        out.push((to_char(m.start()), to_char(m.end()), spec.attrs.clone()));
+                    }
+                }
+            }
+            super::PartialPart::Left => {
+                if let Some(m) = matches.first().and_then(|c| c.get(0)) {
+                    out.push((0, to_char(m.start()), spec.attrs.clone()));
+                }
+            }
+            super::PartialPart::Right => {
+                if let Some(m) = matches.first().and_then(|c| c.get(0)) {
+                    out.push((to_char(m.end()), line.chars().count(), spec.attrs.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Run the triggers on a line, TF's way: in priority order, every match firing until a
+/// non-fall-through one has; %borg off runs no bodies (attributes still apply), %gag off
+/// drops gag attributes, %hilite off drops the display ones.
+pub fn process_triggers_outcome(engine: &mut TfEngine, line: &str, world: Option<&str>, world_type: Option<&str>) -> TriggerOutcome {
+    let flag = |engine: &TfEngine, name: &str| engine.get_var(name).is_none_or(super::special_vars::flag_is_on);
+    let (gag_on, hilite_on, borg_on) = (flag(engine, "gag"), flag(engine, "hilite"), flag(engine, "borg"));
+    let mut outcome = TriggerOutcome::default();
     let mut results = Vec::new();
     let mut macros_to_remove = Vec::new();
+    // -T matches TF's type for the world (`/addworld -T`) or Clay's name for it.
+    let tf_type = engine.world_types(world).map(|(t, _)| t).unwrap_or_default();
+    let types = world_type.map(|clay| (tf_type.as_str(), clay));
 
     // Sort macros by priority (higher first)
     let mut macro_indices: Vec<usize> = (0..engine.macros.len()).collect();
@@ -1021,7 +1194,7 @@ pub fn process_triggers(engine: &mut TfEngine, line: &str, world: Option<&str>, 
         }
 
         // Check world-type restriction (-T)
-        if !world_type_matches(macro_def, world_type) {
+        if !world_type_matches(macro_def, types) {
             continue;
         }
 
@@ -1061,9 +1234,22 @@ pub fn process_triggers(engine: &mut TfEngine, line: &str, world: Option<&str>, 
             // every trigger macro's %1../%* empty - surfaced by `/trigger`'s finding
             // B rewrite, which is the first thing in this corpus to exercise a
             // trigger macro's plain %1 rather than only %Pn regexp captures).
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let exec_results = execute_macro(engine, &macro_clone, &words, Some(&trigger_match));
-            results.extend(exec_results);
+            let mut attrs = macro_clone.attributes.clone();
+            if !gag_on {
+                attrs.gag = false;
+            }
+            if hilite_on {
+                outcome.partials.extend(partial_ranges(&macro_clone, line));
+            } else {
+                attrs = TfAttributes { gag: attrs.gag, norecord: attrs.norecord, nolog: attrs.nolog,
+                    noactivity: attrs.noactivity, bell: attrs.bell, ..Default::default() };
+            }
+            outcome.attrs.merge(&attrs);
+            outcome.fired_non_quiet |= !macro_clone.quiet;
+            if borg_on {
+                let exec_results = execute_macro_with_raw(engine, &macro_clone, line, Some(&trigger_match));
+                results.extend(exec_results);
+            }
 
             // Decrement shots if one-shot/n-shot. Compare by sequence_number, not name -
             // a nameless macro (P1.2) has name == "", and more than one can coexist, so
@@ -1090,7 +1276,8 @@ pub fn process_triggers(engine: &mut TfEngine, line: &str, world: Option<&str>, 
         engine.macros.remove(idx);
     }
 
-    results
+    outcome.results = results;
+    outcome
 }
 
 // =============================================================================
@@ -1182,9 +1369,9 @@ impl HookFilter {
         match self {
             HookFilter::NoHook => macro_def.hook.is_none(),
             HookFilter::AnyHook => macro_def.hook.is_some(),
-            HookFilter::Event(ev, None) => macro_def.hook == Some(*ev),
+            HookFilter::Event(ev, None) => macro_def.has_hook(*ev),
             HookFilter::Event(ev, Some(pat)) => {
-                macro_def.hook == Some(*ev) && macro_def.hook_pattern.as_deref() == Some(pat.as_str())
+                macro_def.has_hook(*ev) && macro_def.hook_pattern.as_deref() == Some(pat.as_str())
             }
         }
     }
@@ -1503,7 +1690,7 @@ impl MacroFilter {
             if macro_def.fall_through != want { return false; }
         }
         if let Some(want) = self.partial_hilite {
-            if macro_def.partial_hilite != want { return false; }
+            if macro_def.partials.is_empty() == want { return false; }
         }
         if let Some(want) = self.quiet {
             if macro_def.quiet != want { return false; }
@@ -1532,13 +1719,16 @@ impl MacroFilter {
 fn attrs_overlap(have: &TfAttributes, want: &TfAttributes) -> bool {
     (want.gag && have.gag)
         || (want.norecord && have.norecord)
+        || (want.nolog && have.nolog)
+        || (want.noactivity && have.noactivity)
+        || (want.exclusive && have.exclusive)
         || (want.bold && have.bold)
         || (want.underline && have.underline)
         || (want.reverse && have.reverse)
-        || (want.flash && have.flash)
-        || (want.dim && have.dim)
         || (want.bell && have.bell)
-        || (want.hilite.is_some() && have.hilite.is_some())
+        || (want.hilite && have.hilite)
+        || (want.fg.is_some() && have.fg.is_some())
+        || (want.bg.is_some() && have.bg.is_some())
 }
 
 /// Full-string match of `value` against `pattern` under a matching style, for
@@ -1594,12 +1784,9 @@ fn format_short(macro_def: &TfMacro) -> String {
     if attrs.underline { line.push_str("(underline) "); }
     if attrs.reverse { line.push_str("(reverse) "); }
     if attrs.bold { line.push_str("(bold) "); }
-    if let Some(ref color) = attrs.hilite {
-        if color == "hilite" {
-            line.push_str("(hilite) ");
-        } else {
-            line.push_str(&format!("({}) ", color));
-        }
+    if attrs.hilite { line.push_str("(hilite) "); }
+    if let Some(ref color) = attrs.fg {
+        line.push_str(&format!("({}) ", color));
     }
 
     if !macro_def.name.is_empty() {
@@ -1639,99 +1826,101 @@ pub(crate) fn format_macro_full(macro_def: &TfMacro) -> String {
 /// never had all of them - a macro with a keybinding or attributes used to
 /// silently lose them on a /save round-trip.
 pub(crate) fn format_def_line(macro_def: &TfMacro) -> String {
-    let mut output = String::from("/def ");
+    // Real tf's own /list (and /save) format, option for option - verified against tf
+    // 5.0b8: `/def -i -Fp7 -c50 -auB -n3 -w'foo' -mregexp -T'lp' -E'1' -t'^x' -q all1 =
+    // body1`. Priority shows only on a trigger or hook (where it means something), -m
+    // only with a pattern and no -P (which implies regexp), and option arguments are
+    // single-quoted with ' and \ escaped.
+    let m = macro_def;
+    let mut out = String::from("/def");
+    let trigger_pattern = m.trigger.as_ref().map(|t| t.pattern.as_str()).filter(|p| !p.is_empty());
+    let triggered = trigger_pattern.is_some() || m.hook.is_some();
 
-    // Show trigger if present (before name, like TF)
-    if let Some(ref trigger) = macro_def.trigger {
-        if !trigger.pattern.is_empty() {
-            output.push_str(&format!("-t\"{}\" ", trigger.pattern));
-            if trigger.match_mode != TfMatchMode::Glob {
-                output.push_str(&format!("-m{:?} ", trigger.match_mode).to_lowercase());
-            }
-        }
+    if m.invisible {
+        out.push_str(" -i");
     }
-
-    // Show other flags
-    if macro_def.priority != 0 {
-        output.push_str(&format!("-p{} ", macro_def.priority));
+    if triggered {
+        out.push_str(if m.fall_through { " -Fp" } else { " -p" });
+        out.push_str(&m.priority.to_string());
+    } else if m.fall_through {
+        out.push_str(" -F");
     }
-    if macro_def.fall_through {
-        output.push_str("-F ");
-    }
-    if let Some(n) = macro_def.one_shot {
-        if n == 1 {
-            output.push_str("-1 ");
-        } else {
-            output.push_str(&format!("-n{} ", n));
-        }
-    }
-    if let Some(hook) = macro_def.hook {
-        match &macro_def.hook_pattern {
-            Some(pat) => output.push_str(&format!("-h\"{} {}\" ", hook.name(), pat)),
-            None => output.push_str(&format!("-h{} ", hook.name())),
-        }
-    }
-    if let Some(ref wt) = macro_def.world_type {
-        output.push_str(&format!("-T\"{}\" ", wt));
-    }
-    if let Some(ref world) = macro_def.world {
-        output.push_str(&format!("-w\"{}\" ", world));
-    }
-    if let Some(ref cond) = macro_def.condition {
-        output.push_str(&format!("-E\"{}\" ", cond));
-    }
-    if let Some(prob) = macro_def.probability {
-        // Default is 1.0 (100%, `parse_option_char`'s own 0.0..=1.0 range) - only
-        // emit -c when the macro actually restricts it.
+    if let Some(prob) = m.probability {
         if prob < 1.0 {
-            output.push_str(&format!("-c{} ", prob));
+            out.push_str(" -c");
+            let percent = super::TfValue::Float((prob as f64 * 100.0 * 1000.0).round() / 1000.0).to_string_value();
+            out.push_str(percent.trim_end_matches('.'));
         }
     }
-
-    // Attributes (-a): long-form comma-joined names, all of which
-    // `parse_attributes` accepts back (see its own doc comment).
-    let attrs = &macro_def.attributes;
-    let mut attr_names: Vec<&str> = Vec::new();
-    if attrs.gag { attr_names.push("gag"); }
-    if attrs.norecord { attr_names.push("norecord"); }
-    if attrs.bold { attr_names.push("bold"); }
-    if attrs.underline { attr_names.push("underline"); }
-    if attrs.reverse { attr_names.push("reverse"); }
-    if attrs.flash { attr_names.push("flash"); }
-    if attrs.dim { attr_names.push("dim"); }
-    if attrs.bell { attr_names.push("bell"); }
-    let hilite_name = attrs.hilite.as_ref().map(|color| format!("hilite:{}", color));
-    if !attr_names.is_empty() || hilite_name.is_some() {
-        let mut joined = attr_names.join(",");
-        if let Some(h) = hilite_name {
-            if !joined.is_empty() {
-                joined.push(',');
-            }
-            joined.push_str(&h);
+    let attrs = m.attributes.canonical();
+    if !attrs.is_empty() {
+        out.push_str(" -a");
+        out.push_str(&attrs);
+    }
+    if !m.partials.is_empty() {
+        out.push_str(" -P");
+        out.push_str(&super::PartialSpec::format_list(&m.partials));
+    }
+    if let Some(n) = m.shots_remaining.or(m.one_shot) {
+        out.push_str(&format!(" -n{}", n));
+    }
+    if let Some(ref world) = m.world {
+        out.push_str(" -w");
+        out.push_str(&tf_quote(world));
+    }
+    if (trigger_pattern.is_some() || m.hook_pattern.is_some() || m.world_type.is_some()) && m.partials.is_empty() {
+        let mode = m.trigger.as_ref().map(|t| t.match_mode).unwrap_or_default();
+        out.push_str(" -m");
+        out.push_str(mode.name());
+    }
+    if let Some(ref wt) = m.world_type {
+        out.push_str(" -T");
+        out.push_str(&tf_quote(wt));
+    }
+    if let Some(ref cond) = m.condition {
+        out.push_str(" -E");
+        out.push_str(&tf_quote(cond));
+    }
+    if m.hook.is_some() {
+        let events: Vec<String> = m.hook_events().iter().map(|e| e.name()).collect();
+        let events = events.join("|");
+        out.push_str(" -h");
+        match m.hook_pattern {
+            Some(ref pat) => out.push_str(&tf_quote(&format!("{} {}", events, pat))),
+            None => out.push_str(&events),
         }
-        output.push_str(&format!("-a{} ", joined));
+    }
+    if let Some(ref keys) = m.keybinding {
+        out.push_str(" -b");
+        out.push_str(&tf_quote(keys));
+    }
+    if let Some(pattern) = trigger_pattern {
+        out.push_str(" -t");
+        out.push_str(&tf_quote(pattern));
+    }
+    if m.quiet {
+        out.push_str(" -q");
     }
 
-    if let Some(ref keys) = macro_def.keybinding {
-        output.push_str(&format!("-b\"{}\" ", keys));
+    // A nameless macro (addressed only by its #N) prints with nothing between its
+    // flags and "= body", so the line stays directly pasteable.
+    if !m.name.is_empty() {
+        out.push(' ');
+        out.push_str(&m.name);
     }
-    if macro_def.invisible {
-        output.push_str("-i ");
+    if m.body.is_empty() && !m.name.is_empty() {
+        // TF: a body-less macro lists as "/def name " - no "=".
+        out.push(' ');
+    } else {
+        out.push_str(" = ");
+        out.push_str(&m.body);
     }
-    if macro_def.quiet {
-        output.push_str("-q ");
-    }
+    out
+}
 
-    // A nameless macro (P1.2 - addressed only by its #N) prints with nothing between
-    // its flags and "= body", so the line stays an unambiguous, directly-pasteable
-    // "/def [opts] = body" rather than showing a misleading empty name token.
-    if !macro_def.name.is_empty() {
-        output.push_str(&macro_def.name);
-        output.push(' ');
-    }
-    output.push_str(&format!("= {}", macro_def.body));
-
-    output
+/// Single-quote an option argument the way TF's /list does: ' and \ escaped with \.
+fn tf_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 /// Format one macro the short way `/trigger -n` wants (`/help /trigger`:
@@ -1985,9 +2174,9 @@ mod tests {
         let result = parse_def("-p'maxpri' foo = bar").unwrap();
         assert_eq!(result.priority_expr.as_deref(), Some("maxpri"));
         // Not resolved yet - parse_def alone never touches `priority`
-        // itself for a deferred expression (still its struct default)
+        // itself for a deferred expression (still TF's default of 1)
         // until resolve_priority_expr runs.
-        assert_eq!(result.priority, TfMacro::default().priority);
+        assert_eq!(result.priority, 1);
     }
 
     #[test]
@@ -2126,13 +2315,77 @@ mod tests {
         assert_eq!(result.right, "!");
     }
 
+    /// /list (and /save) print each definition exactly as real tf 5.0b8 does - every
+    /// expected line below was copied from real tf's own /list output.
+    #[test]
+    fn test_list_format_matches_real_tf() {
+        let mut engine = TfEngine::new();
+        engine.execute("/addworld foo localhost 4000");
+        let cases = [
+            ("/def foo = bar", "/def foo = bar"),
+            ("/def -p5 five = f", "/def five = f"),
+            ("/def -t'hi*' trig = x", "/def -p1 -mglob -t'hi*' trig = x"),
+            ("/def -P1BCred -t'(a)(b)' part = p", "/def -p1 -P1BCred -t'(a)(b)' part = p"),
+            ("/def -h'CONNECT|DISCONNECT' both = /echo hooked %1", "/def -p1 -hCONNECT|DISCONNECT both = /echo hooked %1"),
+            ("/def -ah -t'q' hil", "/def -p1 -aB -mglob -t'q' hil "),
+            ("/def -1 -t'once' onemac = o", "/def -p1 -n1 -mglob -t'once' onemac = o"),
+            ("/def -h'SEND go*' -ag gsend = /echo s", "/def -p1 -ag -mglob -h'SEND go*' gsend = /echo s"),
+            ("/def -t\"it's\" quote2 = q", "/def -p1 -mglob -t'it\\'s' quote2 = q"),
+            ("/def -aCred,Cbggreen,u col = c", "/def -auCred,Cbggreen col = c"),
+            ("/def -i -F -c50 -n3 -p7 -q -Tlp -E'1' -aBu -mregexp -t'^x' all1 = body1",
+             "/def -i -Fp7 -c50 -auB -n3 -mregexp -T'lp' -E'1' -t'^x' -q all1 = body1"),
+            ("/def -p3 -F -t'ff' fallm = ff", "/def -Fp3 -mglob -t'ff' fallm = ff"),
+            ("/def -c25 -t'cc' chancem = cc", "/def -p1 -c25 -mglob -t'cc' chancem = cc"),
+        ];
+        for (def, listed) in cases {
+            let r = engine.execute(def);
+            assert!(matches!(r, TfCommandResult::Success(_)), "{def}: {r:?}");
+            let m = engine.macros.last().unwrap();
+            assert_eq!(format_def_line(m), listed, "for {def}");
+        }
+    }
+
+    /// -P names a part of the match; a part the trigger doesn't have is TF's error.
+    #[test]
+    fn test_partial_option_parses_and_validates() {
+        let m = parse_def("-t'(x)(y)' -P2u;1Cblue mp = m").unwrap();
+        assert_eq!(m.partials.len(), 2);
+        assert_eq!(m.partials[0].part, crate::tf::PartialPart::Group(2));
+        assert!(m.partials[0].attrs.underline);
+        assert_eq!(m.trigger.as_ref().unwrap().match_mode, TfMatchMode::Regexp, "-P implies regexp");
+        assert_eq!(parse_def("-t'z' -P2u bad = b").unwrap_err(), "-P2: trigger has only 0 subexpressions");
+        let lr = parse_def("-t'mid' -PLB;Ru lr = x").unwrap();
+        assert_eq!(lr.partials[0].part, crate::tf::PartialPart::Left);
+        assert_eq!(lr.partials[1].part, crate::tf::PartialPart::Right);
+    }
+
+    /// -h takes a '|' list of events; the macro fires for each.
+    #[test]
+    fn test_hook_event_list_fires_for_each_event() {
+        let mut engine = TfEngine::new();
+        engine.execute("/def -h'CONNECT|DISCONNECT' both = /echo hooked %1");
+        for event in [TfHookEvent::Connect, TfHookEvent::Disconnect] {
+            let outcome = super::super::hooks::fire_hook(&mut engine, event, "w");
+            assert!(outcome.matched_any, "{event:?}");
+        }
+        assert!(!super::super::hooks::fire_hook(&mut engine, TfHookEvent::Send, "w").matched_any);
+    }
+
+    /// -c is a percentage, as in TF.
+    #[test]
+    fn test_chance_is_a_percentage() {
+        let m = parse_def("-c25 -t'x' c = y").unwrap();
+        assert_eq!(m.probability, Some(0.25));
+        assert!(parse_def("-c150 -t'x' c = y").is_err());
+    }
+
     #[test]
     fn test_parse_attributes() {
         // Long-form names
         let attrs = parse_attributes("gag,bold,hilite:red").unwrap();
         assert!(attrs.gag);
         assert!(attrs.bold);
-        assert_eq!(attrs.hilite, Some("red".to_string()));
+        assert_eq!(attrs.fg, Some("red".to_string()));
         assert!(!attrs.underline);
 
         // TF single-letter codes
@@ -2149,7 +2402,7 @@ mod tests {
 
         // Color attribute
         let attrs = parse_attributes("Cred").unwrap();
-        assert_eq!(attrs.hilite, Some("red".to_string()));
+        assert_eq!(attrs.fg, Some("red".to_string()));
 
         // Mixed: single-letter with comma-separated long-form
         let attrs = parse_attributes("B,gag").unwrap();
@@ -2193,7 +2446,8 @@ mod tests {
         let output = list_macros(&engine, None, false);
         // Format: N: /def [opts] name = body
         assert!(output.contains("0: /def greet = say Hello!"));
-        assert!(output.contains("1: /def -t\"^You hit\" attack = kick"));
+        // TF's own format: priority and matching style on a trigger, single quotes
+        assert!(output.contains("1: /def -p0 -mglob -t'^You hit' attack = kick"), "{output}");
     }
 
     #[test]
@@ -2224,17 +2478,49 @@ mod tests {
         engine.add_macro(parse_def(r#"-Tmud -t"hello" greet = /echo matched"#).unwrap());
 
         // Wrong world type: the -T restriction must prevent the trigger from firing.
-        let results = process_triggers(&mut engine, "hello", None, Some("slack"));
-        assert!(results.is_empty(), "-Tmud macro must not fire for a slack world: {results:?}");
+        let _ = process_triggers(&mut engine, "hello", None, Some("slack"));
+        let effects = engine.take_effects();
+        assert!(effects.is_empty(), "-Tmud macro must not fire for a slack world: {effects:?}");
 
         // Matching world type: it must fire normally.
-        let results = process_triggers(&mut engine, "hello", None, Some("mud"));
-        assert!(!results.is_empty(), "-Tmud macro must fire for a mud world: {results:?}");
+        let _ = process_triggers(&mut engine, "hello", None, Some("mud"));
+        let effects = engine.take_effects();
+        assert!(!effects.is_empty(), "-Tmud macro must fire for a mud world: {effects:?}");
 
         // Unknown/unsupplied world type: the safe default is "don't fire" (see
         // world_type_matches's doc comment).
-        let results = process_triggers(&mut engine, "hello", None, None);
-        assert!(results.is_empty(), "-Tmud macro must not fire when the world type is unknown: {results:?}");
+        let _ = process_triggers(&mut engine, "hello", None, None);
+        let effects = engine.take_effects();
+        assert!(effects.is_empty(), "-Tmud macro must not fire when the world type is unknown: {effects:?}");
+    }
+
+    /// -T matches a world's TF type (`/addworld -T`) whole - stdlib.tf's `-T{}` is an
+    /// untyped world, `-T{tiny|tiny.*}` a tiny one - or, as before, Clay's name for it.
+    #[test]
+    fn test_world_type_matches_tf_type_or_clay_type() {
+        let mut engine = TfEngine::new();
+        for (name, tf_type) in [("Typed", "tiny.muck"), ("Plain", ""), ("Other", "notiny")] {
+            engine.world_info_cache.push(crate::tf::WorldInfoCache {
+                name: name.into(), world_type: "mud".into(), tf_type: tf_type.into(), ..Default::default()
+            });
+        }
+        engine.add_macro(parse_def(r#"-F -mglob -T"{tiny|tiny.*}" -t"ping" tinyonly = /echo tiny"#).unwrap());
+        engine.add_macro(parse_def(r#"-F -mglob -T"{}" -t"ping" untyped = /echo untyped"#).unwrap());
+        engine.add_macro(parse_def(r#"-F -mglob -Tmud -t"ping" mudonly = /echo mud"#).unwrap());
+        let fired = |engine: &mut TfEngine, world: &str| -> Vec<String> {
+            let _ = process_triggers(engine, "ping", Some(world), Some("mud"));
+            engine.take_effects().into_iter().filter_map(|e| match e {
+                crate::tf::effects::TfEffect::Output { text, .. } => Some(text),
+                _ => None,
+            }).collect()
+        };
+        let mut typed = fired(&mut engine, "Typed");
+        typed.sort();
+        assert_eq!(typed, vec!["mud", "tiny"]);
+        let mut plain = fired(&mut engine, "Plain");
+        plain.sort();
+        assert_eq!(plain, vec!["mud", "untyped"]);
+        assert_eq!(fired(&mut engine, "Other"), vec!["mud"], "-T{{tiny|tiny.*}} matches the whole type");
     }
 
     #[test]
@@ -2491,19 +2777,18 @@ mod split_tests {
             ..Default::default()
         };
 
-        let results = execute_macro(&mut engine, &macro_def, &[], None);
+        let _ = execute_macro(&mut engine, &macro_def, &[], None);
+        // No frame is open here, so what the macro did is in the engine's top-level queue.
+        let effects = engine.take_effects();
 
         // Should have some output
-        assert!(!results.is_empty(), "Should have some results");
+        assert!(!effects.is_empty(), "Should have some effects");
 
         // Check for the expected message (foobar3.14 - "3.14" = "foobar")
-        let has_foobar = results.iter().any(|r| {
-            match r {
-                super::TfCommandResult::Success(Some(msg)) => msg.contains("foobar"),
-                _ => false,
-            }
+        let has_foobar = effects.iter().any(|e| {
+            matches!(e, crate::tf::effects::TfEffect::Output { text, .. } if text.contains("foobar"))
         });
-        assert!(has_foobar, "Should output 'foobar', got: {:?}", results);
+        assert!(has_foobar, "Should output 'foobar', got: {:?}", effects);
     }
 
     #[test]

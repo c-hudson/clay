@@ -502,22 +502,9 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
             let start = x.saturating_sub(1).min(output_lines.len());
             (start, output_lines.len())
         }
-        RecallRange::TimePeriod(secs) => {
-            // Lines within the last `secs` seconds
-            let now = std::time::SystemTime::now();
-            let cutoff = now - std::time::Duration::from_secs_f64(*secs);
-            let start = output_lines.iter().position(|line| line.timestamp >= cutoff).unwrap_or(output_lines.len());
-            (start, output_lines.len())
-        }
-        RecallRange::TimeRange(start_secs, end_secs) => {
-            // Lines between two time periods
-            let now = std::time::SystemTime::now();
-            let start_time = now - std::time::Duration::from_secs_f64(*start_secs);
-            let end_time = now - std::time::Duration::from_secs_f64(*end_secs);
-            let start = output_lines.iter().position(|line| line.timestamp >= start_time).unwrap_or(output_lines.len());
-            let end = output_lines.iter().rposition(|line| line.timestamp <= end_time).map(|i| i + 1).unwrap_or(0);
-            (start, end.max(start))
-        }
+        // Time ranges are checked line by line (`time_window` below), not sliced: a line
+        // /recordline -t recorded carries its own time, out of order with its neighbours.
+        RecallRange::TimePeriod(_) | RecallRange::TimeRange(..) => (0, output_lines.len()),
     };
 
     // Every line that passes the source/gag filters, in buffer order - the pool -An/-Bn/-Cn
@@ -535,15 +522,38 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
 
     let mut eligible: Vec<EligibleLine> = Vec::new();
     let lines_to_check = &output_lines[start_idx..end_idx];
+    // /recall -a<attrs>: the display attributes to take off a line's own (`g`, showing
+    // gagged lines, is `show_gagged`).
+    let suppress = tf::TfAttributes::parse(&opts.suppress_attrs).ok().filter(|a| {
+        a.bold || a.underline || a.reverse || a.hilite || a.error || a.warning || a.fg.is_some() || a.bg.is_some()
+    });
+    let now = std::time::SystemTime::now();
+    let time_window = match &opts.range {
+        // Lines within the last `secs` seconds
+        RecallRange::TimePeriod(secs) => Some((now - std::time::Duration::from_secs_f64(*secs), now)),
+        // Lines between two time periods
+        RecallRange::TimeRange(start_secs, end_secs) => Some((
+            now - std::time::Duration::from_secs_f64(*start_secs),
+            now - std::time::Duration::from_secs_f64(*end_secs),
+        )),
+        _ => None,
+    };
 
     for (rel_idx, line) in lines_to_check.iter().enumerate() {
         let abs_idx = start_idx + rel_idx;
+        if let Some((from, to)) = time_window {
+            if line.timestamp < from || line.timestamp > to {
+                continue;
+            }
+        }
 
         // Skip gagged lines unless show_gagged is set. Captured user input carries
         // gagged:true purely as its invisibility mechanism (see OutputLine::is_input's doc
         // comment), NOT because an action gagged it - so -ag must not be required to
         // /recall it. The source match below is what decides whether input is in scope.
-        if line.gagged && !line.is_input && !opts.show_gagged {
+        // A line /recordline recorded is gagged the same way, purely to keep it off the
+        // screen - it belongs to the history it was recorded into.
+        if line.gagged && !line.is_input && line.hist.recorded.is_none() && !opts.show_gagged {
             continue;
         }
 
@@ -561,7 +571,8 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
             tf::RecallSource::Local => {
                 // -l: client-generated output (TF output, system messages) AND everything
                 // captured as input - both are from_server:false, so no extra check needed.
-                if line.from_server {
+                // A line /recordline -g recorded is in the global history only.
+                if line.from_server || line.hist.recorded == Some(crate::RecordScope::Global) {
                     continue;
                 }
             }
@@ -596,10 +607,16 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
             None => true, // No pattern = match all
         };
 
+        // -a<attrs> (besides g): TF shows the line without those of its own attributes.
+        let text = match (&suppress, &line.tf_attrs) {
+            (Some(suppress), Some(own)) => own.without(suppress).map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(line.text.as_str())),
+            _ => std::borrow::Cow::Borrowed(line.text.as_str()),
+        };
         let mut display_line = if show_tags {
-            line.text.clone()
+            text.into_owned()
         } else {
-            strip_mud_tag(&line.text)
+            strip_mud_tag(&text)
         };
 
         // Mark captured user input so it's visually distinguishable from world output

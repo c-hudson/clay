@@ -496,13 +496,15 @@ pub fn evaluate_condition(
         }
         let (piece_status, result) = execute_condition_command(engine, piece);
         status = piece_status;
-        let error = match &result {
-            TfCommandResult::Error(e) => Some(e.clone()),
-            _ => None,
-        };
-        side_effects.push(result);
-        if let Some(e) = error {
-            return Err(e);
+        if let TfCommandResult::Error(e) = &result {
+            if parse_break_marker(e).is_none() {
+                return Err(e.clone());
+            }
+        }
+        // What the condition's commands did happens now, in order; only a control
+        // result is handed back to the caller.
+        if let Some(control) = engine.emit_result(result) {
+            side_effects.push(control);
         }
     }
     Ok((status, side_effects))
@@ -591,6 +593,40 @@ fn execute_condition_command(engine: &mut TfEngine, piece: &str) -> (TfValue, Tf
 /// callers should route through the inline-block executors whenever this
 /// returns more than one piece, not just when a keyword happens to be found
 /// textually.
+/// `split_percent_semi`, but also splitting at TF's other list separator, "%|" (a
+/// pipe: the piece's output becomes the next piece's input - see `/help pipes`).
+/// Each piece comes with whether it is piped into the next one. The same escaping rule
+/// applies: "%%|" is a literal "%|", not a separator.
+pub(crate) fn split_list(text: &str) -> Vec<(String, bool)> {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '%' {
+            let mut run_len = 1;
+            while i + run_len < len && chars[i + run_len] == '%' {
+                run_len += 1;
+            }
+            if run_len == 1 && i + 1 < len && (chars[i + 1] == ';' || chars[i + 1] == '|') {
+                parts.push((std::mem::take(&mut current), chars[i + 1] == '|'));
+                i += 2;
+            } else {
+                for _ in 0..run_len {
+                    current.push('%');
+                }
+                i += run_len;
+            }
+        } else {
+            current.push(chars[i]);
+            i += 1;
+        }
+    }
+    parts.push((current, false));
+    parts
+}
+
 pub(crate) fn split_percent_semi(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -1004,6 +1040,12 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                                     let cmd = super::variables::substitute_commands(engine, &cmd);
                                     execute_body_line(engine, &cmd)
                                 };
+                                // Emit what the line did now; only a control result
+                                // (/return, /result, /break, /exit) is kept to act on.
+                                let result = match engine.emit_result(result) {
+                                    None => continue,
+                                    Some(control) => control,
+                                };
                                 // /return and /result stop the macro body that
                                 // contains this /if - don't run the rest of
                                 // this branch (matches the same early-stop
@@ -1292,6 +1334,12 @@ fn execute_while_loop(engine: &mut TfEngine, condition: &str, body: &[String]) -
             };
 
             let result = execute_body_line(engine, &line);
+            // Emit what the line did now; only a control result (/return, /result,
+            // /break, /exit) is kept to act on below.
+            let result = match engine.emit_result(result) {
+                None => continue,
+                Some(control) => control,
+            };
             // Check for break in nested execution
             if let TfCommandResult::Error(ref e) = result {
                 if let Some(remaining) = parse_break_marker(e) {
@@ -1493,6 +1541,12 @@ pub(crate) fn execute_for_loop(
             };
 
             let result = execute_body_line(engine, &line);
+            // Emit what the line did now; only a control result (/return, /result,
+            // /break, /exit) is kept to act on below.
+            let result = match engine.emit_result(result) {
+                None => continue,
+                Some(control) => control,
+            };
             if let TfCommandResult::Error(ref e) = result {
                 if let Some(remaining) = parse_break_marker(e) {
                     // Absorb one level here; a count >1 must keep unwinding
@@ -1732,7 +1786,12 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
                                                 super::variables::substitute_commands(engine, line)
                             };
 
-                            results.push(execute_body_line(engine, &line));
+                            let result = execute_body_line(engine, &line);
+                            if let Some(control) = engine.emit_result(result) {
+                                // /return, /result, /break or /exit ends this branch
+                                results.push(control);
+                                break;
+                            }
                         }
                     }
                     return results;
@@ -1766,7 +1825,12 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
                 super::variables::substitute_commands(engine, line)
             };
 
-            results.push(execute_body_line(engine, &line));
+            let result = execute_body_line(engine, &line);
+            if let Some(control) = engine.emit_result(result) {
+                // /return, /result, /break or /exit ends this branch
+                results.push(control);
+                break;
+            }
         }
     }
 
@@ -1848,6 +1912,12 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
             }
             let line = super::variables::substitute_commands(engine, line);
             let result = execute_body_line(engine, &line);
+            // Emit what the line did now; only a control result (/return, /result,
+            // /break, /exit) is kept to act on below.
+            let result = match engine.emit_result(result) {
+                None => continue,
+                Some(control) => control,
+            };
             // Check for break in nested execution
             if let TfCommandResult::Error(ref e) = result {
                 if let Some(remaining) = parse_break_marker(e) {
@@ -1974,6 +2044,12 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
             }
             let line = super::variables::substitute_commands(engine, line);
             let result = execute_body_line(engine, &line);
+            // Emit what the line did now; only a control result (/return, /result,
+            // /break, /exit) is kept to act on below.
+            let result = match engine.emit_result(result) {
+                None => continue,
+                Some(control) => control,
+            };
             if let TfCommandResult::Error(ref e) = result {
                 if let Some(remaining) = parse_break_marker(e) {
                     // Absorb one level here; a count >1 must keep unwinding
@@ -2410,23 +2486,29 @@ mod command_form_tests {
     /// branch must survive a later /return in that branch, not be
     /// silently discarded - real tf: at.tf's own usage-message branch is
     /// exactly "/echo ...%; /set ...%; /return 0", and the echo's text
-    /// must still reach the screen even though a /return follows it.
-    /// `aggregate_results_with_engine`'s Return/Result arm used to
-    /// `return r` outright, dropping every `Success(Some(...))` collected
-    /// earlier in the same aggregation; fixed by queueing that text into
-    /// `engine.pending_outputs` (the same side channel `echo()` uses)
-    /// before propagating the Return/Result marker.
+    /// must still reach the screen even though a /return follows it - and in order,
+    /// ahead of whatever the macro's caller does next (see `super::effects`).
     #[test]
     fn test_echo_before_return_in_same_if_branch_is_not_lost() {
         let mut engine = TfEngine::new();
         engine.execute("/def foo = /if (1) /echo hi%; /return 0%; /endif");
         let result = engine.execute("/foo");
-        // The direct return is Success(None) - the actual text went to
-        // pending_outputs, mirroring what a real command dispatch would
-        // drain (script_tests::run_script / builtins::load_lines /
-        // commands::process_pending_tf_outputs all do this).
-        assert!(matches!(result, TfCommandResult::Success(None)), "{:?}", result);
-        assert_eq!(engine.pending_outputs.len(), 1);
-        assert_eq!(engine.pending_outputs[0].text, "hi");
+        match result {
+            TfCommandResult::Success(Some(text)) => assert_eq!(text, "hi"),
+            other => panic!("Expected the echoed text, got {:?}", other),
+        }
+    }
+
+    /// Effects keep their order across /return: text echoed before a /return deep in
+    /// a block comes before text the caller echoes afterwards.
+    #[test]
+    fn test_effect_order_survives_return_in_nested_block() {
+        let mut engine = TfEngine::new();
+        engine.execute("/def inner = /echo a%; /if (1) /echo b%; /return 5%; /endif%; /echo never");
+        engine.execute("/def outer = /inner%; /echo c");
+        match engine.execute("/outer") {
+            TfCommandResult::Success(Some(text)) => assert_eq!(text, "a\nb\nc"),
+            other => panic!("Expected a, b, c in order, got {:?}", other),
+        }
     }
 }

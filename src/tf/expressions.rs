@@ -47,6 +47,8 @@ pub enum Token {
 
     // Assignment
     Assign,      // :=
+    /// `+=`, `-=`, `*=`, `/=`: `v op= n` is `v := v op (n)` (`/help expressions`)
+    CompoundAssign(BinaryOp),
 
     // Ternary
     Question,    // ?
@@ -196,6 +198,9 @@ impl Lexer {
                 if self.peek() == Some('+') {
                     self.advance();
                     Ok(Token::PlusPlus)
+                } else if self.peek() == Some('=') {
+                    self.advance();
+                    Ok(Token::CompoundAssign(BinaryOp::Add))
                 } else {
                     Ok(Token::Plus)
                 }
@@ -204,12 +209,29 @@ impl Lexer {
                 if self.peek() == Some('-') {
                     self.advance();
                     Ok(Token::MinusMinus)
+                } else if self.peek() == Some('=') {
+                    self.advance();
+                    Ok(Token::CompoundAssign(BinaryOp::Sub))
                 } else {
                     Ok(Token::Minus)
                 }
             }
-            '*' => Ok(Token::Star),
-            '/' => Ok(Token::Slash),
+            '*' => {
+                if self.peek() == Some('=') {
+                    self.advance();
+                    Ok(Token::CompoundAssign(BinaryOp::Mul))
+                } else {
+                    Ok(Token::Star)
+                }
+            }
+            '/' => {
+                if self.peek() == Some('=') {
+                    self.advance();
+                    Ok(Token::CompoundAssign(BinaryOp::Div))
+                } else {
+                    Ok(Token::Slash)
+                }
+            }
             '%' => Ok(Token::Percent),
             '=' => {
                 match self.peek() {
@@ -441,6 +463,17 @@ impl Parser {
 
     fn parse_assignment(&mut self) -> Result<Expr, String> {
         let expr = self.parse_ternary()?;
+
+        if let Token::CompoundAssign(op) = self.peek().clone() {
+            self.advance();
+            let value = self.parse_assignment()?;  // Right-associative
+            if let Expr::Variable(name) = expr {
+                let combined = Expr::BinaryOp(Box::new(Expr::Variable(name.clone())), op, Box::new(value));
+                return Ok(Expr::Assign(name, Box::new(combined)));
+            } else {
+                return Err("Left side of assignment must be a variable".to_string());
+            }
+        }
 
         if self.peek() == &Token::Assign {
             self.advance();
@@ -824,6 +857,15 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// A world's more state - paused, and the lines waiting - for morepaused() and
+    /// moresize(); None (or the current world) when it is unknown.
+    fn more_info(&self, world: Option<String>) -> Option<(bool, usize)> {
+        let name = world.or_else(|| self.engine.context_world_name())?;
+        self.engine.world_info_cache.iter()
+            .find(|w| w.name.eq_ignore_ascii_case(&name))
+            .map(|w| (w.paused, w.more_lines))
+    }
+
     /// Evaluate an expression and return the result
     pub fn eval(&mut self, expr: &Expr) -> Result<TfValue, String> {
         match expr {
@@ -842,9 +884,10 @@ impl<'a> Evaluator<'a> {
                 if let Some(value) = super::variables::resolve_extended_selector(self.engine, name) {
                     return Ok(TfValue::String(value));
                 }
-                // Return empty string for undefined variables (TF behavior)
+                // Return empty string for undefined variables (TF behavior); an
+                // enumerated special variable reads dual-valued (special_vars::expr_value).
                 Ok(self.engine.get_var(name)
-                    .cloned()
+                    .map(|v| super::special_vars::expr_value(name, v))
                     .unwrap_or_else(|| TfValue::String(String::new())))
             }
 
@@ -857,17 +900,13 @@ impl<'a> Evaluator<'a> {
                 match op {
                     UnaryOp::Not => Ok(TfValue::Integer(if val.to_bool() { 0 } else { 1 })),
                     UnaryOp::Neg => {
-                        match val {
-                            TfValue::Integer(n) => Ok(TfValue::Integer(-n)),
+                        // A string negates its number (`TfValue::tf_number`: "-3x" is -3,
+                        // "abc" is 0) - real tf never errors here.
+                        match val.tf_number() {
+                            TfValue::Integer(n) | TfValue::Enum(n, _) => Ok(TfValue::Integer(n.wrapping_neg())),
                             TfValue::Float(f) => Ok(TfValue::Float(-f)),
                             TfValue::String(s) => {
-                                if let Ok(n) = s.parse::<i64>() {
-                                    Ok(TfValue::Integer(-n))
-                                } else if let Ok(f) = s.parse::<f64>() {
-                                    Ok(TfValue::Float(-f))
-                                } else {
-                                    Err(format!("Cannot negate string: {}", s))
-                                }
+                                Err(format!("Cannot negate string: {}", s))
                             }
                         }
                     }
@@ -889,8 +928,9 @@ impl<'a> Evaluator<'a> {
                 // the innermost local scope. See
                 // `TfEngine::set_existing_or_global`'s doc comment.
                 let val = self.eval(value)?;
-                self.engine.set_existing_or_global(name, val.clone());
-                Ok(val)
+                self.engine.assign_existing_or_global(name, val.clone())?;
+                // The value of `:=` is what was stored (`more := 1` stores "on")
+                Ok(self.engine.get_var(name).map(|v| super::special_vars::expr_value(name, v)).unwrap_or(val))
             }
 
             Expr::PreIncrement(name) => {
@@ -898,7 +938,7 @@ impl<'a> Evaluator<'a> {
                     .cloned()
                     .unwrap_or(TfValue::Integer(0));
                 let new_val = match val {
-                    TfValue::Integer(n) => TfValue::Integer(n + 1),
+                    TfValue::Integer(n) | TfValue::Enum(n, _) => TfValue::Integer(n + 1),
                     TfValue::Float(f) => TfValue::Float(f + 1.0),
                     TfValue::String(s) => {
                         if let Ok(n) = s.parse::<i64>() {
@@ -910,7 +950,7 @@ impl<'a> Evaluator<'a> {
                 };
                 // ++/-- follow the same "update wherever it lives" rule as
                 // `:=` (finding 20).
-                self.engine.set_existing_or_global(name, new_val.clone());
+                self.engine.assign_existing_or_global(name, new_val.clone())?;
                 Ok(new_val)
             }
 
@@ -919,7 +959,7 @@ impl<'a> Evaluator<'a> {
                     .cloned()
                     .unwrap_or(TfValue::Integer(0));
                 let new_val = match val {
-                    TfValue::Integer(n) => TfValue::Integer(n - 1),
+                    TfValue::Integer(n) | TfValue::Enum(n, _) => TfValue::Integer(n - 1),
                     TfValue::Float(f) => TfValue::Float(f - 1.0),
                     TfValue::String(s) => {
                         if let Ok(n) = s.parse::<i64>() {
@@ -929,7 +969,7 @@ impl<'a> Evaluator<'a> {
                         }
                     }
                 };
-                self.engine.set_existing_or_global(name, new_val.clone());
+                self.engine.assign_existing_or_global(name, new_val.clone())?;
                 Ok(new_val)
             }
 
@@ -977,6 +1017,9 @@ impl<'a> Evaluator<'a> {
             Expr::MacroSub(name) => {
                 if let Some(value) = self.engine.get_var(name) {
                     Ok(value.clone())
+                } else if let Some(value) = super::variables::get_special_var(self.engine, name) {
+                    // ${world_name} and the rest of TF's built-in expansions
+                    Ok(TfValue::String(value))
                 } else if let Some(macro_def) = self.engine.macros.iter()
                     .find(|m| m.name == *name && m.trigger.is_none() && m.hook.is_none())
                 {
@@ -988,24 +1031,34 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// A function argument that names a variable (tfread()'s <variable>): a bare variable
+    /// reference names that variable rather than reading its value; anything else is
+    /// evaluated to the name.
+    fn lvalue_name(&mut self, expr: &Expr) -> Result<String, String> {
+        match expr {
+            Expr::Variable(name) => Ok(name.clone()),
+            other => Ok(self.eval(other)?.to_string_value()),
+        }
+    }
+
     fn eval_binary_op(&mut self, left: &Expr, op: &BinaryOp, right: &Expr) -> Result<TfValue, String> {
-        // Short-circuit for logical operators
+        // Short-circuit logical operators. Like C's, but the value is the last operand
+        // evaluated, not 0/1 (verified against real tf: `"abc" & "def"` is "abc",
+        // `"abc" | "def"` is "def", `1 & 2 & 3` is 3).
         if *op == BinaryOp::And {
             let left_val = self.eval(left)?;
             if !left_val.to_bool() {
-                return Ok(TfValue::Integer(0));
+                return Ok(left_val);
             }
-            let right_val = self.eval(right)?;
-            return Ok(TfValue::Integer(if right_val.to_bool() { 1 } else { 0 }));
+            return self.eval(right);
         }
 
         if *op == BinaryOp::Or {
             let left_val = self.eval(left)?;
             if left_val.to_bool() {
-                return Ok(TfValue::Integer(1));
+                return Ok(left_val);
             }
-            let right_val = self.eval(right)?;
-            return Ok(TfValue::Integer(if right_val.to_bool() { 1 } else { 0 }));
+            return self.eval(right);
         }
 
         let left_val = self.eval(left)?;
@@ -1027,19 +1080,18 @@ impl<'a> Evaluator<'a> {
             BinaryOp::Mul => self.eval_arithmetic(&left_val, &right_val, |a, b| a.wrapping_mul(b), |a, b| a * b),
             BinaryOp::Div => {
                 // Check for division by zero
-                let right_num = right_val.to_float().unwrap_or(0.0);
-                if right_num == 0.0 {
+                if right_val.tf_float() == 0.0 {
                     return Err("Division by zero".to_string());
                 }
                 self.eval_arithmetic(&left_val, &right_val, |a, b| a / b, |a, b| a / b)
             }
             BinaryOp::Mod => {
-                let left_int = left_val.to_int().unwrap_or(0);
-                let right_int = right_val.to_int().unwrap_or(1);
+                let left_int = left_val.tf_int();
+                let right_int = right_val.tf_int();
                 if right_int == 0 {
                     return Err("Modulo by zero".to_string());
                 }
-                Ok(TfValue::Integer(left_int % right_int))
+                Ok(TfValue::Integer(left_int.wrapping_rem(right_int)))
             }
 
             // Numeric comparison
@@ -1106,40 +1158,19 @@ impl<'a> Evaluator<'a> {
         F: Fn(i64, i64) -> i64,
         G: Fn(f64, f64) -> f64,
     {
-        // If either is a float, use float arithmetic
-        match (left, right) {
-            (TfValue::Float(a), TfValue::Float(b)) => Ok(TfValue::Float(float_op(*a, *b))),
-            (TfValue::Float(a), _) => {
-                let b = right.to_float().unwrap_or(0.0);
-                Ok(TfValue::Float(float_op(*a, b)))
-            }
-            (_, TfValue::Float(b)) => {
-                let a = left.to_float().unwrap_or(0.0);
-                Ok(TfValue::Float(float_op(a, *b)))
-            }
-            _ => {
-                let a = left.to_int().unwrap_or(0);
-                let b = right.to_int().unwrap_or(0);
-                Ok(TfValue::Integer(int_op(a, b)))
-            }
+        // Operands are read TF's way (`TfValue::tf_number`: "12abc" is 12, "abc" is 0);
+        // if either is a float, use float arithmetic.
+        match (left.tf_number(), right.tf_number()) {
+            (TfValue::Integer(a), TfValue::Integer(b)) => Ok(TfValue::Integer(int_op(a, b))),
+            (a, b) => Ok(TfValue::Float(float_op(a.tf_float(), b.tf_float()))),
         }
     }
 
+    /// `==`, `<` and friends compare numbers only (verified against real tf: `"abc" ==
+    /// "def"` is 1 - both read as 0 - and `"10" <= "9"` is 0). Strings compare with `=~`.
     fn compare_values(&self, left: &TfValue, right: &TfValue) -> i32 {
-        // Try numeric comparison first
-        match (left.to_float(), right.to_float()) {
-            (Some(a), Some(b)) => {
-                if a < b { -1 }
-                else if a > b { 1 }
-                else { 0 }
-            }
-            _ => {
-                // Fall back to string comparison
-                let a = left.to_string_value();
-                let b = right.to_string_value();
-                a.cmp(&b) as i32
-            }
-        }
+        let (a, b) = (left.tf_float(), right.tf_float());
+        if a < b { -1 } else if a > b { 1 } else { 0 }
     }
 
     fn glob_match(&mut self, text: &str, pattern: &str) -> bool {
@@ -1356,7 +1387,7 @@ impl<'a> Evaluator<'a> {
                 }
                 let val = self.eval(&args[0])?;
                 match val {
-                    TfValue::Integer(n) => Ok(TfValue::Integer(n.abs())),
+                    TfValue::Integer(n) | TfValue::Enum(n, _) => Ok(TfValue::Integer(n.abs())),
                     TfValue::Float(f) => Ok(TfValue::Float(f.abs())),
                     TfValue::String(s) => {
                         if let Ok(n) = s.parse::<i64>() {
@@ -1542,73 +1573,42 @@ impl<'a> Evaluator<'a> {
             }
 
             "addworld" => {
-                // addworld(name, type, [host, port [, char, pass [, file [, flags]]]])
-                // Minimum 1 argument (name), type is optional and ignored (defaults to MUD)
+                // addworld(name, type [, host, port [, char, pass [, file [, flags [, srchost]]]]])
+                // (`/help addworld`): an empty argument leaves that field as it is.
                 if args.is_empty() {
                     return Err("addworld requires at least 1 argument (name)".to_string());
                 }
-
-                let name = self.eval(&args[0])?.to_string_value();
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.eval(arg)?.to_string_value());
+                }
+                let name = values[0].clone();
                 if name.is_empty() {
                     return Err("addworld: name cannot be empty".to_string());
                 }
                 if name.contains(' ') {
-                    return Err("addworld: name cannot contain spaces".to_string());
+                    return Err(format!("addworld: illegal world name: {}", name));
                 }
-                if name.starts_with('(') {
-                    return Err("addworld: name cannot start with '('".to_string());
+                let field = |i: usize| values.get(i).filter(|v| !v.is_empty()).cloned();
+                // Flags: "x" SSL, "e" echo; "p" (no proxy), "f"/"0"/"n"/"1" (old forms) have
+                // nothing to do in Clay.
+                let flags = field(7).unwrap_or_default();
+                let op = super::PendingWorldOp {
+                    name,
+                    tf_type: field(1),
+                    host: field(2),
+                    port: field(3),
+                    user: field(4),
+                    password: field(5),
+                    file: field(6),
+                    use_ssl: flags.contains('x'),
+                    echo: flags.contains('e'),
+                    quiet: true,
+                };
+                match super::builtins::submit_world_op(self.engine, op) {
+                    super::TfCommandResult::Error(e) => Err(e),
+                    _ => Ok(TfValue::Integer(1)),
                 }
-
-                // Type is ignored (arg index 1) - we default to MUD
-                let host = if args.len() > 2 {
-                    let h = self.eval(&args[2])?.to_string_value();
-                    if h.is_empty() { None } else { Some(h) }
-                } else {
-                    None
-                };
-
-                let port = if args.len() > 3 {
-                    let p = self.eval(&args[3])?.to_string_value();
-                    if p.is_empty() { None } else { Some(p) }
-                } else {
-                    None
-                };
-
-                let user = if args.len() > 4 {
-                    let u = self.eval(&args[4])?.to_string_value();
-                    if u.is_empty() { None } else { Some(u) }
-                } else {
-                    None
-                };
-
-                let password = if args.len() > 5 {
-                    let p = self.eval(&args[5])?.to_string_value();
-                    if p.is_empty() { None } else { Some(p) }
-                } else {
-                    None
-                };
-
-                // file (arg 6) is ignored
-                // flags (arg 7) - check for 'x' (SSL)
-                let use_ssl = if args.len() > 7 {
-                    let flags = self.eval(&args[7])?.to_string_value();
-                    flags.contains('x')
-                } else {
-                    false
-                };
-
-                // Queue the world operation for the main app to process
-                self.engine.pending_world_ops.push(super::PendingWorldOp {
-                    name: name.clone(),
-                    host,
-                    port,
-                    user,
-                    password,
-                    use_ssl,
-                });
-
-                // Return 1 for success (TF convention)
-                Ok(TfValue::Integer(1))
             }
 
             // regmatch(pattern, string) - regex matching with capture groups
@@ -1975,7 +1975,10 @@ impl<'a> Evaluator<'a> {
                         self.engine.set_local(&i.to_string(), TfValue::String(String::new()));
                     }
                     self.engine.set_local("#", TfValue::Integer(new_argc as i64));
-                    self.engine.set_local("*", TfValue::String(tokens.join(" ")));
+                    // %* keeps the remaining argument text as written (TF)
+                    let raw = self.engine.get_var("*").map(|v| v.to_string_value()).unwrap_or_default();
+                    let rest = super::variables::skip_words(&raw, consumed).to_string();
+                    self.engine.set_local("*", TfValue::String(rest));
                 }
 
                 // Real tf prints an error message and returns 0 on a bad
@@ -1994,39 +1997,20 @@ impl<'a> Evaluator<'a> {
 
             // world_info(world, field) - get information about a world
             "world_info" => {
-                if args.len() != 2 {
-                    return Err("world_info requires 2 arguments (world, field)".to_string());
-                }
-                let world_name = self.eval(&args[0])?.to_string_value();
-                let field = self.eval(&args[1])?.to_string_value();
-
-                // Find world in cache
-                let world = self.engine.world_info_cache.iter()
-                    .find(|w| w.name.eq_ignore_ascii_case(&world_name));
-
-                match world {
-                    Some(w) => {
-                        let value = match field.to_lowercase().as_str() {
-                            "name" => TfValue::String(w.name.clone()),
-                            "host" => TfValue::String(w.host.clone()),
-                            "port" => TfValue::String(w.port.clone()),
-                            "character" | "char" => TfValue::String(w.user.clone()),
-                            "password" | "pass" => TfValue::String(w.password.clone()),
-                            "login" => TfValue::Integer(if w.is_connected { 1 } else { 0 }),
-                            "ssl" | "secure" => TfValue::Integer(if w.use_ssl { 1 } else { 0 }),
-                            // `/addworld ... [<file>]` (finding 31): engine memory only, keyed
-                            // by lower-cased world name, falling back to DEFAULT's own file
-                            // the same way character/password do (see variables.rs).
-                            "file" | "mfile" => {
-                                let own = self.engine.world_files.get(&w.name.to_lowercase()).cloned();
-                                TfValue::String(own.or_else(|| self.engine.default_world_file.clone()).unwrap_or_default())
-                            }
-                            _ => TfValue::String(String::new()),
-                        };
-                        Ok(value)
-                    }
-                    None => Ok(TfValue::String(String::new())),
-                }
+                // world_info() = the current world's name; world_info(field) = a field of
+                // the current world; world_info(world, field) (`/help world_info()`).
+                let (world, field) = match args.len() {
+                    0 => return Ok(TfValue::String(self.engine.context_world_name().unwrap_or_default())),
+                    1 => (None, self.eval(&args[0])?.to_string_value()),
+                    2 => (Some(self.eval(&args[0])?.to_string_value()), self.eval(&args[1])?.to_string_value()),
+                    _ => return Err("world_info takes at most 2 arguments (world, field)".to_string()),
+                };
+                let value = self.engine.world_field(world.as_deref(), &field).unwrap_or_default();
+                // login/ssl/proxy are flags; everything else is text
+                Ok(match field.to_lowercase().as_str() {
+                    "login" | "ssl" | "secure" | "proxy" => TfValue::Integer(if value == "1" { 1 } else { 0 }),
+                    _ => TfValue::String(value),
+                })
             }
 
             // ismacro(name) - check if a macro exists
@@ -2067,16 +2051,17 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Integer(0))
             }
 
-            // nlog() - lines in current log buffer (always 0 - we write directly)
+            // nlog() - the number of open log files (/help nlog): worlds being logged
             "nlog" => {
-                Ok(TfValue::Integer(0))
+                let open = self.engine.world_info_cache.iter().filter(|w| w.logging).count();
+                Ok(TfValue::Integer(open as i64))
             }
 
             // is_connected(world) - check if world is connected
             "is_connected" => {
                 if args.is_empty() {
-                    // Check current world
-                    let current = self.engine.current_world.clone().unwrap_or_default();
+                    // Check the current world (the running trigger's/hook's, else foreground)
+                    let current = self.engine.context_world_name().unwrap_or_default();
                     let connected = self.engine.world_info_cache.iter()
                         .find(|w| w.name == current)
                         .map(|w| w.is_connected)
@@ -2126,21 +2111,34 @@ impl<'a> Evaluator<'a> {
                 }
             }
 
-            // columns() - number of columns on screen
-            "columns" => {
-                // Return a reasonable default; actual terminal width not tracked in TfEngine
-                Ok(TfValue::Integer(80))
+            // limit() - 1 if a /limit is in effect (tfstatus.tf's @more uses it)
+            "limit" => {
+                if !args.is_empty() {
+                    return Err("limit requires 0 arguments".to_string());
+                }
+                Ok(TfValue::Integer(self.engine.screen.limit as i64))
             }
 
-            // lines() - number of lines on screen
-            "lines" => {
-                // Return a reasonable default; actual terminal height not tracked in TfEngine
-                Ok(TfValue::Integer(24))
-            }
+            // columns(), lines() - the screen's size (TfEngine::screen)
+            "columns" => Ok(TfValue::Integer(self.engine.screen.columns as i64)),
+            "lines" => Ok(TfValue::Integer(self.engine.screen.lines as i64)),
 
-            // moresize() - lines queued at more prompt (always 0 - handled by main app)
+            // moresize([flags [, world]]) - lines waiting below the output window of
+            // world (default: the current one). Clay's are the lines held at its more
+            // prompt, all of them new, so the flags ("n" new only, "l" matching the
+            // /limit, "a" with noactivity lines too) change nothing.
             "moresize" => {
-                Ok(TfValue::Integer(0))
+                if args.len() > 2 {
+                    return Err("moresize requires 0 to 2 arguments".to_string());
+                }
+                if let Some(flags) = args.first() {
+                    let _ = self.eval(flags)?;
+                }
+                let world = match args.get(1) {
+                    Some(arg) => Some(self.eval(arg)?.to_string_value()).filter(|s| !s.is_empty()),
+                    None => None,
+                };
+                Ok(TfValue::Integer(self.more_info(world).map_or(0, |(_, n)| n as i64)))
             }
 
             // morescroll(n) - scroll n lines at more prompt (returns 1 if scrolled, 0 otherwise)
@@ -2166,10 +2164,8 @@ impl<'a> Evaluator<'a> {
                 { Ok(TfValue::String("unix".to_string())) }
             }
 
-            // nmail() - mail files with unread mail (always 0 - not implemented)
-            "nmail" => {
-                Ok(TfValue::Integer(0))
-            }
+            // nmail() - the mail files with unread mail (App::check_tf_mail)
+            "nmail" => Ok(TfValue::Integer(self.engine.mail_count as i64)),
 
             // filename(s) - perform filename expansion
             "filename" => {
@@ -2179,18 +2175,7 @@ impl<'a> Evaluator<'a> {
                 let path = self.eval(&args[0])?.to_string_value();
                 // Expand ~ to home directory
                 let expanded = if path.starts_with('~') {
-                    if let Some(home) = std::env::var_os("HOME") {
-                        let home_str = home.to_string_lossy();
-                        if path == "~" {
-                            home_str.to_string()
-                        } else if let Some(rest) = path.strip_prefix("~/") {
-                            format!("{}/{}", home_str, rest)
-                        } else {
-                            path
-                        }
-                    } else {
-                        path
-                    }
+                    self.engine.expand_tilde(&path)
                 } else {
                     path
                 };
@@ -2239,12 +2224,8 @@ impl<'a> Evaluator<'a> {
                 let text = self.eval(&args[1])?.to_string_value();
 
                 // Expand ~ in filename
-                let expanded = if let Some(rest) = filename.strip_prefix("~/") {
-                    if let Some(home) = std::env::var_os("HOME") {
-                        format!("{}/{}", home.to_string_lossy(), rest)
-                    } else {
-                        filename
-                    }
+                let expanded = if filename.starts_with("~/") {
+                    self.engine.expand_tilde(&filename)
                 } else {
                     filename
                 };
@@ -2488,7 +2469,27 @@ impl<'a> Evaluator<'a> {
                 if args.len() != 1 {
                     return Err("tfclose requires 1 argument (handle)".to_string());
                 }
-                let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
+                let handle_value = self.eval(&args[0])?;
+                // tfout ("o"): closed for the rest of the current macro body (see
+                // TfEngine::tfout_closed); tfin ("i"): no further reads; tferr ("e") may
+                // not be closed.
+                match handle_value.to_string_value().as_str() {
+                    "o" => {
+                        if let Some(closed) = self.engine.tfout_closed.last_mut() {
+                            *closed = true;
+                        }
+                        return Ok(TfValue::Integer(1));
+                    }
+                    "i" => {
+                        if let Some(input) = self.engine.tfin.last_mut() {
+                            input.clear();
+                        }
+                        return Ok(TfValue::Integer(1));
+                    }
+                    "e" => return Ok(TfValue::Integer(-1)),
+                    _ => {}
+                }
+                let handle = handle_value.to_int().unwrap_or(-1) as i32;
 
                 if self.engine.open_files.remove(&handle).is_some() {
                     Ok(TfValue::Integer(1))
@@ -2499,26 +2500,41 @@ impl<'a> Evaluator<'a> {
 
             // tfread(handle, varname) - read a line into variable (returns 1 on success, 0 on EOF/error)
             "tfread" => {
-                if args.len() != 2 {
-                    return Err("tfread requires 2 arguments (handle, varname)".to_string());
+                // tfread(v) reads tfin; tfread(handle, v) reads a stream ("i" is tfin).
+                // Returns the line's length, or -1 when there is no line (`/help tfio`); a
+                // variable that doesn't exist yet is created globally, as if by /set.
+                let (handle_val, varname) = match args.len() {
+                    1 => (TfValue::String("i".to_string()), self.lvalue_name(&args[0])?),
+                    2 => (self.eval(&args[0])?, self.lvalue_name(&args[1])?),
+                    _ => return Err("tfread requires 1 or 2 arguments ([handle,] variable)".to_string()),
+                };
+                if handle_val.to_string_value() == "i" {
+                    let line = self.engine.tfin.last_mut().and_then(|q| q.pop_front());
+                    return Ok(match line {
+                        Some(line) => {
+                            let len = line.chars().count() as i64;
+                            self.engine.set_existing_or_global(&varname, TfValue::String(line));
+                            TfValue::Integer(len)
+                        }
+                        None => TfValue::Integer(-1),
+                    });
                 }
-                let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
-                let varname = self.eval(&args[1])?.to_string_value();
+                let handle = handle_val.to_int().unwrap_or(-1) as i32;
 
                 let file_handle = match self.engine.open_files.get_mut(&handle) {
                     Some(fh) if fh.mode == super::TfFileMode::Read => fh,
-                    _ => return Ok(TfValue::Integer(0)),
+                    _ => return Ok(TfValue::Integer(-1)),
                 };
 
                 // Use the stored file handle
                 let file = match file_handle.file.as_mut() {
                     Some(f) => f,
-                    None => return Ok(TfValue::Integer(0)),
+                    None => return Ok(TfValue::Integer(-1)),
                 };
 
                 use std::io::Seek;
                 if file.seek(std::io::SeekFrom::Start(file_handle.read_position)).is_err() {
-                    return Ok(TfValue::Integer(0));
+                    return Ok(TfValue::Integer(-1));
                 }
 
                 // Read one line using a temporary BufReader
@@ -2527,14 +2543,14 @@ impl<'a> Evaluator<'a> {
                     std::fs::File::open(&file_handle.path).unwrap()
                 }));
                 if buf_reader.seek(std::io::SeekFrom::Start(file_handle.read_position)).is_err() {
-                    return Ok(TfValue::Integer(0));
+                    return Ok(TfValue::Integer(-1));
                 }
 
                 let mut line = String::new();
                 match buf_reader.read_line(&mut line) {
                     Ok(0) => {
                         // EOF
-                        Ok(TfValue::Integer(0))
+                        Ok(TfValue::Integer(-1))
                     }
                     Ok(n) => {
                         // Update position
@@ -2548,37 +2564,43 @@ impl<'a> Evaluator<'a> {
                             }
                         }
 
-                        // Set the variable
-                        self.engine.set_global(&varname, TfValue::String(line));
-                        Ok(TfValue::Integer(1))
+                        let len = line.chars().count() as i64;
+                        self.engine.set_existing_or_global(&varname, TfValue::String(line));
+                        Ok(TfValue::Integer(len))
                     }
-                    Err(_) => Ok(TfValue::Integer(0)),
+                    Err(_) => Ok(TfValue::Integer(-1)),
                 }
             }
 
-            // tfwrite(handle, text) - write text to file (returns 1 on success, 0 on failure)
+            // tfwrite(s) writes tfout; tfwrite(handle, s) a stream ("o" tfout, "e" tferr) or
+            // an open file (returns 1 on success, -1 when the stream can't be written)
             "tfwrite" => {
-                if args.len() != 2 {
-                    return Err("tfwrite requires 2 arguments (handle, text)".to_string());
+                let (handle_val, text) = match args.len() {
+                    1 => (TfValue::String("o".to_string()), self.eval(&args[0])?.to_string_value()),
+                    2 => (self.eval(&args[0])?, self.eval(&args[1])?.to_string_value()),
+                    _ => return Err("tfwrite requires 1 or 2 arguments ([handle,] text)".to_string()),
+                };
+                if matches!(handle_val.to_string_value().as_str(), "o" | "e") {
+                    self.engine.emit_output(text);
+                    return Ok(TfValue::Integer(1));
                 }
-                let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
-                let text = self.eval(&args[1])?.to_string_value();
+                let handle = handle_val.to_int().unwrap_or(-1) as i32;
 
                 let file_handle = match self.engine.open_files.get_mut(&handle) {
                     Some(fh) if fh.mode == super::TfFileMode::Write || fh.mode == super::TfFileMode::Append => fh,
-                    _ => return Ok(TfValue::Integer(0)),
+                    _ => return Ok(TfValue::Integer(-1)),
                 };
 
                 // Use the stored file handle
                 let file = match file_handle.file.as_mut() {
                     Some(f) => f,
-                    None => return Ok(TfValue::Integer(0)),
+                    None => return Ok(TfValue::Integer(-1)),
                 };
 
                 // Write with newline
                 match writeln!(file, "{}", text) {
                     Ok(_) => Ok(TfValue::Integer(1)),
-                    Err(_) => Ok(TfValue::Integer(0)),
+                    Err(_) => Ok(TfValue::Integer(-1)),
                 }
             }
 
@@ -2638,14 +2660,26 @@ impl<'a> Evaluator<'a> {
                 } else {
                     String::new()
                 };
-                // dest and inline are ignored in our implementation
-                // Queue the echo for main app to process
-                self.engine.pending_outputs.push(super::TfOutput {
-                    text,
+                // dest and inline are ignored in our implementation. Emitted in order
+                // with everything else the enclosing command does (see super::effects).
+                let vars = super::parser::AttrVars::of(self.engine);
+                self.engine.emit(super::effects::TfEffect::Output {
+                    text: super::parser::decode_inline_attrs(&text, &vars, false).unwrap_or_default(),
                     attrs,
                     world: None,
+                    plain: None,
                 });
                 Ok(TfValue::Integer(1))
+            }
+
+            // prompt(text) - the current world's prompt is now text (/help prompt);
+            // 1, or 0 when there is no world.
+            "prompt" => {
+                if args.len() != 1 {
+                    return Err("prompt requires 1 argument (text)".to_string());
+                }
+                let text = self.eval(&args[0])?.to_string_value();
+                Ok(TfValue::Integer(super::parser::set_prompt(self.engine, text) as i64))
             }
 
             // send(s [,world [,flags]]) - function form of /send
@@ -2668,11 +2702,7 @@ impl<'a> Evaluator<'a> {
                 } else {
                     false
                 };
-                self.engine.pending_commands.push(super::TfCommand {
-                    command: text,
-                    world,
-                    no_eol,
-                });
+                self.engine.emit(super::effects::TfEffect::Send { text, world, no_eol });
                 Ok(TfValue::Integer(1))
             }
 
@@ -2819,32 +2849,26 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Float(n.ln()))
             }
 
-            // morepaused([world]) - 1 if the world's output is paused by
-            // more-mode or `/dokey pause` (finding C.11). Defined in terms
-            // of moresize(), which Clay's engine always reports as 0 (more-
-            // mode paging state lives in the main App, not TfEngine) - so
-            // this always reports "not paused" too, matching functions.tf's
-            // own expectation.
+            // morepaused([world]) - 1 if the world's output is paused at a more
+            // prompt (more-mode or `/dokey pause`), default the current world.
             "morepaused" => {
                 if args.len() > 1 {
                     return Err("morepaused requires 0 or 1 arguments".to_string());
                 }
-                if !args.is_empty() {
-                    let _ = self.eval(&args[0])?;
-                }
-                Ok(TfValue::Integer(0))
+                let world = match args.first() {
+                    Some(arg) => Some(self.eval(arg)?.to_string_value()).filter(|s| !s.is_empty()),
+                    None => None,
+                };
+                Ok(TfValue::Integer(self.more_info(world).is_some_and(|(paused, _)| paused) as i64))
             }
 
-            // winlines() - output window height (finding C.11): lines()
-            // minus the status/input rows Clay reserves at the bottom of
-            // the screen. lines() itself is a fixed default of 24 (see its
-            // own arm above - Clay doesn't track real terminal height in
-            // TfEngine).
+            // winlines() - the output window's height: lines() less the status and
+            // input rows (TfEngine::screen).
             "winlines" => {
                 if !args.is_empty() {
                     return Err("winlines requires 0 arguments".to_string());
                 }
-                Ok(TfValue::Integer(22))
+                Ok(TfValue::Integer(self.engine.screen.winlines as i64))
             }
 
             // strip_attr(s) - remove all display attributes (finding C.11).
@@ -2876,16 +2900,18 @@ impl<'a> Evaluator<'a> {
                 } else {
                     true
                 };
+                let vars = super::parser::AttrVars::of(self.engine);
                 let mut decoded = if interpret {
-                    super::parser::process_attr_codes(&s)
+                    super::parser::decode_inline_attrs(&s, &vars, false).unwrap_or_default()
                 } else {
                     s
                 };
                 if args.len() >= 2 {
                     let attrs = self.eval(&args[1])?.to_string_value();
-                    let prefix = super::parser::attrs_to_ansi_prefix(&attrs);
-                    if !prefix.is_empty() {
-                        decoded = format!("{}{}\x1b[0m", prefix, decoded);
+                    if let Ok(prefix) = super::parser::attr_list_sgr(&attrs, &vars) {
+                        if !prefix.is_empty() {
+                            decoded = format!("{}{}\x1b[0m", prefix, decoded);
+                        }
                     }
                 }
                 Ok(TfValue::String(decoded))
@@ -2924,7 +2950,8 @@ impl<'a> Evaluator<'a> {
                     return Err("encode_ansi requires 1 argument".to_string());
                 }
                 let s = self.eval(&args[0])?.to_string_value();
-                Ok(TfValue::String(super::parser::process_attr_codes(&s)))
+                let vars = super::parser::AttrVars::of(self.engine);
+                Ok(TfValue::String(super::parser::decode_inline_attrs(&s, &vars, false).unwrap_or_default()))
             }
 
             // strcmpattr(s1, s2) - like strcmp(), but strings must also
@@ -2982,10 +3009,11 @@ impl<'a> Evaluator<'a> {
                 if args.len() > 1 {
                     return Err("status_fields requires 0 or 1 arguments".to_string());
                 }
-                if !args.is_empty() {
-                    let _ = self.eval(&args[0])?;
-                }
-                Ok(TfValue::String(String::new()))
+                let row = match args.first() {
+                    Some(arg) => self.eval(arg)?.to_int().unwrap_or(0).max(0) as usize,
+                    None => 0,
+                };
+                Ok(TfValue::String(self.engine.status.fields_text(row)))
             }
 
             _ => {
@@ -3031,6 +3059,10 @@ impl<'a> Evaluator<'a> {
                     } else {
                         Ok(self.engine.get_var("?").cloned().unwrap_or(TfValue::Integer(1)))
                     }
+                } else if name == "status_int_more" {
+                    // tfstatus.tf's macro, which %status_int_more calls (status::status_int_more)
+                    let (paused, waiting) = self.more_info(None).unwrap_or((false, 0));
+                    Ok(TfValue::String(super::status::status_int_more(waiting, self.engine.screen.limit, paused)))
                 } else if super::parser::is_tf_command_name(name) {
                     // Try calling as a builtin command
                     let mut arg_strs: Vec<String> = Vec::new();
@@ -3505,21 +3537,23 @@ mod tests {
     #[test]
     fn test_echo_function() {
         let mut engine = TfEngine::new();
-        // echo() should queue an output and return 1
+        // echo() should emit an output and return 1
         let result = evaluate(&mut engine, r#"echo("Hello world")"#).unwrap();
         assert_eq!(result, TfValue::Integer(1));
-        assert_eq!(engine.pending_outputs.len(), 1);
-        assert_eq!(engine.pending_outputs[0].text, "Hello world");
+        let effects = engine.take_effects();
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(&effects[0], crate::tf::effects::TfEffect::Output { text, .. } if text == "Hello world"));
     }
 
     #[test]
     fn test_send_function() {
         let mut engine = TfEngine::new();
-        // send() should queue a command and return 1
+        // send() should emit a send and return 1
         let result = evaluate(&mut engine, r#"send("look")"#).unwrap();
         assert_eq!(result, TfValue::Integer(1));
-        assert_eq!(engine.pending_commands.len(), 1);
-        assert_eq!(engine.pending_commands[0].command, "look");
+        let effects = engine.take_effects();
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(&effects[0], crate::tf::effects::TfEffect::Send { text, .. } if text == "look"));
     }
 
     #[test]
@@ -3731,8 +3765,8 @@ mod tests {
         assert_eq!(evaluate(&mut engine, "is_open(\"noworld\")").unwrap(), TfValue::Integer(0));
         // gethostname() should at least not error; content is host-dependent.
         assert!(evaluate(&mut engine, "gethostname()").is_ok());
-        assert_eq!(evaluate(&mut engine, "status_fields()").unwrap(), TfValue::String(String::new()));
-        assert_eq!(evaluate(&mut engine, "status_fields(0)").unwrap(), TfValue::String(String::new()));
+        assert_eq!(evaluate(&mut engine, "status_fields()").unwrap(), TfValue::String(super::super::status::StatusLayout::tf_default().fields_text(0)));
+        assert_eq!(evaluate(&mut engine, "status_fields(1)").unwrap(), TfValue::String(String::new()));
     }
 
     #[test]

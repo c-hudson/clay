@@ -1,0 +1,71 @@
+Help on: .tfrc
+
+.tfrc
+
+  At startup, TF attempts to load and execute commands from the personal 
+  config file named "~/.tfrc", "~/tfrc", "./.tfrc" or "./tfrc".  This file can 
+  contain any commands you want executed automatically when TF starts.  
+
+  Some useful commands to include in your personal config file: 
+
+  /addworld 
+          Define a world.  TF will automatically connect to the first world if 
+          not started with the "-n" option.  
+  /def    Define a macro (including triggers, hilites, gags, keybindings, and 
+          hooks).  
+  /set    Set a variable.  There are many special variables that change the 
+          behavior of tf, listed under "special variables".  
+  /load   Load commands from another file.  
+  /require 
+          Load a library file.  
+
+  TFLIBDIR contains a sample "tfrc" file that you may want to copy and modify 
+  to fit your tastes.  
+
+  For backward compatibility, TF will load ~/.tinytalk if it exists.  The use 
+  of ~/.tinytalk is discouraged.  
+
+  See: startup, library, special variables, /load 
+
+Help on: /addtelnet
+
+/add<worldtype>
+
+  The comamnds /addtiny, /addlp, /addlpp, /adddiku, and /addtelnet take the 
+  same arguments as /addworld, and also give that world a type.  A world's 
+  type determines the format for automatic login and flag settings.  
+
+  See: /addworld 
+
+Help on: /lcd
+
+/lcd
+
+  Usage: 
+
+  /LCD [<dir>]
+  /CD [<dir>]
+  /PWD
+  ____________________________________________________________________________
+
+  /lcd and /cd change to a new working directory.  If <dir> is omitted with 
+  /lcd, the current directory is displayed (if supported on your system).  If 
+  <dir> is omitted with /cd, %{HOME} is assumed.  
+
+  The <dir> name is expanded as described under "filenames".  
+
+  /pwd displays the current working directory (if supported on your system).  
+
+Help on: special variables: %kecho
+  kecho=off 
+          (flag) Enables echoing of keyboard input, preceded by %{kprefix}.  
+          See also: %{kecho_attr}.  %{secho}.  /localecho, /addworld -e.  
+
+For more complete information, see "special variables".
+Help on: special variables: %kecho
+  kecho=off 
+          (flag) Enables echoing of keyboard input, preceded by %{kprefix}.  
+          See also: %{kecho_attr}.  %{secho}.  /localecho, /addworld -e.  
+
+For more complete information, see "special variables".
+% Help on subject nosuch not found.

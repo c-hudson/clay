@@ -1700,8 +1700,7 @@
 
     /// Helper: find a free TCP port
     fn find_free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+        crate::testserver::free_port()
     }
 
     #[test]
@@ -2805,8 +2804,169 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// /recall -a<attrs>, as in tf: a line is shown without those of its own attributes - a
+    /// trigger's `-aB`, `/echo -aB` - while attributes inside the text (`@{B}`, the
+    /// server's colours, a trigger's `-P` parts) stay, as TF leaves them.
     #[test]
-    fn test_record_input_line_respects_log_input_gate() {
+    fn test_recall_suppresses_a_lines_own_attributes() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Aw"));
+        app.current_world_index = 0;
+        app.tf_engine.execute("/def -aB -t\"bold*\" make_bold");
+        app.process_server_data(0, b"bold line\n\x1b[32mserver green\x1b[0m\n", 24, 80, false);
+        for cmd in ["/echo -aB boldecho", "/echo -p @{B}inline@{n}"] {
+            let effects = app.run_tf_in_world(0, cmd);
+            app.apply_tf_effects_now(effects, crate::tfrun::TfEffectCtx::for_world(0, false));
+        }
+        let recall = |app: &App, source: tf::RecallSource, suppress: &str| -> Vec<String> {
+            let opts = tf::RecallOptions { source, suppress_attrs: suppress.to_string(), ..tf::RecallOptions::default() };
+            app.recall_matches(&opts, 0).unwrap().into_iter().map(|(t, _)| t).collect()
+        };
+        let bold = |lines: &[String], text: &str| lines.iter().find(|l| l.contains(text))
+            .unwrap_or_else(|| panic!("{text} in {lines:?}")).contains("\x1b[1m");
+        let server = recall(&app, tf::RecallSource::Server, "");
+        assert!(bold(&server, "bold line"), "{server:?}");
+        let server = recall(&app, tf::RecallSource::Server, "B");
+        assert!(!bold(&server, "bold line"), "-aB takes the trigger's bold off: {server:?}");
+        assert!(server.iter().any(|l| l.contains("\x1b[32m")), "the server's colour stays: {server:?}");
+        let local = recall(&app, tf::RecallSource::Local, "B");
+        assert!(!bold(&local, "boldecho"), "/echo -aB's own bold comes off: {local:?}");
+        assert!(bold(&local, "inline"), "inline @{{B}} stays: {local:?}");
+        assert!(bold(&recall(&app, tf::RecallSource::Local, "u"), "boldecho"), "-au leaves bold alone");
+    }
+
+    /// TF's `G` (nohistory) attribute: the line is shown as usual, but /recall never finds
+    /// it (not even with -ag) and it is never archived - a trigger's on a server line or a
+    /// gagged one, /echo -aG, and a /substitute -aG.
+    #[test]
+    fn test_nohistory_lines_stay_out_of_history_and_the_archive() {
+        let dir = std::env::temp_dir().join(format!("clay_test_nohistory_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("scrollback.db");
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Gw"));
+        app.current_world_index = 0;
+        app.tf_engine.execute("/def -aG -t\"secret*\" hide_secret");
+        app.tf_engine.execute("/def -agG -t\"hidden*\" hide_hidden");
+        app.tf_engine.execute("/def -t\"swap*\" swap = /substitute -aG swapped");
+        {
+            let sdb = crate::scrollback::ScrollbackDb::open(&db_path, &[]).expect("open archive");
+            app.worlds[0].scrollback_tx = Some(sdb.sender());
+            app.worlds[0].ensure_world_id();
+            app.process_server_data(0, b"secret one\nnormal two\nhidden three\nswap four\n", 24, 80, false);
+            app.worlds[0].scrollback_tx = None;
+            drop(sdb);
+        }
+        let effects = app.run_tf_in_world(0, "/echo -aG echoed quietly");
+        app.apply_tf_effects_now(effects, crate::tfrun::TfEffectCtx::for_world(0, false));
+
+        let line = |text: &str| app.worlds[0].output_lines.iter().find(|l| l.text == text).cloned()
+            .unwrap_or_else(|| panic!("{text} is in the buffer"));
+        let secret = line("secret one");
+        assert!(secret.hist.nohistory && !secret.gagged, "G alone still shows the line");
+        assert!(!line("normal two").hist.nohistory);
+        assert!(line("hidden three").hist.nohistory);
+        assert!(line("swapped").hist.nohistory, "/substitute -aG");
+        assert!(line("echoed quietly").hist.nohistory, "/echo -aG");
+
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::Global,
+            show_gagged: true,
+            ..tf::RecallOptions::default()
+        };
+        let found: Vec<String> = app.recall_matches(&opts, 0).unwrap().into_iter().map(|(t, _)| t).collect();
+        assert!(found.iter().any(|t| t.contains("normal two")), "{found:?}");
+        for hidden in ["secret one", "hidden three", "swapped", "echoed quietly"] {
+            assert!(!found.iter().any(|t| t.contains(hidden)), "/recall -g -ag found {hidden}: {found:?}");
+        }
+
+        let mut archived = Vec::new();
+        for _ in 0..100 {
+            archived = crate::scrollback::ScrollbackDb::search(&db_path, Some("Gw"), "*", None, None, 100, false);
+            if archived.iter().any(|l| l.text == "normal two") { break; }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let texts: Vec<&str> = archived.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"normal two"), "{texts:?}");
+        assert!(!texts.contains(&"secret one") && !texts.contains(&"hidden three"), "{texts:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// /recordline puts a line into a history without showing it: -w lines are found by
+    /// /recall (-w), -l by -l, -g (the default) only by -g; -i joins the input history and
+    /// the console's Up/Down history; -t gives the line its own time, which time-range
+    /// /recall goes by even though the line is out of order.
+    #[test]
+    fn test_recordline_scopes() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("Rw");
+        world.showing_splash = false;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        app.sync_tf_world_info();
+        for cmd in ["/recordline -w rec-world", "/recordline -l rec-local", "/recordline rec-global",
+                    "/recordline -i rec-input", "/recordline -l -t1000 rec-old"] {
+            let effects = app.run_tf_in_world(0, cmd);
+            app.apply_tf_effects_now(effects, crate::tfrun::TfEffectCtx::for_world(0, false));
+        }
+        assert_eq!(app.worlds[0].output_lines.len(), 5);
+        assert!(app.worlds[0].output_lines.iter().all(|l| l.gagged), "never displayed");
+        let recall = |app: &App, source: tf::RecallSource| -> Vec<String> {
+            let opts = tf::RecallOptions { source, ..tf::RecallOptions::default() };
+            app.recall_matches(&opts, 0).unwrap().into_iter().map(|(t, _)| t).collect()
+        };
+        assert_eq!(recall(&app, tf::RecallSource::Server), ["rec-world"]);
+        let local = recall(&app, tf::RecallSource::Local);
+        assert!(local.iter().any(|t| t.contains("rec-local")) && local.iter().any(|t| t.contains("rec-old")), "{local:?}");
+        assert!(!local.iter().any(|t| t.contains("rec-global") || t.contains("rec-world")), "{local:?}");
+        let global = recall(&app, tf::RecallSource::Global);
+        for text in ["rec-world", "rec-local", "rec-global", "rec-input", "rec-old"] {
+            assert!(global.iter().any(|t| t.contains(text)), "{text} in {global:?}");
+        }
+        assert!(recall(&app, tf::RecallSource::Input).iter().any(|t| t.contains("rec-input")));
+        assert!(app.input.history.iter().any(|h| h == "rec-input"), "the console's Up/Down history");
+        let old = app.worlds[0].output_lines.iter().find(|l| l.text == "rec-old").unwrap();
+        assert_eq!(old.timestamp, std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000));
+        let recent = tf::RecallOptions {
+            source: tf::RecallSource::Local,
+            range: tf::RecallRange::TimePeriod(3600.0),
+            ..tf::RecallOptions::default()
+        };
+        let found: Vec<String> = app.recall_matches(&recent, 0).unwrap().into_iter().map(|(t, _)| t).collect();
+        assert!(found.iter().any(|t| t.contains("rec-local")) && !found.iter().any(|t| t.contains("rec-old")), "{found:?}");
+    }
+
+    /// The server's certificate and key load through rustls's own PEM reader (the
+    /// rustls-pemfile crate is unmaintained): Clay's own generated pair (an EC key in
+    /// PKCS#8), and the errors a bad file gets.
+    #[cfg(feature = "rustls-backend")]
+    #[test]
+    fn test_load_pem_cert_and_key() {
+        let dir = std::env::temp_dir().join(format!("clay_pem_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap().self_signed(&key_pair).unwrap();
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
+        let (certs, _key) = crate::websocket::load_pem_cert_and_key(&path(&cert_path), &path(&key_path)).expect("loads");
+        assert_eq!(certs.len(), 1);
+        // A key file holding only a certificate: no key in it.
+        let err = crate::websocket::load_pem_cert_and_key(&path(&cert_path), &path(&cert_path)).unwrap_err();
+        assert!(err.starts_with("No private key found"), "{err}");
+        let err = crate::websocket::load_pem_cert_and_key(&path(&dir.join("missing.pem")), &path(&key_path)).unwrap_err();
+        assert!(err.starts_with("Failed to open cert file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_input_line_respects_log_input_gate() {
         let mut world = World::new("test");
         world.settings.log_enabled = true; // per-world log switch, must ALSO be on
         world.log_date = Some(World::get_current_date_string()); // avoid real file rollover
@@ -2817,14 +2977,16 @@
 
         // log_input: false - captured line must still land in output_lines (so /recall -i
         // still finds it), but must NOT be written to the log file.
-        let (_, in_output) = world.record_input_line("secretcmd", false, false);
+        let line = world.input_line("secretcmd", false, false);
+        let (_, in_output) = world.push_hidden_line(line);
         assert!(in_output);
         assert_eq!(world.output_lines.len(), 1);
         assert!(world.output_lines[0].is_input);
         assert_eq!(world.output_lines[0].text, "secretcmd");
 
         // log_input: true - captured line lands in output_lines AND is written to the file.
-        let (_, in_output2) = world.record_input_line("visiblecmd", true, false);
+        let line = world.input_line("visiblecmd", true, false);
+        let (_, in_output2) = world.push_hidden_line(line);
         assert!(in_output2);
         assert_eq!(world.output_lines.len(), 2);
 
@@ -3408,7 +3570,7 @@
         }
 
         app.ws_broadcast_log.lock().unwrap().clear();
-        app.handle_disconnected(0);
+        app.handle_disconnected(0, &crate::telnet_reader::CloseReason::ByServer);
 
         // The "Disconnected." message must have been deferred into pending_lines (world was
         // paused with a non-empty backlog), not displayed - and therefore must NOT have been
@@ -5683,6 +5845,8 @@
             "cd", "pwd", "runtime", "ismacro", "isvar", "features", "restrict", "sys",
             "xtitle", "more", "wrap", "limit", "unlimit", "relimit", "result",
             "first", "rest", "last", "nth", "ver", "man", "nogag",
+            // TF's own, parsed by the TF engine (Clay's remote attach is /server).
+            "connect", "addworld",
         ].into_iter().collect();
 
         // --- Compare ---
@@ -5752,6 +5916,8 @@
             from_archive: false,
             viewed: marked_new,
             display_id: if marked_new { Some(crate::CONSOLE_DISPLAY_ID) } else { None },
+            hist: crate::LineHistory::default(),
+            tf_attrs: None,
         }
     }
 
@@ -6034,6 +6200,82 @@
         app.worlds[0].scroll_offset = app.worlds[0].output_lines.len().saturating_sub(1);
         app.worlds[0].visual_line_offset = 0;
         app
+    }
+
+    /// TF's %textdiv on the console: the divider row sits above the first line that
+    /// arrived after the console last showed the world, counts as that line's row, and
+    /// Page Up walks across it row-exactly. "always" puts it below the old text when
+    /// nothing arrived; "clear" puts a screen-high blank there; leaving the world drops it.
+    #[test]
+    fn test_console_textdiv_divider_rows() {
+        let lines = |n: u64| -> Vec<OutputLine> { (0..n).map(|i| OutputLine::new(format!("line {}", i), i)).collect() };
+        let shown_text = |app: &App| -> Vec<String> {
+            app_rows(app).iter().map(|r| crate::util::strip_ansi_codes(r)).collect()
+        };
+        let arrive = |app: &mut App, mode: &str, seen: u64| {
+            app.settings.textdiv = mode.to_string();
+            app.worlds[0].console_seen_seq = Some(seen);
+            app.console_drawn_world = Some("other".to_string());
+            app.track_console_world();
+        };
+        let mut app = app_with_lines(lines(30), 10, 40, true, 0);
+        app.worlds.push(World::new("other"));
+        arrive(&mut app, "on", 9);
+        let mut all: Vec<String> = (0..30).map(|i| format!("line {}", i)).collect();
+        all.insert(10, "=====".to_string());
+        let metrics = crate::rendering::RowMetrics::for_console(&app);
+        assert_eq!(app.worlds[0].output_lines.iter().map(|l| metrics.rows(l)).sum::<usize>(), all.len(),
+            "the divider counts as its line's row");
+        assert_eq!(shown_text(&app), all[21..].to_vec(), "at the bottom: the newest screenful");
+        let page = app.page_step();
+        let mut saw_divider = false;
+        for step in 0..6 {
+            if !app.scroll_output_up_rows(page) {
+                break;
+            }
+            let shown = shown_text(&app);
+            assert_eq!(shown.len(), 10, "step {step}: short screen");
+            window_start(&shown, &all, &format!("step {step}"));
+            saw_divider |= shown.iter().any(|r| r == "=====");
+        }
+        assert!(saw_divider, "Page Up reached the divider");
+
+        // Nothing new: "on" draws nothing, "always" draws it below the old text.
+        let mut app = app_with_lines(lines(30), 10, 40, false, 0);
+        app.worlds.push(World::new("other"));
+        arrive(&mut app, "on", 29);
+        assert!(!shown_text(&app).contains(&"=====".to_string()));
+        arrive(&mut app, "always", 29);
+        assert_eq!(shown_text(&app).last().map(String::as_str), Some("====="));
+
+        // "clear": a screen-high blank above the two new lines - the old text out of view.
+        let mut app = app_with_lines(lines(30), 10, 40, false, 0);
+        app.worlds.push(World::new("other"));
+        arrive(&mut app, "clear", 27);
+        let shown = shown_text(&app);
+        assert_eq!(&shown[8..], ["line 28", "line 29"]);
+        assert!(shown[..8].iter().all(|r| r.is_empty()), "{shown:?}");
+
+        // "off", and Clay's own way (unset): no divider. Leaving the world drops it.
+        for mode in ["off", ""] {
+            let mut app = app_with_lines(lines(30), 10, 40, false, 0);
+            app.worlds.push(World::new("other"));
+            arrive(&mut app, mode, 9);
+            assert!(app.worlds[0].console_textdiv.is_none(), "{mode:?}");
+        }
+        let mut app = app_with_lines(lines(30), 10, 40, false, 0);
+        app.worlds.push(World::new("other"));
+        arrive(&mut app, "always", 29);
+        app.current_world_index = 1;
+        app.track_console_world();
+        assert!(app.worlds[0].console_textdiv.is_none(), "dropped on leaving");
+        assert_eq!(app.worlds[0].console_seen_seq, Some(29));
+
+        // The SSH console gets %textdiv with the rest of the global settings, and draws the
+        // divider with this same code.
+        let mut mirror = App::new();
+        mirror.apply_global_settings(&app.build_global_settings_msg());
+        assert_eq!((mirror.settings.textdiv.as_str(), mirror.settings.textdiv_str.as_str()), ("always", "====="));
     }
 
     fn app_rows(app: &App) -> Vec<String> {
@@ -6685,7 +6927,7 @@ if you're more curious.\"";
 
     #[test]
     fn test_parse_remote_attach_command_host_port_colon() {
-        match parse_command("/connect example.com:9000") {
+        match parse_command("/server example.com:9000") {
             Command::RemoteAttach { addr, close, cancel } => {
                 assert_eq!(addr, "example.com:9000");
                 assert!(!close);
@@ -6697,7 +6939,7 @@ if you're more curious.\"";
 
     #[test]
     fn test_parse_remote_attach_command_host_port_space() {
-        match parse_command("/connect example.com 9000") {
+        match parse_command("/server example.com 9000") {
             Command::RemoteAttach { addr, close, cancel } => {
                 assert_eq!(addr, "example.com:9000");
                 assert!(!close);
@@ -6709,7 +6951,7 @@ if you're more curious.\"";
 
     #[test]
     fn test_parse_remote_attach_command_close() {
-        match parse_command("/connect --close") {
+        match parse_command("/server --close") {
             Command::RemoteAttach { addr, close, cancel } => {
                 assert!(addr.is_empty());
                 assert!(close);
@@ -6721,7 +6963,7 @@ if you're more curious.\"";
 
     #[test]
     fn test_parse_remote_attach_command_cancel() {
-        match parse_command("/connect --cancel") {
+        match parse_command("/server --cancel") {
             Command::RemoteAttach { addr, close, cancel } => {
                 assert!(addr.is_empty());
                 assert!(!close);
@@ -6733,13 +6975,22 @@ if you're more curious.\"";
 
     #[test]
     fn test_parse_remote_attach_command_empty() {
-        match parse_command("/connect") {
+        match parse_command("/server") {
             Command::RemoteAttach { addr, close, cancel } => {
                 assert!(addr.is_empty());
                 assert!(!close);
                 assert!(!cancel);
             }
             other => panic!("Expected RemoteAttach, got {:?}", other),
+        }
+    }
+
+    /// Remote attach is /server now; /connect is TinyFugue's (connect a world), which
+    /// Clay's own parser leaves for TF.
+    #[test]
+    fn test_connect_is_not_remote_attach() {
+        for line in ["/connect", "/connect mymud", "/connect example.com 9000", "/connect --close"] {
+            assert!(!matches!(parse_command(line), Command::RemoteAttach { .. }), "{line}");
         }
     }
 
@@ -7295,6 +7546,47 @@ third
         let action = restored.settings.actions.iter().find(|a| a.name == "spam")
             .expect("action restored");
         assert!(action.suppress_blanks, "the flag must survive a full reload round trip");
+    }
+
+    /// TF state - a trigger, a key binding, a hook, a variable - comes through /reload:
+    /// written by the real writer, restored by the real parser. It used to be lost.
+    #[test]
+    fn test_tf_state_survives_a_reload() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        for line in [
+            "/def -t\"hello*\" greet = /echo hi",
+            "/def -hCONNECT onconn = /echo up",
+            "/bind ^X = /echo x",
+            "/set foo=bar baz",
+        ] {
+            app.tf_engine.execute(line);
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
+        assert!(restored.tf_state_restored);
+        let engine = &restored.tf_engine;
+        assert!(engine.macros.iter().any(|m| m.name == "greet" && m.trigger.as_ref().is_some_and(|t| t.compiled.is_some())));
+        assert!(engine.macros.iter().any(|m| m.name == "onconn" && m.has_hook(crate::tf::TfHookEvent::Connect)));
+        assert_eq!(engine.keybindings, app.tf_engine.keybindings);
+        assert_eq!(engine.get_var("foo").map(|v| v.to_string_value()).as_deref(), Some("bar baz"));
+    }
+
+    /// A reload state written before TF state was carried restores nothing for TF, so
+    /// startup actions (and the TF rc) still run.
+    #[test]
+    fn test_reload_state_without_tf_state_is_a_tf_cold_start() {
+        let mut app = App::new();
+        crate::persistence::load_reload_state_from_str(&mut app, "[reload]\ncurrent_world_index=0\n").expect("parses");
+        assert!(!app.tf_state_restored);
+        let mut app = App::new();
+        crate::persistence::load_reload_state_from_str(&mut app, "[reload]\ntf_state=garbage!!\n").expect("parses");
+        assert!(!app.tf_state_restored, "an unreadable snapshot is no snapshot");
     }
 
     /// Build an app with one world and one action that matches `pattern` and suppresses the
@@ -8977,6 +9269,7 @@ third
             mccp2_enabled: true,
             world_type: "mud_timed_prompt".to_string(),
             prompt_wait_ms: 2500,
+            tf_type: String::new(),
             slack_token: "xoxb-token".to_string(),
             slack_channel: "#general".to_string(),
             slack_workspace: "acme".to_string(),
@@ -9139,7 +9432,7 @@ third
             String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
-            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
             None,
         );
@@ -9163,7 +9456,7 @@ third
             String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
-            "mud_timed_prompt".to_string(), 2500, "xoxb-new".to_string(), String::new(), String::new(),
+            "mud_timed_prompt".to_string(), 2500, None, "xoxb-new".to_string(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
             None,
         );
@@ -9191,7 +9484,7 @@ third
             String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
-            "mud".to_string(), 1000, String::new(), String::new(), String::new(),
+            "mud".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
             None,
         );
@@ -9217,87 +9510,87 @@ third
         assert_eq!(app.worlds[0].name, before, "must be true no-ops");
     }
 
-    // --- App::resolve_quote_lines ---
-    // Pins the shared /quote helper's behavior, including the world-targeting/delay-scheduling
-    // support console's two call sites used to silently drop entirely (T32).
+    // --- App::start_quote ---
+    // A -S quote's lines come back to be done now, for the world they go to; any other
+    // quote becomes one background process holding all its lines (`/help processes`).
 
-    #[test]
-    fn test_resolve_quote_lines_no_options_returns_lines_unchanged() {
-        let mut app = App::new();
-        app.worlds.clear();
-        app.worlds.push(World::new("alpha"));
-        app.current_world_index = 0;
-
-        let result = app.resolve_quote_lines(
-            vec!["one".to_string(), "two".to_string()],
-            &None, 0.0, None, false, 0, tf::QuoteDisposition::Send, false,
-        );
-        assert_eq!(result, Some((0, vec!["one".to_string(), "two".to_string()])));
+    fn quote_request(lines: &[&str], world: Option<&str>, timing: tf::QuoteTiming) -> tf::effects::QuoteRequest {
+        tf::effects::QuoteRequest {
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+            disposition: tf::QuoteDisposition::Send,
+            world: world.map(str::to_string),
+            timing,
+            recall_opts: None,
+            strip_ansi: false,
+            pid: None,
+            label: "!\"cmd\"".to_string(),
+        }
     }
 
     #[test]
-    fn test_resolve_quote_lines_targets_named_world() {
+    fn test_start_quote_sync_returns_lines_for_its_world() {
         let mut app = App::new();
         app.worlds.clear();
         app.worlds.push(World::new("alpha"));
         app.worlds.push(World::new("beta"));
         app.current_world_index = 0;
 
-        let result = app.resolve_quote_lines(
-            vec!["hi".to_string()],
-            &Some("beta".to_string()), 0.0, None, false, 0, tf::QuoteDisposition::Send, false,
-        );
-        assert_eq!(result, Some((1, vec!["hi".to_string()])), "should target beta (index 1), not the current world");
-    }
-
-    #[test]
-    fn test_resolve_quote_lines_unknown_world_falls_back_to_current() {
-        let mut app = App::new();
-        app.worlds.clear();
-        app.worlds.push(World::new("alpha"));
-        app.current_world_index = 0;
-
-        let result = app.resolve_quote_lines(
-            vec!["hi".to_string()],
-            &Some("nonexistent".to_string()), 0.0, None, false, 0, tf::QuoteDisposition::Send, false,
-        );
-        assert_eq!(result, Some((0, vec!["hi".to_string()])), "unknown world name should fall back to world_index");
-    }
-
-    #[test]
-    fn test_resolve_quote_lines_delay_schedules_processes_and_returns_none() {
-        let mut app = App::new();
-        app.worlds.clear();
-        app.worlds.push(World::new("alpha"));
-        app.current_world_index = 0;
+        let result = app.start_quote(quote_request(&["one", "two"], None, tf::QuoteTiming::Sync), 0);
+        assert_eq!(result, Some((0, vec!["one".to_string(), "two".to_string()])));
+        let result = app.start_quote(quote_request(&["hi"], Some("BETA"), tf::QuoteTiming::Sync), 0);
+        assert_eq!(result, Some((1, vec!["hi".to_string()])), "-w beta targets beta, whatever its case");
+        let result = app.start_quote(quote_request(&["hi"], Some("nonexistent"), tf::QuoteTiming::Sync), 0);
+        assert_eq!(result, Some((0, vec!["hi".to_string()])), "an unknown world falls back to the invoking one");
         assert!(app.tf_engine.processes.is_empty());
-
-        let result = app.resolve_quote_lines(
-            vec!["one".to_string(), "two".to_string(), "three".to_string()],
-            &None, 5.0, None, false, 0, tf::QuoteDisposition::Send, false,
-        );
-        assert_eq!(result, None, "delayed multi-line quote has nothing left to send immediately");
-        assert_eq!(app.tf_engine.processes.len(), 3, "each line should be scheduled as its own delayed process");
-        assert_eq!(app.tf_engine.processes[0].command, "one");
-        assert_eq!(app.tf_engine.processes[1].command, "two");
-        assert_eq!(app.tf_engine.processes[2].command, "three");
     }
 
     #[test]
-    fn test_resolve_quote_lines_single_line_ignores_delay() {
-        // Delay-scheduling only kicks in for lines.len() > 1 - a single line always sends
-        // immediately regardless of delay_secs.
+    fn test_start_quote_background_is_one_process_with_every_line() {
         let mut app = App::new();
         app.worlds.clear();
         app.worlds.push(World::new("alpha"));
         app.current_world_index = 0;
 
-        let result = app.resolve_quote_lines(
-            vec!["only".to_string()],
-            &None, 5.0, None, false, 0, tf::QuoteDisposition::Send, false,
-        );
-        assert_eq!(result, Some((0, vec!["only".to_string()])));
-        assert!(app.tf_engine.processes.is_empty());
+        let every = tf::QuoteTiming::Every { interval: std::time::Duration::from_secs(5), given: true };
+        let result = app.start_quote(quote_request(&["one", "two", "three"], None, every), 0);
+        assert_eq!(result, None, "nothing is done now");
+        assert_eq!(app.tf_engine.processes.len(), 1);
+        let p = &app.tf_engine.processes[0];
+        assert_eq!(p.kind, tf::ProcessKind::Quote);
+        assert_eq!(p.lines, ["one", "two", "three"]);
+        assert_eq!(p.command, "!\"cmd\"");
+        assert_eq!(p.world.as_deref(), Some("alpha"));
+        assert!(p.next_run > std::time::Instant::now() + std::time::Duration::from_secs(4), "the first line waits an interval");
+
+        // One line per run; the process ends with its last line.
+        let due = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        for expected in ["one", "two", "three"] {
+            let runs = app.tick_tf_processes(due + std::time::Duration::from_secs(60), false);
+            assert_eq!(runs.len(), 1);
+            match &runs[0].1[..] {
+                [crate::tf::effects::TfEffect::Quote(q)] => assert_eq!(q.lines, [expected]),
+                other => panic!("expected one quoted line, got {:?}", other),
+            }
+        }
+        assert!(app.tf_engine.processes.is_empty(), "done after its last line");
+    }
+
+    #[test]
+    fn test_start_quote_on_prompt_waits_for_a_prompt_from_its_world() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds.push(World::new("beta"));
+        app.current_world_index = 0;
+
+        let _ = app.start_quote(quote_request(&["n", "w"], Some("beta"), tf::QuoteTiming::Prompt), 0);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        assert!(app.tick_tf_processes(far, false).is_empty(), "no timer runs a -P quote");
+        assert!(app.run_prompt_processes(0, false).is_empty(), "alpha's prompt isn't beta's");
+        let runs = app.run_prompt_processes(1, false);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0.world_idx, 1);
+        assert_eq!(app.tf_engine.processes[0].lines, ["w"]);
     }
 
     // --- App::update_world_settings ---
@@ -9317,7 +9610,7 @@ third
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
-            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
             None,
         );
@@ -9338,7 +9631,7 @@ third
             "myuser".to_string(), "ENC:whatever".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
-            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
             None,
         );
@@ -9359,7 +9652,7 @@ third
             "myuser".to_string(), "newpassword".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
-            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
             None,
         );
@@ -9438,7 +9731,7 @@ third
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, false,
-            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
             None,
         );
@@ -9457,7 +9750,7 @@ third
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, false,
-            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
             None,
         );
@@ -9565,6 +9858,8 @@ third
             from_archive: false,
             viewed: false,
             display_id: None,
+            hist: crate::LineHistory::default(),
+            tf_attrs: None,
         }
     }
 
@@ -10456,7 +10751,7 @@ third
         app.current_world_index = 0;
         let (_client_id, mut rx) = phase_c_register_client(&mut app);
 
-        app.handle_disconnected(0);
+        app.handle_disconnected(0, &crate::telnet_reader::CloseReason::ByServer);
 
         let sent = drain_server_data(&mut rx);
         assert!(sent.iter().any(|(_, _, d)| d.contains("HP:100>")),
@@ -14149,6 +14444,7 @@ third
         match action {
             KeyAction::Quit => "Quit".to_string(),
             KeyAction::SendCommand(cmd) => format!("SendCommand({cmd:?})"),
+            KeyAction::RunBound(cmd) => format!("RunBound({cmd:?})"),
             KeyAction::Connect => "Connect".to_string(),
             KeyAction::Redraw => "Redraw".to_string(),
             KeyAction::Refresh => "Refresh".to_string(),
@@ -14181,7 +14477,7 @@ third
 
         let lower = send_esc_then(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         match lower {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo lower"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo lower"),
             other => panic!(
                 "Esc,j should fire the /bind Esc-j command; got {} instead (case-fold bug)",
                 describe_key_action(&other)),
@@ -14189,7 +14485,7 @@ third
 
         let upper = send_esc_then(&mut app, KeyCode::Char('J'), KeyModifiers::NONE);
         match upper {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo upper"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo upper"),
             other => panic!(
                 "Esc,J should fire the /bind Esc-J command; got {} instead (case-fold bug)",
                 describe_key_action(&other)),
@@ -14211,7 +14507,7 @@ third
 
         let action = send_esc_then(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         match action {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo alt"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo alt"),
             other => panic!(
                 "Esc,j should fire the /bind Alt-j command via the Alt- normalisation path; got {}",
                 describe_key_action(&other)),
@@ -14230,7 +14526,7 @@ third
 
         let action = send_esc_then(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
         match action {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo rawesc"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo rawesc"),
             other => panic!("Esc,b should fire the /bind ^[b command; got {}",
                 describe_key_action(&other)),
         }
@@ -14249,7 +14545,7 @@ third
 
         let action = send_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
         match action {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo uparrow"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo uparrow"),
             other => panic!("Up should fire the /def -b'^[[A' command; got {}",
                 describe_key_action(&other)),
         }
@@ -14829,7 +15125,7 @@ third
 
         let action = send_key(&mut app, KeyCode::F(5), KeyModifiers::NONE);
         match action {
-            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/key_f5"),
+            KeyAction::RunBound(cmd) => assert_eq!(cmd, "/key_f5"),
             other => panic!(
                 "F5 should fire the key_f5 macro, not the default search_popup action; got {}",
                 describe_key_action(&other)
@@ -14846,7 +15142,7 @@ third
 
         let action = send_esc_then(&mut app, KeyCode::Left, KeyModifiers::NONE);
         match action {
-            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/key_esc_left"),
+            KeyAction::RunBound(cmd) => assert_eq!(cmd, "/key_esc_left"),
             other => panic!("Esc,Left should fire the key_esc_left macro; got {}", describe_key_action(&other)),
         }
     }
@@ -14862,7 +15158,7 @@ third
 
         let action = send_key(&mut app, KeyCode::Left, KeyModifiers::ALT);
         match action {
-            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/key_esc_left"),
+            KeyAction::RunBound(cmd) => assert_eq!(cmd, "/key_esc_left"),
             other => panic!("Alt-Left should fall back to key_esc_left when key_meta_left is undefined; got {}",
                 describe_key_action(&other)),
         }
@@ -14876,7 +15172,7 @@ third
 
         let action = send_key(&mut app, KeyCode::Left, KeyModifiers::ALT);
         match action {
-            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/key_meta_left"),
+            KeyAction::RunBound(cmd) => assert_eq!(cmd, "/key_meta_left"),
             other => panic!("Alt-Left should prefer key_meta_left when it IS defined; got {}", describe_key_action(&other)),
         }
     }
@@ -14889,7 +15185,7 @@ third
 
         let action = send_key(&mut app, KeyCode::F(5), KeyModifiers::NONE);
         match action {
-            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/echo b"),
+            KeyAction::RunBound(cmd) => assert_eq!(cmd, "/echo b"),
             other => panic!("F5 should fire the -B\"F5\" nameless macro's body; got {}", describe_key_action(&other)),
         }
     }
@@ -15326,7 +15622,7 @@ third
         assert!(app.input.insert);
         app.sync_tf_world_info();
         let result = app.tf_engine.execute("/set insert=0");
-        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        assert!(!matches!(result, tf::TfCommandResult::Error(_)), "got {result:?}");
         app.process_pending_keyboard_ops();
         assert!(!app.input.insert, "/set insert=0 must be reflected back into InputArea.insert");
     }
@@ -15392,7 +15688,7 @@ third
 
         let action = send_esc_then(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
         let cmd = match action {
-            KeyAction::SendCommand(cmd) => cmd,
+            KeyAction::RunBound(cmd) => cmd,
             other => panic!("Esc,x should fire the /def -b'^[x' command; got {}", describe_key_action(&other)),
         };
 
@@ -15425,7 +15721,7 @@ third
 
         let action = send_esc_then(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
         let cmd = match action {
-            KeyAction::SendCommand(cmd) => cmd,
+            KeyAction::RunBound(cmd) => cmd,
             other => panic!("Esc,x should fire the /bind Esc-x command; got {}", describe_key_action(&other)),
         };
 
@@ -15502,7 +15798,8 @@ third
 
         // A second binding that reads $[kbnum] directly, to prove the client's kbnum was
         // genuinely visible to the bound command while it ran (not just cleared after).
-        let bound2 = app.tf_engine.execute("/bind Esc-y = /let kbnum_seen=$[kbnum]");
+        // /set, not /let: a binding runs as a macro body (TF), where /let is local to it.
+        let bound2 = app.tf_engine.execute("/bind Esc-y = /set kbnum_seen=$[kbnum]");
         assert!(matches!(bound2, tf::TfCommandResult::Success(_)), "got {bound2:?}");
 
         let client_id = 99;
@@ -15647,7 +15944,7 @@ third
 
         let r = send_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
         match r {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo chord"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo chord"),
             other => panic!("^X^R should fire the /bind ^X^R command; got {}",
                 describe_key_action(&other)),
         }
@@ -15681,7 +15978,7 @@ third
         assert!(matches!(x2, KeyAction::None));
         let r2 = send_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
         match r2 {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo chord"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo chord"),
             other => panic!("^X^R should still fire after an unrelated abandon; got {}",
                 describe_key_action(&other)),
         }
@@ -15704,7 +16001,7 @@ third
 
         let bracket = send_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
         match bracket {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo bracket"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo bracket"),
             other => panic!("^X[ should fire the /def -b'^X[' command; got {}",
                 describe_key_action(&other)),
         }
@@ -15734,7 +16031,7 @@ third
         assert!(matches!(x2, KeyAction::None));
         let r2 = send_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
         match r2 {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo chord"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo chord"),
             other => panic!("^X^R should fire normally after a ^G cancel; got {}",
                 describe_key_action(&other)),
         }
@@ -15749,7 +16046,7 @@ third
 
         let action = send_esc_then(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
         match action {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo escctrln"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo escctrln"),
             other => panic!("Esc,^N should fire the /bind Esc-^N command; got {}",
                 describe_key_action(&other)),
         }
@@ -15764,7 +16061,7 @@ third
 
         let action = send_esc_then(&mut app, KeyCode::Left, KeyModifiers::NONE);
         match action {
-            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo escleft"),
+            KeyAction::RunBound(ref cmd) => assert_eq!(cmd, "/echo escleft"),
             other => panic!("Esc,Left should fire the /bind Esc-Left command; got {}",
                 describe_key_action(&other)),
         }
@@ -16246,87 +16543,71 @@ third
         }
     }
 
+    /// What `/addworld <args>` hands the App - TF's own argument rules (the engine parses
+    /// it now; Clay's command parser no longer has a copy).
+    fn addworld_op(args: &str) -> crate::tf::PendingWorldOp {
+        let mut engine = crate::tf::TfEngine::new();
+        let effects = engine.run(&format!("/addworld {}", args));
+        effects.into_iter().find_map(|e| match e {
+            crate::tf::effects::TfEffect::WorldOp(op) => Some(op),
+            _ => None,
+        }).unwrap_or_else(|| panic!("no world op from /addworld {}", args))
+    }
+
     #[test]
     fn test_parse_addworld_default_form() {
-        match parse_command("/addworld DEFAULT hero secret") {
-            Command::AddWorldDefault { character, password, file } => {
-                assert_eq!(character, Some("hero".to_string()));
-                assert_eq!(password, Some("secret".to_string()));
-                assert_eq!(file, None);
-            }
-            other => panic!("expected AddWorldDefault, got {:?}", other),
-        }
+        let op = addworld_op("DEFAULT hero secret");
+        assert_eq!((op.user.as_deref(), op.password.as_deref(), op.file.as_deref()), (Some("hero"), Some("secret"), None));
         // Case-insensitive, and with a file argument.
-        match parse_command("/addworld default hero secret /tmp/x.tf") {
-            Command::AddWorldDefault { character, password, file } => {
-                assert_eq!(character, Some("hero".to_string()));
-                assert_eq!(password, Some("secret".to_string()));
-                assert_eq!(file, Some("/tmp/x.tf".to_string()));
-            }
-            other => panic!("expected AddWorldDefault, got {:?}", other),
-        }
+        let op = addworld_op("default hero secret /tmp/x.tf");
+        assert_eq!((op.user.as_deref(), op.password.as_deref(), op.file.as_deref()), (Some("hero"), Some("secret"), Some("/tmp/x.tf")));
     }
 
     #[test]
     fn test_parse_addworld_captures_trailing_file() {
-        // 4 raw tokens: name host port file (was misparsed as name/char/host/port before
-        // Job 14b - see parse_addworld_command's own doc comment).
-        match parse_command("/addworld Cave cave.tcp.com 2283 /tmp/cave.tf") {
-            Command::AddWorld { name, host, port, user, password, file, .. } => {
-                assert_eq!(name, "Cave");
-                assert_eq!(host, Some("cave.tcp.com".to_string()));
-                assert_eq!(port, Some("2283".to_string()));
-                assert_eq!(user, None);
-                assert_eq!(password, None);
-                assert_eq!(file, Some("/tmp/cave.tf".to_string()));
-            }
-            other => panic!("expected AddWorld, got {:?}", other),
-        }
-
-        // 6 raw tokens: name char pass host port file.
-        match parse_command("/addworld Cave hero secret cave.tcp.com 2283 /tmp/cave.tf") {
-            Command::AddWorld { name, host, port, user, password, file, .. } => {
-                assert_eq!(name, "Cave");
-                assert_eq!(user, Some("hero".to_string()));
-                assert_eq!(password, Some("secret".to_string()));
-                assert_eq!(host, Some("cave.tcp.com".to_string()));
-                assert_eq!(port, Some("2283".to_string()));
-                assert_eq!(file, Some("/tmp/cave.tf".to_string()));
-            }
-            other => panic!("expected AddWorld, got {:?}", other),
-        }
+        // 4 words: name host port file (stdlib.tf's own /addworld rule).
+        let op = addworld_op("Cave cave.tcp.com 2283 /tmp/cave.tf");
+        assert_eq!(op.name, "Cave");
+        assert_eq!((op.host.as_deref(), op.port.as_deref()), (Some("cave.tcp.com"), Some("2283")));
+        assert_eq!((op.user.as_deref(), op.password.as_deref()), (None, None));
+        assert_eq!(op.file.as_deref(), Some("/tmp/cave.tf"));
+        // 6 words: name char pass host port file.
+        let op = addworld_op("Cave hero secret cave.tcp.com 2283 /tmp/cave.tf");
+        assert_eq!((op.user.as_deref(), op.password.as_deref()), (Some("hero"), Some("secret")));
+        assert_eq!((op.host.as_deref(), op.port.as_deref()), (Some("cave.tcp.com"), Some("2283")));
+        assert_eq!(op.file.as_deref(), Some("/tmp/cave.tf"));
+        // Options: -T takes an attached value; -x/-e flags bundle.
+        let op = addworld_op("-xTlp.diku Cave cave.tcp.com 2283");
+        assert!(op.use_ssl);
+        assert_eq!(op.tf_type.as_deref(), Some("lp.diku"));
     }
 
     #[test]
     fn test_parse_addworld_srchost_not_misread_as_bundled_flags() {
         // -s<srchost> must consume the rest of its own token - a srchost value
         // containing 'x' must NOT be misread as the -x (SSL) flag.
-        match parse_command("/addworld -sexample.com Cave cave.tcp.com 2283") {
-            Command::AddWorld { use_ssl, .. } => {
-                assert!(!use_ssl, "srchost 'example.com' contains 'x' but must not enable SSL");
-            }
-            other => panic!("expected AddWorld, got {:?}", other),
-        }
+        assert!(!addworld_op("-sexample.com Cave cave.tcp.com 2283").use_ssl,
+            "srchost 'example.com' contains 'x' but must not enable SSL");
     }
 
     #[test]
-    fn test_execute_add_world_command_stores_file_in_tf_engine() {
+    fn test_addworld_stores_file_in_tf_engine() {
         let mut app = App::new();
         app.worlds.clear();
         app.current_world_index = 0;
         app.worlds.push(send_test_world("Placeholder", false));
 
-        execute_add_world_command(
-            &mut app, "Cave".to_string(), Some("cave.tcp.com".to_string()), Some("2283".to_string()),
-            None, None, false, Some("/tmp/cave.tf".to_string()), 0, false,
-        );
+        crate::commands::apply_world_definition(&mut app, crate::tf::PendingWorldOp {
+            name: "Cave".into(), host: Some("cave.tcp.com".into()), port: Some("2283".into()),
+            file: Some("/tmp/cave.tf".into()), ..Default::default()
+        }, 0, false);
 
         assert!(app.worlds.iter().any(|w| w.name == "Cave"));
         assert_eq!(app.tf_engine.world_files.get("cave"), Some(&"/tmp/cave.tf".to_string()));
     }
 
     #[test]
-    fn test_execute_add_world_command_wires_scrollback_tx() {
+    fn test_addworld_wires_scrollback_tx() {
         // Regression guard: this used to be missing on the console and WS dispatch
         // paths (only daemon.rs remembered it), so a world added outside daemon mode
         // never archived a single line to scrollback.db.
@@ -16341,15 +16622,95 @@ third
         app.worlds.push(send_test_world("Placeholder", false));
         app.scrollback = Some(crate::scrollback::ScrollbackDb::open(&db_path, &[]).expect("open archive"));
 
-        execute_add_world_command(
-            &mut app, "Cave".to_string(), Some("cave.tcp.com".to_string()), Some("2283".to_string()),
-            None, None, false, None, 0, false,
-        );
+        crate::commands::apply_world_definition(&mut app, crate::tf::PendingWorldOp {
+            name: "Cave".into(), host: Some("cave.tcp.com".into()), port: Some("2283".into()), ..Default::default()
+        }, 0, false);
 
         let idx = app.worlds.iter().position(|w| w.name == "Cave").unwrap();
         assert!(app.worlds[idx].scrollback_tx.is_some());
 
         drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A .tfrc runs its /addworld lines on every start: running one again changes nothing
+    /// and says nothing; a line that names fewer fields keeps the rest; -x only turns SSL
+    /// on; -T picks the login TF's library gives the type (each checked in real tf).
+    #[test]
+    fn test_addworld_is_idempotent_and_updates_only_named_fields() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Placeholder", false));
+        let lines = |app: &App| app.worlds[0].output_lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>();
+        let define = |app: &mut App, args: &str| {
+            let op = addworld_op(args);
+            crate::commands::apply_world_definition(app, op, 0, false);
+        };
+
+        define(&mut app, "-Ttiny foo bob secret localhost 4000");
+        assert!(lines(&app).iter().any(|l| l == "Added world 'foo' (localhost:4000)."), "{:?}", lines(&app));
+        let before = lines(&app).len();
+        define(&mut app, "-Ttiny foo bob secret localhost 4000");
+        assert_eq!(lines(&app).len(), before, "the same line again is silent");
+
+        define(&mut app, "foo localhost 4001");
+        let foo = app.worlds.iter().find(|w| w.name == "foo").unwrap();
+        assert_eq!((foo.settings.port.as_str(), foo.settings.user.as_str(), foo.settings.password.as_str()), ("4001", "bob", "secret"),
+            "char/pass kept when the line omits them");
+        assert_eq!(foo.settings.tf_type, "tiny", "type kept without -T");
+        assert!(lines(&app).iter().any(|l| l == "Updated world 'foo' (localhost:4001)."));
+
+        define(&mut app, "-Tlp foo");
+        let foo = app.worlds.iter().find(|w| w.name == "foo").unwrap();
+        assert_eq!((foo.settings.hostname.as_str(), foo.settings.port.as_str()), ("localhost", "4001"), "a type-only line keeps the address");
+        assert_eq!(foo.settings.tf_type, "lp");
+        assert!(matches!(foo.settings.auto_connect_type, AutoConnectType::Lines), "lp logs in with two lines");
+        assert_eq!(foo.settings.world_type, WorldType::MudTimedPrompt, "lp: prompts arrive without a newline");
+
+        define(&mut app, "-x foo localhost 4001");
+        define(&mut app, "foo localhost 4001");
+        assert!(app.worlds.iter().find(|w| w.name == "foo").unwrap().settings.use_ssl, "no /addworld turns SSL off");
+
+        define(&mut app, "-Ttelnet tn localhost 23");
+        let tn = app.worlds.iter().find(|w| w.name == "tn").unwrap();
+        assert!(matches!(tn.settings.auto_connect_type, AutoConnectType::Prompt));
+        define(&mut app, "-Tmymush custom localhost 4201");
+        let custom = app.worlds.iter().find(|w| w.name == "custom").unwrap();
+        assert!(matches!(custom.settings.auto_connect_type, AutoConnectType::NoLogin), "a type with no library login");
+
+        // A new world may not start with "(" (that's a temporary world's).
+        define(&mut app, "(paren) localhost 1");
+        assert!(lines(&app).iter().any(|l| l == "addworld: illegal world name: (paren)"));
+    }
+
+    /// TF's argument checks: a host needs a port, and a password in a file others can read
+    /// draws a warning (once per load of the file).
+    #[cfg(unix)]
+    #[test]
+    fn test_addworld_argument_checks_and_password_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut engine = crate::tf::TfEngine::new();
+        let effects = engine.run("/addworld nm host");
+        assert!(effects.iter().any(|e| matches!(e, crate::tf::effects::TfEffect::Error { msg, .. }
+            if msg == "addworld: world nm: host and port must be both blank or both non-blank.")), "{:?}", effects);
+
+        let dir = std::env::temp_dir().join(format!("clay_addworld_perm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = dir.join("rc.tf");
+        std::fs::write(&rc, "/addworld a bob pw localhost 1\n/addworld b bob pw localhost 2\n").unwrap();
+        let warnings = |engine: &mut crate::tf::TfEngine| -> Vec<String> {
+            engine.run(&format!("/load -q {}", rc.display())).into_iter().filter_map(|e| match e {
+                crate::tf::effects::TfEffect::Error { msg, at } => Some(format!("{}: {}", at.unwrap_or_default(), msg)),
+                _ => None,
+            }).collect()
+        };
+        std::fs::set_permissions(&rc, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let shown = warnings(&mut engine);
+        assert_eq!(shown, vec![format!("{}, line 1: addworld: Warning: file contains passwords and is readable by others.", rc.display())]);
+        assert_eq!(warnings(&mut engine).len(), 1, "again on the next load of the file");
+        std::fs::set_permissions(&rc, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(warnings(&mut engine).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16404,15 +16765,13 @@ third
     }
 
     #[test]
-    fn test_execute_add_world_default_command_sets_engine_globals() {
+    fn test_addworld_default_sets_engine_globals() {
         let mut app = App::new();
         app.worlds.clear();
         app.worlds.push(send_test_world("Placeholder", false));
         app.current_world_index = 0;
 
-        execute_add_world_default_command(
-            &mut app, Some("hero".to_string()), Some("secret".to_string()), Some("/tmp/def.tf".to_string()), 0, false,
-        );
+        crate::commands::apply_world_definition(&mut app, addworld_op("DEFAULT hero secret /tmp/def.tf"), 0, false);
 
         assert_eq!(app.tf_engine.default_world_character, Some("hero".to_string()));
         assert_eq!(app.tf_engine.default_world_password, Some("secret".to_string()));
@@ -16588,10 +16947,8 @@ third
         assert_eq!(app.filter_popup.filtered_indices, vec![2], "-msimple treats '.' as a literal character, not any-char");
     }
 
-    /// Bare /limit (no options, no pattern) reports status instead of opening/changing
-    /// anything - real tf answers this silently via %?, which can't survive the queued
-    /// round trip to App, so Clay prints a short status line instead (documented
-    /// deviation - see cmd_limit's own doc comment).
+    /// Bare /limit (no options, no pattern) opens and changes nothing: as in TF, %? says
+    /// whether a limit is in effect - known to the engine through the synced screen state.
     #[test]
     fn test_limit_bare_reports_without_opening_popup() {
         let mut app = App::new();
@@ -16600,17 +16957,24 @@ third
         app.worlds.push(send_test_world("Test", false));
 
         let lines_before = app.current_world().output_lines.len();
+        app.sync_tf_world_info();
         app.tf_engine.execute("/limit");
         apply_pending_tf_console_ops(&mut app);
         assert!(!app.filter_popup.visible, "bare /limit must not open the popup");
-        assert!(
-            app.current_world().output_lines.len() > lines_before,
-            "bare /limit should print a status line"
-        );
+        assert_eq!(app.current_world().output_lines.len(), lines_before, "silent, as in TF");
+        assert_eq!(app.tf_engine.get_var("?").map(|v| v.to_string_value()).as_deref(), Some("0"));
+
+        app.tf_engine.execute("/limit x");
+        apply_pending_tf_console_ops(&mut app);
+        assert!(app.filter_popup.visible);
+        app.sync_tf_world_info();
+        app.tf_engine.execute("/limit");
+        assert_eq!(app.tf_engine.get_var("?").map(|v| v.to_string_value()).as_deref(), Some("1"));
     }
 
     /// /more toggles Clay's real more-mode setting (not just a TF variable) and persists/
-    /// broadcasts it; a bare or invalid /more is a clear error, matching real tf.
+    /// broadcasts it - in every interface, through the Setting effect; a bare or invalid
+    /// /more is a clear error, matching real tf.
     #[test]
     fn test_more_toggles_settings_more_mode_enabled() {
         let mut app = App::new();
@@ -16618,38 +16982,50 @@ third
         app.current_world_index = 0;
         app.worlds.push(send_test_world("Test", false));
         app.settings.more_mode_enabled = false;
+        let run = |app: &mut App, line: &str| {
+            let effects = app.run_tf_in_world(0, line);
+            app.apply_tf_effects_now(effects, tfrun::TfEffectCtx::for_world(0, false));
+        };
 
-        app.tf_engine.execute("/more on");
-        apply_pending_tf_console_ops(&mut app);
+        run(&mut app, "/more on");
         assert!(app.settings.more_mode_enabled, "/more on must flip Settings::more_mode_enabled");
-        assert_eq!(app.tf_engine.get_var("more").map(|v| v.to_string_value()), Some("1".to_string()));
-
-        app.tf_engine.execute("/more off");
-        apply_pending_tf_console_ops(&mut app);
-        assert!(!app.settings.more_mode_enabled);
+        assert_eq!(app.tf_engine.get_var("more").map(|v| v.to_string_value()), Some("on".to_string()));
+        run(&mut app, "/set more=off");
+        assert!(!app.settings.more_mode_enabled, "%more is Clay's more-paging");
 
         assert!(matches!(app.tf_engine.execute("/more"), tf::TfCommandResult::Error(_)),
             "bare /more is an error, matching real tf's own validated %more flag");
         assert!(matches!(app.tf_engine.execute("/more sideways"), tf::TfCommandResult::Error(_)));
     }
 
-    /// /wrap <n> sets Clay's real Settings::wrapspace (clamped to u8); /wrap on|off has
-    /// no Clay-side equivalent and only updates the TF-visible %wrap variable.
+    /// %wrapspace and %isize are Clay's wrap indent and input height; `/wrap <n>` is TF's
+    /// wrap width (%wrapsize), not the indent it used to set.
     #[test]
-    fn test_wrap_numeric_sets_settings_wrapspace() {
+    fn test_bound_settings_wrapspace_isize_and_wrap() {
         let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Test", false));
         app.settings.wrapspace = 0;
+        let run = |app: &mut App, line: &str| {
+            let effects = app.run_tf_in_world(0, line);
+            app.apply_tf_effects_now(effects, tfrun::TfEffectCtx::for_world(0, false));
+        };
 
-        app.tf_engine.execute("/wrap 5");
-        apply_pending_tf_console_ops(&mut app);
-        assert_eq!(app.settings.wrapspace, 5);
+        run(&mut app, "/wrap 5");
+        assert_eq!(app.settings.wrapspace, 0, "/wrap is not the indent");
         assert_eq!(app.tf_engine.get_var("wrapsize").map(|v| v.to_string_value()), Some("5".to_string()));
-        assert_eq!(app.tf_engine.get_var("wrap").map(|v| v.to_string_value()), Some("1".to_string()));
+        assert_eq!(app.tf_engine.get_var("wrap").map(|v| v.to_string_value()), Some("on".to_string()));
 
-        app.tf_engine.execute("/wrap off");
-        apply_pending_tf_console_ops(&mut app);
-        assert_eq!(app.settings.wrapspace, 5, "on/off has no Clay-side wrap-width equivalent");
-        assert_eq!(app.tf_engine.get_var("wrap").map(|v| v.to_string_value()), Some("off".to_string()));
+        run(&mut app, "/set wrapspace=4");
+        assert_eq!(app.settings.wrapspace, 4);
+        run(&mut app, "/isize 5");
+        assert_eq!(app.input_height, 5);
+        run(&mut app, "/isize 99");
+        assert_eq!(app.input_height, 15, "clamped to what Clay allows");
+        assert_eq!(app.tf_engine.get_var("isize").map(|v| v.to_string_value()), Some("15".to_string()));
+        // Mirrored values are Clay's, not TF variables: never written to [tf_globals].
+        assert!(!app.tf_engine.persistable_globals().iter().any(|(n, _)| ["more", "wrapspace", "isize"].contains(&n.as_str())));
     }
 
     // ======================================================================
@@ -17369,7 +17745,7 @@ third
         app.ws_broadcast_log.lock().unwrap().clear();
         assert!(!app.worlds[0].protocol.stats.is_empty(), "sanity check: the world must actually have stats before disconnecting");
 
-        app.handle_disconnected(0);
+        app.handle_disconnected(0, &crate::telnet_reader::CloseReason::ByServer);
         assert!(app.worlds[0].protocol.stats.is_empty(), "clear_connection_state must clear World::stats on disconnect");
         assert!(app.worlds[0].protocol.stats_dirty, "the clear itself must mark the world dirty so it propagates");
 
@@ -18807,7 +19183,7 @@ third
         // Non-fatal close while connected: handed back as Disconnected for the loop.
         assert!(matches!(
             app.handle_chat_event(owner.clone(), 5, chat::ChatEvent::Closed { reason: "lost".into(), fatal: false }),
-            Some(AppEvent::Disconnected(ref n, 5)) if n == "Disc"
+            Some(AppEvent::Disconnected(ref n, 5, crate::telnet_reader::CloseReason::Chat(ref r))) if n == "Disc" && r == "lost"
         ));
         // Fatal close: disconnected here, and auto-reconnect is suppressed.
         app.worlds[0].settings.auto_reconnect_secs = 10;
@@ -18899,6 +19275,151 @@ third
         app
     }
 
+    /// Connect `app`'s first world (as the client path does) and return what it sent.
+    fn connect_and_collect_sends(app: &mut App) -> Vec<String> {
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(16);
+        let name = app.worlds[0].name.clone();
+        let id = app.worlds[0].connection_id;
+        app.handle_world_connect_result(&name, id, ConnectOrigin::Client { report_failure: true },
+            Ok((tx, None, false, None, None)));
+        let mut sent = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let WriteCommand::Text(t) = cmd {
+                sent.push(t);
+            }
+        }
+        sent
+    }
+
+    /// TF's connect sequence: the login style a world's type gives (one "connect" line, or
+    /// LP/Diku's two lines), the DEFAULT world's character for a world without one, the
+    /// mfile then the CONNECT hook then the LOGIN hook, and %login turning it all off.
+    #[test]
+    fn test_tf_connect_sequence_logins_and_hooks() {
+        let mut app = client_connect_app(Encoding::Utf8);
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["connect bob pw"]);
+
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.auto_connect_type = AutoConnectType::Lines;
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["bob", "pw"]);
+
+        // A world without its own character uses the DEFAULT world's.
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.user.clear();
+        app.worlds[0].settings.password.clear();
+        app.tf_engine.default_world_character = Some("dflt".into());
+        app.tf_engine.default_world_password = Some("dpw".into());
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["connect dflt dpw"]);
+
+        // %login off: no login, no LOGIN hook.
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.tf_engine.execute("/def -hLOGIN onlogin = /echo LOGIN-HOOK %1");
+        app.tf_engine.execute("/set login=off");
+        assert!(connect_and_collect_sends(&mut app).is_empty());
+        let texts = |app: &App| app.worlds[0].output_lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>();
+        assert!(!texts(&app).iter().any(|t| t.contains("LOGIN-HOOK")));
+
+        // The macro file loads first, then CONNECT, then the login and LOGIN.
+        let dir = std::env::temp_dir().join(format!("clay_mfile_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mfile = dir.join("fansi.tf");
+        std::fs::write(&mfile, "/echo MFILE\n").unwrap();
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.tf_engine.world_files.insert("fansi".into(), mfile.display().to_string());
+        app.tf_engine.execute("/def -hCONNECT onconnect = /echo CONNECT-HOOK %1");
+        app.tf_engine.execute("/def -hLOGIN onlogin = /echo LOGIN-HOOK %1");
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["connect bob pw"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = texts(&app);
+        let pos = |needle: &str| t.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in {t:?}"));
+        assert!(pos("MFILE") < pos("CONNECT-HOOK Fansi") && pos("CONNECT-HOOK Fansi") < pos("LOGIN-HOOK Fansi"), "{t:?}");
+    }
+
+    /// A trigger's display attributes are in the stored line (so every interface shows
+    /// them): -a for the whole line, -P for a part; %hilite off shows nothing; a gagged
+    /// line stays gagged whatever else it has; only fired triggers count.
+    #[test]
+    fn test_trigger_attributes_are_stored_in_the_line() {
+        let mut app = client_connect_app(Encoding::Utf8);
+        let _ = connect_and_collect_sends(&mut app);
+        app.tf_engine.execute("/def -aBu -t\"*hello*\" hl");
+        app.tf_engine.execute("/def -F -mregexp -P1Cred -t\"(dragon)\" part");
+        app.tf_engine.execute("/def -aBg -t\"*secret*\" hidden");
+        app.process_server_data(0, b"say hello there\r\na red dragon here\r\nthe secret word\r\n", 24, 80, false);
+        let line = |app: &App, needle: &str| app.worlds[0].output_lines.iter().find(|l| l.text.contains(needle)).cloned()
+            .unwrap_or_else(|| panic!("{needle}"));
+        assert_eq!(line(&app, "hello").text, "\x1b[1;4msay hello there\x1b[0m");
+        assert_eq!(line(&app, "dragon").text, "a red \x1b[31mdragon\x1b[0m here");
+        assert!(line(&app, "secret").gagged, "a gag wins over its display attributes");
+
+        app.tf_engine.execute("/set hilite=off");
+        app.process_server_data(0, b"hello again\r\n", 24, 80, false);
+        assert_eq!(line(&app, "hello again").text, "hello again");
+    }
+
+    /// TF's hooks for a background world: BGTEXT on each packet, BGTRIG when a trigger
+    /// fired, PREACTIVITY then ACTIVITY only on the first activity since it was looked at;
+    /// PROMPT for a prompt (a matching hook takes it over); PROCESS for a /repeat.
+    #[test]
+    fn test_background_prompt_and_process_hooks() {
+        let mut app = client_connect_app(Encoding::Utf8);
+        let _ = connect_and_collect_sends(&mut app);
+        app.worlds.push(World::new("Other"));
+        app.current_world_index = 1; // world 0 is in the background now
+        for line in [
+            "/def -F -hBGTEXT h1 = /echo -wOther BGTEXT %1",
+            "/def -F -hBGTRIG h2 = /echo -wOther BGTRIG %1",
+            "/def -F -hPREACTIVITY h3 = /echo -wOther PREACTIVITY %1",
+            "/def -F -hACTIVITY h4 = /echo -wOther ACTIVITY %1",
+            "/def -t\"*ping*\" pinger = /:",
+        ] {
+            app.tf_engine.execute(line);
+        }
+        app.process_server_data(0, b"first ping\r\n", 24, 80, false);
+        app.process_server_data(0, b"second line\r\n", 24, 80, false);
+        let other: Vec<String> = app.worlds[1].output_lines.iter().map(|l| l.text.clone()).collect();
+        let count = |needle: &str| other.iter().filter(|l| l.as_str() == needle).count();
+        assert_eq!(count("BGTEXT Fansi"), 2, "{other:?}");
+        assert_eq!(count("BGTRIG Fansi"), 1, "{other:?}");
+        assert_eq!(count("PREACTIVITY Fansi"), 1, "{other:?}");
+        assert_eq!(count("ACTIVITY Fansi"), 1, "{other:?}");
+        let pre = other.iter().position(|l| l == "PREACTIVITY Fansi").unwrap();
+        let act = other.iter().position(|l| l == "ACTIVITY Fansi").unwrap();
+        assert!(pre < act);
+
+        // PROMPT: a matching hook takes the prompt; -q leaves it to Clay.
+        app.current_world_index = 0;
+        app.tf_engine.execute("/def -hPROMPT onprompt = /echo PROMPT-HOOK %*");
+        app.handle_prompt_text(0, "HP: 10> ", PromptSource::Marker);
+        assert!(app.worlds[0].prompt.is_empty() || !app.worlds[0].prompt.contains("HP"));
+        assert!(app.worlds[0].output_lines.iter().any(|l| l.text == "PROMPT-HOOK HP: 10>"));
+
+        app.tf_engine.execute("/def -hPROCESS onproc = /echo PROCESS %1");
+        let effects = app.run_tf_in_world(0, "/repeat -60 1 /echo tick");
+        app.apply_tf_effects_now(effects, tfrun::TfEffectCtx::for_world(0, false));
+        assert!(app.worlds[0].output_lines.iter().any(|l| l.text.starts_with("PROCESS ")));
+    }
+
+    /// A quiet login (`/connect -q`, %quiet) gags what follows until the MUD's
+    /// end-of-intro marker (TF: "Use the WHO command", "### end of messages ###").
+    #[test]
+    fn test_quiet_login_gags_until_the_marker() {
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].quiet_login = true;
+        let _ = connect_and_collect_sends(&mut app);
+        app.process_server_data(0, b"Welcome to the MUD\r\nNews: blah\r\nUse the WHO command to see who is on.\r\nYou are in a room.\r\n", 24, 80, false);
+        let shown: Vec<(String, bool)> = app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.gagged)).collect();
+        for (text, gagged) in &shown {
+            if text.contains("Welcome") || text.contains("News") || text.contains("WHO command") {
+                assert!(*gagged, "{text} gagged: {shown:?}");
+            }
+            if text.contains("You are in a room") {
+                assert!(!*gagged, "after the marker, output shows again: {shown:?}");
+            }
+        }
+        assert!(app.worlds[0].quiet_login_lines.is_none());
+    }
+
     #[test]
     fn test_client_connect_of_a_fansi_world_runs_client_detection() {
         // The GUI/web connect path used to set the connected state by hand, skipping
@@ -18907,7 +19428,7 @@ third
         let mut app = client_connect_app(Encoding::Fansi);
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
         app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
-            Some((tx, None, false, None, None)));
+            Ok((tx, None, false, None, None)));
         assert!(app.worlds[0].connected);
         assert!(app.worlds[0].fansi_detect_until.is_some(), "detection window opened");
         assert_eq!(app.worlds[0].fansi_login_pending.as_deref(), Some("connect bob pw"),
@@ -18928,7 +19449,7 @@ third
         let mut app = client_connect_app(Encoding::Utf8);
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
         app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
-            Some((tx, None, false, None, None)));
+            Ok((tx, None, false, None, None)));
         match rx.try_recv() {
             Ok(WriteCommand::Text(t)) => assert_eq!(t, "connect bob pw"),
             other => panic!("expected the auto-login, got {:?}", other.map(|_| ())),
@@ -18940,6 +19461,6 @@ third
         app.worlds[0].skip_auto_login = true;
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
         app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
-            Some((tx, None, false, None, None)));
+            Ok((tx, None, false, None, None)));
         assert!(rx.try_recv().is_err(), "no login with -l");
     }

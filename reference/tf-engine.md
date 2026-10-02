@@ -1,11 +1,9 @@
 # TF (TinyFugue) Engine Reference
 
 Clay includes a TinyFugue (TF) 5.0 compatibility layer (`src/tf/`). Only `/`
-dispatches a command. A line starting with `;`, a bare `#`, or `#` followed
-by a space is a **comment** — matching TF's own script convention, not a
-second command prefix (`/load`, and loop/`/if` bodies loaded from a file,
-skip such lines entirely; typed at the console, an unrecognized `#...` line
-is just sent to the current world like any other non-`/` text). See
+dispatches a command. In a loaded file, a line starting with `;` or `#` in
+column 0 is a **comment**, as in TF; typed at the console, a `#...` line is just
+sent to the current world like any other non-`/` text. See
 `docs/markdown/06-tf-commands.md` for the full command list grouped like
 `/help commands`, and `TINYFUGUE-COMPAT.md` for the rulings behind every
 place Clay's behavior differs from real TF's.
@@ -15,6 +13,10 @@ place Clay's behavior differs from real TF's.
 On the console, typed input goes through the TF engine first (a native Clay
 command bounces back via `TfCommandResult::ClayCommand`); WS/GUI/web/daemon
 clients run Clay's own native command parser first and fall through to TF.
+Either way, what a TF command did - output, sends, Clay commands, world
+definitions, connects, settings, shell escapes - comes back as an ordered list
+of `TfEffect`s (`src/tf/effects.rs`) that the App applies in that order, in
+every interface (`src/tfrun.rs`).
 Within the TF engine itself, one name resolves in this order:
 
 1. `/@name` forces the **builtin**, bypassing a same-named macro (TF's own
@@ -56,8 +58,9 @@ Within the TF engine itself, one name resolves in this order:
 - `%{kbnum}` - The pending numeric-prefix magnitude (`Esc-0`..`Esc-9`/`Esc--`); consumed and cleared by movement/scroll/delete actions and `/dokey`
 - `%{insert}` - `1` when insert mode is on, `0` when overwrite mode is on (`Insert`/`Esc-v`)
 - `%{TFLIBDIR}` - The resolved TinyFugue library directory (see "Loading Library Files" below)
-- `%{TFPATH}` - Colon-separated search path for `/load`/`/require` (checked before `%{TFLIBDIR}`)
+- `%{TFPATH}` - Space-separated search path for `/load`/`/require` (`\ ` for a space in a name); when it is set, `%{TFLIBDIR}` is not searched
 - `%{maxpri}` - `2147483647`, seeded at engine start (kbfunc.tf's own `-ip%maxpri` idiom needs this without loading stdlib.tf first)
+- TF's special variables (`src/tf/special_vars.rs`) are seeded with TF's defaults wherever that changes nothing Clay does by default, and never saved while unchanged. `%more`, `%wrapspace`, `%isize`, `%insert` and `%visual` are Clay's own settings (setting one changes Clay, in every interface; they are mirrored, not saved as TF variables). `%sub` is off: typed lines aren't expanded.
 
 ## Output
 
@@ -66,9 +69,9 @@ Within the TF engine itself, one name resolves in this order:
   - Colors: `@{Crgb}` foreground (r,g,b = 0-5), `@{BCrgb}` background, `@{Cname}` named colors
 - `/send [-W] [-T<type>] [-w[world]] [-n] [-h] text` - Send text to a world, bypassing macro/alias expansion. `-W` = every connected world; `-T<type>` = every connected world of that type; `-n` = no end-of-line marker; `-h` fires the SEND hook first (off by default for `/send`)
 - `/beep [on|off]` - Terminal bell (bare: ring it now; `on`/`off` toggles the setting)
-- `/quote [options] [prefix]source[suffix]` - Generate and send/echo/execute text from a file, a command's output, a shell command, or literal text
-  - Sources: `'"file"'` (file), `` `"command" `` (Clay/TF command's own output, finding 14), `!"command"` (shell output), or literal text
-  - Options: `-dsend` (default) / `-decho` (display locally) / `-dexec` (run each line back through the engine); `-w<world>`
+- `/quote [options] [pre]source[suf]` - TF's: lines from a file (`'`), shell command (`!`, stderr included), TF command (`` ` ``, expanded per `-s<sub>`, default full) or `/recall` (`#`), each with <pre>/<suf>, sent (`-dsend`, the default without a <pre>), echoed (`-decho`) or run unexpanded (`-dexec`, the default with a <pre>). `\` makes a source character in <pre> ordinary; an unquoted source runs to the end of the line.
+  - Timing: `-S` now; otherwise a background process (`/ps`, `/kill`, `%?` = pid) doing a line every `-<time>` (default `%ptime`; the first after one interval; `-0` all at once) or, with `-P`/`%lpquote`, at each prompt
+  - `-w<world>` (must exist; bare: this one); `-A` (Clay) keeps escape sequences
 - `/substitute [-p] text` - Run `text` through the current world's SUBSTITUTE hook processing (`-p`: preview only, doesn't display)
 - `/hilite [pattern [= response]]`, `/nohilite [pattern]`, `/partial regexp` - Shortcuts for a highlighting trigger (`/help hilite`/`nohilite`/`partial` for the exact `/def` equivalents)
 - `/gag <pattern>` / `/ungag <pattern>` - Shortcuts for a gag trigger
@@ -157,6 +160,15 @@ fires when `/load`/`/require` can't find or open a file — a gagged LOADFAIL
 hook suppresses the default error message (stdlib.tf's own guard around an
 optional, legitimately-missing `local.tf` relies on exactly this).
 
+The connection hooks carry real tf's arguments (`telnet_reader::CloseReason`,
+`daemon::ConnectFailure`): CONNECT gets the world and, for a direct rustls TLS
+connection, its cipher as OpenSSL names it (`daemon::openssl_cipher_name`); DISCONNECT gets `<world>` when the server closed the
+connection (a TLS close without close_notify too), `<world> recv <error>` for a failed
+read; CONFAIL `<world> <address> <port>: <reason>`, and ICONFAIL the same for each
+address of a name that failed before the next was tried - on every connect path. A
+gagged hook hides Clay's own message for the event (judged with the event's world as
+TF's current one, so `-w`/`-T` apply). `/dc` fires no DISCONNECT. PROXY never fires.
+
 ## Key Bindings
 
 - `/bind [sequence [= command]]` - `/bind seq = cmd` is exactly `/def -b"seq" = cmd` (substitution deferred to keypress, not bind time); bare `/bind` lists everything, `/bind seq` shows one binding
@@ -171,7 +183,8 @@ optional, legitimately-missing `local.tf` relies on exactly this).
 - `/load [-q] filename` - Load and execute a TF script file. Comments: a line starting with `;`, a bare `#`, or `#` followed by a space. Line continuation: trailing `\` (use `%\` for a literal trailing backslash).
 - `/require [-q] filename` - Like `/load`, but does nothing if the file already registered a `/loaded` token
 - `/loaded token` - Mark a file loaded (for `/require`); should be the file's first command
-- File search order for a bare filename (no `/`): the current directory (`/lcd`/actual cwd), then each directory in `%{TFPATH}` (colon-separated), then `%{TFLIBDIR}`
+- File search order for a bare filename (no `/`): the current directory (`/lcd`/actual cwd), then each directory in `%{TFPATH}` (space-separated) - or `%{TFLIBDIR}` when `%{TFPATH}` is blank. `~`/`~user` are expanded first.
+- File rules (`builtins::load_lines`, all checked against real tf): `;`/`#` comments in column 0 only; a plain-text line aborts (`% <file>, line N: Invalid command. Aborting.`, followed by TF's own "last command is incomplete" notice); an indented line starting a command warns `% <file>: line N: Warning: possibly missing trailing \`; errors are tagged `% <file>, line N: ` (or `lines A-B`) via `TfEffect::located`, Clay commands too (so an unknown one names its line); `/load -q` quiets nested loads (`TfEngine::quiet_loads`).
 - `%{TFLIBDIR}` defaults to `$TFLIBDIR` if that names a real directory, else `/usr/share/tf5/tf-lib` if it exists (the path the `tf5` distro package installs to), else unset. **Nothing GPL-licensed ships with Clay** — the real TF library is only ever *referenced* on a machine that already has it installed; a script that `/require`s a library file simply fails to find it (or the whole feature is skipped) on a machine without one.
 - **TinyFugue does not expand `%var`, `$[...]`, or `$(...)` on a top-level line read from a file** — only inside a macro body, or when a command explicitly asks for it (`/eval`). A bare top-level `/echo len=$[strlen("abc")]` in a loaded file prints the *literal*, unexpanded text under real TF. Clay matches this: substitution only happens inside macro bodies and via `/eval`'s own pass, never unconditionally on a bare top-level command's arguments read from a file. See `tests/tf/README.md`'s "C.12 rule" for how the test suite writes probes that need expansion.
 - `/exit [n]` - Abort loading the current file early (and `n` enclosing `/load`'s, default 1)
@@ -191,13 +204,18 @@ optional, legitimately-missing `local.tf` relies on exactly this).
 - `/runtime command` - Run `command`, then print `real=<secs> cpu=<secs>`
 - `/trigger [-ln] [-g] [-w[world]] [-h[event]] [-d] text` - Run `text` through the real trigger (or hook, with `-h`) matcher as if it arrived from a world. `-n`/`-l` list matches without firing; `-d` deletes matching triggers (Clay extra)
 - `/version` - Show TF compatibility version; `/tfhelp [topic]` - TF text help (vs `/help`'s Clay popup)
-- `/ps [-srq] [-w[world]] [pid]` - List background `/repeat`/`/quote` processes; `/kill pid...` - kill one or more
-- `/repeat [-w[world]] {-time|-S|-P} count command` - Schedule a repeated command (`-p priority` sets ordering; higher runs first)
-- `/sh [-q] [command]` - Execute a shell command (bare `/sh` opens an interactive shell where supported)
-- `/recall [-D] [-w<world>] [-ligv] [-t[format]] [-a<attrs>] [-m<style>] [-A/-B/-C<n>] [#]range [pattern]` - Search output/input history; `-D` (Clay extra) also searches the long-term scrollback archive
-- `/histsize [-w<world>] n` - Set history size; `/localecho` - toggle local echo; `/sub`/`/substitute` - run text through SUBSTITUTE hook processing
+- `/ps [-srq] [-w[world]] [pid]` - TF's process table (PID NEXT T D WORLD PTIME COUNT COMMAND; `-s` pids one a line); `/kill pid...` - kill one or more
+- `/repeat [-w[world]] [-n] {-time|-S|-P} count command` - Run `command` (a macro body) `count` times (`i`: forever), the first an interval from now (`-n`: now; default interval `%ptime`; `-P` on prompts); `-p priority` (Clay) orders processes due together
+- `/sh [-q] [command]` - TF's shell escape: on Clay's console, runs on the terminal (Clay's screen put away; `%shpause` waits for a key after; `%?` = exit status); from a client or a console-less Clay, a command runs in the background. `/suspend` stops Clay like `^Z`
+- `/prompt [-a<attrs>] [-p] text`, `prompt(text)` - Make `text` the current world's prompt (a PROMPT hook that matches takes the prompt over)
+- `/visual [on|off]` - Clay's console is always visual: `off` is refused (`% Clay's console has no non-visual mode.`) and `%visual` reads `on`
+- Status line (`src/tf/status.rs`): `/status_add [-r<N>] [-A[<field>]] [-B[<field>]] [-s<N>] [-x] [-c] field...`, `/status_rm [-r<N>] name`, `/status_edit [-r<N>] field`, `/status_defaults`, `/status_save name`, `/status_restore name`, `/clock [on|off|format]`, `status_fields([row])`; fields `name[:width[:attrs]]`, formats in `%status_int_<name>`/`%status_var_<name>`, `%status_height`, `%status_pad`, `%status_attr`. Clay's own bar is shown until a script changes the status line.
+- `/recall [-D] [-w<world>] [-ligv] [-t[format]] [-a<attrs>] [-m<style>] [-A/-B/-C<n>] [#]range [pattern]` - Search output/input history; `-D` (Clay extra) also searches the long-term scrollback archive. Lines with the `G` (nohistory) attribute are never in it; `-a<attrs>` shows lines without those of their own attributes (`-ag`: gagged lines too)
+- `/recordline [-lig] [-w[<world>]] [-t<time>] [-a<attrs>] [-p] [--] text` - Record a line into a history without showing, logging or archiving it (`-g`, global, by default; `-i` also feeds the console's Up/Down history)
+- `%textdiv` (`on`/`always`/`clear`/`off`) and `%textdiv_str` - Once a script sets them, a world brought forward shows TF's divider (or, for `clear`, no old text) in every interface, in place of Clay's ▶ markers; `/unset textdiv` restores the markers
+- `/histsize [-lig] [-w<world>] [n]` - Says Clay keeps whole histories (nothing to resize); `/localecho [on|off]` - with no argument `%?` = local echo on; on/off negotiate telnet ECHO (DONT/DO); `/sub [off|on|full]` - how typed lines are expanded; `/substitute` - replace the triggering line
 - `/input text` - Insert text into the input buffer at the cursor; `/grab [world]` - grab the world's last output line into the input buffer
-- `/more [-w<world>] [on|off]` / `/wrap [-w<world>] n` - Console-only: more-mode pause and word-wrap width
+- `/more [on|off]` - Clay's more-paging, in every interface (`%more`); `/wrap [n]` - `%wrapsize`/`%wrap` (TF's; Clay still wraps at the window's edge)
 - `/limit [-v] [-a] [-m<style>] [pattern]` / `/unlimit` / `/relimit` - Console-only: open/close/reapply the F4 filter popup as a text filter (no equivalent live-updating filter view exists on web/GUI clients today — a remote client's own `/limit` reaches the shared TF engine but nothing drains it until the console next processes a typed command)
 - `/restrict [none|shell|file|world]` - Raise (never lower) the sandboxing level: `shell` disables `/sh`/`/sys`/`` /quote ! ``; `file` (implies `shell`) also disables `/load`/`/require`/`/save`/`/lcd`/`/cd`/`/log`/`` /quote ' ``; `world` (implies `file`) also disables `/addworld` and connecting to an arbitrary host/port
 - `/xtitle text` - Console-only: set the terminal title
@@ -206,10 +224,11 @@ optional, legitimately-missing `local.tf` relies on exactly this).
 ## Console-Only Commands
 
 A few commands only make sense (or are currently only wired up) on the
-interactive console, not the web/GUI/remote clients: `/limit`/`/unlimit`/
-`/relimit` (drive the console's own F4 filter popup), `/xtitle` (sets the
-*terminal's* title), and the `expand_line` key action (`Esc-^E` — no wire
-path exists today for a remote client to ask the server to substitute its
+interactive console, not the web/GUI/remote clients: an interactive `/sh` and
+`/suspend` (they need the terminal), `/limit`/
+`/unlimit`/`/relimit` (drive the console's own F4 filter popup), `/xtitle`
+(sets the *terminal's* title), and the `expand_line` key action (`Esc-^E` — no
+wire path exists today for a remote client to ask the server to substitute its
 own input line in place).
 
 ## Examples

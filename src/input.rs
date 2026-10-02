@@ -322,6 +322,18 @@ pub fn scramble_words_with(text: &str, rng: &mut Scrambler) -> String {
     out.into_iter().collect()
 }
 
+/// What TF's history substitution made of a typed line (see
+/// `InputArea::substitute_history`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistorySub {
+    /// The line isn't of the form `^old^new`.
+    NotSubstitution,
+    /// The line to run instead.
+    Substituted(String),
+    /// No history line contains `old` (TF says "% No match.").
+    NoMatch,
+}
+
 pub struct InputArea {
     pub buffer: String,
     pub cursor_position: usize,
@@ -647,6 +659,28 @@ impl InputArea {
         }
         self.clear();
         input
+    }
+
+    /// TF's history substitution (`/help history`): a typed line `^old^new` finds the most
+    /// recent history line containing `old` and replaces the first `old` in it with `new`
+    /// (everything after the second `^`, carets included). `old` may be empty: `^^x`
+    /// puts `x` in front of the last line. Call it after `take_input`; history ends up as
+    /// TF keeps it - the new line in place of the `^old^new` one, nothing for a failure.
+    pub fn substitute_history(&mut self, line: &str) -> HistorySub {
+        let Some((old, new)) = line.strip_prefix('^').and_then(|rest| rest.split_once('^')) else {
+            return HistorySub::NotSubstitution;
+        };
+        if self.history.last().is_some_and(|last| last == line) {
+            self.history.pop();
+        }
+        match self.history.iter().rev().find(|h| h.contains(old)) {
+            Some(found) => {
+                let substituted = found.replacen(old, new, 1);
+                self.history.push(substituted.clone());
+                HistorySub::Substituted(substituted)
+            }
+            None => HistorySub::NoMatch,
+        }
     }
 
     pub fn history_prev(&mut self) {
@@ -1427,6 +1461,40 @@ impl Default for InputArea {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Type `line` the way Enter does (recorded in history), then substitute.
+    fn type_and_substitute(input: &mut InputArea, line: &str) -> HistorySub {
+        input.buffer = line.to_string();
+        let taken = input.take_input(true);
+        input.substitute_history(&taken)
+    }
+
+    /// TF's `^old^new`, each case checked against real tf 5.0 beta 8: the first `old` in
+    /// the most recent line containing it; `new` runs to the end of the line, carets and
+    /// all; an empty `old` prefixes the last line; and history keeps the new line in
+    /// place of the `^` one, and nothing for a failed one.
+    #[test]
+    fn test_substitute_history_matches_tf() {
+        let mut input = InputArea::default();
+        // The same session as the real-tf probe, line for line.
+        assert_eq!(type_and_substitute(&mut input, "/echo hello world hello"), HistorySub::NotSubstitution);
+        assert_eq!(type_and_substitute(&mut input, "^hello^bye"),
+            HistorySub::Substituted("/echo bye world hello".into()));
+        assert_eq!(type_and_substitute(&mut input, "^zzz^q"), HistorySub::NoMatch);
+        assert_eq!(type_and_substitute(&mut input, "/echo abc"), HistorySub::NotSubstitution);
+        assert_eq!(type_and_substitute(&mut input, "^b^"), HistorySub::Substituted("/echo ac".into()));
+        assert_eq!(type_and_substitute(&mut input, "^c^X^"), HistorySub::Substituted("/eX^ho ac".into()));
+        assert_eq!(type_and_substitute(&mut input, "/echo one two"), HistorySub::NotSubstitution);
+        assert_eq!(type_and_substitute(&mut input, "^^z"), HistorySub::Substituted("z/echo one two".into()));
+        assert_eq!(input.history, vec![
+            "/echo hello world hello", "/echo bye world hello", "/echo abc", "/echo ac", "/eX^ho ac",
+            "/echo one two", "z/echo one two",
+        ]);
+        // Not the form: no second caret.
+        for line in ["^", "^abc", "plain", "a^b^c"] {
+            assert_eq!(input.substitute_history(line), HistorySub::NotSubstitution, "{line}");
+        }
+    }
 
     #[test]
     fn test_kbnum_digit_accumulates() {

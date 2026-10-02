@@ -6,32 +6,32 @@
 //! - Hook firing on connect/disconnect events
 //! - Conversion between TF macros and Clay actions
 
-use super::{TfEngine, TfCommandResult, TfHookEvent, TfMatchMode};
+use super::{TfEngine, TfHookEvent, TfMatchMode};
+use super::effects::TfEffect;
 use super::macros;
 use super::hooks;
-use super::control_flow;
 
-/// Result of processing TF triggers against a line
+/// Result of processing TF triggers against a line (or firing a hook event)
 #[derive(Debug, Default)]
 pub struct TfTriggerResult {
-    /// Commands to send to the MUD server
-    pub send_commands: Vec<String>,
-    /// Commands to execute as Clay commands
-    pub clay_commands: Vec<String>,
-    /// Messages to display locally
-    pub messages: Vec<String>,
+    /// Everything the fired macros did, in the order they did it (see
+    /// `super::effects`) - output, sends, Clay commands, errors.
+    pub effects: Vec<TfEffect>,
     /// Whether to gag (suppress) the line
     pub should_gag: bool,
-    /// Any errors that occurred
-    pub errors: Vec<String>,
     /// Substituted text (replaces the original line)
     pub substitution: Option<(String, String)>,  // (text, attrs)
-    /// `fire_event` only: a non-quiet hook macro matched. Per `/help hooks`'
+    /// A non-quiet macro matched: for `process_line`, a trigger (BGTRIG); for
+    /// `fire_event`, a hook. Per `/help hooks`'
     /// SEND rule ("If a SEND hook matches the text that would be sent, the text
     /// is not sent (unless the hook was defined with /def -q)"), a SEND caller
     /// uses this to decide whether to suppress sending the original text - see
     /// `App::fire_tf_hook`.
     pub matched_non_quiet: bool,
+    /// The fired triggers' attributes (see `macros::TriggerOutcome`).
+    pub attrs: super::TfAttributes,
+    /// Their `-P` parts: (start, end) in characters of the line.
+    pub partials: Vec<(usize, usize, super::TfAttributes)>,
 }
 
 /// Process a line of MUD output against all TF triggers
@@ -43,60 +43,24 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>, worl
     let plain_line = crate::util::strip_ansi_codes(line);
     let plain_line = plain_line.trim_end();
 
-    // Get trigger results from the macro system
-    let command_results = macros::process_triggers(engine, plain_line, world, world_type);
+    // Run the matching triggers in their own frame, collecting what they did in order.
+    // Their control results (a stray /exit or /return) have nothing to act on here.
+    engine.begin_frame();
+    let outcome = engine.with_context_world(world, |engine| {
+        macros::process_triggers_outcome(engine, plain_line, world, world_type)
+    });
+    result.effects = engine.end_frame();
 
-    // Process each result
-    for cmd_result in command_results {
-        match cmd_result {
-            TfCommandResult::Success(Some(msg)) => {
-                result.messages.push(msg);
-            }
-            TfCommandResult::SendToMud(cmd) => {
-                result.send_commands.push(cmd);
-            }
-            TfCommandResult::ClayCommand(cmd) => {
-                result.clay_commands.push(cmd);
-            }
-            TfCommandResult::Error(e) if control_flow::parse_break_marker(&e).is_none() => {
-                result.errors.push(e);
-            }
-            _ => {}
-        }
+    // What the fired macros' attributes do to the line: gag it, ring the bell, show it
+    // in their colors (only the macros that fired count - a gag on a lower priority
+    // than a non-fall-through match doesn't, as in TF).
+    result.should_gag = outcome.attrs.gag;
+    if outcome.attrs.bell {
+        result.effects.push(TfEffect::Output { text: "\x07".to_string(), attrs: String::new(), world: None, plain: None });
     }
-
-    // Check if any matching macro has gag attribute
-    for macro_def in &engine.macros {
-        if !macro_def.attributes.gag {
-            continue;
-        }
-
-        let trigger = match &macro_def.trigger {
-            Some(t) if !t.pattern.is_empty() => t,
-            _ => continue,
-        };
-
-        if macros::match_trigger(trigger, plain_line).is_none() {
-            continue;
-        }
-
-        // Check world restriction
-        if let Some(ref macro_world) = macro_def.world {
-            if let Some(current_world) = world {
-                if macro_world != current_world {
-                    continue;
-                }
-            }
-        }
-
-        // Check world-type restriction (-T)
-        if !macros::world_type_matches(macro_def, world_type) {
-            continue;
-        }
-
-        result.should_gag = true;
-        break;
-    }
+    result.attrs = outcome.attrs;
+    result.partials = outcome.partials;
+    result.matched_non_quiet = outcome.fired_non_quiet;
 
     // Check for pending substitution
     if let Some(sub) = engine.pending_substitution.take() {
@@ -112,26 +76,10 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>, worl
 pub fn fire_event(engine: &mut TfEngine, event: TfHookEvent, arg: &str) -> TfTriggerResult {
     let mut result = TfTriggerResult::default();
 
+    engine.begin_frame();
     let outcome = hooks::fire_hook(engine, event, arg);
+    result.effects = engine.end_frame();
     result.matched_non_quiet = outcome.matched_non_quiet;
-
-    for cmd_result in outcome.results {
-        match cmd_result {
-            TfCommandResult::Success(Some(msg)) => {
-                result.messages.push(msg);
-            }
-            TfCommandResult::SendToMud(cmd) => {
-                result.send_commands.push(cmd);
-            }
-            TfCommandResult::ClayCommand(cmd) => {
-                result.clay_commands.push(cmd);
-            }
-            TfCommandResult::Error(e) => {
-                result.errors.push(e);
-            }
-            _ => {}
-        }
-    }
 
     result
 }
@@ -229,8 +177,7 @@ mod tests {
     fn test_process_line_no_triggers() {
         let mut engine = TfEngine::new();
         let result = process_line(&mut engine, "Hello world", None, None);
-        assert!(result.send_commands.is_empty());
-        assert!(result.clay_commands.is_empty());
+        assert!(result.effects.is_empty());
         assert!(!result.should_gag);
     }
 
@@ -251,7 +198,7 @@ mod tests {
         });
 
         let result = process_line(&mut engine, "Hello world", None, None);
-        assert!(result.send_commands.contains(&"say matched!".to_string()));
+        assert!(result.effects.iter().any(|e| matches!(e, TfEffect::Send { text, .. } if text == "say matched!")));
     }
 
     #[test]

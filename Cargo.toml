@@ -32,7 +32,6 @@ native-tls = { version = "0.2", optional = true }
 # must stay pinned to ring the same way - see TofuVerifier in platform.rs.
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["logging", "tls12", "ring"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-pemfile = { version = "1", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 
 # WebSocket support (TLS features are conditional on backend)
@@ -134,7 +133,7 @@ tokio = { version = "1", features = ["test-util"] }
 [features]
 default = ["rustls-backend", "native-audio", "ssh-transport"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
-rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
+rustls-backend = ["tokio-rustls", "rustls", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
 native-audio = ["rodio"]
 webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk", "gio", "glib", "x11rb"]
 ssh-transport = ["russh"]

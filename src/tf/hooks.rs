@@ -53,42 +53,65 @@ pub struct HookOutcome {
 /// carefully skip-if-already-executed each other, which is strictly more state
 /// for the same result and only ever covered *named* macros.
 pub fn fire_hook(engine: &mut TfEngine, event: TfHookEvent, arg: &str) -> HookOutcome {
-    let mut outcome = HookOutcome::default();
-    let mut to_remove = Vec::new();
+    let selected = select_hooks(engine, event, arg);
+    run_selected_hooks(engine, selected, arg)
+}
 
+/// The macros a `fire_hook` for `event`/`arg` would run, in order: highest priority
+/// first, stopping after the first non-fall-through match. Split out from running them so
+/// a caller can act on what is about to fire first - TF displays a hook's default message
+/// (unless the first hook to fire is gagged) *before* any hooked macro runs.
+pub fn select_hooks(engine: &TfEngine, event: TfHookEvent, arg: &str) -> Vec<TfMacro> {
+    // %hook off: no hook fires at all (`/help hook`).
+    if engine.get_var("hook").is_some_and(|v| !super::special_vars::flag_is_on(v)) {
+        return Vec::new();
+    }
     let mut idxs: Vec<usize> = engine.macros.iter().enumerate()
-        .filter(|(_, m)| m.hook == Some(event))
+        .filter(|(_, m)| m.has_hook(event))
         .map(|(i, _)| i)
         .collect();
     idxs.sort_by(|&a, &b| engine.macros[b].priority.cmp(&engine.macros[a].priority));
 
+    // -T: the hook runs for the current world (see TfEngine::context_world); with none
+    // known, a -T-restricted hook doesn't fire (macros::world_type_matches).
+    let types = engine.world_types(None);
+    let types = types.as_ref().map(|(tf, clay)| (tf.as_str(), clay.as_str()));
+    let mut selected = Vec::new();
     for idx in idxs {
-        if idx >= engine.macros.len() {
-            continue; // an earlier macro's own body could have /purge'd this one
-        }
-        let macro_def = engine.macros[idx].clone();
+        let macro_def = &engine.macros[idx];
 
-        // -T world-type restriction: fire_hook has no world context to test the
-        // pattern against, so a -T-restricted hook macro is conservatively treated
-        // as "never matches" here - see macros::world_type_matches's doc comment.
-        if macro_def.world_type.is_some() {
+        if !macros::world_type_matches(macro_def, types) {
             continue;
         }
-        if let Some(remaining) = macro_def.shots_remaining {
-            if remaining == 0 {
+        // -w: only for that world's events.
+        if let Some(ref only) = macro_def.world {
+            if engine.context_world_name().is_none_or(|w| !w.eq_ignore_ascii_case(only)) {
                 continue;
             }
         }
+        if macro_def.shots_remaining == Some(0) {
+            continue;
+        }
+        if let Some(t) = compile_hook_pattern(macro_def) {
+            if macros::match_trigger(&t, arg).is_none() {
+                continue; // pattern didn't match this event's argument text
+            }
+        }
+        selected.push(macro_def.clone());
+        if !macro_def.fall_through {
+            break;
+        }
+    }
+    selected
+}
 
-        let hook_trigger = compile_hook_pattern(&macro_def);
-        let trigger_match = match &hook_trigger {
-            Some(t) => match macros::match_trigger(t, arg) {
-                Some(m) => Some(m),
-                None => continue, // pattern didn't match this event's argument text
-            },
-            None => None, // no pattern: matches every occurrence (see /help hook)
-        };
+/// Run hook macros chosen by `select_hooks`. Their effects are emitted in order (see
+/// `super::effects`); `HookOutcome::results` carries only control results.
+pub fn run_selected_hooks(engine: &mut TfEngine, selected: Vec<TfMacro>, arg: &str) -> HookOutcome {
+    let mut outcome = HookOutcome::default();
+    let mut to_remove = Vec::new();
 
+    for macro_def in selected {
         outcome.matched_any = true;
         if outcome.first_fired_gagged.is_none() {
             outcome.first_fired_gagged = Some(macro_def.attributes.gag);
@@ -97,8 +120,9 @@ pub fn fire_hook(engine: &mut TfEngine, event: TfHookEvent, arg: &str) -> HookOu
             outcome.matched_non_quiet = true;
         }
 
-        let words: Vec<&str> = arg.split_whitespace().collect();
-        let exec_results = macros::execute_macro(engine, &macro_def, &words, trigger_match.as_ref());
+        let hook_trigger = compile_hook_pattern(&macro_def);
+        let trigger_match = hook_trigger.as_ref().and_then(|t| macros::match_trigger(t, arg));
+        let exec_results = macros::execute_macro_with_raw(engine, &macro_def, arg, trigger_match.as_ref());
         outcome.results.extend(exec_results);
 
         // Decrement shots (match by sequence_number, not index - mirrors
@@ -111,10 +135,6 @@ pub fn fire_hook(engine: &mut TfEngine, event: TfHookEvent, arg: &str) -> HookOu
                     to_remove.push(cur_idx);
                 }
             }
-        }
-
-        if !macro_def.fall_through {
-            break;
         }
     }
 
@@ -269,6 +289,15 @@ pub fn list_hooks(engine: &TfEngine) -> String {
 mod tests {
     use super::*;
 
+    /// The output a fired hook emitted (no frame is open in these tests, so it is in the
+    /// engine's top-level queue - see `super::super::effects`).
+    fn hook_outputs(engine: &mut TfEngine) -> Vec<String> {
+        engine.take_effects().into_iter().filter_map(|e| match e {
+            super::super::effects::TfEffect::Output { text, .. } => Some(text),
+            _ => None,
+        }).collect()
+    }
+
     #[test]
     fn test_parse_key_name_function_keys() {
         // plan P2.1: the shared grammar's raw-sequence table covers F1-F12
@@ -412,7 +441,7 @@ mod tests {
         add_hook_macro(&mut engine, TfHookEvent::Connect, None, "/echo connected");
         let outcome = fire_hook(&mut engine, TfHookEvent::Connect, "anyworld");
         assert!(outcome.matched_any);
-        assert!(matches!(outcome.results.as_slice(), [TfCommandResult::Success(Some(s))] if s == "connected"));
+        assert_eq!(hook_outputs(&mut engine), vec!["connected".to_string()]);
     }
 
     #[test]
@@ -437,8 +466,8 @@ mod tests {
             }),
             ..Default::default()
         });
-        let outcome = fire_hook(&mut engine, TfHookEvent::Send, "go north");
-        assert!(matches!(outcome.results.as_slice(), [TfCommandResult::Success(Some(s))] if s == "cap=north"));
+        let _ = fire_hook(&mut engine, TfHookEvent::Send, "go north");
+        assert_eq!(hook_outputs(&mut engine), vec!["cap=north".to_string()]);
     }
 
     #[test]
@@ -457,9 +486,8 @@ mod tests {
             priority: 5,
             ..Default::default()
         });
-        let outcome = fire_hook(&mut engine, TfHookEvent::Send, "x");
-        assert_eq!(outcome.results.len(), 1);
-        assert!(matches!(&outcome.results[0], TfCommandResult::Success(Some(s)) if s == "first"));
+        let _ = fire_hook(&mut engine, TfHookEvent::Send, "x");
+        assert_eq!(hook_outputs(&mut engine), vec!["first".to_string()]);
 
         // Same setup, but the higher-priority one IS fall-through: both should fire.
         let mut engine2 = TfEngine::new();
@@ -476,8 +504,8 @@ mod tests {
             priority: 5,
             ..Default::default()
         });
-        let outcome2 = fire_hook(&mut engine2, TfHookEvent::Send, "x");
-        assert_eq!(outcome2.results.len(), 2);
+        let _ = fire_hook(&mut engine2, TfHookEvent::Send, "x");
+        assert_eq!(hook_outputs(&mut engine2), vec!["first".to_string(), "second".to_string()]);
     }
 
     #[test]

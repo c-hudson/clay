@@ -44,6 +44,13 @@ const WS_PONG_TIMEOUT_SECS: u64 = 20;
 /// `ResyncRequired` rather than let grow forever.
 pub(crate) const WS_CLIENT_CHANNEL_CAPACITY: usize = 256;
 
+/// One world's TF status area, in `InitialState`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TfStatusEntry {
+    pub world_index: usize,
+    pub view: crate::tf::status::StatusView,
+}
+
 /// Extract the `world_index` a `WsMessage` pertains to, if any (PROTOCOL-ROADMAP.md Step
 /// 3). Used to target a dropped-on-overflow message's `ResyncRequired` at the right world;
 /// messages with no single world (control/global messages) return `None` and are simply
@@ -414,6 +421,11 @@ pub enum WsMessage {
     /// no "All" tab to fall back to; it was removed when search went global.
         #[serde(default)]
         emoji_categories_json: String,
+        /// TF's status area for each world, once a script has made it its own
+        /// (`tf::status`); empty while Clay's own status bar is shown. `serde(default)` =
+        /// empty against an older server.
+        #[serde(default)]
+        tf_status: Vec<TfStatusEntry>,
     },
 
     // Real-time updates (server -> client)
@@ -452,6 +464,14 @@ pub enum WsMessage {
     WorldRemoved { world_index: usize },
     WorldSwitched { new_index: usize },
     PromptUpdate { world_index: usize, prompt: String },
+    /// TF's status area as `world_index` shows it now (`tf::status::StatusView`, laid out
+    /// by each client to its own width - app.js `layoutTfStatusRow`). `view: None`: no
+    /// script has the status area any more, so every world shows Clay's own bar again.
+    TfStatus {
+        world_index: usize,
+        #[serde(default)]
+        view: Option<crate::tf::status::StatusView>,
+    },
     PendingLinesUpdate { world_index: usize, count: usize },
     /// Broadcast when pending lines are released (by any interface)
     PendingReleased { world_index: usize, count: usize },
@@ -658,6 +678,10 @@ pub enum WsMessage {
         /// `serde(default)`'s implicit zero value.
         #[serde(default = "default_prompt_wait_ms")]
         prompt_wait_ms: u64,
+        /// TinyFugue world type (`WorldSettings::tf_type`). None - an older client that
+        /// doesn't know the field - leaves it unchanged; Some("") clears it.
+        #[serde(default)]
+        tf_type: Option<String>,
         /// Slack/Discord credentials and destination fields (mirrors the matching
         /// `WorldSettings` fields). Tokens follow the password precedent: sent
         /// plaintext, never masked (`secret()`-encrypted only at rest in
@@ -1501,6 +1525,9 @@ pub struct WorldSettingsMsg {
     /// `DEFAULT_PROMPT_WAIT_MS` (1000) via `default_prompt_wait_ms`.
     #[serde(default = "default_prompt_wait_ms")]
     pub prompt_wait_ms: u64,
+    /// Mirrors `WorldSettings::tf_type` (TinyFugue world type; empty = untyped).
+    #[serde(default)]
+    pub tf_type: String,
     /// Mirror of `WorldSettings::slack_token`/`slack_channel`/`slack_workspace` and
     /// `discord_token`/`discord_guild`/`discord_channel`/`discord_dm_user`. Tokens
     /// follow the password precedent above: sent plaintext to authenticated clients,
@@ -1557,6 +1584,21 @@ pub struct GlobalSettingsMsg {
     pub color_offset_percent: u8,
     #[serde(default)]
     pub wrapspace: u8,
+    /// TF's %wrapsize, once a script sets it: the column output wraps at (0 = the
+    /// window's edge). Clients cap their output's width to it.
+    #[serde(default)]
+    pub wrap_columns: usize,
+    /// TF's %clock_format, once a script sets it: how the status bar's clock reads (empty:
+    /// Clay's own 12-hour clock).
+    #[serde(default)]
+    pub clock_format: String,
+    /// TF's %textdiv, once a script sets it ("off", "on", "always", "clear"): what a world
+    /// brought forward shows between old and new text, in place of the ▶ markers (empty:
+    /// Clay's own markers). `textdiv_str` is the divider's text.
+    #[serde(default)]
+    pub textdiv: String,
+    #[serde(default)]
+    pub textdiv_str: String,
     /// Number of visible (non-gagged) lines sent to a remote/web/GUI client per world
     /// on initial connect. See App::build_initial_state.
     #[serde(default = "default_remote_initial_lines")]
@@ -2372,6 +2414,31 @@ impl AckAuditOutcome {
     }
 }
 
+/// A server's certificate chain and private key from PEM files - a key in PKCS#8, PKCS#1
+/// (RSA) or SEC1 (EC) form. Through rustls's own PEM reader (`rustls::pki_types::pem`):
+/// the rustls-pemfile crate this used to need is unmaintained (RUSTSEC-2025-0134).
+#[cfg(feature = "rustls-backend")]
+pub(crate) fn load_pem_cert_and_key(
+    cert_file: &str,
+    key_file: &str,
+) -> Result<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>), String> {
+    use rustls::pki_types::pem::{Error as PemError, PemObject};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_file)
+        .map_err(|e| format!("Failed to open cert file '{}': {}", cert_file, e))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("Failed to parse cert file '{}': {}", cert_file, e))?;
+    if certs.is_empty() {
+        return Err(format!("No certificates found in cert file '{}'", cert_file));
+    }
+    let key = PrivateKeyDer::from_pem_file(key_file).map_err(|e| match e {
+        PemError::NoItemsFound => format!("No private key found in key file '{}'", key_file),
+        PemError::Io(e) => format!("Failed to open key file '{}': {}", key_file, e),
+        e => format!("Failed to parse key file '{}': {}", key_file, e),
+    })?;
+    Ok((certs, key))
+}
+
 impl WebSocketServer {
     /// Decide, for one client, which worlds have fallen behind and need an audit-driven
     /// resync (PROTOCOL-ROADMAP.md Phase C). `deliverables` is `(world_index,
@@ -2617,45 +2684,7 @@ impl WebSocketServer {
     /// Configure TLS for WSS support (rustls version)
     #[cfg(feature = "rustls-backend")]
     pub fn configure_tls(&mut self, cert_file: &str, key_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-        use std::fs::File;
-        use std::io::BufReader;
-        use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-        // Read certificate chain
-        let cert_file_handle = File::open(cert_file)
-            .map_err(|e| format!("Failed to open cert file '{}': {}", cert_file, e))?;
-        let mut cert_reader = BufReader::new(cert_file_handle);
-        let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
-            .map_err(|e| format!("Failed to parse cert file '{}': {}", cert_file, e))?
-            .into_iter()
-            .map(CertificateDer::from)
-            .collect();
-
-        if certs.is_empty() {
-            return Err(format!("No certificates found in cert file '{}'", cert_file).into());
-        }
-
-        // Read private key - try PKCS8 first, then RSA
-        let key_file_handle = File::open(key_file)
-            .map_err(|e| format!("Failed to open key file '{}': {}", key_file, e))?;
-        let mut key_reader = BufReader::new(key_file_handle);
-        let keys = pkcs8_private_keys(&mut key_reader)
-            .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?;
-        let key: PrivateKeyDer<'static> = if !keys.is_empty() {
-            PrivateKeyDer::Pkcs8(keys.into_iter().next().unwrap().into())
-        } else {
-            // Try RSA format
-            let key_file_handle = File::open(key_file)
-                .map_err(|e| format!("Failed to open key file '{}': {}", key_file, e))?;
-            let mut key_reader = BufReader::new(key_file_handle);
-            let keys = rsa_private_keys(&mut key_reader)
-                .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?;
-            if keys.is_empty() {
-                return Err(format!("No private key found in key file '{}'", key_file).into());
-            }
-            PrivateKeyDer::Pkcs1(keys.into_iter().next().unwrap().into())
-        };
+        let (certs, key) = load_pem_cert_and_key(cert_file, key_file)?;
 
         // Build TLS config
         let config = rustls::ServerConfig::builder()

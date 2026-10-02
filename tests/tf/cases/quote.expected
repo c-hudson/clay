@@ -1,0 +1,15 @@
+a
+b
+c
+pre!x hi
+hi suf
+q end
+[bar]
+[%{foo}]
+asuf
+bsuf
+P: hi
+status=3
+status=7
+[%{foo}]
+x%;/echo y

@@ -344,10 +344,12 @@ pub(crate) fn crash_restart() {
     // Try to exec the binary
     if let Ok((exe, _)) = get_executable_path() {
         use std::os::unix::process::CommandExt;
-        let mut args: Vec<String> = std::env::args()
+        // Without TinyFugue's startup options: the restarted process must not load the
+        // rc or connect again (tfstartup::clay_args_only).
+        let mut args: Vec<String> = crate::tfstartup::clay_args_only(std::env::args()
             .skip(1)
             .filter(|a| a != "--reload" && a != "--crash")
-            .collect();
+            .collect());
         args.push("--crash".to_string());
 
         // This replaces the current process if successful
@@ -437,10 +439,12 @@ pub(crate) fn crash_restart() {
     std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
     if let Ok((exe, _)) = get_executable_path() {
-        let mut args: Vec<String> = std::env::args()
+        // Without TinyFugue's startup options: the restarted process must not load the
+        // rc or connect again (tfstartup::clay_args_only).
+        let mut args: Vec<String> = crate::tfstartup::clay_args_only(std::env::args()
             .skip(1)
             .filter(|a| a != "--reload" && a != "--crash")
-            .collect();
+            .collect());
         args.push("--crash".to_string());
 
         if std::process::Command::new(&exe).args(&args).spawn().is_ok() {
@@ -1726,7 +1730,9 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
 
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
-    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
+    // Without TinyFugue's startup options: a reload must not load the rc or connect again.
+    let mut args: Vec<String> = crate::tfstartup::clay_args_only(
+        std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect());
     args.push("--reload".to_string());
     debug_log(is_debug_enabled(), &format!("RELOAD: About to exec {} with args={:?} fds={}", exe.display(), args, fds_str));
     let err = std::process::Command::new(&exe)
@@ -1824,7 +1830,9 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         0
     };
 
-    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
+    // Without TinyFugue's startup options: a reload must not load the rc or connect again.
+    let mut args: Vec<String> = crate::tfstartup::clay_args_only(
+        std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect());
     args.push("--reload".to_string());
     // On Windows/macOS, GUI is the default mode (no --gui flag in args).
     // Ensure the reload child also runs in GUI mode.
@@ -1887,7 +1895,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
 }
 
 /// Relaunch this process attached to a different Clay server, or (when `connect_addr` is
-/// `None`) as an independent master — used by `/connect host:port` and `/connect --close`.
+/// `None`) as an independent master — used by `/server host:port` and `/server --close`.
 /// Unlike `exec_reload`, no app state is saved/restored: the new process starts fresh and
 /// (for a remote client) fetches its state from the target server over WebSocket.
 /// Exec-replaces the process on Unix; spawns a new process and exits on Windows.
@@ -1900,15 +1908,15 @@ pub fn exec_relaunch(connect_addr: Option<&str>, use_gui: bool) -> io::Result<()
     // detaching/switching must not carry over a stale --console=/--gui= target. --ssh is
     // dropped for the same reason: it's meaningless without a target (detach case), and
     // would otherwise silently keep applying to whatever new target this relaunch is for
-    // (switch case) even though the user didn't ask for an SSH tunnel to it. A `/connect`
+    // (switch case) even though the user didn't ask for an SSH tunnel to it. A `/server`
     // to an SSH-reachable target starts a fresh direct connection unless re-specified;
     // `/reload` (a separate code path using the full original argv) correctly preserves
     // --ssh, since a reload should resume the same SSH-tunneled session.
-    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| {
+    let mut args: Vec<String> = crate::tfstartup::clay_args_only(std::env::args().skip(1).filter(|a| {
         a != "--reload" && a != "--crash"
             && a != "--console" && a != "--gui" && a != "--ssh"
             && !a.starts_with("--console=") && !a.starts_with("--gui=")
-    }).collect();
+    }).collect());
     let mode_flag = match (use_gui, connect_addr) {
         (true, Some(addr)) => format!("--gui={}", addr),
         (true, None) => "--gui".to_string(),

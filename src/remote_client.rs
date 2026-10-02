@@ -1047,13 +1047,14 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             }
                             // Auth success - continue waiting for InitialState
                         }
-                        WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, .. } => {
+                        WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, tf_status, .. } => {
                             // Save world totals for backfill before consuming worlds vec
                             let world_totals: Vec<(usize, usize)> = worlds.iter()
                                 .map(|w| (w.index, w.total_output_lines))
                                 .collect();
                             // Initialize app state from server
                             app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
+                            app.tf_status = tf_status.into_iter().map(|e| (e.world_index, e.view)).collect();
                             // Warn once per session if our version differs from the server's.
                             // An empty server_version means an old server that predates this
                             // field (#[serde(default)]) - stay silent, not a mismatch.
@@ -1351,7 +1352,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     app.add_output("Reload is not available on this platform.");
                                 }
                             }
-                            // Check if a /connect --close was requested (detach and become
+                            // Check if a /server --close was requested (detach and become
                             // an independent master)
                             if app.pending_remote_detach {
                                 app.pending_remote_detach = false;
@@ -1359,7 +1360,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     app.add_output(&format!("Detach failed: {}", e));
                                 }
                             }
-                            // Check if a /connect host:port was requested (switch to a
+                            // Check if a /server host:port was requested (switch to a
                             // different remote server)
                             if let Some(addr) = app.pending_remote_switch.take() {
                                 if let Err(e) = crate::platform::exec_relaunch(Some(&addr), false) {
@@ -1521,13 +1522,19 @@ pub(crate) fn handle_remote_client_key(
                     Command::Help => {
                         app.open_help_popup_new();
                     }
-                    Command::HelpTopic { ref topic } => {
+                    Command::HelpTopic { ref topic, .. } => {
                         use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
                         if let Some(lines) = get_topic_help(topic) {
                             app.popup_manager.open(create_topic_help_popup(lines));
                             if let Some(state) = app.popup_manager.current_mut() {
                                 state.select_field(HELP_FIELD_CONTENT);
                             }
+                        } else {
+                            // TinyFugue's help lives on the server, which answers just us.
+                            let _ = ws_tx.send(WsMessage::SendCommand {
+                                world_index: app.current_world_index,
+                                command: cmd.clone(),
+                            });
                         }
                     }
                     Command::Version => {
@@ -1916,6 +1923,7 @@ pub(crate) fn handle_remote_client_key(
                     }
                     app.worlds[idx].settings.world_type = new_world_type;
                     app.worlds[idx].settings.prompt_wait_ms = settings.prompt_wait_ms;
+                    app.worlds[idx].settings.tf_type = settings.tf_type.clone();
                     app.worlds[idx].settings.slack_token = settings.slack_token.clone();
                     app.worlds[idx].settings.slack_channel = settings.slack_channel.clone();
                     app.worlds[idx].settings.slack_workspace = settings.slack_workspace.clone();
@@ -1976,6 +1984,7 @@ pub(crate) fn handle_remote_client_key(
                         mccp2_enabled: settings.mccp2_enabled,
                         world_type: settings.world_type,
                         prompt_wait_ms: settings.prompt_wait_ms,
+                        tf_type: Some(settings.tf_type.clone()),
                         slack_token: settings.slack_token,
                         slack_channel: settings.slack_channel.clone(),
                         slack_workspace: settings.slack_workspace.clone(),
@@ -2125,7 +2134,23 @@ pub(crate) fn handle_remote_client_key(
             // (World::echo_masked is mirrored here via InitialState/EchoMaskChanged; see
             // InputArea::take_input's doc comment).
             let record_history = !app.current_world().protocol.echo_masked;
-            let cmd = app.input.take_input(record_history);
+            let mut cmd = app.input.take_input(record_history);
+            // TF's "^old^new" (see InputArea::substitute_history). This client keeps its own
+            // history, so it is resolved here, before sending - never at a password prompt,
+            // and not in a chat world, where "^^" is just text.
+            if !app.current_world().protocol.echo_masked && app.current_world().settings.world_type.is_mud() {
+                match app.input.substitute_history(&cmd) {
+                    crate::input::HistorySub::NoMatch => {
+                        app.add_output("% No match.");
+                        return false;
+                    }
+                    crate::input::HistorySub::Substituted(line) => {
+                        app.add_output(&line);
+                        cmd = line;
+                    }
+                    crate::input::HistorySub::NotSubstitution => {}
+                }
+            }
             if cmd.is_empty() {
                 // Send empty command to server (some MUDs use this for "look")
                 let _ = ws_tx.send(WsMessage::SendCommand {
@@ -2140,13 +2165,19 @@ pub(crate) fn handle_remote_client_key(
                     Command::Help => {
                         app.open_help_popup_new();
                     }
-                    Command::HelpTopic { ref topic } => {
+                    Command::HelpTopic { ref topic, .. } => {
                         use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
                         if let Some(lines) = get_topic_help(topic) {
                             app.popup_manager.open(create_topic_help_popup(lines));
                             if let Some(state) = app.popup_manager.current_mut() {
                                 state.select_field(HELP_FIELD_CONTENT);
                             }
+                        } else {
+                            // TinyFugue's help lives on the server, which answers just us.
+                            let _ = ws_tx.send(WsMessage::SendCommand {
+                                world_index: app.current_world_index,
+                                command: cmd.clone(),
+                            });
                         }
                     }
                     Command::Version => {
@@ -2270,11 +2301,11 @@ pub(crate) fn handle_remote_client_key(
                         // A remote client owns no server/worlds of its own, so switching or
                         // detaching relaunches immediately — no confirmation needed.
                         if cancel {
-                            app.add_output("No pending /connect to cancel.");
+                            app.add_output("No pending /server to cancel.");
                         } else if close {
                             app.pending_remote_detach = true;
                         } else if addr.is_empty() {
-                            app.add_output("Usage: /connect host:port  (or)  /connect host port  (or)  /connect --close");
+                            app.add_output("Usage: /server host:port  (or)  /server host port  (or)  /server --close");
                         } else {
                             app.pending_remote_switch = Some(addr);
                         }
