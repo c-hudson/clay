@@ -48,7 +48,7 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-pub(crate) const VERSION: &str = "1.6.24";
+pub(crate) const VERSION: &str = "1.6.25";
 /// The minimum Android app version this server considers fully compatible: the last
 /// release in which the Android app itself changed (the bundled web client in `src/web/`,
 /// or the native app in `android/app/`). `/release` sets it to the new `VERSION` exactly
