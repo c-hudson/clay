@@ -1,9 +1,0 @@
-target/
-.git/
-.github/
-output/
-*.md
-!README.md
-Dockerfile*
-.dockerignore
-.gitignore
