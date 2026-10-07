@@ -464,41 +464,77 @@ pub async fn shorten_url_fallback(url: &str, services: &[crate::encoding::UrlSho
     Err(last_err)
 }
 
-/// Shorten a URL using the selected service.
-/// Validates that the response body is actually a URL (starts with "http") so
-/// plain-text error bodies like "Error, database insert failed" are returned as
-/// Err rather than being silently accepted as a result.
+/// Shorten a URL using the selected service. The reply is judged by
+/// `parse_shortener_reply`.
 pub async fn lookup_tinyurl(url: &str, service: crate::encoding::UrlShortener) -> Result<String, String> {
-    let api_url = service.build_request_url(url);
+    use crate::encoding::ShortenRequest;
+
+    let request = service.build_request(url);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-    let response = client
-        .get(&api_url)
+    let pending = match &request {
+        ShortenRequest::PlainGet(api_url) => client.get(api_url),
+        ShortenRequest::JsonPost { url: api_url, body, .. } => client.post(*api_url).json(body),
+    };
+    let response = pending
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {}", e))?;
 
-    if !response.status().is_success() {
-        return Err(format!("API error: {}", response.status()));
-    }
-
+    let status = response.status();
     let body = response.text().await
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
-    let trimmed = body.trim().to_string();
-    if trimmed.is_empty() || !trimmed.to_lowercase().starts_with("http") {
-        return Err(if trimmed.is_empty() {
-            "empty response".to_string()
-        } else {
-            trimmed
-        });
-    }
+    parse_shortener_reply(&request, status, &body)
+}
 
-    Ok(trimmed)
+/// Turn a shortener's reply into the short link, or an error the fallback can move past.
+/// Whatever comes back must actually be a URL (start with "http"): services answer
+/// failures with 200 and a plain-text body ("Error, database insert failed", "Erreur"),
+/// and those must not be handed to the user as a result.
+fn parse_shortener_reply(
+    request: &crate::encoding::ShortenRequest,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<String, String> {
+    use crate::encoding::ShortenRequest;
+
+    let link = match request {
+        ShortenRequest::PlainGet(_) => {
+            if !status.is_success() {
+                return Err(format!("API error: {}", status));
+            }
+            body.trim().to_string()
+        }
+        ShortenRequest::JsonPost { field, .. } => {
+            let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+            if !status.is_success() {
+                // spoo.me explains a refusal as {"error": "...", ...}.
+                return Err(json
+                    .as_ref()
+                    .and_then(|j| j.get("error"))
+                    .and_then(|e| e.as_str())
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| format!("API error: {}", status)));
+            }
+            match json.as_ref().and_then(|j| j.get(*field)).and_then(|v| v.as_str()) {
+                Some(link) => link.trim().to_string(),
+                None => return Err(format!("no \"{}\" in the reply", field)),
+            }
+        }
+    };
+
+    if link.is_empty() {
+        return Err("empty response".to_string());
+    }
+    if !link.to_lowercase().starts_with("http") {
+        return Err(link);
+    }
+    Ok(link)
 }
 
 /// Translate text using MyMemory API (free, no API key required for up to 1000 words/day)
@@ -2814,6 +2850,72 @@ mod tests {
     fn test_shortener_order_single_entry_list() {
         let cfg = vec![UrlShortener::IsGd];
         assert_eq!(resolve_shortener_order(&cfg, Some(UrlShortener::IsGd)), cfg);
+    }
+
+    // Reply bodies below are the services' real answers, captured with curl.
+
+    #[test]
+    fn test_shortener_reply_spoo_me_success() {
+        let req = UrlShortener::SpooMe.build_request("https://example.com/search?q=a%20b&x=1#frag");
+        let body = r#"{"id":"6ac57087084d81f33b2eee6f","alias":"IUGjn2d","short_url":"https://spoo.me/IUGjn2d","long_url":"https://example.com/search?q=a%20b&x=1#frag","owner_id":null,"status":"ACTIVE"}"#;
+        assert_eq!(
+            parse_shortener_reply(&req, reqwest::StatusCode::CREATED, body),
+            Ok("https://spoo.me/IUGjn2d".to_string())
+        );
+    }
+
+    #[test]
+    fn test_shortener_reply_spoo_me_refusal_reports_its_reason() {
+        let req = UrlShortener::SpooMe.build_request("not a url");
+        let body = r#"{"error":"URL is not allowed or invalid","code":"validation_error","field":"long_url"}"#;
+        assert_eq!(
+            parse_shortener_reply(&req, reqwest::StatusCode::BAD_REQUEST, body),
+            Err("URL is not allowed or invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn test_shortener_reply_spoo_me_rate_limit_is_an_error() {
+        // A rate-limited reply must fail so the next service in the list gets its turn.
+        let req = UrlShortener::SpooMe.build_request("https://example.com/");
+        let err = parse_shortener_reply(&req, reqwest::StatusCode::TOO_MANY_REQUESTS, "rate limited")
+            .unwrap_err();
+        assert!(err.contains("429"), "got {err}");
+    }
+
+    #[test]
+    fn test_shortener_reply_json_without_the_link_is_an_error() {
+        let req = UrlShortener::SpooMe.build_request("https://example.com/");
+        assert!(parse_shortener_reply(&req, reqwest::StatusCode::CREATED, r#"{"alias":"x"}"#).is_err());
+        assert!(parse_shortener_reply(&req, reqwest::StatusCode::CREATED, "<html>oops</html>").is_err());
+        assert!(parse_shortener_reply(&req, reqwest::StatusCode::CREATED, r#"{"short_url":"spoo.me/x"}"#).is_err());
+    }
+
+    #[test]
+    fn test_shortener_reply_plain_text() {
+        let urlz = UrlShortener::UrlzFr.build_request("https://example.com/");
+        assert_eq!(
+            parse_shortener_reply(&urlz, reqwest::StatusCode::OK, "https://urlz.fr/vjk4"),
+            Ok("https://urlz.fr/vjk4".to_string())
+        );
+        assert_eq!(
+            parse_shortener_reply(&urlz, reqwest::StatusCode::OK, "Erreur"),
+            Err("Erreur".to_string())
+        );
+        let isgd = UrlShortener::IsGd.build_request("https://example.com/");
+        assert_eq!(
+            parse_shortener_reply(&isgd, reqwest::StatusCode::OK, "Error, database insert failed"),
+            Err("Error, database insert failed".to_string())
+        );
+        assert_eq!(
+            parse_shortener_reply(&isgd, reqwest::StatusCode::OK, "https://is.gd/cySk6U\n"),
+            Ok("https://is.gd/cySk6U".to_string())
+        );
+        assert!(parse_shortener_reply(&isgd, reqwest::StatusCode::SERVICE_UNAVAILABLE, "https://is.gd/x").is_err());
+        assert_eq!(
+            parse_shortener_reply(&isgd, reqwest::StatusCode::OK, "  \n"),
+            Err("empty response".to_string())
+        );
     }
 }
 

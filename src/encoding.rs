@@ -654,6 +654,32 @@ pub enum UrlShortener {
     /// `lookup_tinyurl`'s must-start-with-http check, so the next service in the list
     /// gets its turn.
     Ulvis,
+    /// Not in `default_order()`. Added when is.gd/v.gd were still failing every insert
+    /// and da.gd's domain had picked up a Google Safe Browsing "some pages unsafe"
+    /// verdict, so viewers of a da.gd link got a browser security warning. spoo.me's
+    /// domain was clean, its links 302 straight to the target, and its anonymous v1 API
+    /// allows 20 links a minute / 200 a day. It is the one service here that is not a
+    /// plain-text GET: it takes a JSON POST and answers in JSON (`ShortenRequest::JsonPost`).
+    SpooMe,
+    /// Not in `default_order()`. Added alongside spoo.me as a backup: plain-text GET like
+    /// is.gd, direct 302 to the target. A refused URL comes back as the bare body
+    /// "Erreur", which the must-start-with-http check turns into an error.
+    UrlzFr,
+}
+
+/// How to call a URL shortener and where its answer is: what `lookup_tinyurl` sends, and
+/// what `parse_shortener_reply` reads back.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShortenRequest {
+    /// GET this URL; the response body is the short link as plain text.
+    PlainGet(String),
+    /// POST `body` as JSON to `url`; the short link is the string at `field` in the JSON
+    /// reply.
+    JsonPost {
+        url: &'static str,
+        body: serde_json::Value,
+        field: &'static str,
+    },
 }
 
 impl UrlShortener {
@@ -666,6 +692,8 @@ impl UrlShortener {
             UrlShortener::TinyUrl => "tinyurl",
             UrlShortener::DaGd => "da.gd",
             UrlShortener::Ulvis => "ulvis.net",
+            UrlShortener::SpooMe => "spoo.me",
+            UrlShortener::UrlzFr => "urlz.fr",
         }
     }
 
@@ -678,6 +706,8 @@ impl UrlShortener {
             "tinyurl" | "tinyurl.com" => Some(UrlShortener::TinyUrl),
             "da.gd" | "dagd" => Some(UrlShortener::DaGd),
             "ulvis.net" | "ulvis" => Some(UrlShortener::Ulvis),
+            "spoo.me" | "spoome" | "spoo" => Some(UrlShortener::SpooMe),
+            "urlz.fr" | "urlz" | "urlzfr" => Some(UrlShortener::UrlzFr),
             _ => None,
         }
     }
@@ -715,8 +745,15 @@ impl UrlShortener {
         list.iter().map(|s| s.name()).collect::<Vec<_>>().join(",")
     }
 
-    /// Build the full API request URL for the given long URL.
-    pub fn build_request_url(&self, long_url: &str) -> String {
+    /// The request that shortens `long_url` with this service.
+    pub fn build_request(&self, long_url: &str) -> ShortenRequest {
+        // `url=<long_url>`, percent-encoded so a target containing & or = can't truncate
+        // the request.
+        let url_query = || -> String {
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("url", long_url)
+                .finish()
+        };
         match self {
             UrlShortener::IsGd | UrlShortener::VGd => {
                 let encoded: String = url::form_urlencoded::Serializer::new(String::new())
@@ -724,28 +761,20 @@ impl UrlShortener {
                     .append_pair("url", long_url)
                     .finish();
                 let host = if matches!(self, UrlShortener::VGd) { "v.gd" } else { "is.gd" };
-                format!("https://{}/create.php?{}", host, encoded)
+                ShortenRequest::PlainGet(format!("https://{}/create.php?{}", host, encoded))
             }
             UrlShortener::TinyUrl => {
-                let encoded: String = url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("url", long_url)
-                    .finish();
-                format!("https://tinyurl.com/api-create.php?{}", encoded)
+                ShortenRequest::PlainGet(format!("https://tinyurl.com/api-create.php?{}", url_query()))
             }
-            UrlShortener::DaGd => {
-                let encoded: String = url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("url", long_url)
-                    .finish();
-                format!("https://da.gd/s?{}", encoded)
-            }
-            UrlShortener::Ulvis => {
-                // Plain-text response by default; `type=json` would need parsing that
-                // `lookup_tinyurl` does not do.
-                let encoded: String = url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("url", long_url)
-                    .finish();
-                format!("https://ulvis.net/api.php?{}", encoded)
-            }
+            UrlShortener::DaGd => ShortenRequest::PlainGet(format!("https://da.gd/s?{}", url_query())),
+            // Plain-text response by default; `type=json` would only add parsing.
+            UrlShortener::Ulvis => ShortenRequest::PlainGet(format!("https://ulvis.net/api.php?{}", url_query())),
+            UrlShortener::UrlzFr => ShortenRequest::PlainGet(format!("https://urlz.fr/api_new.php?{}", url_query())),
+            UrlShortener::SpooMe => ShortenRequest::JsonPost {
+                url: "https://spoo.me/api/v1/shorten",
+                body: serde_json::json!({ "long_url": long_url }),
+                field: "short_url",
+            },
         }
     }
 }
@@ -1364,26 +1393,46 @@ mod tests {
         assert_eq!(UrlShortener::parse_list("nope,,also-nope"), UrlShortener::default_order());
     }
 
+    /// The GET URL of a plain-text service, or the test fails.
+    fn get_url(s: UrlShortener, long_url: &str) -> String {
+        match s.build_request(long_url) {
+            ShortenRequest::PlainGet(url) => url,
+            other => panic!("{} should be a plain GET, got {:?}", s.name(), other),
+        }
+    }
+
     #[test]
     fn test_url_shortener_request_urls() {
-        assert!(UrlShortener::IsGd.build_request_url("http://x/y").starts_with("https://is.gd/create.php?"));
-        assert!(UrlShortener::VGd.build_request_url("http://x/y").starts_with("https://v.gd/create.php?"));
-        assert!(UrlShortener::TinyUrl.build_request_url("http://x/y").starts_with("https://tinyurl.com/api-create.php?"));
-        assert!(UrlShortener::DaGd.build_request_url("http://x/y").starts_with("https://da.gd/s?"));
-        assert!(UrlShortener::Ulvis.build_request_url("http://x/y").starts_with("https://ulvis.net/api.php?"));
+        assert!(get_url(UrlShortener::IsGd, "http://x/y").starts_with("https://is.gd/create.php?"));
+        assert!(get_url(UrlShortener::VGd, "http://x/y").starts_with("https://v.gd/create.php?"));
+        assert!(get_url(UrlShortener::TinyUrl, "http://x/y").starts_with("https://tinyurl.com/api-create.php?"));
+        assert!(get_url(UrlShortener::DaGd, "http://x/y").starts_with("https://da.gd/s?"));
+        assert!(get_url(UrlShortener::Ulvis, "http://x/y").starts_with("https://ulvis.net/api.php?"));
+        assert!(get_url(UrlShortener::UrlzFr, "http://x/y").starts_with("https://urlz.fr/api_new.php?"));
+        assert_eq!(
+            UrlShortener::SpooMe.build_request("http://x/y"),
+            ShortenRequest::JsonPost {
+                url: "https://spoo.me/api/v1/shorten",
+                body: serde_json::json!({ "long_url": "http://x/y" }),
+                field: "short_url",
+            }
+        );
     }
 
     #[test]
     fn test_every_shortener_round_trips_through_the_settings_name() {
         // Guards the four places a new service has to be wired: name(), from_name(),
-        // build_request_url() and the CSV round trip. A variant added to only some of
+        // build_request() and the CSV round trip. A variant added to only some of
         // them silently drops out of `url_shorteners=` on the next save.
+        let target = "https://example.com/a?b=1&c=2";
         for s in [
             UrlShortener::IsGd,
             UrlShortener::VGd,
             UrlShortener::TinyUrl,
             UrlShortener::DaGd,
             UrlShortener::Ulvis,
+            UrlShortener::SpooMe,
+            UrlShortener::UrlzFr,
         ] {
             let name = s.name();
             assert_eq!(UrlShortener::from_name(name), Some(s), "{name} must parse back to itself");
@@ -1391,14 +1440,26 @@ mod tests {
                 UrlShortener::parse_list(name), vec![s],
                 "{name} must survive the url_shorteners= CSV"
             );
-            let req = s.build_request_url("https://example.com/a?b=1&c=2");
-            assert!(req.starts_with("https://"), "{name} must build an https request, got {req}");
-            // The long URL has to be percent-encoded into the query, or a target
-            // containing & or = truncates the request.
-            assert!(
-                req.contains("https%3A%2F%2Fexample.com%2Fa%3Fb%3D1%26c%3D2"),
-                "{name} must percent-encode the target, got {req}"
-            );
+            match s.build_request(target) {
+                ShortenRequest::PlainGet(req) => {
+                    assert!(req.starts_with("https://"), "{name} must build an https request, got {req}");
+                    // The long URL has to be percent-encoded into the query, or a target
+                    // containing & or = truncates the request.
+                    assert!(
+                        req.contains("https%3A%2F%2Fexample.com%2Fa%3Fb%3D1%26c%3D2"),
+                        "{name} must percent-encode the target, got {req}"
+                    );
+                }
+                ShortenRequest::JsonPost { url, body, field } => {
+                    assert!(url.starts_with("https://"), "{name} must post over https, got {url}");
+                    // In a JSON body the target travels verbatim - no query to truncate.
+                    assert!(
+                        body.as_object().is_some_and(|o| o.values().any(|v| v.as_str() == Some(target))),
+                        "{name} must carry the target in its JSON body, got {body}"
+                    );
+                    assert!(!field.is_empty(), "{name} must name the reply field holding the link");
+                }
+            }
         }
     }
 
