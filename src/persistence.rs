@@ -1015,11 +1015,15 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                 // saved every global: the whole imported environment (secrets included)
                 // and the engine's own seeds. Environment variable names are all
                 // capitals; a seed is recognised by its unchanged value.
+                // %wrap/%wrapsize go too: before version 2 Clay ignored them, but `/wrap <n>`
+                // (then Clay's wrap indent) set %wrapsize as a side effect - honoured now, a
+                // saved `wrapsize=5` would wrap every line at 5 columns.
                 if !tf_globals_v2 {
                     let is_env_name = key.chars().any(|c| c.is_ascii_uppercase())
                         && key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
                     let is_seed = app.tf_engine.seed_values.get(key).is_some_and(|s| *s == unescaped);
-                    if is_env_name || is_seed || crate::tf::TRANSIENT_GLOBALS.contains(&key) {
+                    let is_old_wrap = key == "wrap" || key == "wrapsize";
+                    if is_env_name || is_seed || is_old_wrap || crate::tf::TRANSIENT_GLOBALS.contains(&key) {
                         dropped_tf_globals.push(key.to_string());
                         continue;
                     }
@@ -5384,10 +5388,12 @@ MyHost.Example:9000=AABBCC
     /// next save no longer contains them. A deliberate lower-case variable survives.
     #[test]
     fn test_old_tf_globals_section_is_cleaned_once() {
-        let old = "[global]\nmore_mode=true\n\n[tf_globals]\nCLAY_TEST_LEAKED_TOKEN=abc\nmaxpri=2147483647\ntime_format=%H:%M\nmyvar=keep\n?=1\n";
+        let old = "[global]\nmore_mode=true\n\n[tf_globals]\nCLAY_TEST_LEAKED_TOKEN=abc\nmaxpri=2147483647\ntime_format=%H:%M\nmyvar=keep\n?=1\nwrap=1\nwrapsize=5\n";
         let mut app = App::new();
         load_settings_from_str(&mut app, old);
         assert!(app.tf_engine.get_var("CLAY_TEST_LEAKED_TOKEN").is_none());
+        // An old `/wrap 5` (Clay's wrap indent then) must not wrap output at 5 columns now.
+        assert_eq!(app.settings.wrap_columns, 0, "pre-v2 %wrapsize is a stale /wrap side effect");
         assert_eq!(app.tf_engine.get_var("myvar").map(|v| v.to_string_value()), Some("keep".to_string()));
 
         let tmp = std::env::temp_dir().join(format!("clay_test_tf_globals_cleanup_{}.dat", std::process::id()));
@@ -5402,6 +5408,11 @@ MyHost.Example:9000=AABBCC
         let mut app2 = App::new();
         load_settings_from_str(&mut app2, v2);
         assert_eq!(app2.tf_engine.get_var("MYVAR").map(|v| v.to_string_value()), Some("1".to_string()));
+
+        // ...and so is a %wrapsize: set since version 2, it means what TF means.
+        let mut app3 = App::new();
+        load_settings_from_str(&mut app3, "[global]\ntf_globals_version=2\n\n[tf_globals]\nwrapsize=60\n");
+        assert_eq!(app3.settings.wrap_columns, 60);
     }
 
     /// The live environment wins over a saved copy (a stale TFLIBDIR from another
