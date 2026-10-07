@@ -1,0 +1,129 @@
+<h1 align="center">
+  <img src="clay2.png" width="200" alt="Clay">
+  <br>
+  Clay
+</h1>
+
+<h4 align="center">Play MUDs and other text worlds in your terminal, on your desktop, or on your phone.</h4>
+
+<p align="center">
+  <a href="https://github.com/c-hudson/clay/releases/latest"><img src="https://img.shields.io/github/v/release/c-hudson/clay" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/c-hudson/clay" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  <a href="#about">About</a> •
+  <a href="#key-features">Key Features</a> •
+  <a href="#download">Download</a> •
+  <a href="#how-to-use">How To Use</a> •
+  <a href="#documentation">Documentation</a> •
+  <a href="#license">License</a>
+</p>
+
+<p align="center">
+  <img src="screenshot.png" alt="Clay in a web browser, a terminal, its desktop app and the Android app">
+  <br>
+  <em>Clay in a web browser, a terminal, its desktop app and the Android app</em>
+</p>
+
+## About
+
+Clay is a [MUD](https://en.wikipedia.org/wiki/Multi-user_dungeon) client, for playing MUDs,
+MUSHes, MOOs and other text-based online worlds. It connects to as many worlds as you like at
+once, keeps their full-color text in an unlimited scrollback, logs you in, and takes care of
+the routine with triggers and scripts, set up in a point-and-click editor or written by hand.
+It runs on Windows, macOS, Linux and Android, in a terminal or in its own window.
+
+What sets Clay apart is what it adds on top. It is a drop-in replacement for TinyFugue: it
+runs your `.tfrc` with its macros, triggers, hooks and key bindings. It can put your Slack and
+Discord channels beside your MUDs. And if you play on more than one device, one running Clay
+can be opened from a terminal, the desktop app, a web browser and the Android app at the same
+time, so you can switch devices without disconnecting. None of this is needed to use Clay as
+an everyday MUD client.
+
+## Key Features
+
+* Windows, macOS, Linux and Android, in a terminal or a window
+* Many worlds at once, with auto-login
+* 256-color and true-color ANSI
+* TLS, GMCP, MSDP, MSSP, MCCP, MSP and MCP
+* Triggers, gags and highlights, with a point-and-click editor
+* TinyFugue compatible: runs your `.tfrc`
+* Unlimited scrollback, find, and a searchable archive
+* Status panel from GMCP/MSDP vitals
+* Spell check, tab completion, command history
+* Slack and Discord alongside your MUDs
+* One session from several devices at once
+* Upgrades without disconnecting
+* Text-to-speech, sound and ANSI music
+* Free and open source
+
+<details>
+  <summary>And more</summary>
+
+More-mode paging, timers, hooks, macros, grep windows, logging, timestamps, clickable links,
+multi-line input, Emacs-style editing keys, history search, character encodings, themes,
+fonts, custom key bindings, per-world notes, dictionary and translation lookups, an Android
+app that runs Clay on its own, secure remote access, settings import, crash recovery,
+headless and multi-user servers, self-update.
+
+</details>
+
+## Download
+
+Get the latest version from the [releases page](https://github.com/c-hudson/clay/releases/latest):
+
+- **Windows:** [clay-windows-x86_64.exe](https://github.com/c-hudson/clay/releases/latest/download/clay-windows-x86_64.exe)
+- **macOS** (Intel and Apple Silicon): [clay-macos-universal](https://github.com/c-hudson/clay/releases/latest/download/clay-macos-universal)
+- **Linux:** [clay-linux-x86_64-gui](https://github.com/c-hudson/clay/releases/latest/download/clay-linux-x86_64-gui)
+  with the desktop app, or [clay-linux-x86_64-musl](https://github.com/c-hudson/clay/releases/latest/download/clay-linux-x86_64-musl)
+  for the terminal only (any distro)
+- **Android:** [clay-android.apk](https://github.com/c-hudson/clay/releases/latest/download/clay-android.apk)
+- **Termux:** [clay-termux-aarch64-nogui](https://github.com/c-hudson/clay/releases/latest/download/clay-termux-aarch64-nogui),
+  [clay-termux-aarch64](https://github.com/c-hudson/clay/releases/latest/download/clay-termux-aarch64)
+  for Termux:X11, or [clay-termux-armv7-32bit-nogui](https://github.com/c-hudson/clay/releases/latest/download/clay-termux-armv7-32bit-nogui)
+  for 32-bit phones
+
+On Linux and macOS, make the file executable (`chmod +x`) before running it.
+
+## How To Use
+
+1. Download Clay and run it. On Linux, `clay` runs in the terminal and `clay --gui` opens a
+   window. On Android, choose **Run on This Phone**.
+1. Open the **World Selector** from the ☰ menu (in a terminal, type `/world`) and click
+   **Add**.
+1. Give the world a **Name** and enter the **Hostname** and **Port** of your game (found on
+   the game's website, e.g. `mygame.com` and `4000`).
+1. Click **Connect**.
+
+Press F1 for help at any time. To switch worlds, click the world name in the status bar, or
+press Alt+←/→ in a terminal. To play the same session from your other devices, see
+[Remote access](docs/markdown/11-web-interface.md#reaching-clay-from-outside-your-network).
+
+## Compiling
+
+Clay is written in Rust. To build it yourself, see
+[Installation](docs/markdown/02-installation.md).
+
+## Documentation
+
+Clay has built-in help (F1, or `/help <topic>`) and a manual:
+[Quick start](docs/markdown/03-quickstart.md) ·
+[Commands](docs/markdown/05-commands.md) ·
+[Triggers](docs/markdown/09-actions.md) ·
+[Keyboard shortcuts](docs/markdown/07-keyboard-shortcuts.md) ·
+[Switching from TinyFugue](docs/markdown/22-switching-from-tinyfugue.md) ·
+[TinyFugue commands](docs/markdown/06-tf-commands.md) ·
+[Slack and Discord](docs/markdown/21-chat-worlds.md) ·
+[Remote access](docs/markdown/11-web-interface.md#reaching-clay-from-outside-your-network) ·
+[Troubleshooting](docs/markdown/20-troubleshooting.md) ·
+[all chapters](docs/markdown)
+
+## Support
+
+Questions, ideas and bug reports are welcome as
+[GitHub issues](https://github.com/c-hudson/clay/issues).
+
+## License
+
+MIT
