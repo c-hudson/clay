@@ -11723,6 +11723,77 @@ third
             "an operator pause must be re-asserted on resync so the PAUSED badge survives");
     }
 
+    /// An auth-key login gets the same post-login treatment as a password login: its stable
+    /// client_uid owns its ▶ markers and its `resume` list is replayed. The key path used to
+    /// build InitialState directly and skipped both.
+    #[test]
+    fn test_auth_key_login_resumes_and_keeps_its_display_owner() {
+        use crate::websocket::{hash_with_challenge, Outbound, RemoteClientType, WebSocketServer, WsClientInfo, WsMessage};
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=10u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        app.settings.websocket_auth_key = Some(crate::AuthKey { key: "k3y".into(), created_at: 0 });
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 5u64;
+        server.clients.write().unwrap().insert(client_id, WsClientInfo {
+            authenticated: false,
+            tx,
+            current_world: None,
+            username: None,
+            received_initial_state: false,
+            client_type: RemoteClientType::RemoteGUI,
+            viewport_height: 24,
+            ip_address: "127.0.0.1".to_string(),
+            connected_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            paused: false,
+            acked_seq: std::collections::HashMap::new(),
+            audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
+            needs_resync: std::collections::HashSet::new(),
+        });
+        app.ws_server = Some(server);
+
+        let challenge = "c0ffee";
+        let request = WsMessage::AuthRequest {
+            username: None,
+            password_hash: String::new(),
+            current_world: Some(0),
+            auth_key: Some(hash_with_challenge("k3y", challenge)),
+            request_key: false,
+            challenge_response: true,
+            resume: vec![(0, 7)],
+            resume_epochs: Vec::new(),
+            client_version: "test".into(),
+            client_uid: "device-with-key".into(),
+        };
+        app.handle_ws_auth_key_validation(client_id, request, "127.0.0.1", challenge);
+
+        let msgs = drain_ws_messages(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::AuthResponse { success: true, .. })));
+        let mut your_id = None;
+        let mut replay = None;
+        for m in msgs {
+            match m {
+                WsMessage::InitialState { your_display_id, .. } => your_id = Some(your_display_id),
+                WsMessage::ScrollbackLines { lines, request_id: Some(0), .. } => replay = Some(lines.iter().map(|l| l.seq).collect::<Vec<_>>()),
+                _ => {}
+            }
+        }
+        assert_eq!(replay, Some(vec![8, 9, 10]), "the resume list must be replayed, exactly the gap");
+        app.set_display_owner_id(99, "device-with-key");
+        assert_eq!(your_id, Some(app.display_owner_id(99)),
+            "the key login's ▶ owner must be its client_uid's, so it survives a reconnect");
+    }
+
     /// A stable client_uid keeps ▶ ownership across a reconnect, which is what makes a brief
     /// transport drop non-destructive. Without one, ownership falls back to the connection id
     /// and a reconnect loses the markers.

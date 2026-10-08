@@ -13815,7 +13815,17 @@ impl App {
 
     /// Handle WsAuthKeyValidation event.
     fn handle_ws_auth_key_validation(&mut self, client_id: u64, msg: WsMessage, client_ip: &str, challenge: &str) {
-        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, challenge_response: uses_challenge, .. } = msg {
+        if let WsMessage::AuthRequest {
+            auth_key: Some(key),
+            current_world,
+            challenge_response: uses_challenge,
+            resume,
+            resume_epochs,
+            client_uid,
+            client_version,
+            ..
+        } = msg
+        {
             let has_key = self.settings.websocket_auth_key.is_some();
 
             crate::http::log_remote_event("WS-KEY", client_ip,
@@ -13845,23 +13855,16 @@ impl App {
                     username: None,
                     multiuser_mode: false,
                 });
-                let initial_state = self.build_initial_state(self.display_owner_id(client_id));
-                self.ws_send_initial_state_and_mark(client_id, initial_state);
-                let world_idx = current_world
-                    .filter(|&w| w < self.worlds.len())
-                    .unwrap_or(self.current_world_index);
-                self.ws_set_client_world(client_id, Some(world_idx));
-                self.ws_client_worlds.insert(client_id, ClientViewState {
-                    world_index: world_idx,
-                    visible_lines: 0,
-                    visible_columns: 0,
-                    dimensions: None,
-                    paused: false,
-                    visible: true,
-                    disconnected_at: None,
-                });
-                // Signal event loop to trigger web reconnects
-                self.web_reconnect_needed = true;
+                crate::http::log_remote_event("CLIENT-VERSION", client_ip,
+                    if client_version.is_empty() { "-" } else { client_version.as_str() });
+                // The same post-login path as a password login: the stable ownership id
+                // first (so InitialState's your_display_id matches what claims stamp, and ▶
+                // survives a reconnect), then InitialState with the resume-aware history
+                // skip and the unprompted resume replay. This path used to build
+                // InitialState directly, so a key login lost its ▶ markers on every
+                // reconnect and got no replay of what it missed.
+                self.set_display_owner_id(client_id, &client_uid);
+                self.handle_ws_auth_initial_state(client_id, current_world, resume, resume_epochs);
             } else {
                 crate::http::log_remote_event("WS-KEY-REJECT", client_ip, "no matching key");
                 // Don't record a ban violation for auth key failures — these come from known
