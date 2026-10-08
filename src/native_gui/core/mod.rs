@@ -2,6 +2,7 @@
 
 pub mod boxdraw;
 pub mod client;
+pub mod decor;
 pub mod keys;
 pub mod net;
 pub mod seq;

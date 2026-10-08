@@ -52,7 +52,6 @@ const CLAIM_TTL: Duration = Duration::from_secs(5);
 const GAPFILL_MAX_NO_PROGRESS: u32 = 2;
 const GAPFILL_COUNT: usize = 500;
 const BACKFILL_DELAY: Duration = Duration::from_millis(500);
-const MAX_LINE_CHARS: usize = 10_000;
 /// A tick arriving this much later than the last means the machine slept: check the
 /// connection is still alive before trusting it (app.js's wake check).
 const SLEEP_GAP: Duration = Duration::from_secs(10);
@@ -939,7 +938,7 @@ impl ClientCore {
     fn new_line(&mut self, text: &str, ts: u64, seq: Option<u64>) -> Line {
         let id = self.next_line_id;
         self.next_line_id += 1;
-        let text = if text.chars().count() > MAX_LINE_CHARS { text.chars().take(MAX_LINE_CHARS).collect() } else { text.to_string() };
+        let text = super::decor::truncate(text).into_owned();
         Line {
             id,
             text,

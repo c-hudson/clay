@@ -26,7 +26,8 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use crate::native_gui::core::client::{Credentials, Effect, Input as NetInput, Status, hidden_line};
 use crate::native_gui::core::keys::{Keys, Resolved};
 use crate::native_gui::core::session::Session;
-use crate::native_gui::core::style::{Palette, StyleOptions, StyledLine, strip_mud_tag, style_line};
+use crate::native_gui::core::decor::{ActionMatcher, DecorOptions, LineFacts, decorate};
+use crate::native_gui::core::style::{Palette, StyleOptions, StyledLine};
 use crate::theme::ThemeColors;
 use fonts::Fonts;
 use more::MoreMode;
@@ -54,8 +55,13 @@ pub struct ClayView {
     show_tags: bool,
     font_size: f32,
     wrapspace: usize,
-    /// Styled lines by `Line::id`, valid while the style inputs are unchanged.
-    styled: HashMap<u64, Arc<StyledLine>>,
+    /// Decorated lines by `Line::id` (with whether they carried ▶), valid while the
+    /// style inputs are unchanged.
+    styled: HashMap<u64, (bool, Arc<StyledLine>)>,
+    decor: DecorOptions,
+    matcher: ActionMatcher,
+    /// What `matcher` was built from.
+    actions_sig: String,
     /// Bumped whenever the same line would style differently (clears `styled`).
     style_epoch: u64,
     scroll: ScrollHandle,
@@ -109,6 +115,9 @@ impl ClayView {
             font_size: DEFAULT_FONT_SIZE,
             wrapspace: 0,
             styled: HashMap::new(),
+            decor: DecorOptions { show_tags: false, new_markers: false, temp_convert: false, accent: [0, 0, 0], hover_bg: [0, 0, 0] },
+            matcher: ActionMatcher::default(),
+            actions_sig: String::new(),
             style_epoch: 0,
             scroll: ScrollHandle::default(),
             more: MoreMode::default(),
@@ -257,6 +266,24 @@ impl ClayView {
             self.style.discord_emoji = !s.show_tags;
             restyle = true;
         }
+        let rgb = |c: &crate::theme::ThemeColor| [c.r, c.g, c.b];
+        let decor = DecorOptions {
+            show_tags: s.show_tags,
+            new_markers: s.new_line_indicator && s.textdiv.is_empty(),
+            temp_convert: s.temp_convert_enabled,
+            accent: rgb(&self.theme.accent),
+            hover_bg: rgb(&self.theme.bg_hover),
+        };
+        if decor != self.decor {
+            self.decor = decor;
+            restyle = true;
+        }
+        let sig = serde_json::to_string(&self.session.core.actions).unwrap_or_default();
+        if sig != self.actions_sig {
+            self.matcher = ActionMatcher::new(&self.session.core.actions);
+            self.actions_sig = sig;
+            restyle |= self.action_highlight;
+        }
         if restyle {
             self.restyle();
         }
@@ -265,16 +292,31 @@ impl ClayView {
     /// The current world's lines as the output shows them, with their ids.
     fn visible_lines(&mut self) -> Vec<(u64, Arc<StyledLine>)> {
         let Some(world) = self.session.core.current_world() else { return Vec::new() };
+        let me = self.session.core.display_id;
         let mut out = Vec::with_capacity(world.lines.len());
         for line in &world.lines {
             if (line.gagged && !self.show_tags) || hidden_line(&line.text) || self.more.is_held(line.id) {
                 continue;
             }
-            let styled = self
-                .styled
-                .entry(line.id)
-                .or_insert_with(|| style_raw(&line.text, &self.palette, &self.style, self.show_tags))
-                .clone();
+            let is_new = me != 0 && line.display_id == Some(me);
+            if let Some((was_new, styled)) = self.styled.get(&line.id) {
+                if *was_new == is_new {
+                    out.push((line.id, styled.clone()));
+                    continue;
+                }
+            }
+            let facts = LineFacts {
+                text: &line.text,
+                ts: line.ts,
+                from_server: line.from_server,
+                from_archive: line.from_archive,
+                archive_sourced: line.archive_sourced,
+                is_new,
+                highlight: line.highlight.as_deref(),
+                action_match: self.action_highlight && self.matcher.matches(&line.text, &world.name),
+            };
+            let styled = Arc::new(decorate(&facts, &self.palette, &self.style, &self.decor));
+            self.styled.insert(line.id, (is_new, styled.clone()));
             out.push((line.id, styled));
         }
         if self.styled.len() > 2 * out.len() + 1024 {
@@ -361,12 +403,6 @@ impl ClayView {
                 ),
         )
     }
-}
-
-/// One server line as the output shows it: the MUD tag stripped unless tags are shown
-/// (F2), then styled.
-fn style_raw(raw: &str, palette: &Palette, style: &StyleOptions, show_tags: bool) -> Arc<StyledLine> {
-    if show_tags { Arc::new(style_line(raw, palette, style)) } else { Arc::new(style_line(&strip_mud_tag(raw), palette, style)) }
 }
 
 impl Focusable for ClayView {

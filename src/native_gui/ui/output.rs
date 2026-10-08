@@ -549,6 +549,10 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
     // Where the font's own content area starts within a row (CSS half-leading).
     let half_leading = (m.row - (m.ascent + m.descent)) / 2.0;
     let ul = Underline::new(m);
+    // `animation: ansi-blink 1s step-end infinite`: shown 750 ms, hidden 250 ms.
+    let blink_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() % 1000) as u64;
+    let blink_on = blink_ms < 750;
+    let mut blinking = false;
 
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for vr in &p.rows {
@@ -558,6 +562,13 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
             let x0 = line.x[range.start];
             let baseline = vr.top + half_leading + m.ascent;
 
+            // A /highlight colour fills the whole row, edge to edge (`display: block`).
+            if let Some(bg) = line.styled.line_bg {
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.origin.x, px(vr.top)), size(bounds.size.width, px(m.row))),
+                    hsla(bg),
+                ));
+            }
             // Every coloured run's background, over the font's full height (CSS paints
             // an inline box's background over its content area, taller than the row).
             // Cells repaint their own exact boxes on top later.
@@ -566,7 +577,7 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 let (s, e) = (at, at + run.len);
                 at = e;
                 let (s, e) = (s.max(range.start), e.min(range.end));
-                if s >= e {
+                if s >= e || (run.blink && !blink_on) {
                     continue;
                 }
                 if let Some(bg) = run.bg {
@@ -580,18 +591,22 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
             }
 
             // Glyphs, noting where they cross an underline.
-            let mut style_ends: Vec<(usize, Rgb, bool)> = Vec::new();
+            let mut style_ends: Vec<(usize, Rgb, bool, bool)> = Vec::new();
             let mut at = 0;
             for run in &line.styled.runs {
                 at += run.len;
-                style_ends.push((at, run.fg, underlined(run)));
+                style_ends.push((at, run.fg, underlined(run), run.blink));
+                blinking |= run.blink;
             }
             let style_at = |i: usize| {
-                style_ends.iter().find(|(end, ..)| i < *end).map(|&(_, c, u)| (c, u)).unwrap_or(([255, 255, 255], false))
+                style_ends.iter().find(|(end, ..)| i < *end).map(|&(_, c, u, b)| (c, u, b)).unwrap_or(([255, 255, 255], false, false))
             };
             let fg_at = |i: usize| style_at(i).0;
             let text = &line.styled.text;
-            let skip = |i: usize| line.no_glyph[i] || text[i..].chars().next().is_some_and(|c| c == '\t' || is_invisible(c));
+            // Blinking text is hidden for the last quarter of each second (style.css).
+            let skip = |i: usize| {
+                line.no_glyph[i] || text[i..].chars().next().is_some_and(|c| c == '\t' || is_invisible(c)) || (style_at(i).2 && !blink_on)
+            };
             let mut gaps: Vec<(f32, f32)> = Vec::new();
             let row_text = &text[range.clone()];
             if line.rtl && row_text.chars().any(is_rtl) {
@@ -665,7 +680,7 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 let (s, e) = (at, at + run.len);
                 at = e;
                 let (s, e) = (s.max(range.start), e.min(range.end));
-                if s >= e || !underlined(run) {
+                if s >= e || !underlined(run) || (run.blink && !blink_on) {
                     continue;
                 }
                 let (sx, ex) = (left + line.x[s] - x0, left + line.x[e] - x0);
@@ -740,6 +755,11 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                     Look::Loading => {}
                 }
             }
+        }
+        if blinking {
+            let until_flip = if blink_on { 750 - blink_ms } else { 1000 - blink_ms };
+            let t = now + std::time::Duration::from_millis(until_flip.max(1));
+            next_frame = Some(next_frame.map_or(t, |n| n.min(t)));
         }
         if let Some(t) = next_frame {
             emoji::wake_at(t);

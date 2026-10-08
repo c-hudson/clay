@@ -92,6 +92,8 @@ pub struct StyledLine {
     /// wrap opportunities inside long words. Kept out of `text`, so copying needs no
     /// clean-up.
     pub breaks: Vec<usize>,
+    /// A background behind the whole line, edge to edge (`/highlight`).
+    pub line_bg: Option<Rgb>,
 }
 
 /// Settings that change how a line is styled.
