@@ -66,12 +66,6 @@ sleep 0.5
 
 HOME=$WORK/home-native CLAY_WS_PASSWORD=$PW "$NATIVE" --local-server --port=$WEB_B > "$WORK/localserver.log" 2>&1 &
 PIDS+=($!)
-HOME=$WORK/home-webview "$WEBVIEW" --gui > "$WORK/webview.log" 2>&1 &
-PIDS+=($!); WEBVIEW_PID=$!
-sleep 3
-HOME=$WORK/home-native CLAY_PASSWORD=$PW "$NATIVE" --native-gui=127.0.0.1:$WEB_B > "$WORK/native.log" 2>&1 &
-PIDS+=($!); NATIVE_PID=$!
-sleep 4
 
 window_of() {   # the top-level X window of a pid
     for id in $(xprop -root _NET_CLIENT_LIST | sed 's/.*# //; s/,//g'); do
@@ -79,14 +73,27 @@ window_of() {   # the top-level X window of a pid
     done
 }
 
-if [ $CAPTURE = 1 ]; then
-    for side in webview:$WEBVIEW_PID native:$NATIVE_PID; do
-        name=${side%%:*}; pid=${side##*:}
-        win=$(window_of "$pid")
-        if [ -z "$win" ]; then echo "$name: no window found"; continue; fi
-        xwd -silent -id "$win" -out "$WORK/$name.xwd" && python3 -I "$HERE/xwd2png.py" "$WORK/$name.xwd" "$WORK/$name.png"
-    done
-fi
+# Photograph a window only when it is on top: xwd reads screen pixels, so an obscured
+# window would come back with pieces of whatever covers it.
+capture() {   # capture <name> <pid>
+    local win top
+    win=$(window_of "$2")
+    if [ -z "$win" ]; then echo "$1: no window found"; return; fi
+    top=$(xprop -root _NET_CLIENT_LIST_STACKING | sed 's/.*# //; s/,//g' | awk '{print $NF}')
+    if [ "$((win))" != "$((top))" ]; then echo "$1: window is not on top, not captured"; return; fi
+    xwd -silent -id "$win" -out "$WORK/$1.xwd" && python3 -I "$HERE/xwd2png.py" "$WORK/$1.xwd" "$WORK/$1.png"
+}
+
+# One GUI at a time, so neither can cover the other.
+HOME=$WORK/home-webview "$WEBVIEW" --gui > "$WORK/webview.log" 2>&1 &
+WEBVIEW_PID=$!; PIDS+=($WEBVIEW_PID)
+sleep 4
+[ $CAPTURE = 1 ] && capture webview $WEBVIEW_PID
+if [ $KEEP = 0 ]; then kill $WEBVIEW_PID 2>/dev/null; wait $WEBVIEW_PID 2>/dev/null; fi
+HOME=$WORK/home-native CLAY_PASSWORD=$PW "$NATIVE" --native-gui=127.0.0.1:$WEB_B > "$WORK/native.log" 2>&1 &
+NATIVE_PID=$!; PIDS+=($NATIVE_PID)
+sleep 4
+[ $CAPTURE = 1 ] && capture native $NATIVE_PID
 
 if [ $KEEP = 1 ]; then
     echo "Running. Press Enter to stop."; read -r _
