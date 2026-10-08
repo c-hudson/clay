@@ -361,18 +361,31 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 let bidi = unicode_bidi::BidiInfo::new(row_text, None);
                 let mut pen = left;
                 for para in &bidi.paragraphs {
-                    let (_, visual) = bidi.visual_runs(para, para.range.clone());
+                    let (levels, visual) = bidi.visual_runs(para, para.range.clone());
                     for vr in visual {
+                        let rtl_run = levels.get(vr.start).is_some_and(|l| l.is_rtl());
                         let span = range.start + vr.start..range.start + vr.end;
                         let runs = sub_runs(&line.text_runs, &span);
                         let run_layout = window.text_system().layout_line(&text[span.clone()], m.font_size, &runs, None);
+                        let width = f32::from(run_layout.width);
+                        // GPUI's DirectWrite path lays every glyph run out left to right in
+                        // logical order (it ignores the run's bidi level), so a right-to-left
+                        // run comes back reversed: mirror it. The other platforms' shapers
+                        // already return visual positions.
+                        let mirror = cfg!(target_os = "windows") && rtl_run;
+                        let xs: Vec<f32> = run_layout.runs.iter().flat_map(|r| r.glyphs.iter().map(|g| f32::from(g.position.x))).collect();
+                        let mut k = 0usize;
                         for run in &run_layout.runs {
                             for g in &run.glyphs {
+                                let gx = xs[k];
+                                let next = xs.iter().skip(k + 1).copied().find(|&x| x > gx).unwrap_or(width);
+                                k += 1;
                                 let i = span.start + g.index;
                                 if i >= span.end || skip(i) {
                                     continue;
                                 }
-                                let origin = point(px(pen) + g.position.x, px(baseline) + g.position.y);
+                                let x = if mirror { width - next } else { gx };
+                                let origin = point(px(pen + x), px(baseline) + g.position.y);
                                 let _ = if g.is_emoji {
                                     window.paint_emoji(origin, run.font_id, g.id, m.font_size)
                                 } else {
