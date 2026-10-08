@@ -100,7 +100,7 @@ pub enum Effect {
     Connect,
     /// Close the open connection; a `Closed` input follows.
     Disconnect,
-    Send(WsMessage),
+    Send(Box<WsMessage>),
     /// Trust this certificate from now on (`persistence::replace_pin`).
     TrustCert { host: String, fingerprint: String },
     /// The server handed this client its auth key: keep it for the next login.
@@ -290,7 +290,7 @@ impl ClientCore {
     }
 
     fn send(&mut self, msg: WsMessage) {
-        self.out.push(Effect::Send(msg));
+        self.out.push(Effect::Send(Box::new(msg)));
     }
 
     fn changed(&mut self) {
@@ -928,9 +928,6 @@ impl ClientCore {
         let ts = if d.ts > 0 { d.ts } else { unix_now() };
         let mut fresh = Vec::new();
         for (k, text) in raw.iter().enumerate() {
-            if is_ansi_only(text) || (text.contains("###_idler_message_") && text.contains("_###")) {
-                continue;
-            }
             let seq = has_real.then_some(d.seq + k as u64);
             if seq.is_some_and(|s| self.worlds[d.world_index].seen.contains(s)) {
                 continue;
@@ -1025,9 +1022,8 @@ impl ClientCore {
                     // The server can't produce this hole (flushed, or past its buffer):
                     // give it up, say so, and carry on from past it.
                     w.gap_no_progress = 0;
-                    let hole = w.seen.oldest_hole();
-                    if hole.is_some() && w.seen.close_oldest_hole() {
-                        let (hole_start, hole_end) = hole.unwrap();
+                    let closed = w.seen.oldest_hole().filter(|_| w.seen.close_oldest_hole());
+                    if let Some((hole_start, hole_end)) = closed {
                         self.send(WsMessage::ReportGap { world_index, hole_start, hole_end, attempts: GAPFILL_MAX_NO_PROGRESS, source: SOURCE.into() });
                     } else {
                         w.gap_fill_pending = false;
@@ -1288,7 +1284,16 @@ fn split_lines(s: &str) -> Vec<&str> {
     out
 }
 
-/// A line that is nothing but escape sequences (app.js drops these; blank lines stay).
+/// A line the output never shows: nothing but escape sequences (a trailing reset after a
+/// newline), or a keep-alive idler marker. Blank lines do show.
+///
+/// app.js drops these only as they arrive live, so the same line shows as a blank row
+/// when it comes back in history after a reconnect. Here every line is kept, so the
+/// buffer matches the server's, and this decides at display time on every path.
+pub fn hidden_line(text: &str) -> bool {
+    is_ansi_only(text) || (text.contains("###_idler_message_") && text.contains("_###"))
+}
+
 fn is_ansi_only(line: &str) -> bool {
     if line.is_empty() {
         return false;

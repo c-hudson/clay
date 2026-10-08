@@ -19573,6 +19573,7 @@ async fn main() -> io::Result<()> {
     let mut gui_arg: Option<Option<String>> = None;
     let mut native_gui_arg: Option<Option<String>> = None;
     let mut native_gui_snapshot: Option<String> = None;
+    let mut native_gui_verify: Option<u64> = None;
     let mut ssh_mode = false;
     let mut ssh_proxy_mode = false;
     #[allow(unused_variables)]
@@ -19645,6 +19646,13 @@ async fn main() -> io::Result<()> {
                 _ if arg.starts_with("--gui=") => gui_arg = Some(Some(arg[6..].to_string())),
                 _ if arg.starts_with("--native-gui=") => native_gui_arg = Some(Some(arg[13..].to_string())),
                 _ if arg.starts_with("--native-gui-snapshot=") => native_gui_snapshot = Some(arg[22..].to_string()),
+                "--native-gui-verify" => native_gui_verify = Some(30),
+                _ if arg.starts_with("--native-gui-verify=") => {
+                    native_gui_verify = Some(arg[20..].parse().unwrap_or_else(|_| {
+                        eprintln!("Error: --native-gui-verify=SECONDS");
+                        std::process::exit(1);
+                    }))
+                }
                 _ if arg.starts_with("--tls-proxy=") => tls_proxy_config = Some(arg[12..].to_string()),
                 _ => {
                     eprintln!("Error: Unknown option '{}'. Use -h for help.", arg);
@@ -19761,14 +19769,14 @@ async fn main() -> io::Result<()> {
     }
 
     // Native GUI (branch native-gui): attaches to a running Clay, like --gui=host.
-    if let Some(target) = native_gui_arg {
+    if let Some(target) = native_gui_arg.or_else(|| native_gui_verify.map(|_| None)) {
         #[cfg(feature = "native-gui")]
         {
-            return native_gui::run(target, native_gui_snapshot);
+            return native_gui::run(target, native_gui_snapshot, native_gui_verify);
         }
         #[cfg(not(feature = "native-gui"))]
         {
-            let _ = (target, native_gui_snapshot);
+            let _ = (target, native_gui_snapshot, native_gui_verify);
             eprintln!("Error: --native-gui requires a build with the 'native-gui' feature.");
             std::process::exit(1);
         }

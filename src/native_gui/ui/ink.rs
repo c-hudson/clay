@@ -21,9 +21,12 @@ const SCANS: usize = 6;
 /// Line segments per curve.
 const CURVE_STEPS: usize = 8;
 
+/// Ink spans by (face, glyph, band bottom, band top), in font units.
+type SpanCache = HashMap<(usize, u32, i32, i32), Rc<Vec<(f32, f32)>>>;
+
 thread_local! {
     static FACES: Vec<Option<Face<'static>>> = BUNDLED.into_iter().map(|b| Face::parse(b, 0).ok()).collect();
-    static SPANS: RefCell<HashMap<(usize, u32, i32, i32), Rc<Vec<(f32, f32)>>>> = RefCell::new(HashMap::new());
+    static SPANS: RefCell<SpanCache> = RefCell::new(HashMap::new());
 }
 
 /// A bundled face's units per em, if it parsed.

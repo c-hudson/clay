@@ -317,7 +317,7 @@ mod tests {
         let t = Target::parse(Some("[::1]:9001")).unwrap();
         assert_eq!((t.host.as_str(), t.port, t.secure), ("::1", 9001, false));
         assert_eq!(t.key(), "[::1]:9001");
-        assert_eq!(Target::parse(Some("wss://localhost")).unwrap().secure, true);
+        assert!(Target::parse(Some("wss://localhost")).unwrap().secure);
         assert!(Target::parse(Some("ws://mud.example.org")).is_err());
         assert!(Target::parse(Some("http://x")).is_err());
         assert_eq!(Target::parse(Some("h:1")).unwrap().url(""), "wss://h:1/ws");

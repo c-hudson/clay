@@ -7,9 +7,10 @@
 pub mod core;
 mod ui;
 
-/// `clay --native-gui[=host[:port]]`, or with `snapshot` set (`--native-gui-snapshot=<png>`)
-/// render one frame offscreen to that file and exit.
-pub fn run(target: Option<String>, snapshot: Option<String>) -> std::io::Result<()> {
+/// `clay --native-gui[=host[:port]]`; with `snapshot` set (`--native-gui-snapshot=<png>`)
+/// render one frame offscreen to that file and exit; with `verify` set
+/// (`--native-gui-verify[=SECONDS]`) run the client headless and check its buffer.
+pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>) -> std::io::Result<()> {
     let target = match core::net::Target::parse(target.as_deref()) {
         Ok(t) => t,
         Err(e) => {
@@ -19,6 +20,8 @@ pub fn run(target: Option<String>, snapshot: Option<String>) -> std::io::Result<
     };
     // Optional: without it (and without a stored key for this server) the window asks.
     let password = std::env::var("CLAY_PASSWORD").ok().filter(|p| !p.is_empty());
+    // An auth key to use instead of the one remembered for this server (scripts, tests).
+    let auth_key = std::env::var("CLAY_AUTH_KEY").ok().filter(|k| !k.is_empty());
     // WebKitGTK blends text linearly; GPUI's Linux renderer defaults to gamma 1.8, which
     // measured 15% heavier than the WebView. 1.0 matches it to within 2%.
     #[cfg(target_os = "linux")]
@@ -33,7 +36,10 @@ pub fn run(target: Option<String>, snapshot: Option<String>) -> std::io::Result<
     disable_font_smoothing();
     let runtime = tokio::runtime::Handle::current();
     ui::emoji::init(runtime.clone());
-    let (session, events) = core::session::Session::new(&runtime, target, password);
+    let (session, events) = core::session::Session::new(&runtime, target, password, auth_key);
+    if let Some(secs) = verify {
+        std::process::exit(core::verify::run(session, events, secs));
+    }
     if let Some(out) = snapshot {
         #[cfg(feature = "native-gui-snapshot")]
         {

@@ -20,7 +20,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 
-use crate::native_gui::core::client::{Credentials, Effect, Input as NetInput, Status};
+use crate::native_gui::core::client::{Credentials, Effect, Input as NetInput, Status, hidden_line};
 use crate::native_gui::core::session::Session;
 use crate::native_gui::core::style::{Palette, StyleOptions, StyledLine, strip_mud_tag, style_line};
 use crate::theme::ThemeColors;
@@ -157,7 +157,7 @@ impl ClayView {
         let Some(world) = self.session.core.current_world() else { return Vec::new() };
         let mut out = Vec::with_capacity(world.lines.len());
         for line in &world.lines {
-            if line.gagged && !self.show_tags {
+            if (line.gagged && !self.show_tags) || hidden_line(&line.text) {
                 continue;
             }
             let styled = self

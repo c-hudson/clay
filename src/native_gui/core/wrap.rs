@@ -37,7 +37,7 @@ fn ascii_table() -> &'static [[bool; ASCII_N]; ASCII_N] {
             }
         };
         let one = |c: u8| (c, c);
-        for c in [b'(', b'<', b'[', b'{'] {
+        for c in *b"(<[{" {
             set(ALL, one(c), true);
         }
         set(one(b'-'), ALL, true);
@@ -53,7 +53,7 @@ fn ascii_table() -> &'static [[bool; ASCII_N]; ASCII_N] {
         set(ALL, one(b'/'), false);
         set(one(b'-'), one(b'/'), true);
         set(one(b'-'), (b'0', b'9'), false);
-        for c in [b':', b';', b'?', b']', b'}'] {
+        for c in *b":;?]}" {
             set(ALL, one(c), false);
             set(one(b'-'), one(c), true);
         }
@@ -105,6 +105,7 @@ fn break_opportunities(text: &str, extra: &[usize]) -> Vec<usize> {
 /// `x(i)` is the x position of byte boundary `i` (0 at the start of the line), and is
 /// only asked about char boundaries. `indent` is how far continuation rows are pushed
 /// right (wrapspace's hanging indent); the first row starts at 0.
+#[allow(clippy::single_range_in_vec_init)] // one empty row for an empty line
 pub fn wrap_rows(
     text: &str,
     breaks: &[usize],

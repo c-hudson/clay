@@ -210,7 +210,7 @@ fn decode(bytes: &[u8]) -> Result<Loaded, String> {
         return Err("empty image".into());
     }
     for frame in &mut frames {
-        for px in frame.buffer_mut().chunks_exact_mut(4) {
+        for px in frame.buffer_mut().as_chunks_mut::<4>().0 {
             px.swap(0, 2); // RGBA -> BGRA, as GPUI's atlas takes it
         }
     }

@@ -97,7 +97,7 @@ impl H {
     fn sent(&mut self) -> Vec<WsMessage> {
         std::mem::take(&mut self.effects)
             .into_iter()
-            .filter_map(|e| if let Effect::Send(m) = e { Some(m) } else { None })
+            .filter_map(|e| if let Effect::Send(m) = e { Some(*m) } else { None })
             .collect()
     }
 
@@ -221,7 +221,7 @@ fn no_challenge_means_no_credentials_on_the_wire() {
     h.input(Input::Opened);
     h.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: String::new() });
     let effects = h.drain();
-    assert!(!effects.iter().any(|e| matches!(e, Effect::Send(WsMessage::AuthRequest { .. }))));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::Send(m) if matches!(**m, WsMessage::AuthRequest { .. }))));
     assert!(effects.iter().any(|e| matches!(e, Effect::Disconnect)));
     assert!(matches!(h.core.status(), Status::Stopped(_)));
 }
@@ -259,13 +259,15 @@ fn a_repeated_batch_is_dropped_and_reported() {
 }
 
 #[test]
-fn filtered_lines_still_use_up_their_seqs() {
-    // An escape-only line and an idler marker are not shown, but the server numbered
-    // them: the record must cover them or the client would ask for them forever.
+fn every_line_is_kept_and_the_unshown_ones_are_marked_for_display() {
+    // An escape-only line and an idler marker are never shown, but they are kept (so the
+    // buffer matches the server's) and their seqs are recorded like any other.
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
     h.msg(data(0, 1, "a\n\x1b[0m\n###_idler_message_x_###\n\nb\n"));
-    assert_eq!(h.texts(0), vec!["line 0", "a", "", "b"], "blank lines stay");
+    assert_eq!(h.texts(0), vec!["line 0", "a", "\x1b[0m", "###_idler_message_x_###", "", "b"]);
+    let shown: Vec<String> = h.texts(0).into_iter().filter(|t| !hidden_line(t)).collect();
+    assert_eq!(shown, vec!["line 0", "a", "", "b"], "blank lines show");
     assert_eq!(h.core.worlds[0].seen.ranges(), &[(0, 5)]);
 }
 

@@ -7,4 +7,5 @@ pub mod seq;
 pub mod session;
 pub mod store;
 pub mod style;
+pub mod verify;
 pub mod wrap;

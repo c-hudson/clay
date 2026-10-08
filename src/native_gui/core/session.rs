@@ -22,8 +22,16 @@ impl Session {
     /// A session for `target`, with what's remembered about it (its key, its web path) and
     /// the password if one was given. Events arrive on the returned receiver; feed them to
     /// [`Session::handle`].
-    pub fn new(runtime: &tokio::runtime::Handle, target: Target, password: Option<String>) -> (Session, mpsc::UnboundedReceiver<Input>) {
-        let remembered = store::server(&target.key());
+    pub fn new(
+        runtime: &tokio::runtime::Handle,
+        target: Target,
+        password: Option<String>,
+        auth_key: Option<String>,
+    ) -> (Session, mpsc::UnboundedReceiver<Input>) {
+        let mut remembered = store::server(&target.key());
+        if auth_key.is_some() {
+            remembered.auth_key = auth_key;
+        }
         let web_path = target.path.clone().or(remembered.web_path).unwrap_or_else(|| "clay".to_string());
         let (tx, rx) = mpsc::unbounded();
         let transport = super::net::spawn(runtime, target.clone(), remembered.auth_key.clone(), web_path, tx);
@@ -39,7 +47,7 @@ impl Session {
             match e {
                 Effect::Connect => self.transport.connect(),
                 Effect::Disconnect => self.transport.disconnect(),
-                Effect::Send(msg) => self.transport.send(msg),
+                Effect::Send(msg) => self.transport.send(*msg),
                 Effect::TrustCert { host, fingerprint } => crate::persistence::replace_pin(&host, &fingerprint),
                 Effect::StoreAuthKey(key) => {
                     store::set_auth_key(&self.target.key(), &key);
