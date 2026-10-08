@@ -43,6 +43,8 @@ pub mod tfrun;
 mod tfstartup;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
+#[cfg(feature = "native-gui")]
+pub mod native_gui;
 pub mod testserver;
 #[cfg(test)]
 pub mod testharness;
@@ -19569,6 +19571,8 @@ async fn main() -> io::Result<()> {
     let mut tls_proxy_config: Option<String> = None;
     let mut console_arg: Option<Option<String>> = None;  // None=not set, Some(None)=bare, Some(Some(addr))=with addr
     let mut gui_arg: Option<Option<String>> = None;
+    let mut native_gui_arg: Option<Option<String>> = None;
+    let mut native_gui_snapshot: Option<String> = None;
     let mut ssh_mode = false;
     let mut ssh_proxy_mode = false;
     #[allow(unused_variables)]
@@ -19612,6 +19616,7 @@ async fn main() -> io::Result<()> {
                 "--crash" => is_crash_arg = true,
                 "--console" => console_arg = Some(None),
                 "--gui" => gui_arg = Some(None),
+                "--native-gui" => native_gui_arg = Some(None),
                 "--ssh" => ssh_mode = true,
                 "--ssh-proxy" => ssh_proxy_mode = true,
                 "--dump" => dump_mode = true,
@@ -19638,6 +19643,8 @@ async fn main() -> io::Result<()> {
                 },
                 _ if arg.starts_with("--console=") => console_arg = Some(Some(arg[10..].to_string())),
                 _ if arg.starts_with("--gui=") => gui_arg = Some(Some(arg[6..].to_string())),
+                _ if arg.starts_with("--native-gui=") => native_gui_arg = Some(Some(arg[13..].to_string())),
+                _ if arg.starts_with("--native-gui-snapshot=") => native_gui_snapshot = Some(arg[22..].to_string()),
                 _ if arg.starts_with("--tls-proxy=") => tls_proxy_config = Some(arg[12..].to_string()),
                 _ => {
                     eprintln!("Error: Unknown option '{}'. Use -h for help.", arg);
@@ -19751,6 +19758,20 @@ async fn main() -> io::Result<()> {
     // Set custom config path if specified
     if let Some(ref path) = conf_path {
         set_custom_config_path(PathBuf::from(path));
+    }
+
+    // Native GUI (branch native-gui): attaches to a running Clay, like --gui=host.
+    if let Some(target) = native_gui_arg {
+        #[cfg(feature = "native-gui")]
+        {
+            return native_gui::run(target, native_gui_snapshot);
+        }
+        #[cfg(not(feature = "native-gui"))]
+        {
+            let _ = (target, native_gui_snapshot);
+            eprintln!("Error: --native-gui requires a build with the 'native-gui' feature.");
+            std::process::exit(1);
+        }
     }
 
     // Record startup time and reset debug log header flags for this session

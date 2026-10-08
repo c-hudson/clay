@@ -62,6 +62,45 @@ fn get_scenario(name: &str) -> PortScenario {
             ],
             telnet_negotiate: false,
         },
+        // The native GUI's rendering corpus (tests/native_gui/corpus.ans), then idle so
+        // the world stays connected while both GUIs are compared. CLAY_CORPUS_EXTRA names
+        // a further file of raw output to append (e.g. real MUD captures kept out of the
+        // repo).
+        "corpus" => {
+            let mut bytes = include_bytes!("../../tests/native_gui/corpus.ans").to_vec();
+            // CLAY_CORPUS_SECTIONS=Emoji,CJK: only those "== Name ==" sections, so one
+            // capture holds one screenful without scrolling either GUI.
+            if let Ok(wanted) = std::env::var("CLAY_CORPUS_SECTIONS") {
+                let wanted: Vec<String> = wanted.split(',').map(|s| format!("== {} ==", s.trim())).collect();
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let mut keep = false;
+                let mut out = String::new();
+                for line in text.split_inclusive("\r\n") {
+                    if line.contains("== ") && line.contains(" ==") {
+                        keep = wanted.iter().any(|w| line.contains(w.as_str()));
+                    }
+                    if keep {
+                        out.push_str(line);
+                    }
+                }
+                bytes = out.into_bytes();
+            }
+            if let Ok(path) = std::env::var("CLAY_CORPUS_EXTRA") {
+                if let Ok(extra) = std::fs::read(&path) {
+                    bytes.extend_from_slice(&extra);
+                    if !bytes.ends_with(b"\r\n") {
+                        bytes.extend_from_slice(b"\r\n");
+                    }
+                }
+            }
+            PortScenario {
+                actions: vec![
+                    ServerAction::SendRaw(bytes),
+                    ServerAction::Sleep(Duration::from_secs(24 * 3600)),
+                ],
+                telnet_negotiate: false,
+            }
+        }
         "idle" => PortScenario {
             actions: vec![
                 ServerAction::Sleep(Duration::from_secs(30)),

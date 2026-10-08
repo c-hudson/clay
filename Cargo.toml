@@ -48,11 +48,13 @@ hex = "0.4"
 # Async recursion support for Rust 1.75
 async-recursion = "1.0"
 
-# Force older versions of transitive deps for Rust 1.75 compatibility
-indexmap = ">=2.2.0, <2.5.0"
+# Originally capped for Rust 1.75 compatibility. rust-version is 1.89 now, and
+# the caps on indexmap and home blocked the native-gui deps (gpui needs indexmap
+# >= 2.7), so only the floors remain.
+indexmap = ">=2.2.0"
 url = ">=2.5.4"
 hashbrown = "0.14"
-home = "=0.5.5"
+home = "0.5.5"
 time = ">=0.3.37"
 
 # MCCP2 (MUD Client Compression Protocol) zlib decompression
@@ -77,6 +79,26 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # cross-compile to Android/Termux armv7. ring is pure-Rust and matches everything else.
 russh = { version = "0.63", optional = true, default-features = false, features = ["ring", "rsa"] }
 igd-next = { version = "0.17.1", default-features = false, features = ["aio_tokio"] }
+
+# Native GUI (optional, `native-gui` feature, branch native-gui): Zed's GPUI
+# framework plus Longbridge's gpui-component widgets. gpui-pre is the weekly
+# crates.io snapshot of Zed's main branch, so these are pinned exactly - its API
+# moves between snapshots. Needs a much newer rustc than rust-version above;
+# only `--features native-gui` builds use it. runtime_shaders compiles the Metal
+# shaders when the app starts, so macOS builds need no full Xcode.
+gpui = { package = "gpui-pre", version = "=0.3.8", optional = true }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", optional = true, features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-component = { version = "=0.7.1", optional = true }
+# Output-view line wrapping (UAX #14 break opportunities, grapheme boundaries).
+unicode-linebreak = { version = "0.1.5", optional = true }
+unicode-segmentation = { version = "1.12", optional = true }
+# Emoji_Presentation and friends: which clusters the browser draws from the colour
+# emoji font.
+unicode-properties = { version = "0.1.4", optional = true, default-features = false, features = ["emoji"] }
+# Bidi classes: rows holding right-to-left text are reshaped on their own for display.
+unicode-bidi = { version = "0.3", optional = true }
+# --native-gui-snapshot: writes the offscreen render as PNG (same image crate GPUI uses).
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -137,7 +159,15 @@ rustls-backend = ["tokio-rustls", "rustls", "webpki-roots", "tokio-tungstenite/r
 native-audio = ["rodio"]
 webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk", "gio", "glib", "x11rb"]
 ssh-transport = ["russh"]
+native-gui = ["gpui", "gpui_platform", "gpui-component", "unicode-linebreak", "unicode-segmentation", "unicode-properties", "unicode-bidi"]
+# Offscreen rendering of the native GUI to PNG, for comparisons against the WebView.
+native-gui-snapshot = ["native-gui", "gpui/test-support", "gpui_platform/test-support", "image"]
 
 [[bin]]
 name = "clay-test-server"
 path = "src/bin/clay-test-server.rs"
+
+# Native GUI (branch native-gui): GPUI's Linux text system with one fix so the colour
+# emoji font can be requested by name. See vendor/gpui-pre-wgpu/CLAY-PATCH.md.
+[patch.crates-io]
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
