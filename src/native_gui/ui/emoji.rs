@@ -124,6 +124,7 @@ pub fn lookup(e: &DiscordEmoji) -> Look {
 }
 
 /// How many emoji are still on their way (the offscreen snapshot waits for them).
+#[cfg(feature = "native-gui-snapshot")]
 pub fn pending() -> usize {
     CACHE.lock().unwrap().values().filter(|l| matches!(l, Look::Loading)).count()
 }
