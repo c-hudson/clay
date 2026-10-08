@@ -62,7 +62,7 @@ fn disable_font_smoothing() {
     use core_foundation::base::TCFType;
     use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
-    use core_foundation::sys::preferences::{CFPreferencesSetAppValue, kCFPreferencesCurrentApplication};
+    use core_foundation_sys::preferences::{CFPreferencesSetAppValue, kCFPreferencesCurrentApplication};
     let key = CFString::new("AppleFontSmoothing");
     let value = CFNumber::from(0i32);
     unsafe {

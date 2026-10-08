@@ -130,6 +130,7 @@ x11rb = { version = "0.14", optional = true }
 # native-gui: turns off CoreGraphics-style glyph thickening for the process, as the web
 # client's `-webkit-font-smoothing: antialiased` does in WKWebView.
 core-foundation = { version = "0.10", optional = true }
+core-foundation-sys = { version = "0.8", optional = true }
 # Audio playback (uses CoreAudio on macOS automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav", "mp3", "vorbis", "flac"] }
 # WebView GUI (native WebView window using system browser engine)
@@ -162,7 +163,7 @@ rustls-backend = ["tokio-rustls", "rustls", "webpki-roots", "tokio-tungstenite/r
 native-audio = ["rodio"]
 webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk", "gio", "glib", "x11rb"]
 ssh-transport = ["russh"]
-native-gui = ["gpui", "gpui_platform", "gpui-component", "unicode-linebreak", "unicode-segmentation", "unicode-properties", "unicode-bidi", "core-foundation"]
+native-gui = ["gpui", "gpui_platform", "gpui-component", "unicode-linebreak", "unicode-segmentation", "unicode-properties", "unicode-bidi", "core-foundation", "core-foundation-sys"]
 # Offscreen rendering of the native GUI to PNG, for comparisons against the WebView.
 native-gui-snapshot = ["native-gui", "gpui/test-support", "gpui_platform/test-support", "image"]
 
