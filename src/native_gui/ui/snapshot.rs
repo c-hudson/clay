@@ -53,6 +53,7 @@ pub fn run(sender: Sender, mut events: mpsc::UnboundedReceiver<NetEvent>, out: &
     let text_system = gpui_platform::current_platform(true).text_system();
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), gpui_platform::current_headless_renderer);
     let fonts = cx.update(|app| {
+        #[cfg(not(target_os = "windows"))]
         app.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         fonts::load(app)
     });

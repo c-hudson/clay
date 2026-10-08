@@ -211,7 +211,10 @@ impl Render for ClayView {
 /// Open the main window and pump connection events into it.
 pub fn run(sender: Sender, events: mpsc::UnboundedReceiver<NetEvent>) {
     gpui_platform::application().run(move |cx: &mut App| {
-        // The web client's output is `-webkit-font-smoothing: antialiased`: grayscale.
+        // The web client's output is `-webkit-font-smoothing: antialiased`, which WebKit
+        // (Linux, macOS) honours with grayscale text. WebView2 is Chromium, which ignores
+        // it on Windows and draws ClearType - so there, keep the system's rendering.
+        #[cfg(not(target_os = "windows"))]
         cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         let fonts = fonts::load(cx);
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
