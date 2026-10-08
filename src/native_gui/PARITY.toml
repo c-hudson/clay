@@ -2288,3 +2288,365 @@ phase = 6
 status = "todo"
 feature = "wire ScrollbackBatch"
 note = "server-push history download (Phase J); no client uses it yet"
+
+# ---- The web window's features (ui:*), from the Phase 2 surveys ----
+
+[[item]]
+id = "ui:output.prefix-client"
+section = "output"
+phase = 2
+status = "todo"
+feature = "✨ before client-generated lines (not archive_sourced, not visually empty)"
+note = "app.js applyClientPrefix"
+
+[[item]]
+id = "ui:output.prefix-new"
+section = "output"
+phase = 2
+status = "todo"
+feature = "▶ (#00ff00 + space) on lines this client owns, when new_line_indicator and no textdiv"
+note = "app.js lineIsNew/nliDrawn"
+
+[[item]]
+id = "ui:output.prefix-archive"
+section = "output"
+phase = 2
+status = "todo"
+feature = "🛢️ on from_archive / archive_sourced lines, after ▶"
+note = ""
+
+[[item]]
+id = "ui:output.timestamps"
+section = "output"
+phase = 2
+status = "todo"
+feature = "MM/DD HH:MM> in the accent colour first, while show_tags"
+note = "formatTimestamp"
+
+[[item]]
+id = "ui:output.highlight"
+section = "output"
+phase = 2
+status = "todo"
+feature = "/highlight colour as a full-width line background (colorNameToCss)"
+note = ""
+
+[[item]]
+id = "ui:output.action-highlight"
+section = "output"
+phase = 2
+status = "todo"
+feature = "F8: lines matching an enabled action get the hover background"
+note = "lineMatchesAction; applied on every path (B8)"
+
+[[item]]
+id = "ui:output.temperature"
+section = "output"
+phase = 2
+status = "todo"
+feature = "temperature conversion (temp_convert_enabled, while show_tags)"
+note = "on text only, never inside escapes (B13)"
+
+[[item]]
+id = "ui:output.truncate"
+section = "output"
+phase = 2
+status = "todo"
+feature = "lines over 10000 chars truncated with a yellow "... [truncated]""
+note = "MAX_LINE_LENGTH"
+
+[[item]]
+id = "ui:output.blink"
+section = "output"
+phase = 2
+status = "todo"
+feature = "SGR 5/6 blink: 750 ms shown, 250 ms hidden"
+note = ""
+
+[[item]]
+id = "ui:output.more-mode"
+section = "output"
+phase = 2
+status = "todo"
+feature = "local more-mode: pause at visible-2 lines, queue, release by keys/badge/wheel past the bottom"
+note = "handleIncomingLine, releaseLines"
+
+[[item]]
+id = "ui:output.scroll"
+section = "output"
+phase = 2
+status = "todo"
+feature = "page/half/line scroll keys, wheel, follow-bottom only un-pinned by the user, position kept when lines arrive or are prepended"
+note = ""
+
+[[item]]
+id = "ui:output.selection"
+section = "output"
+phase = 2
+status = "todo"
+feature = "mouse selection, double-click word, Ctrl+C copy (prefixes included, divider excluded)"
+note = ""
+
+[[item]]
+id = "ui:output.links"
+section = "output"
+phase = 2
+status = "todo"
+feature = "link hover style; click opens the system browser"
+note = ""
+
+[[item]]
+id = "ui:output.context-menu"
+section = "output"
+phase = 2
+status = "todo"
+feature = "right-click: Copy, Debug Selection (raw text with <esc>, modal with Copy/Close)"
+note = "webview_gui.rs context menu"
+
+[[item]]
+id = "ui:output.textdiv"
+section = "output"
+phase = 2
+status = "todo"
+feature = "TF %textdiv divider (on/always/clear, textdiv_str)"
+note = "arriveTextdiv, console_divider"
+
+[[item]]
+id = "ui:output.splash"
+section = "output"
+phase = 2
+status = "todo"
+feature = "splash (logo + two lines, centred) while showing_splash, cleared as the web does"
+note = ""
+
+[[item]]
+id = "ui:output.redraw"
+section = "output"
+phase = 2
+status = "todo"
+feature = "^L: drop client lines, clear own ▶, re-render"
+note = ""
+
+[[item]]
+id = "ui:output.filter"
+section = "output"
+phase = 2
+status = "todo"
+feature = "F4 Find popup: show only matching lines (contains / wildcards), Esc-L reopen with last text"
+note = ""
+
+[[item]]
+id = "ui:output.search"
+section = "output"
+phase = 2
+status = "todo"
+feature = "F5 Search History popup: cut output at the match, Enter = older, (i/n)"
+note = ""
+
+[[item]]
+id = "ui:output.font"
+section = "output"
+phase = 2
+status = "todo"
+feature = "font_name, size 7-20, weight, letter/word spacing applied to output"
+note = ""
+
+[[item]]
+id = "ui:output.wrap"
+section = "output"
+phase = 2
+status = "todo"
+feature = "wrapspace hanging indent and wrap_columns cap from settings"
+note = ""
+
+[[item]]
+id = "ui:output.scrollbar"
+section = "output"
+phase = 2
+status = "todo"
+feature = "thin overlay scroll thumb that fades after scrolling"
+note = "webview_gui.rs thumb"
+
+[[item]]
+id = "ui:output.grep"
+section = "windows"
+phase = 4
+status = "todo"
+feature = "/window --grep windows (filtered, locked, chrome hidden)"
+note = "separate OS window"
+
+[[item]]
+id = "ui:status.layout"
+section = "status"
+phase = 2
+status = "todo"
+feature = "window layout: icon bar, tabs (top/bottom), output, stats panel, status bar, input"
+note = ""
+
+[[item]]
+id = "ui:status.menu"
+section = "status"
+phase = 2
+status = "todo"
+feature = "hamburger menu (dropdown upward); items open their features as those land"
+note = "Help/Worlds/Actions/Settings/Import open phase-4 windows"
+
+[[item]]
+id = "ui:status.world"
+section = "status"
+phase = 2
+status = "todo"
+feature = "connection dot (green/amber/red) + world name [g] [N]; click = world menu"
+note = ""
+
+[[item]]
+id = "ui:status.world-menu"
+section = "status"
+phase = 2
+status = "todo"
+feature = "world menu: connected or unseen worlds, [N unseen], click switches"
+note = ""
+
+[[item]]
+id = "ui:status.more"
+section = "status"
+phase = 2
+status = "todo"
+feature = "More/History badge (hard-coded reds, 4-char counts); click releases a screenful"
+note = ""
+
+[[item]]
+id = "ui:status.activity"
+section = "status"
+phase = 2
+status = "todo"
+feature = "ACT n badge with Unseen: tooltip; click = next world"
+note = ""
+
+[[item]]
+id = "ui:status.paused"
+section = "status"
+phase = 2
+status = "todo"
+feature = "PAUSED badge (PausedState)"
+note = ""
+
+[[item]]
+id = "ui:status.notes"
+section = "status"
+phase = 2
+status = "todo"
+feature = "notes icon when the world has notes"
+note = "opens the note editor in phase 4"
+
+[[item]]
+id = "ui:status.font-slider"
+section = "status"
+phase = 2
+status = "todo"
+feature = "A / slider / value: font size 7-20, saved to web_font_size_desktop"
+note = ""
+
+[[item]]
+id = "ui:status.scrollback"
+section = "status"
+phase = 2
+status = "todo"
+feature = "Scrollback NN% while history downloads"
+note = ""
+
+[[item]]
+id = "ui:status.clock"
+section = "status"
+phase = 2
+status = "todo"
+feature = "clock: H:MM 12-hour, or clock_format (strftime subset)"
+note = ""
+
+[[item]]
+id = "ui:status.tf"
+section = "status"
+phase = 2
+status = "todo"
+feature = "TF status rows replace the bar items (tf::status::layout_row)"
+note = ""
+
+[[item]]
+id = "ui:status.stats"
+section = "status"
+phase = 2
+status = "todo"
+feature = "stats panel: gauges and values, collapsible (StatsUpdate)"
+note = ""
+
+[[item]]
+id = "ui:status.iconbar"
+section = "status"
+phase = 2
+status = "todo"
+feature = "icon bar: Worlds/Actions/Settings/Find/Tags tiles (icon_bar setting)"
+note = "tiles open phase-4 windows as they land"
+
+[[item]]
+id = "ui:status.shortcuts"
+section = "status"
+phase = 2
+status = "todo"
+feature = "shortcut tiles for actions with gui_shortcut, with overflow arrows"
+note = ""
+
+[[item]]
+id = "ui:status.tabs"
+section = "status"
+phase = 2
+status = "todo"
+feature = "tabs ribbon of connected worlds (tabs = top/bottom), overflow arrows"
+note = ""
+
+[[item]]
+id = "ui:status.title"
+section = "status"
+phase = 2
+status = "todo"
+feature = "window title Clay MUD Client"
+note = ""
+
+[[item]]
+id = "ui:nav.keys"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "world keys: Shift-Up/Down, Esc-{ }, Esc-w/Alt-w, Esc/Alt-Left/Right, numeric prefix"
+note = ""
+
+[[item]]
+id = "ui:nav.remember"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "remember the last world per server and return to it"
+note = ""
+
+[[item]]
+id = "ui:nav.cache"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "world cache: keep recent lines per world across restarts (epoch-checked)"
+note = "IndexedDB equivalent"
+
+[[item]]
+id = "ui:keys.dispatch"
+section = "input"
+phase = 2
+status = "todo"
+feature = "key -> action resolution from the server key map (needed by output/navigation actions)"
+note = "full input editing is phase 3"
+
+[[item]]
+id = "ui:perf.targets"
+section = "output"
+phase = 2
+status = "todo"
+feature = "5k-line scroll at 60 fps, 200 lines/s incoming, idle CPU near 0, RSS, cold start measured"
+note = ""
