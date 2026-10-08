@@ -1,6 +1,8 @@
 //! The GPUI side of the native GUI.
 
+pub mod emoji;
 pub mod fonts;
+pub mod ink;
 pub mod output;
 #[cfg(feature = "native-gui-snapshot")]
 pub mod snapshot;
@@ -229,6 +231,18 @@ pub fn run(sender: Sender, events: mpsc::UnboundedReceiver<NetEvent>) {
             )
             .expect("open the main window");
         let view = window.update(cx, |_, _, cx| cx.entity().downgrade()).expect("main view");
+        // Redraw when a Discord emoji arrives or an animated one moves to its next frame.
+        let (repaint_tx, mut repaint) = mpsc::unbounded();
+        emoji::set_repaint(repaint_tx);
+        let repaint_view = view.clone();
+        cx.spawn(async move |cx| {
+            while repaint.next().await.is_some() {
+                if repaint_view.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let mut events = events;
         cx.spawn(async move |cx| {
             while let Some(ev) = events.next().await {

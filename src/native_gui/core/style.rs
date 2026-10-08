@@ -43,6 +43,21 @@ pub enum Cell {
     Block(char),
 }
 
+/// A Discord custom emoji (`<:name:id>`, or `<a:name:id>` when animated), which app.js
+/// `convertDiscordEmojis` turns into an image from Discord's CDN.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DiscordEmoji {
+    /// Digits only.
+    pub id: String,
+    /// `[A-Za-z0-9_]` only: what the web shows as the image's alt text, `:name:`.
+    pub name: String,
+    pub animated: bool,
+}
+
+/// Stands in for a Discord emoji in [`StyledLine::text`]: one character, which line
+/// breaking treats as an inline object (UAX #14 class CB), as browsers treat an image.
+pub const EMOJI_PLACEHOLDER: char = '\u{FFFC}';
+
 /// A styled stretch of [`StyledLine::text`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Run {
@@ -57,6 +72,8 @@ pub struct Run {
     pub link: bool,
     /// Drawn as cells rather than glyphs. The characters stay in `text` for copying.
     pub cell: Option<Cell>,
+    /// A Discord emoji: the run is its one [`EMOJI_PLACEHOLDER`].
+    pub emoji: Option<std::sync::Arc<DiscordEmoji>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -77,11 +94,13 @@ pub struct StyleOptions {
     /// `color_offset_percent`: pushes text colours away from a background they nearly
     /// match. 0 is off.
     pub color_offset_percent: u32,
+    /// Turn Discord emoji tags into emoji (off while tags are shown, F2).
+    pub discord_emoji: bool,
 }
 
 impl Default for StyleOptions {
     fn default() -> Self {
-        StyleOptions { color_offset_percent: 0 }
+        StyleOptions { color_offset_percent: 0, discord_emoji: true }
     }
 }
 
@@ -317,6 +336,10 @@ fn word_breaks(text: &str) -> Vec<usize> {
                 continue;
             }
         }
+        if c == EMOJI_PLACEHOLDER {
+            // An emoji that replaced its tag: the tag counted nothing either.
+            continue;
+        }
         if c.is_whitespace() {
             word_len = 0;
         } else {
@@ -413,11 +436,37 @@ fn push_chunk(out: &mut StyledLine, chunk: &str, sgr: &Sgr, palette: &Palette, o
         blink: sgr.blink,
         link: false,
         cell: None,
+        emoji: None,
     };
+    // Links are found first, on the text with its tags (app.js links before it converts
+    // emoji; a URL can't contain `<` or `>`, so the two never overlap).
     let links = link_ranges(chunk);
-    out.text.push_str(chunk);
+    let emoji = if opts.discord_emoji { discord_tags(chunk) } else { Vec::new() };
+    let mut next_emoji = emoji.iter().peekable();
 
     for (i, c) in chunk.char_indices() {
+        while next_emoji.peek().is_some_and(|(r, _)| i >= r.end) {
+            next_emoji.next();
+        }
+        if let Some((range, e)) = next_emoji.peek() {
+            if i > range.start {
+                continue;
+            }
+            if i == range.start {
+                // An image in the span: its background, but no underline (text decoration
+                // isn't drawn across an image) and not the link colour.
+                let run = Run {
+                    len: EMOJI_PLACEHOLDER.len_utf8(),
+                    underline: false,
+                    emoji: Some(std::sync::Arc::new(e.clone())),
+                    ..base.clone()
+                };
+                out.text.push(EMOJI_PLACEHOLDER);
+                out.runs.push(run);
+                continue;
+            }
+        }
+        out.text.push(c);
         let mut run = base.clone();
         run.len = c.len_utf8();
         if links.iter().any(|r| r.contains(&i)) {
@@ -445,9 +494,21 @@ fn push_chunk(out: &mut StyledLine, chunk: &str, sgr: &Sgr, palette: &Palette, o
     }
 }
 
+/// app.js `convertDiscordEmojis`: every `<:name:id>` / `<a:name:id>`, with its byte range.
+fn discord_tags(text: &str) -> Vec<(std::ops::Range<usize>, DiscordEmoji)> {
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    let tag = TAG.get_or_init(|| Regex::new(r"<(a?):([A-Za-z0-9_]+):(\d+)>").unwrap());
+    tag.captures_iter(text)
+        .map(|c| {
+            let e = DiscordEmoji { id: c[3].to_string(), name: c[2].to_string(), animated: !c[1].is_empty() };
+            (c.get(0).unwrap().range(), e)
+        })
+        .collect()
+}
+
 /// Append a one-character run, merging it into the previous run when nothing differs.
 fn push_run(out: &mut StyledLine, run: Run) {
-    if let Some(last) = out.runs.last_mut() {
+    if let Some(last) = out.runs.last_mut().filter(|l| l.emoji.is_none()) {
         let same = last.fg == run.fg
             && last.bg == run.bg
             && last.bold == run.bold
@@ -585,8 +646,87 @@ mod tests {
 
     #[test]
     fn colour_offset_lightens_text_close_to_the_background() {
-        let opts = StyleOptions { color_offset_percent: 50 };
+        let opts = StyleOptions { color_offset_percent: 50, ..StyleOptions::default() };
         let l = style_line("\x1b[30mx", &palette(), &opts);
         assert_ne!(l.runs[0].fg, palette().ansi[0]);
+    }
+
+    fn emoji_of(l: &StyledLine) -> Vec<(String, String, bool)> {
+        l.runs.iter().filter_map(|r| r.emoji.as_ref()).map(|e| (e.name.clone(), e.id.clone(), e.animated)).collect()
+    }
+
+    #[test]
+    fn discord_tags_become_one_placeholder_each() {
+        let l = style("hi <:mmLol:216154654256398347> and <a:b1nzy:392938283556143104>!");
+        assert_eq!(l.text, "hi \u{FFFC} and \u{FFFC}!");
+        assert_eq!(
+            emoji_of(&l),
+            vec![
+                ("mmLol".into(), "216154654256398347".into(), false),
+                ("b1nzy".into(), "392938283556143104".into(), true),
+            ]
+        );
+        // Each placeholder is a run of its own, so two emoji never merge.
+        let l = style("<:a:1><:b:2>");
+        assert_eq!(l.text, "\u{FFFC}\u{FFFC}");
+        assert_eq!(l.runs.len(), 2);
+        assert_eq!(emoji_of(&l).len(), 2);
+    }
+
+    #[test]
+    fn discord_emoji_keep_the_span_background_but_no_underline() {
+        let l = style("\x1b[4;44mx <:a:1> y");
+        let e = l.runs.iter().find(|r| r.emoji.is_some()).unwrap();
+        assert!(!e.underline);
+        assert!(e.bg.is_some());
+        assert!(l.runs.iter().filter(|r| r.emoji.is_none()).all(|r| r.underline));
+    }
+
+    #[test]
+    fn only_real_discord_tags_convert() {
+        // app.js's name pattern is [A-Za-z0-9_]: anything else stays text.
+        for raw in ["<:bad-name:1>", "<:name:12a>", "<name:1>", "<::1>"] {
+            let l = style(raw);
+            assert_eq!(l.text, raw);
+            assert!(emoji_of(&l).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn shown_tags_stay_as_text() {
+        let opts = StyleOptions { discord_emoji: false, ..StyleOptions::default() };
+        let l = style_line("<:a:1>", &palette(), &opts);
+        assert_eq!(l.text, "<:a:1>");
+        assert!(emoji_of(&l).is_empty());
+    }
+
+    #[test]
+    fn an_emoji_counts_nothing_toward_a_long_word() {
+        // insertWordBreaks skips a tag; the placeholder that replaced it does the same,
+        // so the break after "/" comes at the same character count either way.
+        let plain = style("aaaaaaaaaaaaaaaa/b");
+        let with = style("aaaaaaaa<:a:1>aaaaaaaa/b");
+        assert_eq!(plain.breaks.len(), 1);
+        assert_eq!(with.breaks, vec![with.text.find('/').unwrap() + 1]);
+    }
+
+    #[test]
+    fn a_link_ends_before_an_emoji() {
+        let l = style("see https://example.com/x<:a:1> now");
+        let link: String = l
+            .text
+            .char_indices()
+            .filter(|(i, _)| {
+                let mut at = 0;
+                l.runs.iter().any(|r| {
+                    let hit = r.link && (at..at + r.len).contains(i);
+                    at += r.len;
+                    hit
+                })
+            })
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(link, "https://example.com/x");
+        assert_eq!(emoji_of(&l).len(), 1);
     }
 }

@@ -33,6 +33,7 @@ This line is deliberately long so that it has to wrap across several rows of the
 [1mbold[0m [3mitalic[0m [4munderline[0m [5mblink[0m [7mreverse[0m [1;3mbold italic[0m [1;4;31mbold underline red[0m
 [7;32mreverse green[0m [7;33;44mreverse yellow on blue[0m [2mdim (ignored)[0m [9mstrike (ignored)[0m
 stray leftovers [0m[1;32mgone, but [match( and [menu] stay[0m
+descenders under a line: [4mjumpy gray pygmy hogs[0m and [4;36mgoing quietly, yes[0m
 
 [1;37m== Block art ==[0m
 [31m▄▄▄[33m▄▄▄[32m▄▄▄[36m▄▄▄[34m▄▄▄[35m▄▄▄[0m  half blocks, default background
@@ -87,7 +88,8 @@ col1	col2	col3	col4
 a	bb	ccc	dddd
 
 [1;37m== Discord and MUD tags ==[0m
-[chat(ooc)] Bob: hello there <:smile:123456789012345678> and <a:wave:234567890123456789>
+[chat(ooc)] Bob: hello there <:mmLol:216154654256398347> and <a:b1nzy:392938283556143104>
+Carol: an emoji that no longer exists <:gone:123456789012345678>
   [indented] tags are never stripped
 [36m[Newbie] Alice: colours after a tag[0m
 

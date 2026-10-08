@@ -39,6 +39,7 @@ pub fn run(target: Option<String>, snapshot: Option<String>) -> std::io::Result<
     #[cfg(target_os = "macos")]
     disable_font_smoothing();
     let runtime = tokio::runtime::Handle::current();
+    ui::emoji::init(runtime.clone());
     let (sender, events) = core::net::connect(&runtime, target, password, hex::encode(uid));
     if let Some(out) = snapshot {
         #[cfg(feature = "native-gui-snapshot")]

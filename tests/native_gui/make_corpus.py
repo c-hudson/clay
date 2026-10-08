@@ -53,6 +53,7 @@ section("Attributes")
 line(f"{E}1mbold{R} {E}3mitalic{R} {E}4munderline{R} {E}5mblink{R} {E}7mreverse{R} {E}1;3mbold italic{R} {E}1;4;31mbold underline red{R}")
 line(f"{E}7;32mreverse green{R} {E}7;33;44mreverse yellow on blue{R} {E}2mdim (ignored){R} {E}9mstrike (ignored){R}")
 line(f"stray leftovers [0m[1;32mgone, but [match( and [menu] stay{R}")
+line(f"descenders under a line: {E}4mjumpy gray pygmy hogs{R} and {E}4;36mgoing quietly, yes{R}")
 
 section("Block art")
 line(f"{E}31m▄▄▄{E}33m▄▄▄{E}32m▄▄▄{E}36m▄▄▄{E}34m▄▄▄{E}35m▄▄▄{R}  half blocks, default background")
@@ -111,7 +112,10 @@ line("col1\tcol2\tcol3\tcol4")
 line("a\tbb\tccc\tdddd")
 
 section("Discord and MUD tags")
-line("[chat(ooc)] Bob: hello there <:smile:123456789012345678> and <a:wave:234567890123456789>")
+# Real emoji (the examples in Discord's own message-formatting docs: a PNG and an
+# animated GIF), then one whose id the CDN doesn't know.
+line("[chat(ooc)] Bob: hello there <:mmLol:216154654256398347> and <a:b1nzy:392938283556143104>")
+line("Carol: an emoji that no longer exists <:gone:123456789012345678>")
 line("  [indented] tags are never stripped")
 line(f"{E}36m[Newbie] Alice: colours after a tag{R}")
 

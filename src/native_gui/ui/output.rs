@@ -13,18 +13,25 @@
 //! - Block elements and coloured spaces are exact cells, one column wide and one row
 //!   tall, painted after everything else (style.css `.blk`).
 //! - The container has 4px padding, and the view follows the bottom.
+//! - A Discord emoji is an image 1.2em tall centred on the text's middle, as the web's
+//!   `vertical-align: middle` puts it. Where the browser makes that row taller, here rows
+//!   stay one em, so the image reaches a little into the rows around it; it paints last.
+//! - Underlines skip descenders (`text-decoration-skip-ink`), see `ink`.
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
-    App, Bounds, ContentMask, Font, Hsla, IntoElement, LineLayout, Pixels, Rgba, SharedString, Styled, TextRun,
-    UnderlineStyle, Window, canvas, fill, point, px, size,
+    App, Bounds, ContentMask, Corners, Font, FontId, Hsla, IntoElement, LineLayout, Pixels, Rgba, SharedString,
+    Styled, TextRun, UnderlineStyle, Window, canvas, fill, point, px, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::fonts::{FontClass, Fonts, class_of};
-use crate::native_gui::core::style::{Cell, Rgb, StyledLine};
+use super::emoji::{self, Look};
+use super::fonts::{FontClass, Fonts, bundled_index, class_of};
+use super::ink;
+use crate::native_gui::core::style::{Cell, DiscordEmoji, Rgb, Run, StyledLine};
 use crate::native_gui::core::wrap::wrap_rows;
 
 /// `#output-container { padding: 4px }`.
@@ -71,8 +78,8 @@ struct LaidLine {
     /// offset over its base letter).
     cluster_origin: Vec<f32>,
     rows: Vec<Range<usize>>,
-    /// Per byte: inside a run drawn as cells.
-    is_cell: Vec<bool>,
+    /// Per byte: drawn here rather than as a glyph (a cell, or a Discord emoji).
+    no_glyph: Vec<bool>,
     /// Holds right-to-left text: such rows are reshaped for display.
     rtl: bool,
 }
@@ -89,6 +96,9 @@ pub struct Prepared {
     lines: Vec<LaidLine>,
     rows: Vec<VisibleRow>,
     content: Bounds<Pixels>,
+    /// The bundled faces' font ids, by [`bundled_index`]: glyphs whose outlines `ink` can
+    /// read.
+    bundled: [FontId; 4],
 }
 
 pub fn output_view(snapshot: OutputSnapshot) -> impl IntoElement {
@@ -192,17 +202,27 @@ fn lay_out(styled: Arc<StyledLine>, snapshot: &OutputSnapshot, m: &Metrics, widt
         cluster_origin[i] = cluster_origin[i].min(gx);
     }
 
-    let mut is_cell = vec![false; n];
+    // Cells are exactly one column each (`width: Nch`); an emoji is as wide as its image.
+    let mut no_glyph = vec![false; n];
+    let mut fixed: Vec<Option<f32>> = vec![None; n];
     let mut at = 0;
     for run in &styled.runs {
-        if run.cell.is_some() {
-            is_cell[at..at + run.len].iter_mut().for_each(|c| *c = true);
-        }
+        let span = at..at + run.len;
         at += run.len;
+        if run.cell.is_some() {
+            no_glyph[span.clone()].fill(true);
+            for (off, _) in text[span.clone()].char_indices() {
+                fixed[span.start + off] = Some(m.ch);
+            }
+        }
+        if let Some(e) = &run.emoji {
+            no_glyph[span.clone()].fill(true);
+            fixed[span.start] = Some(emoji_width(e, m));
+        }
     }
 
-    // Positions in logical order: cells exactly one column (`width: Nch`), tabs to the
-    // next eight-column stop, invisible characters nothing.
+    // Positions in logical order: cells and emoji as above, tabs to the next
+    // eight-column stop, invisible characters nothing.
     let tab = TAB_COLUMNS * m.ch;
     let mut x = vec![0.0f32; n + 1];
     let mut cur = 0.0f32;
@@ -210,8 +230,8 @@ fn lay_out(styled: Arc<StyledLine>, snapshot: &OutputSnapshot, m: &Metrics, widt
     for (i, c) in text.char_indices() {
         let j = i + c.len_utf8();
         rtl |= is_rtl(c);
-        let adv = if is_cell[i] {
-            m.ch
+        let adv = if let Some(w) = fixed[i] {
+            w
         } else if c == '\t' {
             tab - (cur % tab)
         } else if is_invisible(c) {
@@ -228,7 +248,18 @@ fn lay_out(styled: Arc<StyledLine>, snapshot: &OutputSnapshot, m: &Metrics, widt
 
     let indent = snapshot.wrapspace as f32 * m.ch;
     let rows = wrap_rows(text, &styled.breaks, width, indent, &|i| x[i]);
-    LaidLine { styled, layout, text_runs, x, cluster_origin, rows, is_cell, rtl }
+    LaidLine { styled, layout, text_runs, x, cluster_origin, rows, no_glyph, rtl }
+}
+
+/// How wide a Discord emoji is: its image at the web's height, a square until the image
+/// arrives, or its `:name:` if it never will.
+fn emoji_width(e: &DiscordEmoji, m: &Metrics) -> f32 {
+    let h = emoji::HEIGHT_EM * f32::from(m.font_size);
+    match emoji::lookup(e) {
+        Look::Ready(l) => h * l.aspect,
+        Look::Loading => h,
+        Look::Failed => (e.name.chars().count() + 2) as f32 * m.ch,
+    }
 }
 
 /// The text runs for part of a line (a right-to-left row reshaped on its own).
@@ -304,7 +335,11 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         rows.reverse();
     }
 
-    Prepared { snapshot, metrics, lines, rows, content }
+    let ts = window.text_system();
+    let bundled = [(false, false), (true, false), (false, true), (true, true)]
+        .map(|(b, i)| ts.resolve_font(&snapshot.fonts.font(FontClass::Primary, b, i)));
+    debug_assert!((0..4).all(|k| bundled_index(k & 1 == 1, k & 2 == 2) == k));
+    Prepared { snapshot, metrics, lines, rows, content, bundled }
 }
 
 fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App) {
@@ -313,6 +348,7 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
     let indent = p.snapshot.wrapspace as f32 * m.ch;
     // Where the font's own content area starts within a row (CSS half-leading).
     let half_leading = (m.row - (m.ascent + m.descent)) / 2.0;
+    let ul = Underline::new(m);
 
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for vr in &p.rows {
@@ -343,16 +379,20 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 }
             }
 
-            // Glyphs.
-            let mut style_ends: Vec<(usize, Rgb)> = Vec::new();
+            // Glyphs, noting where they cross an underline.
+            let mut style_ends: Vec<(usize, Rgb, bool)> = Vec::new();
             let mut at = 0;
             for run in &line.styled.runs {
                 at += run.len;
-                style_ends.push((at, run.fg));
+                style_ends.push((at, run.fg, underlined(run)));
             }
-            let fg_at = |i: usize| style_ends.iter().find(|(end, _)| i < *end).map(|(_, c)| *c).unwrap_or([255, 255, 255]);
+            let style_at = |i: usize| {
+                style_ends.iter().find(|(end, ..)| i < *end).map(|&(_, c, u)| (c, u)).unwrap_or(([255, 255, 255], false))
+            };
+            let fg_at = |i: usize| style_at(i).0;
             let text = &line.styled.text;
-            let skip = |i: usize| line.is_cell[i] || text[i..].chars().next().is_some_and(|c| c == '\t' || is_invisible(c));
+            let skip = |i: usize| line.no_glyph[i] || text[i..].chars().next().is_some_and(|c| c == '\t' || is_invisible(c));
+            let mut gaps: Vec<(f32, f32)> = Vec::new();
             let row_text = &text[range.clone()];
             if line.rtl && row_text.chars().any(is_rtl) {
                 // Right-to-left text: order the row with the Unicode bidi algorithm, then
@@ -410,25 +450,34 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                         } else {
                             window.paint_glyph(origin, run.font_id, g.id, m.font_size, hsla(fg_at(i)))
                         };
+                        if !g.is_emoji && style_at(i).1 {
+                            if let Some(face) = p.bundled.iter().position(|f| *f == run.font_id) {
+                                underline_gaps(&mut gaps, &ul, face, g.id.0, f32::from(origin.x), f32::from(g.position.y));
+                            }
+                        }
                     }
                 }
             }
 
-            // Underlines.
+            // Underlines, with the gaps the glyphs above made.
             let mut at = 0;
             for run in &line.styled.runs {
                 let (s, e) = (at, at + run.len);
                 at = e;
                 let (s, e) = (s.max(range.start), e.min(range.end));
-                if s >= e || !run.underline || run.cell.is_some() {
+                if s >= e || !underlined(run) {
                     continue;
                 }
-                let thickness = (m.row / 14.0).max(1.0);
-                window.paint_underline(
-                    point(px(left + line.x[s] - x0), px(baseline + m.descent * 0.35)),
-                    px(line.x[e] - line.x[s]),
-                    &UnderlineStyle { thickness: px(thickness), color: Some(hsla(run.fg)), wavy: false },
-                );
+                let (sx, ex) = (left + line.x[s] - x0, left + line.x[e] - x0);
+                for (a, b) in ink::cut(sx, ex, &gaps) {
+                    if b - a >= 0.5 {
+                        window.paint_underline(
+                            point(px(a), px(baseline + ul.offset)),
+                            px(b - a),
+                            &UnderlineStyle { thickness: px(ul.thickness), color: Some(hsla(run.fg)), wavy: false },
+                        );
+                    }
+                }
             }
         }
 
@@ -454,7 +503,104 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 }
             }
         }
+
+        // Discord emoji last: an image reaches past its row.
+        let now = Instant::now();
+        let mut next_frame: Option<Instant> = None;
+        let height = emoji::HEIGHT_EM * f32::from(m.font_size);
+        let middle = ink::x_height_em() * f32::from(m.font_size) / 2.0;
+        for vr in &p.rows {
+            let line = &p.lines[vr.line];
+            let range = line.rows[vr.row].clone();
+            let left = f32::from(p.content.origin.x) + if vr.row > 0 { indent } else { 0.0 };
+            let x0 = line.x[range.start];
+            let baseline = vr.top + half_leading + m.ascent;
+            let mut at = 0;
+            for run in &line.styled.runs {
+                let s = at;
+                at += run.len;
+                let Some(e) = &run.emoji else { continue };
+                if !range.contains(&s) {
+                    continue;
+                }
+                let x = left + line.x[s] - x0;
+                match emoji::lookup(e) {
+                    Look::Ready(l) => {
+                        let b = Bounds::new(
+                            point(px(x), px(baseline - middle - height / 2.0)),
+                            size(px(height * l.aspect), px(height)),
+                        );
+                        let (frame, next) = l.frame_at(now);
+                        let _ = window.paint_image(b, b, Corners::default(), l.image.clone(), frame, false);
+                        if let Some(t) = next {
+                            next_frame = Some(next_frame.map_or(t, |n| n.min(t)));
+                        }
+                    }
+                    Look::Failed => paint_emoji_name(window, &p, e, run, x, baseline),
+                    Look::Loading => {}
+                }
+            }
+        }
+        if let Some(t) = next_frame {
+            emoji::wake_at(t);
+        }
     });
+}
+
+/// Whether a run's text is underlined (cells and emoji never are).
+fn underlined(run: &Run) -> bool {
+    run.underline && run.cell.is_none() && run.emoji.is_none()
+}
+
+/// Where the underline sits: below the baseline, in the run's colour.
+struct Underline {
+    /// From the baseline down to the line's top edge.
+    offset: f32,
+    thickness: f32,
+    /// How far a gap reaches past the ink on each side: the line's thickness, as Blink
+    /// does (capped at 13px there too).
+    clearance: f32,
+    font_size: f32,
+}
+
+impl Underline {
+    fn new(m: &Metrics) -> Self {
+        let thickness = (m.row / 14.0).max(1.0);
+        Underline {
+            offset: m.descent * 0.35,
+            thickness,
+            clearance: thickness.round().clamp(1.0, 13.0),
+            font_size: f32::from(m.font_size),
+        }
+    }
+}
+
+/// Add the gaps a bundled-font glyph at `origin_x` (drawn `dy` below the baseline) cuts
+/// into the underline.
+fn underline_gaps(gaps: &mut Vec<(f32, f32)>, ul: &Underline, face: usize, glyph: u32, origin_x: f32, dy: f32) {
+    let Some(upem) = ink::units_per_em(face) else { return };
+    let k = upem / ul.font_size;
+    // The band in the glyph's own units, y up from its baseline.
+    let top = ul.offset - dy;
+    let (lo, hi) = (-(top + ul.thickness) * k, -top * k);
+    for &(a, b) in ink::spans(face, glyph, lo, hi).iter() {
+        gaps.push((origin_x + a / k - ul.clearance, origin_x + b / k + ul.clearance));
+    }
+}
+
+/// An emoji Discord couldn't supply, shown as its name (the web shows a broken image).
+fn paint_emoji_name(window: &mut Window, p: &Prepared, e: &DiscordEmoji, run: &Run, x: f32, baseline: f32) {
+    let m = &p.metrics;
+    let name = format!(":{}:", e.name);
+    let font = p.snapshot.fonts.font(FontClass::Primary, run.bold, run.italic);
+    let runs = [TextRun { len: name.len(), font, color: Hsla::default(), ..Default::default() }];
+    let layout = window.text_system().layout_line(&name, m.font_size, &runs, None);
+    for r in &layout.runs {
+        for g in &r.glyphs {
+            let origin = point(px(x) + g.position.x, px(baseline) + g.position.y);
+            let _ = window.paint_glyph(origin, r.font_id, g.id, m.font_size, hsla(run.fg));
+        }
+    }
 }
 
 /// A block element's shape, from app.js `BLOCK_ELEMENT_LAYERS`, over the cell's background.

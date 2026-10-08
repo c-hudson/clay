@@ -1287,6 +1287,7 @@ dependencies = [
  "tokio-native-tls",
  "tokio-rustls",
  "tokio-tungstenite",
+ "ttf-parser",
  "unicode-bidi",
  "unicode-linebreak",
  "unicode-properties",

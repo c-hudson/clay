@@ -103,13 +103,21 @@ fn presents_as_emoji(cluster: &str) -> bool {
 }
 
 /// Register the bundled fonts and work out the fallback, once at startup.
+/// The bundled JetBrains Mono NL faces, indexed by [`bundled_index`].
+pub const BUNDLED: [&[u8]; 4] = [
+    include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Regular.ttf"),
+    include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Bold.ttf"),
+    include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Italic.ttf"),
+    include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-BoldItalic.ttf"),
+];
+
+/// Which of [`BUNDLED`] is the primary font in this weight and style.
+pub fn bundled_index(bold: bool, italic: bool) -> usize {
+    bold as usize + 2 * italic as usize
+}
+
 pub fn load(cx: &mut App) -> Fonts {
-    let bundled: Vec<Cow<'static, [u8]>> = vec![
-        Cow::Borrowed(include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Regular.ttf")),
-        Cow::Borrowed(include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Bold.ttf")),
-        Cow::Borrowed(include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Italic.ttf")),
-        Cow::Borrowed(include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-BoldItalic.ttf")),
-    ];
+    let bundled: Vec<Cow<'static, [u8]>> = BUNDLED.iter().map(|b| Cow::Borrowed(*b)).collect();
     if let Err(e) = cx.text_system().add_fonts(bundled) {
         crate::debug_log(true, &format!("native-gui: bundled fonts failed to load: {e}"));
     }

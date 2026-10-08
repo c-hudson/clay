@@ -16,6 +16,8 @@ use crate::websocket::WsMessage;
 /// How long the output must be quiet, after the initial state, before the snapshot.
 const SETTLE: Duration = Duration::from_millis(1500);
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// How long to wait for Discord emoji images.
+const EMOJI_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn run(sender: Sender, mut events: mpsc::UnboundedReceiver<NetEvent>, out: &str, width: f32, height: f32) {
     // Collect the session's events first: the headless app runs on a deterministic test
@@ -75,6 +77,19 @@ pub fn run(sender: Sender, mut events: mpsc::UnboundedReceiver<NetEvent>, out: &
         let _ = window.draw(app);
     })
     .expect("draw the frame");
+    // That frame asked for any Discord emoji it shows: wait for them, then draw again.
+    if super::emoji::pending() > 0 {
+        let start = Instant::now();
+        while super::emoji::pending() > 0 && start.elapsed() < EMOJI_TIMEOUT {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        cx.update(|app| window.update(app, |_, _, cx| cx.notify()).expect("update the view"));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, app| {
+            let _ = window.draw(app);
+        })
+        .expect("draw the frame again");
+    }
     match cx.capture_screenshot(window.into()) {
         Ok(image) => {
             if let Err(e) = image.save(out) {
