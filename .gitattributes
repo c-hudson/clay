@@ -11,3 +11,5 @@
 *.so       binary
 *.dll      binary
 *.exe      binary
+# Raw MUD bytes (CRLF line endings, ESC characters): keep byte-exact.
+tests/native_gui/corpus.ans -text
