@@ -603,6 +603,40 @@ fn paint_emoji_name(window: &mut Window, p: &Prepared, e: &DiscordEmoji, run: &R
     }
 }
 
+/// A box-drawing character as exact lines (`boxdraw`), in device pixels so they land on
+/// whole pixels and meet the next cell's.
+fn paint_box(window: &mut Window, cell: Bounds<Pixels>, ch: char, colour: Hsla) {
+    use crate::native_gui::core::boxdraw::{CellPx, Seg, Thickness, shape};
+    let s = window.scale_factor();
+    let dev = |v: Pixels| (f32::from(v) * s).round();
+    let px_box = CellPx {
+        x0: dev(cell.origin.x),
+        x1: dev(cell.origin.x + cell.size.width),
+        y0: dev(cell.origin.y),
+        y1: dev(cell.origin.y + cell.size.height),
+    };
+    let Some(sh) = shape(ch, px_box, Thickness::for_row(px_box.y1 - px_box.y0)) else { return };
+    let lp = |v: f32| px(v / s);
+    for [x0, y0, x1, y1] in sh.rects {
+        window.paint_quad(fill(Bounds::new(point(lp(x0), lp(y0)), size(lp(x1 - x0), lp(y1 - y0))), colour));
+    }
+    for (width, segs) in sh.strokes {
+        let mut path = gpui::PathBuilder::stroke(lp(width));
+        for seg in segs {
+            match seg {
+                Seg::Move(x, y) => path.move_to(point(lp(x), lp(y))),
+                Seg::Line(x, y) => path.line_to(point(lp(x), lp(y))),
+                Seg::Cubic([ax, ay, bx, by, x, y]) => {
+                    path.cubic_bezier_to(point(lp(x), lp(y)), point(lp(ax), lp(ay)), point(lp(bx), lp(by)))
+                }
+            }
+        }
+        if let Ok(path) = path.build() {
+            window.paint_path(path, colour);
+        }
+    }
+}
+
 /// A block element's shape, from app.js `BLOCK_ELEMENT_LAYERS`, over the cell's background.
 fn paint_cell(window: &mut Window, cell: Bounds<Pixels>, kind: Cell, fg: Rgb, bg: Option<Rgb>) {
     // Snap to device pixels so neighbouring cells meet without seams.
@@ -620,6 +654,10 @@ fn paint_cell(window: &mut Window, cell: Bounds<Pixels>, kind: Cell, fg: Rgb, bg
         rect(window, 0.0, 0.0, 1.0, 1.0, hsla(bg));
     }
     let c = hsla(fg);
+    if let Cell::Box(ch) = kind {
+        paint_box(window, cell, ch, c);
+        return;
+    }
     let Cell::Block(ch) = kind else { return };
     let eighth = |n: u32| n as f32 / 8.0;
     match ch {

@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use super::boxdraw::is_box_drawing;
+
 pub type Rgb = [u8; 3];
 
 /// The colours a line is styled with: the theme's 16 ANSI colours, its default text and
@@ -41,6 +43,10 @@ pub enum Cell {
     Space,
     /// A block element (U+2580-U+259F), drawn as its exact shape in the run's colour.
     Block(char),
+    /// A box-drawing character (U+2500-U+257F), drawn as exact lines that meet the
+    /// neighbouring cells' (see `boxdraw`). The WebView draws these from a fallback font,
+    /// whose columns and line height don't match the output's.
+    Box(char),
 }
 
 /// A Discord custom emoji (`<:name:id>`, or `<a:name:id>` when animated), which app.js
@@ -485,10 +491,13 @@ fn push_chunk(out: &mut StyledLine, chunk: &str, sgr: &Sgr, palette: &Palette, o
                 }
                 ' ' => run.cell = Some(Cell::Space),
                 c if is_block_element(c) => run.cell = Some(Cell::Block(c)),
+                c if is_box_drawing(c) => run.cell = Some(Cell::Box(c)),
                 _ => {}
             }
         } else if is_block_element(c) {
             run.cell = Some(Cell::Block(c));
+        } else if is_box_drawing(c) {
+            run.cell = Some(Cell::Box(c));
         }
         push_run(out, run);
     }
@@ -728,5 +737,14 @@ mod tests {
             .collect();
         assert_eq!(link, "https://example.com/x");
         assert_eq!(emoji_of(&l).len(), 1);
+    }
+
+    #[test]
+    fn box_drawing_becomes_cells() {
+        let l = style("┌─┐ a");
+        let cells: Vec<Option<Cell>> = l.runs.iter().map(|r| r.cell).collect();
+        assert_eq!(l.runs.len(), 4, "{:?}", l.runs);
+        assert_eq!(cells[..3], [Some(Cell::Box('┌')), Some(Cell::Box('─')), Some(Cell::Box('┐'))]);
+        assert_eq!(cells[3], None);
     }
 }
