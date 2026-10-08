@@ -6,6 +6,8 @@
 
 pub mod core;
 mod ui;
+#[cfg(test)]
+mod parity_tests;
 
 /// `clay --native-gui[=host[:port]]`; with `snapshot` set (`--native-gui-snapshot=<png>`)
 /// render one frame offscreen to that file and exit; with `verify` set

@@ -1,0 +1,2290 @@
+# The native GUI's parity checklist: one row per thing the web GUI does.
+#
+# Sources of truth: app.js `handleMessage` (msg:*), app.js `dispatchActionImpl`
+# (action:*), `WsMessage` in websocket.rs (wire:*), and the web window's features
+# (ui:*). parity_tests.rs fails on any msg/action/wire id missing from this file or no
+# longer in its source, so nothing the web GUI gains can be silently left out.
+#
+# status: done | todo | waived (with a note saying why) | see (wire rows of handled
+# messages: their msg: row decides). phase: the plan's phase that delivers it (0 = n/a).
+# Format: [[item]] blocks of `key = "value"` / `key = number` only.
+
+[[item]]
+id = "msg:ActionsUpdated"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle ActionsUpdated"
+note = "actions list for the Actions window and tiles"
+
+[[item]]
+id = "msg:ActivityUpdate"
+section = "status"
+phase = 2
+status = "todo"
+feature = "handle ActivityUpdate"
+note = "activity count in the status bar"
+
+[[item]]
+id = "msg:AnsiMusic"
+section = "media"
+phase = 5
+status = "todo"
+feature = "handle AnsiMusic"
+note = ""
+
+[[item]]
+id = "msg:AuthResponse"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle AuthResponse"
+note = "core/client.rs on_auth_response"
+
+[[item]]
+id = "msg:BanListResponse"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle BanListResponse"
+note = ""
+
+[[item]]
+id = "msg:CalculatedWorld"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "handle CalculatedWorld"
+note = "reply to Calculate*World: switch locally"
+
+[[item]]
+id = "msg:CertMismatch"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle CertMismatch"
+note = "a MUD world certificate changed (server-side TLS), not this connection"
+
+[[item]]
+id = "msg:ChatLookupResult"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle ChatLookupResult"
+note = ""
+
+[[item]]
+id = "msg:ClaimedNew"
+section = "output"
+phase = 1
+status = "done"
+feature = "handle ClaimedNew"
+note = "core on_claimed"
+
+[[item]]
+id = "msg:ConnectionsListResponse"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle ConnectionsListResponse"
+note = ""
+
+[[item]]
+id = "msg:EchoMaskChanged"
+section = "input"
+phase = 3
+status = "todo"
+feature = "handle EchoMaskChanged"
+note = ""
+
+[[item]]
+id = "msg:ExecuteLocalCommand"
+section = "misc"
+phase = 4
+status = "todo"
+feature = "handle ExecuteLocalCommand"
+note = ""
+
+[[item]]
+id = "msg:GlobalSettingsUpdated"
+section = "settings"
+phase = 1
+status = "done"
+feature = "handle GlobalSettingsUpdated"
+note = "core stores settings; ui applies theme/font/show_tags"
+
+[[item]]
+id = "msg:GmcpData"
+section = "status"
+phase = 2
+status = "todo"
+feature = "handle GmcpData"
+note = "status display / stats"
+
+[[item]]
+id = "msg:GmcpUserToggled"
+section = "status"
+phase = 2
+status = "todo"
+feature = "handle GmcpUserToggled"
+note = ""
+
+[[item]]
+id = "msg:ImportNeedsInsecureConfirm"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle ImportNeedsInsecureConfirm"
+note = ""
+
+[[item]]
+id = "msg:ImportResult"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle ImportResult"
+note = ""
+
+[[item]]
+id = "msg:InitialState"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle InitialState"
+note = "core on_initial_state"
+
+[[item]]
+id = "msg:KeyGenerated"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle KeyGenerated"
+note = "core adopt_key"
+
+[[item]]
+id = "msg:KeybindingsUpdated"
+section = "input"
+phase = 3
+status = "todo"
+feature = "handle KeybindingsUpdated"
+note = ""
+
+[[item]]
+id = "msg:LoggedOut"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle LoggedOut"
+note = "multiuser logout"
+
+[[item]]
+id = "msg:McmpMedia"
+section = "media"
+phase = 5
+status = "todo"
+feature = "handle McmpMedia"
+note = ""
+
+[[item]]
+id = "msg:McpEditOpen"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle McpEditOpen"
+note = ""
+
+[[item]]
+id = "msg:MsdpData"
+section = "status"
+phase = 2
+status = "todo"
+feature = "handle MsdpData"
+note = "status display / stats"
+
+[[item]]
+id = "msg:NoteEditorState"
+section = "windows"
+phase = 4
+status = "todo"
+feature = "handle NoteEditorState"
+note = ""
+
+[[item]]
+id = "msg:NotesChanged"
+section = "status"
+phase = 2
+status = "todo"
+feature = "handle NotesChanged"
+note = "notes icon in the status bar"
+
+[[item]]
+id = "msg:Notification"
+section = "media"
+phase = 5
+status = "todo"
+feature = "handle Notification"
+note = ""
+
+[[item]]
+id = "msg:OpenWindow"
+section = "windows"
+phase = 4
+status = "todo"
+feature = "handle OpenWindow"
+note = ""
+
+[[item]]
+id = "msg:OutputLines"
+section = "output"
+phase = 2
+status = "todo"
+feature = "handle OutputLines"
+note = ""
+
+[[item]]
+id = "msg:PasswordChanged"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle PasswordChanged"
+note = ""
+
+[[item]]
+id = "msg:PausedState"
+section = "status"
+phase = 2
+status = "todo"
+feature = "handle PausedState"
+note = "PAUSED badge"
+
+[[item]]
+id = "msg:PendingCountUpdate"
+section = "output"
+phase = 1
+status = "done"
+feature = "handle PendingCountUpdate"
+note = "core pending_count"
+
+[[item]]
+id = "msg:PendingLinesUpdate"
+section = "output"
+phase = 1
+status = "done"
+feature = "handle PendingLinesUpdate"
+note = "core pending_count"
+
+[[item]]
+id = "msg:PendingReleased"
+section = "output"
+phase = 2
+status = "todo"
+feature = "handle PendingReleased"
+note = "core re-drives gap fill (done); local more-mode release is phase 2"
+
+[[item]]
+id = "msg:PingCheck"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle PingCheck"
+note = ""
+
+[[item]]
+id = "msg:Pong"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle Pong"
+note = "wake check"
+
+[[item]]
+id = "msg:PromptUpdate"
+section = "input"
+phase = 3
+status = "todo"
+feature = "handle PromptUpdate"
+note = "core stores the prompt; drawn with the input in phase 3"
+
+[[item]]
+id = "msg:ReleasedNew"
+section = "output"
+phase = 1
+status = "done"
+feature = "handle ReleasedNew"
+note = ""
+
+[[item]]
+id = "msg:ResyncRequired"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle ResyncRequired"
+note = ""
+
+[[item]]
+id = "msg:ScrollbackLines"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle ScrollbackLines"
+note = ""
+
+[[item]]
+id = "msg:ServerData"
+section = "output"
+phase = 1
+status = "done"
+feature = "handle ServerData"
+note = ""
+
+[[item]]
+id = "msg:ServerHello"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle ServerHello"
+note = ""
+
+[[item]]
+id = "msg:ServerReloading"
+section = "connection"
+phase = 1
+status = "done"
+feature = "handle ServerReloading"
+note = ""
+
+[[item]]
+id = "msg:ServerSpeak"
+section = "media"
+phase = 5
+status = "todo"
+feature = "handle ServerSpeak"
+note = ""
+
+[[item]]
+id = "msg:SetInputBuffer"
+section = "input"
+phase = 3
+status = "todo"
+feature = "handle SetInputBuffer"
+note = ""
+
+[[item]]
+id = "msg:ShowTagsChanged"
+section = "output"
+phase = 1
+status = "done"
+feature = "handle ShowTagsChanged"
+note = ""
+
+[[item]]
+id = "msg:StatsUpdate"
+section = "status"
+phase = 2
+status = "todo"
+feature = "handle StatsUpdate"
+note = "stats panel"
+
+[[item]]
+id = "msg:TfStatus"
+section = "status"
+phase = 2
+status = "todo"
+feature = "handle TfStatus"
+note = "TF status row"
+
+[[item]]
+id = "msg:ThemeCssVarsUpdated"
+section = "settings"
+phase = 2
+status = "todo"
+feature = "handle ThemeCssVarsUpdated"
+note = "live theme change"
+
+[[item]]
+id = "msg:UnbanResult"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle UnbanResult"
+note = ""
+
+[[item]]
+id = "msg:UnseenCleared"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "handle UnseenCleared"
+note = "core stores; drawn in phase 2"
+
+[[item]]
+id = "msg:UnseenUpdate"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "handle UnseenUpdate"
+note = "core stores; drawn in phase 2"
+
+[[item]]
+id = "msg:WorldAdded"
+section = "navigation"
+phase = 1
+status = "done"
+feature = "handle WorldAdded"
+note = "core"
+
+[[item]]
+id = "msg:WorldConnected"
+section = "navigation"
+phase = 1
+status = "done"
+feature = "handle WorldConnected"
+note = "core"
+
+[[item]]
+id = "msg:WorldCreated"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle WorldCreated"
+note = ""
+
+[[item]]
+id = "msg:WorldDisconnected"
+section = "navigation"
+phase = 1
+status = "done"
+feature = "handle WorldDisconnected"
+note = "core"
+
+[[item]]
+id = "msg:WorldFlushed"
+section = "output"
+phase = 1
+status = "done"
+feature = "handle WorldFlushed"
+note = ""
+
+[[item]]
+id = "msg:WorldRemoved"
+section = "navigation"
+phase = 1
+status = "done"
+feature = "handle WorldRemoved"
+note = "core"
+
+[[item]]
+id = "msg:WorldSettingsUpdated"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "handle WorldSettingsUpdated"
+note = ""
+
+[[item]]
+id = "msg:WorldStateResponse"
+section = "navigation"
+phase = 1
+status = "done"
+feature = "handle WorldStateResponse"
+note = "core: pending, prompt, deliverable_high_seq gap check"
+
+[[item]]
+id = "msg:WorldSwitchResult"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "handle WorldSwitchResult"
+note = ""
+
+[[item]]
+id = "msg:WorldSwitched"
+section = "navigation"
+phase = 1
+status = "waived"
+feature = "handle WorldSwitched"
+note = "the client keeps its own current world, as app.js does"
+
+[[item]]
+id = "action:bell"
+section = "media"
+phase = 5
+status = "todo"
+feature = "action bell"
+note = ""
+
+[[item]]
+id = "action:bg_all_worlds"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action bg_all_worlds"
+note = ""
+
+[[item]]
+id = "action:capitalize_word"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action capitalize_word"
+note = ""
+
+[[item]]
+id = "action:clear_line"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action clear_line"
+note = ""
+
+[[item]]
+id = "action:clear_screen"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action clear_screen"
+note = ""
+
+[[item]]
+id = "action:collapse_spaces"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action collapse_spaces"
+note = ""
+
+[[item]]
+id = "action:completion"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action completion"
+note = ""
+
+[[item]]
+id = "action:cursor_down"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action cursor_down"
+note = ""
+
+[[item]]
+id = "action:cursor_end"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action cursor_end"
+note = ""
+
+[[item]]
+id = "action:cursor_home"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action cursor_home"
+note = ""
+
+[[item]]
+id = "action:cursor_left"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action cursor_left"
+note = ""
+
+[[item]]
+id = "action:cursor_right"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action cursor_right"
+note = ""
+
+[[item]]
+id = "action:cursor_up"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action cursor_up"
+note = ""
+
+[[item]]
+id = "action:cursor_word_left"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action cursor_word_left"
+note = ""
+
+[[item]]
+id = "action:cursor_word_right"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action cursor_word_right"
+note = ""
+
+[[item]]
+id = "action:delete_backward"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action delete_backward"
+note = ""
+
+[[item]]
+id = "action:delete_forward"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action delete_forward"
+note = ""
+
+[[item]]
+id = "action:delete_word_backward"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action delete_word_backward"
+note = ""
+
+[[item]]
+id = "action:delete_word_backward_punct"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action delete_word_backward_punct"
+note = ""
+
+[[item]]
+id = "action:delete_word_forward"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action delete_word_forward"
+note = ""
+
+[[item]]
+id = "action:emoji_picker"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "action emoji_picker"
+note = ""
+
+[[item]]
+id = "action:expand_line"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action expand_line"
+note = ""
+
+[[item]]
+id = "action:filter_popup"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action filter_popup"
+note = ""
+
+[[item]]
+id = "action:flush_output"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action flush_output"
+note = ""
+
+[[item]]
+id = "action:goto_matching_bracket"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action goto_matching_bracket"
+note = ""
+
+[[item]]
+id = "action:help"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "action help"
+note = ""
+
+[[item]]
+id = "action:history_next"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action history_next"
+note = ""
+
+[[item]]
+id = "action:history_prev"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action history_prev"
+note = ""
+
+[[item]]
+id = "action:history_search_backward"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action history_search_backward"
+note = ""
+
+[[item]]
+id = "action:history_search_forward"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action history_search_forward"
+note = ""
+
+[[item]]
+id = "action:input_grow"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action input_grow"
+note = ""
+
+[[item]]
+id = "action:input_shrink"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action input_shrink"
+note = ""
+
+[[item]]
+id = "action:insert_last_arg"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action insert_last_arg"
+note = ""
+
+[[item]]
+id = "action:kbnum_0"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_0"
+note = ""
+
+[[item]]
+id = "action:kbnum_1"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_1"
+note = ""
+
+[[item]]
+id = "action:kbnum_2"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_2"
+note = ""
+
+[[item]]
+id = "action:kbnum_3"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_3"
+note = ""
+
+[[item]]
+id = "action:kbnum_4"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_4"
+note = ""
+
+[[item]]
+id = "action:kbnum_5"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_5"
+note = ""
+
+[[item]]
+id = "action:kbnum_6"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_6"
+note = ""
+
+[[item]]
+id = "action:kbnum_7"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_7"
+note = ""
+
+[[item]]
+id = "action:kbnum_8"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_8"
+note = ""
+
+[[item]]
+id = "action:kbnum_9"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_9"
+note = ""
+
+[[item]]
+id = "action:kbnum_negative"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kbnum_negative"
+note = ""
+
+[[item]]
+id = "action:kill_to_end"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kill_to_end"
+note = ""
+
+[[item]]
+id = "action:kill_to_start"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action kill_to_start"
+note = ""
+
+[[item]]
+id = "action:literal_next"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action literal_next"
+note = ""
+
+[[item]]
+id = "action:lowercase_word"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action lowercase_word"
+note = ""
+
+[[item]]
+id = "action:pause_output"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action pause_output"
+note = ""
+
+[[item]]
+id = "action:quit"
+section = "misc"
+phase = 5
+status = "todo"
+feature = "action quit"
+note = ""
+
+[[item]]
+id = "action:recall_begin"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action recall_begin"
+note = ""
+
+[[item]]
+id = "action:recall_end"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action recall_end"
+note = ""
+
+[[item]]
+id = "action:redraw"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action redraw"
+note = ""
+
+[[item]]
+id = "action:redraw_server_only"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action redraw_server_only"
+note = ""
+
+[[item]]
+id = "action:refresh_line"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action refresh_line"
+note = ""
+
+[[item]]
+id = "action:reload"
+section = "misc"
+phase = 5
+status = "todo"
+feature = "action reload"
+note = ""
+
+[[item]]
+id = "action:scramble_words"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action scramble_words"
+note = ""
+
+[[item]]
+id = "action:scroll_half_page"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action scroll_half_page"
+note = ""
+
+[[item]]
+id = "action:scroll_half_page_back"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action scroll_half_page_back"
+note = ""
+
+[[item]]
+id = "action:scroll_line_back"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action scroll_line_back"
+note = ""
+
+[[item]]
+id = "action:scroll_line_forward"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action scroll_line_forward"
+note = ""
+
+[[item]]
+id = "action:scroll_page_back"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action scroll_page_back"
+note = ""
+
+[[item]]
+id = "action:scroll_page_down"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action scroll_page_down"
+note = ""
+
+[[item]]
+id = "action:scroll_page_up"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action scroll_page_up"
+note = ""
+
+[[item]]
+id = "action:search_popup"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action search_popup"
+note = ""
+
+[[item]]
+id = "action:selective_flush"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action selective_flush"
+note = ""
+
+[[item]]
+id = "action:show_version"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "action show_version"
+note = ""
+
+[[item]]
+id = "action:spell_check"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action spell_check"
+note = ""
+
+[[item]]
+id = "action:suspend"
+section = "misc"
+phase = 5
+status = "todo"
+feature = "action suspend"
+note = ""
+
+[[item]]
+id = "action:tab_key"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action tab_key"
+note = ""
+
+[[item]]
+id = "action:toggle_action_highlight"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action toggle_action_highlight"
+note = ""
+
+[[item]]
+id = "action:toggle_gmcp_media"
+section = "media"
+phase = 5
+status = "todo"
+feature = "action toggle_gmcp_media"
+note = ""
+
+[[item]]
+id = "action:toggle_insert"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action toggle_insert"
+note = ""
+
+[[item]]
+id = "action:toggle_limit"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action toggle_limit"
+note = ""
+
+[[item]]
+id = "action:toggle_tags"
+section = "output"
+phase = 2
+status = "todo"
+feature = "action toggle_tags"
+note = ""
+
+[[item]]
+id = "action:transpose_chars"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action transpose_chars"
+note = ""
+
+[[item]]
+id = "action:uppercase_word"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action uppercase_word"
+note = ""
+
+[[item]]
+id = "action:world_activity"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_activity"
+note = ""
+
+[[item]]
+id = "action:world_all_next"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_all_next"
+note = ""
+
+[[item]]
+id = "action:world_all_prev"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_all_prev"
+note = ""
+
+[[item]]
+id = "action:world_forward"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_forward"
+note = ""
+
+[[item]]
+id = "action:world_next"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_next"
+note = ""
+
+[[item]]
+id = "action:world_prev"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_prev"
+note = ""
+
+[[item]]
+id = "action:world_previous"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_previous"
+note = ""
+
+[[item]]
+id = "action:world_socket_next"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_socket_next"
+note = ""
+
+[[item]]
+id = "action:world_socket_prev"
+section = "navigation"
+phase = 2
+status = "todo"
+feature = "action world_socket_prev"
+note = ""
+
+[[item]]
+id = "action:yank"
+section = "input"
+phase = 3
+status = "todo"
+feature = "action yank"
+note = ""
+
+[[item]]
+id = "wire:ServerHello"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire ServerHello"
+note = "handled: see msg:ServerHello"
+
+[[item]]
+id = "wire:AuthRequest"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire AuthRequest"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:AuthResponse"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire AuthResponse"
+note = "handled: see msg:AuthResponse"
+
+[[item]]
+id = "wire:KeyGenerated"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire KeyGenerated"
+note = "handled: see msg:KeyGenerated"
+
+[[item]]
+id = "wire:RevokeKey"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire RevokeKey"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:KeyRevoked"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "wire KeyRevoked"
+note = ""
+
+[[item]]
+id = "wire:RegenerateAuthKey"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire RegenerateAuthKey"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:SetPortMapping"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire SetPortMapping"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:FirewallRule"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire FirewallRule"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:LookupPublicIp"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire LookupPublicIp"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:RefreshReachability"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire RefreshReachability"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ChangePassword"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire ChangePassword"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:PasswordChanged"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire PasswordChanged"
+note = "handled: see msg:PasswordChanged"
+
+[[item]]
+id = "wire:Logout"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire Logout"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:LoggedOut"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire LoggedOut"
+note = "handled: see msg:LoggedOut"
+
+[[item]]
+id = "wire:InitialState"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire InitialState"
+note = "handled: see msg:InitialState"
+
+[[item]]
+id = "wire:ServerData"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire ServerData"
+note = "handled: see msg:ServerData"
+
+[[item]]
+id = "wire:WorldConnected"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire WorldConnected"
+note = "handled: see msg:WorldConnected"
+
+[[item]]
+id = "wire:WorldDisconnected"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire WorldDisconnected"
+note = "handled: see msg:WorldDisconnected"
+
+[[item]]
+id = "wire:WorldAdded"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire WorldAdded"
+note = "handled: see msg:WorldAdded"
+
+[[item]]
+id = "wire:WorldCreated"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire WorldCreated"
+note = "handled: see msg:WorldCreated"
+
+[[item]]
+id = "wire:WorldRemoved"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire WorldRemoved"
+note = "handled: see msg:WorldRemoved"
+
+[[item]]
+id = "wire:WorldSwitched"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire WorldSwitched"
+note = "handled: see msg:WorldSwitched"
+
+[[item]]
+id = "wire:PromptUpdate"
+section = "wire"
+phase = 3
+status = "see"
+feature = "wire PromptUpdate"
+note = "handled: see msg:PromptUpdate"
+
+[[item]]
+id = "wire:TfStatus"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire TfStatus"
+note = "handled: see msg:TfStatus"
+
+[[item]]
+id = "wire:PendingLinesUpdate"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire PendingLinesUpdate"
+note = "handled: see msg:PendingLinesUpdate"
+
+[[item]]
+id = "wire:PendingReleased"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire PendingReleased"
+note = "handled: see msg:PendingReleased"
+
+[[item]]
+id = "wire:UnseenCleared"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire UnseenCleared"
+note = "handled: see msg:UnseenCleared"
+
+[[item]]
+id = "wire:UnseenUpdate"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire UnseenUpdate"
+note = "handled: see msg:UnseenUpdate"
+
+[[item]]
+id = "wire:ClaimedNew"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire ClaimedNew"
+note = "handled: see msg:ClaimedNew"
+
+[[item]]
+id = "wire:ReleasedNew"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire ReleasedNew"
+note = "handled: see msg:ReleasedNew"
+
+[[item]]
+id = "wire:ClientVisibility"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire ClientVisibility"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ActivityUpdate"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire ActivityUpdate"
+note = "handled: see msg:ActivityUpdate"
+
+[[item]]
+id = "wire:PausedState"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire PausedState"
+note = "handled: see msg:PausedState"
+
+[[item]]
+id = "wire:ShowTagsChanged"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire ShowTagsChanged"
+note = "handled: see msg:ShowTagsChanged"
+
+[[item]]
+id = "wire:ServerReloading"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire ServerReloading"
+note = "handled: see msg:ServerReloading"
+
+[[item]]
+id = "wire:WorldFlushed"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire WorldFlushed"
+note = "handled: see msg:WorldFlushed"
+
+[[item]]
+id = "wire:ExecuteLocalCommand"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire ExecuteLocalCommand"
+note = "handled: see msg:ExecuteLocalCommand"
+
+[[item]]
+id = "wire:OpenWindow"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire OpenWindow"
+note = "handled: see msg:OpenWindow"
+
+[[item]]
+id = "wire:SetInputBuffer"
+section = "wire"
+phase = 3
+status = "see"
+feature = "wire SetInputBuffer"
+note = "handled: see msg:SetInputBuffer"
+
+[[item]]
+id = "wire:Notification"
+section = "wire"
+phase = 5
+status = "see"
+feature = "wire Notification"
+note = "handled: see msg:Notification"
+
+[[item]]
+id = "wire:ServerSpeak"
+section = "wire"
+phase = 5
+status = "see"
+feature = "wire ServerSpeak"
+note = "handled: see msg:ServerSpeak"
+
+[[item]]
+id = "wire:AnsiMusic"
+section = "wire"
+phase = 5
+status = "see"
+feature = "wire AnsiMusic"
+note = "handled: see msg:AnsiMusic"
+
+[[item]]
+id = "wire:StatsUpdate"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire StatsUpdate"
+note = "handled: see msg:StatsUpdate"
+
+[[item]]
+id = "wire:GmcpData"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire GmcpData"
+note = "handled: see msg:GmcpData"
+
+[[item]]
+id = "wire:MsdpData"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire MsdpData"
+note = "handled: see msg:MsdpData"
+
+[[item]]
+id = "wire:McmpMedia"
+section = "wire"
+phase = 5
+status = "see"
+feature = "wire McmpMedia"
+note = "handled: see msg:McmpMedia"
+
+[[item]]
+id = "wire:GmcpUserToggled"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire GmcpUserToggled"
+note = "handled: see msg:GmcpUserToggled"
+
+[[item]]
+id = "wire:EchoMaskChanged"
+section = "wire"
+phase = 3
+status = "see"
+feature = "wire EchoMaskChanged"
+note = "handled: see msg:EchoMaskChanged"
+
+[[item]]
+id = "wire:ToggleWorldGmcp"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire ToggleWorldGmcp"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:SendGmcp"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire SendGmcp"
+note = "not used by the web GUI (console/server only)"
+
+[[item]]
+id = "wire:SendMsdp"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire SendMsdp"
+note = "not used by the web GUI (console/server only)"
+
+[[item]]
+id = "wire:SendCommand"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire SendCommand"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:RunKeyBinding"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire RunKeyBinding"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:SwitchWorld"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire SwitchWorld"
+note = "not used by the web GUI (console/server only)"
+
+[[item]]
+id = "wire:ConnectWorld"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire ConnectWorld"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:CertMismatch"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire CertMismatch"
+note = "handled: see msg:CertMismatch"
+
+[[item]]
+id = "wire:TrustCertificate"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire TrustCertificate"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:DisconnectWorld"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire DisconnectWorld"
+note = "not used by the web GUI (console/server only)"
+
+[[item]]
+id = "wire:DeleteWorld"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire DeleteWorld"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:CreateWorld"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire CreateWorld"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ReleasePending"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire ReleasePending"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:SelectiveFlush"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire SelectiveFlush"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:MarkWorldSeen"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire MarkWorldSeen"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:UpdateViewState"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire UpdateViewState"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:UpdateDimensions"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire UpdateDimensions"
+note = "not used by the web GUI (console/server only)"
+
+[[item]]
+id = "wire:RequestState"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire RequestState"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:RequestWorldState"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire RequestWorldState"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:WorldStateResponse"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire WorldStateResponse"
+note = "handled: see msg:WorldStateResponse"
+
+[[item]]
+id = "wire:UpdateWorldSettings"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire UpdateWorldSettings"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ChatLookup"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire ChatLookup"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ChatLookupResult"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire ChatLookupResult"
+note = "handled: see msg:ChatLookupResult"
+
+[[item]]
+id = "wire:UpdateGlobalSettings"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire UpdateGlobalSettings"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:WorldSettingsUpdated"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire WorldSettingsUpdated"
+note = "handled: see msg:WorldSettingsUpdated"
+
+[[item]]
+id = "wire:GlobalSettingsUpdated"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire GlobalSettingsUpdated"
+note = "handled: see msg:GlobalSettingsUpdated"
+
+[[item]]
+id = "wire:ActionsUpdated"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire ActionsUpdated"
+note = "handled: see msg:ActionsUpdated"
+
+[[item]]
+id = "wire:UpdateActions"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire UpdateActions"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:BanListRequest"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "wire BanListRequest"
+note = ""
+
+[[item]]
+id = "wire:BanListResponse"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire BanListResponse"
+note = "handled: see msg:BanListResponse"
+
+[[item]]
+id = "wire:UnbanRequest"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "wire UnbanRequest"
+note = ""
+
+[[item]]
+id = "wire:UnbanResult"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire UnbanResult"
+note = "handled: see msg:UnbanResult"
+
+[[item]]
+id = "wire:CalculateNextWorld"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire CalculateNextWorld"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:CalculatePrevWorld"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire CalculatePrevWorld"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:CalculateOldestPending"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire CalculateOldestPending"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:CalculatedWorld"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire CalculatedWorld"
+note = "handled: see msg:CalculatedWorld"
+
+[[item]]
+id = "wire:RequestConnectionsList"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire RequestConnectionsList"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ConnectionsListResponse"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire ConnectionsListResponse"
+note = "handled: see msg:ConnectionsListResponse"
+
+[[item]]
+id = "wire:ReportSeqMismatch"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire ReportSeqMismatch"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ReportDuplicate"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire ReportDuplicate"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ReportOutOfOrder"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire ReportOutOfOrder"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ReportGap"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire ReportGap"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ReportClientLifecycle"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire ReportClientLifecycle"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ClientTypeDeclaration"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire ClientTypeDeclaration"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:CycleWorld"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire CycleWorld"
+note = "not used by the web GUI (console/server only)"
+
+[[item]]
+id = "wire:RequestScrollback"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire RequestScrollback"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:OutputLines"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire OutputLines"
+note = "handled: see msg:OutputLines"
+
+[[item]]
+id = "wire:PendingCountUpdate"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire PendingCountUpdate"
+note = "handled: see msg:PendingCountUpdate"
+
+[[item]]
+id = "wire:ScrollbackLines"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire ScrollbackLines"
+note = "handled: see msg:ScrollbackLines"
+
+[[item]]
+id = "wire:WorldSwitchResult"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire WorldSwitchResult"
+note = "handled: see msg:WorldSwitchResult"
+
+[[item]]
+id = "wire:ImportSettings"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire ImportSettings"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ImportNeedsInsecureConfirm"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire ImportNeedsInsecureConfirm"
+note = "handled: see msg:ImportNeedsInsecureConfirm"
+
+[[item]]
+id = "wire:ImportResult"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire ImportResult"
+note = "handled: see msg:ImportResult"
+
+[[item]]
+id = "wire:RequestSettingsExport"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "wire RequestSettingsExport"
+note = ""
+
+[[item]]
+id = "wire:SettingsExport"
+section = "dialogs"
+phase = 4
+status = "todo"
+feature = "wire SettingsExport"
+note = ""
+
+[[item]]
+id = "wire:RequestThemeEditorState"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire RequestThemeEditorState"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:UpdateThemeColors"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire UpdateThemeColors"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:AddTheme"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire AddTheme"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:DeleteTheme"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire DeleteTheme"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:SaveThemeFile"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire SaveThemeFile"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:UpdateSeparatorStyle"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire UpdateSeparatorStyle"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:ThemeEditorState"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire ThemeEditorState"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:ThemeFileSaved"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire ThemeFileSaved"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:ThemeCssVarsUpdated"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire ThemeCssVarsUpdated"
+note = "handled: see msg:ThemeCssVarsUpdated"
+
+[[item]]
+id = "wire:RequestActionEditorState"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire RequestActionEditorState"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:ActionEditorState"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire ActionEditorState"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:RequestKeybindEditorState"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire RequestKeybindEditorState"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:UpdateKeybindEditorBindings"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire UpdateKeybindEditorBindings"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:SaveKeybindFile"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire SaveKeybindFile"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:ResetKeybindDefaults"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire ResetKeybindDefaults"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:KeybindEditorState"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire KeybindEditorState"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:KeybindFileSaved"
+section = "editors"
+phase = 4
+status = "todo"
+feature = "wire KeybindFileSaved"
+note = "spoken by the theme/keybind/action editor pages"
+
+[[item]]
+id = "wire:KeybindingsUpdated"
+section = "wire"
+phase = 3
+status = "see"
+feature = "wire KeybindingsUpdated"
+note = "handled: see msg:KeybindingsUpdated"
+
+[[item]]
+id = "wire:RequestNoteEditorState"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire RequestNoteEditorState"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:UpdateNote"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire UpdateNote"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:NoteEditorState"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire NoteEditorState"
+note = "handled: see msg:NoteEditorState"
+
+[[item]]
+id = "wire:NotesChanged"
+section = "wire"
+phase = 2
+status = "see"
+feature = "wire NotesChanged"
+note = "handled: see msg:NotesChanged"
+
+[[item]]
+id = "wire:McpEditOpen"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire McpEditOpen"
+note = "handled: see msg:McpEditOpen"
+
+[[item]]
+id = "wire:McpEditSet"
+section = "wire"
+phase = 0
+status = "todo"
+feature = "wire McpEditSet"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:Ping"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire Ping"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:Pong"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire Pong"
+note = "handled: see msg:Pong"
+
+[[item]]
+id = "wire:PingCheck"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire PingCheck"
+note = "handled: see msg:PingCheck"
+
+[[item]]
+id = "wire:PongCheck"
+section = "wire"
+phase = 1
+status = "done"
+feature = "wire PongCheck"
+note = "sent by the web client"
+
+[[item]]
+id = "wire:ResyncRequired"
+section = "wire"
+phase = 1
+status = "see"
+feature = "wire ResyncRequired"
+note = "handled: see msg:ResyncRequired"
+
+[[item]]
+id = "wire:ScrollbackSyncRequest"
+section = "connection"
+phase = 6
+status = "todo"
+feature = "wire ScrollbackSyncRequest"
+note = "server-push history download (Phase J); no client uses it yet"
+
+[[item]]
+id = "wire:ScrollbackContinue"
+section = "connection"
+phase = 6
+status = "todo"
+feature = "wire ScrollbackContinue"
+note = "server-push history download (Phase J); no client uses it yet"
+
+[[item]]
+id = "wire:ScrollbackBatch"
+section = "connection"
+phase = 6
+status = "todo"
+feature = "wire ScrollbackBatch"
+note = "server-push history download (Phase J); no client uses it yet"
