@@ -235,6 +235,8 @@ pub struct ClientCore {
     failures: u32,
     reconnect_at: Option<Instant>,
     reload_retries: Option<u32>,
+    /// The user asked to start over: reconnect the moment the old connection is gone.
+    restarting: bool,
     hello_deadline: Option<Instant>,
     last_rx: Instant,
     last_tick: Option<Instant>,
@@ -280,6 +282,7 @@ impl ClientCore {
             failures: 0,
             reconnect_at: None,
             reload_retries: None,
+            restarting: false,
             hello_deadline: None,
             last_rx: now,
             last_tick: None,
@@ -312,6 +315,29 @@ impl ClientCore {
 
     pub fn is_online(&self) -> bool {
         self.phase == Phase::Online
+    }
+
+    pub fn is_multiuser(&self) -> bool {
+        self.multiuser
+    }
+
+    /// How far the scrollback download after a connect has got, in tens of percent
+    /// (the status bar's Scrollback badge, app.js `updateScrollbackProgress`); `None` once
+    /// it's done, or when there was nothing to fetch.
+    pub fn backfill_progress(&self) -> Option<u32> {
+        if self.backfill_phase == 0 {
+            return None;
+        }
+        let rows = self.view.map_or(24, |v| v.0);
+        let initial = self.settings.as_ref().map_or(0, |s| s.remote_initial_lines as usize);
+        let target = if initial == 0 { 100 } else { initial }.max(75.max(rows));
+        let (mut got, mut goal) = (0, 0);
+        for w in &self.worlds {
+            let g = target.min(w.total_visible);
+            goal += g;
+            got += w.lines.iter().filter(|l| !l.gagged).count().min(g);
+        }
+        (goal > 0 && got < goal).then(|| (got * 100 / goal) as u32 / 10 * 10)
     }
 
     fn take(&mut self) -> Vec<Effect> {
@@ -361,6 +387,37 @@ impl ClientCore {
             self.connect();
         }
         let _ = now;
+        self.take()
+    }
+
+    /// Start over on a fresh connection, as reloading the web page does (the menu's
+    /// Reload and Resync): nothing kept, everything fetched again.
+    pub fn restart(&mut self) -> Vec<Effect> {
+        self.worlds.clear();
+        self.actions.clear();
+        self.current = 0;
+        self.activity = 0;
+        self.paused = false;
+        self.changed();
+        match self.phase {
+            Phase::Idle | Phase::Closed => {
+                self.reconnect_at = None;
+                self.connect();
+            }
+            Phase::NeedLogin => {}
+            _ => {
+                self.restarting = true;
+                self.out.push(Effect::Disconnect);
+            }
+        }
+        self.take()
+    }
+
+    /// Multiuser: end this user's session (the server answers `LoggedOut`).
+    pub fn logout(&mut self) -> Vec<Effect> {
+        if self.multiuser && self.is_online() {
+            self.send(WsMessage::Logout);
+        }
         self.take()
     }
 
@@ -588,6 +645,12 @@ impl ClientCore {
         if was_online {
             self.failures = 0;
         }
+        if std::mem::take(&mut self.restarting) {
+            self.reconnect_at = None;
+            self.connect();
+            self.changed();
+            return;
+        }
         let delay = match self.reload_retries.as_mut() {
             Some(n) if *n < RELOAD_RETRIES => {
                 *n += 1;
@@ -622,6 +685,17 @@ impl ClientCore {
             }
             WsMessage::AuthResponse { success, error, multiuser_mode, .. } => self.on_auth_response(success, error, multiuser_mode),
             WsMessage::KeyGenerated { auth_key } => self.adopt_key(auth_key),
+            WsMessage::LoggedOut => {
+                // Multiuser: this login is over; the connection stays for the next one.
+                self.worlds.clear();
+                self.actions.clear();
+                self.current = 0;
+                self.activity = 0;
+                self.creds.password = None;
+                self.phase = Phase::NeedLogin;
+                self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
+                self.changed();
+            }
             WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, .. } => {
                 self.actions = actions;
                 self.on_initial_state(worlds, settings, current_world_index, your_display_id, now);
@@ -1472,6 +1546,59 @@ fn split_lines(s: &str) -> Vec<&str> {
 /// app.js drops these only as they arrive live, so the same line shows as a blank row
 /// when it comes back in history after a reconnect. Here every line is kept, so the
 /// buffer matches the server's, and this decides at display time on every path.
+/// Save the server's global settings with whatever this client changed in `s` (the
+/// font slider): every field echoed back as the server sent it, so nothing else moves.
+/// The password goes back empty, which the server reads as "unchanged".
+pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
+    WsMessage::UpdateGlobalSettings {
+        more_mode_enabled: s.more_mode_enabled,
+        spell_check_enabled: s.spell_check_enabled,
+        temp_convert_enabled: s.temp_convert_enabled,
+        world_switch_mode: s.world_switch_mode.clone(),
+        show_tags: s.show_tags,
+        debug_enabled: s.debug_enabled,
+        ansi_music_enabled: s.ansi_music_enabled,
+        console_theme: s.console_theme.clone(),
+        gui_theme: s.gui_theme.clone(),
+        gui_transparency: s.gui_transparency,
+        color_offset_percent: s.color_offset_percent,
+        wrapspace: s.wrapspace,
+        remote_initial_lines: s.remote_initial_lines,
+        input_height: s.input_height,
+        font_name: s.font_name.clone(),
+        font_size: s.font_size,
+        web_font_size_phone: s.web_font_size_phone,
+        web_font_size_tablet: s.web_font_size_tablet,
+        web_font_size_desktop: s.web_font_size_desktop,
+        web_font_weight: s.web_font_weight,
+        web_font_line_height: s.web_font_line_height,
+        web_font_letter_spacing: s.web_font_letter_spacing,
+        web_font_word_spacing: s.web_font_word_spacing,
+        ws_allow_list: s.ws_allow_list.clone(),
+        web_secure: true,
+        http_enabled: s.http_enabled,
+        http_port: s.http_port,
+        web_path: s.web_path.clone(),
+        ws_enabled: s.ws_enabled,
+        ws_port: s.ws_port,
+        ws_cert_file: s.ws_cert_file.clone(),
+        ws_key_file: s.ws_key_file.clone(),
+        ws_password: String::new(),
+        tls_proxy_enabled: s.tls_proxy_enabled,
+        dictionary_path: s.dictionary_path.clone(),
+        mouse_enabled: s.mouse_enabled,
+        zwj_enabled: s.zwj_enabled,
+        new_line_indicator: s.new_line_indicator,
+        tts_mode: s.tts_mode.clone(),
+        tts_speak_mode: s.tts_speak_mode.clone(),
+        scrollback_enabled: s.scrollback_enabled,
+        log_input_enabled: s.log_input_enabled,
+        keyboard_always_visible: s.keyboard_always_visible,
+        tabs: s.tabs.clone(),
+        icon_bar: s.icon_bar.clone(),
+    }
+}
+
 pub fn hidden_line(text: &str) -> bool {
     is_ansi_only(text) || (text.contains("###_idler_message_") && text.contains("_###"))
 }

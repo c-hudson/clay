@@ -556,3 +556,80 @@ fn split_lines_matches_the_web_clients_split() {
     assert!(!is_ansi_only(""));
     assert!(!is_ansi_only("\x1b[0mx"));
 }
+
+#[test]
+fn saving_the_settings_back_unchanged_changes_nothing_but_what_was_edited() {
+    let mut app = crate::App::new();
+    app.settings.web_font_size_desktop = 15.0;
+    app.settings.websocket_allow_list = "10.0.0.*".into();
+    let before = app.build_global_settings_msg();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let _ = app.handle_ws_client_msg(1, settings_update(&before), &tx);
+    let after = app.build_global_settings_msg();
+    // `web_secure` goes back true, as the web client sends it: it's kept only for wire
+    // compatibility and never read (the server is always TLS-capable).
+    let json = |s: &crate::websocket::GlobalSettingsMsg| {
+        let mut v = serde_json::to_value(s).unwrap();
+        v.as_object_mut().unwrap().remove("web_secure");
+        v
+    };
+    assert_eq!(json(&before), json(&after));
+    // And the one field the slider moves does move.
+    let mut edited = after.clone();
+    edited.web_font_size_desktop = 17.0;
+    let _ = app.handle_ws_client_msg(1, settings_update(&edited), &tx);
+    assert_eq!(app.settings.web_font_size_desktop, 17.0);
+    assert_eq!(app.settings.websocket_allow_list, "10.0.0.*");
+}
+
+#[test]
+fn the_scrollback_badge_counts_down_to_done() {
+    let mut t = H::password();
+    t.connect_and_login();
+    let mut w = world_msg(0, "w", 900..1000, 7);
+    w.output_lines_ts.drain(..80);
+    w.total_visible_lines = Some(1000);
+    t.initial(vec![w]);
+    // 20 of the 100 (remote_initial_lines' default) held: 20%.
+    assert_eq!(t.core.backfill_progress(), Some(20));
+}
+
+#[test]
+fn a_multiuser_logout_returns_to_the_login_screen_on_the_same_connection() {
+    let mut t = H::new(Credentials { username: Some("ann".into()), password: Some("pw".into()), auth_key: None });
+    let e = t.core.start(t.now);
+    t.keep(e);
+    t.input(Input::Opened);
+    t.msg(WsMessage::ServerHello { multiuser_mode: true, challenge: CHALLENGE.into() });
+    t.msg(WsMessage::AuthResponse { success: true, error: None, username: Some("ann".into()), multiuser_mode: true });
+    t.initial(vec![world_msg(0, "w", 0..3, 7)]);
+    t.sent();
+    let e = t.core.logout();
+    t.keep(e);
+    assert!(t.sent().iter().any(|m| matches!(m, WsMessage::Logout)));
+    t.msg(WsMessage::LoggedOut);
+    assert!(t.core.worlds.is_empty());
+    assert!(matches!(t.core.status(), Status::NeedLogin { multiuser: true, .. }));
+    let e = t.core.login(Credentials { username: Some("bob".into()), password: Some("pw2".into()), auth_key: None }, t.now);
+    t.keep(e);
+    let sent = t.sent();
+    assert!(matches!(auth_request(&sent), WsMessage::AuthRequest { username: Some(u), .. } if u == "bob"));
+}
+
+#[test]
+fn restarting_reconnects_at_once_and_fetches_everything_again() {
+    let mut t = H::password();
+    t.connect_and_login();
+    t.initial(vec![world_msg(0, "w", 0..50, 7)]);
+    t.drain();
+    let e = t.core.restart();
+    t.keep(e);
+    assert!(t.drain().iter().any(|e| matches!(e, Effect::Disconnect)));
+    assert!(t.core.worlds.is_empty());
+    t.input(Input::Closed("closed by the client".into()));
+    assert!(t.drain().iter().any(|e| matches!(e, Effect::Connect)), "no backoff");
+    t.input(Input::Opened);
+    t.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: CHALLENGE.into() });
+    let sent = t.sent();
+    assert!(matches!(auth_request(&sent), WsMessage::AuthRequest { resume, .. } if resume.is_empty()), "nothing to resume");
+}

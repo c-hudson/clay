@@ -17,6 +17,8 @@ use std::borrow::Cow;
 use gpui::{App, Font, FontStyle, FontWeight, SharedString, font};
 
 pub const PRIMARY_FAMILY: &str = "JetBrains Mono NL";
+/// The web client's `--sans`: the menus, the status bar's words, the tiles' labels.
+pub const UI_FAMILY: &str = "Nunito";
 
 /// The fonts after JetBrains Mono in the web client's list, in order.
 const WEB_FALLBACKS: &[&str] = &["Cascadia Code", "Fira Code", "Consolas", "Monaco", "Lucida Console"];
@@ -30,6 +32,8 @@ pub struct Fonts {
     /// The system's colour emoji font. (On Linux this needs the vendored GPUI patch in
     /// vendor/gpui-pre-wgpu: stock GPUI refuses to load a font with no "m" by name.)
     pub emoji: SharedString,
+    /// Nunito (bundled), for everything that isn't output.
+    pub ui: SharedString,
 }
 
 /// Which font a grapheme cluster is drawn from.
@@ -111,13 +115,20 @@ pub const BUNDLED: [&[u8]; 4] = [
     include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-BoldItalic.ttf"),
 ];
 
+/// Nunito Regular and Bold (the web bundles it as a variable font; the weights it uses
+/// are 400, 500 and 700).
+const UI_FONTS: [&[u8]; 2] = [
+    include_bytes!("../../../assets/native-gui/fonts/Nunito-Regular.ttf"),
+    include_bytes!("../../../assets/native-gui/fonts/Nunito-Bold.ttf"),
+];
+
 /// Which of [`BUNDLED`] is the primary font in this weight and style.
 pub fn bundled_index(bold: bool, italic: bool) -> usize {
     bold as usize + 2 * italic as usize
 }
 
 pub fn load(cx: &mut App) -> Fonts {
-    let bundled: Vec<Cow<'static, [u8]>> = BUNDLED.iter().map(|b| Cow::Borrowed(*b)).collect();
+    let bundled: Vec<Cow<'static, [u8]>> = BUNDLED.iter().chain(UI_FONTS.iter()).map(|b| Cow::Borrowed(*b)).collect();
     if let Err(e) = cx.text_system().add_fonts(bundled) {
         crate::debug_log(true, &format!("native-gui: bundled fonts failed to load: {e}"));
     }
@@ -127,7 +138,7 @@ pub fn load(cx: &mut App) -> Fonts {
         .find(|f| installed.iter().any(|i| i == *f))
         .map(|f| f.to_string())
         .unwrap_or_else(system_monospace);
-    Fonts { primary: PRIMARY_FAMILY.into(), fallback: fallback.into(), emoji: emoji_family().into() }
+    Fonts { primary: PRIMARY_FAMILY.into(), fallback: fallback.into(), emoji: emoji_family().into(), ui: UI_FAMILY.into() }
 }
 
 /// The colour emoji font browsers use on this platform.

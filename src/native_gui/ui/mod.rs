@@ -1,6 +1,9 @@
 //! The GPUI side of the native GUI.
 
 mod actions;
+pub mod assets;
+mod bars;
+mod chrome;
 pub mod emoji;
 pub mod fonts;
 pub mod ink;
@@ -17,8 +20,9 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, ParentElement, Render,
-    ScrollWheelEvent, SharedString, Styled, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Render, ScrollWheelEvent, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -29,14 +33,13 @@ use crate::native_gui::core::session::Session;
 use crate::native_gui::core::decor::{ActionMatcher, DecorOptions, LineFacts, decorate};
 use crate::native_gui::core::style::{Palette, StyleOptions, StyledLine};
 use crate::theme::ThemeColors;
+use chrome::{Chrome, Tokens};
 use fonts::Fonts;
 use more::MoreMode;
 use output::{OutputSnapshot, ScrollHandle, hsla, output_view};
 
 /// `web_font_size_desktop`'s default.
 const DEFAULT_FONT_SIZE: f32 = 18.0;
-/// `--status-height` in style.css.
-const STATUS_HEIGHT: f32 = 26.0;
 
 /// The fields of the login screen.
 struct LoginForm {
@@ -77,6 +80,7 @@ pub struct ClayView {
     login: LoginForm,
     /// The login screen has put the cursor in its first empty field.
     login_focused: bool,
+    chrome: Chrome,
 }
 
 impl ClayView {
@@ -103,6 +107,7 @@ impl ClayView {
         let mut session = session;
         let _ = session.core.set_visible(window.is_visible(), Instant::now());
         let theme = ThemeColors::dark_default();
+        let tokens = Tokens::new(&theme, false);
         let mut view = ClayView {
             focus: cx.focus_handle(),
             fonts,
@@ -128,6 +133,7 @@ impl ClayView {
             shown_world: None,
             login: LoginForm { username, password },
             login_focused: false,
+            chrome: Chrome::new(tokens),
         };
         view.apply_settings();
         view
@@ -166,14 +172,14 @@ impl ClayView {
         if current != self.shown_world {
             self.shown_world = current;
             self.more.reset(self.session.core.current_world());
-            self.scroll.borrow_mut().to_bottom();
+            self.scroll.borrow_mut().follow_bottom();
             return;
         }
         let threshold = self.scroll.borrow().view_rows.saturating_sub(2);
         let enabled = self.more_mode_enabled();
         if let Some(world) = self.session.core.current_world() {
             if self.more.arrivals(world, enabled, threshold) {
-                self.scroll.borrow_mut().to_bottom();
+                self.scroll.borrow_mut().follow_bottom();
             }
         }
         // Back at the bottom with nothing held: output flows again.
@@ -232,6 +238,11 @@ impl ClayView {
         if matches!(self.session.core.status(), Status::Reconnecting { .. }) {
             cx.notify(); // the countdown
         }
+        let clock = chrome::clock_text(self.session.core.settings.as_ref().map_or("", |s| s.clock_format.as_str()));
+        if clock != self.chrome.clock {
+            self.chrome.clock = clock;
+            cx.notify();
+        }
     }
 
     fn submit_login(&mut self, cx: &mut Context<Self>) {
@@ -259,6 +270,11 @@ impl ClayView {
         if s.web_font_size_desktop > 0.0 {
             self.font_size = s.web_font_size_desktop;
         }
+        let tokens = Tokens::new(&self.theme, s.gui_theme == "light");
+        if tokens != self.chrome.tokens {
+            self.chrome.tokens = tokens;
+        }
+        self.chrome.clock = chrome::clock_text(&s.clock_format);
         let offset = s.color_offset_percent as u32;
         if offset != self.style.color_offset_percent || s.show_tags != self.show_tags {
             self.style.color_offset_percent = offset;
@@ -326,27 +342,28 @@ impl ClayView {
         out
     }
 
-    fn status_text(&self) -> String {
-        let core = &self.session.core;
-        let world = core.current_world().map(|w| w.name.clone()).unwrap_or_default();
-        match core.status() {
-            Status::Online => world,
+    /// The connection's state, while it isn't simply online (the status bar shows it
+    /// beside the world).
+    fn connection_note(&self) -> Option<String> {
+        Some(match self.session.core.status() {
+            Status::Online => return None,
             Status::Idle | Status::Connecting { .. } => format!("Connecting to {}…", self.session.target.key()),
             Status::LoggingIn => "Logging in…".into(),
             Status::NeedLogin { .. } => "Log in".into(),
             Status::CertMismatch(_) => "The server's certificate has changed".into(),
             Status::Reconnecting { at, reason, .. } => {
                 let secs = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
-                format!("{world}  —  reconnecting in {secs} s ({reason})")
+                format!("Reconnecting in {secs} s ({reason})")
             }
             Status::Stopped(why) => why.clone(),
-        }
+        })
     }
 
     /// Tell the server how much the output shows (it sizes more-mode and history by it).
     fn report_view(&mut self, window: &Window) {
         let vp = window.viewport_size();
-        let rows = ((f32::from(vp.height) - STATUS_HEIGHT - 8.0) / self.font_size).floor().max(1.0) as usize;
+        // The rows the output showed when last laid out (the bars around it take the rest).
+        let rows = self.scroll.borrow().view_rows.max(1);
         let cols = ((f32::from(vp.width) - 8.0) / (self.font_size * 0.6)).floor().max(1.0) as usize;
         let fx = self.session.core.set_view(rows, cols);
         let _ = self.session.apply(fx);
@@ -414,8 +431,6 @@ impl Focusable for ClayView {
 impl Render for ClayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.report_view(window);
-        let status_bg = [self.theme.status_bar_bg.r, self.theme.status_bar_bg.g, self.theme.status_bar_bg.b];
-        let status = self.status_text();
         let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
         if need_login && !self.login_focused {
             // The cursor goes where typing starts: the name in multiuser mode, else the password.
@@ -443,6 +458,11 @@ impl Render for ClayView {
                 output_view(snapshot).into_any_element()
             }
         };
+        let icon_bar = self.icon_bar(cx);
+        let tabs_top = self.tabs_mode() == "top";
+        let mut tabs = self.tabs_ribbon(cx);
+        let stats = self.stats_panel(cx);
+        let status_bar = self.status_bar(window, cx);
         div()
             .track_focus(&self.focus)
             .size_full()
@@ -475,24 +495,35 @@ impl Render for ClayView {
                 }
                 cx.notify();
             }))
-            .child(div().flex_1().min_h_0().child(body))
-            .child(
-                div()
-                    .h(px(STATUS_HEIGHT))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .bg(hsla(status_bg))
-                    .text_color(hsla(self.palette.fg))
-                    .text_size(px(13.0))
-                    .child(SharedString::from(status)),
+            // Dragging the font slider, and the end of a press.
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                if this.chrome.slider_drag {
+                    if ev.pressed_button == Some(MouseButton::Left) {
+                        this.slide_to(ev.position.x, cx);
+                    } else {
+                        this.chrome.slider_drag = false;
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _window, _cx| {
+                    this.chrome.slider_drag = false;
+                    this.chrome.closed_by_press = None;
+                }),
             )
+            .children(icon_bar)
+            .when(tabs_top, |d| d.children(tabs.take()))
+            .child(div().flex_1().min_h_0().child(body))
+            .children(stats)
+            .children(tabs)
+            .child(status_bar)
     }
 }
 
 /// Open the main window and run the session in it.
 pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
-    gpui_platform::application().run(move |cx: &mut App| {
+    gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         // The web client's output is `-webkit-font-smoothing: antialiased`, which WebKit
         // (Linux, macOS) honours with grayscale text. WebView2 is Chromium, which ignores
@@ -503,7 +534,11 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
         let window = cx
             .open_window(
-                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions { title: Some("Clay".into()), ..Default::default() }),
+                    ..Default::default()
+                },
                 |window, cx| {
                     let view = cx.new(|cx| ClayView::new(fonts, session, window, cx));
                     window.focus(&view.focus_handle(cx), cx);

@@ -2479,23 +2479,23 @@ note = "separate OS window"
 id = "ui:status.layout"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "window layout: icon bar, tabs (top/bottom), output, stats panel, status bar, input"
-note = ""
+note = "icon bar, tabs top/bottom, output, stats panel, status bar; the input area arrives in phase 3"
 
 [[item]]
 id = "ui:status.menu"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "hamburger menu (dropdown upward); items open their features as those land"
-note = "Help/Worlds/Actions/Settings/Import open phase-4 windows"
+note = "Toggle Tags, Reload/Resync (fresh connection) and Logout work; Help/Worlds/Actions/Settings/Import/Find/Search/Change Password/New Window open surfaces that land in 2e and phase 4"
 
 [[item]]
 id = "ui:status.world"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "connection dot (green/amber/red) + world name [g] [N]; click = world menu"
 note = ""
 
@@ -2503,7 +2503,7 @@ note = ""
 id = "ui:status.world-menu"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "world menu: connected or unseen worlds, [N unseen], click switches"
 note = ""
 
@@ -2511,15 +2511,15 @@ note = ""
 id = "ui:status.more"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "More/History badge (hard-coded reds, 4-char counts); click releases a screenful"
-note = ""
+note = "counts without the padding, which the browser collapses anyway"
 
 [[item]]
 id = "ui:status.activity"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "ACT n badge with Unseen: tooltip; click = next world"
 note = ""
 
@@ -2527,7 +2527,7 @@ note = ""
 id = "ui:status.paused"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "PAUSED badge (PausedState)"
 note = ""
 
@@ -2535,39 +2535,39 @@ note = ""
 id = "ui:status.notes"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "notes icon when the world has notes"
-note = "opens the note editor in phase 4"
+note = "the icon shows; the note editor it opens arrives in phase 4"
 
 [[item]]
 id = "ui:status.font-slider"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "A / slider / value: font size 7-20, saved to web_font_size_desktop"
-note = ""
+note = "UpdateGlobalSettings echoes every field back (settings_update, round-trip tested against App)"
 
 [[item]]
 id = "ui:status.scrollback"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "Scrollback NN% while history downloads"
-note = ""
+note = "ClientCore::backfill_progress"
 
 [[item]]
 id = "ui:status.clock"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "clock: H:MM 12-hour, or clock_format (strftime subset)"
-note = ""
+note = "util::get_current_time_12hr / util::format_clock (TF's own ftime)"
 
 [[item]]
 id = "ui:status.tf"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "TF status rows replace the bar items (tf::status::layout_row)"
 note = ""
 
@@ -2575,23 +2575,23 @@ note = ""
 id = "ui:status.stats"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "stats panel: gauges and values, collapsible (StatsUpdate)"
-note = ""
+note = "drawn as style.css intends; the web drops that rule (deferred bug B15)"
 
 [[item]]
 id = "ui:status.iconbar"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "icon bar: Worlds/Actions/Settings/Find/Tags tiles (icon_bar setting)"
-note = "tiles open phase-4 windows as they land"
+note = "tiles open phase-4 windows as they land; Tags shows on while tags are"
 
 [[item]]
 id = "ui:status.shortcuts"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "shortcut tiles for actions with gui_shortcut, with overflow arrows"
 note = ""
 
@@ -2599,7 +2599,7 @@ note = ""
 id = "ui:status.tabs"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "tabs ribbon of connected worlds (tabs = top/bottom), overflow arrows"
 note = ""
 
@@ -2607,9 +2607,9 @@ note = ""
 id = "ui:status.title"
 section = "status"
 phase = 2
-status = "todo"
-feature = "window title Clay MUD Client"
-note = ""
+status = "done"
+feature = "window title"
+note = "the GUI window's own title is \"Clay\" (webview_gui.rs); document.title never reaches it"
 
 [[item]]
 id = "ui:nav.keys"

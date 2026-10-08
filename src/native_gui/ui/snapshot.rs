@@ -55,7 +55,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
     }
 
     let text_system = gpui_platform::current_platform(true).text_system();
-    let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), gpui_platform::current_headless_renderer);
+    let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(super::assets::Assets), gpui_platform::current_headless_renderer);
     let fonts = cx.update(|app| {
         gpui_component::init(app);
         #[cfg(not(target_os = "windows"))]
@@ -63,7 +63,18 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         fonts::load(app)
     });
     let window = cx
-        .open_window(size(px(width), px(height)), |window, app| app.new(|cx| ClayView::new(fonts, session, window, cx)))
+        .open_window(size(px(width), px(height)), |window, app| {
+            app.new(|cx| {
+                let mut view = ClayView::new(fonts, session, window, cx);
+                // CLAY_SNAPSHOT_MENU=main|worlds: draw with that menu open, for reviewing it.
+                view.chrome.menu = match std::env::var("CLAY_SNAPSHOT_MENU").as_deref() {
+                    Ok("main") => Some(super::chrome::MenuKind::Main),
+                    Ok("worlds") => Some(super::chrome::MenuKind::Worlds),
+                    _ => None,
+                };
+                view
+            })
+        })
         .expect("open the offscreen window");
     cx.run_until_parked();
     cx.update_window(window.into(), |_, window, app| {

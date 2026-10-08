@@ -100,7 +100,7 @@ impl Scroll {
     }
 
     /// Jump to the bottom and follow it.
-    pub fn to_bottom(&mut self) {
+    pub fn follow_bottom(&mut self) {
         self.follow = true;
         self.top = None;
         self.pending = 0;
@@ -477,8 +477,8 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     let mut order: Vec<usize> = Vec::new();
     let mut rows = Vec::new();
     let place = |i: usize, laid: &mut HashMap<usize, LaidLine>, order: &mut Vec<usize>| -> usize {
-        if !laid.contains_key(&i) {
-            laid.insert(i, lay_out(snapshot.lines[i].1.clone(), &snapshot, &metrics, width, window));
+        if let std::collections::hash_map::Entry::Vacant(e) = laid.entry(i) {
+            e.insert(lay_out(snapshot.lines[i].1.clone(), &snapshot, &metrics, width, window));
         }
         match order.iter().position(|&o| o == i) {
             Some(p) => p,

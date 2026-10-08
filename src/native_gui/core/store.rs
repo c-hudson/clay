@@ -6,6 +6,9 @@
 //! - Per server: the auth key the server handed it (encrypted with the machine key, like
 //!   the passwords in settings.dat) and the server's web path.
 //!
+//! - The window's own preferences, what the web client keeps in `localStorage` (the
+//!   stats panel collapsed or not).
+//!
 //! INI, written owner-only (`util::write_secret_file`): it holds a credential.
 
 use std::collections::BTreeMap;
@@ -105,6 +108,20 @@ pub fn set_web_path(name: &str, web_path: &str) {
     }
 }
 
+/// One of the window's own preferences.
+pub fn pref(key: &str) -> Option<String> {
+    load().get("ui").and_then(|s| s.get(key)).cloned()
+}
+
+pub fn set_pref(key: &str, value: &str) {
+    let mut ini = load();
+    let s = ini.entry("ui".into()).or_default();
+    if s.get(key).map(String::as_str) != Some(value) {
+        s.insert(key.into(), value.into());
+        save(&ini);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +139,10 @@ mod tests {
         let on_disk = std::fs::read_to_string(path()).unwrap();
         assert!(!on_disk.contains("secret-key"), "the key is stored encrypted");
         assert_eq!(server("other:9000"), Server::default());
+        // (In this one test: the file is shared, and tests run in parallel.)
+        assert_eq!(pref("stats_collapsed"), None);
+        set_pref("stats_collapsed", "1");
+        assert_eq!(pref("stats_collapsed").as_deref(), Some("1"));
+        assert_eq!(server("HOST.example:9000").auth_key.as_deref(), Some("secret-key"));
     }
 }

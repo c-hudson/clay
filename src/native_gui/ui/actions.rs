@@ -75,18 +75,18 @@ impl ClayView {
             }
             "flush_output" => {
                 self.release_all(cx);
-                self.scroll.borrow_mut().to_bottom();
+                self.scroll.borrow_mut().follow_bottom();
             }
             "selective_flush" => {
                 let fx = self.session.send(WsMessage::SelectiveFlush { world_index: world });
                 self.after(fx, cx);
             }
             "pause_output" => self.more.pause(),
-            "clear_screen" | "refresh_line" => self.scroll.borrow_mut().to_bottom(),
+            "clear_screen" | "refresh_line" => self.scroll.borrow_mut().follow_bottom(),
             "redraw" | "redraw_server_only" => {
                 let fx = self.session.core.redraw();
                 let rest = self.session.apply(fx);
-                self.scroll.borrow_mut().to_bottom();
+                self.scroll.borrow_mut().follow_bottom();
                 self.after(rest, cx);
             }
             "toggle_tags" => {
