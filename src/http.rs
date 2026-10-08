@@ -628,13 +628,13 @@ enum GateResult {
 // protocols cleanly.
 
 /// C->S HELLO magic: `0xC7` + ASCII "LAY".
-const KNOCK_MAGIC: [u8; 4] = [0xC7, 0x4C, 0x41, 0x59];
+pub(crate) const KNOCK_MAGIC: [u8; 4] = [0xC7, 0x4C, 0x41, 0x59];
 /// C->S HELLO protocol version.
-const KNOCK_VERSION: u8 = 0x01;
+pub(crate) const KNOCK_VERSION: u8 = 0x01;
 /// S->C CHALLENGE magic prefix (followed by 32 random bytes).
-const KNOCK_CHALLENGE_MAGIC: [u8; 2] = [0xC7, 0x4B];
+pub(crate) const KNOCK_CHALLENGE_MAGIC: [u8; 2] = [0xC7, 0x4B];
 /// S->C ACK on successful knock.
-const KNOCK_ACK: [u8; 2] = [0xC7, 0x06];
+pub(crate) const KNOCK_ACK: [u8; 2] = [0xC7, 0x06];
 
 /// Validate a 6-byte C->S HELLO: magic + version match, reserved byte is zero.
 fn parse_knock_hello(buf: &[u8; 6]) -> bool {
@@ -645,7 +645,7 @@ fn parse_knock_hello(buf: &[u8; 6]) -> bool {
 /// NOTE: this is a raw 32-byte digest, unlike `hash_with_challenge` (src/websocket.rs),
 /// which hex-encodes its inputs and output for the WS auth-key challenge-response. The
 /// knock protocol is binary throughout (D4) — do not confuse the two conventions.
-fn knock_expected_response(key: &str, challenge: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn knock_expected_response(key: &str, challenge: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     hasher.update(challenge);

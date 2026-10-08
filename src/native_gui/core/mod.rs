@@ -4,5 +4,7 @@ pub mod boxdraw;
 pub mod client;
 pub mod net;
 pub mod seq;
+pub mod session;
+pub mod store;
 pub mod style;
 pub mod wrap;

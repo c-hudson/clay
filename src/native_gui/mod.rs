@@ -17,15 +17,8 @@ pub fn run(target: Option<String>, snapshot: Option<String>) -> std::io::Result<
             std::process::exit(1);
         }
     };
-    let password = match std::env::var("CLAY_PASSWORD") {
-        Ok(p) if !p.is_empty() => p,
-        _ => {
-            eprintln!("Error: set CLAY_PASSWORD to the Clay server's password.");
-            std::process::exit(1);
-        }
-    };
-    let mut uid = [0u8; 16];
-    let _ = getrandom::getrandom(&mut uid);
+    // Optional: without it (and without a stored key for this server) the window asks.
+    let password = std::env::var("CLAY_PASSWORD").ok().filter(|p| !p.is_empty());
     // WebKitGTK blends text linearly; GPUI's Linux renderer defaults to gamma 1.8, which
     // measured 15% heavier than the WebView. 1.0 matches it to within 2%.
     #[cfg(target_os = "linux")]
@@ -40,21 +33,21 @@ pub fn run(target: Option<String>, snapshot: Option<String>) -> std::io::Result<
     disable_font_smoothing();
     let runtime = tokio::runtime::Handle::current();
     ui::emoji::init(runtime.clone());
-    let (sender, events) = core::net::connect(&runtime, target, password, hex::encode(uid));
+    let (session, events) = core::session::Session::new(&runtime, target, password);
     if let Some(out) = snapshot {
         #[cfg(feature = "native-gui-snapshot")]
         {
-            ui::snapshot::run(sender, events, &out, 800.0, 600.0);
+            ui::snapshot::run(session, events, &out, 800.0, 600.0);
             return Ok(());
         }
         #[cfg(not(feature = "native-gui-snapshot"))]
         {
-            let _ = out;
+            let _ = (out, session, events);
             eprintln!("Error: --native-gui-snapshot needs a build with the 'native-gui-snapshot' feature.");
             std::process::exit(1);
         }
     }
-    ui::run(sender, events);
+    ui::run(session, events);
     Ok(())
 }
 

@@ -10,8 +10,8 @@ use futures::channel::mpsc;
 use gpui::{AppContext, HeadlessAppContext, px, size};
 
 use super::{ClayView, fonts};
-use crate::native_gui::core::net::{NetEvent, Sender};
-use crate::websocket::WsMessage;
+use crate::native_gui::core::client::{Input, Status};
+use crate::native_gui::core::session::Session;
 
 /// How long the output must be quiet, after the initial state, before the snapshot.
 const SETTLE: Duration = Duration::from_millis(1500);
@@ -19,33 +19,35 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to wait for Discord emoji images.
 const EMOJI_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub fn run(sender: Sender, mut events: mpsc::UnboundedReceiver<NetEvent>, out: &str, width: f32, height: f32) {
-    // Collect the session's events first: the headless app runs on a deterministic test
-    // executor, so feed it everything at once rather than pumping a live channel.
+pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out: &str, width: f32, height: f32) {
+    // Run the session here until the output has settled: the headless app runs on a
+    // deterministic test executor, so hand it a finished state rather than a live channel.
     let start = Instant::now();
-    let mut collected = Vec::new();
-    let mut have_state = false;
     let mut last = Instant::now();
+    let _ = session.start();
     loop {
         match events.try_recv() {
             Ok(ev) => {
-                if let NetEvent::Message(m) = &ev {
-                    have_state |= matches!(**m, WsMessage::InitialState { .. });
-                }
-                if let NetEvent::Closed(reason) = &ev {
+                if let Input::Closed(reason) = &ev {
                     eprintln!("snapshot: connection closed: {reason}");
                 }
-                collected.push(ev);
+                let _ = session.handle(ev);
                 last = Instant::now();
             }
             Err(mpsc::TryRecvError::Closed) => break,
             Err(mpsc::TryRecvError::Empty) => {
-                if have_state && last.elapsed() >= SETTLE {
+                let _ = session.tick();
+                match session.core.status() {
+                    Status::NeedLogin { .. } => fail("the server wants a login: set CLAY_PASSWORD"),
+                    Status::CertMismatch(m) => fail(&format!("the certificate of {} has changed", m.host)),
+                    Status::Stopped(why) => fail(why),
+                    _ => {}
+                }
+                if session.core.is_online() && !session.core.worlds.is_empty() && last.elapsed() >= SETTLE {
                     break;
                 }
                 if start.elapsed() >= TIMEOUT {
-                    eprintln!("snapshot: timed out waiting for the server");
-                    std::process::exit(1);
+                    fail("timed out waiting for the server");
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -55,23 +57,14 @@ pub fn run(sender: Sender, mut events: mpsc::UnboundedReceiver<NetEvent>, out: &
     let text_system = gpui_platform::current_platform(true).text_system();
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), gpui_platform::current_headless_renderer);
     let fonts = cx.update(|app| {
+        gpui_component::init(app);
         #[cfg(not(target_os = "windows"))]
         app.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         fonts::load(app)
     });
     let window = cx
-        .open_window(size(px(width), px(height)), |_, app| app.new(|cx| ClayView::new(fonts, sender, cx)))
+        .open_window(size(px(width), px(height)), |window, app| app.new(|cx| ClayView::new(fonts, session, window, cx)))
         .expect("open the offscreen window");
-    cx.update(|app| {
-        window
-            .update(app, |view, _, cx| {
-                for ev in collected {
-                    view.handle(ev);
-                }
-                cx.notify();
-            })
-            .expect("update the view");
-    });
     cx.run_until_parked();
     cx.update_window(window.into(), |_, window, app| {
         let _ = window.draw(app);
@@ -103,4 +96,9 @@ pub fn run(sender: Sender, mut events: mpsc::UnboundedReceiver<NetEvent>, out: &
             std::process::exit(1);
         }
     }
+}
+
+fn fail(why: &str) -> ! {
+    eprintln!("snapshot: {why}");
+    std::process::exit(1);
 }
