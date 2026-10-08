@@ -25,8 +25,12 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use super::seq::SeenRanges;
+use crate::actions::Action;
+use crate::stats::StatEntry;
+use crate::tf::status::StatusView;
 use crate::websocket::{
-    GlobalSettingsMsg, RemoteClientType, TimestampedLine, WorldStateMsg, WsMessage, hash_password, hash_with_challenge,
+    GlobalSettingsMsg, RemoteClientType, TimestampedLine, WorldSettingsMsg, WorldStateMsg, WsMessage, hash_password,
+    hash_with_challenge,
 };
 
 /// What this client calls itself in the diagnostics it sends (`ReportGap` and friends).
@@ -111,6 +115,14 @@ pub enum Effect {
     Event(Box<WsMessage>),
 }
 
+/// Which world to ask the server for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorldRequest {
+    Next,
+    Prev,
+    OldestPending,
+}
+
 /// What the transport reports.
 #[derive(Clone, Debug)]
 pub enum Input {
@@ -153,6 +165,15 @@ pub struct World {
     pub prompt: String,
     pub pending_count: usize,
     pub unseen: usize,
+    /// The world's settings as the server last described them (notes flag, reconnect
+    /// interval, encoding, ...). `None` until the first InitialState.
+    pub settings: Option<WorldSettingsMsg>,
+    pub gmcp_user_enabled: bool,
+    pub echo_masked: bool,
+    /// The MUD status display's rows (GMCP/MSDP), empty when it has none.
+    pub stats: Vec<StatEntry>,
+    /// TF's status area for this world, once a script has made it its own.
+    pub tf_status: Option<StatusView>,
     /// Bumped whenever `lines` change.
     pub revision: u64,
     pub seen: SeenRanges,
@@ -225,6 +246,12 @@ pub struct ClientCore {
     pub worlds: Vec<World>,
     pub current: usize,
     pub settings: Option<GlobalSettingsMsg>,
+    /// The server's actions (F8 highlighting, shortcut tiles).
+    pub actions: Vec<Action>,
+    /// Worlds with activity, as the server counts them (`ActivityUpdate`).
+    pub activity: usize,
+    /// An operator paused this client (`/remote pause`).
+    pub paused: bool,
     pub visible: bool,
     view: Option<(usize, usize)>,
     /// World name -> index, for the worlds listed in this connection's `resume`.
@@ -263,6 +290,9 @@ impl ClientCore {
             worlds: Vec::new(),
             current: 0,
             settings: None,
+            actions: Vec::new(),
+            activity: 0,
+            paused: false,
             visible: true,
             view: None,
             resume_sent: HashMap::new(),
@@ -379,6 +409,11 @@ impl ClientCore {
 
     /// Show another world (the client keeps its own current world, as app.js does).
     pub fn switch_world(&mut self, index: usize, now: Instant) -> Vec<Effect> {
+        self.switch_to(index, now);
+        self.take()
+    }
+
+    fn switch_to(&mut self, index: usize, now: Instant) {
         if index < self.worlds.len() && index != self.current {
             let previous = self.current;
             self.current = index;
@@ -388,6 +423,72 @@ impl ClientCore {
                 self.send(WsMessage::RequestWorldState { world_index: index });
                 self.send_view_state();
             }
+            self.changed();
+        }
+    }
+
+    /// Ask the server which world comes next, previous, or has the oldest pending output
+    /// (its switching rules: unseen-first or alphabetical). The answer, `CalculatedWorld`,
+    /// switches.
+    pub fn request_world(&mut self, which: WorldRequest) -> Vec<Effect> {
+        let current_index = self.current;
+        let msg = match which {
+            WorldRequest::Next => WsMessage::CalculateNextWorld { current_index },
+            WorldRequest::Prev => WsMessage::CalculatePrevWorld { current_index },
+            WorldRequest::OldestPending => WsMessage::CalculateOldestPending { current_index },
+        };
+        if self.is_online() {
+            self.send(msg);
+        }
+        self.take()
+    }
+
+    /// Step through the connected worlds in list order, `n` at a time (app.js
+    /// `cycleConnectedWorldLocal`); negative goes back.
+    pub fn cycle_connected(&mut self, n: isize, now: Instant) -> Vec<Effect> {
+        let connected: Vec<usize> = (0..self.worlds.len()).filter(|&i| self.worlds[i].connected).collect();
+        if !connected.is_empty() {
+            let pos = connected.iter().position(|&i| i == self.current);
+            let len = connected.len() as isize;
+            let next = match pos {
+                Some(p) => (p as isize + n).rem_euclid(len),
+                None if n >= 0 => 0,
+                None => len - 1,
+            };
+            self.switch_to(connected[next as usize], now);
+        }
+        self.take()
+    }
+
+    /// Release `count` screen rows of the server's held output for `world` (0 = all),
+    /// counting them released straight away as app.js does.
+    pub fn release_pending(&mut self, world: usize, count: usize) -> Vec<Effect> {
+        if let Some(w) = self.worlds.get_mut(world) {
+            if w.pending_count > 0 {
+                w.pending_count = if count == 0 { 0 } else { w.pending_count.saturating_sub(count) };
+                let msg = WsMessage::ReleasePending { world_index: world, count };
+                if self.phase == Phase::Online {
+                    self.send(msg);
+                }
+                self.changed();
+            }
+        }
+        self.take()
+    }
+
+    /// Ctrl+L (app.js `redraw`): drop this client's own notices from the current world and
+    /// clear its ▶ markers there.
+    pub fn redraw(&mut self) -> Vec<Effect> {
+        let me = self.display_id;
+        if let Some(w) = self.worlds.get_mut(self.current) {
+            w.lines.retain(|l| l.from_server);
+            for l in &mut w.lines {
+                if l.display_id == Some(me) {
+                    l.display_id = None;
+                }
+            }
+            w.claim = None;
+            w.touch();
             self.changed();
         }
         self.take()
@@ -522,8 +623,19 @@ impl ClientCore {
             }
             WsMessage::AuthResponse { success, error, multiuser_mode, .. } => self.on_auth_response(success, error, multiuser_mode),
             WsMessage::KeyGenerated { auth_key } => self.adopt_key(auth_key),
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, .. } => {
-                self.on_initial_state(worlds, settings, current_world_index, your_display_id, now)
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, .. } => {
+                self.actions = actions;
+                self.on_initial_state(worlds, settings, current_world_index, your_display_id, now);
+                for entry in tf_status {
+                    if let Some(w) = self.worlds.get_mut(entry.world_index) {
+                        w.tf_status = Some(entry.view);
+                    }
+                }
+                // Until the server's next ActivityUpdate: the other worlds with something
+                // to read (app.js recomputes it the same way on connect).
+                let cur = self.current;
+                self.activity =
+                    self.worlds.iter().enumerate().filter(|(i, w)| *i != cur && (w.unseen > 0 || w.pending_count > 0)).count();
             }
             WsMessage::GlobalSettingsUpdated { settings, .. } => {
                 if !settings.auth_key.is_empty() {
@@ -668,6 +780,73 @@ impl ClientCore {
             }
             // The client keeps its own current world (app.js ignores the console's switch).
             WsMessage::WorldSwitched { .. } => {}
+            WsMessage::ActionsUpdated { actions } => {
+                self.actions = actions;
+                self.changed();
+            }
+            WsMessage::ActivityUpdate { count } => {
+                self.activity = count;
+                self.changed();
+            }
+            WsMessage::PausedState { paused } => {
+                self.paused = paused;
+                self.changed();
+            }
+            WsMessage::StatsUpdate { world_index, stats } => {
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.stats = stats;
+                    self.changed();
+                }
+            }
+            WsMessage::TfStatus { world_index, view } => {
+                match view {
+                    // No view: TF's status area is gone everywhere.
+                    None => self.worlds.iter_mut().for_each(|w| w.tf_status = None),
+                    Some(v) => {
+                        if let Some(w) = self.worlds.get_mut(world_index) {
+                            w.tf_status = Some(v);
+                        }
+                    }
+                }
+                self.changed();
+            }
+            WsMessage::GmcpUserToggled { world_index, enabled } => {
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.gmcp_user_enabled = enabled;
+                    self.changed();
+                }
+            }
+            WsMessage::EchoMaskChanged { world_index, masked } => {
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.echo_masked = masked;
+                    self.changed();
+                }
+            }
+            WsMessage::NotesChanged { world_index, has_notes } => {
+                if let Some(s) = self.worlds.get_mut(world_index).and_then(|w| w.settings.as_mut()) {
+                    s.has_notes = has_notes;
+                    self.changed();
+                }
+            }
+            WsMessage::WorldSettingsUpdated { world_index, settings, name } => {
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.settings = Some(settings);
+                    w.name = name;
+                    self.changed();
+                }
+            }
+            WsMessage::CalculatedWorld { index: Some(index) } => {
+                let _ = self.switch_world(index, now);
+                self.out.push(Effect::Changed);
+            }
+            WsMessage::CalculatedWorld { index: None } => {}
+            WsMessage::WorldSwitchResult { world_index, pending_count, .. } => {
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.pending_count = pending_count;
+                }
+                let _ = self.switch_world(world_index, now);
+                self.out.push(Effect::Changed);
+            }
             other => self.out.push(Effect::Event(Box::new(other))),
         }
     }
@@ -807,6 +986,10 @@ impl ClientCore {
             unseen: m.unseen_lines,
             epoch: m.seq_epoch,
             total_visible: m.total_visible_lines.unwrap_or(m.total_output_lines),
+            settings: Some(m.settings.clone()),
+            gmcp_user_enabled: m.gmcp_user_enabled,
+            echo_masked: m.echo_masked,
+            stats: m.stats.clone(),
             lines,
             ..World::default()
         };

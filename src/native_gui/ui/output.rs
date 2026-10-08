@@ -18,7 +18,10 @@
 //!   stay one em, so the image reaches a little into the rows around it; it paints last.
 //! - Underlines skip descenders (`text-decoration-skip-ink`), see `ink`.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -47,14 +50,65 @@ fn hsla_alpha(c: Rgb, a: f32) -> Hsla {
 
 /// Everything the output element needs for one frame.
 pub struct OutputSnapshot {
-    pub lines: Vec<Arc<StyledLine>>,
+    /// The lines shown, oldest first, each with its `Line::id`.
+    pub lines: Vec<(u64, Arc<StyledLine>)>,
     pub background: Rgb,
     pub font_size: f32,
     pub fonts: Fonts,
-    /// How far the view is scrolled up from the bottom, in rows.
-    pub scroll_rows: usize,
     /// wrapspace: hanging indent of continuation rows, in columns.
     pub wrapspace: usize,
+    /// Changes whenever the same line would lay out differently (styling, show_tags).
+    pub style_epoch: u64,
+    pub scroll: ScrollHandle,
+}
+
+/// Where the view is. The window moves it (keys, wheel, more-mode); the layout resolves
+/// the move against the lines' real row counts and reports back what it found.
+///
+/// Following the bottom, new output scrolls into view. Otherwise the view is anchored to
+/// a line, so neither output arriving below nor history arriving above moves what the
+/// user is reading. Only the user leaves the bottom; reaching it again follows again
+/// (app.js `followBottom`).
+pub struct Scroll {
+    pub follow: bool,
+    /// When not following: the top row shown, as (line id, row within the line).
+    top: Option<(u64, usize)>,
+    /// Rows to move at the next layout; negative is up.
+    pending: isize,
+    /// After the last layout: rows below the view (the History count).
+    pub rows_below: usize,
+    /// After the last layout: whole rows the view holds.
+    pub view_rows: usize,
+    /// Rows per line at the current width, font and style, so counting rows below the
+    /// view costs a layout only once per line.
+    rows_cache: (u32, u32, u64),
+    rows: HashMap<u64, usize>,
+}
+
+pub type ScrollHandle = Rc<RefCell<Scroll>>;
+
+impl Default for Scroll {
+    fn default() -> Self {
+        Scroll { follow: true, top: None, pending: 0, rows_below: 0, view_rows: 24, rows_cache: (0, 0, 0), rows: HashMap::new() }
+    }
+}
+
+impl Scroll {
+    /// Move by `rows` (negative is up).
+    pub fn by(&mut self, rows: isize) {
+        self.pending += rows;
+    }
+
+    /// Jump to the bottom and follow it.
+    pub fn to_bottom(&mut self) {
+        self.follow = true;
+        self.top = None;
+        self.pending = 0;
+    }
+
+    pub fn at_bottom(&self) -> bool {
+        self.follow || self.rows_below == 0
+    }
 }
 
 struct Metrics {
@@ -262,6 +316,81 @@ fn emoji_width(e: &DiscordEmoji, m: &Metrics) -> f32 {
     }
 }
 
+/// Where the view lands: `top` is the first row shown (line, row within it), or `None`
+/// when the view sits on the bottom; `below` is how many rows are under the view.
+#[derive(Debug, PartialEq, Eq)]
+struct ViewPlan {
+    top: Option<(usize, usize)>,
+    below: usize,
+}
+
+/// Resolve a scroll against the lines' row counts (`rows(i)`, at least 1 each): start
+/// from the anchor (or from the bottom when following), move `pending` rows, and see
+/// whether what follows fills the view — if it doesn't, the view is at the bottom.
+fn plan_view(
+    n: usize,
+    rows: &mut dyn FnMut(usize) -> usize,
+    follow: bool,
+    anchored: Option<(usize, usize)>,
+    pending: isize,
+    view_rows: usize,
+) -> ViewPlan {
+    if n == 0 || (follow && pending >= 0) {
+        return ViewPlan { top: None, below: 0 };
+    }
+    let mut pos = match anchored {
+        Some((i, r)) => (i, r.min(rows(i) - 1)),
+        None => {
+            // A screenful up from the end.
+            let (mut i, mut need) = (n - 1, view_rows);
+            loop {
+                let r = rows(i);
+                if r >= need || i == 0 {
+                    break (i, r.saturating_sub(need));
+                }
+                need -= r;
+                i -= 1;
+            }
+        }
+    };
+    let mut delta = pending;
+    while delta < 0 {
+        if pos.1 > 0 {
+            pos.1 -= 1;
+        } else if pos.0 > 0 {
+            pos.0 -= 1;
+            pos.1 = rows(pos.0) - 1;
+        } else {
+            break;
+        }
+        delta += 1;
+    }
+    while delta > 0 {
+        if pos.1 + 1 < rows(pos.0) {
+            pos.1 += 1;
+        } else if pos.0 + 1 < n {
+            pos = (pos.0 + 1, 0);
+        } else {
+            break;
+        }
+        delta -= 1;
+    }
+    let mut have = rows(pos.0) - pos.1;
+    let mut i = pos.0;
+    while have < view_rows && i + 1 < n {
+        i += 1;
+        have += rows(i);
+    }
+    if have <= view_rows && i + 1 >= n {
+        return ViewPlan { top: None, below: 0 };
+    }
+    let mut below = have - view_rows;
+    for j in i + 1..n {
+        below += rows(j);
+    }
+    ViewPlan { top: Some(pos), below }
+}
+
 /// The text runs for part of a line (a right-to-left row reshaped on its own).
 fn sub_runs(runs: &[TextRun], range: &Range<usize>) -> Vec<TextRun> {
     let mut out = Vec::new();
@@ -296,44 +425,115 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         size(bounds.size.width - px(2.0 * PADDING), bounds.size.height - px(2.0 * PADDING)),
     );
     let width = f32::from(content.size.width).max(metrics.ch);
-    let visible = (f32::from(content.size.height) / metrics.row).ceil() as usize + 1;
-    let wanted = visible + snapshot.scroll_rows;
+    let height = f32::from(content.size.height);
+    let view_rows = ((height / metrics.row).floor() as usize).max(1);
+    let n = snapshot.lines.len();
+    let scroll = snapshot.scroll.clone();
+    let mut st = scroll.borrow_mut();
+    let key = (width.to_bits(), snapshot.font_size.to_bits(), snapshot.style_epoch);
+    if st.rows_cache != key {
+        st.rows_cache = key;
+        st.rows.clear();
+    }
 
-    // Lay out from the newest line upward until the screen (plus the scroll) is full.
-    let mut lines: Vec<LaidLine> = Vec::new();
-    let mut total_rows = 0usize;
-    for styled in snapshot.lines.iter().rev() {
-        let laid = lay_out(styled.clone(), &snapshot, &metrics, width, window);
-        total_rows += laid.rows.len();
-        lines.push(laid);
-        if total_rows >= wanted {
-            break;
+    // Lines are laid out only as far as the view (and the scroll) needs.
+    let mut laid: HashMap<usize, LaidLine> = HashMap::new();
+    let rows_of = |i: usize, st: &mut Scroll, laid: &mut HashMap<usize, LaidLine>| -> usize {
+        let id = snapshot.lines[i].0;
+        if let Some(&r) = st.rows.get(&id) {
+            return r;
+        }
+        let l = lay_out(snapshot.lines[i].1.clone(), &snapshot, &metrics, width, window);
+        let r = l.rows.len().max(1);
+        st.rows.insert(id, r);
+        laid.insert(i, l);
+        r
+    };
+
+    // Where the view is, worked out against the lines' row counts.
+    let anchored = if st.follow { None } else { st.top.and_then(|(id, r)| snapshot.lines.iter().position(|l| l.0 == id).map(|i| (i, r))) };
+    let (follow, pending) = (st.follow, st.pending);
+    let plan = {
+        let mut rows = |i: usize| rows_of(i, &mut st, &mut laid);
+        plan_view(n, &mut rows, follow, anchored, pending, view_rows)
+    };
+    let (top, below) = (plan.top, plan.below);
+    st.pending = 0;
+    match top {
+        Some((ti, tr)) => {
+            st.follow = false;
+            st.top = Some((snapshot.lines[ti].0, tr));
+        }
+        None => {
+            st.follow = true;
+            st.top = None;
         }
     }
-    lines.reverse();
+    st.rows_below = below;
+    st.view_rows = view_rows;
+    drop(st);
 
-    // Rows top to bottom. Following the bottom, the newest row sits on the bottom edge;
-    // with less than a screenful, rows start at the top as in the browser.
-    let all: Vec<(usize, usize)> =
-        lines.iter().enumerate().flat_map(|(li, l)| (0..l.rows.len()).map(move |ri| (li, ri))).collect();
-    let fits = (f32::from(content.size.height) / metrics.row).floor() as usize;
+    // The visible rows, top to bottom.
+    let mut order: Vec<usize> = Vec::new();
     let mut rows = Vec::new();
-    if all.len() <= fits {
-        for (k, (li, ri)) in all.iter().enumerate() {
-            rows.push(VisibleRow { line: *li, row: *ri, top: f32::from(content.origin.y) + k as f32 * metrics.row });
+    let place = |i: usize, laid: &mut HashMap<usize, LaidLine>, order: &mut Vec<usize>| -> usize {
+        if !laid.contains_key(&i) {
+            laid.insert(i, lay_out(snapshot.lines[i].1.clone(), &snapshot, &metrics, width, window));
         }
-    } else {
-        let bottom = f32::from(content.origin.y + content.size.height);
-        let end = all.len().saturating_sub(snapshot.scroll_rows.min(all.len()));
-        for (k, (li, ri)) in all[..end].iter().rev().enumerate() {
-            let top = bottom - (k + 1) as f32 * metrics.row;
-            if top + metrics.row < f32::from(content.origin.y) {
-                break;
+        match order.iter().position(|&o| o == i) {
+            Some(p) => p,
+            None => {
+                order.push(i);
+                order.len() - 1
             }
-            rows.push(VisibleRow { line: *li, row: *ri, top });
         }
-        rows.reverse();
+    };
+    match top {
+        Some((ti, tr)) => {
+            let (mut i, mut r, mut k) = (ti, tr, 0usize);
+            while k <= view_rows && i < n {
+                let li = place(i, &mut laid, &mut order);
+                let count = laid[&i].rows.len().max(1);
+                while r < count && k <= view_rows {
+                    rows.push(VisibleRow { line: li, row: r, top: f32::from(content.origin.y) + k as f32 * metrics.row });
+                    r += 1;
+                    k += 1;
+                }
+                i += 1;
+                r = 0;
+            }
+        }
+        None if n > 0 => {
+            // Bottom-anchored: the newest row on the bottom edge; with less than a
+            // screenful, rows start at the top as in the browser.
+            let mut stack: Vec<(usize, usize)> = Vec::new();
+            let mut i = n;
+            while i > 0 && stack.len() <= view_rows {
+                i -= 1;
+                let count = rows_of(i, &mut scroll.borrow_mut(), &mut laid);
+                for r in (0..count).rev() {
+                    stack.push((i, r));
+                }
+            }
+            stack.reverse();
+            let fits = stack.len() <= view_rows;
+            let skip = stack.len().saturating_sub(view_rows + 1);
+            let bottom = f32::from(content.origin.y + content.size.height);
+            let shown: Vec<(usize, usize)> = stack[skip..].to_vec();
+            let count = shown.len();
+            for (k, (i, r)) in shown.into_iter().enumerate() {
+                let li = place(i, &mut laid, &mut order);
+                let top = if fits {
+                    f32::from(content.origin.y) + k as f32 * metrics.row
+                } else {
+                    bottom - (count - k) as f32 * metrics.row
+                };
+                rows.push(VisibleRow { line: li, row: r, top });
+            }
+        }
+        None => {}
     }
+    let lines: Vec<LaidLine> = order.iter().map(|i| laid.remove(i).expect("laid out")).collect();
 
     let ts = window.text_system();
     let bundled = [(false, false), (true, false), (false, true), (true, true)]
@@ -697,5 +897,52 @@ fn paint_cell(window: &mut Window, cell: Bounds<Pixels>, kind: Cell, fg: Rgb, bg
             if ll { rect(window, 0.0, 0.5, 0.5, 1.0, c); }
             if lr { rect(window, 0.5, 0.5, 1.0, 1.0, c); }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ten lines; line 5 wraps to three rows.
+    fn rows(i: usize) -> usize {
+        if i == 5 { 3 } else { 1 }
+    }
+
+    fn plan(follow: bool, anchored: Option<(usize, usize)>, pending: isize, view: usize) -> ViewPlan {
+        plan_view(10, &mut rows, follow, anchored, pending, view)
+    }
+
+    #[test]
+    fn following_stays_on_the_bottom() {
+        assert_eq!(plan(true, None, 0, 4), ViewPlan { top: None, below: 0 });
+        assert_eq!(plan(true, None, 3, 4), ViewPlan { top: None, below: 0 }, "down at the bottom stays there");
+    }
+
+    #[test]
+    fn scrolling_up_from_the_bottom_anchors_by_rows() {
+        // 12 rows in all (line 5 is rows 5-7), 4 shown: following, the top is row 8 =
+        // line 6. Up 2 rows: the top is row 6, line 5's middle row; 2 rows under the view.
+        assert_eq!(plan(true, None, -2, 4), ViewPlan { top: Some((5, 1)), below: 2 });
+        // Up 4: row 4, line 4; rows 8-11 under the view.
+        assert_eq!(plan(true, None, -4, 4), ViewPlan { top: Some((4, 0)), below: 4 });
+    }
+
+    #[test]
+    fn an_anchor_holds_and_clamps_at_the_top() {
+        assert_eq!(plan(false, Some((2, 0)), 0, 4), ViewPlan { top: Some((2, 0)), below: 6 });
+        assert_eq!(plan(false, Some((1, 0)), -5, 4), ViewPlan { top: Some((0, 0)), below: 8 });
+    }
+
+    #[test]
+    fn reaching_the_bottom_follows_again() {
+        assert_eq!(plan(false, Some((2, 0)), 6, 4), ViewPlan { top: None, below: 0 });
+        // Row 2 down 5 is row 7, line 5's last row: rows 7-10 shown, row 11 under.
+        assert_eq!(plan(false, Some((2, 0)), 5, 4), ViewPlan { top: Some((5, 2)), below: 1 });
+    }
+
+    #[test]
+    fn less_than_a_screenful_is_always_at_the_bottom() {
+        assert_eq!(plan_view(2, &mut |_| 1, false, Some((0, 0)), -3, 10), ViewPlan { top: None, below: 0 });
     }
 }

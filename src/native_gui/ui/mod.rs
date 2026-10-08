@@ -1,8 +1,11 @@
 //! The GPUI side of the native GUI.
 
+mod actions;
 pub mod emoji;
 pub mod fonts;
 pub mod ink;
+mod keymap;
+mod more;
 pub mod output;
 #[cfg(feature = "native-gui-snapshot")]
 pub mod snapshot;
@@ -21,11 +24,13 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 
 use crate::native_gui::core::client::{Credentials, Effect, Input as NetInput, Status, hidden_line};
+use crate::native_gui::core::keys::{Keys, Resolved};
 use crate::native_gui::core::session::Session;
 use crate::native_gui::core::style::{Palette, StyleOptions, StyledLine, strip_mud_tag, style_line};
 use crate::theme::ThemeColors;
 use fonts::Fonts;
-use output::{OutputSnapshot, hsla, output_view};
+use more::MoreMode;
+use output::{OutputSnapshot, ScrollHandle, hsla, output_view};
 
 /// `web_font_size_desktop`'s default.
 const DEFAULT_FONT_SIZE: f32 = 18.0;
@@ -51,7 +56,18 @@ pub struct ClayView {
     wrapspace: usize,
     /// Styled lines by `Line::id`, valid while the style inputs are unchanged.
     styled: HashMap<u64, Arc<StyledLine>>,
-    scroll_rows: usize,
+    /// Bumped whenever the same line would style differently (clears `styled`).
+    style_epoch: u64,
+    scroll: ScrollHandle,
+    more: MoreMode,
+    keys: Keys,
+    /// TF's numeric prefix (`%kbnum`), shown as [N] after the world name.
+    kbnum: Option<i64>,
+    kbnum_sign: i64,
+    /// F8: lines matching an enabled action get a highlight.
+    action_highlight: bool,
+    /// The world the output last showed (a switch resets more-mode and the scroll).
+    shown_world: Option<usize>,
     login: LoginForm,
     /// The login screen has put the cursor in its first empty field.
     login_focused: bool,
@@ -93,7 +109,14 @@ impl ClayView {
             font_size: DEFAULT_FONT_SIZE,
             wrapspace: 0,
             styled: HashMap::new(),
-            scroll_rows: 0,
+            style_epoch: 0,
+            scroll: ScrollHandle::default(),
+            more: MoreMode::default(),
+            keys: Keys::default(),
+            kbnum: None,
+            kbnum_sign: 1,
+            action_highlight: false,
+            shown_world: None,
             login: LoginForm { username, password },
             login_focused: false,
         };
@@ -101,19 +124,82 @@ impl ClayView {
         view
     }
 
-    /// Effects the session left for us: redraw, and (later) the GUI's own messages.
+    /// Effects the session left for us: redraw, and the GUI's own messages.
     fn after(&mut self, effects: Vec<Effect>, cx: &mut Context<Self>) {
         let mut changed = false;
         for e in effects {
             match e {
                 Effect::Changed => changed = true,
-                Effect::Event(_msg) => {}
+                Effect::Event(msg) => {
+                    if let crate::websocket::WsMessage::PendingReleased { world_index, count } = *msg {
+                        // Released by any interface: count afresh, and show as many of ours.
+                        self.more.caught_up();
+                        if world_index == self.session.core.current {
+                            self.more.release(count);
+                        }
+                        changed = true;
+                    }
+                }
                 _ => {}
             }
         }
         if changed {
             self.apply_settings();
+            self.follow_world();
             cx.notify();
+        }
+    }
+
+    /// After any change: a world switch starts the output over; new lines at the tail go
+    /// through more-mode.
+    fn follow_world(&mut self) {
+        let current = self.session.core.current_world().map(|_| self.session.core.current);
+        if current != self.shown_world {
+            self.shown_world = current;
+            self.more.reset(self.session.core.current_world());
+            self.scroll.borrow_mut().to_bottom();
+            return;
+        }
+        let threshold = self.scroll.borrow().view_rows.saturating_sub(2);
+        let enabled = self.more_mode_enabled();
+        if let Some(world) = self.session.core.current_world() {
+            if self.more.arrivals(world, enabled, threshold) {
+                self.scroll.borrow_mut().to_bottom();
+            }
+        }
+        // Back at the bottom with nothing held: output flows again.
+        if self.scroll.borrow().at_bottom() && self.pending_total() == 0 {
+            self.more.paused = false;
+        }
+    }
+
+    fn more_mode_enabled(&self) -> bool {
+        self.session.core.settings.as_ref().is_some_and(|s| s.more_mode_enabled)
+    }
+
+    /// Lines will style differently from now on.
+    fn restyle(&mut self) {
+        self.style_epoch += 1;
+        self.styled.clear();
+    }
+
+    /// A keystroke, resolved as every Clay client resolves it.
+    fn key_down(&mut self, ks: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((code, mods)) = keymap::console_key(ks) else { return false };
+        match self.keys.resolve(code, mods, Instant::now()) {
+            Resolved::Pending => true,
+            Resolved::Server(key) => {
+                let kbnum = self.kbnum.take();
+                self.kbnum_sign = 1;
+                let fx = self.session.send(crate::websocket::WsMessage::RunKeyBinding { key, kbnum });
+                self.after(fx, cx);
+                true
+            }
+            Resolved::Action { action, .. } => {
+                self.run_action(&action, window, cx);
+                true
+            }
+            Resolved::NotBound => false,
         }
     }
 
@@ -122,9 +208,18 @@ impl ClayView {
         self.after(fx, cx);
     }
 
-    fn tick(&mut self, cx: &mut Context<Self>) {
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fx = self.session.tick();
         self.after(fx, cx);
+        // A chord left waiting fires its own binding.
+        match self.keys.tick(Instant::now()) {
+            Some(Resolved::Action { action, .. }) => self.run_action(&action, window, cx),
+            Some(Resolved::Server(key)) => {
+                let fx = self.session.send(crate::websocket::WsMessage::RunKeyBinding { key, kbnum: self.kbnum.take() });
+                self.after(fx, cx);
+            }
+            _ => {}
+        }
         if matches!(self.session.core.status(), Status::Reconnecting { .. }) {
             cx.notify(); // the countdown
         }
@@ -144,6 +239,7 @@ impl ClayView {
     /// The server's display settings, whenever they change.
     fn apply_settings(&mut self) {
         let Some(s) = self.session.core.settings.as_ref() else { return };
+        self.keys.update(s);
         let mut restyle = false;
         if !s.theme_colors_json.is_empty() && s.theme_colors_json != self.theme_json {
             self.theme_json = s.theme_colors_json.clone();
@@ -162,16 +258,16 @@ impl ClayView {
             restyle = true;
         }
         if restyle {
-            self.styled.clear();
+            self.restyle();
         }
     }
 
-    /// The current world's lines as the output shows them.
-    fn visible_lines(&mut self) -> Vec<Arc<StyledLine>> {
+    /// The current world's lines as the output shows them, with their ids.
+    fn visible_lines(&mut self) -> Vec<(u64, Arc<StyledLine>)> {
         let Some(world) = self.session.core.current_world() else { return Vec::new() };
         let mut out = Vec::with_capacity(world.lines.len());
         for line in &world.lines {
-            if (line.gagged && !self.show_tags) || hidden_line(&line.text) {
+            if (line.gagged && !self.show_tags) || hidden_line(&line.text) || self.more.is_held(line.id) {
                 continue;
             }
             let styled = self
@@ -179,7 +275,7 @@ impl ClayView {
                 .entry(line.id)
                 .or_insert_with(|| style_raw(&line.text, &self.palette, &self.style, self.show_tags))
                 .clone();
-            out.push(styled);
+            out.push((line.id, styled));
         }
         if self.styled.len() > 2 * out.len() + 1024 {
             let live: std::collections::HashSet<u64> = world.lines.iter().map(|l| l.id).collect();
@@ -203,11 +299,6 @@ impl ClayView {
             }
             Status::Stopped(why) => why.clone(),
         }
-    }
-
-    fn page_rows(&self, window: &Window) -> usize {
-        let h = f32::from(window.viewport_size().height) - STATUS_HEIGHT;
-        ((h / self.font_size).floor() as usize).saturating_sub(2).max(1)
     }
 
     /// Tell the server how much the output shows (it sizes more-mode and history by it).
@@ -309,8 +400,9 @@ impl Render for ClayView {
                     background: self.palette.bg,
                     font_size: self.font_size,
                     fonts: self.fonts.clone(),
-                    scroll_rows: self.scroll_rows,
                     wrapspace: self.wrapspace,
+                    style_epoch: self.style_epoch,
+                    scroll: self.scroll.clone(),
                 };
                 output_view(snapshot).into_any_element()
             }
@@ -322,19 +414,29 @@ impl Render for ClayView {
             .flex_col()
             .bg(hsla(self.palette.bg))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                let page = this.page_rows(window);
-                match ev.keystroke.key.as_str() {
-                    "pageup" => this.scroll_rows += page,
-                    "pagedown" => this.scroll_rows = this.scroll_rows.saturating_sub(page),
-                    "end" => this.scroll_rows = 0,
-                    _ => return,
+                if this.key_down(&ev.keystroke, window, cx) {
+                    cx.stop_propagation();
                 }
-                cx.notify();
             }))
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _window, cx| {
-                let dy = f32::from(ev.delta.pixel_delta(px(this.font_size)).y);
-                let rows = (dy / this.font_size).round() as isize;
-                this.scroll_rows = (this.scroll_rows as isize + rows).max(0) as usize;
+                // Positive is towards the user (down the page in GPUI: content moves up).
+                let dy = -f32::from(ev.delta.pixel_delta(px(this.font_size)).y);
+                let at_bottom = this.scroll.borrow().at_bottom();
+                if dy > 0.0 && at_bottom && this.pending_total() > 0 {
+                    // Wheel past the bottom feeds held output in a row at a time.
+                    this.more.wheel_px += dy;
+                    let rows = (this.more.wheel_px / this.font_size).floor() as usize;
+                    if rows > 0 {
+                        this.more.wheel_px -= rows as f32 * this.font_size;
+                        this.release_lines(rows, cx);
+                    }
+                } else {
+                    this.more.wheel_px = 0.0;
+                    let rows = (dy / this.font_size).round() as isize;
+                    if rows != 0 {
+                        this.user_scroll(rows);
+                    }
+                }
                 cx.notify();
             }))
             .child(div().flex_1().min_h_0().child(body))
@@ -397,11 +499,13 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
             }
         })
         .detach();
-        // The clock: keepalives, watchdogs, reconnects.
+        // The clock: keepalives, watchdogs, reconnects, chord timeouts.
+        let window_handle = window;
+        let _ = view;
         cx.spawn(async move |cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                if view.update(cx, |v, cx| v.tick(cx)).is_err() {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                if window_handle.update(cx, |v, window, cx| v.tick(window, cx)).is_err() {
                     break;
                 }
             }
