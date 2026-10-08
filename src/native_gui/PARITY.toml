@@ -1455,7 +1455,7 @@ section = "wire"
 phase = 1
 status = "done"
 feature = "wire ClientVisibility"
-note = "sent by the web client"
+note = "on window visibility changes (observe_window_visibility), and after InitialState when hidden"
 
 [[item]]
 id = "wire:ActivityUpdate"

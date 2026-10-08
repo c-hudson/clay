@@ -69,6 +69,17 @@ impl ClayView {
             })
             .detach();
         }
+        // Minimised, fully covered (macOS) or on a sleeping display: not visible, so text
+        // arriving meanwhile is unviewed and gets its ▶ when the window comes back (app.js
+        // does the same on `visibilitychange`).
+        cx.observe_window_visibility(window, |this, vis, _window, cx| {
+            let fx = this.session.core.set_visible(vis.is_visible(), Instant::now());
+            let rest = this.session.apply(fx);
+            this.after(rest, cx);
+        })
+        .detach();
+        let mut session = session;
+        let _ = session.core.set_visible(window.is_visible(), Instant::now());
         let theme = ThemeColors::dark_default();
         let mut view = ClayView {
             focus: cx.focus_handle(),
