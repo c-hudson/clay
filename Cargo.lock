@@ -1247,6 +1247,7 @@ dependencies = [
  "async-recursion",
  "base64 0.21.7",
  "bytes",
+ "core-foundation 0.10.1",
  "crossterm",
  "flate2",
  "futures",

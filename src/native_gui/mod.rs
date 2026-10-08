@@ -32,6 +32,12 @@ pub fn run(target: Option<String>, snapshot: Option<String>) -> std::io::Result<
     if std::env::var_os("ZED_FONTS_GAMMA").is_none() {
         std::env::set_var("ZED_FONTS_GAMMA", "1.0");
     }
+    // WKWebView draws the web client's output with `-webkit-font-smoothing: antialiased`,
+    // i.e. without CoreGraphics' stroke thickening; GPUI on macOS thickens unless the
+    // app's AppleFontSmoothing preference is 0. Measured 15-25% heavier before. Set for
+    // this process only (never synchronized to disk).
+    #[cfg(target_os = "macos")]
+    disable_font_smoothing();
     let runtime = tokio::runtime::Handle::current();
     let (sender, events) = core::net::connect(&runtime, target, password, hex::encode(uid));
     if let Some(out) = snapshot {
@@ -49,4 +55,17 @@ pub fn run(target: Option<String>, snapshot: Option<String>) -> std::io::Result<
     }
     ui::run(sender, events);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn disable_font_smoothing() {
+    use core_foundation::base::TCFType;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_foundation::sys::preferences::{CFPreferencesSetAppValue, kCFPreferencesCurrentApplication};
+    let key = CFString::new("AppleFontSmoothing");
+    let value = CFNumber::from(0i32);
+    unsafe {
+        CFPreferencesSetAppValue(key.as_concrete_TypeRef(), value.as_CFTypeRef(), kCFPreferencesCurrentApplication);
+    }
 }
