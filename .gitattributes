@@ -13,3 +13,5 @@
 *.exe      binary
 # Raw MUD bytes (CRLF line endings, ESC characters): keep byte-exact.
 tests/native_gui/corpus.ans -text
+# cmd.exe mis-parses labels and goto in LF-only batch files.
+*.cmd text eol=crlf
