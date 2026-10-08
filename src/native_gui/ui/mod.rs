@@ -53,6 +53,8 @@ pub struct ClayView {
     styled: HashMap<u64, Arc<StyledLine>>,
     scroll_rows: usize,
     login: LoginForm,
+    /// The login screen has put the cursor in its first empty field.
+    login_focused: bool,
 }
 
 impl ClayView {
@@ -82,6 +84,7 @@ impl ClayView {
             styled: HashMap::new(),
             scroll_rows: 0,
             login: LoginForm { username, password },
+            login_focused: false,
         };
         view.apply_settings();
         view
@@ -275,6 +278,17 @@ impl Render for ClayView {
         self.report_view(window);
         let status_bg = [self.theme.status_bar_bg.r, self.theme.status_bar_bg.g, self.theme.status_bar_bg.b];
         let status = self.status_text();
+        let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
+        if need_login && !self.login_focused {
+            // The cursor goes where typing starts: the name in multiuser mode, else the password.
+            let multiuser = matches!(self.session.core.status(), Status::NeedLogin { multiuser: true, .. });
+            let field = if multiuser && self.login.username.read(cx).value().is_empty() { &self.login.username } else { &self.login.password };
+            field.update(cx, |f, cx| f.focus(window, cx));
+            self.login_focused = true;
+        } else if !need_login && self.login_focused {
+            self.login_focused = false;
+            window.focus(&self.focus, cx);
+        }
         let body = match self.session.core.status().clone() {
             Status::NeedLogin { multiuser, error } => self.login_screen(multiuser, error, cx).into_any_element(),
             Status::CertMismatch(m) => self.mismatch_screen(&m.host, &m.old_fingerprint, &m.new_fingerprint, cx).into_any_element(),
