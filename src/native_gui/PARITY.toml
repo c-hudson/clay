@@ -2352,7 +2352,7 @@ id = "ui:output.truncate"
 section = "output"
 phase = 2
 status = "done"
-feature = "lines over 10000 chars truncated with a yellow "... [truncated]""
+feature = "lines over 10000 chars truncated with a yellow '... [truncated]'"
 note = "core/decor.rs truncate"
 
 [[item]]

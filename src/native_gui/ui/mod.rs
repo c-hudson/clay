@@ -30,6 +30,7 @@ use gpui::{
     MouseUpEvent, ParentElement, Render, ScrollWheelEvent, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
     prelude::*, px, size,
 };
+use gpui::{KeyBinding, Keystroke};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 
@@ -761,6 +762,11 @@ impl Render for ClayView {
         let debug_dialog = self.debug_dialog(window, cx);
         div()
             .track_focus(&self.focus)
+            .key_context(MAIN_CONTEXT)
+            .on_action(cx.listener(|this, _: &MainTab, window, cx| this.main_key("tab", window, cx)))
+            .on_action(cx.listener(|this, _: &MainTabPrev, window, cx| this.main_key("shift-tab", window, cx)))
+            .on_action(cx.listener(|this, _: &MainCopyCtrl, window, cx| this.main_key("ctrl-c", window, cx)))
+            .on_action(cx.listener(|this, _: &MainCopyCmd, window, cx| this.main_key("cmd-c", window, cx)))
             .size_full()
             .flex()
             .flex_col()
@@ -826,11 +832,41 @@ impl Render for ClayView {
     }
 }
 
+gpui::actions!(clay_main, [MainTab, MainTabPrev, MainCopyCtrl, MainCopyCmd]);
+
+const MAIN_CONTEXT: &str = "ClayMain";
+
+/// gpui-component's root binds Tab, Shift+Tab and Copy for itself (focus order, its own
+/// text selection), and GPUI runs bindings before key listeners. In the main view they
+/// are Clay's keys: bound here in a deeper context, they go to the root only while a text
+/// field or a dialog has the focus.
+pub(super) fn bind_main_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", MainTab, Some(MAIN_CONTEXT)),
+        KeyBinding::new("shift-tab", MainTabPrev, Some(MAIN_CONTEXT)),
+        KeyBinding::new("ctrl-c", MainCopyCtrl, Some(MAIN_CONTEXT)),
+        KeyBinding::new("cmd-c", MainCopyCmd, Some(MAIN_CONTEXT)),
+    ]);
+}
+
+impl ClayView {
+    fn main_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        if let Ok(k) = Keystroke::parse(key) {
+            self.key_down(&k, window, cx);
+        }
+    }
+}
+
 /// Open the main window and run the session in it.
 pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
     let _ = STARTED.set(Instant::now());
     gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
+        bind_main_keys(cx);
         // The web client's output is `-webkit-font-smoothing: antialiased`, which WebKit
         // (Linux, macOS) honours with grayscale text. WebView2 is Chromium, which ignores
         // it on Windows and draws ClearType - so there, keep the system's rendering.
@@ -838,6 +874,7 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         let fonts = fonts::load(cx);
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
+        let mut main = None;
         let window = cx
             .open_window(
                 WindowOptions {
@@ -852,11 +889,14 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
                         v
                     });
                     window.focus(&view.focus_handle(cx), cx);
-                    view
+                    main = Some(view.clone());
+                    // gpui-component's root: its dialogs, notifications and Tab order.
+                    cx.new(|cx| gpui_component::Root::new(view, window, cx))
                 },
             )
             .expect("open the main window");
-        let view = window.update(cx, |_, _, cx| cx.entity().downgrade()).expect("main view");
+        let main = main.expect("main view");
+        let view = main.downgrade();
         // Redraw when a Discord emoji arrives or an animated one moves to its next frame.
         let (repaint_tx, mut repaint) = mpsc::unbounded();
         emoji::set_repaint(repaint_tx);
@@ -882,22 +922,21 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         .detach();
         // The clock: keepalives, watchdogs, reconnects, chord timeouts.
         let window_handle = window;
-        let _ = view;
+        let tick_view = view.clone();
         cx.spawn(async move |cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(250)).await;
-                if window_handle.update(cx, |v, window, cx| v.tick(window, cx)).is_err() {
+                let ticked = window_handle.update(cx, |_, window, cx| tick_view.update(cx, |v, cx| v.tick(window, cx)));
+                if !matches!(ticked, Ok(Ok(()))) {
                     break;
                 }
             }
         })
         .detach();
-        window
-            .update(cx, |v, _, cx| {
-                let fx = v.session.start();
-                v.after(fx, cx);
-            })
-            .expect("start the session");
+        main.update(cx, |v, cx| {
+            let fx = v.session.start();
+            v.after(fx, cx);
+        });
         cx.activate(true);
     });
 }

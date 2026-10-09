@@ -58,13 +58,15 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(super::assets::Assets), gpui_platform::current_headless_renderer);
     let fonts = cx.update(|app| {
         gpui_component::init(app);
+        super::bind_main_keys(app);
         #[cfg(not(target_os = "windows"))]
         app.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         fonts::load(app)
     });
+    let mut main = None;
     let window = cx
         .open_window(size(px(width), px(height)), |window, app| {
-            app.new(|cx| {
+            let view = app.new(|cx| {
                 let mut view = ClayView::new(fonts, session, window, cx);
                 // CLAY_SNAPSHOT_MENU=main|worlds: draw with that menu open, for reviewing it.
                 view.chrome.menu = match std::env::var("CLAY_SNAPSHOT_MENU").as_deref() {
@@ -74,9 +76,12 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                 };
                 window.focus(&view.focus.clone(), cx);
                 view
-            })
+            });
+            main = Some(view.clone());
+            app.new(|cx| gpui_component::Root::new(view, window, cx))
         })
         .expect("open the offscreen window");
+    let view = main.expect("the main view");
     cx.run_until_parked();
     cx.update_window(window.into(), |_, window, app| {
         let _ = window.draw(app);
@@ -88,7 +93,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         while super::emoji::pending() > 0 && start.elapsed() < EMOJI_TIMEOUT {
             std::thread::sleep(Duration::from_millis(50));
         }
-        cx.update(|app| window.update(app, |_, _, cx| cx.notify()).expect("update the view"));
+        cx.update(|app| view.update(app, |_, cx| cx.notify()));
         cx.run_until_parked();
         cx.update_window(window.into(), |_, window, app| {
             let _ = window.draw(app);
@@ -129,17 +134,15 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                 // method's uncommitted text, `commit` its result.
                 "type" | "compose" | "commit" => {
                     let text = arg.to_string();
-                    cx.update_window(window.into(), |root, w, app| {
-                        if let Ok(view) = root.downcast::<ClayView>() {
-                            view.update(app, |v, cx| {
-                                use gpui::EntityInputHandler;
-                                if verb == "compose" {
-                                    v.replace_and_mark_text_in_range(None, &text, None, w, cx);
-                                } else if verb == "commit" || !v.type_into_find(&text, w, cx) {
-                                    v.replace_text_in_range(None, &text, w, cx);
-                                }
-                            });
-                        }
+                    cx.update_window(window.into(), |_, w, app| {
+                        view.update(app, |v, cx| {
+                            use gpui::EntityInputHandler;
+                            if verb == "compose" {
+                                v.replace_and_mark_text_in_range(None, &text, None, w, cx);
+                            } else if verb == "commit" || !v.type_into_find(&text, w, cx) {
+                                v.replace_text_in_range(None, &text, w, cx);
+                            }
+                        });
                     })
                     .expect("type");
                     Vec::new()
@@ -173,7 +176,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
     // CLAY_SNAPSHOT_BENCH=1: time frames scrolling the buffer and taking in 200 lines a
     // second, and report memory (the CPU side of the phase 2 performance targets).
     if std::env::var_os("CLAY_SNAPSHOT_BENCH").is_some() {
-        bench(&mut cx, window.into());
+        bench(&mut cx, window.into(), &view);
     }
     match cx.capture_screenshot(window.into()) {
         Ok(image) => {
@@ -205,7 +208,7 @@ fn rss_mb() -> f64 {
         .map_or(0.0, |kb| kb / 1024.0)
 }
 
-fn bench(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle) {
+fn bench(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle, view: &gpui::Entity<ClayView>) {
     let draw = |cx: &mut HeadlessAppContext| -> f64 {
         let t = Instant::now();
         cx.update_window(window, |_, window, app| {
@@ -215,12 +218,7 @@ fn bench(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle) {
         t.elapsed().as_secs_f64() * 1000.0
     };
     let with_view = |cx: &mut HeadlessAppContext, f: &mut dyn FnMut(&mut ClayView, &mut gpui::Context<ClayView>)| {
-        cx.update_window(window, |root, _w, app| {
-            if let Ok(view) = root.downcast::<ClayView>() {
-                view.update(app, |v, cx| f(v, cx));
-            }
-        })
-        .expect("update the view");
+        cx.update(|app| view.update(app, |v, cx| f(v, cx)));
     };
     let mut lines = 0;
     with_view(cx, &mut |v, _| lines = v.session.core.current_world().map_or(0, |w| w.lines.len()));
