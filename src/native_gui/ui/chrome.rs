@@ -515,6 +515,7 @@ impl ClayView {
                 MenuKind::Main => "menu-dropdown",
                 MenuKind::Worlds => "world-menu-dropdown",
             })
+            .occlude()
             .flex()
             .flex_col()
             .min_w(px(190.0))
@@ -634,6 +635,8 @@ impl ClayView {
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
             }
+            "filter" => self.toggle_filter(window, cx),
+            "search" => self.toggle_search(window, cx),
             "logout" => {
                 let fx = self.session.core.logout();
                 let rest = self.session.apply(fx);

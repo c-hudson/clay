@@ -254,6 +254,8 @@ pub struct ClientCore {
     /// An operator paused this client (`/remote pause`).
     pub paused: bool,
     pub visible: bool,
+    /// The ASCII splash shown before there's any world (multiuser, before connecting).
+    pub splash_lines: Vec<String>,
     view: Option<(usize, usize)>,
     /// World name -> index, for the worlds listed in this connection's `resume`.
     resume_sent: HashMap<String, usize>,
@@ -295,6 +297,7 @@ impl ClientCore {
             actions: Vec::new(),
             activity: 0,
             paused: false,
+            splash_lines: Vec::new(),
             visible: true,
             view: None,
             resume_sent: HashMap::new(),
@@ -473,6 +476,13 @@ impl ClientCore {
         if index < self.worlds.len() && index != self.current {
             let previous = self.current;
             self.current = index;
+            // A world that has had output since its splash shows the output (app.js
+            // switchWorldLocal).
+            if let Some(w) = self.worlds.get_mut(index) {
+                if w.showing_splash && w.was_connected && !w.lines.is_empty() {
+                    w.showing_splash = false;
+                }
+            }
             self.claim_locally(index, now);
             if self.is_online() {
                 self.send(WsMessage::MarkWorldSeen { world_index: index, previous_world_index: Some(previous) });
@@ -696,8 +706,9 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, .. } => {
                 self.actions = actions;
+                self.splash_lines = splash_lines;
                 self.on_initial_state(worlds, settings, current_world_index, your_display_id, now);
                 for entry in tf_status {
                     if let Some(w) = self.worlds.get_mut(entry.world_index) {
@@ -777,6 +788,7 @@ impl ClientCore {
             }
             WsMessage::WorldFlushed { world_index } => {
                 if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.showing_splash = false;
                     w.lines.clear();
                     w.partial.clear();
                     w.touch();
@@ -1158,6 +1170,7 @@ impl ClientCore {
         }
         if d.flush {
             let w = &mut self.worlds[d.world_index];
+            w.showing_splash = false;
             w.lines.clear();
             w.seen.clear();
             w.partial.clear();

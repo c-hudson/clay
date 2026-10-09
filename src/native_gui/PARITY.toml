@@ -2383,41 +2383,41 @@ note = ""
 id = "ui:output.selection"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "mouse selection, double-click word, Ctrl+C copy (prefixes included, divider excluded)"
-note = ""
+note = "drag, double-click word, triple-click line; Ctrl/Cmd+C; Linux primary selection; selection colour is the theme's selection_bg"
 
 [[item]]
 id = "ui:output.links"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "link hover style; click opens the system browser"
-note = ""
+note = "brightness(1.3) on hover, pointer cursor; a click (not a drag) opens it with the system browser"
 
 [[item]]
 id = "ui:output.context-menu"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "right-click: Copy, Debug Selection (raw text with <esc>, modal with Copy/Close)"
-note = "webview_gui.rs context menu"
+note = "Copy and Debug Selection, styled like the app's other menus"
 
 [[item]]
 id = "ui:output.textdiv"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "TF %textdiv divider (on/always/clear, textdiv_str)"
-note = "arriveTextdiv, console_divider"
+note = "on/always/clear; hidden while Find filters; never copied"
 
 [[item]]
 id = "ui:output.splash"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "splash (logo + two lines, centred) while showing_splash, cleared as the web does"
-note = ""
+note = "logo + two lines while showing_splash (cleared on flush/WorldFlushed/switch to a world with output); ASCII splash_lines before any world"
 
 [[item]]
 id = "ui:output.redraw"
@@ -2431,41 +2431,41 @@ note = ""
 id = "ui:output.filter"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "F4 Find popup: show only matching lines (contains / wildcards), Esc-L reopen with last text"
-note = ""
+note = "F4 / menu / tile; Esc-L toggle_limit reopens with the last text"
 
 [[item]]
 id = "ui:output.search"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "F5 Search History popup: cut output at the match, Enter = older, (i/n)"
-note = ""
+note = "F5 / menu; Enter = older, (n/m), cut at the match"
 
 [[item]]
 id = "ui:output.font"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "font_name, size 7-20, weight, letter/word spacing applied to output"
-note = ""
+note = "font_name (installed fonts, monospace), web_font_weight, letter and word spacing (letter spacing on all text: B16)"
 
 [[item]]
 id = "ui:output.wrap"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "wrapspace hanging indent and wrap_columns cap from settings"
-note = ""
+note = "wrapspace hanging indent, wrap_columns cap"
 
 [[item]]
 id = "ui:output.scrollbar"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "thin overlay scroll thumb that fades after scrolling"
-note = "webview_gui.rs thumb"
+note = "5px translucent thumb, 1.5s then a 0.3s fade, on any move (as the GUI's)"
 
 [[item]]
 id = "ui:output.grep"

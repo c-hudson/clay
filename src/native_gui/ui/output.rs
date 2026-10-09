@@ -37,8 +37,10 @@ use super::ink;
 use crate::native_gui::core::style::{Cell, DiscordEmoji, Rgb, Run, StyledLine};
 use crate::native_gui::core::wrap::wrap_rows;
 
-/// `#output-container { padding: 4px }`.
-const PADDING: f32 = 4.0;
+/// The GUI's `#output-container { padding: 2px 4px }` (webview_gui.rs's override of
+/// style.css's 4px).
+const PAD_X: f32 = 4.0;
+const PAD_Y: f32 = 2.0;
 
 pub fn hsla(c: Rgb) -> Hsla {
     Rgba { r: c[0] as f32 / 255.0, g: c[1] as f32 / 255.0, b: c[2] as f32 / 255.0, a: 1.0 }.into()
@@ -57,9 +59,37 @@ pub struct OutputSnapshot {
     pub fonts: Fonts,
     /// wrapspace: hanging indent of continuation rows, in columns.
     pub wrapspace: usize,
+    /// TF's %wrapsize (`wrap_columns`): rows wrap at this many columns rather than the
+    /// edge; 0 is the edge.
+    pub wrap_columns: usize,
+    /// `web_font_letter_spacing` / `web_font_word_spacing`, in pixels.
+    pub letter_spacing: f32,
+    pub word_spacing: f32,
     /// Changes whenever the same line would lay out differently (styling, show_tags).
     pub style_epoch: u64,
     pub scroll: ScrollHandle,
+    /// The selected bytes of each visible line that has any.
+    pub selection: HashMap<u64, Range<usize>>,
+    pub selection_bg: Rgb,
+    /// The link under the mouse: (line, bytes), drawn brighter (`.output-link:hover`).
+    pub hover_link: Option<(u64, Range<usize>)>,
+}
+
+/// One painted row, for finding what's under the mouse.
+#[derive(Clone, Debug, Default)]
+pub struct HitRow {
+    pub id: u64,
+    pub top: f32,
+    /// Each character boundary in the row (byte offset in the line, window x), in order,
+    /// the row's end included.
+    pub stops: Vec<(usize, f32)>,
+}
+
+/// A place in the output: a line and a byte offset in its displayed text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pos {
+    pub id: u64,
+    pub byte: usize,
 }
 
 /// Where the view is. The window moves it (keys, wheel, more-mode); the layout resolves
@@ -83,13 +113,35 @@ pub struct Scroll {
     /// view costs a layout only once per line.
     rows_cache: (u32, u32, u64),
     rows: HashMap<u64, usize>,
+    /// After the last layout: the rows painted, top to bottom, and their height.
+    pub hits: Vec<HitRow>,
+    pub row_h: f32,
+    /// Where the view was (top, rows below, rows in all), and when that last changed:
+    /// the scroll thumb shows for a moment after any move.
+    pos_key: Option<PosKey>,
+    moved_at: Option<Instant>,
 }
 
 pub type ScrollHandle = Rc<RefCell<Scroll>>;
 
+/// Where the view is: the top row (`None` on the bottom), rows below, rows in all.
+type PosKey = (Option<(u64, usize)>, usize, usize);
+
 impl Default for Scroll {
     fn default() -> Self {
-        Scroll { follow: true, top: None, pending: 0, rows_below: 0, view_rows: 24, rows_cache: (0, 0, 0), rows: HashMap::new() }
+        Scroll {
+            follow: true,
+            top: None,
+            pending: 0,
+            rows_below: 0,
+            view_rows: 24,
+            rows_cache: (0, 0, 0),
+            rows: HashMap::new(),
+            hits: Vec::new(),
+            row_h: 16.0,
+            pos_key: None,
+            moved_at: None,
+        }
     }
 }
 
@@ -108,6 +160,30 @@ impl Scroll {
 
     pub fn at_bottom(&self) -> bool {
         self.follow || self.rows_below == 0
+    }
+
+    /// What's under window point (x, y), as of the last frame: the nearest character
+    /// boundary on the row there. Above the first row is its start, below the last its
+    /// end; `None` when nothing is shown.
+    pub fn hit(&self, x: f32, y: f32) -> Option<Pos> {
+        let first = self.hits.first()?;
+        let last = self.hits.last()?;
+        let row = if y < first.top {
+            return first.stops.first().map(|&(b, _)| Pos { id: first.id, byte: b });
+        } else if y >= last.top + self.row_h {
+            return last.stops.last().map(|&(b, _)| Pos { id: last.id, byte: b });
+        } else {
+            self.hits.iter().rev().find(|r| y >= r.top).unwrap_or(first)
+        };
+        let k = row.stops.windows(2).position(|w| x < (w[0].1 + w[1].1) / 2.0).unwrap_or(row.stops.len().saturating_sub(1));
+        row.stops.get(k).map(|&(b, _)| Pos { id: row.id, byte: b })
+    }
+
+    /// The byte under window point (x, y), if it's on a character (for links).
+    pub fn byte_at(&self, x: f32, y: f32) -> Option<Pos> {
+        let row = self.hits.iter().find(|r| y >= r.top && y < r.top + self.row_h)?;
+        let k = row.stops.windows(2).position(|w| x >= w[0].1 && x < w[1].1)?;
+        Some(Pos { id: row.id, byte: row.stops[k].0 })
     }
 }
 
@@ -150,10 +226,19 @@ pub struct Prepared {
     lines: Vec<LaidLine>,
     rows: Vec<VisibleRow>,
     content: Bounds<Pixels>,
+    /// Each laid-out line's id, parallel to `lines`.
+    ids: Vec<u64>,
     /// The bundled faces' font ids, by [`bundled_index`]: glyphs whose outlines `ink` can
     /// read.
     bundled: [FontId; 4],
+    /// The scroll thumb: top, height and opacity.
+    thumb: Option<(f32, f32, f32)>,
 }
+
+/// The GUI's scroll thumb (webview_gui.rs `.clay-scrollbar`): shown on any scroll, then
+/// faded out over 0.3 s once 1.5 s have passed.
+const THUMB_SHOWN: f32 = 1.5;
+const THUMB_FADE: f32 = 0.3;
 
 pub fn output_view(snapshot: OutputSnapshot) -> impl IntoElement {
     canvas(move |bounds, window, cx| prepare(snapshot, bounds, window, cx), paint).size_full()
@@ -187,6 +272,13 @@ fn text_runs(line: &StyledLine, fonts: &Fonts, window: &Window) -> Vec<TextRun> 
         let seg = &line.text[at..at + run.len];
         for g in seg.graphemes(true) {
             let mut class = class_of(g);
+            // The user's font comes first for anything it covers that isn't an emoji.
+            if class != FontClass::Emoji && fonts.user.is_some() {
+                let user = fonts.font(FontClass::User, false, false);
+                if g.chars().all(|c| is_invisible(c) || covers(window, &user, c)) {
+                    class = FontClass::User;
+                }
+            }
             if class == FontClass::Text {
                 let text_font = fonts.font(FontClass::Text, false, false);
                 let primary = fonts.font(FontClass::Primary, false, false);
@@ -275,6 +367,18 @@ fn lay_out(styled: Arc<StyledLine>, snapshot: &OutputSnapshot, m: &Metrics, widt
         }
     }
 
+    // Letter spacing goes after each cluster (the last character of each), word spacing
+    // after each space; neither for cells and emoji, as `#output span` has none there.
+    let spaced = snapshot.letter_spacing != 0.0 || snapshot.word_spacing != 0.0;
+    let mut cluster_end = vec![false; n];
+    if snapshot.letter_spacing != 0.0 {
+        for (i, g) in text.grapheme_indices(true) {
+            if let Some((o, _)) = g.char_indices().last() {
+                cluster_end[i + o] = true;
+            }
+        }
+    }
+
     // Positions in logical order: cells and emoji as above, tabs to the next
     // eight-column stop, invisible characters nothing.
     let tab = TAB_COLUMNS * m.ch;
@@ -290,6 +394,10 @@ fn lay_out(styled: Arc<StyledLine>, snapshot: &OutputSnapshot, m: &Metrics, widt
             tab - (cur % tab)
         } else if is_invisible(c) {
             0.0
+        } else if spaced {
+            advance[i]
+                + if cluster_end[i] { snapshot.letter_spacing } else { 0.0 }
+                + if c == ' ' || c == '\u{a0}' { snapshot.word_spacing } else { 0.0 }
         } else {
             advance[i]
         };
@@ -301,6 +409,9 @@ fn lay_out(styled: Arc<StyledLine>, snapshot: &OutputSnapshot, m: &Metrics, widt
     x[n] = cur;
 
     let indent = snapshot.wrapspace as f32 * m.ch;
+    // `max-width: (wrap-columns - wrapspace) ch` plus the wrapspace padding: rows are at
+    // most wrap-columns wide.
+    let width = if snapshot.wrap_columns > 0 { width.min(snapshot.wrap_columns as f32 * m.ch) } else { width };
     let rows = wrap_rows(text, &styled.breaks, width, indent, &|i| x[i]);
     LaidLine { styled, layout, text_runs, x, cluster_origin, rows, no_glyph, rtl }
 }
@@ -410,7 +521,7 @@ fn sub_runs(runs: &[TextRun], range: &Range<usize>) -> Vec<TextRun> {
 fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) -> Prepared {
     let font_size = px(snapshot.font_size);
     let ts = window.text_system();
-    let primary = ts.resolve_font(&snapshot.fonts.font(FontClass::Primary, false, false));
+    let primary = ts.resolve_font(&snapshot.fonts.font(snapshot.fonts.base(), false, false));
     let metrics = Metrics {
         font_size,
         row: snapshot.font_size,
@@ -421,8 +532,8 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     };
 
     let content = Bounds::new(
-        point(bounds.origin.x + px(PADDING), bounds.origin.y + px(PADDING)),
-        size(bounds.size.width - px(2.0 * PADDING), bounds.size.height - px(2.0 * PADDING)),
+        point(bounds.origin.x + px(PAD_X), bounds.origin.y + px(PAD_Y)),
+        size(bounds.size.width - px(2.0 * PAD_X), bounds.size.height - px(2.0 * PAD_Y)),
     );
     let width = f32::from(content.size.width).max(metrics.ch);
     let height = f32::from(content.size.height);
@@ -471,6 +582,29 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     }
     st.rows_below = below;
     st.view_rows = view_rows;
+    // Rows in all (lines not laid out yet count one each), for the thumb.
+    let total: usize = snapshot.lines.iter().map(|(id, _)| st.rows.get(id).copied().unwrap_or(1)).sum();
+    let key = (st.top, below, total);
+    let now = Instant::now();
+    if st.pos_key.is_some_and(|k| k != key) {
+        st.moved_at = Some(now);
+    }
+    st.pos_key = Some(key);
+    let thumb = st.moved_at.and_then(|at| {
+        let t = now.saturating_duration_since(at).as_secs_f32();
+        let opacity = if t < THUMB_SHOWN { 1.0 } else { 1.0 - (t - THUMB_SHOWN) / THUMB_FADE };
+        if opacity <= 0.0 || total <= view_rows {
+            return None;
+        }
+        // Wake for the fade.
+        let next = if t < THUMB_SHOWN { at + std::time::Duration::from_secs_f32(THUMB_SHOWN) } else { now + std::time::Duration::from_millis(16) };
+        emoji::wake_at(next);
+        let h = f32::from(bounds.size.height);
+        let thumb_h = (view_rows as f32 / total as f32 * h).max(20.0);
+        let above = total.saturating_sub(below + view_rows);
+        let ratio = above as f32 / (total - view_rows) as f32;
+        Some((f32::from(bounds.origin.y) + ratio.clamp(0.0, 1.0) * (h - thumb_h), thumb_h, opacity))
+    });
     drop(st);
 
     // The visible rows, top to bottom.
@@ -534,12 +668,35 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         None => {}
     }
     let lines: Vec<LaidLine> = order.iter().map(|i| laid.remove(i).expect("laid out")).collect();
+    let ids: Vec<u64> = order.iter().map(|&i| snapshot.lines[i].0).collect();
+
+    // What each painted row holds, for the mouse.
+    let indent = snapshot.wrapspace as f32 * metrics.ch;
+    let hits = rows
+        .iter()
+        .map(|vr| {
+            let line = &lines[vr.line];
+            let range = line.rows[vr.row].clone();
+            let left = f32::from(content.origin.x) + if vr.row > 0 { indent } else { 0.0 };
+            let x0 = line.x[range.start];
+            let text = &line.styled.text;
+            let mut stops: Vec<(usize, f32)> =
+                text[range.clone()].char_indices().map(|(o, _)| (range.start + o, left + line.x[range.start + o] - x0)).collect();
+            stops.push((range.end, left + line.x[range.end] - x0));
+            HitRow { id: ids[vr.line], top: vr.top, stops }
+        })
+        .collect();
+    {
+        let mut st = scroll.borrow_mut();
+        st.hits = hits;
+        st.row_h = metrics.row;
+    }
 
     let ts = window.text_system();
     let bundled = [(false, false), (true, false), (false, true), (true, true)]
         .map(|(b, i)| ts.resolve_font(&snapshot.fonts.font(FontClass::Primary, b, i)));
     debug_assert!((0..4).all(|k| bundled_index(k & 1 == 1, k & 2 == 2) == k));
-    Prepared { snapshot, metrics, lines, rows, content, bundled }
+    Prepared { snapshot, metrics, lines, rows, content, ids, bundled, thumb }
 }
 
 fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App) {
@@ -590,6 +747,23 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 }
             }
 
+            // The selection, over the backgrounds and under the text. A selection that
+            // takes in the line's end shows its newline as one more column.
+            if let Some(sel) = p.snapshot.selection.get(&p.ids[vr.line]) {
+                let n = line.styled.text.len();
+                let last_row = vr.row + 1 == line.rows.len();
+                let (s, e) = (sel.start.max(range.start), sel.end.min(range.end));
+                let newline = last_row && sel.end > n && sel.start <= n;
+                if s < e || newline {
+                    let sx = left + line.x[s.min(range.end)] - x0;
+                    let ex = left + line.x[e.max(s).min(range.end)] - x0 + if newline { m.ch } else { 0.0 };
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(sx), px(vr.top)), size(px(ex - sx), px(m.row))),
+                        hsla(p.snapshot.selection_bg),
+                    ));
+                }
+            }
+
             // Glyphs, noting where they cross an underline.
             let mut style_ends: Vec<(usize, Rgb, bool, bool)> = Vec::new();
             let mut at = 0;
@@ -601,7 +775,12 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
             let style_at = |i: usize| {
                 style_ends.iter().find(|(end, ..)| i < *end).map(|&(_, c, u, b)| (c, u, b)).unwrap_or(([255, 255, 255], false, false))
             };
-            let fg_at = |i: usize| style_at(i).0;
+            let hover = p.snapshot.hover_link.as_ref().filter(|(id, _)| *id == p.ids[vr.line]).map(|(_, r)| r.clone());
+            let fg_at = |i: usize| match &hover {
+                // `filter: brightness(1.3)`.
+                Some(r) if r.contains(&i) => style_at(i).0.map(|c| (c as f32 * 1.3).min(255.0) as u8),
+                _ => style_at(i).0,
+            };
             let text = &line.styled.text;
             // Blinking text is hidden for the last quarter of each second (style.css).
             let skip = |i: usize| {
@@ -689,7 +868,7 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                         window.paint_underline(
                             point(px(a), px(baseline + ul.offset)),
                             px(b - a),
-                            &UnderlineStyle { thickness: px(ul.thickness), color: Some(hsla(run.fg)), wavy: false },
+                            &UnderlineStyle { thickness: px(ul.thickness), color: Some(hsla(fg_at(s))), wavy: false },
                         );
                     }
                 }
@@ -763,6 +942,12 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
         }
         if let Some(t) = next_frame {
             emoji::wake_at(t);
+        }
+
+        // The scroll thumb: 5px wide, 1px from the right edge, translucent white.
+        if let Some((top, h, opacity)) = p.thumb {
+            let b = Bounds::new(point(bounds.origin.x + bounds.size.width - px(6.0), px(top)), size(px(5.0), px(h)));
+            window.paint_quad(fill(b, hsla_alpha([255, 255, 255], 0.25 * opacity)).corner_radii(px(3.0)));
         }
     });
 }
@@ -931,6 +1116,24 @@ mod tests {
 
     fn plan(follow: bool, anchored: Option<(usize, usize)>, pending: isize, view: usize) -> ViewPlan {
         plan_view(10, &mut rows, follow, anchored, pending, view)
+    }
+
+    #[test]
+    fn the_mouse_finds_the_nearest_character_boundary() {
+        let mut s = Scroll::default();
+        s.row_h = 10.0;
+        s.hits = vec![
+            HitRow { id: 1, top: 0.0, stops: vec![(0, 4.0), (1, 12.0), (2, 20.0)] },
+            HitRow { id: 2, top: 10.0, stops: vec![(0, 4.0), (3, 20.0), (4, 28.0)] },
+        ];
+        assert_eq!(s.hit(9.0, 5.0), Some(Pos { id: 1, byte: 1 }));
+        assert_eq!(s.hit(7.0, 5.0), Some(Pos { id: 1, byte: 0 }));
+        assert_eq!(s.hit(500.0, 5.0), Some(Pos { id: 1, byte: 2 }), "past the end: the end");
+        assert_eq!(s.hit(13.0, 15.0), Some(Pos { id: 2, byte: 3 }), "a multi-byte character is one step");
+        assert_eq!(s.hit(9.0, -3.0), Some(Pos { id: 1, byte: 0 }), "above: the start");
+        assert_eq!(s.hit(9.0, 99.0), Some(Pos { id: 2, byte: 4 }), "below: the end");
+        assert_eq!(s.byte_at(13.0, 15.0), Some(Pos { id: 2, byte: 0 }));
+        assert_eq!(s.byte_at(30.0, 15.0), None, "past the text is no character");
     }
 
     #[test]

@@ -5,11 +5,15 @@ pub mod assets;
 mod bars;
 mod chrome;
 pub mod emoji;
+mod find;
 pub mod fonts;
 pub mod ink;
 mod keymap;
 mod more;
 pub mod output;
+mod select;
+mod textdiv;
+mod theme_bridge;
 #[cfg(feature = "native-gui-snapshot")]
 pub mod snapshot;
 
@@ -20,7 +24,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Render, ScrollWheelEvent, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
     prelude::*, px, size,
 };
@@ -58,6 +62,9 @@ pub struct ClayView {
     show_tags: bool,
     font_size: f32,
     wrapspace: usize,
+    wrap_columns: usize,
+    letter_spacing: f32,
+    word_spacing: f32,
     /// Decorated lines by `Line::id` (with whether they carried ▶), valid while the
     /// style inputs are unchanged.
     styled: HashMap<u64, (bool, Arc<StyledLine>)>,
@@ -81,6 +88,11 @@ pub struct ClayView {
     /// The login screen has put the cursor in its first empty field.
     login_focused: bool,
     chrome: Chrome,
+    select: select::SelectState,
+    textdiv: textdiv::Textdiv,
+    find: find::FindState,
+    /// The theme gpui-component's widgets were last given.
+    bridged_theme: String,
 }
 
 impl ClayView {
@@ -119,6 +131,9 @@ impl ClayView {
             show_tags: false,
             font_size: DEFAULT_FONT_SIZE,
             wrapspace: 0,
+            wrap_columns: 0,
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
             styled: HashMap::new(),
             decor: DecorOptions { show_tags: false, new_markers: false, temp_convert: false, accent: [0, 0, 0], hover_bg: [0, 0, 0] },
             matcher: ActionMatcher::default(),
@@ -134,8 +149,14 @@ impl ClayView {
             login: LoginForm { username, password },
             login_focused: false,
             chrome: Chrome::new(tokens),
+            select: select::SelectState::default(),
+            textdiv: textdiv::Textdiv::default(),
+            find: find::FindState::new(window, cx),
+            bridged_theme: String::new(),
         };
         view.apply_settings();
+        theme_bridge::apply(&view.theme, &view.fonts, cx);
+        view.bridged_theme = view.theme_json.clone();
         view
     }
 
@@ -160,6 +181,10 @@ impl ClayView {
         }
         if changed {
             self.apply_settings();
+            if self.bridged_theme != self.theme_json {
+                theme_bridge::apply(&self.theme, &self.fonts, cx);
+                self.bridged_theme = self.theme_json.clone();
+            }
             self.follow_world();
             cx.notify();
         }
@@ -169,7 +194,15 @@ impl ClayView {
     /// through more-mode.
     fn follow_world(&mut self) {
         let current = self.session.core.current_world().map(|_| self.session.core.current);
+        self.textdiv.note_worlds(&self.session.core.worlds);
         if current != self.shown_world {
+            if let Some(old) = self.shown_world.and_then(|i| self.session.core.worlds.get(i)) {
+                self.textdiv.leave(old);
+            }
+            if let Some(new) = self.session.core.current_world() {
+                let mode = self.session.core.settings.as_ref().map_or("", |s| s.textdiv.as_str());
+                self.textdiv.arrive(new, mode);
+            }
             self.shown_world = current;
             self.more.reset(self.session.core.current_world());
             self.scroll.borrow_mut().follow_bottom();
@@ -200,6 +233,21 @@ impl ClayView {
 
     /// A keystroke, resolved as every Clay client resolves it.
     fn key_down(&mut self, ks: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // Any key closes the right-click menu (as the GUI's does); Escape closes the
+        // Debug Selection dialog.
+        if self.select.menu.take().is_some() {
+            cx.notify();
+        }
+        if self.select.debug.is_some() && ks.key == "escape" {
+            self.select.debug = None;
+            cx.notify();
+            return true;
+        }
+        // Copy wins over a binding while there's a selection (the browser's order).
+        let m = &ks.modifiers;
+        if ks.key == "c" && (m.platform || (m.control && !m.alt)) && self.copy_selection(cx) {
+            return true;
+        }
         let Some((code, mods)) = keymap::console_key(ks) else { return false };
         match self.keys.resolve(code, mods, Instant::now()) {
             Resolved::Pending => true,
@@ -238,6 +286,7 @@ impl ClayView {
         if matches!(self.session.core.status(), Status::Reconnecting { .. }) {
             cx.notify(); // the countdown
         }
+        self.drag_scroll(cx);
         let clock = chrome::clock_text(self.session.core.settings.as_ref().map_or("", |s| s.clock_format.as_str()));
         if clock != self.chrome.clock {
             self.chrome.clock = clock;
@@ -270,6 +319,13 @@ impl ClayView {
         if s.web_font_size_desktop > 0.0 {
             self.font_size = s.web_font_size_desktop;
         }
+        // Font and wrapping settings change every line's layout.
+        let layout = (s.wrapspace as usize, s.wrap_columns, s.web_font_letter_spacing, s.web_font_word_spacing);
+        if layout != (self.wrapspace, self.wrap_columns, self.letter_spacing, self.word_spacing) {
+            (self.wrapspace, self.wrap_columns, self.letter_spacing, self.word_spacing) = layout;
+            restyle = true;
+        }
+        restyle |= self.fonts.set_user(&s.font_name, s.web_font_weight);
         let tokens = Tokens::new(&self.theme, s.gui_theme == "light");
         if tokens != self.chrome.tokens {
             self.chrome.tokens = tokens;
@@ -307,17 +363,43 @@ impl ClayView {
 
     /// The current world's lines as the output shows them, with their ids.
     fn visible_lines(&mut self) -> Vec<(u64, Arc<StyledLine>)> {
-        let Some(world) = self.session.core.current_world() else { return Vec::new() };
+        let Some(world) = self.session.core.current_world() else {
+            // No world yet (multiuser, before connecting): the ASCII splash.
+            let lines: Vec<(u64, Arc<StyledLine>)> = self
+                .session
+                .core
+                .splash_lines
+                .iter()
+                .enumerate()
+                .map(|(k, l)| (textdiv::DIVIDER_ID / 2 + k as u64, Arc::new(crate::native_gui::core::style::style_line(l, &self.palette, &self.style))))
+                .collect();
+            self.note_visible(lines.iter().map(|(id, _)| *id).collect());
+            return lines;
+        };
         let me = self.session.core.display_id;
         let mut out = Vec::with_capacity(world.lines.len());
+        let mut seqs = Vec::with_capacity(world.lines.len());
+        let filter = self.find.filtering().map(str::to_string);
+        let cut = self.find.search_cut();
         for line in &world.lines {
             if (line.gagged && !self.show_tags) || hidden_line(&line.text) || self.more.is_held(line.id) {
+                if Some(line.id) == cut {
+                    break;
+                }
                 continue;
             }
+            // F4: only the lines containing Find's text.
+            if filter.as_deref().is_some_and(|f| !find::matches_filter(&find::plain(&line.text), f)) {
+                continue;
+            }
+            seqs.push(line.seq.filter(|_| !line.from_archive));
             let is_new = me != 0 && line.display_id == Some(me);
             if let Some((was_new, styled)) = self.styled.get(&line.id) {
                 if *was_new == is_new {
                     out.push((line.id, styled.clone()));
+                    if Some(line.id) == cut {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -334,11 +416,31 @@ impl ClayView {
             let styled = Arc::new(decorate(&facts, &self.palette, &self.style, &self.decor));
             self.styled.insert(line.id, (is_new, styled.clone()));
             out.push((line.id, styled));
+            if Some(line.id) == cut {
+                // F5: the output ends at the match.
+                break;
+            }
         }
         if self.styled.len() > 2 * out.len() + 1024 {
             let live: std::collections::HashSet<u64> = world.lines.iter().map(|l| l.id).collect();
             self.styled.retain(|id, _| live.contains(id));
         }
+        // TF's %textdiv divider for this visit (not in a filtered view).
+        if let Some(at) = self.textdiv.place(&seqs).filter(|_| filter.is_none()) {
+            let settings = self.session.core.settings.as_ref();
+            let rows: Vec<(u64, Arc<StyledLine>)> = match self.textdiv.visit.as_ref().map(|v| v.1.as_str()) {
+                Some("clear") => {
+                    let n = self.scroll.borrow().view_rows.max(1) as u64;
+                    (0..n).map(|k| (textdiv::DIVIDER_ID + k, Arc::new(StyledLine::default()))).collect()
+                }
+                _ => {
+                    let text = settings.map_or("=====", |s| s.textdiv_str.as_str());
+                    vec![(textdiv::DIVIDER_ID, Arc::new(crate::native_gui::core::style::style_line(text, &self.palette, &self.style)))]
+                }
+            };
+            out.splice(at..at, rows);
+        }
+        self.note_visible(out.iter().map(|(id, _)| *id).collect());
         out
     }
 
@@ -367,6 +469,24 @@ impl ClayView {
         let cols = ((f32::from(vp.width) - 8.0) / (self.font_size * 0.6)).floor().max(1.0) as usize;
         let fx = self.session.core.set_view(rows, cols);
         let _ = self.session.apply(fx);
+    }
+
+    /// The GUI's splash (app.js `renderOutput` in WEBVIEW_MODE): the logo and two lines,
+    /// centred, in the output's font.
+    fn splash(&self) -> gpui::Div {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(5.0))
+            .font_family(self.fonts.primary.clone())
+            .text_size(px(self.font_size))
+            .line_height(gpui::relative(1.0))
+            .child(gpui::img(assets::LOGO).size(px(200.0)))
+            .child(div().italic().text_color(hsla([0xff, 0x87, 0xff])).child("A 90dies mud client written today"))
+            .child(div().text_color(hsla([0x88, 0x88, 0x88])).child("/help for how to use clay"))
     }
 
     fn panel(&self) -> gpui::Div {
@@ -445,6 +565,7 @@ impl Render for ClayView {
         let body = match self.session.core.status().clone() {
             Status::NeedLogin { multiuser, error } => self.login_screen(multiuser, error, cx).into_any_element(),
             Status::CertMismatch(m) => self.mismatch_screen(&m.host, &m.old_fingerprint, &m.new_fingerprint, cx).into_any_element(),
+            _ if self.session.core.current_world().is_some_and(|w| w.showing_splash) => self.splash().into_any_element(),
             _ => {
                 let snapshot = OutputSnapshot {
                     lines: self.visible_lines(),
@@ -452,10 +573,26 @@ impl Render for ClayView {
                     font_size: self.font_size,
                     fonts: self.fonts.clone(),
                     wrapspace: self.wrapspace,
+                    wrap_columns: self.wrap_columns,
+                    letter_spacing: self.letter_spacing,
+                    word_spacing: self.word_spacing,
                     style_epoch: self.style_epoch,
                     scroll: self.scroll.clone(),
+                    selection: self.selection_ranges(),
+                    selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],
+                    hover_link: self.select.hover_link.clone(),
                 };
-                output_view(snapshot).into_any_element()
+                let link = self.select.hover_link.is_some();
+                div()
+                    .id("output")
+                    .size_full()
+                    .map(|d| if link { d.cursor_pointer() } else { d.cursor_text() })
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.output_mouse_down(ev, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.output_mouse_down(ev, cx)))
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| this.output_mouse_move(ev, cx)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _w, cx| this.output_mouse_up(ev, cx)))
+                    .child(output_view(snapshot))
+                    .into_any_element()
             }
         };
         let icon_bar = self.icon_bar(cx);
@@ -463,6 +600,9 @@ impl Render for ClayView {
         let mut tabs = self.tabs_ribbon(cx);
         let stats = self.stats_panel(cx);
         let status_bar = self.status_bar(window, cx);
+        let context_menu = self.context_menu(cx);
+        let find_popups = self.find_popups(window, cx);
+        let debug_dialog = self.debug_dialog(window, cx);
         div()
             .track_focus(&self.focus)
             .size_full()
@@ -470,6 +610,10 @@ impl Render for ClayView {
             .flex_col()
             .bg(hsla(self.palette.bg))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // A text field (login, Find, Search) has the keys while it's focused.
+                if !this.focus.is_focused(window) {
+                    return;
+                }
                 if this.key_down(&ev.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
@@ -518,6 +662,9 @@ impl Render for ClayView {
             .children(stats)
             .children(tabs)
             .child(status_bar)
+            .children(find_popups)
+            .children(context_menu)
+            .children(debug_dialog)
     }
 }
 

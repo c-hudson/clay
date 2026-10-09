@@ -34,6 +34,13 @@ pub struct Fonts {
     pub emoji: SharedString,
     /// Nunito (bundled), for everything that isn't output.
     pub ui: SharedString,
+    /// The `font_name` setting, when it names a font installed here: it comes first, for
+    /// every cluster it covers (style.css: `'<name>', var(--mono)`).
+    pub user: Option<SharedString>,
+    /// `web_font_weight`: the weight of text that isn't bold.
+    pub weight: u16,
+    /// The fonts installed here, to check `font_name` against.
+    installed: std::sync::Arc<Vec<String>>,
 }
 
 /// Which font a grapheme cluster is drawn from.
@@ -45,19 +52,42 @@ pub enum FontClass {
     Text,
     /// The colour emoji font.
     Emoji,
+    /// The user's own font (`font_name`).
+    User,
 }
 
 impl Fonts {
+    /// The font the output's metrics (row baseline, `ch`) come from: the user's, if set.
+    pub fn base(&self) -> FontClass {
+        if self.user.is_some() { FontClass::User } else { FontClass::Primary }
+    }
+
+    /// Take the `font_name` and `web_font_weight` settings; whether anything changed.
+    pub fn set_user(&mut self, name: &str, weight: u16) -> bool {
+        let weight = if weight == 0 { 400 } else { weight.clamp(100, 900) };
+        let user: Option<SharedString> = match name.trim() {
+            "" => None,
+            // The web's own bundled font is the default stack.
+            n if n.eq_ignore_ascii_case("JetBrains Mono") => None,
+            n if n.eq_ignore_ascii_case("monospace") || n.eq_ignore_ascii_case("ui-monospace") => Some(system_monospace().into()),
+            n => self.installed.iter().find(|i| i.eq_ignore_ascii_case(n)).map(|i| i.clone().into()),
+        };
+        let changed = user != self.user || weight != self.weight;
+        self.user = user;
+        self.weight = weight;
+        changed
+    }
+
     pub fn font(&self, class: FontClass, bold: bool, italic: bool) -> Font {
         let family = match class {
             FontClass::Primary => self.primary.clone(),
             FontClass::Text => self.fallback.clone(),
             FontClass::Emoji => return font(self.emoji.clone()),
+            FontClass::User => self.user.clone().unwrap_or_else(|| self.primary.clone()),
         };
         let mut f = font(family);
-        if bold {
-            f.weight = FontWeight::BOLD;
-        }
+        // `.ansi-bold` is `font-weight: bold`, 700 whatever the base weight.
+        f.weight = if bold { FontWeight::BOLD } else { FontWeight(self.weight as f32) };
         if italic {
             f.style = FontStyle::Italic;
         }
@@ -138,7 +168,15 @@ pub fn load(cx: &mut App) -> Fonts {
         .find(|f| installed.iter().any(|i| i == *f))
         .map(|f| f.to_string())
         .unwrap_or_else(system_monospace);
-    Fonts { primary: PRIMARY_FAMILY.into(), fallback: fallback.into(), emoji: emoji_family().into(), ui: UI_FAMILY.into() }
+    Fonts {
+        primary: PRIMARY_FAMILY.into(),
+        fallback: fallback.into(),
+        emoji: emoji_family().into(),
+        ui: UI_FAMILY.into(),
+        user: None,
+        weight: 400,
+        installed: std::sync::Arc::new(installed),
+    }
 }
 
 /// The colour emoji font browsers use on this platform.

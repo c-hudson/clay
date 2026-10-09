@@ -20,12 +20,19 @@ pub fn icon(name: &str) -> SharedString {
     format!("clay/{name}.svg").into()
 }
 
+/// The splash logo (the repo's clay2.png, as the GUI's web assets serve it).
+pub const LOGO: &str = "clay/clay2.png";
+const LOGO_PNG: &[u8] = include_bytes!("../../../clay2.png");
+
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some((_, bytes)) = ICONS.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(*bytes)));
+        }
+        if path == LOGO {
+            return Ok(Some(Cow::Borrowed(LOGO_PNG)));
         }
         gpui_kit_assets::Assets.load(path)
     }

@@ -72,6 +72,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     Ok("worlds") => Some(super::chrome::MenuKind::Worlds),
                     _ => None,
                 };
+                window.focus(&view.focus.clone(), cx);
                 view
             })
         })
@@ -93,6 +94,67 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
             let _ = window.draw(app);
         })
         .expect("draw the frame again");
+    }
+    // CLAY_SNAPSHOT_INPUT: mouse and key events to replay before the capture, for
+    // checking selection, menus and dialogs, e.g. "down:40,60;move:300,90;up:300,90;key:ctrl-c".
+    if let Ok(script) = std::env::var("CLAY_SNAPSHOT_INPUT") {
+        let mut left_down = false;
+        for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let (verb, arg) = step.split_once(':').unwrap_or((step, ""));
+            let nums: Vec<f32> = arg.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+            let at = || gpui::point(px(nums.first().copied().unwrap_or(0.0)), px(nums.get(1).copied().unwrap_or(0.0)));
+            let mods = gpui::Modifiers::default();
+            let events: Vec<gpui::PlatformInput> = match verb {
+                "down" | "rdown" => {
+                    let button = if verb == "down" { gpui::MouseButton::Left } else { gpui::MouseButton::Right };
+                    left_down |= verb == "down";
+                    let click_count = nums.get(2).map_or(1, |n| *n as usize);
+                    vec![gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button, position: at(), modifiers: mods, click_count, first_mouse: false })]
+                }
+                "move" | "hover" => vec![gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position: at(),
+                    pressed_button: (verb == "move" && left_down).then_some(gpui::MouseButton::Left),
+                    modifiers: mods,
+                })],
+                "up" => {
+                    left_down = false;
+                    vec![gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button: gpui::MouseButton::Left, position: at(), modifiers: mods, click_count: 1 })]
+                }
+                "key" => match gpui::Keystroke::parse(arg) {
+                    Ok(keystroke) => vec![gpui::PlatformInput::KeyDown(gpui::KeyDownEvent { keystroke, is_held: false, prefer_character_input: false })],
+                    Err(e) => fail(&format!("bad key {arg}: {e}")),
+                },
+                "type" => {
+                    let text = arg.to_string();
+                    cx.update_window(window.into(), |root, w, app| {
+                        if let Ok(view) = root.downcast::<ClayView>() {
+                            view.update(app, |v, cx| v.type_into_find(&text, w, cx));
+                        }
+                    })
+                    .expect("type");
+                    Vec::new()
+                }
+                "wait" => {
+                    cx.advance_clock(Duration::from_millis(nums.first().copied().unwrap_or(0.0) as u64));
+                    Vec::new()
+                }
+                other => fail(&format!("unknown input step {other}")),
+            };
+            for ev in events {
+                cx.update_window(window.into(), |_, window, app| {
+                    let _ = window.dispatch_event(ev, app);
+                })
+                .expect("dispatch an event");
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, app| {
+                    let _ = window.draw(app);
+                })
+                .expect("draw after an event");
+            }
+        }
+        if let Some(text) = cx.update(|app| app.read_from_clipboard()).and_then(|c| c.text()) {
+            println!("snapshot-clipboard: {}", text.replace('\n', "\\n"));
+        }
     }
     match cx.capture_screenshot(window.into()) {
         Ok(image) => {
