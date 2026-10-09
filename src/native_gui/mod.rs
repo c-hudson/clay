@@ -116,17 +116,14 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
     if !std::env::args().any(|a| a == "--reload") {
         if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
             if e.kind() == std::io::ErrorKind::AddrInUse {
-                eprintln!("Clay is already running (port {port} is in use). Only one Clay runs at a time; to attach to it: clay --native-gui=127.0.0.1:{port}");
-            } else {
-                eprintln!("Clay failed to start: could not bind port {port}: {e}");
+                fail(format!("Clay is already running (port {port} is in use). Only one Clay runs at a time; to attach to it: clay --native-gui=127.0.0.1:{port}"));
             }
-            std::process::exit(1);
+            fail(format!("Clay failed to start: could not bind port {port}: {e}"));
         }
     }
     let mut random = [0u8; 32];
     if let Err(e) = getrandom::getrandom(&mut random) {
-        eprintln!("Clay failed to start: could not make a session password: {e}");
-        std::process::exit(1);
+        fail(format!("Clay failed to start: could not make a session password: {e}"));
     }
     let password = hex::encode(random);
     // The app's GUI channels (run_app_headless's API): kept open for the whole run.
@@ -149,12 +146,20 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
         false
     });
     if !ready {
-        eprintln!("Clay failed to start: its server did not come up on port {port} within 10 seconds.");
-        std::process::exit(1);
+        fail(format!("Clay failed to start: its server did not come up on port {port} within 10 seconds."));
     }
+    crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: Clay's server is up on port {port}"));
     LOCAL.store(true, std::sync::atomic::Ordering::Relaxed);
     let target = core::net::Target::parse(Some(&format!("127.0.0.1:{port}"))).expect("a loopback address");
     (target, password)
+}
+
+/// Starting Clay failed: said on the terminal and in debug.log, since a GUI started from
+/// the desktop (or by a /reload on Windows) has no terminal to say it on.
+fn fail(message: String) -> ! {
+    eprintln!("{message}");
+    crate::debug_log(true, &format!("native-gui: {message}"));
+    std::process::exit(1);
 }
 
 #[cfg(target_os = "macos")]
