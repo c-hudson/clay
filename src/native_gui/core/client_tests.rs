@@ -804,3 +804,67 @@ fn a_connection_given_up_on_is_reported_once_there_is_one_again() {
     h.msg(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false });
     assert!(!h.sent().iter().any(|m| matches!(m, WsMessage::ReportClientLifecycle { .. })));
 }
+
+fn mine(h: &H, w: usize) -> Vec<u64> {
+    let me = h.core.display_id;
+    h.core.worlds[w].lines.iter().filter(|l| l.display_id == Some(me)).filter_map(|l| l.seq).collect()
+}
+
+#[test]
+fn cached_lines_are_never_guessed_new() {
+    // The disk cache can't know what's new: that's the server's to say (ClaimedNew). Taken
+    // as unviewed, every cached line got a ▶ the moment its world was shown.
+    let mut h = H::password();
+    h.core.set_cache(vec![cached("A", 9, 0..5), cached("B", 3, 0..4)]);
+    h.connect_and_login();
+    h.initial(vec![world_msg(0, "A", 0..5, 9), world_msg(1, "B", 0..4, 3)]);
+    assert_eq!(h.texts(1), vec!["cached 0", "cached 1", "cached 2", "cached 3"], "B's cached buffer stands");
+    let _ = h.core.switch_world(1, h.now);
+    assert!(mine(&h, 1).is_empty(), "no ▶ guessed on cached lines: {:?}", mine(&h, 1));
+    // What the server grants still shows.
+    h.msg(WsMessage::ClaimedNew { world_index: 1, seqs: vec![3] });
+    assert_eq!(mine(&h, 1), vec![3]);
+}
+
+#[test]
+fn a_second_claim_keeps_the_first_guess_until_it_is_answered() {
+    let mut h = H::password();
+    let mut b = world_msg(1, "B", 0..4, 3);
+    for l in &mut b.output_lines_ts {
+        l.viewed = false;
+    }
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 9), b]);
+    // Into B (a guess), out, and back before the server has answered the first visit.
+    let _ = h.core.switch_world(1, h.now);
+    let _ = h.core.switch_world(0, h.now);
+    let _ = h.core.switch_world(1, h.now);
+    assert_eq!(mine(&h, 1), vec![0, 1, 2, 3], "guessed");
+    // Another viewer got there first: nothing was ours. The leaving released nothing on
+    // the server, so no ReleasedNew comes; this answer must take the guess back.
+    h.msg(WsMessage::ClaimedNew { world_index: 1, seqs: vec![] });
+    assert!(mine(&h, 1).is_empty(), "the first visit's answer withdraws the guess: {:?}", mine(&h, 1));
+}
+
+#[test]
+fn a_line_without_a_seq_is_never_guessed() {
+    // The server grants by seq: a guess on a line without one could never be withdrawn.
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..2, 3)]);
+    h.msg(WsMessage::ServerData {
+        archive_sourced: false,
+        world_index: 1,
+        data: "unnumbered\n".into(),
+        is_viewed: false,
+        ts: 1_000,
+        from_server: true,
+        seq: 0,
+        end_seq: None,
+        flush: false,
+        gagged: false,
+        highlight_colors: Vec::new(),
+    });
+    let _ = h.core.switch_world(1, h.now);
+    let me = h.core.display_id;
+    let unnumbered = h.core.worlds[1].lines.iter().find(|l| l.text.starts_with("unnumbered")).expect("the line");
+    assert_ne!(unnumbered.display_id, Some(me));
+}

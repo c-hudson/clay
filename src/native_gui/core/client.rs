@@ -398,6 +398,10 @@ impl ClientCore {
                 l.from_server = cl.from_server;
                 l.gagged = cl.gagged;
                 l.highlight = cl.highlight.clone();
+                // Shown before, and what's new is the server's to say (ClaimedNew): taken as
+                // unviewed, every cached line was guessed ▶ when its world was shown (app.js
+                // caches its lines whole, `viewed` and all, so its guesses stay right).
+                l.viewed = true;
                 l
             })
             .collect();
@@ -1672,17 +1676,21 @@ impl ClientCore {
     fn claim_locally(&mut self, index: usize, now: Instant) {
         let me = self.display_id;
         let Some(w) = self.worlds.get_mut(index) else { return };
-        let mut guessed = HashSet::new();
+        // A guess not yet answered stays: a second visit before the server has answered the
+        // first finds nothing new, and must not forget what the first guessed, or that
+        // answer can't take a wrong guess back. (Leaving the world doesn't either: the server
+        // releases only what it owned, so a wrong guess gets no ReleasedNew.)
+        let mut guessed: HashSet<u64> = w.claim.take().filter(|(_, at)| now.saturating_duration_since(*at) < CLAIM_TTL).map(|(g, _)| g).unwrap_or_default();
         for l in &mut w.lines {
             if l.viewed {
                 continue;
             }
             l.viewed = true;
-            if l.from_server && !l.from_archive {
+            // The server grants by seq, so only a line with one can be guessed: a guess on
+            // one without could never be withdrawn.
+            if let (true, false, Some(s)) = (l.from_server, l.from_archive, l.seq) {
                 l.display_id = Some(me);
-                if let Some(s) = l.seq {
-                    guessed.insert(s);
-                }
+                guessed.insert(s);
             }
         }
         w.claim = (!guessed.is_empty()).then_some((guessed, now));
