@@ -6,6 +6,7 @@
 
 pub mod actions;
 pub mod help;
+pub mod settings;
 pub mod worlds;
 
 use std::collections::HashMap;
@@ -20,7 +21,6 @@ use super::dialogs::{self, DialogEvent, Host};
 
 /// The kinds (app.js `openInPopupWindow`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Settings, Actions and Worlds open in phases 4c-4e.
 pub enum Kind {
     Settings,
     Help,
@@ -48,6 +48,8 @@ pub enum MainEvent {
     Actions,
     /// What the Worlds window shows changed.
     Worlds,
+    /// The settings changed.
+    Settings,
 }
 
 impl EventEmitter<MainEvent> for ClayView {}

@@ -685,6 +685,7 @@ impl ClayView {
             }
             "/menu" => self.later(|v, window, cx| v.open_surface("menu", window, cx), cx),
             "/help" => self.later(|v, window, cx| v.open_surface("help", window, cx), cx),
+            "/setup" | "/web" | "/font" => self.open_settings(super::windows::settings::Tab::from_name(&first[1..]), cx),
             "/worlds" | "/world" => {
                 let args: Vec<&str> = command.split_whitespace().skip(1).collect();
                 self.worlds_command(&args, cx);

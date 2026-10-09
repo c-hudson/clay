@@ -238,7 +238,15 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
             .expect("draw the window");
             handle
         }
-        None => window.into(),
+        None => {
+            // Events sent to another window can change this one (a font preview).
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, w, app| {
+                let _ = w.draw(app);
+            })
+            .expect("draw the main window");
+            window.into()
+        }
     };
     match cx.capture_screenshot(target) {
         Ok(image) => {

@@ -240,6 +240,7 @@ impl ClayView {
                 cx.emit(windows::MainEvent::Actions);
             }
             self.watch_worlds(cx);
+            self.watch_settings(cx);
             if self.bridged_theme != self.theme_json {
                 theme_bridge::apply(&self.theme, &self.fonts, cx);
                 self.bridged_theme = self.theme_json.clone();
@@ -465,7 +466,7 @@ impl ClayView {
 
     /// The server's display settings, whenever they change.
     fn apply_settings(&mut self) {
-        let Some(s) = self.session.core.settings.as_ref() else { return };
+        let Some(s) = self.surf.preview.as_ref().or(self.session.core.settings.as_ref()) else { return };
         self.keys.update(s);
         let mut restyle = false;
         if !s.theme_colors_json.is_empty() && s.theme_colors_json != self.theme_json {
@@ -490,7 +491,7 @@ impl ClayView {
             self.input.rows = (s.input_height as usize).clamp(1, 15);
         }
         self.spell_settings(spell_on, &dict);
-        let Some(s) = self.session.core.settings.as_ref() else { return };
+        let Some(s) = self.surf.preview.as_ref().or(self.session.core.settings.as_ref()) else { return };
         let tokens = Tokens::new(&self.theme, s.gui_theme == "light");
         if tokens != self.chrome.tokens {
             self.chrome.tokens = tokens;

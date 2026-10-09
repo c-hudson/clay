@@ -225,6 +225,8 @@ enum Phase {
 pub struct ClientCore {
     /// How many `InitialState`s have come (a new one means the worlds were sent afresh).
     pub initial_states: u64,
+    /// Bumped whenever the settings may have changed (Settings windows redraw on it).
+    pub settings_rev: u64,
     creds: Credentials,
     client_uid: String,
     client_version: String,
@@ -281,6 +283,7 @@ impl ClientCore {
     pub fn new(creds: Credentials, client_uid: String, now: Instant) -> Self {
         ClientCore {
             initial_states: 0,
+            settings_rev: 0,
             creds,
             client_uid,
             client_version: crate::VERSION.to_string(),
@@ -496,6 +499,15 @@ impl ClientCore {
             self.changed();
         }
         self.take()
+    }
+
+    /// The key was deleted (Settings' Modify Key → Delete): it shows as none.
+    pub fn forget_auth_key(&mut self) {
+        if let Some(s) = self.settings.as_mut() {
+            self.settings_rev = self.settings_rev.wrapping_add(1);
+            s.auth_key.clear();
+            self.changed();
+        }
     }
 
     /// A line this client shows itself, in the current world and never sent anywhere
@@ -805,6 +817,7 @@ impl ClientCore {
             WsMessage::ThemeCssVarsUpdated { colors_json, .. } => {
                 // A live theme edit (the theme editor): the colours as the settings carry them.
                 if let Some(s) = self.settings.as_mut() {
+                    self.settings_rev = self.settings_rev.wrapping_add(1);
                     if !colors_json.is_empty() && s.theme_colors_json != colors_json {
                         s.theme_colors_json = colors_json;
                         self.changed();
@@ -817,6 +830,7 @@ impl ClientCore {
             WsMessage::KeybindingsUpdated { bindings_json } => {
                 // The key table changed (the keybind editor): the window's keys follow.
                 if let Some(s) = self.settings.as_mut() {
+                    self.settings_rev = self.settings_rev.wrapping_add(1);
                     if !bindings_json.is_empty() && s.keybindings_json != bindings_json {
                         s.keybindings_json = bindings_json;
                         self.changed();
@@ -855,6 +869,7 @@ impl ClientCore {
                     self.adopt_key(settings.auth_key.clone());
                 }
                 self.settings = Some(settings);
+                self.settings_rev = self.settings_rev.wrapping_add(1);
                 self.changed();
             }
             WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, end_seq, flush, gagged, archive_sourced, highlight_colors } => {
@@ -988,6 +1003,7 @@ impl ClientCore {
             }
             WsMessage::ShowTagsChanged { show_tags } => {
                 if let Some(s) = self.settings.as_mut() {
+                    self.settings_rev = self.settings_rev.wrapping_add(1);
                     s.show_tags = show_tags;
                 }
                 self.changed();
@@ -1135,6 +1151,15 @@ impl ClientCore {
     }
 
     fn adopt_key(&mut self, key: String) {
+        // What Settings shows as the Auth Key (app.js serverAuthKey: KeyGenerated or
+        // the settings, whichever came last).
+        if let Some(s) = self.settings.as_mut() {
+            self.settings_rev = self.settings_rev.wrapping_add(1);
+            if !key.is_empty() && s.auth_key != key {
+                s.auth_key = key.clone();
+                self.changed();
+            }
+        }
         if !key.is_empty() && self.creds.auth_key.as_deref() != Some(key.as_str()) {
             self.creds.auth_key = Some(key.clone());
             self.key_failed = false;
@@ -1262,6 +1287,7 @@ impl ClientCore {
             .unwrap_or(current_world_index)
             .min(self.worlds.len().saturating_sub(1));
         self.settings = Some(settings);
+        self.settings_rev = self.settings_rev.wrapping_add(1);
         if let Some(key) = self.settings.as_ref().map(|s| s.auth_key.clone()) {
             self.adopt_key(key);
         }

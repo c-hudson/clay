@@ -4,7 +4,7 @@
 //! here, so every dialog gets it the same.
 
 use gpui::{
-    App, BoxShadow, ClickEvent, Div, ElementId, Entity, FontWeight, Hsla, InteractiveElement, ParentElement, SharedString,
+    App, BoxShadow, ClickEvent, Div, ElementId, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
     Stateful, StatefulInteractiveElement, Styled, Window, div, point, px, relative,
 };
 use gpui_component::input::{Input, InputState};
@@ -81,28 +81,31 @@ impl Kit {
 
     /// `.popup-header`: the title and the ✕ that closes.
     pub fn header(&self, id: impl Into<ElementId>, title: impl Into<SharedString>, close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Div {
+        self.header_with(id, div().text_size(px(16.0)).font_weight(FontWeight::BOLD).child(title.into()), close)
+    }
+
+    /// A header with a title of its own styling.
+    pub fn header_with(&self, id: impl Into<ElementId>, title: impl IntoElement, close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Div {
+        div().flex().items_center().justify_between().child(title).child(self.close_button(id, close))
+    }
+
+    /// `.popup-close`: the ✕.
+    pub fn close_button(&self, id: impl Into<ElementId>, close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
         let (surface, hover, muted, fg) = (self.t.surface, self.t.hover, self.t.muted, self.t.fg);
         div()
+            .id(id)
+            .size(px(22.0))
             .flex()
             .items_center()
-            .justify_between()
-            .child(div().text_size(px(16.0)).font_weight(FontWeight::BOLD).child(title.into()))
-            .child(
-                div()
-                    .id(id)
-                    .size(px(22.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.0))
-                    .bg(surface)
-                    .text_color(muted)
-                    .text_size(px(13.0))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover).text_color(fg))
-                    .child("✕")
-                    .on_click(close),
-            )
+            .justify_center()
+            .rounded(px(4.0))
+            .bg(surface)
+            .text_color(muted)
+            .text_size(px(13.0))
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover).text_color(fg))
+            .child("✕")
+            .on_click(close)
     }
 
     /// Body text (`.modal-content p`).
@@ -252,4 +255,35 @@ pub fn list_step(at: Option<usize>, len: usize, by: isize) -> Option<usize> {
     }
     let Some(at) = at.filter(|a| *a < len) else { return Some(if by < 0 { len - 1 } else { 0 }) };
     Some((at as isize + by).rem_euclid(len as isize) as usize)
+}
+
+/// A choice whose labels and values differ ("UTF-8" is `utf8`): gpui-component's select,
+/// and the values behind its rows. Its owner redraws when it changes.
+pub struct Pick {
+    pub state: Entity<gpui_component::select::SelectState<Vec<SharedString>>>,
+    values: Vec<String>,
+}
+
+impl Pick {
+    /// `options` are (value, label); `value` is matched without regard to case (the first
+    /// option when none matches).
+    pub fn new<V: 'static>(options: &[(&str, &str)], value: &str, window: &mut Window, cx: &mut gpui::Context<V>) -> Self {
+        use gpui::AppContext;
+        let labels: Vec<SharedString> = options.iter().map(|(_, l)| SharedString::from(l.to_string())).collect();
+        let values: Vec<String> = options.iter().map(|(v, _)| v.to_string()).collect();
+        let at = values.iter().position(|v| v.eq_ignore_ascii_case(value)).unwrap_or(0);
+        let state = cx.new(|cx| gpui_component::select::SelectState::new(labels, Some(gpui_component::IndexPath::new(at)), window, cx));
+        cx.subscribe(&state, |_, _, _: &gpui_component::select::SelectEvent<Vec<SharedString>>, cx| cx.notify()).detach();
+        Self { state, values }
+    }
+
+    pub fn value(&self, cx: &App) -> String {
+        self.state.read(cx).selected_index(cx).and_then(|i| self.values.get(i.row)).cloned().unwrap_or_default()
+    }
+
+    /// The select, full width.
+    pub fn view(&self) -> gpui::AnyElement {
+        use gpui::IntoElement;
+        gpui_component::select::Select::new(&self.state).w_full().into_any_element()
+    }
 }

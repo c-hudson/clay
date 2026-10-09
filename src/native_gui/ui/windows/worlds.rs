@@ -21,7 +21,7 @@ use crate::native_gui::ui::ClayView;
 use crate::native_gui::ui::assets::icon;
 use crate::native_gui::ui::chrome::alpha;
 use crate::native_gui::ui::dialogs::{self, DialogEvent, Host};
-use crate::native_gui::ui::kit::{self, Btn, Kit, ListDown, ListEnter, ListEscape, ListUp};
+use crate::native_gui::ui::kit::{self, Btn, Kit, ListDown, ListEnter, ListEscape, ListUp, Pick};
 use crate::native_gui::ui::output::hsla;
 use crate::websocket::{ChatDirectoryMsg, ChatPickItem, ChatSettingsUpdate, WsMessage};
 
@@ -57,28 +57,6 @@ pub fn new_world_name(worlds: &[World]) -> String {
         name = format!("New World {k}");
     }
     name
-}
-
-/// A choice whose labels and values differ (the type, the encoding).
-struct Pick {
-    state: Entity<SelectState<Vec<SharedString>>>,
-    values: Vec<String>,
-}
-
-impl Pick {
-    fn new(options: &[(&str, &str)], value: &str, window: &mut Window, cx: &mut Context<WorldsView>) -> Self {
-        let labels: Vec<SharedString> = options.iter().map(|(_, l)| SharedString::from(l.to_string())).collect();
-        let values: Vec<String> = options.iter().map(|(v, _)| v.to_string()).collect();
-        let at = values.iter().position(|v| v.eq_ignore_ascii_case(value)).unwrap_or(0);
-        let state = cx.new(|cx| SelectState::new(labels, Some(IndexPath::new(at)), window, cx));
-        // The rows shown depend on the type and the keep-alive.
-        cx.subscribe(&state, |_, _, _: &SelectEvent<Vec<SharedString>>, cx| cx.notify()).detach();
-        Self { state, values }
-    }
-
-    fn value(&self, cx: &App) -> String {
-        self.state.read(cx).selected_index(cx).and_then(|i| self.values.get(i.row)).cloned().unwrap_or_default()
-    }
 }
 
 /// A Fetch result's list (servers or channels): pick one to fill its text box.

@@ -4,6 +4,7 @@
 
 pub mod emoji;
 pub mod small;
+pub mod web;
 
 use gpui::{
     AnyElement, AnyView, AppContext, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled, Subscription,
@@ -31,6 +32,8 @@ pub enum Kind {
     ImportInsecure,
     Emoji,
     Confirm,
+    ModifyKey,
+    RemoteAccess,
 }
 
 struct Open {

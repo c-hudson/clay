@@ -48,6 +48,12 @@ pub struct Surfaces {
     pub actions_changed: bool,
     /// What the Worlds window shows, hashed: when it changes, the windows are told.
     worlds_sig: u64,
+    /// The settings revision the windows were last told of.
+    settings_rev: u64,
+    /// Settings' Font tab, previewed on this window (`None`: the saved settings).
+    pub preview: Option<crate::websocket::GlobalSettingsMsg>,
+    /// Saved: the preview goes once the settings move past this revision.
+    preview_until: Option<u64>,
 }
 
 impl Host for ClayView {
@@ -140,6 +146,7 @@ impl ClayView {
             }
             "actions" => self.open_actions(None, cx),
             "world-selector" => self.open_worlds(super::windows::worlds::Show::Selector, cx),
+            "setup" | "web" | "font" => self.open_settings(super::windows::settings::Tab::from_name(name), cx),
             "help" => self.open_window(super::windows::Kind::Help, |main, _w, cx| cx.new(|cx| super::windows::help::HelpView::new(main, cx)), |_, _, _| {}, cx),
             // Until the native editors (phase 4h-4j): the server's own pages, in the browser.
             "theme-editor" | "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
@@ -333,6 +340,55 @@ impl ClayView {
             self.surf.worlds_sig = sig;
             cx.emit(super::windows::MainEvent::Worlds);
         }
+    }
+
+    /// Tell the other windows the settings changed; a saved preview gives way to them.
+    pub(super) fn watch_settings(&mut self, cx: &mut Context<Self>) {
+        let rev = self.session.core.settings_rev;
+        if rev != self.surf.settings_rev {
+            self.surf.settings_rev = rev;
+            if self.surf.preview_until.is_some_and(|r| rev > r) {
+                self.surf.preview = None;
+                self.surf.preview_until = None;
+                self.apply_settings();
+                cx.notify();
+            }
+            cx.emit(super::windows::MainEvent::Settings);
+        }
+    }
+
+    /// Draw with these settings instead of the saved ones (`None`: back to the saved).
+    pub(super) fn preview_settings(&mut self, s: Option<crate::websocket::GlobalSettingsMsg>, cx: &mut Context<Self>) {
+        self.surf.preview = s;
+        self.surf.preview_until = None;
+        self.apply_settings();
+        cx.notify();
+    }
+
+    /// Settings were saved: keep the preview until the server's answer arrives.
+    pub(super) fn keep_preview_until_settings(&mut self, _cx: &mut Context<Self>) {
+        if self.surf.preview.is_some() {
+            self.surf.preview_until = Some(self.session.core.settings_rev);
+        }
+    }
+
+    /// The Settings window on a tab (`/setup`, `/web`, `/font`, the menu, the icon bar).
+    pub(super) fn open_settings(&mut self, tab: super::windows::settings::Tab, cx: &mut Context<Self>) {
+        use super::windows::{Kind as Win, settings::{SettingsView, Tab}};
+        if tab == Tab::Web && self.session.core.is_multiuser() {
+            self.client_line("Web settings are disabled in multiuser mode.", cx);
+            return;
+        }
+        let Some(edit) = self.session.core.settings.clone() else {
+            self.client_line("% Settings are available once connected.", cx);
+            return;
+        };
+        self.open_window(
+            Win::Settings,
+            move |main, window, cx| cx.new(|cx| SettingsView::new(main, edit, tab, window, cx)),
+            move |view, _window, cx| view.update(cx, |v, cx| v.show(tab, cx)),
+            cx,
+        );
     }
 
     /// Follow the connection: the log's rows, when it shows, and a held command.

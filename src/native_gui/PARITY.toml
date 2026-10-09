@@ -1237,57 +1237,57 @@ note = "handled: see msg:KeyGenerated"
 id = "wire:RevokeKey"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire RevokeKey"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "Modify Key's Delete"
 
 [[item]]
 id = "wire:KeyRevoked"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "waived"
 feature = "wire KeyRevoked"
-note = ""
+note = "app.js has no case for it: Delete clears the key itself"
 
 [[item]]
 id = "wire:RegenerateAuthKey"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire RegenerateAuthKey"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "Modify Key's Regen"
 
 [[item]]
 id = "wire:SetPortMapping"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire SetPortMapping"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "Remote Access's Port Mapping switch"
 
 [[item]]
 id = "wire:FirewallRule"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire FirewallRule"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "Remote Access's Add Firewall Rule (Windows)"
 
 [[item]]
 id = "wire:LookupPublicIp"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire LookupPublicIp"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "Remote Access's Look Up Public IP"
 
 [[item]]
 id = "wire:RefreshReachability"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire RefreshReachability"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "Remote Access on opening and Refresh"
 
 [[item]]
 id = "wire:ChangePassword"
@@ -2858,3 +2858,51 @@ phase = 4
 status = "done"
 feature = "Delete world 'x'? (Y/Enter yes, N/Esc no; never the last world)"
 note = "app.js deleteWorldFromEditor"
+
+[[item]]
+id = "ui:window.settings"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Settings window: General/Web/Font tabs, sidebar links to the three editors, one Save (UpdateGlobalSettings from an edited copy; blank password = unchanged), ? help per tab"
+note = "app.js openSettingsPopup"
+
+[[item]]
+id = "ui:settings.web_validation"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Web tab blocks Save with the console's own validate_web_settings and its words"
+note = "app.js validateWebSettings"
+
+[[item]]
+id = "ui:settings.font_preview"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Font tab previews family, size, weight and spacing on the main window; Cancel or closing puts the saved font back; Save keeps it until the server answers"
+note = "app.js previewFontEdit"
+
+[[item]]
+id = "ui:dialog.modify_key"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "Modify Auth Key: the key, Copy, Regen (KeyGenerated redraws it), Delete"
+note = "app.js showModifyKeyDialog"
+
+[[item]]
+id = "ui:dialog.remote_access"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "Remote Access: the server's ReachabilityInfo as it is, connect hints with Copy, Port Mapping switch, Refresh, Look Up Public IP, Add Firewall Rule (Windows)"
+note = "app.js showRemoteAccessDialog"
+
+[[item]]
+id = "ui:settings.transparency"
+section = "dialogs"
+phase = 5
+status = "todo"
+feature = "the Transparency slider is saved; applying it to the window is phase 5's opacity"
+note = "app.js applyTransparency"
