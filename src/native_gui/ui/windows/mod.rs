@@ -8,6 +8,7 @@ pub mod actions;
 pub mod help;
 pub mod notes;
 pub mod settings;
+pub mod theme_editor;
 pub mod worlds;
 
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ pub enum Kind {
     Worlds,
     /// A world's notes (one window per world).
     Notes(usize),
+    ThemeEditor,
 }
 
 impl Kind {
@@ -41,6 +43,7 @@ impl Kind {
             Kind::Worlds => ("Clay - Worlds", 640.0, 680.0),
             // The world's name goes in the title once the notes arrive.
             Kind::Notes(_) => ("Clay - Notes", 700.0, 500.0),
+            Kind::ThemeEditor => ("Clay - Theme Editor", 1000.0, 720.0),
         }
     }
 }

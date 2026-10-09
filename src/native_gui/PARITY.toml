@@ -2037,73 +2037,73 @@ note = "between two Clay servers during an import; no client sends or reads it"
 id = "wire:RequestThemeEditorState"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire RequestThemeEditorState"
-note = "spoken by the theme/keybind/action editor pages"
+note = "the Theme editor on opening"
 
 [[item]]
 id = "wire:UpdateThemeColors"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire UpdateThemeColors"
-note = "spoken by the theme/keybind/action editor pages"
+note = "every colour change (50 ms debounce), Load Defaults"
 
 [[item]]
 id = "wire:AddTheme"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire AddTheme"
-note = "spoken by the theme/keybind/action editor pages"
+note = "Add (a copy of the current theme)"
 
 [[item]]
 id = "wire:DeleteTheme"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire DeleteTheme"
-note = "spoken by the theme/keybind/action editor pages"
+note = "Delete, after asking"
 
 [[item]]
 id = "wire:SaveThemeFile"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire SaveThemeFile"
-note = "spoken by the theme/keybind/action editor pages"
+note = "Save"
 
 [[item]]
 id = "wire:UpdateSeparatorStyle"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire UpdateSeparatorStyle"
-note = "spoken by the theme/keybind/action editor pages"
+note = "Save, when the separator style changed"
 
 [[item]]
 id = "wire:ThemeEditorState"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ThemeEditorState"
-note = "spoken by the theme/keybind/action editor pages"
+note = "fills the Theme editor"
 
 [[item]]
 id = "wire:ThemeFileSaved"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ThemeFileSaved"
-note = "spoken by the theme/keybind/action editor pages"
+note = "Saved / Error in the toolbar"
 
 [[item]]
 id = "wire:ThemeCssVarsUpdated"
 section = "wire"
 phase = 2
-status = "see"
+status = "done"
 feature = "wire ThemeCssVarsUpdated"
-note = "handled: see msg:ThemeCssVarsUpdated"
+note = "the core takes the live colours (every window redraws in them)"
 
 [[item]]
 id = "wire:RequestActionEditorState"
@@ -2930,3 +2930,11 @@ phase = 4
 status = "done"
 feature = "/window [world] and the menu's New Window: a whole client in an 800x600 window, kept to the world by name (no switching)"
 note = "app.js LOCK_WORLD; the menu item opens a GUI window, not a browser tab (B24)"
+
+[[item]]
+id = "ui:editor.theme"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Theme editor as a native window: themes, grouped colours (double-click flashes), SV square + hue bar + hex picker, live preview, separator style, Add/Delete/Save/Reset/Load Defaults; edits go live to every window"
+note = "theme-editor.html (opened in the browser by the web client)"

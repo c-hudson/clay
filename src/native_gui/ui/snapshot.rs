@@ -110,6 +110,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         "actions" => super::windows::Kind::Actions,
         "worlds" => super::windows::Kind::Worlds,
         "notes" => super::windows::Kind::Notes(0),
+        "theme" => super::windows::Kind::ThemeEditor,
         other => fail(&format!("no window kind {other}")),
     };
     // CLAY_SNAPSHOT_INPUT: mouse and key events to replay before the capture, for

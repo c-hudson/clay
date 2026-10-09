@@ -150,8 +150,23 @@ impl ClayView {
             "notes" => self.open_notes(cx),
             "new-window" => self.open_world_window(None, cx),
             "help" => self.open_window(super::windows::Kind::Help, |main, _w, cx| cx.new(|cx| super::windows::help::HelpView::new(main, cx)), |_, _, _| {}, cx),
-            // Until the native editors (phase 4h-4j): the server's own pages, in the browser.
-            "theme-editor" | "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
+            "theme-editor" => {
+                use super::windows::{Kind as Win, theme_editor::ThemeEditor};
+                self.open_window(
+                    Win::ThemeEditor,
+                    |main, window, cx| {
+                        cx.new(|cx| {
+                            let mut e = ThemeEditor::new(main, window, cx);
+                            e.follow(cx);
+                            e
+                        })
+                    },
+                    |_, _, _| {},
+                    cx,
+                );
+            }
+            // Until the native editors (phase 4i-4j): the server's own pages, in the browser.
+            "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
             other => crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: {other} is not available yet")),
         }
     }
@@ -217,6 +232,15 @@ impl ClayView {
     pub(super) fn open_help(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         let main = cx.entity().downgrade();
         dialogs::open_help(self, main, key, window, cx);
+    }
+
+    /// Run `f` on the content of the window of `kind`, if it's open, in that window.
+    pub(super) fn in_window<V: 'static>(&mut self, kind: super::windows::Kind, f: impl FnOnce(&mut V, &mut Window, &mut Context<V>) + 'static, cx: &mut Context<Self>) {
+        let (Some(frame), Some(handle)) = (self.windows.frame(kind), self.windows.handle_of(kind)) else { return };
+        let Some(view) = frame.read(cx).content::<V>() else { return };
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| view.update(cx, |v, cx| f(v, window, cx)));
+        });
     }
 
     /// Send a message (dialogs use this).
@@ -304,6 +328,15 @@ impl ClayView {
             }
             // `/window [world]`: the server connected it; a window of its own shows it.
             WsMessage::OpenWindow { world } => self.open_world_window(world.clone(), cx),
+            // The theme editor's themes, and Save's answer.
+            WsMessage::ThemeEditorState { themes_json, active_theme, separator_style, .. } => {
+                let (j, a, sep) = (themes_json.clone(), active_theme.clone(), separator_style.clone());
+                self.in_window::<super::windows::theme_editor::ThemeEditor>(super::windows::Kind::ThemeEditor, move |v, window, cx| v.state(&j, &a, &sep, window, cx), cx);
+            }
+            WsMessage::ThemeFileSaved { success, error } => {
+                let (ok, e) = (*success, error.clone());
+                self.in_window::<super::windows::theme_editor::ThemeEditor>(super::windows::Kind::ThemeEditor, move |v, _window, cx| v.saved(ok, e.as_deref(), cx), cx);
+            }
             // A world's notes, for its notes window.
             WsMessage::NoteEditorState { world_index, world_name, notes } => {
                 let kind = super::windows::Kind::Notes(*world_index);

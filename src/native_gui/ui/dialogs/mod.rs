@@ -36,6 +36,7 @@ pub enum Kind {
     RemoteAccess,
     /// The MUD's simpleedit text, over the whole window.
     McpEdit,
+    AddTheme,
 }
 
 struct Open {
