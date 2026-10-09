@@ -14,6 +14,7 @@ mod input_view;
 mod keymap;
 mod kit;
 mod native_spell;
+mod opacity;
 mod more;
 pub mod output;
 mod select;
@@ -138,6 +139,8 @@ pub struct ClayView {
     /// The current world and whether its media is on, as last seen: turning it off
     /// stops what it started (app.js `GmcpUserToggled`).
     media_gate: Option<(usize, bool)>,
+    /// The settings' Transparency, as applied to this window.
+    opacity: opacity::Opacity,
 }
 
 impl ClayView {
@@ -208,6 +211,7 @@ impl ClayView {
             link: Default::default(),
             media: None,
             media_gate: None,
+            opacity: Default::default(),
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -292,6 +296,11 @@ impl ClayView {
             cx.notify();
         }
         self.relay_outbox(cx);
+    }
+
+    /// The settings' Transparency (0.3 to 1), the Settings window's preview first.
+    pub(super) fn transparency(&self) -> f32 {
+        self.surf.preview.as_ref().or(self.session.core.settings.as_ref()).map_or(1.0, |s| s.gui_transparency)
     }
 
     /// The current world's media switched off (F9, the MUD's toggle): stop what it started.
@@ -792,6 +801,8 @@ impl Render for ClayView {
         }
         self.run_later(window, cx);
         self.report_view(window);
+        let alpha = self.transparency();
+        self.opacity.apply(window, alpha);
         let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
         if need_login && !self.login_focused {
             // The cursor goes where typing starts: the name in multiuser mode, else the password.

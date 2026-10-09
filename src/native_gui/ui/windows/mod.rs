@@ -74,6 +74,7 @@ pub struct PopupWindow {
     content: AnyView,
     content_focus: FocusHandle,
     stack: dialogs::Stack,
+    opacity: super::opacity::Opacity,
     _subs: Vec<Subscription>,
 }
 
@@ -87,7 +88,7 @@ impl PopupWindow {
         }
         let content_focus = content.focus_handle(cx);
         window.focus(&content_focus, cx);
-        Self { main, content: content.into(), content_focus, stack: Default::default(), _subs: subs }
+        Self { main, content: content.into(), content_focus, stack: Default::default(), opacity: Default::default(), _subs: subs }
     }
 
     /// The content, as its own type.
@@ -107,8 +108,11 @@ impl Host for PopupWindow {
 }
 
 impl Render for PopupWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = self.main.upgrade().map(|m| m.read(cx).kit().t.elevated).unwrap_or(gpui::black());
+        // Every window takes the Transparency, as the WebView GUI's do.
+        let alpha = self.main.upgrade().map_or(1.0, |m| m.read(cx).transparency());
+        self.opacity.apply(window, alpha);
         div().size_full().relative().bg(bg).child(self.content.clone()).children(self.stack.render())
     }
 }

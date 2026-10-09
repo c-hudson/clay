@@ -2903,8 +2903,8 @@ note = "app.js showRemoteAccessDialog"
 id = "ui:settings.transparency"
 section = "dialogs"
 phase = 5
-status = "todo"
-feature = "the Transparency slider is saved; applying it to the window is phase 5's opacity"
+status = "done"
+feature = "the Transparency slider: every window (text and all) at that opacity on X11 (_NET_WM_WINDOW_OPACITY, what GTK set_opacity sets there), its preview live; kept but not applied on Wayland, Windows and macOS, as in the WebView GUI"
 note = "app.js applyTransparency"
 
 [[item]]
