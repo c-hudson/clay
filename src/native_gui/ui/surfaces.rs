@@ -423,7 +423,7 @@ impl ClayView {
         let fonts = self.fonts.clone();
         cx.defer(move |cx| {
             let (session, events) = crate::native_gui::core::session::Session::with_credentials(&runtime, target, creds);
-            super::open_view_window(cx, fonts, session, events, mode, title.into(), size, false);
+            super::open_view_window(cx, fonts, session, events, mode, super::ViewWindow { title: title.into(), size, is_main: false });
         });
     }
 

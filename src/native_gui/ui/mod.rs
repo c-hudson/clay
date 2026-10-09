@@ -913,7 +913,8 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         #[cfg(not(target_os = "windows"))]
         cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         let fonts = fonts::load(cx);
-        let Some(main) = open_view_window(cx, fonts, session, events, viewmode::ViewMode::default(), "Clay".into(), (800.0, 600.0), true) else {
+        let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true };
+        let Some(main) = open_view_window(cx, fonts, session, events, viewmode::ViewMode::default(), how) else {
             panic!("open the main window");
         };
         // Redraw when a Discord emoji arrives or an animated one moves to its next frame.
@@ -935,16 +936,23 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
 /// A window of output with a session of its own: the main window, or a `/window` /
 /// `--grep` window (which logs in again with the main window's credentials, as the
 /// WebView's do). Its view, or `None` if no window could open.
+/// How a window of output opens.
+pub(super) struct ViewWindow {
+    pub title: SharedString,
+    pub size: (f32, f32),
+    /// The main window (it keeps the disk cache).
+    pub is_main: bool,
+}
+
 pub(super) fn open_view_window(
     cx: &mut App,
     fonts: Fonts,
     session: Session,
     events: mpsc::UnboundedReceiver<NetInput>,
     mode: viewmode::ViewMode,
-    title: SharedString,
-    (w, h): (f32, f32),
-    is_main: bool,
+    how: ViewWindow,
 ) -> Option<gpui::WeakEntity<ClayView>> {
+    let ViewWindow { title, size: (w, h), is_main } = how;
     let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
     let mut view = None;
     let window = cx
