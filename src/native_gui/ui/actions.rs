@@ -127,11 +127,7 @@ impl ClayView {
             }
             "input_grow" => self.input.rows = (self.input.rows + 1).min(15),
             "input_shrink" => self.input.rows = self.input.rows.saturating_sub(1).max(1),
-            "reload" => {
-                let fx = self.session.core.restart();
-                let rest = self.session.apply(fx);
-                self.after(rest, cx);
-            }
+            "reload" => self.relaunch(None, cx),
             "help" | "emoji_picker" | "spell_check" | "recent_worlds" => self.open_surface(action, window, cx),
             a if self.edit_action(a, cx) => {}
             "kbnum_negative" => {

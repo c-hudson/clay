@@ -103,7 +103,7 @@ section = "misc"
 phase = 4
 status = "done"
 feature = "handle ExecuteLocalCommand"
-note = "input_view local_command: the same commands as app.js executeLocalCommand, anything else back as SendCommand; /update (and /reload of the binary itself) are phase 5's"
+note = "input_view local_command: the same commands as app.js executeLocalCommand, anything else back as SendCommand; /reload restarts this GUI; /update says there is no native GUI release yet (phase 6 adds them); /server and /reload typed here never reach the server (app.js remote-GUI branch)"
 
 [[item]]
 id = "msg:GlobalSettingsUpdated"
@@ -949,9 +949,9 @@ note = "redraws (ui/actions.rs)"
 id = "action:reload"
 section = "misc"
 phase = 5
-status = "todo"
+status = "done"
 feature = "action reload"
-note = ""
+note = "starts this GUI again as it was started (exec in place; Windows: a new process), never the server (app.js)"
 
 [[item]]
 id = "action:scramble_words"
@@ -2954,3 +2954,11 @@ phase = 4
 status = "done"
 feature = "the Action editor as a native window: list with text and world filters, enabled marks and pattern hints; name, worlds, Enabled/Run at startup/GUI Menu Shortcut/Suppress Blanks, match type, patterns (add/remove), command; Save/Cancel/Delete; Save/Discard/Stay on leaving an edited action or closing with changes; a list saved elsewhere taken when nothing is unsaved"
 note = "action-editor.html (opened in the browser by the web client); Delete is saved at once and names are checked as the Actions editor checks them (B28)"
+
+[[item]]
+id = "ui:command.server"
+section = "windows"
+phase = 5
+status = "done"
+feature = "/server host:port (asked twice within 15 s, --cancel) attaches this GUI to another Clay by starting again with --native-gui=<addr> (--ssh dropped, as the WebView GUI drops it); --close (become a server) is not offered: the native GUI only attaches"
+note = "app.js sendCommand remote-GUI branch; platform::exec_relaunch"

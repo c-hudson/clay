@@ -1928,6 +1928,14 @@ pub fn exec_relaunch(connect_addr: Option<&str>, use_gui: bool) -> io::Result<()
     exec_relaunch_with_args(args, use_gui)
 }
 
+/// Start this binary again with `args` in this process's place (exec on Unix; on Windows
+/// a new process, then this one exits): the native GUI's /reload and /server. Returns
+/// only if that failed.
+#[cfg(feature = "native-gui")]
+pub fn exec_with_args(args: Vec<String>) -> io::Result<()> {
+    exec_relaunch_with_args(args, true)
+}
+
 #[cfg(all(unix, not(target_os = "android")))]
 fn exec_relaunch_with_args(args: Vec<String>, use_gui: bool) -> io::Result<()> {
     use std::os::unix::process::CommandExt;

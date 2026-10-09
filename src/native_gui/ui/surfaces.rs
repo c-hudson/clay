@@ -46,6 +46,8 @@ pub struct Surfaces {
     pub pending_import: Option<ImportCreds>,
     /// The actions changed since the windows were last told.
     pub actions_changed: bool,
+    /// A `/server` waiting to be asked again: where to, and when.
+    pub pending_server: Option<(String, std::time::Instant)>,
     /// What the Worlds window shows, hashed: when it changes, the windows are told.
     worlds_sig: u64,
     /// The settings revision the windows were last told of.
@@ -241,6 +243,50 @@ impl ClayView {
         let fx = self.session.core.client_line(text);
         let rest = self.session.apply(fx);
         self.after(rest, cx);
+    }
+
+    /// `/reload`: this GUI starts again as it was started (the server's never restarted
+    /// from here, app.js). `/server <addr>`: it starts again attached to `addr`.
+    pub(super) fn relaunch(&mut self, target: Option<&str>, cx: &mut Context<Self>) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args = match target {
+            Some(t) => relaunch_args(&args, t),
+            None => args,
+        };
+        if let Err(e) = crate::platform::exec_with_args(args) {
+            self.client_line(&format!("% Couldn't start again: {e}"), cx);
+        }
+    }
+
+    /// `/server ...` (app.js sendCommand's remote-GUI branch): attach to another Clay,
+    /// asked twice within 15 seconds; `--cancel` forgets the first. The native GUI only
+    /// ever attaches, so there's no `--close` (become a server) here.
+    pub(super) fn server_command(&mut self, args: &[&str], cx: &mut Context<Self>) {
+        const CONFIRM_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
+        match args {
+            [] => self.client_line("Usage: /server host:port  (or)  /server host port  (or)  /server --cancel", cx),
+            ["--close", ..] => self.client_line("The native GUI only attaches to a running Clay, so /server --close isn't available here.", cx),
+            ["--cancel", ..] => {
+                let had = self.surf.pending_server.take().is_some();
+                self.client_line(if had { "Cancelled." } else { "No pending /server to cancel." }, cx);
+            }
+            [host, rest @ ..] => {
+                let addr = match rest.first() {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_string(),
+                };
+                match self.surf.pending_server.take() {
+                    Some((a, at)) if a == addr && at.elapsed() < CONFIRM_WITHIN => self.relaunch(Some(&addr), cx),
+                    _ => {
+                        self.client_line(
+                            &format!("This will disconnect from the current server and attach to {addr} instead. Run /server {addr} again within 15s to confirm, or /server --cancel."),
+                            cx,
+                        );
+                        self.surf.pending_server = Some((addr, std::time::Instant::now()));
+                    }
+                }
+            }
+        }
     }
 
     /// Retry now (the connection log's Retry, Connection Lost's Reconnect).
@@ -652,5 +698,25 @@ impl ClayView {
                 other => self.open_surface(other, window, cx),
             },
         }
+    }
+}
+
+/// The arguments to start again with for `/server <target>`: this run's, less its
+/// target and `--ssh` (a new target is reached directly unless asked again), plus the new
+/// one (platform::exec_relaunch's rule for the WebView GUI).
+pub(super) fn relaunch_args(args: &[String], target: &str) -> Vec<String> {
+    let mut out: Vec<String> = args.iter().filter(|a| *a != "--native-gui" && !a.starts_with("--native-gui=") && *a != "--ssh").cloned().collect();
+    out.push(format!("--native-gui={target}"));
+    out
+}
+
+#[cfg(test)]
+mod relaunch_tests {
+    use super::relaunch_args;
+
+    #[test]
+    fn a_new_target_replaces_the_old_and_drops_ssh() {
+        let args: Vec<String> = ["--conf=/x/settings.dat", "--native-gui=old:9000", "--ssh"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(relaunch_args(&args, "new.example:9001"), vec!["--conf=/x/settings.dat".to_string(), "--native-gui=new.example:9001".to_string()]);
     }
 }

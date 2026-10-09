@@ -608,6 +608,21 @@ impl ClayView {
                 return;
             }
         }
+        // `/server` and `/reload` are this GUI's own, connected or not (app.js sendCommand
+        // in a remote GUI): never the server's.
+        let first = trimmed.split_whitespace().next().unwrap_or("");
+        if first.eq_ignore_ascii_case("/server") || first.eq_ignore_ascii_case("/reload") {
+            self.editor.remember(&trimmed, false);
+            self.editor.clear();
+            if first.eq_ignore_ascii_case("/reload") {
+                self.relaunch(None, cx);
+            } else {
+                let args: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+                self.server_command(&args, cx);
+            }
+            cx.notify();
+            return;
+        }
         if !self.session.core.is_online() {
             let command = self.editor.text.clone();
             self.editor.remember(&command, false);
@@ -688,11 +703,7 @@ impl ClayView {
         let first = command.split_whitespace().next().unwrap_or("").to_lowercase();
         match first.as_str() {
             "/quit" => cx.quit(),
-            "/reload" => {
-                let fx = self.session.core.restart();
-                let rest = self.session.apply(fx);
-                self.after(rest, cx);
-            }
+            "/reload" => self.relaunch(None, cx),
             // The console's menu (this window has its menu button). A server from before
             // /menu went console-only still sends it here: answer it, don't return it.
             "/menu" => self.client_line("/menu is the console's menu; here, use the menu button (\u{2630}).", cx),
@@ -717,12 +728,9 @@ impl ClayView {
                 let fx = self.session.send(crate::websocket::WsMessage::RequestConnectionsList);
                 self.after(fx, cx);
             }
-            // Updating this binary is phase 5's.
-            "/update" => {
-                let fx = self.session.core.client_line("% /update isn't in the native GUI yet.");
-                let rest = self.session.apply(fx);
-                self.after(rest, cx);
-            }
+            // The releases have no native GUI build to update to yet: updating would put a
+            // binary without it in this one's place.
+            "/update" => self.client_line("% There's no native GUI release to update to yet.", cx),
             // Anything else is the server's after all (app.js's default).
             _ => {
                 let world_index = self.session.core.current;
