@@ -149,9 +149,13 @@ impl ClayView {
         again: impl FnOnce(gpui::Entity<V>, &mut Window, &mut App) + 'static,
         cx: &mut Context<Self>,
     ) {
-        let main = cx.entity().downgrade();
-        let existing = self.windows.open.get(&kind).copied().zip(self.windows.frame(kind));
+        // A follower's windows are the main window's (one Settings, one Help...).
+        let main = self.owner(cx);
         cx.defer(move |cx| {
+            let existing = main.upgrade().and_then(|m| {
+                let m = m.read(cx);
+                m.windows.open.get(&kind).copied().zip(m.windows.frame(kind))
+            });
             if let Some((handle, frame)) = existing {
                 let shown = handle.update(cx, |_, window, cx| {
                     window.activate_window();

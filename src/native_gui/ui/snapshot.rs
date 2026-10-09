@@ -185,6 +185,9 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                 "win" => {
                     target = if arg == "main" {
                         window.into()
+                    } else if arg == "view" {
+                        // The first window following this one (`/window`, `--grep`, New Window).
+                        cx.update(|app| view.read(app).link.follower_window(0)).unwrap_or_else(|| fail("no /window is open"))
                     } else {
                         let kind = window_kind(arg);
                         cx.update(|app| view.read(app).windows.handle(kind)).unwrap_or_else(|| fail("that window isn't open (add an open: step)"))
@@ -275,8 +278,12 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
     // instead of the main one.
     let target: gpui::AnyWindowHandle = match std::env::var("CLAY_SNAPSHOT_WINDOW").ok().filter(|k| !k.is_empty()).as_deref() {
         Some(kind) => {
-            let kind = window_kind(kind);
-            let handle = cx.update(|app| view.read(app).windows.handle(kind)).unwrap_or_else(|| fail("that window isn't open (add an open: step)"));
+            let handle = if kind == "view" {
+                cx.update(|app| view.read(app).link.follower_window(0)).unwrap_or_else(|| fail("no /window is open"))
+            } else {
+                let kind = window_kind(kind);
+                cx.update(|app| view.read(app).windows.handle(kind)).unwrap_or_else(|| fail("that window isn't open (add an open: step)"))
+            };
             cx.run_until_parked();
             cx.update_window(handle, |_, w, app| {
                 let _ = w.draw(app);

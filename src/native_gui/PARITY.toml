@@ -231,7 +231,7 @@ section = "windows"
 phase = 4
 status = "done"
 feature = "handle OpenWindow"
-note = "a window of its own kept to that world (a second session, as the WebView windows log in again)"
+note = "a window of its own on the main window's connection (follow.rs), kept to that world"
 
 [[item]]
 id = "msg:OutputLines"
@@ -2472,8 +2472,8 @@ id = "ui:output.grep"
 section = "windows"
 phase = 4
 status = "done"
-feature = "/window --grep windows (filtered, locked, chrome hidden)"
-note = "/window --grep pattern [-w world] [--regexp]: 800x300, matching lines only, no chrome (ui/viewmode.rs)"
+feature = "/window --grep windows: the matching lines and a scrollbar, nothing else (filtered, locked, on the main window's connection)"
+note = "/window --grep pattern [-w world] [--regexp]: 800x300, no chrome or input, a track and thumb that stay and drag (ui/viewmode.rs, output.rs Bar)"
 
 [[item]]
 id = "ui:status.layout"
@@ -2928,7 +2928,7 @@ id = "ui:window.world"
 section = "dialogs"
 phase = 4
 status = "done"
-feature = "/window [world] and the menu's New Window: a whole client in an 800x600 window, kept to the world by name (no switching)"
+feature = "/window [world] and the menu's New Window: a whole client (output, status bar, input) in an 800x600 window of this process, on the main window's connection (no second login: a follower session fed the main window's messages, its requests sent by it, replies routed back to it); kept to the world by name (no switching) when one is given"
 note = "app.js LOCK_WORLD; the menu item opens a GUI window, not a browser tab (B24)"
 
 [[item]]

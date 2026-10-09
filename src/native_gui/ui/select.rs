@@ -56,6 +56,8 @@ pub struct SelectState {
     copied_at: Option<Instant>,
     /// The mouse while dragging, for scrolling when it's past the top or bottom.
     pub drag_at: Option<Point<Pixels>>,
+    /// Dragging a grep window's scrollbar: where on the thumb it was taken.
+    bar_grab: Option<f32>,
 }
 
 /// The word around `byte` (Unicode word boundaries; a run of spaces is its own word).
@@ -198,6 +200,16 @@ impl ClayView {
             return;
         }
         self.select.menu = None;
+        // A grep window's scrollbar: take the thumb where it was pressed, or, pressed
+        // beside it, by its middle (the view jumps there).
+        let bar = self.scroll.borrow().bar_at(x, y);
+        if let Some(b) = bar {
+            let grab = if y >= b.thumb_top && y < b.thumb_top + b.thumb_h { y - b.thumb_top } else { b.thumb_h / 2.0 };
+            self.select.bar_grab = Some(grab);
+            self.scroll.borrow_mut().drag_thumb_to(y - grab);
+            cx.notify();
+            return;
+        }
         let (hit, on) = {
             let s = self.scroll.borrow();
             (s.hit(x, y), s.byte_at(x, y))
@@ -225,6 +237,14 @@ impl ClayView {
 
     pub(super) fn output_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
         let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+        if let Some(grab) = self.select.bar_grab {
+            if ev.pressed_button == Some(MouseButton::Left) {
+                self.scroll.borrow_mut().drag_thumb_to(y - grab);
+                cx.notify();
+                return;
+            }
+            self.select.bar_grab = None;
+        }
         let dragging = self.select.sel.is_some_and(|s| s.dragging);
         if dragging && ev.pressed_button == Some(MouseButton::Left) {
             self.select.drag_at = Some(ev.position);
@@ -265,6 +285,9 @@ impl ClayView {
     }
 
     pub(super) fn output_mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.select.bar_grab.take().is_some() {
+            return;
+        }
         let Some(mut sel) = self.select.sel else { return };
         if !sel.dragging {
             return;

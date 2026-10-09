@@ -7,6 +7,7 @@ mod chrome;
 mod dialogs;
 pub mod emoji;
 mod find;
+mod follow;
 pub mod fonts;
 pub mod ink;
 mod input_view;
@@ -128,6 +129,9 @@ pub struct ClayView {
     windows: windows::Windows,
     /// What this window of output is for (the main window, `/window`, `--grep`).
     mode: viewmode::ViewMode,
+    /// The windows sharing this one's connection, or the window whose connection this
+    /// one shares.
+    link: follow::Link,
 }
 
 impl ClayView {
@@ -195,6 +199,7 @@ impl ClayView {
             surf: Default::default(),
             windows: Default::default(),
             mode: Default::default(),
+            link: Default::default(),
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -254,6 +259,7 @@ impl ClayView {
             self.follow_world();
             cx.notify();
         }
+        self.relay_outbox(cx);
     }
 
     /// After any change: a world switch starts the output over; new lines at the tail go
@@ -402,11 +408,6 @@ impl ClayView {
                 false
             }
         }
-    }
-
-    pub(super) fn handle(&mut self, input: NetInput, cx: &mut Context<Self>) {
-        let fx = self.session.handle(input);
-        self.after(fx, cx);
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -691,6 +692,11 @@ impl ClayView {
         div().size_full().flex().items_center().justify_center().child(form)
     }
 
+    /// A follower's, in place of the login or certificate screen (the main window's to answer).
+    fn leader_screen(&self) -> impl IntoElement {
+        div().size_full().flex().items_center().justify_center().child(self.panel().child("Waiting for the main window to connect."))
+    }
+
     fn mismatch_screen(&self, host: &str, old: &str, new: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let mono = |s: &str| div().font_family(self.fonts.primary.clone()).text_size(px(12.0)).child(s.to_string());
         div().size_full().flex().items_center().justify_center().child(
@@ -746,6 +752,8 @@ impl Render for ClayView {
             window.focus(&self.focus, cx);
         }
         let body = match self.session.core.status().clone() {
+            // The main window logs in and answers a changed certificate for every window.
+            Status::NeedLogin { .. } | Status::CertMismatch(_) if self.is_follower() => self.leader_screen().into_any_element(),
             Status::NeedLogin { multiuser, error } => self.login_screen(multiuser, error, cx).into_any_element(),
             Status::CertMismatch(m) => self.mismatch_screen(&m.host, &m.old_fingerprint, &m.new_fingerprint, cx).into_any_element(),
             _ if self.session.core.current_world().is_some_and(|w| w.showing_splash) => self.splash().into_any_element(),
@@ -764,6 +772,7 @@ impl Render for ClayView {
                     selection: self.selection_ranges(),
                     selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],
                     hover_link: self.select.hover_link.clone(),
+                    scrollbar: self.mode.grep.is_some(),
                 };
                 let link = self.select.hover_link.is_some();
                 div()
@@ -897,14 +906,8 @@ impl ClayView {
 }
 
 /// Open the main window and run the session in it.
-/// The runtime sessions run on (a `/window` window starts one of its own).
-static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
-
 pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
     let _ = STARTED.set(Instant::now());
-    if let Ok(h) = tokio::runtime::Handle::try_current() {
-        let _ = RUNTIME.set(h);
-    }
     gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         bind_main_keys(cx);
@@ -914,17 +917,25 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         #[cfg(not(target_os = "windows"))]
         cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         let fonts = fonts::load(cx);
-        let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true };
-        let Some(main) = open_view_window(cx, fonts, session, events, viewmode::ViewMode::default(), how) else {
+        let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true, leader: None };
+        let Some((main, main_window)) = open_view_window(cx, fonts, session, Some(events), viewmode::ViewMode::default(), how) else {
             panic!("open the main window");
         };
+        // The other windows are this one's: closing it closes Clay.
+        let main_id = main_window.window_id();
+        cx.on_window_closed(move |cx, id| {
+            if id == main_id {
+                cx.quit();
+            }
+        })
+        .detach();
         // Redraw when a Discord emoji arrives or an animated one moves to its next frame.
         let (repaint_tx, mut repaint) = mpsc::unbounded();
         emoji::set_repaint(repaint_tx);
         let repaint_view = main.clone();
         cx.spawn(async move |cx| {
             while repaint.next().await.is_some() {
-                if repaint_view.update(cx, |_, cx| cx.notify()).is_err() {
+                if repaint_view.update(cx, |v, cx| v.repaint_all(cx)).is_err() {
                     break;
                 }
             }
@@ -934,26 +945,30 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
     });
 }
 
-/// A window of output with a session of its own: the main window, or a `/window` /
-/// `--grep` window (which logs in again with the main window's credentials, as the
-/// WebView's do). Its view, or `None` if no window could open.
 /// How a window of output opens.
 pub(super) struct ViewWindow {
     pub title: SharedString,
     pub size: (f32, f32),
     /// The main window (it keeps the disk cache).
     pub is_main: bool,
+    /// A `/window` or `--grep` window: the window whose connection it shares.
+    pub leader: Option<gpui::WeakEntity<ClayView>>,
 }
 
+/// A window of output: the main window, with its connection's reports on `events`, or a
+/// `/window` / `--grep` window following it (see `follow`). Its view and window, or
+/// `None` if no window could open.
 pub(super) fn open_view_window(
     cx: &mut App,
     fonts: Fonts,
     session: Session,
-    events: mpsc::UnboundedReceiver<NetInput>,
+    events: Option<mpsc::UnboundedReceiver<NetInput>>,
     mode: viewmode::ViewMode,
     how: ViewWindow,
-) -> Option<gpui::WeakEntity<ClayView>> {
-    let ViewWindow { title, size: (w, h), is_main } = how;
+) -> Option<(gpui::WeakEntity<ClayView>, gpui::AnyWindowHandle)> {
+    let ViewWindow { title, size: (w, h), is_main, leader } = how;
+    // A follower's connection is already up (its leader's): only a window with its own starts one.
+    let starts = events.is_some();
     let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
     let mut view = None;
     let window = cx
@@ -971,6 +986,7 @@ pub(super) fn open_view_window(
                         v.cache = Some(CacheSaver::default());
                     }
                     v.mode = mode;
+                    v.link.leader = leader;
                     v
                 });
                 window.focus(&v.focus_handle(cx), cx);
@@ -982,17 +998,18 @@ pub(super) fn open_view_window(
         .ok()?;
     let main = view?;
     let weak = main.downgrade();
-    // The connection's reports.
-    let event_view = weak.clone();
-    let mut events = events;
-    cx.spawn(async move |cx| {
-        while let Some(ev) = events.next().await {
-            if event_view.update(cx, |v, cx| v.handle(ev, cx)).is_err() {
-                break;
+    // The connection's reports (a follower's come from its leader).
+    if let Some(mut events) = events {
+        let event_view = weak.clone();
+        cx.spawn(async move |cx| {
+            while let Some(ev) = events.next().await {
+                if event_view.update(cx, |v, cx| v.handle(ev, cx)).is_err() {
+                    break;
+                }
             }
-        }
-    })
-    .detach();
+        })
+        .detach();
+    }
     // The clock: keepalives, watchdogs, reconnects, chord timeouts.
     let tick_view = weak.clone();
     cx.spawn(async move |cx| {
@@ -1005,9 +1022,11 @@ pub(super) fn open_view_window(
         }
     })
     .detach();
-    main.update(cx, |v, cx| {
-        let fx = v.session.start();
-        v.after(fx, cx);
-    });
-    Some(weak)
+    if starts {
+        main.update(cx, |v, cx| {
+            let fx = v.session.start();
+            v.after(fx, cx);
+        });
+    }
+    Some((weak, window.into()))
 }

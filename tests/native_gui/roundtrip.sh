@@ -21,7 +21,8 @@ run() {   # run <name> <window> <steps> <pattern> [file under ~/.clay, default s
     HOME=$WORK/home CLAY_PASSWORD=bench CLAY_SNAPSHOT_WINDOW="$2" CLAY_SNAPSHOT_INPUT="$3" "$BIN/clay" --native-gui=127.0.0.1:$WEB --native-gui-snapshot="$OUT/$1.png" > "$WORK/snap.log" 2>&1
     sleep 0.5
     local file="$WORK/home/.clay/${5:-settings.dat}"
-    if grep -qP -- "$4" "$file" 2>/dev/null; then echo "PASS $1"; else echo "FAIL $1: $(grep -E 'snapshot|panic|error' $WORK/snap.log | head -2)"; cp "$file" "$OUT/$1.saved" 2>/dev/null; fi
+    # The whole file as one string (-z), lines anchored with ^ as usual ((?m)).
+    if grep -qPz -- "(?m)$4" "$file" 2>/dev/null; then echo "PASS $1"; else echo "FAIL $1: $(grep -E 'snapshot|panic|error' $WORK/snap.log | head -2)"; cp "$file" "$OUT/$1.saved" 2>/dev/null; fi
     kill $mud $ls 2>/dev/null; wait $mud $ls 2>/dev/null
     rm -rf "$WORK"
 }
@@ -32,7 +33,7 @@ run world worlds "open:world-selector;win:worlds;down:420,652;up:420,652;down:40
 # The editors: a key captured for Cursor Left, then Save; a colour picked for bg, then Save;
 # a new action named over its selected placeholder name, then Save.
 run keybind keybind "open:keybind-editor;pump:800;win:keybind;down:100,90;up:100,90;down:600,262;up:600,262;key:f7;pump:500;down:771,22;up:771,22;pump:1000" "F7" keybindings.dat
-run theme theme "open:theme-editor;pump:800;win:theme;down:100,95;up:100,95;down:440,100;up:440,100;wait:100;pump:600;down:785,24;up:785,24;pump:1000" "^bg = #(?!131926)" theme.dat
+run theme theme "open:theme-editor;pump:800;win:theme;down:100,95;up:100,95;down:440,100;up:440,100;wait:100;pump:600;down:785,24;up:785,24;pump:1000" "\\[theme:dark\\][^\\[]*\\nbg = #(?!131926)" theme.dat
 run actioneditor action "open:action-editor;pump:800;win:action;down:140,140;up:140,140;text:heal;down:910,603;up:910,603;pump:1000" "^\[action:heal\]"
 # Closing the Action editor with an unsaved new action asks first; its Save saves, and the
 # window closes (so the main window is the one photographed).

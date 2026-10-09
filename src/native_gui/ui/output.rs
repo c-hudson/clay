@@ -73,7 +73,26 @@ pub struct OutputSnapshot {
     pub selection_bg: Rgb,
     /// The link under the mouse: (line, bytes), drawn brighter (`.output-link:hover`).
     pub hover_link: Option<(u64, Range<usize>)>,
+    /// A scrollbar that stays, with its track, rather than the thumb that shows for a
+    /// moment after a scroll: a grep window's, which has nothing else on screen.
+    pub scrollbar: bool,
 }
+
+/// A grep window's scrollbar, as last laid out (window coordinates).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Bar {
+    pub left: f32,
+    pub top: f32,
+    pub height: f32,
+    pub thumb_top: f32,
+    pub thumb_h: f32,
+    /// Rows in all, when they're more than the view holds (else nothing to drag).
+    total: usize,
+}
+
+/// The scrollbar's width, and the gap between it and the window's edge.
+const BAR_W: f32 = 8.0;
+const BAR_GAP: f32 = 1.0;
 
 /// One painted row, for finding what's under the mouse.
 #[derive(Clone, Debug, Default)]
@@ -120,6 +139,8 @@ pub struct Scroll {
     /// the scroll thumb shows for a moment after any move.
     pos_key: Option<PosKey>,
     moved_at: Option<Instant>,
+    /// A grep window's scrollbar, as last laid out.
+    pub bar: Option<Bar>,
 }
 
 pub type ScrollHandle = Rc<RefCell<Scroll>>;
@@ -141,6 +162,7 @@ impl Default for Scroll {
             row_h: 16.0,
             pos_key: None,
             moved_at: None,
+            bar: None,
         }
     }
 }
@@ -160,6 +182,25 @@ impl Scroll {
 
     pub fn at_bottom(&self) -> bool {
         self.follow || self.rows_below == 0
+    }
+
+    /// The scrollbar, if (x, y) is on it.
+    pub fn bar_at(&self, x: f32, y: f32) -> Option<Bar> {
+        self.bar.filter(|b| x >= b.left - 2.0 && y >= b.top && y < b.top + b.height)
+    }
+
+    /// Put the thumb's top at window y, as far as it goes: the view follows.
+    pub fn drag_thumb_to(&mut self, thumb_top: f32) {
+        let Some(b) = self.bar else { return };
+        if b.total <= self.view_rows {
+            return;
+        }
+        let travel = (b.height - b.thumb_h).max(1.0);
+        let ratio = ((thumb_top - b.top) / travel).clamp(0.0, 1.0);
+        let scrollable = b.total - self.view_rows;
+        let above_now = scrollable.saturating_sub(self.rows_below) as isize;
+        let above = (ratio * scrollable as f32).round() as isize;
+        self.by(above - above_now);
     }
 
     /// What's under window point (x, y), as of the last frame: the nearest character
@@ -531,9 +572,11 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         ch: ts.ch_advance(primary, font_size).map(f32::from).unwrap_or(snapshot.font_size * 0.6),
     };
 
+    // A scrollbar that stays keeps its strip clear of text.
+    let bar_w = if snapshot.scrollbar { BAR_W + BAR_GAP } else { 0.0 };
     let content = Bounds::new(
         point(bounds.origin.x + px(PAD_X), bounds.origin.y + px(PAD_Y)),
-        size(bounds.size.width - px(2.0 * PAD_X), bounds.size.height - px(2.0 * PAD_Y)),
+        size(bounds.size.width - px(2.0 * PAD_X + bar_w), bounds.size.height - px(2.0 * PAD_Y)),
     );
     let width = f32::from(content.size.width).max(metrics.ch);
     let height = f32::from(content.size.height);
@@ -590,7 +633,21 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         st.moved_at = Some(now);
     }
     st.pos_key = Some(key);
-    let thumb = st.moved_at.and_then(|at| {
+    let h = f32::from(bounds.size.height);
+    let place = |above: usize, opacity: f32| {
+        let thumb_h = (view_rows as f32 / total as f32 * h).max(20.0);
+        let ratio = above as f32 / (total - view_rows) as f32;
+        (f32::from(bounds.origin.y) + ratio.clamp(0.0, 1.0) * (h - thumb_h), thumb_h, opacity)
+    };
+    st.bar = None;
+    let thumb = if snapshot.scrollbar {
+        let left = f32::from(bounds.origin.x + bounds.size.width) - BAR_W - BAR_GAP;
+        let top = f32::from(bounds.origin.y);
+        let thumb = (total > view_rows).then(|| place(total.saturating_sub(below + view_rows), 1.0));
+        let (thumb_top, thumb_h) = thumb.map_or((top, h), |(t, th, _)| (t, th));
+        st.bar = Some(Bar { left, top, height: h, thumb_top, thumb_h, total });
+        thumb
+    } else { st.moved_at.and_then(|at| {
         let t = now.saturating_duration_since(at).as_secs_f32();
         let opacity = if t < THUMB_SHOWN { 1.0 } else { 1.0 - (t - THUMB_SHOWN) / THUMB_FADE };
         if opacity <= 0.0 || total <= view_rows {
@@ -599,12 +656,8 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         // Wake for the fade.
         let next = if t < THUMB_SHOWN { at + std::time::Duration::from_secs_f32(THUMB_SHOWN) } else { now + std::time::Duration::from_millis(16) };
         emoji::wake_at(next);
-        let h = f32::from(bounds.size.height);
-        let thumb_h = (view_rows as f32 / total as f32 * h).max(20.0);
-        let above = total.saturating_sub(below + view_rows);
-        let ratio = above as f32 / (total - view_rows) as f32;
-        Some((f32::from(bounds.origin.y) + ratio.clamp(0.0, 1.0) * (h - thumb_h), thumb_h, opacity))
-    });
+        Some(place(total.saturating_sub(below + view_rows), opacity))
+    }) };
     drop(st);
 
     // The visible rows, top to bottom.
@@ -944,8 +997,17 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
             emoji::wake_at(t);
         }
 
-        // The scroll thumb: 5px wide, 1px from the right edge, translucent white.
-        if let Some((top, h, opacity)) = p.thumb {
+        if p.snapshot.scrollbar {
+            // A grep window's scrollbar: a faint track, and the thumb on it.
+            let left = bounds.origin.x + bounds.size.width - px(BAR_W + BAR_GAP);
+            let track = Bounds::new(point(left, bounds.origin.y), size(px(BAR_W), bounds.size.height));
+            window.paint_quad(fill(track, hsla_alpha([255, 255, 255], 0.06)).corner_radii(px(4.0)));
+            if let Some((top, h, _)) = p.thumb {
+                let b = Bounds::new(point(left, px(top)), size(px(BAR_W), px(h)));
+                window.paint_quad(fill(b, hsla_alpha([255, 255, 255], 0.35)).corner_radii(px(4.0)));
+            }
+        } else if let Some((top, h, opacity)) = p.thumb {
+            // The scroll thumb: 5px wide, 1px from the right edge, translucent white.
             let b = Bounds::new(point(bounds.origin.x + bounds.size.width - px(6.0), px(top)), size(px(5.0), px(h)));
             window.paint_quad(fill(b, hsla_alpha([255, 255, 255], 0.25 * opacity)).corner_radii(px(3.0)));
         }

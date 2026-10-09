@@ -205,7 +205,7 @@ impl World {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RequestKind {
+pub(crate) enum RequestKind {
     GapFill,
     Backfill,
     InitialFill,
@@ -222,6 +222,11 @@ enum Phase {
     Closed,
 }
 
+/// A scrollback request in flight: what it was for, its world, when to give up on it.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingRequest(RequestKind, usize, Instant);
+
+#[derive(Clone)]
 pub struct ClientCore {
     /// How many `InitialState`s have come (a new one means the worlds were sent afresh).
     pub initial_states: u64,
@@ -685,6 +690,27 @@ impl ClientCore {
     }
 
     /// Anything else the GUI sends (commands and the like), if connected.
+    /// A copy for another window of this connection (see `Session::follower`): the same
+    /// worlds, output and settings, then the same messages as they come. Its own requests
+    /// are numbered apart from this one's, so the two can never answer to each other's.
+    pub fn follower(&self) -> ClientCore {
+        let mut c = self.clone();
+        c.out.clear();
+        c.next_request_id = c.next_request_id.max(1) + (1 << 40);
+        c
+    }
+
+    /// The scrollback request `id`, if this core made it and it's still waiting.
+    pub fn pending_request(&self, id: u64) -> Option<PendingRequest> {
+        self.requests.get(&id).map(|&(k, w, at)| PendingRequest(k, w, at))
+    }
+
+    /// Take on another core's request (a follower, before the answer to its leader's
+    /// request): so the answer lands in the same place in both.
+    pub fn adopt_request(&mut self, id: u64, request: PendingRequest) {
+        self.requests.insert(id, (request.0, request.1, request.2));
+    }
+
     pub fn send_message(&mut self, msg: WsMessage) -> Vec<Effect> {
         if self.is_online() {
             self.send(msg);

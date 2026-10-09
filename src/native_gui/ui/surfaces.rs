@@ -245,6 +245,13 @@ impl ClayView {
 
     /// Retry now (the connection log's Retry, Connection Lost's Reconnect).
     pub(super) fn reconnect_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(leader) = self.link.leader.clone() {
+            // The connection is the main window's.
+            cx.defer(move |cx| {
+                let _ = leader.update(cx, |v, cx| v.reconnect_now(cx));
+            });
+            return;
+        }
         self.surf.conn_log.attempts.clear();
         self.surf.conn_log.retry = false;
         let fx = self.session.core.reconnect_now();
@@ -441,19 +448,6 @@ impl ClayView {
         self.open_window(Win::Notes(index), move |main, window, cx| cx.new(|cx| NoteView::notes(main, index, &name, window, cx)), |_, _, _| {}, cx);
     }
 
-    /// A window of output of its own: `/window <world>`, New Window, `/window --grep`. It
-    /// logs in again with this window's credentials, as the WebView's windows do.
-    pub(super) fn open_view(&mut self, mode: super::viewmode::ViewMode, title: String, size: (f32, f32), cx: &mut Context<Self>) {
-        let Some(runtime) = super::RUNTIME.get().cloned() else { return };
-        let target = self.session.target.clone();
-        let creds = self.session.core.credentials();
-        let fonts = self.fonts.clone();
-        cx.defer(move |cx| {
-            let (session, events) = crate::native_gui::core::session::Session::with_credentials(&runtime, target, creds);
-            super::open_view_window(cx, fonts, session, events, mode, super::ViewWindow { title: title.into(), size, is_main: false });
-        });
-    }
-
     /// `/window [world]` (the server's OpenWindow, which has connected the world) and the
     /// menu's New Window: a whole client in a window, kept to that world if there is one.
     pub(super) fn open_world_window(&mut self, world: Option<String>, cx: &mut Context<Self>) {
@@ -501,6 +495,12 @@ impl ClayView {
 
     /// Follow the connection: the log's rows, when it shows, and a held command.
     pub(super) fn watch_status(&mut self, cx: &mut Context<Self>) {
+        if self.is_follower() {
+            // The connection's dialogs are the main window's; a command held here still
+            // goes once it's back.
+            self.resend_held(cx);
+            return;
+        }
         let now = match self.session.core.status() {
             Status::Idle => Seen::Idle,
             Status::Connecting { attempt } => Seen::Connecting(*attempt),

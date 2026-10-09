@@ -727,3 +727,52 @@ fn reconnect_now_skips_the_countdown_and_only_when_closed() {
     h.initial(vec![world_msg(0, "A", 0..2, 1)]);
     assert_eq!(h.core.initial_states, 2, "a held command waits for this");
 }
+
+#[test]
+fn a_follower_keeps_up_with_its_leader_and_shows_a_world_of_its_own() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..3, 9), world_msg(1, "B", 0..2, 9)]);
+    h.drain();
+    let mut f = h.core.follower();
+    let _ = f.switch_world(1, h.now);
+    assert_eq!((h.core.current, f.current), (0, 1), "each has its own world on screen");
+    let m = data(0, 3, "three\n");
+    h.msg(m.clone());
+    let _ = f.handle(Input::Message(Box::new(m)), h.now);
+    let texts = |c: &ClientCore| c.worlds[0].lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>();
+    assert_eq!(texts(&h.core), texts(&f));
+}
+
+#[test]
+fn a_gap_fill_lands_in_a_follower_as_it_does_in_its_leader() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..5, 9)]);
+    let mut f = h.core.follower();
+    let ten = data(0, 10, "ten\n"); // a hole, 5..9
+    h.msg(ten.clone());
+    let _ = f.handle(Input::Message(Box::new(ten)), h.now);
+    h.sent();
+    h.msg(WsMessage::ResyncRequired { world_index: 0, from_seq: 4 });
+    let id = h.sent().iter().find_map(|m| if let WsMessage::RequestScrollback { request_id, .. } = m { *request_id } else { None }).expect("leader asks");
+    // The follower's own requests (never sent) are numbered apart from the leader's.
+    let mine = f.handle(Input::Message(Box::new(WsMessage::ResyncRequired { world_index: 0, from_seq: 4 })), h.now);
+    let my_id = mine
+        .iter()
+        .find_map(|e| match e {
+            Effect::Send(m) => match &**m {
+                WsMessage::RequestScrollback { request_id, .. } => *request_id,
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("follower asks too");
+    assert_ne!(id, my_id);
+    // The answer to the leader's request, taken on first, lands the same in both.
+    let fill = WsMessage::ScrollbackLines { world_index: 0, lines: (5..10).map(|s| tl(s, "fill")).collect(), backfill_complete: false, clamped_by_pending: false, request_id: Some(id) };
+    f.adopt_request(id, h.core.pending_request(id).expect("still waiting"));
+    h.msg(fill.clone());
+    let _ = f.handle(Input::Message(Box::new(fill)), h.now);
+    assert_eq!(h.seqs(0), f.worlds[0].lines.iter().filter_map(|l| l.seq).collect::<Vec<_>>());
+    assert_eq!(h.core.worlds[0].seen.frontier(), 10);
+    assert_eq!(f.worlds[0].seen.frontier(), 10);
+}
