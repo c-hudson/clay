@@ -93,9 +93,9 @@ note = ""
 id = "msg:EchoMaskChanged"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "handle EchoMaskChanged"
-note = ""
+note = "dots in the input"
 
 [[item]]
 id = "msg:ExecuteLocalCommand"
@@ -165,9 +165,9 @@ note = "core adopt_key"
 id = "msg:KeybindingsUpdated"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "handle KeybindingsUpdated"
-note = ""
+note = "keys follow the new table"
 
 [[item]]
 id = "msg:LoggedOut"
@@ -301,9 +301,9 @@ note = "wake check"
 id = "msg:PromptUpdate"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "handle PromptUpdate"
-note = "core stores the prompt; drawn with the input in phase 3"
+note = "drawn beside the input"
 
 [[item]]
 id = "msg:ReleasedNew"
@@ -365,9 +365,9 @@ note = ""
 id = "msg:SetInputBuffer"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "handle SetInputBuffer"
-note = ""
+note = "fills the input"
 
 [[item]]
 id = "msg:ShowTagsChanged"
@@ -525,17 +525,17 @@ note = "ui/actions.rs (a no-op, as in app.js)"
 id = "action:capitalize_word"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action capitalize_word"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:clear_line"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action clear_line"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:clear_screen"
@@ -549,121 +549,121 @@ note = "ui/actions.rs"
 id = "action:collapse_spaces"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action collapse_spaces"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:completion"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action completion"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:cursor_down"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action cursor_down"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:cursor_end"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action cursor_end"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:cursor_home"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action cursor_home"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:cursor_left"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action cursor_left"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:cursor_right"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action cursor_right"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:cursor_up"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action cursor_up"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:cursor_word_left"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action cursor_word_left"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:cursor_word_right"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action cursor_word_right"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:delete_backward"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action delete_backward"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:delete_forward"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action delete_forward"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:delete_word_backward"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action delete_word_backward"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:delete_word_backward_punct"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action delete_word_backward_punct"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:delete_word_forward"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action delete_word_forward"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:emoji_picker"
@@ -677,9 +677,9 @@ note = ""
 id = "action:expand_line"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action expand_line"
-note = ""
+note = "ui/actions.rs (no-op, as in app.js)"
 
 [[item]]
 id = "action:filter_popup"
@@ -701,9 +701,9 @@ note = "ui/actions.rs"
 id = "action:goto_matching_bracket"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action goto_matching_bracket"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:help"
@@ -717,177 +717,177 @@ note = ""
 id = "action:history_next"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action history_next"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:history_prev"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action history_prev"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:history_search_backward"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action history_search_backward"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:history_search_forward"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action history_search_forward"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:input_grow"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action input_grow"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:input_shrink"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action input_shrink"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:insert_last_arg"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action insert_last_arg"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_0"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_0"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_1"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_1"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_2"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_2"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_3"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_3"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_4"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_4"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_5"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_5"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_6"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_6"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_7"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_7"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_8"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_8"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_9"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_9"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kbnum_negative"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kbnum_negative"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kill_to_end"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kill_to_end"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:kill_to_start"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action kill_to_start"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:literal_next"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action literal_next"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:lowercase_word"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action lowercase_word"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:pause_output"
@@ -909,17 +909,17 @@ note = ""
 id = "action:recall_begin"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action recall_begin"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:recall_end"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action recall_end"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:redraw"
@@ -941,9 +941,9 @@ note = "ui/actions.rs"
 id = "action:refresh_line"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action refresh_line"
-note = ""
+note = "redraws (ui/actions.rs)"
 
 [[item]]
 id = "action:reload"
@@ -957,9 +957,9 @@ note = ""
 id = "action:scramble_words"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action scramble_words"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:scroll_half_page"
@@ -1045,9 +1045,9 @@ note = ""
 id = "action:spell_check"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action spell_check"
-note = ""
+note = "a no-op, as in app.js (suggestions are on the right-click menu)"
 
 [[item]]
 id = "action:suspend"
@@ -1061,9 +1061,9 @@ note = ""
 id = "action:tab_key"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action tab_key"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:toggle_action_highlight"
@@ -1085,9 +1085,9 @@ note = ""
 id = "action:toggle_insert"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action toggle_insert"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:toggle_limit"
@@ -1109,17 +1109,17 @@ note = "ui/actions.rs"
 id = "action:transpose_chars"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action transpose_chars"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:uppercase_word"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action uppercase_word"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_activity"
@@ -1197,9 +1197,9 @@ note = "ui/actions.rs"
 id = "action:yank"
 section = "input"
 phase = 3
-status = "todo"
+status = "done"
 feature = "action yank"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "wire:ServerHello"
@@ -2642,6 +2642,86 @@ phase = 2
 status = "done"
 feature = "key -> action resolution from the server key map (needed by output/navigation actions)"
 note = "core::keys (2a): server binds, then the action table, then typed input"
+
+[[item]]
+id = "ui:input.line"
+section = "input"
+phase = 3
+status = "done"
+feature = "input line under the status bar: prompt beside the text, input_height rows, wrapping, scrolls to the caret, caret blinks 10 s after an edit"
+note = "core/input.rs + ui/input_view.rs"
+
+[[item]]
+id = "ui:input.editing"
+section = "input"
+phase = 3
+status = "done"
+feature = "every editing action, grapheme-correct (a ZWJ emoji or a flag is one Backspace), with the numeric prefix"
+note = "unit-tested in core/input.rs; a test fails if any bindable action lacks a native case"
+
+[[item]]
+id = "ui:input.send"
+section = "input"
+phase = 3
+status = "done"
+feature = "Enter sends; ^old^new; /reload restarts this client; the local-only commands of later phases say so; ExecuteLocalCommand"
+note = "more-mode releases and the prompt clears on send, as sendCommand does"
+
+[[item]]
+id = "ui:input.history"
+section = "input"
+phase = 3
+status = "done"
+feature = "history (1000, not at a password prompt), Esc-p/Esc-n prefix search, recall begin/end, last argument"
+note = ""
+
+[[item]]
+id = "ui:input.completion"
+section = "input"
+phase = 3
+status = "done"
+feature = "Tab completes /commands and pattern-less actions, narrowing as app.js does"
+note = "the command list is app.js's own INTERNAL_COMMANDS"
+
+[[item]]
+id = "ui:input.ime"
+section = "input"
+phase = 3
+status = "done"
+feature = "input methods compose in place (underlined), the window's keys stand aside while they do"
+note = "simulated composition verified headless; JA/ZH/KO on real input methods is a manual check"
+
+[[item]]
+id = "ui:input.clipboard"
+section = "input"
+phase = 3
+status = "done"
+feature = "select by mouse / Shift+arrows / double and triple click; copy, Ctrl+Shift+V / Shift+Insert / Cmd+V paste; right-click Cut/Copy/Paste/Select All"
+note = "Ctrl+V stays literal-next per the key table (web: B17)"
+
+[[item]]
+id = "ui:input.mask"
+section = "input"
+phase = 3
+status = "done"
+feature = "a dot per character while the world is echo-masked"
+note = ""
+
+[[item]]
+id = "ui:input.spell"
+section = "input"
+phase = 3
+status = "done"
+feature = "misspelled words get a red wavy underline; suggestions on right-click"
+note = "ISpellChecker on Windows, NSSpellChecker on macOS, spell.rs on Linux or with a dictionary file"
+
+[[item]]
+id = "ui:input.temperature"
+section = "input"
+phase = 3
+status = "done"
+feature = "typed temperatures converted when temp_convert_enabled"
+note = ""
 
 [[item]]
 id = "ui:perf.targets"

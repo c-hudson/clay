@@ -144,7 +144,12 @@ mod tests {
     /// On a system with its own checker, it knows English.
     #[test]
     fn the_system_checker_knows_common_words() {
-        let Some(n) = super::Native::new() else { return };
+        // Windows and macOS always have one; elsewhere there's nothing to test.
+        let n = super::Native::new();
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(n.is_some(), "no system spell checker");
+        }
+        let Some(n) = n else { return };
         assert!(n.is_valid("the"));
         assert!(!n.is_valid("qwzxv"));
         assert!(n.suggestions("teh", 5).iter().any(|s| s == "the"), "{:?}", n.suggestions("teh", 5));
