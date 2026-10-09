@@ -24,7 +24,6 @@ pub enum Kind {
     ConnectionLog,
     Reconnect,
     Password,
-    Menu,
     /// The "?" of a dialog (app.js `popupHelpTexts`): over the dialog it explains.
     Help,
     CertMismatch,

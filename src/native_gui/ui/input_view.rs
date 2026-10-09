@@ -693,7 +693,9 @@ impl ClayView {
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
             }
-            "/menu" => self.later(|v, window, cx| v.open_surface("menu", window, cx), cx),
+            // The console's menu (this window has its menu button). A server from before
+            // /menu went console-only still sends it here: answer it, don't return it.
+            "/menu" => self.client_line("/menu is the console's menu; here, use the menu button (\u{2630}).", cx),
             "/help" => self.later(|v, window, cx| v.open_surface("help", window, cx), cx),
             "/note" => {
                 if command.split_whitespace().nth(1).is_some() {

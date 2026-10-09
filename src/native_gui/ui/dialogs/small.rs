@@ -288,96 +288,6 @@ impl Render for Password {
     }
 }
 
-// ---- /menu --------------------------------------------------------------------------
-
-/// app.js `menuItems`: what /menu offers (its commands are run as if typed). The web's
-/// markup lists only five of these and maps clicks by position (B22); this is the list
-/// its keys and commands use.
-pub const MENU: &[(&str, &str)] = &[
-    ("Help", "/help"),
-    ("Settings", "/setup"),
-    ("Web Settings", "/web"),
-    ("Font", "/font"),
-    ("Actions", "/actions"),
-    ("World Selector", "/worlds"),
-    ("Connected Worlds", "/connections"),
-];
-
-pub struct Menu {
-    main: WeakEntity<ClayView>,
-    focus: FocusHandle,
-    selected: usize,
-}
-
-impl Menu {
-    pub fn new(main: WeakEntity<ClayView>, cx: &mut Context<Self>) -> Self {
-        Self { main, focus: cx.focus_handle(), selected: 0 }
-    }
-
-    fn choose(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(DialogEvent::Close);
-        let command = MENU[i].1;
-        let _ = self.main.update(cx, |v, cx| v.run_typed(command, window, cx));
-    }
-}
-
-impl EventEmitter<DialogEvent> for Menu {}
-impl Focusable for Menu {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
-    }
-}
-
-impl Render for Menu {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(k) = kit(&self.main, cx) else { return div().into_any_element() };
-        let items = MENU.iter().enumerate().map(|(i, (label, _))| {
-            let selected = i == self.selected;
-            let hover = k.t.hover;
-            let row = div().id(("menu-item", i)).px(px(12.0)).py(px(8.0)).rounded(px(4.0)).cursor_pointer().child(*label);
-            let row = if selected {
-                row.bg(k.t.accent).text_color(gpui::black()).font_weight(FontWeight::BOLD)
-            } else {
-                row.text_color(k.t.fg).hover(move |s| s.bg(hover))
-            };
-            row.on_click(cx.listener(move |this, _, w, cx| this.choose(i, w, cx)))
-        });
-        let main = self.main.clone();
-        k.panel("menu")
-            .track_focus(&self.focus)
-            .min_w(px(200.0))
-            .max_w(px(280.0))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                let n = MENU.len();
-                match ev.keystroke.key.as_str() {
-                    "escape" => cx.emit(DialogEvent::Close),
-                    "up" => this.selected = (this.selected + n - 1) % n,
-                    "down" => this.selected = (this.selected + 1) % n,
-                    "enter" => this.choose(this.selected, window, cx),
-                    _ => return,
-                }
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .child(k.heading("Menu"))
-            .child(div().flex().flex_col().gap(px(2.0)).children(items))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .pt(px(8.0))
-                    .border_t_1()
-                    .border_color(k.t.border_subtle)
-                    .child(k.help_button("menu-help", move |_, window, cx| {
-                        let _ = main.update(cx, |v, cx| v.open_help("menu", window, cx));
-                    }))
-                    .child(div().flex_1().text_center().text_size(px(11.0)).text_color(k.t.dim).child("↑↓ select, Enter open, Esc close")),
-            )
-            .into_any_element()
-    }
-}
-
 // ---- A yes/no question --------------------------------------------------------------
 
 /// What Yes does.
@@ -737,14 +647,12 @@ mod tests {
 
     #[test]
     fn the_help_texts_come_out_of_app_js() {
-        let menu = help_text("menu").expect("menu help");
-        assert!(menu.len() > 2, "{menu:?}");
         let world = help_text("worldEditor").expect("world editor help");
         assert!(world.iter().any(|l| !l.is_empty()));
         assert!(help_text("clay-server").is_some(), "a quoted key");
         assert!(help_text("nonesuch").is_none());
         // Every key a dialog asks for exists.
-        for key in ["setup", "web", "worldEditor", "worldSelector", "actionsList", "actionEditor", "connections", "menu"] {
+        for key in ["setup", "web", "worldEditor", "worldSelector", "actionsList", "actionEditor", "connections"] {
             assert!(help_text(key).is_some_and(|l| !l.is_empty()), "{key}");
         }
     }

@@ -2759,9 +2759,9 @@ note = "app.js showPasswordModal"
 id = "ui:dialog.menu"
 section = "dialogs"
 phase = 4
-status = "done"
-feature = "/menu: the seven menuItems, arrows wrap, Enter runs, ? help (B22: the web's markup maps clicks wrongly)"
-note = "app.js openMenuPopup"
+status = "waived"
+feature = "/menu"
+note = "console-only by ruling (2026-10-09): the GUI has its menu bar; /menu answers with a pointer to it, as the web client does"
 
 [[item]]
 id = "ui:dialog.popup_help"

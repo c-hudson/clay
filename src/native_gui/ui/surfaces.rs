@@ -6,7 +6,7 @@
 use gpui::{AppContext, Context, Window};
 
 use super::ClayView;
-use super::dialogs::small::{Attempt, CertChanged, ConnLog, ConnectionLog, Import, ImportCreds, ImportInsecure, Menu, Password, Reconnect};
+use super::dialogs::small::{Attempt, CertChanged, ConnLog, ConnectionLog, Import, ImportCreds, ImportInsecure, Password, Reconnect};
 use super::dialogs::{self, Host, Kind};
 use super::kit::Kit;
 use crate::native_gui::core::client::Status;
@@ -121,10 +121,6 @@ impl ClayView {
     pub(super) fn open_surface(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let main = cx.entity().downgrade();
         match name {
-            "menu" => {
-                let v = cx.new(|cx| Menu::new(main, cx));
-                dialogs::open(self, Kind::Menu, v, window, cx);
-            }
             "import" => self.open_import("", window, cx),
             "change-password" => {
                 let v = cx.new(|cx| Password::new(main, window, cx));
@@ -225,12 +221,6 @@ impl ClayView {
         dialogs::open(self, Kind::Import, v, window, cx);
     }
 
-    /// A dialog's "?" (app.js `openPopupHelp`).
-    pub(super) fn open_help(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let main = cx.entity().downgrade();
-        dialogs::open_help(self, main, key, window, cx);
-    }
-
     /// Run `f` on the content of the window of `kind`, if it's open, in that window.
     pub(super) fn in_window<V: 'static>(&mut self, kind: super::windows::Kind, f: impl FnOnce(&mut V, &mut Window, &mut Context<V>) + 'static, cx: &mut Context<Self>) {
         let (Some(frame), Some(handle)) = (self.windows.frame(kind), self.windows.handle_of(kind)) else { return };
@@ -251,13 +241,6 @@ impl ClayView {
         let fx = self.session.core.client_line(text);
         let rest = self.session.apply(fx);
         self.after(rest, cx);
-    }
-
-    /// Run `command` as if it had been typed (the /menu's choices).
-    pub(super) fn run_typed(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.clear();
-        self.editor.insert(command);
-        self.send_line(window, cx);
     }
 
     /// Retry now (the connection log's Retry, Connection Lost's Reconnect).
@@ -640,7 +623,7 @@ impl ClayView {
     pub(super) fn snapshot_open(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
         let main = cx.entity().downgrade();
         match what.split_once('=') {
-            Some(("help", key)) => self.open_help(key, window, cx),
+            Some(("help", key)) => dialogs::open_help(self, main, key, window, cx),
             _ => match what {
                 "reconnect" => self.connection_lost("look".into(), window, cx),
                 "cert" => {
