@@ -156,6 +156,11 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
             println!("snapshot-clipboard: {}", text.replace('\n', "\\n"));
         }
     }
+    // CLAY_SNAPSHOT_BENCH=1: time frames scrolling the buffer and taking in 200 lines a
+    // second, and report memory (the CPU side of the phase 2 performance targets).
+    if std::env::var_os("CLAY_SNAPSHOT_BENCH").is_some() {
+        bench(&mut cx, window.into());
+    }
     match cx.capture_screenshot(window.into()) {
         Ok(image) => {
             if let Err(e) = image.save(out) {
@@ -169,6 +174,106 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
             std::process::exit(1);
         }
     }
+}
+
+/// Frame-time statistics, in milliseconds: mean, 95th percentile, worst.
+fn stats(mut ms: Vec<f64>) -> (f64, f64, f64) {
+    ms.sort_by(f64::total_cmp);
+    let mean = ms.iter().sum::<f64>() / ms.len().max(1) as f64;
+    let p95 = ms.get(ms.len() * 95 / 100).copied().unwrap_or(0.0);
+    (mean, p95, ms.last().copied().unwrap_or(0.0))
+}
+
+fn rss_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()))
+        .map_or(0.0, |kb| kb / 1024.0)
+}
+
+fn bench(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle) {
+    let draw = |cx: &mut HeadlessAppContext| -> f64 {
+        let t = Instant::now();
+        cx.update_window(window, |_, window, app| {
+            let _ = window.draw(app);
+        })
+        .expect("draw");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+    let with_view = |cx: &mut HeadlessAppContext, f: &mut dyn FnMut(&mut ClayView, &mut gpui::Context<ClayView>)| {
+        cx.update_window(window, |root, _w, app| {
+            if let Ok(view) = root.downcast::<ClayView>() {
+                view.update(app, |v, cx| f(v, cx));
+            }
+        })
+        .expect("update the view");
+    };
+    let mut lines = 0;
+    with_view(cx, &mut |v, _| lines = v.session.core.current_world().map_or(0, |w| w.lines.len()));
+    println!("bench: {lines} lines in the current world, RSS {:.0} MB", rss_mb());
+
+    // Scrolling: three rows a frame (a wheel notch) up through the buffer, then a page at a
+    // time back down, 600 frames.
+    let mut ms = Vec::new();
+    for k in 0..600 {
+        let rows = if k < 400 { -3 } else { 30 };
+        with_view(cx, &mut |v, cx| {
+            v.user_scroll(rows);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        ms.push(draw(cx));
+    }
+    let (mean, p95, worst) = stats(ms);
+    println!("bench: scroll  frames {mean:.2} ms mean, {p95:.2} ms p95, {worst:.2} ms worst (60 fps = 16.7 ms)");
+
+    // Incoming: 200 lines a second at 60 frames a second, following the bottom, 10 s.
+    with_view(cx, &mut |v, _| v.scroll.borrow_mut().follow_bottom());
+    let (mut ms, mut work) = (Vec::new(), 0.0);
+    let (mut core_s, mut after_s) = (0.0f64, 0.0f64);
+    let started = Instant::now();
+    for frame in 0..600u64 {
+        let due = ((frame + 1) * 200 / 60) - (frame * 200 / 60);
+        with_view(cx, &mut |v, cx| {
+            let (world_index, next) = (v.session.core.current, v.session.core.current_world().map_or(0, |w| w.seen.max_seen() + 1));
+            for i in 0..due {
+                let seq = next + i;
+                let msg = crate::websocket::WsMessage::ServerData {
+                    world_index,
+                    data: format!("\x1b[1;32mbench\x1b[0m line {seq}: the quick brown fox jumps over the lazy dog, again and again until it wraps\n"),
+                    is_viewed: true,
+                    ts: 0,
+                    from_server: true,
+                    seq,
+                    end_seq: Some(seq),
+                    flush: false,
+                    gagged: false,
+                    archive_sourced: false,
+                    highlight_colors: Vec::new(),
+                };
+                let t0 = Instant::now();
+                let fx = v.session.handle(crate::native_gui::core::client::Input::Message(Box::new(msg)));
+                let t1 = Instant::now();
+                v.after(fx, cx);
+                core_s += (t1 - t0).as_secs_f64();
+                after_s += t1.elapsed().as_secs_f64();
+            }
+        });
+        // (The test executor's own turn isn't counted: the real event loop has none.)
+        cx.run_until_parked();
+        let frame_ms = draw(cx);
+        ms.push(frame_ms);
+        work += frame_ms / 1000.0;
+    }
+    work += core_s + after_s;
+    let (mean, p95, worst) = stats(ms);
+    println!(
+        "bench: incoming frames {mean:.2} ms mean, {p95:.2} ms p95, {worst:.2} ms worst; drawing every frame and handling the lines took {:.1}% of one core over 10 s of 200 lines/s (ran in {:.1} s)",
+        work / 10.0 * 100.0,
+        started.elapsed().as_secs_f64()
+    );
+    println!("bench: of which the client core {:.0} ms and the view's follow-up {:.0} ms", core_s * 1000.0, after_s * 1000.0);
+    println!("bench: RSS {:.0} MB after", rss_mb());
 }
 
 fn fail(why: &str) -> ! {

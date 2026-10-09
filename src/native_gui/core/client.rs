@@ -763,6 +763,15 @@ impl ClientCore {
             }
             WsMessage::AuthResponse { success, error, multiuser_mode, .. } => self.on_auth_response(success, error, multiuser_mode),
             WsMessage::KeyGenerated { auth_key } => self.adopt_key(auth_key),
+            WsMessage::ThemeCssVarsUpdated { colors_json, .. } => {
+                // A live theme edit (the theme editor): the colours as the settings carry them.
+                if let Some(s) = self.settings.as_mut() {
+                    if !colors_json.is_empty() && s.theme_colors_json != colors_json {
+                        s.theme_colors_json = colors_json;
+                        self.changed();
+                    }
+                }
+            }
             WsMessage::LoggedOut => {
                 // Multiuser: this login is over; the connection stays for the next one.
                 self.worlds.clear();

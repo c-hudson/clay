@@ -683,3 +683,11 @@ fn the_world_last_shown_wins_over_the_servers_current_one() {
     h.initial(vec![world_msg(0, "A", 0..2, 1), world_msg(1, "B", 0..2, 2)]);
     assert_eq!(h.core.current, 0);
 }
+
+#[test]
+fn a_live_theme_edit_reaches_the_settings() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 1)]);
+    h.msg(WsMessage::ThemeCssVarsUpdated { css_vars: String::new(), colors_json: r##"{"bg":"#000000"}"##.into() });
+    assert_eq!(h.core.settings.as_ref().unwrap().theme_colors_json, r##"{"bg":"#000000"}"##);
+}

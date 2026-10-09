@@ -21,9 +21,9 @@ note = "actions list for the Actions window and tiles"
 id = "msg:ActivityUpdate"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle ActivityUpdate"
-note = "activity count in the status bar"
+note = "ACT badge"
 
 [[item]]
 id = "msg:AnsiMusic"
@@ -53,9 +53,9 @@ note = ""
 id = "msg:CalculatedWorld"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle CalculatedWorld"
-note = "reply to Calculate*World: switch locally"
+note = "switches locally (core)"
 
 [[item]]
 id = "msg:CertMismatch"
@@ -117,17 +117,17 @@ note = "core stores settings; ui applies theme/font/show_tags"
 id = "msg:GmcpData"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle GmcpData"
-note = "status display / stats"
+note = "nothing to do: app.js keeps nothing either; the stats panel comes from StatsUpdate"
 
 [[item]]
 id = "msg:GmcpUserToggled"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle GmcpUserToggled"
-note = ""
+note = "[g] after the world name"
 
 [[item]]
 id = "msg:ImportNeedsInsecureConfirm"
@@ -197,9 +197,9 @@ note = ""
 id = "msg:MsdpData"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle MsdpData"
-note = "status display / stats"
+note = "nothing to do: app.js keeps nothing either; the stats panel comes from StatsUpdate"
 
 [[item]]
 id = "msg:NoteEditorState"
@@ -213,9 +213,9 @@ note = ""
 id = "msg:NotesChanged"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle NotesChanged"
-note = "notes icon in the status bar"
+note = "notes icon"
 
 [[item]]
 id = "msg:Notification"
@@ -237,9 +237,9 @@ note = ""
 id = "msg:OutputLines"
 section = "output"
 phase = 2
-status = "todo"
+status = "waived"
 feature = "handle OutputLines"
-note = ""
+note = "only the reply to CycleWorld, which this client never sends (it asks Calculate*World and switches locally, as app.js does)"
 
 [[item]]
 id = "msg:PasswordChanged"
@@ -253,7 +253,7 @@ note = ""
 id = "msg:PausedState"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle PausedState"
 note = "PAUSED badge"
 
@@ -277,9 +277,9 @@ note = "core pending_count"
 id = "msg:PendingReleased"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle PendingReleased"
-note = "core re-drives gap fill (done); local more-mode release is phase 2"
+note = "local more-mode releases as many; counts afresh"
 
 [[item]]
 id = "msg:PingCheck"
@@ -381,7 +381,7 @@ note = ""
 id = "msg:StatsUpdate"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle StatsUpdate"
 note = "stats panel"
 
@@ -389,17 +389,17 @@ note = "stats panel"
 id = "msg:TfStatus"
 section = "status"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle TfStatus"
-note = "TF status row"
+note = "TF status rows"
 
 [[item]]
 id = "msg:ThemeCssVarsUpdated"
 section = "settings"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle ThemeCssVarsUpdated"
-note = "live theme change"
+note = "colours applied live (GlobalSettingsUpdated follows with the same)"
 
 [[item]]
 id = "msg:UnbanResult"
@@ -413,17 +413,17 @@ note = ""
 id = "msg:UnseenCleared"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle UnseenCleared"
-note = "core stores; drawn in phase 2"
+note = "world menu and ACT tooltip"
 
 [[item]]
 id = "msg:UnseenUpdate"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle UnseenUpdate"
-note = "core stores; drawn in phase 2"
+note = "world menu and ACT tooltip"
 
 [[item]]
 id = "msg:WorldAdded"
@@ -493,9 +493,9 @@ note = "core: pending, prompt, deliverable_high_seq gap check"
 id = "msg:WorldSwitchResult"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "handle WorldSwitchResult"
-note = ""
+note = "core"
 
 [[item]]
 id = "msg:WorldSwitched"
@@ -517,9 +517,9 @@ note = ""
 id = "action:bg_all_worlds"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action bg_all_worlds"
-note = ""
+note = "ui/actions.rs (a no-op, as in app.js)"
 
 [[item]]
 id = "action:capitalize_word"
@@ -541,9 +541,9 @@ note = ""
 id = "action:clear_screen"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action clear_screen"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:collapse_spaces"
@@ -685,17 +685,17 @@ note = ""
 id = "action:filter_popup"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action filter_popup"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:flush_output"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action flush_output"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:goto_matching_bracket"
@@ -893,9 +893,9 @@ note = ""
 id = "action:pause_output"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action pause_output"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:quit"
@@ -925,17 +925,17 @@ note = ""
 id = "action:redraw"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action redraw"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:redraw_server_only"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action redraw_server_only"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:refresh_line"
@@ -965,73 +965,73 @@ note = ""
 id = "action:scroll_half_page"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action scroll_half_page"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:scroll_half_page_back"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action scroll_half_page_back"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:scroll_line_back"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action scroll_line_back"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:scroll_line_forward"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action scroll_line_forward"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:scroll_page_back"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action scroll_page_back"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:scroll_page_down"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action scroll_page_down"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:scroll_page_up"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action scroll_page_up"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:search_popup"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action search_popup"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:selective_flush"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action selective_flush"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:show_version"
@@ -1069,9 +1069,9 @@ note = ""
 id = "action:toggle_action_highlight"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action toggle_action_highlight"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:toggle_gmcp_media"
@@ -1093,17 +1093,17 @@ note = ""
 id = "action:toggle_limit"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action toggle_limit"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:toggle_tags"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action toggle_tags"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:transpose_chars"
@@ -1125,73 +1125,73 @@ note = ""
 id = "action:world_activity"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_activity"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_all_next"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_all_next"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_all_prev"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_all_prev"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_forward"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_forward"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_next"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_next"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_prev"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_prev"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_previous"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_previous"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_socket_next"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_socket_next"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:world_socket_prev"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "action world_socket_prev"
-note = ""
+note = "ui/actions.rs"
 
 [[item]]
 id = "action:yank"
@@ -1236,10 +1236,10 @@ note = "handled: see msg:KeyGenerated"
 [[item]]
 id = "wire:RevokeKey"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire RevokeKey"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:KeyRevoked"
@@ -1252,50 +1252,50 @@ note = ""
 [[item]]
 id = "wire:RegenerateAuthKey"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire RegenerateAuthKey"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:SetPortMapping"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire SetPortMapping"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:FirewallRule"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire FirewallRule"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:LookupPublicIp"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire LookupPublicIp"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:RefreshReachability"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire RefreshReachability"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:ChangePassword"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire ChangePassword"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:PasswordChanged"
@@ -1309,9 +1309,9 @@ note = "handled: see msg:PasswordChanged"
 id = "wire:Logout"
 section = "wire"
 phase = 0
-status = "todo"
+status = "done"
 feature = "wire Logout"
-note = "sent by the web client"
+note = "menu (multiuser)"
 
 [[item]]
 id = "wire:LoggedOut"
@@ -1596,10 +1596,10 @@ note = "handled: see msg:EchoMaskChanged"
 [[item]]
 id = "wire:ToggleWorldGmcp"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire ToggleWorldGmcp"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:SendGmcp"
@@ -1629,9 +1629,9 @@ note = "sent by the web client"
 id = "wire:RunKeyBinding"
 section = "wire"
 phase = 0
-status = "todo"
+status = "done"
 feature = "wire RunKeyBinding"
-note = "sent by the web client"
+note = "server-bound keys"
 
 [[item]]
 id = "wire:SwitchWorld"
@@ -1644,10 +1644,10 @@ note = "not used by the web GUI (console/server only)"
 [[item]]
 id = "wire:ConnectWorld"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire ConnectWorld"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:CertMismatch"
@@ -1660,10 +1660,10 @@ note = "handled: see msg:CertMismatch"
 [[item]]
 id = "wire:TrustCertificate"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire TrustCertificate"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:DisconnectWorld"
@@ -1676,34 +1676,34 @@ note = "not used by the web GUI (console/server only)"
 [[item]]
 id = "wire:DeleteWorld"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire DeleteWorld"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:CreateWorld"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire CreateWorld"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:ReleasePending"
 section = "wire"
 phase = 0
-status = "todo"
+status = "done"
 feature = "wire ReleasePending"
-note = "sent by the web client"
+note = "more-mode release"
 
 [[item]]
 id = "wire:SelectiveFlush"
 section = "wire"
 phase = 0
-status = "todo"
+status = "done"
 feature = "wire SelectiveFlush"
-note = "sent by the web client"
+note = "Esc-J"
 
 [[item]]
 id = "wire:MarkWorldSeen"
@@ -1756,18 +1756,18 @@ note = "handled: see msg:WorldStateResponse"
 [[item]]
 id = "wire:UpdateWorldSettings"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire UpdateWorldSettings"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:ChatLookup"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire ChatLookup"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:ChatLookupResult"
@@ -1781,9 +1781,9 @@ note = "handled: see msg:ChatLookupResult"
 id = "wire:UpdateGlobalSettings"
 section = "wire"
 phase = 0
-status = "todo"
+status = "done"
 feature = "wire UpdateGlobalSettings"
-note = "sent by the web client"
+note = "font slider (settings_update)"
 
 [[item]]
 id = "wire:WorldSettingsUpdated"
@@ -1812,10 +1812,10 @@ note = "handled: see msg:ActionsUpdated"
 [[item]]
 id = "wire:UpdateActions"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire UpdateActions"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:BanListRequest"
@@ -1853,25 +1853,25 @@ note = "handled: see msg:UnbanResult"
 id = "wire:CalculateNextWorld"
 section = "wire"
 phase = 0
-status = "todo"
+status = "done"
 feature = "wire CalculateNextWorld"
-note = "sent by the web client"
+note = "world keys"
 
 [[item]]
 id = "wire:CalculatePrevWorld"
 section = "wire"
 phase = 0
-status = "todo"
+status = "done"
 feature = "wire CalculatePrevWorld"
-note = "sent by the web client"
+note = "world keys"
 
 [[item]]
 id = "wire:CalculateOldestPending"
 section = "wire"
 phase = 0
-status = "todo"
+status = "done"
 feature = "wire CalculateOldestPending"
-note = "sent by the web client"
+note = "Esc-w"
 
 [[item]]
 id = "wire:CalculatedWorld"
@@ -1884,10 +1884,10 @@ note = "handled: see msg:CalculatedWorld"
 [[item]]
 id = "wire:RequestConnectionsList"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire RequestConnectionsList"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:ConnectionsListResponse"
@@ -1932,10 +1932,10 @@ note = "sent by the web client"
 [[item]]
 id = "wire:ReportClientLifecycle"
 section = "wire"
-phase = 0
+phase = 6
 status = "todo"
 feature = "wire ReportClientLifecycle"
-note = "sent by the web client"
+note = "sent by the web client; client diagnostics, with hardening"
 
 [[item]]
 id = "wire:ClientTypeDeclaration"
@@ -1996,10 +1996,10 @@ note = "handled: see msg:WorldSwitchResult"
 [[item]]
 id = "wire:ImportSettings"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire ImportSettings"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:ImportNeedsInsecureConfirm"
@@ -2180,18 +2180,18 @@ note = "handled: see msg:KeybindingsUpdated"
 [[item]]
 id = "wire:RequestNoteEditorState"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire RequestNoteEditorState"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:UpdateNote"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire UpdateNote"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:NoteEditorState"
@@ -2220,10 +2220,10 @@ note = "handled: see msg:McpEditOpen"
 [[item]]
 id = "wire:McpEditSet"
 section = "wire"
-phase = 0
+phase = 4
 status = "todo"
 feature = "wire McpEditSet"
-note = "sent by the web client"
+note = "sent by the web client; its dialog arrives in phase 4"
 
 [[item]]
 id = "wire:Ping"
@@ -2295,55 +2295,55 @@ note = "server-push history download (Phase J); no client uses it yet"
 id = "ui:output.prefix-client"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "✨ before client-generated lines (not archive_sourced, not visually empty)"
-note = "app.js applyClientPrefix"
+note = "core/decor.rs"
 
 [[item]]
 id = "ui:output.prefix-new"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "▶ (#00ff00 + space) on lines this client owns, when new_line_indicator and no textdiv"
-note = "app.js lineIsNew/nliDrawn"
+note = "core/decor.rs; optimistic claims reconciled with ClaimedNew (core)"
 
 [[item]]
 id = "ui:output.prefix-archive"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "🛢️ on from_archive / archive_sourced lines, after ▶"
-note = ""
+note = "core/decor.rs"
 
 [[item]]
 id = "ui:output.timestamps"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "MM/DD HH:MM> in the accent colour first, while show_tags"
-note = "formatTimestamp"
+note = "core/decor.rs (util::local_time_from_epoch)"
 
 [[item]]
 id = "ui:output.highlight"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "/highlight colour as a full-width line background (colorNameToCss)"
-note = ""
+note = "core/decor.rs line_bg; an r,g,b triple is checked first (B14)"
 
 [[item]]
 id = "ui:output.action-highlight"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "F8: lines matching an enabled action get the hover background"
-note = "lineMatchesAction; applied on every path (B8)"
+note = "F8; applied on every path (B8)"
 
 [[item]]
 id = "ui:output.temperature"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "temperature conversion (temp_convert_enabled, while show_tags)"
 note = "on text only, never inside escapes (B13)"
 
@@ -2351,33 +2351,33 @@ note = "on text only, never inside escapes (B13)"
 id = "ui:output.truncate"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "lines over 10000 chars truncated with a yellow "... [truncated]""
-note = "MAX_LINE_LENGTH"
+note = "core/decor.rs truncate"
 
 [[item]]
 id = "ui:output.blink"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "SGR 5/6 blink: 750 ms shown, 250 ms hidden"
-note = ""
+note = "output.rs: shown 750 ms, hidden 250 ms, underline and background too"
 
 [[item]]
 id = "ui:output.more-mode"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "local more-mode: pause at visible-2 lines, queue, release by keys/badge/wheel past the bottom"
-note = "handleIncomingLine, releaseLines"
+note = "ui/more.rs + the server's pending_count; keys, badge, wheel past the bottom"
 
 [[item]]
 id = "ui:output.scroll"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "page/half/line scroll keys, wheel, follow-bottom only un-pinned by the user, position kept when lines arrive or are prepended"
-note = ""
+note = "anchored scroll (output.rs plan_view): follow-bottom left only by the user; position kept as lines arrive or are prepended"
 
 [[item]]
 id = "ui:output.selection"
@@ -2423,9 +2423,9 @@ note = "logo + two lines while showing_splash (cleared on flush/WorldFlushed/swi
 id = "ui:output.redraw"
 section = "output"
 phase = 2
-status = "todo"
+status = "done"
 feature = "^L: drop client lines, clear own ▶, re-render"
-note = ""
+note = "^L (core redraw)"
 
 [[item]]
 id = "ui:output.filter"
@@ -2649,4 +2649,4 @@ section = "output"
 phase = 2
 status = "todo"
 feature = "5k-line scroll at 60 fps, 200 lines/s incoming, idle CPU near 0, RSS, cold start measured"
-note = ""
+note = "measured headless (release, 5k lines, CLAY_SNAPSHOT_BENCH): scroll frames 1.5 ms mean / 2.0 worst; 200 lines/s at 60 fps 8.8% of a core; RSS ~180 MB. Idle CPU and cold start need a real window"
