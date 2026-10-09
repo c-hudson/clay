@@ -55,6 +55,11 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
             std::process::exit(1);
         }
     }
+    // A cold start shows what was cached and comes back to the world last shown.
+    let mut session = session;
+    let key = session.target.key();
+    session.core.set_cache(core::cache::load(&key));
+    session.core.prefer_world(core::store::server(&key).last_world);
     ui::run(session, events);
     Ok(())
 }

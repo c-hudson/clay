@@ -633,3 +633,53 @@ fn restarting_reconnects_at_once_and_fetches_everything_again() {
     let sent = t.sent();
     assert!(matches!(auth_request(&sent), WsMessage::AuthRequest { resume, .. } if resume.is_empty()), "nothing to resume");
 }
+
+fn cached(name: &str, epoch: u64, seqs: std::ops::Range<u64>) -> crate::native_gui::core::cache::CachedWorld {
+    use crate::native_gui::core::cache::{CachedLine, CachedWorld};
+    let lines: Vec<CachedLine> = seqs
+        .clone()
+        .map(|s| CachedLine { text: format!("cached {s}"), ts: 1_000, seq: Some(s), from_server: true, gagged: false, highlight: None })
+        .collect();
+    CachedWorld { name: name.into(), epoch, lines, seen: vec![(seqs.start, seqs.end - 1)] }
+}
+
+#[test]
+fn a_cold_start_shows_the_cached_lines_and_gap_fills_after_them() {
+    let mut h = H::password();
+    h.core.set_cache(vec![cached("A", 9, 0..5), cached("B", 3, 0..2)]);
+    h.connect_and_login();
+    let sent = h.sent();
+    let WsMessage::AuthRequest { resume, .. } = auth_request(&sent) else { unreachable!() };
+    assert!(resume.is_empty(), "a cache is never a resume list: its indices may be stale");
+    // A's epoch still stands; B's sequence space is gone (a new epoch).
+    h.initial(vec![world_msg(0, "A", 0..8, 9), world_msg(1, "B", 0..4, 4)]);
+    assert_eq!(h.texts(0), vec!["cached 0", "cached 1", "cached 2", "cached 3", "cached 4"]);
+    assert_eq!(h.texts(1), vec!["line 0", "line 1", "line 2", "line 3"]);
+    h.advance(Duration::from_secs(1));
+    let asks: Vec<(usize, Option<u64>)> = h
+        .sent()
+        .into_iter()
+        .filter_map(|m| if let WsMessage::RequestScrollback { world_index, after_seq, .. } = m { Some((world_index, after_seq)) } else { None })
+        .collect();
+    assert!(asks.contains(&(0, Some(4))), "A asks for what came after its cached frontier: {asks:?}");
+    // And what gets cached back is capped, epoch-stamped, with the seq ranges.
+    let snap = h.core.cache_snapshot();
+    assert_eq!(snap.len(), 2);
+    assert_eq!(snap[1].epoch, 4);
+    assert_eq!(snap[1].seen, vec![(0, 3)]);
+}
+
+#[test]
+fn the_world_last_shown_wins_over_the_servers_current_one() {
+    let mut h = H::password();
+    h.core.prefer_world(Some("B".into()));
+    h.connect_and_login();
+    h.initial(vec![world_msg(0, "A", 0..2, 1), world_msg(1, "B", 0..2, 2)]);
+    assert_eq!(h.core.current, 1);
+    // A world that's gone is no preference.
+    let mut h = H::password();
+    h.core.prefer_world(Some("Gone".into()));
+    h.connect_and_login();
+    h.initial(vec![world_msg(0, "A", 0..2, 1), world_msg(1, "B", 0..2, 2)]);
+    assert_eq!(h.core.current, 0);
+}

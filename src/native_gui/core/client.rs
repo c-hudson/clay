@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use super::cache::{CachedLine, CachedWorld};
 use super::seq::SeenRanges;
 use crate::actions::Action;
 use crate::stats::StatEntry;
@@ -256,6 +257,11 @@ pub struct ClientCore {
     pub visible: bool,
     /// The ASCII splash shown before there's any world (multiuser, before connecting).
     pub splash_lines: Vec<String>,
+    /// Worlds from the disk cache, offered once, at the first InitialState.
+    cached: HashMap<String, CachedWorld>,
+    /// The world to show when there's none on screen yet (the one last shown, from the
+    /// previous run): it wins over the server's current world.
+    preferred_world: Option<String>,
     view: Option<(usize, usize)>,
     /// World name -> index, for the worlds listed in this connection's `resume`.
     resume_sent: HashMap<String, usize>,
@@ -298,6 +304,8 @@ impl ClientCore {
             activity: 0,
             paused: false,
             splash_lines: Vec::new(),
+            cached: HashMap::new(),
+            preferred_world: None,
             visible: true,
             view: None,
             resume_sent: HashMap::new(),
@@ -322,6 +330,66 @@ impl ClientCore {
 
     pub fn is_multiuser(&self) -> bool {
         self.multiuser
+    }
+
+    /// Worlds from the disk cache, to stand in for what a fresh connect would download.
+    pub fn set_cache(&mut self, worlds: Vec<CachedWorld>) {
+        self.cached = worlds.into_iter().filter(|w| w.epoch != 0 && !w.lines.is_empty()).map(|w| (w.name.clone(), w)).collect();
+    }
+
+    /// The world to come back to (the user's last, or one just switched to).
+    pub fn prefer_world(&mut self, name: Option<String>) {
+        self.preferred_world = name;
+    }
+
+    /// Each world's newest lines for the disk cache, capped at `remote_initial_lines`
+    /// (at least 10). Worlds without an epoch aren't cached.
+    pub fn cache_snapshot(&self) -> Vec<CachedWorld> {
+        let initial = self.settings.as_ref().map_or(0, |s| s.remote_initial_lines as usize);
+        let cap = if initial == 0 { 100 } else { initial }.max(10);
+        self.worlds
+            .iter()
+            .filter(|w| w.epoch != 0 && !w.lines.is_empty())
+            .map(|w| {
+                let lines: Vec<&Line> = w.lines.iter().filter(|l| !l.from_archive).collect();
+                let lines = lines[lines.len().saturating_sub(cap)..]
+                    .iter()
+                    .map(|l| CachedLine {
+                        text: l.text.clone(),
+                        ts: l.ts,
+                        seq: l.seq,
+                        from_server: l.from_server,
+                        gagged: l.gagged,
+                        highlight: l.highlight.clone(),
+                    })
+                    .collect();
+                CachedWorld { name: w.name.clone(), epoch: w.epoch, lines, seen: w.seen.ranges().to_vec() }
+            })
+            .collect()
+    }
+
+    /// Changes whenever what `cache_snapshot` would return may have.
+    pub fn cache_revision(&self) -> u64 {
+        self.worlds.iter().map(|w| w.revision.wrapping_add(w.epoch)).fold(self.worlds.len() as u64, u64::wrapping_add)
+    }
+
+    fn world_from_cache(&mut self, c: CachedWorld) -> World {
+        let lines = c
+            .lines
+            .iter()
+            .map(|cl| {
+                let mut l = self.new_line(&cl.text, cl.ts, cl.seq);
+                l.from_server = cl.from_server;
+                l.gagged = cl.gagged;
+                l.highlight = cl.highlight.clone();
+                l
+            })
+            .collect();
+        let mut seen = SeenRanges::new();
+        for &(a, b) in &c.seen {
+            seen.mark(a, b);
+        }
+        World { name: c.name, epoch: c.epoch, lines, seen, ..World::default() }
     }
 
     /// How far the scrollback download after a connect has got, in tens of percent
@@ -1091,9 +1159,16 @@ impl ClientCore {
         now: Instant,
     ) {
         self.display_id = your_display_id;
-        let shown_name = self.worlds.get(self.current).map(|w| w.name.clone());
+        let shown_name = self.worlds.get(self.current).map(|w| w.name.clone()).or_else(|| self.preferred_world.clone());
         let mut prior: HashMap<String, World> =
             std::mem::take(&mut self.worlds).into_iter().filter(|w| !w.lines.is_empty()).map(|w| (w.name.clone(), w)).collect();
+        // A cold start: the disk cache stands in for the buffers a reconnect would keep
+        // (and is checked the same way).
+        for (name, c) in std::mem::take(&mut self.cached) {
+            if let std::collections::hash_map::Entry::Vacant(e) = prior.entry(name) {
+                e.insert(self.world_from_cache(c));
+            }
+        }
         let mut out = Vec::with_capacity(worlds.len());
         for (index, m) in worlds.iter().enumerate() {
             let keep = prior.remove(&m.name).filter(|p| keep_buffer(p, m));

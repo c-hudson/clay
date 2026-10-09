@@ -6,6 +6,7 @@
 //! - Per server: the auth key the server handed it (encrypted with the machine key, like
 //!   the passwords in settings.dat) and the server's web path.
 //!
+//! - Per server: the world this client last showed.
 //! - The window's own preferences, what the web client keeps in `localStorage` (the
 //!   stats panel collapsed or not).
 //!
@@ -82,6 +83,8 @@ pub fn client_uid() -> String {
 pub struct Server {
     pub auth_key: Option<String>,
     pub web_path: Option<String>,
+    /// The world this client last showed on that server, to come back to.
+    pub last_world: Option<String>,
 }
 
 pub fn server(name: &str) -> Server {
@@ -90,6 +93,7 @@ pub fn server(name: &str) -> Server {
     Server {
         auth_key: s.get("auth_key").map(|k| crate::persistence::decrypt_password(k)).filter(|k| !k.is_empty()),
         web_path: s.get("web_path").cloned(),
+        last_world: s.get("last_world").cloned().filter(|w| !w.is_empty()),
     }
 }
 
@@ -104,6 +108,15 @@ pub fn set_web_path(name: &str, web_path: &str) {
     let s = ini.entry(section(name)).or_default();
     if s.get("web_path").map(String::as_str) != Some(web_path) {
         s.insert("web_path".into(), web_path.to_string());
+        save(&ini);
+    }
+}
+
+pub fn set_last_world(name: &str, world: &str) {
+    let mut ini = load();
+    let s = ini.entry(section(name)).or_default();
+    if s.get("last_world").map(String::as_str) != Some(world) {
+        s.insert("last_world".into(), world.to_string());
         save(&ini);
     }
 }
@@ -144,5 +157,7 @@ mod tests {
         set_pref("stats_collapsed", "1");
         assert_eq!(pref("stats_collapsed").as_deref(), Some("1"));
         assert_eq!(server("HOST.example:9000").auth_key.as_deref(), Some("secret-key"));
+        set_last_world("host.example:9000", "Midgard");
+        assert_eq!(server("host.example:9000").last_world.as_deref(), Some("Midgard"));
     }
 }

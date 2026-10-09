@@ -2615,33 +2615,33 @@ note = "the GUI window's own title is \"Clay\" (webview_gui.rs); document.title 
 id = "ui:nav.keys"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "world keys: Shift-Up/Down, Esc-{ }, Esc-w/Alt-w, Esc/Alt-Left/Right, numeric prefix"
-note = ""
+note = "Shift-Up/Down, Esc-{ }, Esc-w/Alt-w, Esc/Alt-Left/Right and the numeric prefix through the server's key map (2a)"
 
 [[item]]
 id = "ui:nav.remember"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "remember the last world per server and return to it"
-note = ""
+note = "native-gui.dat last_world per server; wins over the server's current world, as app.js's localStorage does"
 
 [[item]]
 id = "ui:nav.cache"
 section = "navigation"
 phase = 2
-status = "todo"
+status = "done"
 feature = "world cache: keep recent lines per world across restarts (epoch-checked)"
-note = "IndexedDB equivalent"
+note = "~/.clay/native-gui-cache/<server>.json: capped at remote_initial_lines, epoch and seq ranges kept; hydrated at the first InitialState like an in-memory buffer, never a resume list"
 
 [[item]]
 id = "ui:keys.dispatch"
 section = "input"
 phase = 2
-status = "todo"
+status = "done"
 feature = "key -> action resolution from the server key map (needed by output/navigation actions)"
-note = "full input editing is phase 3"
+note = "core::keys (2a): server binds, then the action table, then typed input"
 
 [[item]]
 id = "ui:perf.targets"

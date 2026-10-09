@@ -45,6 +45,16 @@ use output::{OutputSnapshot, ScrollHandle, hsla, output_view};
 /// `web_font_size_desktop`'s default.
 const DEFAULT_FONT_SIZE: f32 = 18.0;
 
+/// When to write the world cache.
+#[derive(Default)]
+struct CacheSaver {
+    /// The cache revision last looked at.
+    seen: u64,
+    /// The last change, and the first one not yet saved.
+    changed: Option<Instant>,
+    dirty_since: Option<Instant>,
+}
+
 /// The fields of the login screen.
 struct LoginForm {
     username: Entity<InputState>,
@@ -93,6 +103,8 @@ pub struct ClayView {
     find: find::FindState,
     /// The theme gpui-component's widgets were last given.
     bridged_theme: String,
+    /// The disk cache (the real window only).
+    cache: Option<CacheSaver>,
 }
 
 impl ClayView {
@@ -153,6 +165,7 @@ impl ClayView {
             textdiv: textdiv::Textdiv::default(),
             find: find::FindState::new(window, cx),
             bridged_theme: String::new(),
+            cache: None,
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -202,6 +215,12 @@ impl ClayView {
             if let Some(new) = self.session.core.current_world() {
                 let mode = self.session.core.settings.as_ref().map_or("", |s| s.textdiv.as_str());
                 self.textdiv.arrive(new, mode);
+                // Remembered, to come back to next time (app.js persistLastActiveWorld).
+                let name = new.name.clone();
+                if !name.is_empty() {
+                    crate::native_gui::core::store::set_last_world(&self.session.target.key(), &name);
+                    self.session.core.prefer_world(Some(name));
+                }
             }
             self.shown_world = current;
             self.more.reset(self.session.core.current_world());
@@ -287,10 +306,35 @@ impl ClayView {
             cx.notify(); // the countdown
         }
         self.drag_scroll(cx);
+        self.save_cache();
         let clock = chrome::clock_text(self.session.core.settings.as_ref().map_or("", |s| s.clock_format.as_str()));
         if clock != self.chrome.clock {
             self.chrome.clock = clock;
             cx.notify();
+        }
+    }
+
+    /// Write the world cache once output has been quiet for two seconds (app.js's
+    /// debounce), or every 30 seconds while it never is.
+    fn save_cache(&mut self) {
+        let Some(c) = self.cache.as_mut() else { return };
+        let now = Instant::now();
+        let rev = self.session.core.cache_revision();
+        if rev != c.seen {
+            c.seen = rev;
+            c.changed = Some(now);
+            c.dirty_since.get_or_insert(now);
+        }
+        let (Some(changed), Some(since)) = (c.changed, c.dirty_since) else { return };
+        if now - changed < Duration::from_secs(2) && now - since < Duration::from_secs(30) {
+            return;
+        }
+        c.changed = None;
+        c.dirty_since = None;
+        let worlds = self.session.core.cache_snapshot();
+        if !worlds.is_empty() {
+            let key = self.session.target.key();
+            std::thread::spawn(move || crate::native_gui::core::cache::save(&key, &worlds));
         }
     }
 
@@ -687,7 +731,11 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = cx.new(|cx| ClayView::new(fonts, session, window, cx));
+                    let view = cx.new(|cx| {
+                        let mut v = ClayView::new(fonts, session, window, cx);
+                        v.cache = Some(CacheSaver::default());
+                        v
+                    });
                     window.focus(&view.focus_handle(cx), cx);
                     view
                 },

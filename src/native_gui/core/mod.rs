@@ -1,6 +1,7 @@
 //! The parts of the native GUI with no GPUI dependency.
 
 pub mod boxdraw;
+pub mod cache;
 pub mod client;
 pub mod decor;
 pub mod keys;
