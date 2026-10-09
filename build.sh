@@ -492,7 +492,8 @@ if echo "$FEATURES" | grep -q "webview-gui"; then
 fi
 if echo "$FEATURES" | grep -q "native-gui"; then
     echo ""
-    echo "Run the native GUI (connects to a running Clay):"
+    echo "Run Clay with the native GUI, or attach it to a running Clay:"
+    echo "  ./$BINARY_PATH --native-gui"
     echo "  ./$BINARY_PATH --native-gui=hostname:port"
 fi
 echo ""

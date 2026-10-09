@@ -19710,7 +19710,9 @@ async fn main() -> io::Result<()> {
         println!("    --gui                Run in GUI (webview) mode");
         println!("    --gui=host[:port]    Connect to a Clay server via GUI (default port: 9000)");
         #[cfg(feature = "native-gui")]
-        println!("    --native-gui[=host[:port]] Attach the native GUI to a Clay server (--ssh too)");
+        println!("    --native-gui         Run Clay with the native GUI (as --gui runs the WebView one)");
+        #[cfg(feature = "native-gui")]
+        println!("    --native-gui=host[:port] Attach the native GUI to a Clay server (--ssh too)");
         println!("    --ssh                Tunnel --console=/--gui= through SSH instead of connecting");
         println!("                         directly. Target grammar becomes:");
         println!("                           [user@]host[:clayport[:sshport]]");

@@ -984,6 +984,15 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         let Some((main, main_window)) = open_view_window(cx, fonts, session, Some(events), viewmode::ViewMode::default(), how) else {
             panic!("open the main window");
         };
+        // Running Clay itself: hand the router its port back on the way out, as the
+        // WebView GUI does.
+        if crate::native_gui::runs_clay() {
+            cx.on_app_quit(|_| {
+                crate::portmap::unmap_active_blocking();
+                async {}
+            })
+            .detach();
+        }
         // The other windows are this one's: closing it closes Clay.
         let main_id = main_window.window_id();
         cx.on_window_closed(move |cx, id| {

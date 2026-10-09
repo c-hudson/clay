@@ -1,21 +1,39 @@
 //! Native (non-WebView) GUI, behind the `native-gui` feature.
 //!
-//! Attaches to a running Clay over its WebSocket protocol, as the web and Android
-//! clients do. `core` holds everything that doesn't touch GPUI (connection, text
-//! styling, wrapping) so it can be unit-tested; `ui` is the GPUI side.
+//! Talks to Clay over its WebSocket protocol, as the web and Android clients do: to a
+//! Clay elsewhere (`--native-gui=host`), or to the one it runs in this process
+//! (`--native-gui` alone, as `--gui` runs the WebView GUI). `core` holds everything that
+//! doesn't touch GPUI (connection, text styling, wrapping) so it can be unit-tested;
+//! `ui` is the GPUI side.
 
 pub mod core;
 mod ui;
 #[cfg(test)]
 mod parity_tests;
 
-/// `clay --native-gui[=host[:port]]`; with `snapshot` set (`--native-gui-snapshot=<png>`)
-/// render one frame offscreen to that file and exit; with `verify` set
-/// (`--native-gui-verify[=SECONDS]`) run the client headless and check its buffer.
+static LOCAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this GUI runs Clay itself (`--native-gui` alone): its /reload is then the
+/// server's hot reload, which keeps the MUD connections.
+pub fn runs_clay() -> bool {
+    LOCAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `clay --native-gui[=host[:port]]`: with a host, attach to that Clay; alone, run Clay
+/// here. With `snapshot` set (`--native-gui-snapshot=<png>`) render one frame offscreen
+/// to that file and exit; with `verify` set (`--native-gui-verify[=SECONDS]`) run the
+/// client headless and check its buffer (both attach, to this machine when no host).
 pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>, ssh: bool) -> std::io::Result<()> {
     log_crashes();
     let runtime = tokio::runtime::Handle::current();
-    let target = if ssh {
+    let local = target.is_none() && !ssh && snapshot.is_none() && verify.is_none();
+    // Optional: without it (and without a stored key for this server) the window asks.
+    let mut password = std::env::var("CLAY_PASSWORD").ok().filter(|p| !p.is_empty());
+    let target = if local {
+        let (target, session_password) = start_clay(&runtime);
+        password = Some(session_password);
+        target
+    } else if ssh {
         ssh_target(target.as_deref(), &runtime)
     } else {
         match core::net::Target::parse(target.as_deref()) {
@@ -26,8 +44,6 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
             }
         }
     };
-    // Optional: without it (and without a stored key for this server) the window asks.
-    let password = std::env::var("CLAY_PASSWORD").ok().filter(|p| !p.is_empty());
     // An auth key to use instead of the one remembered for this server (scripts, tests).
     let auth_key = std::env::var("CLAY_AUTH_KEY").ok().filter(|k| !k.is_empty());
     // WebKitGTK blends text linearly; GPUI's Linux renderer defaults to gamma 1.8, which
@@ -65,8 +81,72 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
     let key = session.target.key();
     session.core.set_cache(core::cache::load(&key));
     session.core.prefer_world(core::store::server(&key).last_world);
+    // Started from a desktop: no console window behind it (as `--gui` does).
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole() };
+    }
     ui::run(session, events);
     Ok(())
+}
+
+/// `--native-gui` alone: Clay itself, in this process, as `--gui` runs it
+/// (webview_gui::run_master_webgui): the app on the settings' port with a session
+/// password of its own (the server listens for remote clients too, so it mustn't be
+/// guessable), and this window logged in to it over the loopback.
+fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
+    let port = {
+        let mut app = crate::App::new();
+        let _ = crate::persistence::load_settings(&mut app);
+        app.settings.http_port
+    };
+    // Another Clay already there? (Not on a reload: the old process may hold the port
+    // a moment longer, and the server's bind retries.)
+    if !std::env::args().any(|a| a == "--reload") {
+        if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                eprintln!("Clay is already running (port {port} is in use). Only one Clay runs at a time; to attach to it: clay --native-gui=127.0.0.1:{port}");
+            } else {
+                eprintln!("Clay failed to start: could not bind port {port}: {e}");
+            }
+            std::process::exit(1);
+        }
+    }
+    let mut random = [0u8; 32];
+    if let Err(e) = getrandom::getrandom(&mut random) {
+        eprintln!("Clay failed to start: could not make a session password: {e}");
+        std::process::exit(1);
+    }
+    let password = hex::encode(random);
+    // The app's GUI channels (run_app_headless's API): kept open for the whole run.
+    let (to_gui, from_app) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
+    let (to_app, from_gui) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
+    std::mem::forget((from_app, to_app));
+    crate::GUI_HTTP_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+    let session_password = password.clone();
+    runtime.spawn(async move {
+        let _ = crate::run_app_headless(to_gui, from_gui, Some(session_password), None, None).await;
+    });
+    // Wait for the server to have its port (it sets GUI_HTTP_READY once bound).
+    let ready = tokio::task::block_in_place(|| {
+        for _ in 0..100 {
+            if crate::GUI_HTTP_READY.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    });
+    if !ready {
+        eprintln!("Clay failed to start: its server did not come up on port {port} within 10 seconds.");
+        std::process::exit(1);
+    }
+    LOCAL.store(true, std::sync::atomic::Ordering::Relaxed);
+    let target = core::net::Target::parse(Some(&format!("127.0.0.1:{port}"))).expect("a loopback address");
+    (target, password)
 }
 
 #[cfg(target_os = "macos")]

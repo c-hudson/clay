@@ -248,6 +248,13 @@ impl ClayView {
     /// `/reload`: this GUI starts again as it was started (the server's never restarted
     /// from here, app.js). `/server <addr>`: it starts again attached to `addr`.
     pub(super) fn relaunch(&mut self, target: Option<&str>, cx: &mut Context<Self>) {
+        // Running Clay itself: /reload is the server's hot reload (it keeps the MUD
+        // connections, and starts this window again with it).
+        if target.is_none() && crate::native_gui::runs_clay() {
+            let world_index = self.session.core.current;
+            self.send_message(WsMessage::SendCommand { world_index, command: "/reload".into() }, cx);
+            return;
+        }
         let args: Vec<String> = std::env::args().skip(1).collect();
         let args = match target {
             Some(t) => relaunch_args(&args, t),
