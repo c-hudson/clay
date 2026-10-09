@@ -12,7 +12,13 @@ Examples:
 ```bash
 ./clay --console=localhost:9000         # Local instance (default port: 9000)
 ./clay --console=mud.server.com:9000    # Remote server
+./clay --console=mud.server.com:9000/mypath   # Remote server whose Web Path isn't "clay"
 ```
+
+A server reached from another machine accepts the connection only at its Web Path
+(`web_path`, `clay` unless changed in its `/web` settings) and drops anything else without
+a reply. If the server's Web Path isn't `clay`, add it after the port, as above. The same
+form works for `--gui=`, `--grep=` and `/import`.
 
 No special build features required - works with the standard musl build.
 

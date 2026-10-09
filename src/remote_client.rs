@@ -76,29 +76,20 @@ pub(crate) async fn run_grep_client(
     };
 
     // Connect to WebSocket server (same logic as run_console_client)
-    let addr_with_port = if addr.starts_with("ws://") || addr.starts_with("wss://") || addr.contains(':') {
-        addr.to_string()
-    } else {
-        format!("{}:9000", addr)
-    };
-
-    let (ws_url, try_fallback) = if addr_with_port.starts_with("ws://") || addr_with_port.starts_with("wss://") {
-        (addr_with_port.clone(), false)
-    } else {
-        (format!("wss://{}", addr_with_port), true)
+    let remote = crate::util::RemoteAddr::parse(addr);
+    let (ws_url, try_fallback) = match remote.scheme {
+        Some(scheme) => (remote.url(scheme), false),
+        None => (remote.url("wss"), true),
     };
     // Plaintext ws:// only to this machine; see util::is_loopback_host.
-    let plaintext_ok = crate::util::is_loopback_host(crate::util::host_of_addr(&addr_with_port));
+    let plaintext_ok = crate::util::is_loopback_host(crate::util::host_of_addr(&remote.host_port));
     if ws_url.starts_with("ws://") && !plaintext_ok {
         eprintln!("Refusing unencrypted ws:// to a remote host (the login would be sent in the clear). Use wss:// or --ssh.");
         std::process::exit(1);
     }
     let try_fallback = try_fallback && plaintext_ok;
 
-    let host_port_key = addr_with_port
-        .trim_start_matches("wss://")
-        .trim_start_matches("ws://")
-        .to_string();
+    let host_port_key = remote.host_port.clone();
 
     #[cfg(feature = "rustls-backend")]
     let connect_result = if ws_url.starts_with("wss://") {
@@ -123,11 +114,11 @@ pub(crate) async fn run_grep_client(
     let (ws_stream, _) = match connect_result {
         Ok(result) => result,
         Err(_) if try_fallback => {
-            let fallback_url = format!("ws://{}", addr_with_port);
+            let fallback_url = remote.url("ws");
             match connect_async(&fallback_url).await {
                 Ok(result) => result,
                 Err(e2) => {
-                    eprintln!("Failed to connect to {}: {}", fallback_url, e2);
+                    eprintln!("Failed to connect to {}: {}{}", fallback_url, e2, remote.path_hint(&e2));
                     std::process::exit(1);
                 }
             }
@@ -143,7 +134,7 @@ pub(crate) async fn run_grep_client(
                 eprintln!("If you trust the new certificate, remove its old pin from ~/.clay/known_hosts.dat and reconnect.");
                 std::process::exit(1);
             }
-            eprintln!("Failed to connect to {}: {}", ws_url, e);
+            eprintln!("Failed to connect to {}: {}{}", ws_url, e, remote.path_hint(&e));
             std::process::exit(1);
         }
     };
@@ -512,9 +503,10 @@ pub(crate) async fn run_import_client(
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use futures::SinkExt;
 
-    let addr_with_port = if addr.contains(':') { addr.to_string() } else { format!("{}:9000", addr) };
+    let remote = crate::util::RemoteAddr::parse(addr);
+    let addr_with_port = remote.host_port.clone();
     let host_port_key = addr_with_port.clone();
-    let ws_url = format!("wss://{}", addr_with_port);
+    let ws_url = remote.url("wss");
 
     #[cfg(feature = "rustls-backend")]
     async fn try_wss(ws_url: &str, host_port_key: &str) -> Result<
@@ -553,14 +545,14 @@ pub(crate) async fn run_import_client(
                 // or auth key, and the reply carries the target's secrets.
                 if !crate::util::is_loopback_host(crate::util::host_of_addr(&addr_with_port)) {
                     return Err(ImportClientError::ConnectFailed(format!(
-                        "Secure (TLS) connection to {} failed: {} - not falling back to unencrypted ws:// for a remote host",
-                        addr_with_port, e
+                        "Secure (TLS) connection to {} failed: {}{} - not falling back to unencrypted ws:// for a remote host",
+                        addr_with_port, e, remote.path_hint(&e)
                     )));
                 }
                 if !allow_insecure {
                     return Err(ImportClientError::NeedsInsecureConfirm);
                 }
-                let fallback_url = format!("ws://{}", addr_with_port);
+                let fallback_url = remote.url("ws");
                 match tokio::time::timeout(IMPORT_NET_TIMEOUT, connect_async(&fallback_url)).await {
                     Ok(Ok((stream, _))) => stream,
                     Ok(Err(e2)) => return Err(ImportClientError::ConnectFailed(format!("Failed to connect to {}: {} (after wss:// failed: {})", fallback_url, e2, e))),
@@ -738,25 +730,15 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             return Ok(());
         }
     } else {
-        // Parse address - add default port 9000 if not specified, then wss:// prefix
-        let addr_with_port = if addr.starts_with("ws://") || addr.starts_with("wss://") {
-            addr.to_string()
-        } else if addr.contains(':') {
-            // Host:port already specified
-            addr.to_string()
-        } else {
-            // No port specified - default to 9000 (same as --gui)
-            format!("{}:9000", addr)
-        };
-
-        let (ws_url, try_fallback) = if addr_with_port.starts_with("ws://") || addr_with_port.starts_with("wss://") {
-            (addr_with_port.clone(), false)
-        } else {
+        // Parse address - default port 9000 (same as --gui), then the web path's endpoint
+        let remote = crate::util::RemoteAddr::parse(addr);
+        let (ws_url, try_fallback) = match remote.scheme {
+            Some(scheme) => (remote.url(scheme), false),
             // Default to wss:// for security; falls back to ws:// only for this machine
-            (format!("wss://{}", addr_with_port), true)
+            None => (remote.url("wss"), true),
         };
         // Plaintext ws:// only to this machine; see util::is_loopback_host.
-        let plaintext_ok = crate::util::is_loopback_host(crate::util::host_of_addr(&addr_with_port));
+        let plaintext_ok = crate::util::is_loopback_host(crate::util::host_of_addr(&remote.host_port));
         if ws_url.starts_with("ws://") && !plaintext_ok {
             eprintln!("Refusing unencrypted ws:// to a remote host (the login would be sent in the clear). Use wss:// or --ssh.");
             return Ok(());
@@ -765,10 +747,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 
         println!("Connecting to {}...", ws_url);
 
-        let host_port_key = addr_with_port
-            .trim_start_matches("wss://")
-            .trim_start_matches("ws://")
-            .to_string();
+        let host_port_key = remote.host_port.clone();
 
         // Connect to WebSocket server - for wss:// we need to configure TLS to accept self-signed
         // certs (trust-on-first-use pinned via ~/.clay/known_hosts.dat, see platform::danger_rustls).
@@ -832,18 +811,18 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             Ok(result) => result,
             Err(_) if try_fallback => {
                 // wss:// failed, try ws:// fallback
-                let fallback_url = format!("ws://{}", addr_with_port);
+                let fallback_url = remote.url("ws");
                 eprintln!("Secure connection failed, trying {}...", fallback_url);
                 match connect_async(&fallback_url).await {
                     Ok(result) => result,
                     Err(e2) => {
-                        eprintln!("Failed to connect to {}: {}", fallback_url, e2);
+                        eprintln!("Failed to connect to {}: {}{}", fallback_url, e2, remote.path_hint(&e2));
                         return Ok(());
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Failed to connect to {}: {}", ws_url, e);
+                eprintln!("Failed to connect to {}: {}{}", ws_url, e, remote.path_hint(&e));
                 return Ok(());
             }
         };

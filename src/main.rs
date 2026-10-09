@@ -19716,9 +19716,9 @@ async fn main() -> io::Result<()> {
         println!();
         println!("Options:");
         println!("    --console            Run in console (TUI) mode");
-        println!("    --console=host[:port] Connect to a Clay server via console (default port: 9000)");
+        println!("    --console=host[:port][/path] Connect to a Clay server via console (default port: 9000, web path clay)");
         println!("    --gui                Run in GUI (webview) mode");
-        println!("    --gui=host[:port]    Connect to a Clay server via GUI (default port: 9000)");
+        println!("    --gui=host[:port][/path] Connect to a Clay server via GUI (default port: 9000, web path clay)");
         #[cfg(feature = "native-gui")]
         println!("    --native-gui         Run Clay with the native GUI (as --gui runs the WebView one)");
         #[cfg(feature = "native-gui")]

@@ -635,23 +635,16 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
         return result;
     }
 
-    // Strip protocol prefix if provided
-    let (addr_stripped, explicit_protocol) = if let Some(rest) = addr.strip_prefix("wss://") {
-        (rest, Some("wss"))
-    } else if let Some(rest) = addr.strip_prefix("ws://") {
-        (rest, Some("ws"))
-    } else {
-        (addr, None)
-    };
-
-    // Parse host:port (default port 9000 if not specified)
-    let (host, port) = if let Some(colon_pos) = addr_stripped.rfind(':') {
-        let h = &addr_stripped[..colon_pos];
-        let p = addr_stripped[colon_pos + 1..].parse::<u16>()
-            .map_err(|_| io::Error::other(format!("Invalid port in address: {}", addr)))?;
-        (h.to_string(), p)
-    } else {
-        (addr_stripped.to_string(), 9000)
+    // `[ws://|wss://]host[:port][/web path]` (port 9000, web path "clay" by default)
+    let remote = crate::util::RemoteAddr::parse(addr);
+    let explicit_protocol = remote.scheme;
+    let (host, port) = match remote.host_port.rfind(':') {
+        Some(colon_pos) => {
+            let p = remote.host_port[colon_pos + 1..].parse::<u16>()
+                .map_err(|_| io::Error::other(format!("Invalid port in address: {}", addr)))?;
+            (remote.host_port[..colon_pos].to_string(), p)
+        }
+        None => (remote.host_port.clone(), 9000),
     };
 
     // Plaintext ws:// only to this machine: to anything else the login, the auth
@@ -687,9 +680,9 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
         local_listener.set_nonblocking(true)?;
         let tokio_listener = tokio::net::TcpListener::from_std(local_listener)?;
 
-        let remote_wss = format!("wss://{}:{}", host, port);
+        let remote_wss = remote.url("wss");
         // Plain ws:// fallback only for a loopback host (see plaintext_ok above)
-        let remote_ws = if plaintext_ok { format!("ws://{}:{}", host, port) } else { String::new() };
+        let remote_ws = if plaintext_ok { remote.url("ws") } else { String::new() };
 
         runtime.handle().spawn(async move {
             loop {
@@ -835,7 +828,9 @@ async fn ws_proxy_bridge(
         let remote_ws = {
             #[cfg(feature = "rustls-backend")]
             {
-                let host_port_key = wss_url.trim_start_matches("wss://").trim_start_matches("ws://").to_string();
+                // The pin is kept under host:port, without the URL's path.
+                let host_port_key = wss_url.trim_start_matches("wss://").trim_start_matches("ws://")
+                    .split('/').next().unwrap_or_default().to_string();
                 let tls_config = rustls::ClientConfig::builder()
                     .dangerous()
                     .with_custom_certificate_verifier(std::sync::Arc::new(

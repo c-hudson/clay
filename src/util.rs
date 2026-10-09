@@ -7,6 +7,68 @@
 // comparison helper) so the same hardening lives in one place instead of being
 // re-implemented per call site.
 
+/// A remote Clay as `--console=`, `--grep=`, `--gui=` and `/import` take it:
+/// `[ws://|wss://]host[:port][/path]`, port 9000 by default. The path is the server's
+/// web path (`web_path`), `clay` unless given: a server reached from another machine takes
+/// a WebSocket only at `/{web_path}/ws` (any path in legacy mode, an empty web path), and
+/// drops anything else without a word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAddr {
+    /// `ws` or `wss`, when the address gave one.
+    pub scheme: Option<&'static str>,
+    /// `host:port`: what the server's certificate pin is kept under, and what's shown.
+    pub host_port: String,
+    /// The server's web path.
+    pub web_path: String,
+}
+
+impl RemoteAddr {
+    pub fn parse(addr: &str) -> RemoteAddr {
+        let addr = addr.trim();
+        let (scheme, rest) = if let Some(r) = addr.strip_prefix("wss://") {
+            (Some("wss"), r)
+        } else if let Some(r) = addr.strip_prefix("ws://") {
+            (Some("ws"), r)
+        } else {
+            (None, addr)
+        };
+        let (host_port, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], rest[i..].trim_matches('/')),
+            None => (rest, ""),
+        };
+        // `host:port/clay/ws` names the same endpoint as `host:port/clay`.
+        let path = path.strip_suffix("/ws").unwrap_or(path).trim_matches('/');
+        RemoteAddr {
+            scheme,
+            host_port: if host_port.contains(':') { host_port.to_string() } else { format!("{host_port}:9000") },
+            web_path: if path.is_empty() || path == "ws" { "clay".to_string() } else { path.to_string() },
+        }
+    }
+
+    /// The WebSocket URL over `scheme` (`ws` or `wss`).
+    pub fn url(&self, scheme: &str) -> String {
+        format!("{scheme}://{}/{}/ws", self.host_port, self.web_path)
+    }
+
+    /// What to add to a failed connection's message when the server may have dropped it
+    /// for its path: a hint at the web path, or nothing.
+    pub fn path_hint(&self, error: &tokio_tungstenite::tungstenite::Error) -> String {
+        use tokio_tungstenite::tungstenite::{error::ProtocolError, Error};
+        let dropped = match error {
+            Error::Io(e) => matches!(e.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset),
+            Error::Protocol(ProtocolError::HandshakeIncomplete | ProtocolError::ResetWithoutClosingHandshake) => true,
+            Error::ConnectionClosed | Error::AlreadyClosed => true,
+            _ => false,
+        };
+        if dropped {
+            format!(" (the server closed the connection without answering: if its web path isn't '{}', give it after the port, as {}/<web path>)",
+                self.web_path, self.host_port)
+        } else {
+            String::new()
+        }
+    }
+}
+
 /// Host part of a Clay address: `ws://host:port/path`, `wss://...`, `host:port`,
 /// `host`, `[v6]:port`. Used to decide whether plaintext `ws://` is acceptable.
 pub fn host_of_addr(addr: &str) -> &str {
@@ -1162,6 +1224,29 @@ pub fn run_command_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_addr_defaults_to_clays_web_path_and_port() {
+        let a = RemoteAddr::parse("example.org");
+        assert_eq!((a.scheme, a.host_port.as_str(), a.web_path.as_str()), (None, "example.org:9000", "clay"));
+        assert_eq!(a.url("wss"), "wss://example.org:9000/clay/ws");
+        let a = RemoteAddr::parse("wss://10.0.0.5:9443");
+        assert_eq!((a.scheme, a.host_port.as_str()), (Some("wss"), "10.0.0.5:9443"));
+        assert_eq!(a.url("wss"), "wss://10.0.0.5:9443/clay/ws");
+    }
+
+    #[test]
+    fn remote_addr_takes_a_web_path_after_the_port() {
+        for given in ["h:1/stealth", "h:1/stealth/", "h:1/stealth/ws", "wss://h:1/stealth"] {
+            let a = RemoteAddr::parse(given);
+            assert_eq!((a.host_port.as_str(), a.web_path.as_str()), ("h:1", "stealth"), "{given}");
+            assert_eq!(a.url("wss"), "wss://h:1/stealth/ws");
+        }
+        // No port before the path: the default one.
+        assert_eq!(RemoteAddr::parse("h/stealth").host_port, "h:9000");
+        // The pin key never carries the path.
+        assert_eq!(RemoteAddr::parse("[::1]:9000/x").host_port, "[::1]:9000");
+    }
+
     use super::*;
 
     #[test]
