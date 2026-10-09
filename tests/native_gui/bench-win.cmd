@@ -5,10 +5,11 @@ rem screenshot of the VM's screen shows only that window:
 rem   bench-win.cmd webview "CJK,Emoji"
 rem   bench-win.cmd native  "CJK,Emoji"
 rem   bench-win.cmd stop
-rem Expects %USERPROFILE%\clay-native built with --features webview-gui,native-gui.
+rem Expects %USERPROFILE%\clay-native built with --features webview-gui,native-gui
+rem (target\debug, or the directory in CLAY_BIN).
 setlocal
 set ROOT=%USERPROFILE%\clay-native
-set BIN=%ROOT%\target\debug
+if "%CLAY_BIN%"=="" (set BIN=%ROOT%\target\debug) else (set BIN=%CLAY_BIN%)
 set WORK=%USERPROFILE%\nbench
 
 taskkill /f /im clay.exe >nul 2>&1
