@@ -25,6 +25,9 @@ pub fn runs_clay() -> bool {
 /// client headless and check its buffer (both attach, to this machine when no host).
 pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>, ssh: bool) -> std::io::Result<()> {
     log_crashes();
+    // Looked at while Clay starts or the target is worked out: it loads the GPU's driver.
+    #[cfg(target_os = "linux")]
+    let vulkan = std::thread::spawn(vulkan_is_software_only);
     let runtime = tokio::runtime::Handle::current();
     let local = target.is_none() && !ssh && snapshot.is_none() && verify.is_none();
     // Optional: without it (and without a stored key for this server) the window asks.
@@ -51,6 +54,11 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
     #[cfg(target_os = "linux")]
     if std::env::var_os("ZED_FONTS_GAMMA").is_none() {
         std::env::set_var("ZED_FONTS_GAMMA", "1.0");
+    }
+    #[cfg(target_os = "linux")]
+    if vulkan.join().unwrap_or(false) {
+        crate::debug_log(true, "native-gui: Vulkan has only software devices here; drawing with OpenGL");
+        std::env::set_var("VK_LOADER_DRIVERS_DISABLE", "*");
     }
     // WKWebView draws the web client's output with `-webkit-font-smoothing: antialiased`,
     // i.e. without CoreGraphics' stroke thickening; GPUI on macOS thickens unless the
@@ -205,4 +213,39 @@ fn log_crashes() {
         crate::debug_log(true, &format!("BACKTRACE:\n{}", std::backtrace::Backtrace::force_capture()));
         default_hook(info);
     }));
+}
+
+/// Linux without a GPU: when Vulkan's only devices are software ones (Mesa's lavapipe,
+/// SwiftShader), GPUI prefers them to software OpenGL, and the window stays black though
+/// it renders fine offscreen. Then Vulkan is to be hidden from this process, so GPUI draws
+/// with OpenGL (Mesa's llvmpipe), which shows. With a real GPU, or no Vulkan at all, it
+/// isn't; nor when the user has already told the Vulkan loader or GPUI which device to use.
+#[cfg(target_os = "linux")]
+fn vulkan_is_software_only() -> bool {
+    if std::env::var_os("VK_LOADER_DRIVERS_DISABLE").is_some() || std::env::var_os("ZED_DEVICE_ID").is_some() {
+        return false;
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+    let kinds: Vec<wgpu::DeviceType> = futures::executor::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN)).iter().map(|a| a.get_info().device_type).collect();
+    only_software(&kinds)
+}
+
+/// Every Vulkan device is a CPU one (and there is at least one).
+#[cfg(target_os = "linux")]
+fn only_software(kinds: &[wgpu::DeviceType]) -> bool {
+    !kinds.is_empty() && kinds.iter().all(|k| *k == wgpu::DeviceType::Cpu)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod vulkan_tests {
+    use super::only_software;
+    use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu};
+
+    #[test]
+    fn vulkan_is_hidden_only_when_every_device_is_software() {
+        assert!(only_software(&[Cpu]), "lavapipe alone");
+        assert!(!only_software(&[DiscreteGpu, Cpu]), "a GPU and lavapipe: the GPU wins anyway");
+        assert!(!only_software(&[IntegratedGpu]));
+        assert!(!only_software(&[]), "no Vulkan at all: GPUI goes to OpenGL by itself");
+    }
 }
