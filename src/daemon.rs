@@ -1072,8 +1072,9 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 Command::Quit | Command::Update { .. } => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                 }
+                Command::Menu => app.ws_menu_is_console_only(client_id, world_index),
                 // UI popup commands - send back to client for local handling
-                Command::Help | Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
+                Command::Help | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                 }

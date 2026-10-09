@@ -1516,6 +1516,10 @@ pub(crate) fn handle_remote_client_key(
     if app.has_new_popup() {
         match handle_new_popup_key(app, key) {
             NewPopupAction::Command(cmd) => {
+                // A menu item that a key opens (the emoji picker and the like).
+                if let Some(action) = popup::definitions::menu::menu_action(&cmd) {
+                    return dispatch_remote_action(action, app, ws_tx);
+                }
                 // Menu command selected - parse and execute locally
                 let parsed = parse_command(&cmd);
                 match parsed {

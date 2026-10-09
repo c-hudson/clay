@@ -452,6 +452,10 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     if app.has_new_popup() {
         match handle_new_popup_key(app, key) {
             NewPopupAction::Command(cmd) => {
+                // A menu item that a key opens (the emoji picker and the like).
+                if let Some(action) = popup::definitions::menu::menu_action(&cmd) {
+                    return dispatch_action(action, app);
+                }
                 // Web-only editors: show URL hint in console
                 if cmd == "/theme-editor" || cmd == "/keybind-editor" {
                     let page = cmd.trim_start_matches('/');

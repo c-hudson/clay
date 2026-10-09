@@ -1948,13 +1948,6 @@ body.device-phone #output-container { padding: 6px 10px; }
 .footer-spacer {
     flex: 1;
 }
-.menu-footer {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-}
-
 #action-error {
     color: var(--error-color);
     font-size: 12px;
@@ -3408,7 +3401,7 @@ html.popup-window .settings-content {
 /* ─── Web Settings popup ─── */
 /* Web modal CSS removed — merged into .settings-modal-content */
 
-/* ─── Menu popup (/menu) ─── */
+/* ─── List popups (the device-mode chooser) ─── */
 .menu-modal-content {
     min-width: 200px;
     max-width: 280px;

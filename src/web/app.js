@@ -715,9 +715,6 @@
         helpContent: document.getElementById('help-content'),
         helpCloseBtn: document.getElementById('help-close-btn'),
         helpOkBtn: document.getElementById('help-ok-btn'),
-        // Menu popup (/menu)
-        menuModal: document.getElementById('menu-modal'),
-        menuList: document.getElementById('menu-list'),
         // Font fields (inside combined settings modal)
         settingsFontSection: document.getElementById('settings-font'),
         fontFamilyList: document.getElementById('font-family-list'),
@@ -754,8 +751,7 @@
         worldSelectorHelpBtn: document.getElementById('world-selector-help-btn'),
         actionsListHelpBtn: document.getElementById('actions-list-help-btn'),
         actionEditorHelpBtn: document.getElementById('action-editor-help-btn'),
-        connectionsHelpBtn: document.getElementById('connections-help-btn'),
-        menuHelpBtn: document.getElementById('menu-help-btn')
+        connectionsHelpBtn: document.getElementById('connections-help-btn')
     };
 
     // State
@@ -1550,19 +1546,6 @@
 
     // Help popup state (/help)
     let helpPopupOpen = false;
-
-    // Menu popup state (/menu)
-    let menuPopupOpen = false;
-    let menuSelectedIndex = 0;
-    const menuItems = [
-        { label: 'Help', command: '/help' },
-        { label: 'Settings', command: '/setup' },
-        { label: 'Web Settings', command: '/web' },
-        { label: 'Font', command: '/font' },
-        { label: 'Actions', command: '/actions' },
-        { label: 'World Selector', command: '/worlds' },
-        { label: 'Connected Worlds', command: '/connections' }
-    ];
 
     // Current theme values (synced from server)
     let consoleTheme = 'dark';
@@ -6994,7 +6977,10 @@
                 break;
 
             case '/menu':
-                openMenuPopup();
+                // The console's menu; this client has its menu button. A server from
+                // before /menu went console-only still sends it here: answer it rather
+                // than return it, or the two would pass it back and forth.
+                appendClientLine("/menu is the console's menu; here, use the menu button (\u2630).", currentWorldIndex, 'system');
                 break;
 
             case '/font':
@@ -7319,7 +7305,7 @@
             { l: '/tag', r: 'Toggle MUD tag display (F2)' },
             { l: '/font', r: 'Font settings (web/GUI)' },
             { heading: 'Display' },
-            { l: '/menu', r: 'Open menu popup' },
+            { l: '/menu', r: 'Menu of windows and popups (console)' },
             { l: '/flush', r: 'Clear output buffer' },
             { l: '/dump', r: 'Dump scrollback to file' },
             { l: '/note [file]', r: 'Open split-screen editor' },
@@ -7875,16 +7861,6 @@
             '  Buffer - Number of lines in output buffer', '',
             'Click a world to switch to it.'
         ],
-        menu: [
-            'Menu - Quick Access', '',
-            'Select an item to open it.', '',
-            '  Help           - Keyboard shortcuts and commands',
-            '  Settings       - Global application settings',
-            '  Web Settings   - WebSocket/HTTP server config',
-            '  Actions        - Trigger and automation editor',
-            '  World Selector - Browse and connect to worlds',
-            '  Connected Worlds - View active connections'
-        ],
         'clay-server': [
             'Clay Server - Connection Settings', '',
             'Host: The local IP or hostname of your Clay server',
@@ -7922,38 +7898,6 @@
 
     function closePopupHelp() {
         elements.popupHelpModal.classList.remove('visible');
-    }
-
-    // Menu popup functions (/menu)
-    function openMenuPopup() {
-        menuPopupOpen = true;
-        menuSelectedIndex = 0;
-        elements.menuModal.classList.add('visible');
-        updateMenuSelection();
-    }
-
-    function closeMenuPopup() {
-        menuPopupOpen = false;
-        elements.menuModal.classList.remove('visible');
-        elements.input.focus();
-    }
-
-    function updateMenuSelection() {
-        const items = elements.menuList.querySelectorAll('.menu-item');
-        items.forEach((item, i) => {
-            if (i === menuSelectedIndex) {
-                item.classList.add('selected');
-            } else {
-                item.classList.remove('selected');
-            }
-        });
-    }
-
-    function selectMenuItem() {
-        const cmd = menuItems[menuSelectedIndex].command;
-        closeMenuPopup();
-        elements.input.value = cmd;
-        sendCommand();
     }
 
     // Strip ANSI codes for filter matching
@@ -15337,14 +15281,6 @@
             elements.helpOkBtn.addEventListener('click', closeHelpPopup);
         }
 
-        // Menu popup item click handlers
-        elements.menuList.querySelectorAll('.menu-item').forEach((item, i) => {
-            item.addEventListener('click', () => {
-                menuSelectedIndex = i;
-                selectMenuItem();
-            });
-        });
-
         // Document-level keyboard handler for navigation keys
         document.onkeydown = function(e) {
             // Skip if auth modal is visible
@@ -15393,36 +15329,6 @@
                 if (e.key === 'Escape' || e.key === 'Enter') {
                     e.preventDefault();
                     closeHelpPopup();
-                }
-                return;
-            }
-
-            // Handle menu popup
-            if (menuPopupOpen) {
-                if (e.key === 'Escape') {
-                    e.preventDefault();
-                    closeMenuPopup();
-                } else if (e.key === 'ArrowUp') {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (menuSelectedIndex > 0) {
-                        menuSelectedIndex--;
-                    } else {
-                        menuSelectedIndex = menuItems.length - 1;
-                    }
-                    updateMenuSelection();
-                } else if (e.key === 'ArrowDown') {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (menuSelectedIndex < menuItems.length - 1) {
-                        menuSelectedIndex++;
-                    } else {
-                        menuSelectedIndex = 0;
-                    }
-                    updateMenuSelection();
-                } else if (e.key === 'Enter') {
-                    e.preventDefault();
-                    selectMenuItem();
                 }
                 return;
             }
@@ -16503,7 +16409,6 @@
         if (elements.actionsListHelpBtn) elements.actionsListHelpBtn.onclick = function() { openPopupHelp('actionsList'); };
         if (elements.actionEditorHelpBtn) elements.actionEditorHelpBtn.onclick = function() { openPopupHelp('actionEditor'); };
         if (elements.connectionsHelpBtn) elements.connectionsHelpBtn.onclick = function() { openPopupHelp('connections'); };
-        if (elements.menuHelpBtn) elements.menuHelpBtn.onclick = function() { openPopupHelp('menu'); };
 
         // Password change modal handlers
         if (elements.passwordSaveBtn) {

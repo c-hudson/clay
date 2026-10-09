@@ -109,24 +109,32 @@ keybind editor.
 
 | Command | Description |
 |---------|-------------|
-| `/menu` | Open hamburger menu popup |
+| `/menu` | Open the menu of windows and popups |
 | `/version` | Display version information |
 
 ## Menu Popup
 
-Access with `/menu` or hamburger icon:
+`/menu` lists every window and popup the console can open without anything
+more from you. Pick one with the arrow keys and Enter.
 
-| Option | Description |
-|--------|-------------|
-| Worlds List | Connected worlds |
-| World Selector | All worlds |
-| World Editor | Edit current world |
-| Setup | Global settings |
-| Web | Web settings |
-| Actions | Actions editor |
-| Toggle Tags | Show/hide MUD tags |
-| Toggle Highlight | Action highlighting |
-| Resync | Refresh from master |
+| Item | Opens |
+|------|-------|
+| Help | Keyboard shortcuts and commands (`/help`) |
+| Settings | Global settings (`/setup`) |
+| Web Settings | Web server and remote access (`/web`) |
+| Actions | Triggers and automation (`/actions`) |
+| World Selector | Browse and connect to worlds (`/worlds`) |
+| Recent Worlds | Worlds you were in lately |
+| Notes | This world's notes (`/note`) |
+| Notes List | Every world's notes (`/note -l`) |
+| Import Settings | Settings from another Clay (`/import`) |
+| Emoji Picker | Pick an emoji to type (`Esc-e`) |
+| Filter Output | Show only matching lines (`F4`) |
+| Search Output | Find text in the output |
+
+Notes, Notes List and Import Settings are the local console's own, so a remote
+console's menu leaves them out. `/menu` is console-only: the web and GUI
+interfaces have their menu button (☰) instead.
 
 ## Popups
 
@@ -260,9 +268,8 @@ ssh your-server -t tmux attach -t clay
 
 ### Sync Issues
 
-1. Use `/menu` → Resync to refresh state
-2. Check network connection
-3. Restart remote console
+1. Check network connection
+2. Restart the remote console: it fetches the whole state again when it connects
 
 \newpage
 

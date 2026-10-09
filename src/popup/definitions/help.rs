@@ -148,9 +148,11 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "reach this Clay: addresses, firewall, router mapping.",
         ],
         "menu" => vec![
-            "/menu                      Open menu popup",
+            "/menu                      Open the console's menu",
             "",
-            "Provides access to common commands and popups.",
+            "Lists every window and popup the console can open",
+            "without anything more from you. Console only: the",
+            "web and GUI interfaces have their menu bar.",
         ],
         "flush" => vec![
             "/flush                     Clear output buffer",

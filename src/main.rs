@@ -6279,7 +6279,7 @@ impl App {
     /// Open the menu popup using the new unified popup system
     fn open_menu_popup_new(&mut self) {
         use popup::definitions::menu::create_menu_popup;
-        self.popup_manager.open(create_menu_popup());
+        self.popup_manager.open(create_menu_popup(self.is_master));
     }
 
     /// Open a confirm dialog for deleting a world
@@ -11233,6 +11233,19 @@ impl App {
         }
     }
 
+    /// `/menu` from a web or GUI client: the menu is the console's (theirs is the menu bar).
+    pub(crate) fn ws_menu_is_console_only(&self, client_id: u64, world_index: usize) {
+        self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
+            world_index,
+            data: "/menu is the console's menu; here, use the menu button (\u{2630}).".to_string(),
+            is_viewed: false,
+            ts: current_timestamp_secs(),
+            from_server: false,
+            seq: 0, end_seq: None,
+            flush: false, gagged: false, highlight_colors: Vec::new(),
+        });
+    }
+
     /// Send a message to a specific WebSocket client (or embedded GUI if client_id == 0)
     fn ws_send_to_client(&self, client_id: u64, msg: WsMessage) {
         // client_id 0 is the embedded GUI in master GUI mode
@@ -15090,8 +15103,9 @@ impl App {
             Command::Help => {
                 self.handle_ws_help_via_tf(client_id, world_index, "");
             }
+            Command::Menu => self.ws_menu_is_console_only(client_id, world_index),
             // UI popup commands - send back to client for local handling
-            Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
+            Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
             Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
             }
