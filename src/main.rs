@@ -1647,7 +1647,7 @@ pub fn migrate_legacy_config_files() {
 }
 
 /// Generate a WAV file from ANSI music notes (square wave, matching web client's oscillator)
-fn generate_wav_from_notes(notes: &[crate::ansi_music::MusicNote]) -> Vec<u8> {
+pub(crate) fn generate_wav_from_notes(notes: &[crate::ansi_music::MusicNote]) -> Vec<u8> {
     let sample_rate: u32 = 22050;
     let mut samples: Vec<i16> = Vec::new();
 

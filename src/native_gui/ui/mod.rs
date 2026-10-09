@@ -132,6 +132,12 @@ pub struct ClayView {
     /// The windows sharing this one's connection, or the window whose connection this
     /// one shares.
     link: follow::Link,
+    /// The MUD's sounds and the server's speech: the main window's (the others get the
+    /// same messages, and mustn't play them again).
+    media: Option<crate::native_gui::core::media::Media>,
+    /// The current world and whether its media is on, as last seen: turning it off
+    /// stops what it started (app.js `GmcpUserToggled`).
+    media_gate: Option<(usize, bool)>,
 }
 
 impl ClayView {
@@ -200,6 +206,8 @@ impl ClayView {
             windows: Default::default(),
             mode: Default::default(),
             link: Default::default(),
+            media: None,
+            media_gate: None,
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -225,6 +233,29 @@ impl ClayView {
                     }
                     ref m if self.surface_message(m, cx) => {}
                     crate::websocket::WsMessage::ExecuteLocalCommand { command } => local.push(command),
+                    crate::websocket::WsMessage::McmpMedia { world_index, action, data, default_url } => {
+                        // The world's own media plays only while it's shown and switched on;
+                        // a Default is kept whatever (app.js).
+                        let core = &self.session.core;
+                        let on = core.worlds.get(world_index).is_some_and(|w| w.gmcp_user_enabled) && world_index == core.current;
+                        if let Some(m) = self.media.as_mut().filter(|_| action == "Default" || on) {
+                            m.mcmp(&action, &data, &default_url);
+                        }
+                    }
+                    crate::websocket::WsMessage::AnsiMusic { notes, .. } => {
+                        let enabled = self.session.core.settings.as_ref().is_some_and(|s| s.ansi_music_enabled);
+                        if let Some(m) = self.media.as_mut().filter(|_| enabled && !notes.is_empty()) {
+                            m.ansi_music(&notes);
+                        }
+                    }
+                    crate::websocket::WsMessage::ServerSpeak { text, .. } => {
+                        let mode = crate::tts::TtsMode::from_name(self.session.core.settings.as_ref().map_or("", |s| s.tts_mode.as_str()));
+                        if let Some(m) = self.media.as_mut() {
+                            m.speak(&text, mode);
+                        }
+                    }
+                    // The web client passes these to Android's notifications only.
+                    crate::websocket::WsMessage::Notification { .. } => {}
                     // The server puts text in the input (TF's /input and the like).
                     crate::websocket::WsMessage::SetInputBuffer { text, cursor_start } => {
                         self.editor.clear();
@@ -244,6 +275,7 @@ impl ClayView {
         }
         self.watch_status(cx);
         self.keep_to_world(cx);
+        self.watch_media();
         if changed {
             self.apply_settings();
             if std::mem::take(&mut self.surf.actions_changed) {
@@ -262,6 +294,19 @@ impl ClayView {
         self.relay_outbox(cx);
     }
 
+    /// The current world's media switched off (F9, the MUD's toggle): stop what it started.
+    fn watch_media(&mut self) {
+        let Some(m) = self.media.as_mut() else { return };
+        let core = &self.session.core;
+        let now = core.current_world().map(|w| (core.current, w.gmcp_user_enabled));
+        if let (Some((was_world, true)), Some((world, false))) = (self.media_gate, now) {
+            if was_world == world {
+                m.stop_all();
+            }
+        }
+        self.media_gate = now;
+    }
+
     /// After any change: a world switch starts the output over; new lines at the tail go
     /// through more-mode.
     fn follow_world(&mut self) {
@@ -276,12 +321,16 @@ impl ClayView {
                 self.textdiv.arrive(new, mode);
                 // Remembered, to come back to next time (app.js persistLastActiveWorld).
                 let name = new.name.clone();
-                if !name.is_empty() {
+                if !name.is_empty() && !self.is_follower() {
                     crate::native_gui::core::store::set_last_world(&self.session.target.key(), &name);
                     self.session.core.prefer_world(Some(name));
                 }
             }
             self.shown_world = current;
+            // A switch stops the MUD's media; the server sends the new world's (app.js).
+            if let Some(m) = self.media.as_mut() {
+                m.stop_all();
+            }
             self.more.reset(self.session.core.current_world());
             self.scroll.borrow_mut().follow_bottom();
             return;
@@ -413,6 +462,9 @@ impl ClayView {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fx = self.session.tick();
         self.after(fx, cx);
+        if let Some(m) = self.media.as_mut() {
+            m.poll();
+        }
         // A chord left waiting fires its own binding.
         match self.keys.tick(Instant::now()) {
             Some(Resolved::Action { action, .. }) => self.run_action(&action, window, cx),
@@ -987,6 +1039,10 @@ pub(super) fn open_view_window(
                     }
                     v.mode = mode;
                     v.link.leader = leader;
+                    // The window with the connection plays the sounds.
+                    if starts {
+                        v.media = Some(crate::native_gui::core::media::Media::new(emoji::runtime()));
+                    }
                     v
                 });
                 window.focus(&v.focus_handle(cx), cx);

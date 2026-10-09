@@ -29,9 +29,9 @@ note = "ACT badge"
 id = "msg:AnsiMusic"
 section = "media"
 phase = 5
-status = "todo"
+status = "done"
 feature = "handle AnsiMusic"
-note = ""
+note = "core/media.rs: the console's square-wave WAV through rodio, when ANSI music is on; a new tune cuts off the last"
 
 [[item]]
 id = "msg:AuthResponse"
@@ -181,9 +181,9 @@ note = "core: worlds, actions and splash cleared, back to the login screen"
 id = "msg:McmpMedia"
 section = "media"
 phase = 5
-status = "todo"
+status = "done"
 feature = "handle McmpMedia"
-note = ""
+note = "core/media.rs: Default/Play/Stop/Load as app.js (music one at a time, continue keeps it, sounds by key, a stop before the file arrives wins); files through audio::download_to_cache (http(s) to a public host only); only for the shown world with its media on; a world switch or F9 off stops it; the main window plays, /window ones never"
 
 [[item]]
 id = "msg:McpEditOpen"
@@ -221,9 +221,9 @@ note = "notes icon"
 id = "msg:Notification"
 section = "media"
 phase = 5
-status = "todo"
+status = "done"
 feature = "handle Notification"
-note = ""
+note = "nothing on the desktop, as the web client (it passes these to Android's notifications only)"
 
 [[item]]
 id = "msg:OpenWindow"
@@ -357,9 +357,9 @@ note = ""
 id = "msg:ServerSpeak"
 section = "media"
 phase = 5
-status = "todo"
+status = "done"
 feature = "handle ServerSpeak"
-note = ""
+note = "tts.rs in the settings' voice (local when TTS is off: the server only asks when something should be said)"
 
 [[item]]
 id = "msg:SetInputBuffer"
@@ -509,9 +509,9 @@ note = "the client keeps its own current world, as app.js does"
 id = "action:bell"
 section = "media"
 phase = 5
-status = "todo"
+status = "done"
 feature = "action bell"
-note = ""
+note = "nothing, as the web client"
 
 [[item]]
 id = "action:bg_all_worlds"
@@ -901,9 +901,9 @@ note = "ui/actions.rs"
 id = "action:quit"
 section = "misc"
 phase = 5
-status = "todo"
+status = "done"
 feature = "action quit"
-note = ""
+note = "quits the GUI (the web client's is a no-op; the WebView GUI closes)"
 
 [[item]]
 id = "action:recall_begin"
@@ -1053,9 +1053,9 @@ note = "^Q: the suggestions for a misspelled word at the cursor, in the input me
 id = "action:suspend"
 section = "misc"
 phase = 5
-status = "todo"
+status = "done"
 feature = "action suspend"
-note = ""
+note = "nothing, as the web client"
 
 [[item]]
 id = "action:tab_key"
@@ -1077,9 +1077,9 @@ note = "ui/actions.rs"
 id = "action:toggle_gmcp_media"
 section = "media"
 phase = 5
-status = "todo"
+status = "done"
 feature = "action toggle_gmcp_media"
-note = ""
+note = "ToggleWorldGmcp, as app.js; turning it off stops what the world started"
 
 [[item]]
 id = "action:toggle_insert"

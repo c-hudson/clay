@@ -6,6 +6,7 @@ pub mod client;
 pub mod decor;
 pub mod input;
 pub mod keys;
+pub mod media;
 pub mod net;
 pub mod seq;
 pub mod session;

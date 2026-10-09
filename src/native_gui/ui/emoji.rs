@@ -72,6 +72,11 @@ static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 static REPAINT: Mutex<Option<mpsc::UnboundedSender<()>>> = Mutex::new(None);
 static WAKE: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// The runtime the GUI's network work runs on (emoji fetches, Edge's voices).
+pub fn runtime() -> Option<tokio::runtime::Handle> {
+    RUNTIME.get().cloned()
+}
+
 /// The runtime fetches run on. Without it every emoji shows as its name.
 pub fn init(runtime: tokio::runtime::Handle) {
     let _ = RUNTIME.set(runtime);

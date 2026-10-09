@@ -69,6 +69,16 @@ impl PlayHandle {
         }
     }
 
+    /// Change the volume (0-100) of what's playing, where the player allows it (rodio
+    /// does; an external player keeps the volume it started with).
+    pub fn set_volume(&self, volume: i64) {
+        match self {
+            #[cfg(feature = "native-audio")]
+            PlayHandle::NativeSink(sink) => sink.set_volume(volume as f32 / 100.0),
+            PlayHandle::ExternalProcess(_) => {}
+        }
+    }
+
     /// Check if the process has finished (for external processes)
     pub fn try_wait(&mut self) -> Option<bool> {
         match self {
