@@ -185,7 +185,7 @@ the full list of changed defaults.
 | `Esc-h` | Half-page scroll forward, or release half a screenful of pending output |
 | `Esc-^N` | Scroll forward one line (TF LINE) |
 | `Esc-^P` | Scroll back one line (TF LINEBACK) |
-| `Esc-^L` | Clear the view without dropping any lines — scrollback still holds them (TF CLEAR) |
+| `Esc-^L` | Clear the view (TF CLEAR): the output goes blank and new text appears below the blank; scrolling back still shows the old text, and the blank goes when you switch worlds |
 | `^S` | Pause the current world so new output queues as pending (TF PAUSE) |
 | `Ctrl-PageDown` | Same as `Esc-j` |
 | `Esc-L` | Toggle the F4 filter popup between no limit and the last limit applied |

@@ -1044,9 +1044,40 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
 }
 
 /// Convert temperatures in text: "32C" -> "32C (90F)", "100F" -> "100F (38C)"
-/// Matches numbers followed by C or F (with optional space), followed by delimiter or end
-/// Uses fast character scanning instead of regex for performance
+/// Matches numbers followed by C or F (with optional space), followed by delimiter or end.
+/// Only the text between escape sequences is looked at: a cursor movement such as `ESC[5C`
+/// is not a temperature (the web and native GUIs draw the same rule).
 pub fn convert_temperatures(text: &str) -> String {
+    if !text.contains('\x1b') {
+        return convert_temperatures_plain(text);
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 16);
+    let (mut plain_from, mut i) = (0, 0);
+    while i < bytes.len() {
+        // A CSI sequence: ESC [ parameters final-letter.
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            let mut end = i + 2;
+            while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b';' || bytes[end] == b'?') {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+                out.push_str(&convert_temperatures_plain(&text[plain_from..i]));
+                out.push_str(&text[i..=end]);
+                i = end + 1;
+                plain_from = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&convert_temperatures_plain(&text[plain_from..]));
+    out
+}
+
+/// `convert_temperatures` on text with no escape sequences in it.
+/// Uses fast character scanning instead of regex for performance
+fn convert_temperatures_plain(text: &str) -> String {
     let bytes = text.as_bytes();
 
     // Quick scan: does this line have any potential temperature patterns?
@@ -1576,6 +1607,14 @@ mod tests {
     #[test]
     fn test_temp_with_space() {
         assert_eq!(convert_temperatures("100 C"), "100 C (212F)");
+    }
+
+    #[test]
+    fn test_temp_leaves_escape_sequences_alone() {
+        // A cursor movement such as ESC[5C is not "5C", and must not become "5C (41F)".
+        assert_eq!(convert_temperatures("go \x1b[5C here"), "go \x1b[5C here");
+        assert_eq!(convert_temperatures("\x1b[2C"), "\x1b[2C");
+        assert_eq!(convert_temperatures("\x1b[1;31m20C\x1b[0m"), "\x1b[1;31m20C (68F)\x1b[0m");
     }
 
     #[test]

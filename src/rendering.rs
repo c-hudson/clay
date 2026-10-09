@@ -637,8 +637,10 @@ pub(crate) struct DividerRows {
 /// "clear", which draws the old text out of view the way TF clears it.
 pub(crate) fn console_divider(world: &World, settings: &Settings, show_tags: bool, visible_height: usize) -> Option<DividerRows> {
     let textdiv = world.console_textdiv?;
-    // The setting may have changed since the console arrived.
-    crate::TextDivMode::from_setting(&settings.textdiv)?;
+    // The setting may have changed since the console arrived (a CLEAR's block stands anyway).
+    if !textdiv.forced {
+        crate::TextDivMode::from_setting(&settings.textdiv)?;
+    }
     let now = CachedNow::new();
     let drawn = |l: &OutputLine| expand_for_display(l, show_tags, settings, &now).is_some();
     let lines = &world.output_lines;

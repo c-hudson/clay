@@ -201,6 +201,14 @@ impl SpellChecker {
         false
     }
 
+    /// The reply to a client's `SpellSuggest`: valid, or up to six suggestions (the
+    /// console's Ctrl+Q count).
+    pub fn suggest_reply(&self, word: String) -> crate::websocket::WsMessage {
+        let valid = self.is_valid(&word);
+        let suggestions = if valid { Vec::new() } else { self.suggestions(&word, 6) };
+        crate::websocket::WsMessage::SpellSuggestions { word, valid, suggestions }
+    }
+
     pub fn suggestions(&self, word: &str, count: usize) -> Vec<String> {
         let word_lower = word.to_lowercase();
         let mut candidates: Vec<(String, usize)> = self

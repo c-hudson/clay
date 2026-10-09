@@ -1514,6 +1514,10 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 }
             }
         }
+        WsMessage::SpellSuggest { word } => {
+            let reply = app.spell_checker.suggest_reply(word);
+            app.ws_send_to_client(client_id, reply);
+        }
         WsMessage::RequestConnectionsList => {
             let current_idx = app.current_world_index;
             const KEEPALIVE_SECS: u64 = 5 * 60;
@@ -3287,6 +3291,11 @@ pub async fn handle_multiuser_ws_message(
                         }
                     }
                 }
+            }
+        }
+        WsMessage::SpellSuggest { word } => {
+            if let Some(ws) = &app.ws_server {
+                ws.send_to_client(client_id, app.spell_checker.suggest_reply(word));
             }
         }
         WsMessage::Logout => {

@@ -2575,10 +2575,7 @@ pub(crate) fn dispatch_remote_action(
         "scroll_line_forward" => { app.move_viewport_down(1); }
         "scroll_line_back" => { app.move_viewport_up(1); }
         // TF CLEAR/PAUSE (Job 19).
-        "clear_screen" => {
-            app.needs_terminal_clear = true;
-            app.needs_output_redraw = true;
-        }
+        "clear_screen" => app.clear_console_view(),
         "pause_output" => { app.current_world_mut().paused = true; }
         "flush_output" => {
             let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;

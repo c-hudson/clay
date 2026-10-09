@@ -641,6 +641,13 @@ pub(crate) fn key_event_to_token(
     use crossterm::event::{KeyCode, KeyModifiers};
 
     Some(match code {
+        // Alt+Ctrl+char is Esc then Ctrl+char (TF's `^[^L`): what a terminal reports when
+        // the two arrive together (`\x1b\x0c`), and Alt-x == Esc-x as everywhere else. The
+        // Ctrl arm below used to take it first and drop the Esc, so Esc-^L redrew instead
+        // of clearing.
+        KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) && modifiers.contains(KeyModifiers::ALT) => {
+            KeyToken::Esc(Box::new(KeyToken::Ctrl(c.to_ascii_uppercase())))
+        }
         KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
             KeyToken::Ctrl(c.to_ascii_uppercase())
         }

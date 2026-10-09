@@ -828,6 +828,13 @@ pub enum WsMessage {
     // World switching response (server -> client)
     CalculatedWorld { index: Option<usize> },
 
+    /// Spelling suggestions for a word (the spell_check action, Ctrl+Q) from the server's
+    /// checker (`spell.rs`), for a client with none of its own (web, Android) - client -> server
+    SpellSuggest { word: String },
+    /// The answer, to the asking client only: whether `word` is spelled right, and up to six
+    /// suggestions when it isn't (as the console's Ctrl+Q) - server -> client
+    SpellSuggestions { word: String, valid: bool, suggestions: Vec<String> },
+
     /// Request connections list (/l command) - client -> server
     RequestConnectionsList,
     /// Connections list response - server -> client

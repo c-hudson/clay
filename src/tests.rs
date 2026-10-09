@@ -15445,6 +15445,25 @@ third
             "clear_screen must not drop any lines - scrollback refills the view");
     }
 
+    /// Esc-^L reaches clear_screen however the terminal delivers it: Escape then Ctrl-L as two
+    /// key events, or the single Alt+Ctrl+L event a terminal sends when they arrive together
+    /// (`\x1b\x0c`, which TF reads as the same key).
+    #[test]
+    fn test_esc_ctrl_l_reaches_clear_screen() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (label, keys) in [
+            ("Esc then ^L", vec![KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)]),
+            ("Alt+Ctrl+L", vec![KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL | KeyModifiers::ALT)]),
+        ] {
+            let mut app = make_key_test_app();
+            app.worlds[0].output_lines.push(OutputLine::new("keep me".to_string(), 0));
+            for k in keys {
+                crate::input_handler::handle_key_event(k, &mut app);
+            }
+            assert!(app.worlds[0].console_textdiv.is_some_and(|t| t.forced), "{label}: no clear");
+        }
+    }
+
     #[test]
     fn test_action_pause_output() {
         let mut app = make_key_test_app();

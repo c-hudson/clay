@@ -2978,3 +2978,27 @@ phase = 6
 status = "done"
 feature = "--native-gui alone runs Clay in this process, as --gui runs it for the WebView GUI (webview_gui::run_master_webgui): refuses when the settings' port is taken, a random session password, run_app_headless, the window logged in over the loopback; /reload is the server's hot reload (MUD connections kept); quitting releases a UPnP mapping"
 note = "user ruling 2026-10-09 (it used to attach to 127.0.0.1)"
+
+[[item]]
+id = "wire:SpellSuggest"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire SpellSuggest"
+note = "the web client's Ctrl+Q asks the server's checker; the native GUI has its own (NSSpellChecker, ISpellChecker, spell.rs)"
+
+[[item]]
+id = "wire:SpellSuggestions"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire SpellSuggestions"
+note = "the reply to SpellSuggest, which the native GUI doesn't send"
+
+[[item]]
+id = "msg:SpellSuggestions"
+section = "input"
+phase = 0
+status = "waived"
+feature = "handle SpellSuggestions"
+note = "the native GUI's Ctrl+Q uses its own spell checker"

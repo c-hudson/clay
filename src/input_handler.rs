@@ -2188,11 +2188,10 @@ fn dispatch_action_impl(action: &str, app: &mut App) -> Option<KeyAction> {
             }
             KeyAction::None
         }
-        // TF CLEAR: empty the view without dropping any lines - scrollback (still fully
-        // intact in output_lines) refills it on the next draw.
+        // TF CLEAR: empty the view without dropping any lines - scrolling back (still fully
+        // intact in output_lines) refills it (App::clear_console_view).
         "clear_screen" => {
-            app.needs_terminal_clear = true;
-            app.needs_output_redraw = true;
+            app.clear_console_view();
             KeyAction::None
         }
         // TF PAUSE: pause the current world so new output queues as pending.

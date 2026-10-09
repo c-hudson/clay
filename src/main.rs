@@ -3393,6 +3393,8 @@ impl TextDivMode {
 pub(crate) struct ConsoleTextDiv {
     pub after_seq: Option<u64>,
     pub mode: TextDivMode,
+    /// Put there by TF's CLEAR (Esc-^L), not by %textdiv: drawn whatever %textdiv is.
+    pub forced: bool,
 }
 
 /// A line a trigger's `/substitute` shows: its text (attributes drawn in), its `G`/`L`/`A`,
@@ -5993,6 +5995,19 @@ impl App {
         }
     }
 
+    /// TF's CLEAR (`/dokey clear`, Esc-^L) on the console: "clear screen (can be refilled
+    /// with scrollback)". The output goes blank - a blank block as tall as the output after
+    /// the newest line, as %textdiv=clear draws it - new text arrives below it, scrolling
+    /// back shows the old, and it goes when the console leaves the world.
+    pub(crate) fn clear_console_view(&mut self) {
+        let world = self.current_world_mut();
+        let after_seq = world.output_lines.last().map(|l| l.seq);
+        world.console_textdiv = Some(ConsoleTextDiv { after_seq, mode: TextDivMode::Clear, forced: true });
+        world.scroll_to_bottom();
+        self.needs_terminal_clear = true;
+        self.needs_output_redraw = true;
+    }
+
     pub fn current_world(&self) -> &World {
         // Safety: clamp index to valid range to prevent panic
         let idx = if self.worlds.is_empty() {
@@ -7967,7 +7982,7 @@ impl App {
                     let after_seq = world.console_seen_seq;
                     let is_new = |l: &OutputLine| after_seq.is_none_or(|seen| l.seq > seen);
                     let has_new = world.output_lines.last().is_some_and(is_new) || world.pending_lines.iter().any(is_new);
-                    (mode != TextDivMode::On || has_new).then_some(ConsoleTextDiv { after_seq, mode })
+                    (mode != TextDivMode::On || has_new).then_some(ConsoleTextDiv { after_seq, mode, forced: false })
                 });
             }
         }
@@ -15824,6 +15839,10 @@ impl App {
                         None => self.emit_client_text(world_index, "Could not send the edited text: the MCP session is no longer available.", false),
                     }
                 }
+            }
+            WsMessage::SpellSuggest { word } => {
+                let reply = self.spell_checker.suggest_reply(word);
+                self.ws_send_to_client(client_id, reply);
             }
             WsMessage::RequestConnectionsList => {
                 // Generate connections list using same format as master console
