@@ -691,3 +691,14 @@ fn a_live_theme_edit_reaches_the_settings() {
     h.msg(WsMessage::ThemeCssVarsUpdated { css_vars: String::new(), colors_json: r##"{"bg":"#000000"}"##.into() });
     assert_eq!(h.core.settings.as_ref().unwrap().theme_colors_json, r##"{"bg":"#000000"}"##);
 }
+
+#[test]
+fn the_server_can_fill_the_input_and_change_the_keys() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 1)]);
+    h.drain();
+    h.msg(WsMessage::SetInputBuffer { text: "say hi".into(), cursor_start: false });
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::Event(m) if matches!(**m, WsMessage::SetInputBuffer { .. }))));
+    h.msg(WsMessage::KeybindingsUpdated { bindings_json: r#"{"F3":"redraw"}"#.into() });
+    assert_eq!(h.core.settings.as_ref().unwrap().keybindings_json, r#"{"F3":"redraw"}"#);
+}

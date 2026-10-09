@@ -123,7 +123,7 @@ const WEB_INDEX_HTML: &str = include_str!("web/index.html");
 const WEB_STYLE_CSS: &str = include_str!("web/style.css");
 
 /// Embedded JavaScript for the web interface
-const WEB_APP_JS: &str = include_str!("web/app.js");
+pub(crate) const WEB_APP_JS: &str = include_str!("web/app.js");
 
 /// Embedded theme editor HTML
 const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");

@@ -8,6 +8,7 @@ pub mod emoji;
 mod find;
 pub mod fonts;
 pub mod ink;
+mod input_view;
 mod keymap;
 mod more;
 pub mod output;
@@ -104,6 +105,12 @@ pub struct ClayView {
     select: select::SelectState,
     textdiv: textdiv::Textdiv,
     find: find::FindState,
+    /// The input line's text and editing state.
+    editor: crate::native_gui::core::input::Editor,
+    input: input_view::InputState,
+    /// The `input_height` last taken from the server (input_grow/shrink change the rows
+    /// locally until it changes, as app.js does).
+    input_height_seen: u16,
     /// The theme gpui-component's widgets were last given.
     bridged_theme: String,
     /// The disk cache (the real window only).
@@ -167,6 +174,9 @@ impl ClayView {
             select: select::SelectState::default(),
             textdiv: textdiv::Textdiv::default(),
             find: find::FindState::new(window, cx),
+            editor: Default::default(),
+            input: Default::default(),
+            input_height_seen: 0,
             bridged_theme: String::new(),
             cache: None,
         };
@@ -179,11 +189,12 @@ impl ClayView {
     /// Effects the session left for us: redraw, and the GUI's own messages.
     fn after(&mut self, effects: Vec<Effect>, cx: &mut Context<Self>) {
         let mut changed = false;
+        let mut local = Vec::new();
         for e in effects {
             match e {
                 Effect::Changed => changed = true,
-                Effect::Event(msg) => {
-                    if let crate::websocket::WsMessage::PendingReleased { world_index, count } = *msg {
+                Effect::Event(msg) => match *msg {
+                    crate::websocket::WsMessage::PendingReleased { world_index, count } => {
                         // Released by any interface: count afresh, and show as many of ours.
                         self.more.caught_up();
                         if world_index == self.session.core.current {
@@ -191,9 +202,23 @@ impl ClayView {
                         }
                         changed = true;
                     }
-                }
+                    crate::websocket::WsMessage::ExecuteLocalCommand { command } => local.push(command),
+                    // The server puts text in the input (TF's /input and the like).
+                    crate::websocket::WsMessage::SetInputBuffer { text, cursor_start } => {
+                        self.editor.clear();
+                        self.editor.insert(&text);
+                        if cursor_start {
+                            self.editor.home();
+                        }
+                        changed = true;
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
+        }
+        for command in local {
+            self.local_command(&command, cx);
         }
         if changed {
             self.apply_settings();
@@ -257,7 +282,7 @@ impl ClayView {
     fn key_down(&mut self, ks: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // Any key closes the right-click menu (as the GUI's does); Escape closes the
         // Debug Selection dialog.
-        if self.select.menu.take().is_some() {
+        if self.select.menu.take().is_some() | self.input.menu.take().is_some() {
             cx.notify();
         }
         if self.select.debug.is_some() && ks.key == "escape" {
@@ -265,13 +290,50 @@ impl ClayView {
             cx.notify();
             return true;
         }
-        // Copy wins over a binding while there's a selection (the browser's order).
+        // While the input method is composing, it has the keys (Enter commits, arrows move
+        // within the composition).
+        if self.editor.marked.is_some() {
+            return false;
+        }
+        // ^V: the next keystroke goes in as itself (TF's literal-next).
+        if self.input.literal_next {
+            if let Some(c) = keymap::console_key(ks).and_then(|(code, mods)| crate::input::literal_char(code, mods)) {
+                self.input.literal_next = false;
+                self.editor.insert(&c.to_string());
+                self.typed(cx);
+                return true;
+            }
+            return false; // a bare modifier: still waiting
+        }
+        // The clipboard. Copy takes the selection, in the input or the output; paste is
+        // Ctrl+Shift+V, Shift+Insert or Cmd+V (Ctrl+V is literal-next by the key table);
+        // Cmd+X and Cmd+A on a Mac (^X and ^A are Clay's).
         let m = &ks.modifiers;
-        if ks.key == "c" && (m.platform || (m.control && !m.alt)) && self.copy_selection(cx) {
+        let key = ks.key.as_str();
+        if key == "c" && (m.platform || (m.control && !m.alt && !m.shift)) && (self.copy_input(false, cx) || self.copy_selection(cx)) {
+            return true;
+        }
+        if (key == "v" && (m.platform || (m.control && m.shift))) || (key == "insert" && m.shift && !m.control) {
+            self.paste(cx);
+            return true;
+        }
+        if m.platform && key == "x" {
+            return self.copy_input(true, cx);
+        }
+        if m.platform && key == "a" {
+            self.editor.select_all();
+            self.input_touched(cx);
             return true;
         }
         let Some((code, mods)) = keymap::console_key(ks) else { return false };
-        match self.keys.resolve(code, mods, Instant::now()) {
+        let resolved = self.keys.resolve(code, mods, Instant::now());
+        // A history search ends at any key but its own.
+        match &resolved {
+            Resolved::Pending => {}
+            Resolved::Action { key, .. } | Resolved::Server(key) if key == "Esc-p" || key == "Esc-n" => {}
+            _ => self.editor.end_search(),
+        }
+        match resolved {
             Resolved::Pending => true,
             Resolved::Server(key) => {
                 let kbnum = self.kbnum.take();
@@ -284,7 +346,36 @@ impl ClayView {
                 self.run_action(&action, window, cx);
                 true
             }
-            Resolved::NotBound => false,
+            Resolved::NotBound => {
+                // Enter sends, bound or not (by the raw key, as app.js and the console do).
+                if key == "enter" && !m.control && !m.alt {
+                    self.send_line(window, cx);
+                    return true;
+                }
+                // Unbound Shift+arrows extend the selection.
+                if m.shift && !m.control && !m.alt && matches!(key, "left" | "right" | "home" | "end") {
+                    let e = &mut self.editor;
+                    let to = match key {
+                        "home" => 0,
+                        "end" => e.text.len(),
+                        "left" => e.text[..e.cursor].char_indices().last().map_or(0, |(i, _)| i),
+                        _ => e.text[e.cursor..].chars().next().map_or(e.cursor, |c| e.cursor + c.len_utf8()),
+                    };
+                    e.set_cursor(to, true);
+                    self.input_touched(cx);
+                    return true;
+                }
+                // %insert off: a typed character replaces the one under the cursor.
+                if self.editor.overwrite && !m.control && !m.alt && !m.platform {
+                    if let Some(ch) = ks.key_char.as_deref().filter(|c| c.chars().count() == 1 && !c.starts_with(char::is_control)) {
+                        self.editor.overwrite(ch);
+                        self.typed(cx);
+                        return true;
+                    }
+                }
+                // Typed text arrives through the input handler.
+                false
+            }
         }
     }
 
@@ -309,6 +400,7 @@ impl ClayView {
             cx.notify(); // the countdown
         }
         self.drag_scroll(cx);
+        self.blink(cx);
         self.save_cache();
         let clock = chrome::clock_text(self.session.core.settings.as_ref().map_or("", |s| s.clock_format.as_str()));
         if clock != self.chrome.clock {
@@ -373,6 +465,13 @@ impl ClayView {
             restyle = true;
         }
         restyle |= self.fonts.set_user(&s.font_name, s.web_font_weight);
+        let (spell_on, dict) = (s.spell_check_enabled, s.dictionary_path.clone());
+        if s.input_height != self.input_height_seen {
+            self.input_height_seen = s.input_height;
+            self.input.rows = (s.input_height as usize).clamp(1, 15);
+        }
+        self.spell_settings(spell_on, &dict);
+        let Some(s) = self.session.core.settings.as_ref() else { return };
         let tokens = Tokens::new(&self.theme, s.gui_theme == "light");
         if tokens != self.chrome.tokens {
             self.chrome.tokens = tokens;
@@ -653,8 +752,11 @@ impl Render for ClayView {
         let mut tabs = self.tabs_ribbon(cx);
         let stats = self.stats_panel(cx);
         let status_bar = self.status_bar(window, cx);
+        let show_input = !matches!(self.session.core.status(), Status::NeedLogin { .. } | Status::CertMismatch(_));
+        let input_bar = show_input.then(|| self.input_bar(window, cx));
         let context_menu = self.context_menu(cx);
         let find_popups = self.find_popups(window, cx);
+        let input_menu = self.input_menu(cx);
         let debug_dialog = self.debug_dialog(window, cx);
         div()
             .track_focus(&self.focus)
@@ -715,8 +817,10 @@ impl Render for ClayView {
             .children(stats)
             .children(tabs)
             .child(status_bar)
+            .children(input_bar)
             .children(find_popups)
             .children(context_menu)
+            .children(input_menu)
             .children(debug_dialog)
     }
 }

@@ -484,6 +484,31 @@ impl ClientCore {
         self.take()
     }
 
+    /// A line this client shows itself, in the current world and never sent anywhere
+    /// (app.js `appendClientLine`).
+    pub fn client_line(&mut self, text: &str) -> Vec<Effect> {
+        let mut line = self.new_line(text, unix_now(), None);
+        line.from_server = false;
+        line.viewed = true;
+        if let Some(w) = self.worlds.get_mut(self.current) {
+            w.lines.push(line);
+            w.touch();
+            self.changed();
+        }
+        self.take()
+    }
+
+    /// A command was sent: the current world's prompt and splash go, as app.js clears
+    /// them (the server sends the next prompt when there is one).
+    pub fn command_sent(&mut self) -> Vec<Effect> {
+        if let Some(w) = self.worlds.get_mut(self.current) {
+            w.prompt.clear();
+            w.showing_splash = false;
+            self.changed();
+        }
+        self.take()
+    }
+
     /// Multiuser: end this user's session (the server answers `LoggedOut`).
     pub fn logout(&mut self) -> Vec<Effect> {
         if self.multiuser && self.is_online() {
@@ -768,6 +793,18 @@ impl ClientCore {
                 if let Some(s) = self.settings.as_mut() {
                     if !colors_json.is_empty() && s.theme_colors_json != colors_json {
                         s.theme_colors_json = colors_json;
+                        self.changed();
+                    }
+                }
+            }
+            // A command the server parsed that opens something on this side (app.js
+            // `executeLocalCommand`): the window acts on it.
+            m @ (WsMessage::ExecuteLocalCommand { .. } | WsMessage::SetInputBuffer { .. }) => self.out.push(Effect::Event(Box::new(m))),
+            WsMessage::KeybindingsUpdated { bindings_json } => {
+                // The key table changed (the keybind editor): the window's keys follow.
+                if let Some(s) = self.settings.as_mut() {
+                    if !bindings_json.is_empty() && s.keybindings_json != bindings_json {
+                        s.keybindings_json = bindings_json;
                         self.changed();
                     }
                 }

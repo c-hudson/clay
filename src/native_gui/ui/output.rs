@@ -265,7 +265,7 @@ fn covers(window: &Window, font: &Font, c: char) -> bool {
 /// lacks one of its characters (DejaVu Sans Mono has no precomposed "ế", so a shaper
 /// would split it into "ê" and an accent the font can't attach), the cluster goes to
 /// JetBrains Mono instead, which covers far more of Latin than the web's subset did.
-fn text_runs(line: &StyledLine, fonts: &Fonts, window: &Window) -> Vec<TextRun> {
+pub(super) fn text_runs(line: &StyledLine, fonts: &Fonts, window: &Window) -> Vec<TextRun> {
     let mut runs: Vec<TextRun> = Vec::new();
     let mut at = 0;
     for run in &line.runs {

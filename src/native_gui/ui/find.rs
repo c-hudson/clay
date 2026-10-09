@@ -233,9 +233,14 @@ impl ClayView {
 
     /// The snapshot tool's typing: into whichever of the two fields has the focus, then
     /// what a real edit does.
+    /// False when neither field has the focus.
     #[cfg(feature = "native-gui-snapshot")]
-    pub(super) fn type_into_find(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn type_into_find(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let search = gpui::Focusable::focus_handle(self.find.search_input.read(cx), cx).is_focused(window);
+        let filter = gpui::Focusable::focus_handle(self.find.filter_input.read(cx), cx).is_focused(window);
+        if !search && !filter {
+            return false;
+        }
         let input = if search { self.find.search_input.clone() } else { self.find.filter_input.clone() };
         input.update(cx, |s, cx| s.insert(text.to_string(), window, cx));
         let value = input.read(cx).value().to_string();
@@ -248,6 +253,7 @@ impl ClayView {
         }
         self.scroll.borrow_mut().follow_bottom();
         cx.notify();
+        true
     }
 
     /// One popup (`.filter-popup`): a header with its title and ✕, then the field.

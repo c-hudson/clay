@@ -124,14 +124,28 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     Ok(keystroke) => vec![gpui::PlatformInput::KeyDown(gpui::KeyDownEvent { keystroke, is_held: false, prefer_character_input: false })],
                     Err(e) => fail(&format!("bad key {arg}: {e}")),
                 },
-                "type" => {
+                // Text as the platform delivers it: to a focused Find/Search field, else
+                // to the input line through its input handler; `compose` is an input
+                // method's uncommitted text, `commit` its result.
+                "type" | "compose" | "commit" => {
                     let text = arg.to_string();
                     cx.update_window(window.into(), |root, w, app| {
                         if let Ok(view) = root.downcast::<ClayView>() {
-                            view.update(app, |v, cx| v.type_into_find(&text, w, cx));
+                            view.update(app, |v, cx| {
+                                use gpui::EntityInputHandler;
+                                if verb == "compose" {
+                                    v.replace_and_mark_text_in_range(None, &text, None, w, cx);
+                                } else if verb == "commit" || !v.type_into_find(&text, w, cx) {
+                                    v.replace_text_in_range(None, &text, w, cx);
+                                }
+                            });
                         }
                     })
                     .expect("type");
+                    Vec::new()
+                }
+                "sleep" => {
+                    std::thread::sleep(Duration::from_millis(nums.first().copied().unwrap_or(0.0) as u64));
                     Vec::new()
                 }
                 "wait" => {
