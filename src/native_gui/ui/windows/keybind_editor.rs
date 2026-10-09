@@ -371,7 +371,7 @@ impl KeybindEditor {
                         .when(selected, |d| d.bg(t.hover))
                         .when(found, |d| d.border_l_2().border_color(t.accent))
                         .when(!selected, |d| d.hover(move |s| s.bg(hover)))
-                        .child(div().text_size(px(12.0)).min_w_0().overflow_hidden().whitespace_nowrap().child(a.name.clone()))
+                        .child(div().text_size(px(12.0)).min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(a.name.clone()))
                         .child(div().flex().flex_wrap().justify_end().gap(px(3.0)).children(badges))
                         .on_click(cx.listener(move |this, _, _w, cx| {
                             this.selected = Some(id.clone());
