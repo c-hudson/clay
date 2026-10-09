@@ -164,7 +164,7 @@ PATCH
 if check_webview; then
     HAS_WEBVIEW=true
     FEATURES="$FEATURES,webview-gui"
-    echo "  [+] webview-gui (native GUI)"
+    echo "  [+] webview-gui (WebView GUI)"
 else
     echo "  [-] webview-gui (not available)"
     if [ -n "$MISSING_DEPS" ]; then
@@ -175,6 +175,94 @@ else
                 ;;
         esac
     fi
+fi
+
+# --- Native GUI (GPUI) ---
+# Needs a newer Rust than the rest of Clay (GPUI uses library features stabilized
+# after 1.89; 1.98 is the release it's tested with): the default toolchain when it's new
+# enough, else any rustup toolchain that is. Not on Termux/Android (GPUI has no Android
+# backend).
+NATIVE_RUST_VERSION="1.98.0"
+NATIVE_TOOLCHAIN=""
+NATIVE_MISSING_DEPS=""
+NATIVE_LINK_DIR=""
+HAS_NATIVE_GUI=false
+
+find_native_toolchain() {
+    if version_ge "$RUST_VERSION" "$NATIVE_RUST_VERSION"; then
+        return 0
+    fi
+    command -v rustup &> /dev/null || return 1
+    local tc ver
+    for tc in $(rustup toolchain list 2>/dev/null | awk '{print $1}'); do
+        ver=$(rustc +"$tc" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+        if [ -n "$ver" ] && version_ge "$ver" "$NATIVE_RUST_VERSION"; then
+            NATIVE_TOOLCHAIN="+$tc"
+            return 0
+        fi
+    done
+    return 1
+}
+
+check_native_gui() {
+    case "$OS" in
+        linux)
+            if ! command -v pkg-config &> /dev/null; then
+                NATIVE_MISSING_DEPS=" pkg-config"
+                return 1
+            fi
+            local pc
+            for pc in xkbcommon wayland-client wayland-cursor fontconfig freetype2; do
+                if ! pkg-config --exists "$pc" 2>/dev/null; then
+                    case "$pc" in
+                        xkbcommon) NATIVE_MISSING_DEPS="$NATIVE_MISSING_DEPS libxkbcommon-dev" ;;
+                        wayland-*) case "$NATIVE_MISSING_DEPS" in *libwayland-dev*) ;; *) NATIVE_MISSING_DEPS="$NATIVE_MISSING_DEPS libwayland-dev" ;; esac ;;
+                        fontconfig) NATIVE_MISSING_DEPS="$NATIVE_MISSING_DEPS libfontconfig-dev" ;;
+                        freetype2) NATIVE_MISSING_DEPS="$NATIVE_MISSING_DEPS libfreetype-dev" ;;
+                    esac
+                fi
+            done
+            # libxkbcommon-x11: linking wants its development symlink. With only the
+            # runtime library installed, a link of our own will do.
+            if ! pkg-config --exists xkbcommon-x11 2>/dev/null; then
+                local lib
+                for lib in /usr/lib/x86_64-linux-gnu/libxkbcommon-x11.so.0 /usr/lib/aarch64-linux-gnu/libxkbcommon-x11.so.0 /usr/lib64/libxkbcommon-x11.so.0 /usr/lib/libxkbcommon-x11.so.0; do
+                    if [ -e "$lib" ]; then
+                        NATIVE_LINK_DIR="$PWD/target/native-gui-link"
+                        mkdir -p "$NATIVE_LINK_DIR"
+                        ln -sf "$lib" "$NATIVE_LINK_DIR/libxkbcommon-x11.so"
+                        break
+                    fi
+                done
+                [ -n "$NATIVE_LINK_DIR" ] || NATIVE_MISSING_DEPS="$NATIVE_MISSING_DEPS libxkbcommon-x11-dev"
+            fi
+            [ -z "$NATIVE_MISSING_DEPS" ]
+            ;;
+        macos|windows)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+if $IS_ANDROID; then
+    echo "  [-] native-gui (not available on Android/Termux)"
+elif ! check_native_gui; then
+    echo "  [-] native-gui (not available)"
+    if [ -n "$NATIVE_MISSING_DEPS" ]; then
+        echo "      Missing:$NATIVE_MISSING_DEPS"
+        [ "$OS" = "linux" ] && echo "      Install: sudo apt install$NATIVE_MISSING_DEPS"
+    fi
+elif ! find_native_toolchain; then
+    echo "  [-] native-gui (needs Rust $NATIVE_RUST_VERSION or newer; this is $RUST_VERSION)"
+    echo "      Update with: rustup update   (or add one: rustup toolchain install 1.98.1)"
+else
+    HAS_NATIVE_GUI=true
+    FEATURES="$FEATURES,native-gui"
+    NATIVE_LABEL=${NATIVE_TOOLCHAIN#+}
+    echo "  [+] native-gui (native GUI, Rust ${NATIVE_LABEL:-$RUST_VERSION})"
 fi
 
 # --- Native audio ---
@@ -233,7 +321,7 @@ if $IS_TERMUX; then
 fi
 
 # --- Determine build target ---
-if [ "$OS" = "linux" ] && $HAS_MUSL && ! $HAS_WEBVIEW && ! $HAS_AUDIO; then
+if [ "$OS" = "linux" ] && $HAS_MUSL && ! $HAS_WEBVIEW && ! $HAS_AUDIO && ! $HAS_NATIVE_GUI; then
     # Static musl build (TUI only, no GUI/audio)
     BUILD_TARGET="--target x86_64-unknown-linux-musl --no-default-features"
 else
@@ -259,9 +347,19 @@ build_with_fallback() {
     local target_flags="$2"
     local rustflags="$3"
     local desc="$4"
+    local toolchain=""
+    local flags="$rustflags"
+    # The native GUI builds with its own toolchain (when the default is too old) and,
+    # on Linux, may need the libxkbcommon-x11 link made above.
+    case ",$features," in
+        *,native-gui,*)
+            toolchain="$NATIVE_TOOLCHAIN"
+            [ -n "$NATIVE_LINK_DIR" ] && flags="$flags -L native=$NATIVE_LINK_DIR"
+            ;;
+    esac
 
     echo "Attempting: $desc"
-    if RUSTFLAGS="$rustflags" cargo build --release $target_flags --features "$features" 2>&1; then
+    if RUSTFLAGS="$flags" cargo $toolchain build --release $target_flags --features "$features" 2>&1; then
         return 0
     fi
     return 1
@@ -272,6 +370,16 @@ BUILD_OK=false
 # Try full feature set first
 if build_with_fallback "$FEATURES" "$BUILD_TARGET" "$EXTRA_RUSTFLAGS" "full feature build ($FEATURES)"; then
     BUILD_OK=true
+fi
+
+# Fallback: try without the native GUI (everything else as before)
+if ! $BUILD_OK && $HAS_NATIVE_GUI; then
+    echo ""
+    echo "Full build failed. Retrying without native-gui..."
+    FEATURES=$(echo "$FEATURES" | sed 's/,native-gui//')
+    if build_with_fallback "$FEATURES" "$BUILD_TARGET" "$EXTRA_RUSTFLAGS" "without native-gui ($FEATURES)"; then
+        BUILD_OK=true
+    fi
 fi
 
 # Fallback: try without audio
@@ -381,5 +489,10 @@ if echo "$FEATURES" | grep -q "webview-gui"; then
     echo ""
     echo "Run as GUI client (connects to running instance):"
     echo "  ./$BINARY_PATH --gui=hostname:port"
+fi
+if echo "$FEATURES" | grep -q "native-gui"; then
+    echo ""
+    echo "Run the native GUI (connects to a running Clay):"
+    echo "  ./$BINARY_PATH --native-gui=hostname:port"
 fi
 echo ""
