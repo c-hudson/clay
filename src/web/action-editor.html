@@ -366,8 +366,11 @@ input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; accent-colo
 let ws = null;
 let actions = [];         // Array of Action objects (from server)
 let worldNames = [];      // Connected world names (for hints)
-let selectedIdx = -1;     // Index into (filtered view) — use selActionName for stability
-let selActionName = null; // Name of currently selected action
+// The selected action itself (not its name: two actions can share a name until Save
+// refuses it, and selecting by name then highlighted both and edited the first).
+let selAction = null;
+// app.js's INTERNAL_COMMANDS, filled in by the server: an action can't take one's name.
+const INTERNAL_COMMANDS = (function() { try { return JSON.parse('{{INTERNAL_COMMANDS_JSON}}'); } catch (e) { return []; } })();
 let savedSnapshot = '';   // JSON.stringify(actions) at last save
 let editBaseline = '';    // JSON.stringify of the selected action at time of selection / last save
 let filterText = '';
@@ -428,7 +431,9 @@ function handleWsMessage(msg) {
       }
       break;
     case 'ActionEditorState':
-      actions = JSON.parse(msg.actions_json || '[]');
+      { const keep = selAction ? selAction.name : null;
+        actions = JSON.parse(msg.actions_json || '[]');
+        selAction = keep === null ? null : actions.find(x => x.name === keep) || null; }
       worldNames = JSON.parse(msg.world_names_json || '[]');
       // Ensure every action has a patterns array (legacy compat)
       normalizeActions();
@@ -438,13 +443,18 @@ function handleWsMessage(msg) {
       renderAll();
       break;
     case 'ActionsUpdated':
-      // Another client saved — refresh if no local unsaved changes
+      // Another client saved — refresh if no local unsaved changes. Our own Save comes back
+      // this way too: say "Updated from server" only when the list really differs.
       if (JSON.stringify(actions) === savedSnapshot) {
+        const before = canonical(actions);
+        const keep = selAction ? selAction.name : null;
         actions = msg.actions || [];
         normalizeActions();
+        selAction = keep === null ? null : actions.find(x => x.name === keep) || null;
+        editBaseline = selAction ? JSON.stringify(selAction) : '';
         savedSnapshot = JSON.stringify(actions);
         renderAll();
-        showSaveStatus('Updated from server');
+        if (canonical(actions) !== before) showSaveStatus('Updated from server');
       }
       break;
     case 'Pong':
@@ -562,6 +572,14 @@ function sha256Fallback(message) {
 // ============================================================
 // Filtering & sorted view
 // ============================================================
+// JSON with every object's keys in order: the server's copy of a list and ours compare equal
+// whatever order their fields were written in.
+function canonical(v) {
+  if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+  return JSON.stringify(v === undefined ? null : v);
+}
+
 function filteredActions() {
   const f = filterText.trim().toLowerCase();
   const w = worldFilterText.trim().toLowerCase();
@@ -600,14 +618,14 @@ function renderList() {
   if (visible.length === 0) {
     const d = document.createElement('div');
     d.style.cssText = 'color:var(--editor-fg2);font-size:11px;padding:12px 10px;font-style:italic;';
-    d.textContent = filterText ? 'No matching actions' : 'No actions yet — click + New Action';
+    d.textContent = (filterText || worldFilterText) ? 'No matching actions' : 'No actions yet — click + New Action';
     container.appendChild(d);
     return;
   }
 
   for (const a of visible) {
     const item = document.createElement('div');
-    item.className = 'list-item' + (a.name === selActionName ? ' selected' : '');
+    item.className = 'list-item' + (a === selAction ? ' selected' : '');
 
     const en = document.createElement('span');
     en.className = 'list-item-en ' + (a.enabled ? 'on' : 'off');
@@ -638,11 +656,10 @@ function renderList() {
     item.appendChild(info);
 
     item.addEventListener('click', () => {
-      if (a.name === selActionName) return;
+      if (a === selAction) return;
       tryLeaveCurrent(() => {
-        selActionName = a.name;
-        const next = actions.find(x => x.name === selActionName);
-        editBaseline = next ? JSON.stringify(next) : '';
+        selAction = actions.includes(a) ? a : null;
+        editBaseline = selAction ? JSON.stringify(selAction) : '';
         renderAll();
       });
     });
@@ -654,7 +671,7 @@ function renderList() {
 function renderDetail() {
   const panel = document.getElementById('detailPanel');
 
-  const a = actions.find(x => x.name === selActionName);
+  const a = currentAction();
   if (!a) {
     panel.innerHTML = '<div class="no-selection">Select an action from the list to edit it</div>';
     return;
@@ -663,7 +680,10 @@ function renderDetail() {
   panel.innerHTML = '';
 
   // Name
-  addField(panel, 'Name', buildInput('text', a.name, v => { a.name = v; selActionName = v; renderList(); markDirty(); }));
+  const nameError = document.createElement('div');
+  nameError.className = 'auth-error';
+  nameError.id = 'nameError';
+  addField(panel, 'Name', buildInput('text', a.name, v => { a.name = v; nameError.textContent = ''; renderList(); markDirty(); }), nameError);
 
   // World
   const worldHint = document.createElement('div');
@@ -790,10 +810,24 @@ function renderDetail() {
   delBtn.className = 'danger';
   delBtn.textContent = 'Delete Action';
   delBtn.addEventListener('click', () => {
-    if (!confirm('Delete action "' + esc(a.name) + '"?')) return;
+    // confirm() shows plain text: no HTML escaping here.
+    if (!confirm('Delete action "' + a.name + '"?')) return;
+    // The name it was saved under (it may have been renamed since, unsaved).
+    const savedName = editBaseline ? JSON.parse(editBaseline).name : a.name;
     const idx = actions.indexOf(a);
     if (idx >= 0) actions.splice(idx, 1);
-    selActionName = null;
+    selAction = null;
+    editBaseline = '';
+    // Deleted on the server now, not at some later Save: the list as last saved, less this
+    // one (a new action never saved just goes).
+    const saved = JSON.parse(savedSnapshot || '[]');
+    if (saved.some(x => x.name === savedName)) {
+      actions = saved.filter(x => x.name !== savedName);
+      normalizeActions();
+      wsSend({ type: 'UpdateActions', actions });
+      savedSnapshot = JSON.stringify(actions);
+      showSaveStatus('Deleted');
+    }
     markDirty();
     renderAll();
   });
@@ -872,7 +906,7 @@ function addNewAction() {
       suppress_blanks: false,
     };
     actions.push(a);
-    selActionName = name;
+    selAction = a;
     editBaseline = JSON.stringify(a);
     markDirty();
     renderAll();
@@ -895,7 +929,16 @@ function updateUnsaved() {
 
 // Returns the currently selected action object, or null.
 function currentAction() {
-  return selActionName ? actions.find(x => x.name === selActionName) || null : null;
+  return selAction && actions.includes(selAction) ? selAction : null;
+}
+
+// app.js validateAction's rules: a name, not another action's (case aside), not a command's.
+function nameProblem(a) {
+  const name = (a.name || '').trim();
+  if (!name) return 'Name is required';
+  if (actions.some(x => x !== a && (x.name || '').toLowerCase() === name.toLowerCase())) return 'An action with this name already exists';
+  if (INTERNAL_COMMANDS.includes(name.toLowerCase())) return 'Cannot use internal command name';
+  return null;
 }
 
 // True when the current action has edits not yet saved to the server.
@@ -907,12 +950,20 @@ function currentActionDirty() {
 
 // Save the current action (sends whole list; server replaces + persists).
 function doSaveCurrent() {
+  const a = currentAction();
+  const problem = a ? nameProblem(a) : null;
+  if (problem) {
+    const el = document.getElementById('nameError');
+    if (el) el.textContent = problem;
+    return false;
+  }
+  if (a) a.name = a.name.trim();
   wsSend({ type: 'UpdateActions', actions });
   savedSnapshot = JSON.stringify(actions);
-  const a = currentAction();
   editBaseline = a ? JSON.stringify(a) : '';
   updateUnsaved();
   showSaveStatus('Saved');
+  return true;
 }
 
 // Discard edits to the current action, restoring from editBaseline.
@@ -935,7 +986,7 @@ function tryLeaveCurrent(proceedFn) {
   }
   const name = (currentAction() && currentAction().name) || '(unnamed)';
   showUnsavedModal(name, {
-    onSave: () => { doSaveCurrent(); proceedFn(); },
+    onSave: () => { if (doSaveCurrent()) proceedFn(); },
     onDiscard: () => { discardCurrent(); proceedFn(); },
     onStay: () => {},
   });

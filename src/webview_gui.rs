@@ -1040,7 +1040,10 @@ document.addEventListener('DOMContentLoaded', function() {
         var indices = [];
         for (var i = 0; i < spans.length; i++) {
             if (range.intersectsNode(spans[i])) {
-                indices.push(parseInt(spans[i].getAttribute('data-line-idx'), 10));
+                /* The seq too: an index goes stale once history is prepended above it. */
+                var seq = spans[i].getAttribute('data-seq');
+                indices.push({ idx: parseInt(spans[i].getAttribute('data-line-idx'), 10),
+                               seq: seq === null ? null : parseInt(seq, 10) });
             }
         }
         return indices;

@@ -637,14 +637,7 @@ pub fn history_substitute(cmd: &str, history: &[String]) -> Option<Result<String
 /// the server already embeds, so the two lists can't drift), as `/name`.
 pub fn internal_commands() -> &'static [String] {
     static LIST: OnceLock<Vec<String>> = OnceLock::new();
-    LIST.get_or_init(|| parse_internal_commands(crate::http::WEB_APP_JS))
-}
-
-fn parse_internal_commands(js: &str) -> Vec<String> {
-    let Some(start) = js.find("const INTERNAL_COMMANDS = [") else { return Vec::new() };
-    let body = &js[start..];
-    let Some(end) = body.find("];") else { return Vec::new() };
-    body[..end].split('\'').skip(1).step_by(2).map(|name| format!("/{name}")).collect()
+    LIST.get_or_init(|| crate::http::internal_command_names().iter().map(|name| format!("/{name}")).collect())
 }
 
 #[cfg(test)]

@@ -489,6 +489,9 @@
         // Device mode selector (long-press menu)
         deviceModeModal: document.getElementById('device-mode-modal'),
         deviceModeList: document.getElementById('device-mode-list'),
+        recentWorldsModal: document.getElementById('recent-worlds-modal'),
+        recentWorldsContent: document.getElementById('recent-worlds-content'),
+        recentWorldsList: document.getElementById('recent-worlds-list'),
         // Password change modal (multiuser mode)
         passwordModal: document.getElementById('password-modal'),
         passwordOld: document.getElementById('password-old'),
@@ -2116,6 +2119,110 @@
         });
     }
 
+    // Ctrl+Q (spell_check), as the console's: the first press asks the server's checker
+    // (the browser has none a page can ask) about the word at the cursor and lists its
+    // suggestions; each press after that puts the next one in its place, the original word
+    // last, and round again. Any edit of the user's ends the round.
+    let spellCycle = null; // { start, end, current, list, next }
+
+    function wordAtCaret(text, at) {
+        const isWord = c => c !== undefined && /[\p{L}\p{N}'\u2019]/u.test(c);
+        let start = at, end = at;
+        while (start > 0 && isWord(text[start - 1])) start--;
+        while (end < text.length && isWord(text[end])) end++;
+        return start < end ? { start, end, word: text.slice(start, end) } : null;
+    }
+
+    function spellCheckKey() {
+        const input = elements.input;
+        const c = spellCycle;
+        if (c && input.selectionStart === c.end && input.value.slice(c.start, c.end) === c.current) {
+            const word = c.list[c.next];
+            input.setRangeText(word, c.start, c.end, 'end');
+            c.end = c.start + word.length;
+            c.current = word;
+            c.next = (c.next + 1) % c.list.length;
+            return;
+        }
+        spellCycle = null;
+        const w = wordAtCaret(input.value, input.selectionStart);
+        if (w) send({ type: 'SpellSuggest', word: w.word });
+    }
+
+    // The server's answer (SpellSuggestions): list the suggestions and get the round ready,
+    // if the word is still the one at the cursor.
+    function applySpellSuggestions(msg) {
+        const input = elements.input;
+        const w = wordAtCaret(input.value, input.selectionStart);
+        if (!w || w.word !== msg.word || msg.valid || !Array.isArray(msg.suggestions) || !msg.suggestions.length) return;
+        appendClientLine(`Suggestions for '${msg.word}': ${msg.suggestions.join(', ')} (Ctrl+Q again to cycle)`);
+        spellCycle = { start: w.start, end: w.end, current: msg.word, list: msg.suggestions.concat([msg.word]), next: 0 };
+    }
+
+    // Recent Worlds (the recent_worlds action, as the console's popup): up to six other
+    // worlds by the last line sent to or received from them, newest first. The times are
+    // this client's own: seeded from InitialState's last_recv_secs/last_send_secs and moved
+    // on as output arrives and commands go out.
+    let recentWorldsModalOpen = false;
+    let recentWorldsSelected = 0;
+
+    function noteWorldActivity(index) {
+        if (worlds[index]) worlds[index]._lastActivityMs = Date.now();
+    }
+
+    function recentWorldEntries() {
+        return worlds.map((w, i) => ({ i, at: w ? w._lastActivityMs : undefined }))
+            .filter(e => e.i !== currentWorldIndex && typeof e.at === 'number')
+            .sort((a, b) => b.at - a.at)
+            .slice(0, 6);
+    }
+
+    function renderRecentWorlds() {
+        const list = elements.recentWorldsList;
+        list.innerHTML = '';
+        const entries = recentWorldEntries();
+        if (!entries.length) {
+            const empty = document.createElement('div');
+            empty.className = 'menu-item empty';
+            empty.textContent = 'No recently active worlds.';
+            list.appendChild(empty);
+            return;
+        }
+        recentWorldsSelected = Math.max(0, Math.min(recentWorldsSelected, entries.length - 1));
+        entries.forEach((e, n) => {
+            const item = document.createElement('div');
+            item.className = 'menu-item' + (n === recentWorldsSelected ? ' selected' : '');
+            item.dataset.world = String(e.i);
+            const name = document.createElement('span');
+            name.textContent = worlds[e.i].name || ('World ' + (e.i + 1));
+            const ago = document.createElement('span');
+            ago.className = 'recent-ago';
+            ago.textContent = formatElapsed(Math.max(0, Math.floor((Date.now() - e.at) / 1000)));
+            item.append(name, ago);
+            list.appendChild(item);
+        });
+    }
+
+    function showRecentWorldsModal() {
+        recentWorldsModalOpen = true;
+        recentWorldsSelected = 0;
+        renderRecentWorlds();
+        elements.recentWorldsModal.classList.add('visible');
+        // Keys go to the list, not the input line.
+        elements.recentWorldsContent.focus();
+    }
+
+    function hideRecentWorldsModal() {
+        recentWorldsModalOpen = false;
+        elements.recentWorldsModal.classList.remove('visible');
+        elements.input.focus();
+    }
+
+    function chooseRecentWorld(index) {
+        hideRecentWorldsModal();
+        if (index >= 0 && index < worlds.length && index !== currentWorldIndex) switchWorldLocal(index);
+    }
+
     // Device mode modal
     let deviceModeModalOpen = false;
 
@@ -3260,6 +3367,15 @@
                 worlds = msg.worlds || [];
                 // TF's %textdiv: what this client is given now counts as already shown.
                 worlds.forEach(function(w) { if (w) w._seenSeq = lastLineSeq(w); });
+                // Recent Worlds: the server's view of each world's last send or receive.
+                {
+                    const nowMs = Date.now();
+                    worlds.forEach(function(w) {
+                        if (!w) return;
+                        const ago = [w.last_recv_secs, w.last_send_secs].filter(v => typeof v === 'number');
+                        if (ago.length) w._lastActivityMs = nowMs - Math.min.apply(null, ago) * 1000;
+                    });
+                }
 
                 // Which world should be focused after this InitialState? Resolved by
                 // world name (the stable identity used elsewhere, e.g. the scrollback
@@ -3663,6 +3779,8 @@
                     }
                     if (msg.settings.spell_check_enabled !== undefined) {
                         spellCheckEnabled = msg.settings.spell_check_enabled;
+                        // The browser's own squiggles follow the setting.
+                        elements.input.spellcheck = !!spellCheckEnabled;
                     }
                     // Web settings (web_secure no longer read — see declaration above)
                     if (msg.settings.http_enabled !== undefined) {
@@ -3801,6 +3919,16 @@
                 serverActivityCount = worlds.filter((w, i) => i !== currentWorldIndex && worldHasActivity(w)).length;
                 renderOutput();
                 updateStatusBar();
+                // The prompt the MUD sent before this (re)connect or resync: each world
+                // carries it, and nothing else draws it until the MUD sends a new one.
+                {
+                    const promptWorld = worlds[currentWorldIndex];
+                    if (promptWorld && promptWorld.prompt) {
+                        elements.prompt.innerHTML = sanitizeHtml(parseAnsi(promptWorld.prompt));
+                    } else {
+                        elements.prompt.textContent = '';
+                    }
+                }
                 // Send initial view state for synchronized more-mode
                 sendViewStateIfChanged();
                 // Warn once per session if this client's bundled version differs from the
@@ -4071,6 +4199,8 @@
                         // Client-generated messages (from_server: false) are always complete
                         // Only use partial line handling for MUD server data
                         const isFromServer = msg.from_server !== false;
+                        // Output from the MUD now (not a refill of history): Recent Worlds.
+                        if (isFromServer && !isGapFill) noteWorldActivity(msg.world_index);
 
                         // Prepend any partial line from previous read (only for server data)
                         let data = msg.data;
@@ -4191,7 +4321,8 @@
                                 // Gagged lines are stored but not rendered (only visible with F2)
                                 // They bypass more-mode entirely
                                 if (msg.gagged) {
-                                    // Don't render or count for more-mode
+                                    // Not counted for more-mode; drawn only with F2 (as a full render does)
+                                    if (showTags) appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
                                 } else if (!hasRealSeq && isFromServer) {
                                     // Released pending lines (seq=0, from_server=true) bypass local
                                     // more-mode to avoid flickering the More indicator
@@ -4527,6 +4658,8 @@
                     }
                     if (msg.settings.spell_check_enabled !== undefined) {
                         spellCheckEnabled = msg.settings.spell_check_enabled;
+                        // The browser's own squiggles follow the setting.
+                        elements.input.spellcheck = !!spellCheckEnabled;
                     }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
@@ -5006,6 +5139,10 @@
                     worlds[msg.world_index].echo_masked = msg.masked;
                     updateStatusBar();
                 }
+                break;
+
+            case 'SpellSuggestions':
+                applySpellSuggestions(msg);
                 break;
 
             case 'ConnectionsListResponse':
@@ -5574,6 +5711,7 @@
     function send(msg) {
         if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
             ws.send(JSON.stringify(msg));
+            if (msg && msg.type === 'SendCommand' && typeof msg.world_index === 'number') noteWorldActivity(msg.world_index);
             return true;
         }
         return false;
@@ -8032,13 +8170,21 @@
     }
 
     // Get raw ANSI text for given line indices (used by WebView debug selection)
+    // `lineIndices`: the selected lines' data-line-idx numbers, or {idx, seq} objects. A seq
+    // names its line for good; an index goes stale once history is prepended above it.
     window.getDebugSelectionText = function(lineIndices) {
         var world = worlds[currentWorldIndex];
         if (!world) return '';
         var lines = world.output_lines || [];
         var parts = [];
         for (var i = 0; i < lineIndices.length; i++) {
-            var idx = lineIndices[i];
+            var item = lineIndices[i];
+            var idx = typeof item === 'object' && item !== null ? item.idx : item;
+            if (typeof item === 'object' && item !== null && typeof item.seq === 'number') {
+                for (var k = 0; k < lines.length; k++) {
+                    if (lines[k] && lines[k].seq === item.seq && lines[k]._has_real_seq !== false) { idx = k; break; }
+                }
+            }
             if (idx >= 0 && idx < lines.length) {
                 var lineObj = lines[idx];
                 var raw = typeof lineObj === 'string' ? lineObj : lineObj.text;
@@ -8203,12 +8349,17 @@
     function claimUnviewedLocally(worldIndex) {
         const w = worlds[worldIndex];
         if (!w || !myDisplayId || !Array.isArray(w.output_lines)) return;
-        const guessed = new Set();
+        // A guess still waiting for its answer stays: a second claim before the first
+        // ClaimedNew (which finds nothing new) must not forget it, or that answer can't take
+        // back a marker the server never granted.
+        const prior = w._optimisticClaim;
+        const guessed = (prior && (Date.now() - prior.at) < OPTIMISTIC_CLAIM_TTL_MS) ? prior.seqs : new Set();
         for (const line of w.output_lines) {
             if (line.viewed) continue;
             line.viewed = true;
-            // from_server defaults true on the wire; archive lines never take a marker.
-            if (line.from_server !== false && !line.from_archive) {
+            // from_server defaults true on the wire; archive lines never take a marker. A line
+            // without a real seq is never guessed: no ClaimedNew could take its marker back.
+            if (line.from_server !== false && !line.from_archive && typeof line.seq === 'number' && line._has_real_seq !== false) {
                 line.display_id = myDisplayId;
                 guessed.add(line.seq);
             }
@@ -8218,8 +8369,130 @@
         // only meaningful until the reply that answers it: an outstanding guess that is never
         // answered must not survive to be revoked by some unrelated later ClaimedNew, which is
         // exactly how ▶ used to appear and then vanish a moment later.
+        // (Re)stamped now: this claim is answered too (as ClientCore::claim_locally does).
         w._optimisticClaim = guessed.size ? { seqs: guessed, at: Date.now() } : null;
     }
+
+    // A line that is only escape codes (a trailing reset after a newline) or an idler
+    // keep-alive marker: never drawn, on any path. The live path drops these on arrival; one
+    // that comes back through InitialState, a scrollback load or a resync is kept (its seq is
+    // real) and hidden here instead, rather than drawn as a blank row.
+    function isFillerLine(text) {
+        const line = String(text).replace(/[\r\n]+/g, '');
+        if (line.length > 0 && line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0) return true;
+        return line.includes('###_idler_message_') && line.includes('_###');
+    }
+
+    // Whether a stored line is drawn right now. One decision for a full render and a live
+    // append, so a line never looks different depending on how it arrived.
+    function lineIsDrawn(cleanLine, gagged) {
+        if (gagged && !showTags) return false;
+        if (isFillerLine(cleanLine)) return false;
+        // Filter (F4, with * and ?) and grep: match the displayed text (no ANSI, no MUD tag for grep)
+        if (filterPopupOpen && filterText.length > 0 && !matchesFilter(stripAnsiForFilter(cleanLine), filterText)) return false;
+        if (grepRegex && !grepRegex.test(stripMudTag(stripAnsiForFilter(cleanLine)))) return false;
+        return true;
+    }
+
+    // A search match (F5) is on display: the view ends at the matched line.
+    function searchCutOff() {
+        return searchPopupOpen && searchCurrentPos >= 0 && searchCurrentPos < searchMatchIndices.length;
+    }
+
+    // An emoji cluster as a browser shows it in colour: a character whose default form is
+    // emoji (unless VS15, U+FE0E, asks for text), or any one with VS16 (U+FE0F), with its
+    // skin tone and ZWJ-joined parts; a flag (two regional indicators); a keycap.
+    // Text-default symbols (©, ™, ↔) stay text.
+    const EMOJI_CLUSTER = new RegExp(
+        '(?:\\p{RI}\\p{RI}' +
+        '|[#*0-9]\\uFE0F?\\u20E3' +
+        '|(?:\\p{Emoji_Presentation}(?!\\uFE0E)|\\p{Extended_Pictographic}\\uFE0F)\\p{EMod}?' +
+        '(?:\\u200D(?:\\p{Emoji_Presentation}|\\p{Extended_Pictographic})\\uFE0F?\\p{EMod}?)*)', 'gu');
+
+    // Emoji in the colour emoji font. A font earlier in the output's font list can have its
+    // own black-and-white glyph for an emoji - Windows' Cascadia Code draws ⬛⬜ as a filled
+    // and an outlined square, which read as one shape - and the font list wins over the
+    // emoji fallback. Text between tags only, never an attribute (a link's href).
+    function wrapEmoji(html) {
+        if (!/[\u00A9-\u{1FAFF}]/u.test(html)) return html;
+        return html.split(/(<[^>]*>)/).map((part, i) =>
+            i % 2 === 1 ? part : part.replace(EMOJI_CLUSTER, m => '<span class="emoji">' + m + '</span>')).join('');
+    }
+
+    // One drawn line's HTML, the same for both paths. `o`: ts, fromServer, archiveSourced,
+    // fromArchive, markedNew, highlightColor, worldName.
+    function lineHtml(cleanLine, o) {
+        // Format timestamp prefix if showTags is enabled
+        const tsPrefix = showTags && o.ts ? `<span class="timestamp">${formatTimestamp(o.ts)}</span>` : '';
+        // Strip the MUD tag BEFORE the prefix, matching process_output_line() on the
+        // Rust side: stripMudTag only fires on a line starting with '[', so prefixing
+        // first silently suppresses it.
+        const taggedText = showTags ? cleanLine : stripMudTag(cleanLine);
+        const strippedText = applyClientPrefix(taggedText, o.fromServer, o.archiveSourced);
+        const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
+        // Skip Discord emoji conversion when showTags is enabled so users can see original text
+        const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
+        const newLinePrefix = (nliDrawn() && o.markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
+        // Mirrors OutputLine::shows_archive_prefix(): both flags mean "text from scrollback.db".
+        const archivePrefix = (o.fromArchive || o.archiveSourced) ? '🛢️ ' : '';
+        let html = tsPrefix + newLinePrefix + archivePrefix + wrapEmoji(showTags ? processed : convertDiscordEmojis(processed));
+        // Apply /highlight color from action command (takes priority)
+        if (o.highlightColor !== null && o.highlightColor !== undefined) {
+            html = `<span style="background-color: ${colorNameToCss(o.highlightColor)}; display: block;">${html}</span>`;
+        }
+        // Apply F8 action highlighting if enabled (and no explicit highlight color)
+        else if (highlightActions && lineMatchesAction(cleanLine, o.worldName || '')) {
+            html = `<span class="action-highlight">${html}</span>`;
+        }
+        return html;
+    }
+
+    // The line's element. data-seq names the line for good (Debug Selection, the view anchor);
+    // data-line-idx goes stale once history is prepended above it.
+    function lineSpanHtml(html, idx, lineObj) {
+        const seq = lineObj && typeof lineObj === 'object' && typeof lineObj.seq === 'number'
+            && lineObj._has_real_seq !== false ? lineObj.seq : null;
+        return `<span class="line" data-line-idx="${idx}"${seq !== null ? ` data-seq="${seq}"` : ''}>${html}</span>`;
+    }
+
+    // The line at the top of the view and how far its top sits from the view's, so a rebuild
+    // can put the reader back where they were instead of at the bottom.
+    function viewAnchor() {
+        const kids = elements.output.children;
+        if (!kids.length) return null;
+        const top = elements.outputContainer.getBoundingClientRect().top;
+        let lo = 0, hi = kids.length - 1;
+        while (lo < hi) {   // the first element whose bottom is below the view's top
+            const mid = (lo + hi) >> 1;
+            if (kids[mid].getBoundingClientRect().bottom > top) hi = mid; else lo = mid + 1;
+        }
+        for (let i = lo; i < kids.length; i++) {
+            const el = kids[i];
+            if (!el.classList.contains('line')) continue;
+            return { seq: el.dataset.seq, idx: el.dataset.lineIdx, offset: el.getBoundingClientRect().top - top };
+        }
+        return null;
+    }
+
+    function restoreViewAnchor(anchor) {
+        if (!anchor) return;
+        let el = null;
+        if (anchor.seq !== undefined) {
+            // The same line, or the next one drawn (a filter may have hidden it).
+            const want = Number(anchor.seq);
+            for (const c of elements.output.querySelectorAll('.line[data-seq]')) {
+                if (Number(c.dataset.seq) >= want) { el = c; break; }
+            }
+        }
+        if (!el && anchor.idx !== undefined) el = elements.output.querySelector(`.line[data-line-idx="${anchor.idx}"]`);
+        if (!el) return;
+        const container = elements.outputContainer;
+        container.scrollTop += (el.getBoundingClientRect().top - container.getBoundingClientRect().top) - anchor.offset;
+    }
+
+    // The world the output area last showed: a rebuild of the same world keeps the reader's
+    // place; another world starts at its bottom.
+    let lastRenderedWorld = null;
 
     function renderOutput(opts) {
         const preserveScroll = !!(opts && opts.preserveScroll);
@@ -8254,6 +8527,13 @@
 
         const lines = world.output_lines || [];
 
+        // A rebuild (F2, F8, a filter, a theme or font change) must not throw a reader who
+        // has scrolled up back to the bottom, or re-pin them: only the user does that. A
+        // different world, or a search match to show, still starts at the bottom.
+        const keepView = !preserveScroll && !followBottom && !(opts && opts.toBottom)
+            && world === lastRenderedWorld && !searchCutOff();
+        const anchor = keepView ? viewAnchor() : null;
+
         // When search popup is active and has a match, truncate output at the match line
         // so the matched line appears at the bottom of the output area
         let searchEndIdx = lines.length;
@@ -8279,7 +8559,7 @@
 
         // TF's %textdiv: above the first line shown that arrived after what this client had
         // shown, else ("always"/"clear") after the last line. Not in a filtered view.
-        const divider = (world._textdiv && (textdivMode === 'on' || textdivMode === 'always' || textdivMode === 'clear')
+        const divider = (world._textdiv && (world._textdiv.forced || textdivMode === 'on' || textdivMode === 'always' || textdivMode === 'clear')
             && !(filterPopupOpen && filterText.length > 0) && !grepRegex) ? world._textdiv : null;
         let dividerPlaced = false;
 
@@ -8302,63 +8582,20 @@
             // scrollback.db", only from_archive also means "fabricated seq, never delivered".
             const lineArchiveSourced = typeof lineObj === 'object' ? !!lineObj.archive_sourced : false;
 
-            // Skip gagged lines unless showTags is enabled (F2)
-            if (lineGagged && !showTags) {
-                continue;
-            }
-
             // Strip newlines/carriage returns
             const cleanLine = String(rawLine).replace(/[\r\n]+/g, '');
+            // Gagged (unless F2), escape-only and idler lines, F4's filter, grep.
+            if (!lineIsDrawn(cleanLine, lineGagged)) continue;
 
-            // Filter: skip lines that don't match (case-insensitive)
-            // Filter: skip lines that don't match (supports wildcards * and ?)
-            if (filterPopupOpen && filterText.length > 0) {
-                const plainLine = stripAnsiForFilter(cleanLine);
-                if (!matchesFilter(plainLine, filterText)) {
-                    continue;
-                }
-            }
-
-            // Grep mode: skip lines that don't match the grep pattern
-            // Match against displayed text (strip ANSI codes AND MUD tags)
-            if (grepRegex) {
-                const plainLine = stripMudTag(stripAnsiForFilter(cleanLine));
-                if (!grepRegex.test(plainLine)) {
-                    continue;
-                }
-            }
-
-            // Format timestamp prefix if showTags is enabled
-            const tsPrefix = showTags && lineTs ? `<span class="timestamp">${formatTimestamp(lineTs)}</span>` : '';
-
-            // Strip the MUD tag BEFORE the prefix, matching process_output_line() on the
-            // Rust side: stripMudTag only fires on a line starting with '[', so prefixing
-            // first silently suppresses it.
-            const taggedText = showTags ? cleanLine : stripMudTag(cleanLine);
-            const strippedText = applyClientPrefix(taggedText, lineFromServer, lineArchiveSourced);
-            const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
-            // Skip Discord emoji conversion when showTags is enabled so users can see original text
-            const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
-            const newLinePrefix = (nliDrawn() && lineMarkedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
-            const archivePrefix = (lineFromArchive || lineArchiveSourced) ? '🛢️ ' : '';
-            let html = tsPrefix + newLinePrefix + archivePrefix + (showTags ? processed : convertDiscordEmojis(processed));
-
-            // Apply /highlight color from action command (takes priority)
-            if (lineHighlightColor !== null && lineHighlightColor !== undefined) {
-                const bgColor = colorNameToCss(lineHighlightColor);
-                html = `<span style="background-color: ${bgColor}; display: block;">${html}</span>`;
-            }
-            // Apply F8 action highlighting if enabled (and no explicit highlight color)
-            else if (highlightActions && lineMatchesAction(cleanLine, world.name || '')) {
-                html = `<span class="action-highlight">${html}</span>`;
-            }
+            const html = lineHtml(cleanLine, { ts: lineTs, fromServer: lineFromServer, archiveSourced: lineArchiveSourced,
+                fromArchive: lineFromArchive, markedNew: lineMarkedNew, highlightColor: lineHighlightColor, worldName: world.name });
 
             if (divider && !dividerPlaced && typeof lineObj === 'object' && typeof lineObj.seq === 'number'
                 && !lineObj.from_archive && (divider.afterSeq === null || lineObj.seq > divider.afterSeq)) {
                 htmlParts.push(textdivHtml(divider.mode));
                 dividerPlaced = true;
             }
-            htmlParts.push(`<span class="line" data-line-idx="${i}">${html}</span>`);
+            htmlParts.push(lineSpanHtml(html, i, lineObj));
         }
         if (divider && !dividerPlaced && divider.mode !== 'on') {
             htmlParts.push(textdivHtml(divider.mode));
@@ -8382,10 +8619,14 @@
             elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
             const newScrollHeight = container.scrollHeight;
             container.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
+        } else if (keepView) {
+            elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
+            restoreViewAnchor(anchor);
         } else {
             elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
             scrollToBottom();
         }
+        lastRenderedWorld = world;
 
         // Clear unseen for current world
         world.unseen_lines = 0;
@@ -8425,31 +8666,24 @@
     function appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null, archiveSourced = false) {
         // Strip newlines/carriage returns
         const cleanText = String(text).replace(/[\r\n]+/g, '');
+        const world = worlds[worldIndex];
+        const lineObj = world && world.output_lines ? world.output_lines[lineIndex] : null;
+        const gagged = !!(lineObj && typeof lineObj === 'object' && lineObj.gagged);
+        // The same rules as renderOutput(): a line it wouldn't draw isn't drawn here either.
+        if (!lineIsDrawn(cleanText, gagged)) return;
+        // A search match is on display and the view ends at it: later lines wait for the
+        // search to close (which redraws).
+        if (searchCutOff()) return;
 
-        // Format timestamp prefix if showTags is enabled
-        const tsPrefix = showTags && ts ? `<span class="timestamp">${formatTimestamp(ts)}</span>` : '';
-
-        // Same ordering as renderOutput()/process_output_line(): strip, then prefix.
-        const taggedText = showTags ? cleanText : stripMudTag(cleanText);
-        const strippedText = applyClientPrefix(taggedText, fromServer, archiveSourced);
-        const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
-        // Skip Discord emoji conversion when showTags is enabled so users can see original text
-        const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
-        const newLinePrefix = (nliDrawn() && markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
-        // Without this the line would render with ✨ on arrival and only become 🛢️ on the
-        // next full renderOutput() - the flash this path has produced before.
-        const archivePrefix = archiveSourced ? '🛢️ ' : '';
-        let html = tsPrefix + newLinePrefix + archivePrefix + (showTags ? processed : convertDiscordEmojis(processed));
-        if (highlightColor !== null && highlightColor !== undefined) {
-            html = `<span style="background-color: ${colorNameToCss(highlightColor)}; display: block;">${html}</span>`;
-        }
+        const html = lineHtml(cleanText, { ts, fromServer, archiveSourced, fromArchive: false, markedNew,
+            highlightColor, worldName: world ? world.name : '' });
 
         // "line" is a block-level element (see style.css) so it auto-stacks below the
         // previous one — no <br> separator needed (also what makes the wrapspace
         // hanging-indent CSS work; see renderOutput()'s comment).
         // Defense-in-depth: strip any event handler attributes that slipped through
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
-        elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(`<span class="line" data-line-idx="${lineIndex}">${html}</span>`));
+        elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(lineSpanHtml(html, lineIndex, lineObj)));
 
         scheduleScrollToBottom();
     }
@@ -8963,16 +9197,19 @@
         const quad = (side, y) => ['linear-gradient(to right,' + (side === 'L' ? c + ' 50%,' + t + ' 50%' : t + ' 50%,' + c + ' 50%') + ')',
             '0 ' + y, '1ch 50%', 'repeat-x'];
         const UL = quad('L', '0'), UR = quad('R', '0'), LL = quad('L', '100%'), LR = quad('R', '100%');
-        const shade = (p) => solid('color-mix(in srgb,' + c + ' ' + p + '%,' + t + ')');
+        // A shade is the text colour at 25/50/75% over the cell's background: an overlay
+        // of that opacity (cellSpan), not color-mix(), which older WebKit (Safari 16 /
+        // macOS 11) doesn't draw at all - the shades simply vanished there.
+        const shade = (p) => ({ shade: p / 100 });
         const m = {};
         m['▀'] = [band('to bottom', 4)];                                  // upper half
         for (let n = 1; n <= 7; n++) m[String.fromCharCode(0x2580 + n)] = [band('to top', n)]; // lower n/8
         m['█'] = [solid(c)];                                              // full
         for (let n = 7; n >= 1; n--) m[String.fromCharCode(0x2589 + 7 - n)] = [band('to right', n, true)]; // left n/8
         m['▐'] = [band('to left', 4, true)];                              // right half
-        m['░'] = [shade(25)];                                             // light shade
-        m['▒'] = [shade(50)];                                             // medium shade
-        m['▓'] = [shade(75)];                                             // dark shade
+        m['░'] = shade(25);                                               // light shade
+        m['▒'] = shade(50);                                               // medium shade
+        m['▓'] = shade(75);                                               // dark shade
         m['▔'] = [band('to bottom', 1)];                                  // upper 1/8
         m['▕'] = [band('to left', 1, true)];                              // right 1/8
         const quads = { '▖': [LL], '▗': [LR], '▘': [UL], '▙': [UL, LL, LR],
@@ -8984,6 +9221,10 @@
 
     function cellSpan(text, layers) {
         let style = 'width:' + text.length + 'ch;';
+        if (layers && layers.shade) {
+            return '<span class="blk" style="' + style + '"><span class="blk-shade" style="opacity:' + layers.shade +
+                '"></span>' + text + '</span>';
+        }
         if (layers && layers.length) {
             const col = (i) => layers.map(function(l) { return l[i]; }).join(',');
             style += 'background-image:' + col(0) + ';background-position:' + col(1) +
@@ -9360,8 +9601,11 @@
     function linkifyUrls(html) {
         // URL pattern that works on HTML-escaped text
         // Matches http://, https://, or www. followed by non-whitespace
-        // Stops at HTML tags, quotes, or common punctuation at end
-        const urlPattern = /(\b(?:https?:\/\/|www\.)[^\s<>"'\u201C\u201D\u2018\u2019]*[^\s<>"'\u201C\u201D\u2018\u2019.,;:!?\)\]}>])/gi;
+        // Stops at HTML tags, quotes, or common punctuation at end. A URL can't end on a
+        // zero-width space either: insertWordBreaks puts one after a comma or ")" in a long
+        // word, and ending there swallowed the punctuation before it ("page," linked).
+        // Inside the URL they stay (they're dropped from the href below).
+        const urlPattern = /(\b(?:https?:\/\/|www\.)[^\s<>"'\u201C\u201D\u2018\u2019]*[^\s<>"'\u201C\u201D\u2018\u2019.,;:!?\)\]}>\u200B])/gi;
 
         return html.replace(urlPattern, function(url) {
             // Strip trailing HTML entities (complete like &quot; or partial like &quot
@@ -9422,13 +9666,8 @@
             return namedColors[c];
         }
 
-        // Try xterm 256 color number
-        const num = parseInt(c, 10);
-        if (!isNaN(num) && num >= 0 && num <= 255) {
-            return xterm256ToRgb(num);
-        }
-
-        // Try RGB format (r,g,b or r;g;b)
+        // RGB format (r,g,b or r;g;b) first: parseInt("10,20,30") is 10, so trying the
+        // single number first read every triple as an xterm colour.
         const parts = c.includes(',') ? c.split(',') : c.split(';');
         if (parts.length === 3) {
             const r = parseInt(parts[0].trim(), 10);
@@ -9437,6 +9676,12 @@
             if (!isNaN(r) && !isNaN(g) && !isNaN(b)) {
                 return `rgb(${r}, ${g}, ${b})`;
             }
+        }
+
+        // Try xterm 256 color number
+        const num = parseInt(c, 10);
+        if (!isNaN(num) && num >= 0 && num <= 255) {
+            return xterm256ToRgb(num);
         }
 
         return '#1a3a3a'; // Default fallback
@@ -9536,6 +9781,13 @@
     // Convert temperatures: "32C" -> "32C (90F)", "100F" -> "100F (38C)"
     function convertTemperatures(text) {
         if (!text) return text;
+        // Only the text between escape sequences: a cursor movement such as ESC[5C is not
+        // "5C", and must not become "5C (41F)" (the console and native GUI share the rule).
+        return String(text).split(/(\x1b\[[0-9;?]*[A-Za-z])/).map((piece, i) =>
+            i % 2 === 1 ? piece : convertTemperaturesPlain(piece)).join('');
+    }
+
+    function convertTemperaturesPlain(text) {
         // Pattern: number (with optional decimal), optional space, C or F, followed by delimiter or end
         return text.replace(/(-?\d+(?:\.\d+)?)\s?([CcFf])([\s.,;:!?\]\)"']|$)/g, (match, num, unit, delim) => {
             const n = parseFloat(num);
@@ -10997,6 +11249,7 @@
             elements.actionEnabled.value = 'yes';
             elements.actionStartup.value = 'no';
             elements.actionGuiShortcut.value = 'no';
+            elements.actionSuppressBlanks.value = 'no';
         }
 
         renderActionPatternRows(editPatterns);
@@ -12832,7 +13085,7 @@
 
     // Check if any popup is open
     function isAnyPopupOpen() {
-        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || settingsPopupOpen;
+        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || settingsPopupOpen || recentWorldsModalOpen;
     }
 
     // Check if a world should be included in cycling (connected OR has activity)
@@ -12994,6 +13247,11 @@
     function keyEventToToken(e) {
         const key = e.key;
         if (e.metaKey) return null;
+        // Alt+Ctrl+letter is Esc then ^letter (TF's ^[^L), as the console reads it. Letters
+        // only: AltGr arrives as Ctrl+Alt too, with the character it typed (@, €, ą).
+        if (e.ctrlKey && e.altKey && /^[A-Za-z]$/.test(key)) {
+            return 'Esc-^' + key.toUpperCase();
+        }
         if (e.ctrlKey && key.length === 1) {
             return '^' + key.toUpperCase();
         }
@@ -13685,8 +13943,10 @@
                 return true;
             }
             case 'literal_next':
-                // Not meaningful in browser
-                return true;
+                // Not meaningful in a browser: "not handled", so the key's own default runs.
+                // ^V is bound here by default, and swallowing it stopped Ctrl+V pasting on
+                // Linux and Windows (what Ctrl+V should mean in a GUI is still open).
+                return false;
             case 'capitalize_word': {
                 const n = takeKbnumPositive();
                 for (let i = 0; i < n; i++) transformWordForward('capitalize');
@@ -13856,10 +14116,15 @@
                 return true;
             // TF CLEAR: empty the view without dropping any lines - scrollback is
             // untouched, so scrolling re-populates it (TF-parity plan Job 22b/P2.7).
-            case 'clear_screen':
-                elements.outputContainer.scrollTop = elements.outputContainer.scrollHeight;
-                renderOutput();
+            // TF CLEAR (Esc-^L): "clear screen (can be refilled with scrollback)". The output
+            // goes blank - the %textdiv=clear block after the newest line - new text arrives
+            // below it, scrolling back shows the old, and it goes when the world is left.
+            case 'clear_screen': {
+                const cw = worlds[currentWorldIndex];
+                if (cw) cw._textdiv = { afterSeq: lastLineSeq(cw), mode: 'clear', forced: true };
+                renderOutput({ toBottom: true });
                 return true;
+            }
             // TF PAUSE: pause the current world so new output queues as pending.
             case 'pause_output':
                 paused = true;
@@ -13910,6 +14175,9 @@
                 return true;
             case 'world_activity':
                 requestOldestPendingWorld();
+                return true;
+            case 'recent_worlds':
+                showRecentWorldsModal();
                 return true;
             case 'world_previous':
                 requestPrevWorld();
@@ -14012,7 +14280,7 @@
                 // No-op in browser
                 return true;
             case 'spell_check':
-                // No-op in web (no spell checker)
+                spellCheckKey();
                 return true;
 
             // Clay Extensions
@@ -14416,6 +14684,12 @@
                 }
                 break;
             case 'new-window':
+                // The desktop GUI opens another GUI window (as /window and OpenWindow do);
+                // window.open there would hand the URL to the system browser.
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('new-window:' + JSON.stringify({ world: null, auth: inheritableAuth() }));
+                    break;
+                }
                 var nwProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
                 var nwHost = window.WS_HOST || window.location.hostname;
                 var nwPort = (window.WS_PORT && window.WS_PORT !== 0)
@@ -15618,6 +15892,26 @@
                 return;
             }
 
+            // Recent Worlds list
+            if (recentWorldsModalOpen) {
+                const entries = recentWorldEntries();
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    hideRecentWorldsModal();
+                } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    if (entries.length) {
+                        recentWorldsSelected = (recentWorldsSelected + (e.key === 'ArrowUp' ? -1 : 1) + entries.length) % entries.length;
+                        renderRecentWorlds();
+                    }
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (entries[recentWorldsSelected]) chooseRecentWorld(entries[recentWorldsSelected].i);
+                    else hideRecentWorldsModal();
+                }
+                return;
+            }
+
             // Handle world selector popup
             if (worldSelectorPopupOpen) {
                 if (e.key === 'Escape') {
@@ -15783,6 +16077,7 @@
         // Reset command completion state when input changes (typing, not Tab)
         // Also check for temperature conversion
         elements.input.addEventListener('input', function(e) {
+            spellCycle = null; // the user's own edit ends a Ctrl+Q round
             resetCompletion();
             // Mirrors Rust's last_input_was_delete: any deleteContent*/deleteBy*
             // inputType counts as a deletion (allows undoing a conversion);
@@ -16016,7 +16311,8 @@
         };
         var openBrowserSettingsBtn = document.getElementById('settings-open-browser-btn');
         if (openBrowserSettingsBtn) {
-            openBrowserSettingsBtn.onclick = function() { openEditorPage(''); };
+            // The Action Editor page (its title says so); '' opened the web client itself.
+            openBrowserSettingsBtn.onclick = function() { openEditorPage('action-editor'); };
         }
         elements.setupMoreModeToggle.onclick = function() {
             setupMoreMode = !setupMoreMode;
@@ -16443,6 +16739,19 @@
         if (elements.passwordCancelBtn) {
             elements.passwordCancelBtn.onclick = function() {
                 showPasswordModal(false);
+            };
+        }
+
+        // Recent Worlds: click a world to switch, click outside to close
+        if (elements.recentWorldsList) {
+            elements.recentWorldsList.onclick = function(e) {
+                const item = e.target.closest('.menu-item');
+                if (item && item.dataset.world !== undefined) chooseRecentWorld(parseInt(item.dataset.world, 10));
+            };
+        }
+        if (elements.recentWorldsModal) {
+            elements.recentWorldsModal.onclick = function(e) {
+                if (e.target === elements.recentWorldsModal) hideRecentWorldsModal();
             };
         }
 

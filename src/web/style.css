@@ -103,11 +103,13 @@ body {
     letter-spacing: 0;
 }
 
+/* No letter-spacing reset here: the font setting's letter-spacing (set on #output by
+   applyAdvancedFontSettings) must reach coloured runs, links and prefixes too, not only
+   plain text. Block cells keep exact columns (.blk). */
 #output span {
     margin: 0;
     padding: 0;
     border: 0;
-    letter-spacing: 0;
 }
 
 /* Block-element and coloured-space runs drawn as exact cells (app.js
@@ -127,6 +129,24 @@ body {
     white-space: pre;
     background-color: inherit;
     -webkit-text-fill-color: transparent;
+    letter-spacing: 0;
+}
+
+/* An emoji cluster (app.js wrapEmoji): the colour emoji fonts first, ahead of any
+   monospace font with a black-and-white glyph of its own for it (Cascadia Code's ⬛⬜). */
+#output .emoji {
+    font-family: 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', 'Twemoji Mozilla', 'EmojiOne Color', sans-serif;
+}
+
+/* A shade cell (░▒▓): the text colour at the shade's opacity over the cell. */
+.blk-shade {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: currentColor;
+    pointer-events: none;
 }
 
 #output .line {
@@ -176,7 +196,7 @@ body {
    A flex sibling of #output-container (see index.html), shown/hidden and
    populated by updateStatsPanel() in app.js only when the current world's
    World.stats is non-empty (plan D1). Every color here comes from the
-   existing --theme-*/derived variables so it follows the user's theme,
+   existing --theme-* and derived variables so it follows the user's theme,
    dark mode included - nothing is hard-coded. */
 .stats-panel {
     flex-shrink: 0;
@@ -997,7 +1017,9 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
 /* ─── Input Area ─── */
 #input-container {
     display: flex;
-    align-items: center;
+    /* The prompt sits on the input's FIRST row: centred, it was level with the second
+       of a multi-row input (and a little low on one row). */
+    align-items: flex-start;
     padding: 4px;
     background-color: var(--bg-color);
     border-top: none;
@@ -1012,6 +1034,9 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
 #prompt {
     color: var(--text-color);
     white-space: pre;
+    /* The textarea's first line: its 2px padding and line-height 1.0. */
+    padding-top: 2px;
+    line-height: 1.0;
 }
 
 #input {
@@ -3429,6 +3454,20 @@ html.popup-window .settings-content {
     background-color: var(--accent-color);
     color: #000;
     font-weight: bold;
+}
+
+#recent-worlds-list .menu-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 24px;
+}
+#recent-worlds-list .recent-ago {
+    opacity: 0.7;
+    font-variant-numeric: tabular-nums;
+}
+#recent-worlds-list .menu-item.empty {
+    cursor: default;
+    opacity: 0.7;
 }
 
 .menu-hint {

@@ -153,7 +153,9 @@ Ctrl+Q → "ten"
 ### Works With
 
 - Console input
-- Web interface input (if enabled)
+- Web interface input (if enabled): the browser's own squiggles follow the Spell check
+  setting, and `Ctrl+Q` asks Clay's spell checker for suggestions (listed in the output,
+  then cycled into the word as in the console)
 - GUI input (if enabled)
 
 ### Doesn't Work With

@@ -134,6 +134,19 @@ const WEB_KEYBIND_EDITOR_HTML: &str = include_str!("web/keybind-editor.html");
 /// Embedded action editor HTML
 const WEB_ACTION_EDITOR_HTML: &str = include_str!("web/action-editor.html");
 
+/// app.js's `INTERNAL_COMMANDS` (names without the `/`), read out of the web client itself
+/// so nothing keeps a second copy: the action editor page's name check and the native
+/// GUI's completion and name check use it.
+pub(crate) fn internal_command_names() -> &'static [String] {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let Some(start) = WEB_APP_JS.find("const INTERNAL_COMMANDS = [") else { return Vec::new() };
+        let body = &WEB_APP_JS[start..];
+        let Some(end) = body.find("];") else { return Vec::new() };
+        body[..end].split('\'').skip(1).step_by(2).map(str::to_string).collect()
+    })
+}
+
 /// Bundled fonts (latin subset, variable weight)
 /// (also served by the desktop GUI's clay:// handler, webview_gui.rs)
 pub(crate) const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("web/fonts/jetbrains-mono-latin-400.woff2");
@@ -578,6 +591,7 @@ fn handle_http_routes(
         }
         "/action-editor" => {
             let html = WEB_ACTION_EDITOR_HTML
+                .replace("{{INTERNAL_COMMANDS_JSON}}", &serde_json::to_string(internal_command_names()).unwrap_or_else(|_| "[]".into()))
                 .replace("{{WEB_PATH}}", web_path)
                 .replace("{{WS_HOST}}", &sanitized_host)
                 .replace("{{WS_PORT}}", "0")
@@ -1825,6 +1839,26 @@ mod local_server_bind_tests {
 // ============================================================================
 // decide_route unit tests (D2 stealth routing matrix)
 // ============================================================================
+
+#[cfg(test)]
+mod web_asset_tests {
+    use super::WEB_STYLE_CSS;
+
+    /// A comment in style.css ends only where it means to (B15). "--theme-*/derived" once
+    /// closed one early, and the browser threw away the whole `.stats-panel` rule after it.
+    #[test]
+    fn style_css_comments_end_where_they_mean_to() {
+        for (n, line) in WEB_STYLE_CSS.lines().enumerate() {
+            let mut rest = line;
+            while let Some(at) = rest.find("*/") {
+                let after = &rest[at + 2..];
+                assert!(after.is_empty() || after.starts_with(char::is_whitespace),
+                    "style.css line {}: `*/` followed by {:?} - a comment closing early? {line}", n + 1, after.chars().next());
+                rest = after;
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod decide_route_tests {
