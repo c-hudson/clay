@@ -5981,6 +5981,16 @@ impl App {
                 current.scroll_offset = current.output_lines.len().saturating_sub(1);
             }
         }
+        // The splash is in place before any client exists, and every client gets it through
+        // InitialState: nothing is owed by broadcast. Unrecorded, the ledger audit took the
+        // lines for undelivered ones at the first login and re-sent them all (SEQ-LEDGER
+        // reports, and duplicates on the client).
+        let world = &self.worlds[self.current_world_index.min(self.worlds.len() - 1)];
+        if world.showing_splash {
+            if let (Some(first), Some(last)) = (world.output_lines.first(), world.output_lines.last()) {
+                world.mark_broadcast(first.seq, last.seq);
+            }
+        }
     }
 
     pub fn current_world(&self) -> &World {

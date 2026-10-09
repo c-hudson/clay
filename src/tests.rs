@@ -14060,6 +14060,36 @@ third
             "a reload must not produce SEQ-LEDGER reports; got {repaired}");
     }
 
+    /// The startup splash must not trip the broadcast-ledger audit (B3).
+    ///
+    /// `ensure_has_world` puts the splash into `output_lines` at startup, before any client
+    /// exists, so nothing broadcasts it; every client gets it through InitialState instead.
+    /// Unrecorded, the first PongCheck after a login logged a SEQ-LEDGER report per splash line
+    /// and re-sent them all, which the client then reported as duplicates.
+    #[test]
+    fn test_startup_splash_counts_as_delivered() {
+        // A fresh start: the initial world is created with the splash.
+        let _guard = LoopbackOnlyGuard::set(false);
+        let mut app = App::new();
+        app.ensure_has_world();
+        let w = &app.worlds[0];
+        assert!(w.showing_splash && !w.output_lines.is_empty(), "precondition: the splash is up");
+        assert!(w.output_lines.iter().all(|l| w.was_broadcast(l.seq)));
+        assert_eq!(app.audit_broadcast_ledger(), 0, "a fresh start must not produce SEQ-LEDGER reports");
+
+        // Worlds from settings, the current one still empty: the splash goes into it, above
+        // whatever seqs it has already handed out.
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].next_seq = 40;
+        app.ensure_has_world();
+        let w = &app.worlds[0];
+        assert!(w.showing_splash && w.output_lines.first().map(|l| l.seq) == Some(40));
+        assert!(w.output_lines.iter().all(|l| w.was_broadcast(l.seq)));
+        assert!(!w.was_broadcast(w.next_seq), "nothing past the splash counts as sent");
+        assert_eq!(app.audit_broadcast_ledger(), 0);
+    }
+
     #[test]
     fn test_reload_state_write_emits_seq_epoch_and_round_trips() {
         // Closes the gap a fixture-driven parser test cannot: if the WRITE side stops
