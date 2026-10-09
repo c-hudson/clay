@@ -199,6 +199,22 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     .expect("draw after open");
                     Vec::new()
                 }
+                // Real time with the connection live: the server's messages reach the view
+                // (round trips: a Save, a reply, a window that opens on one).
+                "pump" => {
+                    let until = Instant::now() + Duration::from_millis(nums.first().copied().unwrap_or(500.0) as u64);
+                    while Instant::now() < until {
+                        while let Ok(ev) = events.try_recv() {
+                            cx.update(|app| view.update(app, |v, cx| v.handle(ev, cx)));
+                        }
+                        cx.run_until_parked();
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    let _ = cx.update_window(target, |_, w, app| {
+                        let _ = w.draw(app);
+                    });
+                    Vec::new()
+                }
                 "sleep" => {
                     std::thread::sleep(Duration::from_millis(nums.first().copied().unwrap_or(0.0) as u64));
                     Vec::new()
