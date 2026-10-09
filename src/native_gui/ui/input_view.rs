@@ -100,6 +100,8 @@ struct Field {
     misspelled: Vec<Range<usize>>,
     masked: bool,
     font_size: f32,
+    /// One row's height: the font size times the "Input Ht" setting.
+    row_h: f32,
     fonts: Fonts,
     fg: Rgb,
     selection_bg: Rgb,
@@ -194,7 +196,7 @@ fn row_runs(row: &str, at: usize, base: &[TextRun], f: &Field, units: &[Unit]) -
 fn paint_field(bounds: Bounds<Pixels>, f: Field, window: &mut Window, cx: &mut App) {
     window.handle_input(&f.focus, ElementInputHandler::new(bounds, f.view.clone()), cx);
     let fs = px(f.font_size);
-    let row_h = f.font_size;
+    let row_h = f.row_h;
     let inner = Bounds::new(point(bounds.origin.x + px(PAD), bounds.origin.y + px(PAD)), size(bounds.size.width - px(2.0 * PAD), bounds.size.height - px(2.0 * PAD)));
     let width = f32::from(inner.size.width).max(1.0);
     let left = f32::from(inner.origin.x);
@@ -375,7 +377,11 @@ impl ClayView {
         let masked = world.is_some_and(|w| w.echo_masked);
         let mono = self.fonts.primary.clone();
         let rows = self.input.rows.clamp(1, 15);
-        let height = rows as f32 * 1.2 * self.font_size + 2.0 * PAD;
+        // The input's line height (Settings > Font > Input Ht, web_font_line_height); the
+        // output's rows stay at 1.0.
+        let line_height = self.session.core.settings.as_ref().map_or(1.2, |s| s.web_font_line_height).clamp(0.5, 3.0);
+        let row_h = line_height * self.font_size;
+        let height = rows as f32 * row_h + 2.0 * PAD;
         let field = Field {
             text: self.editor.text.clone(),
             cursor: self.editor.cursor,
@@ -384,6 +390,7 @@ impl ClayView {
             misspelled: self.input.misspelled.clone(),
             masked,
             font_size: self.font_size,
+            row_h,
             fonts: self.fonts.clone(),
             fg: self.palette.fg,
             selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],
@@ -393,12 +400,12 @@ impl ClayView {
             focus: self.focus.clone(),
             view: cx.entity(),
         };
-        let mut bar = div().flex().items_start().flex_shrink_0().px(px(4.0)).py(px(2.0)).bg(hsla(self.palette.bg)).font_family(mono.clone()).text_size(px(self.font_size)).line_height(relative(1.2)).text_color(hsla(self.palette.fg));
+        let mut bar = div().flex().items_start().flex_shrink_0().px(px(4.0)).py(px(2.0)).bg(hsla(self.palette.bg)).font_family(mono.clone()).text_size(px(self.font_size)).line_height(px(row_h)).text_color(hsla(self.palette.fg));
         // The prompt sits on the field's first row, at its height (the web centres it in
         // the whole input area, so a multi-row input showed it beside the second row).
         if !prompt.is_empty() {
             let styled = style_line(&prompt, &self.palette, &self.style);
-            let prompt = div().flex_shrink_0().whitespace_nowrap().mt(px(PAD)).line_height(px(self.font_size));
+            let prompt = div().flex_shrink_0().whitespace_nowrap().mt(px(PAD)).line_height(px(row_h));
             bar = bar.child(prompt.child(super::chrome::styled_text(&styled, &mono)));
         }
         bar.child(

@@ -510,7 +510,7 @@ impl SettingsView {
                     .flex_col()
                     .gap(px(6.0))
                     .when(!advanced, |d| d.opacity(0.35))
-                    .child(row(k, "Line Ht", self.stepper(k, "font-lineheight", num(e.web_font_line_height), |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, -0.1, (0.5, 3.0)) }, |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, 0.1, (0.5, 3.0)) }, cx)))
+                    .child(row(k, "Input Ht", self.stepper(k, "font-lineheight", num(e.web_font_line_height), |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, -0.1, (0.5, 3.0)) }, |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, 0.1, (0.5, 3.0)) }, cx)))
                     .child(row(k, "Letter", self.stepper(k, "font-letter", num(e.web_font_letter_spacing), |v| if v.advanced { v.edit.web_font_letter_spacing = step(v.edit.web_font_letter_spacing, -0.5, (-5.0, 10.0)) }, |v| if v.advanced { v.edit.web_font_letter_spacing = step(v.edit.web_font_letter_spacing, 0.5, (-5.0, 10.0)) }, cx)))
                     .child(row(k, "Word", self.stepper(k, "font-word", num(e.web_font_word_spacing), |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, -0.5, (-5.0, 20.0)) }, |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, 0.5, (-5.0, 20.0)) }, cx))),
             )

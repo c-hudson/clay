@@ -73,6 +73,11 @@ The toolbar at the top provides quick access:
 
 **Font slider**: Adjust text size
 
+Settings → Font sets the font, its size per device type and its weight. Under
+**Advanced**: **Input Ht** is the line height of the input line (the output's rows stay
+at 1.0, so ANSI and box-drawing art joins up), **Letter** and **Word** add spacing to the
+output and the input. The desktop GUI's Settings window has the same controls.
+
 ### Hamburger Menu
 
 Click the hamburger icon for:

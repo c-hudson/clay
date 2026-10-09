@@ -1800,7 +1800,7 @@ pub struct Settings {
     web_font_size_tablet: f32,
     web_font_size_desktop: f32,
     web_font_weight: u16,
-    web_font_line_height: f32,     // Line height multiplier (default 1.2)
+    web_font_line_height: f32,     // The INPUT line's line height multiplier (default 1.2); output rows stay 1.0
     web_font_letter_spacing: f32,  // Letter spacing in px (default 0)
     web_font_word_spacing: f32,    // Word spacing in px (default 0)
     // Web server settings (consolidated)

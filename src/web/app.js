@@ -1753,8 +1753,13 @@
     function applyAdvancedFontSettings() {
         var output = elements.output;
         var input = elements.input;
-        output.style.lineHeight = webFontLineHeight;
+        // The line height is the INPUT's ("Input Ht"), with its prompt, which sits on the
+        // input's first row. Output rows stay at 1.0 (style.css #output .line) so block and
+        // box-drawing art joins up; lineHeightPx() measures them.
+        output.style.lineHeight = '';
         input.style.lineHeight = webFontLineHeight;
+        elements.prompt.style.lineHeight = webFontLineHeight;
+        setInputHeight(inputHeight);
         output.style.letterSpacing = webFontLetterSpacing ? webFontLetterSpacing + 'px' : '';
         input.style.letterSpacing = webFontLetterSpacing ? webFontLetterSpacing + 'px' : '';
         output.style.wordSpacing = webFontWordSpacing ? webFontWordSpacing + 'px' : '';
@@ -2360,8 +2365,12 @@
     // Single definition because three separate things now convert between pixels and rows -
     // the visible-line count, the "History NNN" distance-from-bottom, and the drag-to-release
     // gesture - and a disagreement between them shows up as the wrong number of lines.
+    // One output row in px, measured: output lines are line-height 1.0 (style.css), not the
+    // 1.2 this used to assume, which put more-mode's pause, PgDn's screenful, the History
+    // count and TF's line scroll about a fifth short.
     function lineHeightPx() {
-        return (currentFontSize || 14) * 1.2;
+        const px = parseFloat(getComputedStyle(elements.output).lineHeight);
+        return px > 0 ? px : (currentFontSize || 14);
     }
 
     // Get visible line count in output area
@@ -10407,7 +10416,7 @@
     function setInputHeight(lines) {
         inputHeight = Math.max(1, Math.min(15, lines));
         const fontSize = currentFontSize || 14;
-        const lineHeight = 1.2 * fontSize; // line-height * font-size
+        const lineHeight = (webFontLineHeight || 1.2) * fontSize; // the input's own line height
         elements.input.style.height = (inputHeight * lineHeight) + 'px';
         elements.input.rows = inputHeight;
     }
