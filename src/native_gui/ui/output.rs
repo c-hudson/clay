@@ -1120,12 +1120,14 @@ mod tests {
 
     #[test]
     fn the_mouse_finds_the_nearest_character_boundary() {
-        let mut s = Scroll::default();
-        s.row_h = 10.0;
-        s.hits = vec![
-            HitRow { id: 1, top: 0.0, stops: vec![(0, 4.0), (1, 12.0), (2, 20.0)] },
-            HitRow { id: 2, top: 10.0, stops: vec![(0, 4.0), (3, 20.0), (4, 28.0)] },
-        ];
+        let s = Scroll {
+            row_h: 10.0,
+            hits: vec![
+                HitRow { id: 1, top: 0.0, stops: vec![(0, 4.0), (1, 12.0), (2, 20.0)] },
+                HitRow { id: 2, top: 10.0, stops: vec![(0, 4.0), (3, 20.0), (4, 28.0)] },
+            ],
+            ..Default::default()
+        };
         assert_eq!(s.hit(9.0, 5.0), Some(Pos { id: 1, byte: 1 }));
         assert_eq!(s.hit(7.0, 5.0), Some(Pos { id: 1, byte: 0 }));
         assert_eq!(s.hit(500.0, 5.0), Some(Pos { id: 1, byte: 2 }), "past the end: the end");

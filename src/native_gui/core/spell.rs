@@ -81,7 +81,8 @@ mod tests {
         // Moved away: the last word is finished and judged.
         assert_eq!(misspelled(t, 0, &[], &valid), vec![8..11]);
         // Back at its end, the earlier verdict holds.
-        assert_eq!(misspelled(t, t.len(), &[8..11], &valid), vec![0..3, 8..11]);
+        let earlier = [Range { start: 8, end: 11 }];
+        assert_eq!(misspelled(t, t.len(), &earlier, &valid), vec![0..3, 8..11]);
         assert_eq!(words("don't stop"), vec![0..5, 6..10]);
         assert_eq!(misspelled("don't xyzzy.", 0, &[], &valid), vec![6..11]);
         assert_eq!(word_at("the catt sat", 6), Some(4..8));
