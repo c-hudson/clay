@@ -75,7 +75,9 @@ impl PlayHandle {
         match self {
             #[cfg(feature = "native-audio")]
             PlayHandle::NativeSink(sink) => sink.set_volume(volume as f32 / 100.0),
-            PlayHandle::ExternalProcess(_) => {}
+            PlayHandle::ExternalProcess(_) => {
+                let _ = volume;
+            }
         }
     }
 
