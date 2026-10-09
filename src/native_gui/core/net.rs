@@ -36,6 +36,9 @@ pub struct Target {
     pub secure: bool,
     /// The server's web path (`web_path`), when given as `host:port/path`.
     pub path: Option<String>,
+    /// The server's name when it's reached some other way (an SSH tunnel's loopback
+    /// end): what its key, last world and cache are kept under, and what's shown.
+    pub name: Option<String>,
 }
 
 impl Target {
@@ -79,7 +82,7 @@ impl Target {
             Some(_) => true,
             None => !loopback,
         };
-        Ok(Target { host, port, secure, path: path.filter(|p| !p.is_empty()) })
+        Ok(Target { host, port, secure, path: path.filter(|p| !p.is_empty()), name: None })
     }
 
     pub fn is_loopback(&self) -> bool {
@@ -92,7 +95,15 @@ impl Target {
 
     /// The server's name for pins and stored keys: `host:port`, as `--console` writes it.
     pub fn key(&self) -> String {
-        format!("{}:{}", self.host_for_url(), self.port)
+        match &self.name {
+            Some(n) => n.clone(),
+            None => format!("{}:{}", self.host_for_url(), self.port),
+        }
+    }
+
+    /// The loopback end of a tunnel to the server called `name` (`--ssh`).
+    pub fn tunnel(port: u16, name: String) -> Target {
+        Target { host: "127.0.0.1".into(), port, secure: false, path: None, name: Some(name) }
     }
 
     pub fn url(&self, web_path: &str) -> String {

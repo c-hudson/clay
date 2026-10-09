@@ -2962,3 +2962,11 @@ phase = 5
 status = "done"
 feature = "/server host:port (asked twice within 15 s, --cancel) attaches this GUI to another Clay by starting again with --native-gui=<addr> (--ssh dropped, as the WebView GUI drops it); --close (become a server) is not offered: the native GUI only attaches"
 note = "app.js sendCommand remote-GUI branch; platform::exec_relaunch"
+
+[[item]]
+id = "ui:connect.ssh"
+section = "connection"
+phase = 5
+status = "done"
+feature = "--native-gui=[user@]host[:clayport[:sshport]] --ssh: the SSH session opens before any window (a key passphrase asked on the terminal), a loopback port forwards each connection through a fresh channel, a dead session is reopened; the server's key, last world and cache are kept under ssh:user@host:clayport"
+note = "src/ssh.rs; core/tunnel.rs. Checked against a throwaway unprivileged sshd"

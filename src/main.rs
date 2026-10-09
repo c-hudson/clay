@@ -19709,6 +19709,8 @@ async fn main() -> io::Result<()> {
         println!("    --console=host[:port] Connect to a Clay server via console (default port: 9000)");
         println!("    --gui                Run in GUI (webview) mode");
         println!("    --gui=host[:port]    Connect to a Clay server via GUI (default port: 9000)");
+        #[cfg(feature = "native-gui")]
+        println!("    --native-gui[=host[:port]] Attach the native GUI to a Clay server (--ssh too)");
         println!("    --ssh                Tunnel --console=/--gui= through SSH instead of connecting");
         println!("                         directly. Target grammar becomes:");
         println!("                           [user@]host[:clayport[:sshport]]");
@@ -19789,11 +19791,11 @@ async fn main() -> io::Result<()> {
     if let Some(target) = native_gui_arg.or_else(|| native_gui_verify.map(|_| None)) {
         #[cfg(feature = "native-gui")]
         {
-            return native_gui::run(target, native_gui_snapshot, native_gui_verify);
+            return native_gui::run(target, native_gui_snapshot, native_gui_verify, ssh_mode);
         }
         #[cfg(not(feature = "native-gui"))]
         {
-            let _ = (target, native_gui_snapshot, native_gui_verify);
+            let _ = (target, native_gui_snapshot, native_gui_verify, ssh_mode);
             eprintln!("Error: --native-gui requires a build with the 'native-gui' feature.");
             std::process::exit(1);
         }

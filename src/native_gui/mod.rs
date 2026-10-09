@@ -12,12 +12,17 @@ mod parity_tests;
 /// `clay --native-gui[=host[:port]]`; with `snapshot` set (`--native-gui-snapshot=<png>`)
 /// render one frame offscreen to that file and exit; with `verify` set
 /// (`--native-gui-verify[=SECONDS]`) run the client headless and check its buffer.
-pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>) -> std::io::Result<()> {
-    let target = match core::net::Target::parse(target.as_deref()) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
+pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>, ssh: bool) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Handle::current();
+    let target = if ssh {
+        ssh_target(target.as_deref(), &runtime)
+    } else {
+        match core::net::Target::parse(target.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
         }
     };
     // Optional: without it (and without a stored key for this server) the window asks.
@@ -36,7 +41,6 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
     // this process only (never synchronized to disk).
     #[cfg(target_os = "macos")]
     disable_font_smoothing();
-    let runtime = tokio::runtime::Handle::current();
     ui::emoji::init(runtime.clone());
     let (session, events) = core::session::Session::new(&runtime, target, password, auth_key);
     if let Some(secs) = verify {
@@ -74,5 +78,38 @@ fn disable_font_smoothing() {
     let value = CFNumber::from(0i32);
     unsafe {
         CFPreferencesSetAppValue(key.as_concrete_TypeRef(), value.as_CFTypeRef(), kCFPreferencesCurrentApplication);
+    }
+}
+
+/// `--ssh`: the server's loopback through an SSH tunnel (core/tunnel.rs), opened before
+/// any window (no TUI here, so errors and a passphrase prompt use the terminal).
+fn ssh_target(spec: Option<&str>, runtime: &tokio::runtime::Handle) -> core::net::Target {
+    let Some(spec) = spec else {
+        eprintln!("Error: --ssh requires --native-gui=<[user@]host[:clayport[:sshport]]>.");
+        std::process::exit(1);
+    };
+    #[cfg(feature = "ssh-transport")]
+    {
+        let t = match crate::ssh::parse_ssh_target(spec) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error: invalid --ssh target: {e}");
+                std::process::exit(1);
+            }
+        };
+        let name = format!("ssh:{}@{}:{}", t.user, t.host, t.clay_port);
+        match tokio::task::block_in_place(|| runtime.block_on(core::tunnel::start(t))) {
+            Ok(port) => core::net::Target::tunnel(port, name),
+            Err(e) => {
+                eprintln!("clay: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(not(feature = "ssh-transport"))]
+    {
+        let _ = (spec, runtime);
+        eprintln!("clay: --ssh requires the 'ssh-transport' feature.");
+        std::process::exit(1);
     }
 }

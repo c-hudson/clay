@@ -12,6 +12,8 @@ pub mod seq;
 pub mod session;
 pub mod spell;
 pub mod store;
+#[cfg(feature = "ssh-transport")]
+pub mod tunnel;
 pub mod style;
 pub mod verify;
 pub mod wrap;
