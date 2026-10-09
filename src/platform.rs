@@ -514,6 +514,23 @@ pub(crate) fn make_inheritable(socket: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Keep one of Clay's own server sockets out of every process Clay starts. On Windows a
+/// socket is inheritable unless told otherwise, and tokio's are, so a /reload's successor
+/// (or a /sh command) got a copy of the web server's listener: the port then stayed taken
+/// by a socket nothing used, and the reloaded Clay could never bind it. Unix gets this from
+/// close-on-exec; the MUD sockets a reload does hand on are marked by `make_inheritable`.
+#[cfg(windows)]
+pub(crate) fn not_inherited<S: std::os::windows::io::AsRawSocket>(socket: &S) {
+    const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+    extern "system" {
+        fn SetHandleInformation(hObject: isize, dwMask: u32, dwFlags: u32) -> i32;
+    }
+    unsafe { SetHandleInformation(socket.as_raw_socket() as isize, HANDLE_FLAG_INHERIT, 0) };
+}
+
+#[cfg(not(windows))]
+pub(crate) fn not_inherited<S>(_socket: &S) {}
+
 /// Check if a process with the given PID is still alive
 #[cfg(all(unix, not(target_os = "android")))]
 pub(crate) fn is_process_alive(pid: u32) -> bool {
@@ -1835,8 +1852,8 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect());
     args.push("--reload".to_string());
     // On Windows/macOS, GUI is the default mode (no --gui flag in args).
-    // Ensure the reload child also runs in GUI mode.
-    if is_headless && !args.iter().any(|a| a == "--gui" || a.starts_with("--gui=")) {
+    // Ensure the reload child also runs in GUI mode (the native GUI's flag already does).
+    if is_headless && !args.iter().any(|a| a == "--gui" || a.starts_with("--gui=") || a == "--native-gui" || a.starts_with("--native-gui=")) {
         args.push("--gui".to_string());
     }
     debug_log(is_debug_enabled(), &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
@@ -1861,14 +1878,33 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             }
         }
 
-        match std::process::Command::new(&exe).args(&args).spawn() {
-            Ok(_child) => {
+        let mut command = std::process::Command::new(&exe);
+        command.args(&args);
+        // A GUI let go of its console at startup (FreeConsole), but its standard handles
+        // still hold the console's old values, closed by now or reused for something
+        // else: inheriting them can make the spawn fail (as it did for the native GUI,
+        // ending Clay with no word) or hand the child some unrelated object. The child
+        // is a GUI too: no standard handles, and no console window flashing up before it
+        // frees its own.
+        if app.gui_tx.is_some() {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW);
+        }
+        match command.spawn() {
+            Ok(child) => {
+                debug_log(true, &format!("RELOAD: started pid {}", child.id()));
                 // Use exit(0) for clean shutdown — lets the OS properly close sockets
                 // so the new process can bind port 9000. TerminateProcess was leaving
                 // the port in a zombie state on Windows.
                 std::process::exit(0);
             }
             Err(e) => {
+                debug_log(true, &format!("RELOAD: could not start {}: {}", exe.display(), e));
                 return Err(io::Error::other(format!("Failed to spawn reload process: {}", e)));
             }
         }

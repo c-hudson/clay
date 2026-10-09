@@ -1196,7 +1196,7 @@ pub async fn start_https_server(
         let mut bound = None;
         for attempt in 0..10 {
             match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => { bound = Some(l); break; }
+                Ok(l) => { crate::platform::not_inherited(&l); bound = Some(l); break; }
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < 9 {
@@ -1245,6 +1245,7 @@ pub async fn start_https_server(
                             };
                             let _ = stream.set_nodelay(true);
                             crate::platform::enable_tcp_keepalive(&stream);
+                            crate::platform::not_inherited(&stream);
                             let tls_acceptor = tls_acceptor.clone();
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
@@ -1362,7 +1363,7 @@ pub async fn start_https_server(
         let mut bound = None;
         for attempt in 0..10 {
             match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => { bound = Some(l); break; }
+                Ok(l) => { crate::platform::not_inherited(&l); bound = Some(l); break; }
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < 9 {
@@ -1411,6 +1412,7 @@ pub async fn start_https_server(
                             };
                             let _ = stream.set_nodelay(true);
                             crate::platform::enable_tcp_keepalive(&stream);
+                            crate::platform::not_inherited(&stream);
                             let tls_acceptor = tls_acceptor.clone();
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
@@ -1715,7 +1717,7 @@ pub async fn start_http_server(
         let mut bound = None;
         for attempt in 0..10 {
             match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => { bound = Some(l); break; }
+                Ok(l) => { crate::platform::not_inherited(&l); bound = Some(l); break; }
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < 9 {
@@ -1768,6 +1770,7 @@ pub async fn start_http_server(
                             };
                             let _ = stream.set_nodelay(true);
                             crate::platform::enable_tcp_keepalive(&stream);
+                            crate::platform::not_inherited(&stream);
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
                             let ws_counter = ws_counter.clone();
