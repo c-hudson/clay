@@ -318,7 +318,15 @@ impl ClayView {
         }
         self.input.speller_source = want.clone();
         *self.input.speller.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.input.native = None;
         self.input.misspelled.clear();
+        // The system's checker, unless the user chose a dictionary file.
+        if want.as_deref() == Some("") {
+            self.input.native = super::native_spell::Native::new();
+            if self.input.native.is_some() {
+                return;
+            }
+        }
         if let Some(path) = want {
             let slot = self.input.speller.clone();
             std::thread::spawn(move || {
@@ -333,9 +341,23 @@ impl ClayView {
     }
 
     fn check_spelling(&mut self) {
-        let Some(sp) = self.speller() else { return };
         let e = &self.editor;
-        self.input.misspelled = crate::native_gui::core::spell::misspelled(&e.text, e.cursor, &self.input.misspelled, &|w| sp.is_valid(w));
+        let found = if let Some(n) = &self.input.native {
+            crate::native_gui::core::spell::misspelled(&e.text, e.cursor, &self.input.misspelled, &|w| n.is_valid(w))
+        } else if let Some(sp) = self.speller() {
+            crate::native_gui::core::spell::misspelled(&e.text, e.cursor, &self.input.misspelled, &|w| sp.is_valid(w))
+        } else {
+            return;
+        };
+        self.input.misspelled = found;
+    }
+
+    /// What a misspelled word might have been, from whichever checker is in use.
+    fn suggest(&self, word: &str) -> Option<Vec<String>> {
+        if let Some(n) = &self.input.native {
+            return Some(n.suggestions(word, 5));
+        }
+        self.speller().map(|sp| sp.suggestions(word, 5))
     }
 
     /// The input line: the prompt, then the text.
@@ -408,10 +430,7 @@ impl ClayView {
     fn input_menu_at(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
         let at = self.input.layout.borrow().hit(f32::from(ev.position.x), f32::from(ev.position.y));
         let word = at.and_then(|at| self.input.misspelled.iter().find(|w| w.start <= at && at <= w.end).cloned());
-        let suggest = word.and_then(|w| {
-            let sp = self.speller()?;
-            Some((w.clone(), sp.suggestions(&self.editor.text[w], 5)))
-        });
+        let suggest = word.and_then(|w| Some((w.clone(), self.suggest(&self.editor.text[w])?)));
         // A right-click outside the selection moves the cursor there.
         if let Some(at) = at {
             if !self.editor.selection().is_some_and(|s| s.contains(&at)) {
@@ -716,6 +735,8 @@ pub struct InputState {
     /// and what it was loaded from.
     pub speller: Arc<std::sync::Mutex<Option<Arc<crate::spell::SpellChecker>>>>,
     speller_source: Option<String>,
+    /// The system's own checker (Windows, macOS), used unless a dictionary file is set.
+    native: Option<super::native_spell::Native>,
     /// The input's right-click menu: where, and the word it's for (with suggestions).
     pub menu: Option<(Point<Pixels>, Option<Suggestions>)>,
 }
@@ -735,6 +756,7 @@ impl Default for InputState {
             misspelled: Vec::new(),
             speller: Arc::new(std::sync::Mutex::new(None)),
             speller_source: None,
+            native: None,
             menu: None,
         }
     }

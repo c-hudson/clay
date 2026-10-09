@@ -10,6 +10,7 @@ pub mod fonts;
 pub mod ink;
 mod input_view;
 mod keymap;
+mod native_spell;
 mod more;
 pub mod output;
 mod select;
