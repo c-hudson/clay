@@ -189,9 +189,9 @@ note = ""
 id = "msg:McpEditOpen"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle McpEditOpen"
-note = ""
+note = "opens the simpleedit editor over the main window (a second is refused while one is open)"
 
 [[item]]
 id = "msg:MsdpData"
@@ -205,9 +205,9 @@ note = "nothing to do: app.js keeps nothing either; the stats panel comes from S
 id = "msg:NoteEditorState"
 section = "windows"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle NoteEditorState"
-note = ""
+note = "fills the world's notes window"
 
 [[item]]
 id = "msg:NotesChanged"
@@ -2181,17 +2181,17 @@ note = "handled: see msg:KeybindingsUpdated"
 id = "wire:RequestNoteEditorState"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire RequestNoteEditorState"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "a notes window asks on opening"
 
 [[item]]
 id = "wire:UpdateNote"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire UpdateNote"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "the notes window's Save"
 
 [[item]]
 id = "wire:NoteEditorState"
@@ -2221,9 +2221,9 @@ note = "handled: see msg:McpEditOpen"
 id = "wire:McpEditSet"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire McpEditSet"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "the simpleedit editor's Save"
 
 [[item]]
 id = "wire:Ping"
@@ -2906,3 +2906,19 @@ phase = 5
 status = "todo"
 feature = "the Transparency slider is saved; applying it to the window is phase 5's opacity"
 note = "app.js applyTransparency"
+
+[[item]]
+id = "ui:window.notes"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "a world's notes in a 700x500 window of its own (one per world): text area, Save (Saved fades), Cancel closes; /note and the note icon; /note with arguments says console-only"
+note = "app.js openNoteEditor"
+
+[[item]]
+id = "ui:dialog.mcp_edit"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "MCP simpleedit over the main window: Edit: <name>, the MUD's text, Save sends McpEditSet (Sent fades), Cancel ends it"
+note = "app.js enterMcpEditMode"

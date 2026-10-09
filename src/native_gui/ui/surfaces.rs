@@ -147,6 +147,7 @@ impl ClayView {
             "actions" => self.open_actions(None, cx),
             "world-selector" => self.open_worlds(super::windows::worlds::Show::Selector, cx),
             "setup" | "web" | "font" => self.open_settings(super::windows::settings::Tab::from_name(name), cx),
+            "notes" => self.open_notes(cx),
             "help" => self.open_window(super::windows::Kind::Help, |main, _w, cx| cx.new(|cx| super::windows::help::HelpView::new(main, cx)), |_, _, _| {}, cx),
             // Until the native editors (phase 4h-4j): the server's own pages, in the browser.
             "theme-editor" | "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
@@ -300,6 +301,36 @@ impl ClayView {
                     self.client_line(line, cx);
                 }
             }
+            // A world's notes, for its notes window.
+            WsMessage::NoteEditorState { world_index, world_name, notes } => {
+                let kind = super::windows::Kind::Notes(*world_index);
+                if let (Some(frame), Some(handle)) = (self.windows.frame(kind), self.windows.handle_of(kind)) {
+                    if let Some(view) = frame.read(cx).content::<super::windows::notes::NoteView>() {
+                        let (name, notes) = (world_name.clone(), notes.clone());
+                        cx.defer(move |cx| {
+                            let _ = handle.update(cx, |_, window, cx| view.update(cx, |v, cx| v.set_notes(&name, &notes, window, cx)));
+                        });
+                    }
+                }
+            }
+            // The MUD wants text edited: over the main window, unless one is open already
+            // (a second would throw away unsaved edits).
+            WsMessage::McpEditOpen { world_index, reference, name, edit_type, content } => {
+                if let Some(open) = self.surf.stack.get::<super::windows::notes::NoteView>(&Kind::McpEdit) {
+                    open.update(cx, |v, cx| v.note_ignored(cx));
+                } else {
+                    let purpose = super::windows::notes::Purpose::Mcp { world_index: *world_index, reference: reference.clone(), edit_type: edit_type.clone(), name: name.clone() };
+                    let content = content.clone();
+                    self.later(
+                        move |v, window, cx| {
+                            let main = cx.entity().downgrade();
+                            let d = cx.new(|cx| super::windows::notes::NoteView::mcp(main, purpose, content, window, cx));
+                            dialogs::open(v, Kind::McpEdit, d, window, cx);
+                        },
+                        cx,
+                    );
+                }
+            }
             // A world this client asked for: its editor (app.js opens it the same way).
             WsMessage::WorldCreated { world_index } => self.open_worlds(super::windows::worlds::Show::Edit(*world_index), cx),
             // A Fetch's answer, for the world editor that asked.
@@ -370,6 +401,14 @@ impl ClayView {
         if self.surf.preview.is_some() {
             self.surf.preview_until = Some(self.session.core.settings_rev);
         }
+    }
+
+    /// The current world's notes, in a window of their own (`/note`, the note icon).
+    pub(super) fn open_notes(&mut self, cx: &mut Context<Self>) {
+        use super::windows::{Kind as Win, notes::NoteView};
+        let index = self.session.core.current;
+        let Some(name) = self.session.core.worlds.get(index).map(|w| w.name.clone()) else { return };
+        self.open_window(Win::Notes(index), move |main, window, cx| cx.new(|cx| NoteView::notes(main, index, &name, window, cx)), |_, _, _| {}, cx);
     }
 
     /// The Settings window on a tab (`/setup`, `/web`, `/font`, the menu, the icon bar).
@@ -521,6 +560,10 @@ impl ClayView {
                 "cert" => {
                     let d = cx.new(|cx| CertChanged::new(main, 0, "mud.example.org:4000".into(), "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900".into(), "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0".into(), cx));
                     dialogs::open(self, Kind::CertMismatch, d, window, cx);
+                }
+                "mcp" => {
+                    let msg = WsMessage::McpEditOpen { world_index: 0, reference: "#123.desc".into(), name: "My Room".into(), edit_type: "string-list".into(), content: "A small room with a view.\nThe walls are blue.".into() };
+                    self.surface_message(&msg, cx);
                 }
                 "insecure" => {
                     let d = cx.new(|cx| ImportInsecure::new(main, "192.168.1.20:9000".into(), cx));

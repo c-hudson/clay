@@ -34,6 +34,8 @@ pub enum Kind {
     Confirm,
     ModifyKey,
     RemoteAccess,
+    /// The MUD's simpleedit text, over the whole window.
+    McpEdit,
 }
 
 struct Open {

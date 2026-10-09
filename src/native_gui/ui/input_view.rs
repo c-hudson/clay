@@ -685,6 +685,13 @@ impl ClayView {
             }
             "/menu" => self.later(|v, window, cx| v.open_surface("menu", window, cx), cx),
             "/help" => self.later(|v, window, cx| v.open_surface("help", window, cx), cx),
+            "/note" => {
+                if command.split_whitespace().nth(1).is_some() {
+                    self.client_line("This form of /note is console-only. Plain /note opens the current world's notes.", cx);
+                } else {
+                    self.open_notes(cx);
+                }
+            }
             "/setup" | "/web" | "/font" => self.open_settings(super::windows::settings::Tab::from_name(&first[1..]), cx),
             "/worlds" | "/world" => {
                 let args: Vec<&str> = command.split_whitespace().skip(1).collect();

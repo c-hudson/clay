@@ -6,6 +6,7 @@
 
 pub mod actions;
 pub mod help;
+pub mod notes;
 pub mod settings;
 pub mod worlds;
 
@@ -26,6 +27,8 @@ pub enum Kind {
     Help,
     Actions,
     Worlds,
+    /// A world's notes (one window per world).
+    Notes(usize),
 }
 
 impl Kind {
@@ -36,6 +39,8 @@ impl Kind {
             Kind::Help => ("Clay - Help", 640.0, 720.0),
             Kind::Actions => ("Clay - Actions", 760.0, 620.0),
             Kind::Worlds => ("Clay - Worlds", 640.0, 680.0),
+            // The world's name goes in the title once the notes arrive.
+            Kind::Notes(_) => ("Clay - Notes", 700.0, 500.0),
         }
     }
 }
