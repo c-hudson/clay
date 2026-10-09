@@ -19,6 +19,7 @@ mod select;
 mod surfaces;
 mod textdiv;
 mod theme_bridge;
+mod viewmode;
 mod windows;
 #[cfg(feature = "native-gui-snapshot")]
 pub mod snapshot;
@@ -34,7 +35,7 @@ use gpui::{
     MouseUpEvent, ParentElement, Render, ScrollWheelEvent, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
     prelude::*, px, size,
 };
-use gpui::{KeyBinding, Keystroke};
+use gpui::{KeyBinding, Keystroke, SharedString};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 
@@ -125,6 +126,8 @@ pub struct ClayView {
     surf: surfaces::Surfaces,
     /// The other windows.
     windows: windows::Windows,
+    /// What this window of output is for (the main window, `/window`, `--grep`).
+    mode: viewmode::ViewMode,
 }
 
 impl ClayView {
@@ -191,6 +194,7 @@ impl ClayView {
             cache: None,
             surf: Default::default(),
             windows: Default::default(),
+            mode: Default::default(),
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -234,6 +238,7 @@ impl ClayView {
             self.local_command(&command, cx);
         }
         self.watch_status(cx);
+        self.keep_to_world(cx);
         if changed {
             self.apply_settings();
             if std::mem::take(&mut self.surf.actions_changed) {
@@ -559,6 +564,10 @@ impl ClayView {
             if filter.as_deref().is_some_and(|f| !find::matches_filter(&find::plain(&line.text), f)) {
                 continue;
             }
+            // A grep window: only the lines matching its pattern.
+            if self.mode.grep.as_ref().is_some_and(|g| !g.matches(&line.text)) {
+                continue;
+            }
             seqs.push(line.seq.filter(|_| !line.from_archive));
             let is_new = me != 0 && line.display_id == Some(me);
             if let Some((was_new, styled)) = self.styled.get(&line.id) {
@@ -769,12 +778,14 @@ impl Render for ClayView {
                     .into_any_element()
             }
         };
-        let icon_bar = self.icon_bar(cx);
+        // A grep window shows its matches and nothing else (app.js GREP_MODE).
+        let grep = self.mode.grep.is_some();
+        let icon_bar = if grep { None } else { self.icon_bar(cx) };
         let tabs_top = self.tabs_mode() == "top";
-        let mut tabs = self.tabs_ribbon(cx);
-        let stats = self.stats_panel(cx);
-        let status_bar = self.status_bar(window, cx);
-        let show_input = !matches!(self.session.core.status(), Status::NeedLogin { .. } | Status::CertMismatch(_));
+        let mut tabs = if grep { None } else { self.tabs_ribbon(cx) };
+        let stats = if grep { None } else { self.stats_panel(cx) };
+        let status_bar = (!grep).then(|| self.status_bar(window, cx));
+        let show_input = !grep && !matches!(self.session.core.status(), Status::NeedLogin { .. } | Status::CertMismatch(_));
         let input_bar = show_input.then(|| self.input_bar(window, cx));
         let context_menu = self.context_menu(cx);
         let find_popups = self.find_popups(window, cx);
@@ -843,7 +854,7 @@ impl Render for ClayView {
             .child(div().flex_1().min_h_0().child(body))
             .children(stats)
             .children(tabs)
-            .child(status_bar)
+            .children(status_bar)
             .children(input_bar)
             .children(find_popups)
             .children(context_menu)
@@ -885,8 +896,14 @@ impl ClayView {
 }
 
 /// Open the main window and run the session in it.
+/// The runtime sessions run on (a `/window` window starts one of its own).
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
 pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
     let _ = STARTED.set(Instant::now());
+    if let Ok(h) = tokio::runtime::Handle::try_current() {
+        let _ = RUNTIME.set(h);
+    }
     gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         bind_main_keys(cx);
@@ -896,34 +913,13 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         #[cfg(not(target_os = "windows"))]
         cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         let fonts = fonts::load(cx);
-        let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
-        let mut main = None;
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions { title: Some("Clay".into()), ..Default::default() }),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(|cx| {
-                        let mut v = ClayView::new(fonts, session, window, cx);
-                        v.cache = Some(CacheSaver::default());
-                        v
-                    });
-                    window.focus(&view.focus_handle(cx), cx);
-                    main = Some(view.clone());
-                    // gpui-component's root: its dialogs, notifications and Tab order.
-                    cx.new(|cx| gpui_component::Root::new(view, window, cx))
-                },
-            )
-            .expect("open the main window");
-        let main = main.expect("main view");
-        let view = main.downgrade();
+        let Some(main) = open_view_window(cx, fonts, session, events, viewmode::ViewMode::default(), "Clay".into(), (800.0, 600.0), true) else {
+            panic!("open the main window");
+        };
         // Redraw when a Discord emoji arrives or an animated one moves to its next frame.
         let (repaint_tx, mut repaint) = mpsc::unbounded();
         emoji::set_repaint(repaint_tx);
-        let repaint_view = view.clone();
+        let repaint_view = main.clone();
         cx.spawn(async move |cx| {
             while repaint.next().await.is_some() {
                 if repaint_view.update(cx, |_, cx| cx.notify()).is_err() {
@@ -932,34 +928,77 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
             }
         })
         .detach();
-        // The connection's reports.
-        let event_view = view.clone();
-        let mut events = events;
-        cx.spawn(async move |cx| {
-            while let Some(ev) = events.next().await {
-                if event_view.update(cx, |v, cx| v.handle(ev, cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-        // The clock: keepalives, watchdogs, reconnects, chord timeouts.
-        let window_handle = window;
-        let tick_view = view.clone();
-        cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(250)).await;
-                let ticked = window_handle.update(cx, |_, window, cx| tick_view.update(cx, |v, cx| v.tick(window, cx)));
-                if !matches!(ticked, Ok(Ok(()))) {
-                    break;
-                }
-            }
-        })
-        .detach();
-        main.update(cx, |v, cx| {
-            let fx = v.session.start();
-            v.after(fx, cx);
-        });
         cx.activate(true);
     });
+}
+
+/// A window of output with a session of its own: the main window, or a `/window` /
+/// `--grep` window (which logs in again with the main window's credentials, as the
+/// WebView's do). Its view, or `None` if no window could open.
+pub(super) fn open_view_window(
+    cx: &mut App,
+    fonts: Fonts,
+    session: Session,
+    events: mpsc::UnboundedReceiver<NetInput>,
+    mode: viewmode::ViewMode,
+    title: SharedString,
+    (w, h): (f32, f32),
+    is_main: bool,
+) -> Option<gpui::WeakEntity<ClayView>> {
+    let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+    let mut view = None;
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions { title: Some(title), ..Default::default() }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let v = cx.new(|cx| {
+                    let mut v = ClayView::new(fonts, session, window, cx);
+                    // Only the main window keeps the disk cache.
+                    if is_main {
+                        v.cache = Some(CacheSaver::default());
+                    }
+                    v.mode = mode;
+                    v
+                });
+                window.focus(&v.focus_handle(cx), cx);
+                view = Some(v.clone());
+                // gpui-component's root: its dialogs, notifications and Tab order.
+                cx.new(|cx| gpui_component::Root::new(v, window, cx))
+            },
+        )
+        .ok()?;
+    let main = view?;
+    let weak = main.downgrade();
+    // The connection's reports.
+    let event_view = weak.clone();
+    let mut events = events;
+    cx.spawn(async move |cx| {
+        while let Some(ev) = events.next().await {
+            if event_view.update(cx, |v, cx| v.handle(ev, cx)).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+    // The clock: keepalives, watchdogs, reconnects, chord timeouts.
+    let tick_view = weak.clone();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_millis(250)).await;
+            let ticked = window.update(cx, |_, window, cx| tick_view.update(cx, |v, cx| v.tick(window, cx)));
+            if !matches!(ticked, Ok(Ok(()))) {
+                break;
+            }
+        }
+    })
+    .detach();
+    main.update(cx, |v, cx| {
+        let fx = v.session.start();
+        v.after(fx, cx);
+    });
+    Some(weak)
 }

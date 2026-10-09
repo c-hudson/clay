@@ -148,6 +148,7 @@ impl ClayView {
             "world-selector" => self.open_worlds(super::windows::worlds::Show::Selector, cx),
             "setup" | "web" | "font" => self.open_settings(super::windows::settings::Tab::from_name(name), cx),
             "notes" => self.open_notes(cx),
+            "new-window" => self.open_world_window(None, cx),
             "help" => self.open_window(super::windows::Kind::Help, |main, _w, cx| cx.new(|cx| super::windows::help::HelpView::new(main, cx)), |_, _, _| {}, cx),
             // Until the native editors (phase 4h-4j): the server's own pages, in the browser.
             "theme-editor" | "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
@@ -301,6 +302,8 @@ impl ClayView {
                     self.client_line(line, cx);
                 }
             }
+            // `/window [world]`: the server connected it; a window of its own shows it.
+            WsMessage::OpenWindow { world } => self.open_world_window(world.clone(), cx),
             // A world's notes, for its notes window.
             WsMessage::NoteEditorState { world_index, world_name, notes } => {
                 let kind = super::windows::Kind::Notes(*world_index);
@@ -409,6 +412,45 @@ impl ClayView {
         let index = self.session.core.current;
         let Some(name) = self.session.core.worlds.get(index).map(|w| w.name.clone()) else { return };
         self.open_window(Win::Notes(index), move |main, window, cx| cx.new(|cx| NoteView::notes(main, index, &name, window, cx)), |_, _, _| {}, cx);
+    }
+
+    /// A window of output of its own: `/window <world>`, New Window, `/window --grep`. It
+    /// logs in again with this window's credentials, as the WebView's windows do.
+    pub(super) fn open_view(&mut self, mode: super::viewmode::ViewMode, title: String, size: (f32, f32), cx: &mut Context<Self>) {
+        let Some(runtime) = super::RUNTIME.get().cloned() else { return };
+        let target = self.session.target.clone();
+        let creds = self.session.core.credentials();
+        let fonts = self.fonts.clone();
+        cx.defer(move |cx| {
+            let (session, events) = crate::native_gui::core::session::Session::with_credentials(&runtime, target, creds);
+            super::open_view_window(cx, fonts, session, events, mode, title.into(), size, false);
+        });
+    }
+
+    /// `/window [world]` (the server's OpenWindow, which has connected the world) and the
+    /// menu's New Window: a whole client in a window, kept to that world if there is one.
+    pub(super) fn open_world_window(&mut self, world: Option<String>, cx: &mut Context<Self>) {
+        let title = world.as_ref().map_or_else(|| "Clay".to_string(), |w| format!("Clay - {w}"));
+        self.open_view(super::viewmode::ViewMode { lock: world, grep: None }, title, (800.0, 600.0), cx);
+    }
+
+    /// `/window --grep pattern [-w world] [--regexp]`: the matching lines, half height.
+    pub(super) fn open_grep_window(&mut self, pattern: String, world: Option<String>, regex: bool, cx: &mut Context<Self>) {
+        let title = format!("Clay - grep: {pattern}");
+        let grep = super::viewmode::Grep::new(&pattern, regex);
+        self.open_view(super::viewmode::ViewMode { lock: world, grep: Some(grep) }, title, (800.0, 300.0), cx);
+    }
+
+    /// A `/window <world>` window: once the worlds are here, show that one, and come back
+    /// to it if the server ever shows another (indices change across a reconnect, so by name).
+    pub(super) fn keep_to_world(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.mode.lock.clone() else { return };
+        let Some(index) = self.session.core.worlds.iter().position(|w| w.name == name) else { return };
+        if self.session.core.current != index {
+            let fx = self.session.core.switch_world(index, std::time::Instant::now());
+            let rest = self.session.apply(fx);
+            self.after(rest, cx);
+        }
     }
 
     /// The Settings window on a tab (`/setup`, `/web`, `/font`, the menu, the icon bar).

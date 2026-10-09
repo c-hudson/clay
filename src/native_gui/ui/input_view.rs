@@ -598,6 +598,16 @@ impl ClayView {
             self.open_import(&addr, window, cx);
             return;
         }
+        // `/window --grep ...` opens its window here (app.js sendCommand); plain
+        // `/window [world]` goes to the server, which answers OpenWindow.
+        if trimmed == "/window" || trimmed.starts_with("/window ") {
+            if let Some((pattern, world, regex)) = super::viewmode::parse_grep_window(&trimmed[7..]) {
+                self.editor.remember(&trimmed, false);
+                self.editor.clear();
+                self.open_grep_window(pattern, world, regex, cx);
+                return;
+            }
+        }
         if !self.session.core.is_online() {
             let command = self.editor.text.clone();
             self.editor.remember(&command, false);

@@ -501,6 +501,11 @@ impl ClientCore {
         self.take()
     }
 
+    /// What this client logged in with, for another window to log in the same way.
+    pub fn credentials(&self) -> Credentials {
+        self.creds.clone()
+    }
+
     /// The key was deleted (Settings' Modify Key → Delete): it shows as none.
     pub fn forget_auth_key(&mut self) {
         if let Some(s) = self.settings.as_mut() {

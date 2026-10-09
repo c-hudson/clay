@@ -28,6 +28,12 @@ impl Session {
         password: Option<String>,
         auth_key: Option<String>,
     ) -> (Session, mpsc::UnboundedReceiver<Input>) {
+        Self::with_credentials(runtime, target, Credentials { username: None, password, auth_key })
+    }
+
+    /// The same, logging in with a name too (another window of a multiuser session).
+    pub fn with_credentials(runtime: &tokio::runtime::Handle, target: Target, given: Credentials) -> (Session, mpsc::UnboundedReceiver<Input>) {
+        let (password, auth_key) = (given.password, given.auth_key);
         let mut remembered = store::server(&target.key());
         if auth_key.is_some() {
             remembered.auth_key = auth_key;
@@ -35,7 +41,7 @@ impl Session {
         let web_path = target.path.clone().or(remembered.web_path).unwrap_or_else(|| "clay".to_string());
         let (tx, rx) = mpsc::unbounded();
         let transport = super::net::spawn(runtime, target.clone(), remembered.auth_key.clone(), web_path, tx);
-        let creds = Credentials { username: None, password, auth_key: remembered.auth_key };
+        let creds = Credentials { username: given.username, password, auth_key: remembered.auth_key };
         let core = ClientCore::new(creds, store::client_uid(), Instant::now());
         (Session { core, target, transport }, rx)
     }

@@ -105,7 +105,7 @@ impl ClayView {
             "world_next" | "world_all_next" | "world_forward" => self.world_request(WorldRequest::Next, cx),
             "world_prev" | "world_all_prev" | "world_previous" => self.world_request(WorldRequest::Prev, cx),
             "world_activity" => self.world_request(WorldRequest::OldestPending, cx),
-            "world_socket_next" | "world_socket_prev" => {
+            "world_socket_next" | "world_socket_prev" if self.mode.lock.is_none() => {
                 let n = self.take_kbnum();
                 let n = if action == "world_socket_next" { n } else { -n };
                 let fx = self.session.core.cycle_connected(n, now);
@@ -273,6 +273,9 @@ impl ClayView {
 
     fn world_request(&mut self, which: WorldRequest, cx: &mut Context<Self>) {
         let _ = self.take_kbnum();
+        if self.mode.lock.is_some() {
+            return;
+        }
         let fx = self.session.core.request_world(which);
         let rest = self.session.apply(fx);
         self.after(rest, cx);

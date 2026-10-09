@@ -229,9 +229,9 @@ note = ""
 id = "msg:OpenWindow"
 section = "windows"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle OpenWindow"
-note = ""
+note = "a window of its own kept to that world (a second session, as the WebView windows log in again)"
 
 [[item]]
 id = "msg:OutputLines"
@@ -2471,9 +2471,9 @@ note = "5px translucent thumb, 1.5s then a 0.3s fade, on any move (as the GUI's)
 id = "ui:output.grep"
 section = "windows"
 phase = 4
-status = "todo"
+status = "done"
 feature = "/window --grep windows (filtered, locked, chrome hidden)"
-note = "separate OS window"
+note = "/window --grep pattern [-w world] [--regexp]: 800x300, matching lines only, no chrome (ui/viewmode.rs)"
 
 [[item]]
 id = "ui:status.layout"
@@ -2922,3 +2922,11 @@ phase = 4
 status = "done"
 feature = "MCP simpleedit over the main window: Edit: <name>, the MUD's text, Save sends McpEditSet (Sent fades), Cancel ends it"
 note = "app.js enterMcpEditMode"
+
+[[item]]
+id = "ui:window.world"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "/window [world] and the menu's New Window: a whole client in an 800x600 window, kept to the world by name (no switching)"
+note = "app.js LOCK_WORLD; the menu item opens a GUI window, not a browser tab (B24)"

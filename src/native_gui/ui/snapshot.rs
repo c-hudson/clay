@@ -74,6 +74,10 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     Ok("worlds") => Some(super::chrome::MenuKind::Worlds),
                     _ => None,
                 };
+                // CLAY_SNAPSHOT_GREP=pattern: draw as a /window --grep window would.
+                if let Ok(p) = std::env::var("CLAY_SNAPSHOT_GREP") {
+                    view.mode.grep = Some(super::viewmode::Grep::new(&p, false));
+                }
                 window.focus(&view.focus.clone(), cx);
                 view
             });

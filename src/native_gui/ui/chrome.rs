@@ -649,6 +649,10 @@ impl ClayView {
 
     /// Show world `index` (a menu, a tab).
     pub(super) fn switch_to(&mut self, index: usize, cx: &mut Context<Self>) {
+        // A `/window <world>` window keeps to its world (app.js switchWorldLocal).
+        if self.mode.lock.is_some() {
+            return;
+        }
         let fx = self.session.core.switch_world(index, Instant::now());
         let rest = self.session.apply(fx);
         self.after(rest, cx);
