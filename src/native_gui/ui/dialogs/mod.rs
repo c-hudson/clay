@@ -6,7 +6,7 @@ pub mod emoji;
 pub mod small;
 
 use gpui::{
-    AnyElement, AnyView, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled, Subscription,
+    AnyElement, AnyView, AppContext, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled, Subscription,
     Window, div, prelude::*,
 };
 
@@ -30,6 +30,7 @@ pub enum Kind {
     Import,
     ImportInsecure,
     Emoji,
+    Confirm,
 }
 
 struct Open {
@@ -130,4 +131,24 @@ fn push<H: Host, V: Render + EventEmitter<DialogEvent> + Focusable>(host: &mut H
     let id = view.entity_id();
     host.dialogs().open.push(Open { kind, view: view.into(), id, focus, _closed: closed });
     cx.notify();
+}
+
+/// A dialog's "?" in whichever window `host` is.
+pub fn open_help<H: Host>(host: &mut H, main: gpui::WeakEntity<super::ClayView>, key: &str, window: &mut Window, cx: &mut Context<H>) {
+    let Some(lines) = small::help_text(key) else { return };
+    let v = cx.new(|cx| small::Help::new(main, lines, cx));
+    open(host, Kind::Help, v, window, cx);
+}
+
+/// Ask a yes/no question; `yes` runs on Yes.
+pub fn confirm<H: Host>(
+    host: &mut H,
+    main: gpui::WeakEntity<super::ClayView>,
+    text: String,
+    yes: impl Fn(&mut Window, &mut gpui::App) + 'static,
+    window: &mut Window,
+    cx: &mut Context<H>,
+) {
+    let v = cx.new(|cx| small::Confirm::new(main, text, Box::new(yes), cx));
+    open(host, Kind::Confirm, v, window, cx);
 }

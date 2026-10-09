@@ -206,3 +206,32 @@ impl Kit {
         Input::new(input).w_full().bg(self.field_bg).text_color(self.t.fg).font_family(self.fonts.ui.clone()).text_size(px(13.0)).rounded(px(4.0))
     }
 }
+
+gpui::actions!(clay_list, [ListUp, ListDown, ListPageUp, ListPageDown, ListHome, ListEnd, ListEnter, ListEscape]);
+
+/// The context a list's filter box sits in: its keys move the list, not the caret.
+pub const LIST_CONTEXT: &str = "ClayList";
+
+/// A list's keys while its filter box has the keyboard (a deeper context than the text
+/// field's own; bound after gpui-component's, so they win). Home and End stay the box's.
+pub fn bind_list_keys(cx: &mut App) {
+    let at = Some("ClayList > Input");
+    cx.bind_keys([
+        gpui::KeyBinding::new("up", ListUp, at),
+        gpui::KeyBinding::new("down", ListDown, at),
+        gpui::KeyBinding::new("pageup", ListPageUp, at),
+        gpui::KeyBinding::new("pagedown", ListPageDown, at),
+        gpui::KeyBinding::new("enter", ListEnter, at),
+        gpui::KeyBinding::new("escape", ListEscape, at),
+    ]);
+}
+
+/// The next position in a list of `len` when moving by `by`, wrapping at the ends as the
+/// web client's lists do (`None` when empty).
+pub fn list_step(at: Option<usize>, len: usize, by: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let Some(at) = at.filter(|a| *a < len) else { return Some(if by < 0 { len - 1 } else { 0 }) };
+    Some((at as isize + by).rem_euclid(len as isize) as usize)
+}

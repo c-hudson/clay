@@ -6,7 +6,7 @@
 use gpui::{AppContext, Context, Window};
 
 use super::ClayView;
-use super::dialogs::small::{Attempt, CertChanged, ConnLog, ConnectionLog, Help, Import, ImportCreds, ImportInsecure, Menu, Password, Reconnect, help_text};
+use super::dialogs::small::{Attempt, CertChanged, ConnLog, ConnectionLog, Import, ImportCreds, ImportInsecure, Menu, Password, Reconnect};
 use super::dialogs::{self, Host, Kind};
 use super::kit::Kit;
 use crate::native_gui::core::client::Status;
@@ -44,6 +44,8 @@ pub struct Surfaces {
     pending_after: u64,
     /// What /import last sent, to send again over plaintext if the user agrees.
     pub pending_import: Option<ImportCreds>,
+    /// The actions changed since the windows were last told.
+    pub actions_changed: bool,
 }
 
 impl Host for ClayView {
@@ -134,11 +136,24 @@ impl ClayView {
                 let v = cx.new(|cx| super::dialogs::emoji::EmojiPicker::new(main, window, cx));
                 dialogs::open(self, Kind::Emoji, v, window, cx);
             }
+            "actions" => self.open_actions(None, cx),
             "help" => self.open_window(super::windows::Kind::Help, |main, _w, cx| cx.new(|cx| super::windows::help::HelpView::new(main, cx)), |_, _, _| {}, cx),
             // Until the native editors (phase 4h-4j): the server's own pages, in the browser.
             "theme-editor" | "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
             other => crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: {other} is not available yet")),
         }
+    }
+
+    /// The Actions window, narrowed to a world for `/actions <world>`.
+    pub(super) fn open_actions(&mut self, world: Option<String>, cx: &mut Context<Self>) {
+        use super::windows::{Kind as Win, actions::ActionsView};
+        let again = world.clone();
+        self.open_window(
+            Win::Actions,
+            move |main, window, cx| cx.new(|cx| ActionsView::new(main, world, window, cx)),
+            move |view, window, cx| view.update(cx, |v, cx| v.set_world(again, window, cx)),
+            cx,
+        );
     }
 
     pub(super) fn open_import(&mut self, prefill: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -149,10 +164,8 @@ impl ClayView {
 
     /// A dialog's "?" (app.js `openPopupHelp`).
     pub(super) fn open_help(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(lines) = help_text(key) else { return };
         let main = cx.entity().downgrade();
-        let v = cx.new(|cx| Help::new(main, lines, cx));
-        dialogs::open(self, Kind::Help, v, window, cx);
+        dialogs::open_help(self, main, key, window, cx);
     }
 
     /// Send a message (dialogs use this).

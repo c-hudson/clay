@@ -236,6 +236,9 @@ impl ClayView {
         self.watch_status(cx);
         if changed {
             self.apply_settings();
+            if std::mem::take(&mut self.surf.actions_changed) {
+                cx.emit(windows::MainEvent::Actions);
+            }
             if self.bridged_theme != self.theme_json {
                 theme_bridge::apply(&self.theme, &self.fonts, cx);
                 self.bridged_theme = self.theme_json.clone();
@@ -515,6 +518,7 @@ impl ClayView {
         if sig != self.actions_sig {
             self.matcher = ActionMatcher::new(&self.session.core.actions);
             self.actions_sig = sig;
+            self.surf.actions_changed = true;
             restyle |= self.action_highlight;
         }
         if restyle {
@@ -863,6 +867,7 @@ pub(super) fn bind_main_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", MainCopyCmd, Some(MAIN_CONTEXT)),
     ]);
     dialogs::emoji::bind_keys(cx);
+    kit::bind_list_keys(cx);
 }
 
 impl ClayView {

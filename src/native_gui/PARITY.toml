@@ -13,9 +13,9 @@
 id = "msg:ActionsUpdated"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle ActionsUpdated"
-note = "actions list for the Actions window and tiles"
+note = "the tiles and matcher, and the Actions window redraws (MainEvent::Actions)"
 
 [[item]]
 id = "msg:ActivityUpdate"
@@ -1813,9 +1813,9 @@ note = "handled: see msg:ActionsUpdated"
 id = "wire:UpdateActions"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire UpdateActions"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "the Actions window saves and deletes (the whole list, as app.js)"
 
 [[item]]
 id = "wire:BanListRequest"
@@ -2810,3 +2810,27 @@ phase = 4
 status = "done"
 feature = "the emoji picker: tabs, search, grid, three arrow-key zones, insert at the caret; the console's filter_emoji"
 note = "app.js openEmojiPopup"
+
+[[item]]
+id = "ui:window.actions"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Actions window: filter box (name, world, patterns), /actions <world>, sorted Name/World/Pattern list, arrows wrap, Enter or double-click edits, Add/Edit/Delete/Ok, ? help"
+note = "app.js openActionsListPopup"
+
+[[item]]
+id = "ui:dialog.action_editor"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the action editor: name, world, match type, patterns (add/remove), enabled, startup, GUI shortcut, suppress blanks, command; the web's name checks; unseen fields kept"
+note = "app.js openActionsEditorPopup"
+
+[[item]]
+id = "ui:dialog.action_confirm"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "Delete action 'x'? Yes/No (from the list or the editor)"
+note = "app.js openActionsConfirmPopup"

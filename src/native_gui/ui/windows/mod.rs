@@ -4,6 +4,7 @@
 //! - One window per kind; asking again brings it forward with what was asked for.
 //! - A window closes when its content does.
 
+pub mod actions;
 pub mod help;
 
 use std::collections::HashMap;
@@ -42,6 +43,8 @@ impl Kind {
 pub enum MainEvent {
     /// The theme, fonts or settings changed: redraw.
     Restyled,
+    /// The actions changed.
+    Actions,
 }
 
 impl EventEmitter<MainEvent> for ClayView {}

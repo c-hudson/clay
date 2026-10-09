@@ -378,6 +378,58 @@ impl Render for Menu {
     }
 }
 
+// ---- A yes/no question --------------------------------------------------------------
+
+/// What Yes does.
+pub type OnYes = Box<dyn Fn(&mut Window, &mut App)>;
+
+/// "Delete action 'x'?" and the like (index.html `#action-confirm-modal`): Yes runs the
+/// deed, No and Esc don't.
+pub struct Confirm {
+    main: WeakEntity<ClayView>,
+    focus: FocusHandle,
+    text: String,
+    yes: OnYes,
+}
+
+impl Confirm {
+    pub fn new(main: WeakEntity<ClayView>, text: String, yes: OnYes, cx: &mut Context<Self>) -> Self {
+        Self { main, focus: cx.focus_handle(), text, yes }
+    }
+}
+
+impl EventEmitter<DialogEvent> for Confirm {}
+impl Focusable for Confirm {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for Confirm {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(k) = kit(&self.main, cx) else { return div().into_any_element() };
+        k.panel("confirm")
+            .track_focus(&self.focus)
+            .max_w(px(420.0))
+            .on_key_down(cx.listener(keys::<Self>(None)))
+            .child(k.text(self.text.clone()))
+            .child(
+                k.buttons()
+                    .child(k.button(
+                        "confirm-yes",
+                        "Yes",
+                        Btn::Plain,
+                        Some(Box::new(cx.listener(|this, _, window, cx| {
+                            (this.yes)(window, cx);
+                            cx.emit(DialogEvent::Close);
+                        }))),
+                    ))
+                    .child(k.button("confirm-no", "No", Btn::Plain, Some(Box::new(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Close)))))),
+            )
+            .into_any_element()
+    }
+}
+
 // ---- A dialog's "?" -----------------------------------------------------------------
 
 /// app.js `popupHelpTexts[key]`, read out of the web client itself so the two never
