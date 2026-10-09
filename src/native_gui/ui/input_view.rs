@@ -385,10 +385,13 @@ impl ClayView {
             focus: self.focus.clone(),
             view: cx.entity(),
         };
-        let mut bar = div().flex().items_center().flex_shrink_0().px(px(4.0)).py(px(2.0)).bg(hsla(self.palette.bg)).font_family(mono.clone()).text_size(px(self.font_size)).line_height(relative(1.2)).text_color(hsla(self.palette.fg));
+        let mut bar = div().flex().items_start().flex_shrink_0().px(px(4.0)).py(px(2.0)).bg(hsla(self.palette.bg)).font_family(mono.clone()).text_size(px(self.font_size)).line_height(relative(1.2)).text_color(hsla(self.palette.fg));
+        // The prompt sits on the field's first row, at its height (the web centres it in
+        // the whole input area, so a multi-row input showed it beside the second row).
         if !prompt.is_empty() {
             let styled = style_line(&prompt, &self.palette, &self.style);
-            bar = bar.child(div().flex_shrink_0().whitespace_nowrap().child(super::chrome::styled_text(&styled, &mono)));
+            let prompt = div().flex_shrink_0().whitespace_nowrap().mt(px(PAD)).line_height(px(self.font_size));
+            bar = bar.child(prompt.child(super::chrome::styled_text(&styled, &mono)));
         }
         bar.child(
             div()
