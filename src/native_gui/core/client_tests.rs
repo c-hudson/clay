@@ -607,8 +607,9 @@ fn a_multiuser_logout_returns_to_the_login_screen_on_the_same_connection() {
     let e = t.core.logout();
     t.keep(e);
     assert!(t.sent().iter().any(|m| matches!(m, WsMessage::Logout)));
+    t.core.splash_lines = vec!["Welcome".into()];
     t.msg(WsMessage::LoggedOut);
-    assert!(t.core.worlds.is_empty());
+    assert!(t.core.worlds.is_empty() && t.core.splash_lines.is_empty(), "as app.js clears them");
     assert!(matches!(t.core.status(), Status::NeedLogin { multiuser: true, .. }));
     let e = t.core.login(Credentials { username: Some("bob".into()), password: Some("pw2".into()), auth_key: None }, t.now);
     t.keep(e);

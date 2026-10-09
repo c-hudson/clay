@@ -715,10 +715,16 @@ impl ClayView {
                 let fx = self.session.send(crate::websocket::WsMessage::RequestConnectionsList);
                 self.after(fx, cx);
             }
-            _ => {
-                let fx = self.session.core.client_line(&format!("% {first} opens a window the native GUI doesn't have yet."));
+            // Updating this binary is phase 5's.
+            "/update" => {
+                let fx = self.session.core.client_line("% /update isn't in the native GUI yet.");
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
+            }
+            // Anything else is the server's after all (app.js's default).
+            _ => {
+                let world_index = self.session.core.current;
+                self.send_message(crate::websocket::WsMessage::SendCommand { world_index, command: command.to_string() }, cx);
             }
         }
     }

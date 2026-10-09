@@ -101,9 +101,9 @@ note = "dots in the input"
 id = "msg:ExecuteLocalCommand"
 section = "misc"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle ExecuteLocalCommand"
-note = ""
+note = "input_view local_command: the same commands as app.js executeLocalCommand, anything else back as SendCommand; /update (and /reload of the binary itself) are phase 5's"
 
 [[item]]
 id = "msg:GlobalSettingsUpdated"
@@ -173,9 +173,9 @@ note = "keys follow the new table"
 id = "msg:LoggedOut"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle LoggedOut"
-note = "multiuser logout"
+note = "core: worlds, actions and splash cleared, back to the login screen"
 
 [[item]]
 id = "msg:McmpMedia"
@@ -2109,17 +2109,17 @@ note = "the core takes the live colours (every window redraws in them)"
 id = "wire:RequestActionEditorState"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire RequestActionEditorState"
-note = "spoken by the theme/keybind/action editor pages"
+note = "the Action editor on opening"
 
 [[item]]
 id = "wire:ActionEditorState"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ActionEditorState"
-note = "spoken by the theme/keybind/action editor pages"
+note = "fills the Action editor (kept unless it has unsaved changes)"
 
 [[item]]
 id = "wire:RequestKeybindEditorState"
@@ -2946,3 +2946,11 @@ phase = 4
 status = "done"
 feature = "the Keybind editor as a native window: actions by category with their keys (changed ones marked), bindings with remove, capture (chords, ^X, ^G cancels, Tab and Ctrl+C too), conflict Reassign, Reset to Default, Clear All, Find, Save/Cancel/Reset Defaults"
 note = "keybind-editor.html (opened in the browser by the web client)"
+
+[[item]]
+id = "ui:editor.action"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Action editor as a native window: list with text and world filters, enabled marks and pattern hints; name, worlds, Enabled/Run at startup/GUI Menu Shortcut/Suppress Blanks, match type, patterns (add/remove), command; Save/Cancel/Delete; Save/Discard/Stay on leaving an edited action or closing with changes; a list saved elsewhere taken when nothing is unsaved"
+note = "action-editor.html (opened in the browser by the web client); Delete is saved at once and names are checked as the Actions editor checks them (B28)"

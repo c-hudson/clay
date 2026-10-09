@@ -846,6 +846,7 @@ impl ClientCore {
                 // Multiuser: this login is over; the connection stays for the next one.
                 self.worlds.clear();
                 self.actions.clear();
+                self.splash_lines.clear();
                 self.current = 0;
                 self.activity = 0;
                 self.creds.password = None;

@@ -88,15 +88,6 @@ impl ClayView {
         super::output::hsla([self.theme.prompt.r, self.theme.prompt.g, self.theme.prompt.b])
     }
 
-    /// A page of the attached server's web client (`/theme-editor` and the like), for what
-    /// the native GUI doesn't draw itself yet.
-    fn server_page(&self, page: &str) -> String {
-        let ws = self.session.url();
-        let base = ws.strip_suffix("/ws").unwrap_or(&ws);
-        let base = base.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
-        format!("{base}/{page}")
-    }
-
     /// Run `f` on the next frame, with the window.
     pub(super) fn later(&mut self, f: impl FnOnce(&mut ClayView, &mut Window, &mut Context<ClayView>) + 'static, cx: &mut Context<Self>) {
         self.surf.later.push(Box::new(f));
@@ -169,8 +160,10 @@ impl ClayView {
                 use super::windows::{Kind as Win, keybind_editor::KeybindEditor};
                 self.open_window(Win::KeybindEditor, |main, _window, cx| cx.new(|cx| KeybindEditor::new(main, cx)), |_, _, _| {}, cx);
             }
-            // Until the native Action editor (phase 4j): the server's own page, in the browser.
-            "action-editor" => cx.open_url(&self.server_page(name)),
+            "action-editor" => {
+                use super::windows::{Kind as Win, action_editor::ActionEditor};
+                self.open_window(Win::ActionEditor, |main, window, cx| cx.new(|cx| ActionEditor::new(main, window, cx)), |_, _, _| {}, cx);
+            }
             other => crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: {other} is not available yet")),
         }
     }
@@ -345,6 +338,11 @@ impl ClayView {
             WsMessage::KeybindEditorState { bindings_json, defaults_json, actions_json } => {
                 let (b, d, a) = (bindings_json.clone(), defaults_json.clone(), actions_json.clone());
                 self.in_window::<super::windows::keybind_editor::KeybindEditor>(super::windows::Kind::KeybindEditor, move |v, _w, cx| v.state(&b, &d, &a, cx), cx);
+            }
+            // The Action editor's list.
+            WsMessage::ActionEditorState { actions_json, .. } => {
+                let j = actions_json.clone();
+                self.in_window::<super::windows::action_editor::ActionEditor>(super::windows::Kind::ActionEditor, move |v, window, cx| v.state(&j, window, cx), cx);
             }
             WsMessage::KeybindFileSaved { success, error } => {
                 let (ok, e) = (*success, error.clone());

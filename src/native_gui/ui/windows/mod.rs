@@ -4,6 +4,7 @@
 //! - One window per kind; asking again brings it forward with what was asked for.
 //! - A window closes when its content does.
 
+pub mod action_editor;
 pub mod actions;
 pub mod help;
 pub mod keybind_editor;
@@ -33,6 +34,7 @@ pub enum Kind {
     Notes(usize),
     ThemeEditor,
     KeybindEditor,
+    ActionEditor,
 }
 
 impl Kind {
@@ -47,6 +49,7 @@ impl Kind {
             Kind::Notes(_) => ("Clay - Notes", 700.0, 500.0),
             Kind::ThemeEditor => ("Clay - Theme Editor", 1000.0, 720.0),
             Kind::KeybindEditor => ("Clay - Keybind Editor", 1000.0, 700.0),
+            Kind::ActionEditor => ("Clay - Action Editor", 960.0, 700.0),
         }
     }
 }

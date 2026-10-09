@@ -112,6 +112,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         "notes" => super::windows::Kind::Notes(0),
         "theme" => super::windows::Kind::ThemeEditor,
         "keybind" => super::windows::Kind::KeybindEditor,
+        "action" => super::windows::Kind::ActionEditor,
         other => fail(&format!("no window kind {other}")),
     };
     // CLAY_SNAPSHOT_INPUT: mouse and key events to replay before the capture, for
@@ -201,6 +202,28 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     .expect("draw after open");
                     Vec::new()
                 }
+                // The target window's close button: the Action editor asks first when it has
+                // changes (what its `on_window_should_close` hook answers); others just close.
+                "close" => {
+                    use super::windows::{Kind, action_editor::ActionEditor};
+                    let guard = cx.update(|app| {
+                        let v = view.read(app);
+                        if v.windows.handle(Kind::ActionEditor) != Some(target) {
+                            return None;
+                        }
+                        v.windows.frame(Kind::ActionEditor).and_then(|f| f.read(app).content::<ActionEditor>())
+                    });
+                    let _ = cx.update_window(target, |_, w, app| {
+                        if guard.is_none_or(|e| e.update(app, |e, cx| e.may_close(w, cx))) {
+                            w.remove_window();
+                        }
+                    });
+                    cx.run_until_parked();
+                    let _ = cx.update_window(target, |_, w, app| {
+                        let _ = w.draw(app);
+                    });
+                    Vec::new()
+                }
                 // Real time with the connection live: the server's messages reach the view
                 // (round trips: a Save, a reply, a window that opens on one).
                 "pump" => {
@@ -250,7 +273,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
     }
     // CLAY_SNAPSHOT_WINDOW=help (etc.): photograph that window, opened by an `open:` step,
     // instead of the main one.
-    let target: gpui::AnyWindowHandle = match std::env::var("CLAY_SNAPSHOT_WINDOW").ok().as_deref() {
+    let target: gpui::AnyWindowHandle = match std::env::var("CLAY_SNAPSHOT_WINDOW").ok().filter(|k| !k.is_empty()).as_deref() {
         Some(kind) => {
             let kind = window_kind(kind);
             let handle = cx.update(|app| view.read(app).windows.handle(kind)).unwrap_or_else(|| fail("that window isn't open (add an open: step)"));

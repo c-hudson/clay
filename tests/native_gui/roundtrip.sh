@@ -1,7 +1,7 @@
 #!/bin/bash
 # The native GUI's windows against a live server, offscreen: the snapshot harness drives
 # them (clicks, typing, `pump` to let the server answer) and settings.dat is checked
-# afterwards. Notes, Settings, a new action, a world's port.
+# afterwards. Notes, Settings, a new action, a world's port, and the three editors.
 #   tests/native_gui/roundtrip.sh <outdir>
 # Needs target/native-gui/debug/clay built with NATIVE_GUI_FEATURES=native-gui-snapshot.
 # Click positions are the windows' logical pixels at their default sizes.
@@ -29,6 +29,11 @@ run notes notes "open:notes;pump:800;win:notes;text:remember the troll;down:578,
 run settings settings "open:setup;win:settings;down:167,275;up:167,275;down:473,654;up:473,654;pump:1000" "^more_mode=true"
 run action actions "open:actions;win:actions;down:590,591;up:590,591;text:greet;down:300,450;up:300,450;text:say hello;down:719,593;up:719,593;pump:1000" "^\[action:greet\]"
 run world worlds "open:world-selector;win:worlds;down:420,652;up:420,652;down:400,174;up:400,174;key:end;key:backspace;key:backspace;key:backspace;key:backspace;key:backspace;text:4321;down:494,652;up:494,652;pump:1000" "^port=4321"
-# The editors: a key captured for Cursor Left, then Save; a colour picked for bg, then Save.
+# The editors: a key captured for Cursor Left, then Save; a colour picked for bg, then Save;
+# a new action named over its selected placeholder name, then Save.
 run keybind keybind "open:keybind-editor;pump:800;win:keybind;down:100,90;up:100,90;down:600,262;up:600,262;key:f7;pump:500;down:771,22;up:771,22;pump:1000" "F7" keybindings.dat
 run theme theme "open:theme-editor;pump:800;win:theme;down:100,95;up:100,95;down:440,100;up:440,100;wait:100;pump:600;down:785,24;up:785,24;pump:1000" "^bg = #(?!131926)" theme.dat
+run actioneditor action "open:action-editor;pump:800;win:action;down:140,140;up:140,140;text:heal;down:910,603;up:910,603;pump:1000" "^\[action:heal\]"
+# Closing the Action editor with an unsaved new action asks first; its Save saves, and the
+# window closes (so the main window is the one photographed).
+run actionclose "" "open:action-editor;pump:800;win:action;down:140,140;up:140,140;text:heal;close:;down:400,363;up:400,363;pump:1000" "^\[action:heal\]"
