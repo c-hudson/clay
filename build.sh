@@ -5,7 +5,9 @@
 
 set -e
 
-REQUIRED_RUST_VERSION="1.75.0"
+# The minimum is Cargo.toml's rust-version (read from it, so the two can't drift apart).
+REQUIRED_RUST_VERSION=$(grep -m1 '^rust-version' Cargo.toml 2>/dev/null | cut -d'"' -f2)
+REQUIRED_RUST_VERSION=${REQUIRED_RUST_VERSION:-1.89}
 
 echo "=============================================="
 echo "  Clay MUD Client - Build Script"
