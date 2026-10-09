@@ -19,6 +19,7 @@ mod select;
 mod surfaces;
 mod textdiv;
 mod theme_bridge;
+mod windows;
 #[cfg(feature = "native-gui-snapshot")]
 pub mod snapshot;
 
@@ -122,6 +123,8 @@ pub struct ClayView {
     cache: Option<CacheSaver>,
     /// Dialogs, and what they wait on.
     surf: surfaces::Surfaces,
+    /// The other windows.
+    windows: windows::Windows,
 }
 
 impl ClayView {
@@ -187,6 +190,7 @@ impl ClayView {
             bridged_theme: String::new(),
             cache: None,
             surf: Default::default(),
+            windows: Default::default(),
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -235,6 +239,7 @@ impl ClayView {
             if self.bridged_theme != self.theme_json {
                 theme_bridge::apply(&self.theme, &self.fonts, cx);
                 self.bridged_theme = self.theme_json.clone();
+                self.restyled(cx);
             }
             self.follow_world();
             cx.notify();
@@ -857,6 +862,7 @@ pub(super) fn bind_main_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", MainCopyCtrl, Some(MAIN_CONTEXT)),
         KeyBinding::new("cmd-c", MainCopyCmd, Some(MAIN_CONTEXT)),
     ]);
+    dialogs::emoji::bind_keys(cx);
 }
 
 impl ClayView {

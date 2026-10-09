@@ -100,10 +100,19 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         })
         .expect("draw the frame again");
     }
+    let window_kind = |kind: &str| match kind {
+        "settings" => super::windows::Kind::Settings,
+        "help" => super::windows::Kind::Help,
+        "actions" => super::windows::Kind::Actions,
+        "worlds" => super::windows::Kind::Worlds,
+        other => fail(&format!("no window kind {other}")),
+    };
     // CLAY_SNAPSHOT_INPUT: mouse and key events to replay before the capture, for
     // checking selection, menus and dialogs, e.g. "down:40,60;move:300,90;up:300,90;key:ctrl-c".
     if let Ok(script) = std::env::var("CLAY_SNAPSHOT_INPUT") {
         let mut left_down = false;
+        // `win:help` sends what follows to that window (`win:main` back).
+        let mut target: gpui::AnyWindowHandle = window.into();
         for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             let (verb, arg) = step.split_once(':').unwrap_or((step, ""));
             let nums: Vec<f32> = arg.split(',').filter_map(|n| n.trim().parse().ok()).collect();
@@ -153,16 +162,25 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     for ch in arg.chars() {
                         let name = if ch == ' ' { "space".to_string() } else { ch.to_string() };
                         let keystroke = gpui::Keystroke::parse(&name).unwrap_or_else(|e| fail(&format!("bad key {ch}: {e}")));
-                        cx.update_window(window.into(), |_, w, app| {
+                        cx.update_window(target, |_, w, app| {
                             w.dispatch_keystroke(keystroke, app);
                         })
                         .expect("type a key");
                         cx.run_until_parked();
-                        cx.update_window(window.into(), |_, w, app| {
+                        cx.update_window(target, |_, w, app| {
                             let _ = w.draw(app);
                         })
                         .expect("draw after a key");
                     }
+                    Vec::new()
+                }
+                "win" => {
+                    target = if arg == "main" {
+                        window.into()
+                    } else {
+                        let kind = window_kind(arg);
+                        cx.update(|app| view.read(app).windows.handle(kind)).unwrap_or_else(|| fail("that window isn't open (add an open: step)"))
+                    };
                     Vec::new()
                 }
                 // A dialog by name (surfaces.rs `snapshot_open`).
@@ -187,12 +205,12 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                 other => fail(&format!("unknown input step {other}")),
             };
             for ev in events {
-                cx.update_window(window.into(), |_, window, app| {
+                cx.update_window(target, |_, window, app| {
                     let _ = window.dispatch_event(ev, app);
                 })
                 .expect("dispatch an event");
                 cx.run_until_parked();
-                cx.update_window(window.into(), |_, window, app| {
+                cx.update_window(target, |_, window, app| {
                     let _ = window.draw(app);
                 })
                 .expect("draw after an event");
@@ -207,7 +225,22 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
     if std::env::var_os("CLAY_SNAPSHOT_BENCH").is_some() {
         bench(&mut cx, window.into(), &view);
     }
-    match cx.capture_screenshot(window.into()) {
+    // CLAY_SNAPSHOT_WINDOW=help (etc.): photograph that window, opened by an `open:` step,
+    // instead of the main one.
+    let target: gpui::AnyWindowHandle = match std::env::var("CLAY_SNAPSHOT_WINDOW").ok().as_deref() {
+        Some(kind) => {
+            let kind = window_kind(kind);
+            let handle = cx.update(|app| view.read(app).windows.handle(kind)).unwrap_or_else(|| fail("that window isn't open (add an open: step)"));
+            cx.run_until_parked();
+            cx.update_window(handle, |_, w, app| {
+                let _ = w.draw(app);
+            })
+            .expect("draw the window");
+            handle
+        }
+        None => window.into(),
+    };
+    match cx.capture_screenshot(target) {
         Ok(image) => {
             if let Err(e) = image.save(out) {
                 eprintln!("snapshot: can't write {out}: {e}");

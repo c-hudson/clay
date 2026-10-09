@@ -61,6 +61,32 @@ impl ClayView {
         Kit { t: self.chrome.tokens.clone(), fonts: self.fonts.clone(), field_bg: super::output::hsla(self.palette.bg) }
     }
 
+    /// `--theme-selection-bg`.
+    pub(super) fn selection_color(&self) -> gpui::Hsla {
+        super::output::hsla([self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b])
+    }
+
+    /// Put `text` in the input at the cursor (over a selection), as typing it would
+    /// (the emoji picker).
+    pub(super) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.editor.insert(text);
+        self.input_touched(cx);
+    }
+
+    /// `--theme-prompt`, which the web client's help links use.
+    pub(super) fn link_color(&self) -> gpui::Hsla {
+        super::output::hsla([self.theme.prompt.r, self.theme.prompt.g, self.theme.prompt.b])
+    }
+
+    /// A page of the attached server's web client (`/theme-editor` and the like), for what
+    /// the native GUI doesn't draw itself yet.
+    fn server_page(&self, page: &str) -> String {
+        let ws = self.session.url();
+        let base = ws.strip_suffix("/ws").unwrap_or(&ws);
+        let base = base.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+        format!("{base}/{page}")
+    }
+
     /// Run `f` on the next frame, with the window.
     pub(super) fn later(&mut self, f: impl FnOnce(&mut ClayView, &mut Window, &mut Context<ClayView>) + 'static, cx: &mut Context<Self>) {
         self.surf.later.push(Box::new(f));
@@ -104,6 +130,13 @@ impl ClayView {
                 dialogs::open(self, Kind::Password, v, window, cx);
             }
             "spell_check" => self.spell_suggest(window, cx),
+            "emoji_picker" => {
+                let v = cx.new(|cx| super::dialogs::emoji::EmojiPicker::new(main, window, cx));
+                dialogs::open(self, Kind::Emoji, v, window, cx);
+            }
+            "help" => self.open_window(super::windows::Kind::Help, |main, _w, cx| cx.new(|cx| super::windows::help::HelpView::new(main, cx)), |_, _, _| {}, cx),
+            // Until the native editors (phase 4h-4j): the server's own pages, in the browser.
+            "theme-editor" | "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
             other => crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: {other} is not available yet")),
         }
     }

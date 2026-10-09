@@ -669,9 +669,9 @@ note = "ui/actions.rs"
 id = "action:emoji_picker"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "action emoji_picker"
-note = ""
+note = "Esc-e: the picker (ui/dialogs/emoji.rs)"
 
 [[item]]
 id = "action:expand_line"
@@ -709,9 +709,9 @@ note = "ui/actions.rs"
 id = "action:help"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "action help"
-note = ""
+note = "F1: the Help window (ui/windows/help.rs)"
 
 [[item]]
 id = "action:history_next"
@@ -2786,3 +2786,27 @@ phase = 4
 status = "done"
 feature = "/import and the menu's Import Settings: host, password, auth key; a plaintext confirm before resending without TLS"
 note = "app.js showImportDialog"
+
+[[item]]
+id = "ui:window.help"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Help window: version title, the eight quick-start cards, the collapsed reference read from app.js helpSections, Esc/Ok closes"
+note = "app.js openHelpPopup"
+
+[[item]]
+id = "ui:window.frame"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "Settings/Help/Actions/Worlds as OS windows of their own, one per kind, sharing the main connection (no second login)"
+note = "app.js openInPopupWindow"
+
+[[item]]
+id = "ui:dialog.emoji"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the emoji picker: tabs, search, grid, three arrow-key zones, insert at the caret; the console's filter_emoji"
+note = "app.js openEmojiPopup"

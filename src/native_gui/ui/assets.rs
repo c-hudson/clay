@@ -13,7 +13,11 @@ macro_rules! icons {
 }
 
 const ICONS: &[(&str, &[u8])] =
-    icons!["worlds", "actions", "settings", "find", "tags", "arrow-left", "arrow-right", "menu", "note", "star"];
+    icons![
+        "worlds", "actions", "settings", "find", "tags", "arrow-left", "arrow-right", "menu", "note", "star",
+        // The help window's quick-start cards (app.js buildHelpQuickStartCards) and its disclosure chevron.
+        "help-connect", "help-switch", "help-send", "help-catchup", "help-actions", "help-yours", "help-remote", "help-notes", "help-chevron",
+    ];
 
 /// The path of one of our icons, for `gpui::svg().path(..)`.
 pub fn icon(name: &str) -> SharedString {
