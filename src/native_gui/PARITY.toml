@@ -2125,57 +2125,57 @@ note = "spoken by the theme/keybind/action editor pages"
 id = "wire:RequestKeybindEditorState"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire RequestKeybindEditorState"
-note = "spoken by the theme/keybind/action editor pages"
+note = "the Keybind editor on opening"
 
 [[item]]
 id = "wire:UpdateKeybindEditorBindings"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire UpdateKeybindEditorBindings"
-note = "spoken by the theme/keybind/action editor pages"
+note = "every change in the Keybind editor"
 
 [[item]]
 id = "wire:SaveKeybindFile"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire SaveKeybindFile"
-note = "spoken by the theme/keybind/action editor pages"
+note = "Save"
 
 [[item]]
 id = "wire:ResetKeybindDefaults"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ResetKeybindDefaults"
-note = "spoken by the theme/keybind/action editor pages"
+note = "Reset Defaults, after asking"
 
 [[item]]
 id = "wire:KeybindEditorState"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire KeybindEditorState"
-note = "spoken by the theme/keybind/action editor pages"
+note = "fills the Keybind editor"
 
 [[item]]
 id = "wire:KeybindFileSaved"
 section = "editors"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire KeybindFileSaved"
-note = "spoken by the theme/keybind/action editor pages"
+note = "Saved / Error in the toolbar"
 
 [[item]]
 id = "wire:KeybindingsUpdated"
 section = "wire"
 phase = 3
-status = "see"
+status = "done"
 feature = "wire KeybindingsUpdated"
-note = "handled: see msg:KeybindingsUpdated"
+note = "the core keeps the keys; the Keybind editor follows them (MainEvent::Settings)"
 
 [[item]]
 id = "wire:RequestNoteEditorState"
@@ -2938,3 +2938,11 @@ phase = 4
 status = "done"
 feature = "the Theme editor as a native window: themes, grouped colours (double-click flashes), SV square + hue bar + hex picker, live preview, separator style, Add/Delete/Save/Reset/Load Defaults; edits go live to every window"
 note = "theme-editor.html (opened in the browser by the web client)"
+
+[[item]]
+id = "ui:editor.keybind"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Keybind editor as a native window: actions by category with their keys (changed ones marked), bindings with remove, capture (chords, ^X, ^G cancels, Tab and Ctrl+C too), conflict Reassign, Reset to Default, Clear All, Find, Save/Cancel/Reset Defaults"
+note = "keybind-editor.html (opened in the browser by the web client)"

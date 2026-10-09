@@ -881,6 +881,7 @@ pub(super) fn bind_main_keys(cx: &mut App) {
     ]);
     dialogs::emoji::bind_keys(cx);
     kit::bind_list_keys(cx);
+    windows::keybind_editor::bind_keys(cx);
 }
 
 impl ClayView {

@@ -165,8 +165,12 @@ impl ClayView {
                     cx,
                 );
             }
-            // Until the native editors (phase 4i-4j): the server's own pages, in the browser.
-            "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
+            "keybind-editor" => {
+                use super::windows::{Kind as Win, keybind_editor::KeybindEditor};
+                self.open_window(Win::KeybindEditor, |main, _window, cx| cx.new(|cx| KeybindEditor::new(main, cx)), |_, _, _| {}, cx);
+            }
+            // Until the native Action editor (phase 4j): the server's own page, in the browser.
+            "action-editor" => cx.open_url(&self.server_page(name)),
             other => crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: {other} is not available yet")),
         }
     }
@@ -336,6 +340,15 @@ impl ClayView {
             WsMessage::ThemeFileSaved { success, error } => {
                 let (ok, e) = (*success, error.clone());
                 self.in_window::<super::windows::theme_editor::ThemeEditor>(super::windows::Kind::ThemeEditor, move |v, _window, cx| v.saved(ok, e.as_deref(), cx), cx);
+            }
+            // The keybind editor's state, and Save's answer.
+            WsMessage::KeybindEditorState { bindings_json, defaults_json, actions_json } => {
+                let (b, d, a) = (bindings_json.clone(), defaults_json.clone(), actions_json.clone());
+                self.in_window::<super::windows::keybind_editor::KeybindEditor>(super::windows::Kind::KeybindEditor, move |v, _w, cx| v.state(&b, &d, &a, cx), cx);
+            }
+            WsMessage::KeybindFileSaved { success, error } => {
+                let (ok, e) = (*success, error.clone());
+                self.in_window::<super::windows::keybind_editor::KeybindEditor>(super::windows::Kind::KeybindEditor, move |v, _w, cx| v.saved(ok, e.as_deref(), cx), cx);
             }
             // A world's notes, for its notes window.
             WsMessage::NoteEditorState { world_index, world_name, notes } => {

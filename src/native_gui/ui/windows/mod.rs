@@ -6,6 +6,7 @@
 
 pub mod actions;
 pub mod help;
+pub mod keybind_editor;
 pub mod notes;
 pub mod settings;
 pub mod theme_editor;
@@ -31,6 +32,7 @@ pub enum Kind {
     /// A world's notes (one window per world).
     Notes(usize),
     ThemeEditor,
+    KeybindEditor,
 }
 
 impl Kind {
@@ -44,6 +46,7 @@ impl Kind {
             // The world's name goes in the title once the notes arrive.
             Kind::Notes(_) => ("Clay - Notes", 700.0, 500.0),
             Kind::ThemeEditor => ("Clay - Theme Editor", 1000.0, 720.0),
+            Kind::KeybindEditor => ("Clay - Keybind Editor", 1000.0, 700.0),
         }
     }
 }
