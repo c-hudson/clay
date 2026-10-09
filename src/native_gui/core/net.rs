@@ -292,6 +292,17 @@ async fn pump(mut ws: Ws, commands: &mut mpsc::UnboundedReceiver<Command>, event
                             .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
                             .unwrap_or_default();
                         crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: unreadable message type={kind} err={e}"));
+                        // And tell the server, whose remote.log is where a remote client's
+                        // trouble is read afterwards (a newer server than this build, most
+                        // likely).
+                        let report = WsMessage::ReportClientLifecycle {
+                            event: "unknownMessage".into(),
+                            detail: format!("type={kind} err={e}"),
+                            source: super::client::SOURCE.into(),
+                        };
+                        if let Ok(text) = serde_json::to_string(&report) {
+                            let _ = ws.send(Message::Text(text)).await;
+                        }
                     }
                 }
             }

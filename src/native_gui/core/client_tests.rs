@@ -776,3 +776,31 @@ fn a_gap_fill_lands_in_a_follower_as_it_does_in_its_leader() {
     assert_eq!(h.core.worlds[0].seen.frontier(), 10);
     assert_eq!(f.worlds[0].seen.frontier(), 10);
 }
+
+#[test]
+fn a_connection_given_up_on_is_reported_once_there_is_one_again() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..3, 9)]);
+    h.sent();
+    // Nothing from the server for longer than the liveness limit: given up.
+    h.advance(Duration::from_secs(80));
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::Disconnect)));
+    h.input(Input::Closed("gone".into()));
+    h.advance(Duration::from_secs(5));
+    h.sent();
+    h.input(Input::Opened);
+    h.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: CHALLENGE.into() });
+    h.msg(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false });
+    let sent = h.sent();
+    assert!(
+        sent.iter().any(|m| matches!(m, WsMessage::ReportClientLifecycle { event, source, .. } if event == "forceReconnect" && source == SOURCE)),
+        "{sent:?}"
+    );
+    // Once only.
+    h.input(Input::Closed("again".into()));
+    h.advance(Duration::from_secs(5));
+    h.input(Input::Opened);
+    h.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: CHALLENGE.into() });
+    h.msg(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false });
+    assert!(!h.sent().iter().any(|m| matches!(m, WsMessage::ReportClientLifecycle { .. })));
+}

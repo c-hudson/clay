@@ -281,6 +281,10 @@ pub struct ClientCore {
     backfill_phase: u8,
     backfill_inflight: bool,
     next_line_id: u64,
+    /// Why the last connections were given up (`ReportClientLifecycle`), sent once there's
+    /// a connection again: the server's remote.log is where a remote client's trouble
+    /// can be read afterwards (the Android app reports the same events).
+    reports: Vec<(&'static str, String)>,
     out: Vec<Effect>,
 }
 
@@ -327,6 +331,7 @@ impl ClientCore {
             backfill_phase: 0,
             backfill_inflight: false,
             next_line_id: 1,
+            reports: Vec::new(),
             out: Vec::new(),
         }
     }
@@ -762,7 +767,11 @@ impl ClientCore {
                 self.send(WsMessage::Ping);
             }
             if self.wake_deadline.is_some_and(|d| now >= d) || now.saturating_duration_since(self.last_rx) > LIVENESS {
-                self.wake_deadline = None;
+                let silent = now.saturating_duration_since(self.last_rx).as_secs();
+                match self.wake_deadline.take() {
+                    Some(_) => self.reports.push(("resumeReconnect", format!("reason=pongTimeout after sleep, silent {silent}s"))),
+                    None => self.reports.push(("forceReconnect", format!("reason=silent {silent}s"))),
+                }
                 self.out.push(Effect::Disconnect);
                 return self.take();
             }
@@ -1167,6 +1176,9 @@ impl ClientCore {
             self.key_failed = false;
             self.next_keepalive = None;
             self.send(WsMessage::ClientTypeDeclaration { client_type: RemoteClientType::RemoteGUI });
+            for (event, detail) in std::mem::take(&mut self.reports) {
+                self.send(WsMessage::ReportClientLifecycle { event: event.into(), detail, source: SOURCE.into() });
+            }
             self.set_status(Status::Online);
             return;
         }

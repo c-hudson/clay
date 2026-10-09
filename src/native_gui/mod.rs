@@ -13,6 +13,7 @@ mod parity_tests;
 /// render one frame offscreen to that file and exit; with `verify` set
 /// (`--native-gui-verify[=SECONDS]`) run the client headless and check its buffer.
 pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>, ssh: bool) -> std::io::Result<()> {
+    log_crashes();
     let runtime = tokio::runtime::Handle::current();
     let target = if ssh {
         ssh_target(target.as_deref(), &runtime)
@@ -112,4 +113,16 @@ fn ssh_target(spec: Option<&str>, runtime: &tokio::runtime::Handle) -> core::net
         eprintln!("clay: --ssh requires the 'ssh-transport' feature.");
         std::process::exit(1);
     }
+}
+
+/// A crash leaves what happened and where in debug.log (the console's crash handler is
+/// set up after the native GUI has taken over, and a window started from a desktop
+/// launcher has no terminal to show the panic on). Background tasks' panics too.
+fn log_crashes() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::debug_log(true, &format!("native-gui CRASH: {info}"));
+        crate::debug_log(true, &format!("BACKTRACE:\n{}", std::backtrace::Backtrace::force_capture()));
+        default_hook(info);
+    }));
 }

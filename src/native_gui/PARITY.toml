@@ -1933,9 +1933,9 @@ note = "sent by the web client"
 id = "wire:ReportClientLifecycle"
 section = "wire"
 phase = 6
-status = "todo"
+status = "done"
 feature = "wire ReportClientLifecycle"
-note = "sent by the web client; client diagnostics, with hardening"
+note = "source \"native\": forceReconnect / resumeReconnect (sent at the next login, the reason the last connection was given up) and unknownMessage (a message this build can't read); the web client sends none, the Android app the same kind"
 
 [[item]]
 id = "wire:ClientTypeDeclaration"
@@ -2269,25 +2269,25 @@ note = "handled: see msg:ResyncRequired"
 id = "wire:ScrollbackSyncRequest"
 section = "connection"
 phase = 6
-status = "todo"
+status = "waived"
 feature = "wire ScrollbackSyncRequest"
-note = "server-push history download (Phase J); no client uses it yet"
+note = "server-push history download (Phase J): no client uses it yet; the native client takes it up with the web client"
 
 [[item]]
 id = "wire:ScrollbackContinue"
 section = "connection"
 phase = 6
-status = "todo"
+status = "waived"
 feature = "wire ScrollbackContinue"
-note = "server-push history download (Phase J); no client uses it yet"
+note = "server-push history download (Phase J): no client uses it yet; the native client takes it up with the web client"
 
 [[item]]
 id = "wire:ScrollbackBatch"
 section = "connection"
 phase = 6
-status = "todo"
+status = "waived"
 feature = "wire ScrollbackBatch"
-note = "server-push history download (Phase J); no client uses it yet"
+note = "server-push history download (Phase J): no client uses it yet; the native client takes it up with the web client"
 
 # ---- The web window's features (ui:*), from the Phase 2 surveys ----
 
