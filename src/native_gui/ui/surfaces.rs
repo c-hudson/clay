@@ -129,6 +129,10 @@ impl ClayView {
                 dialogs::open(self, Kind::Password, v, window, cx);
             }
             "spell_check" => self.spell_suggest(window, cx),
+            "recent_worlds" => {
+                let v = cx.new(|cx| super::dialogs::small::RecentWorlds::new(main, cx));
+                dialogs::open(self, Kind::RecentWorlds, v, window, cx);
+            }
             "emoji_picker" => {
                 let v = cx.new(|cx| super::dialogs::emoji::EmojiPicker::new(main, window, cx));
                 dialogs::open(self, Kind::Emoji, v, window, cx);

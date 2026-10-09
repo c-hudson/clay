@@ -174,6 +174,9 @@ pub struct World {
     pub stats: Vec<StatEntry>,
     /// TF's status area for this world, once a script has made it its own.
     pub tf_status: Option<StatusView>,
+    /// When a line last went to or came from the MUD (Recent Worlds): seeded from
+    /// InitialState's last_recv_secs/last_send_secs, then moved on by this client.
+    pub last_activity: Option<Instant>,
     /// Bumped whenever `lines` change.
     pub revision: u64,
     pub seen: SeenRanges,
@@ -722,6 +725,11 @@ impl ClientCore {
 
     pub fn send_message(&mut self, msg: WsMessage) -> Vec<Effect> {
         if self.is_online() {
+            if let WsMessage::SendCommand { world_index, .. } = &msg {
+                if let Some(w) = self.worlds.get_mut(*world_index) {
+                    w.last_activity = Some(Instant::now());
+                }
+            }
             self.send(msg);
         }
         self.take()
@@ -1277,11 +1285,31 @@ impl ClientCore {
             gmcp_user_enabled: m.gmcp_user_enabled,
             echo_masked: m.echo_masked,
             stats: m.stats.clone(),
+            last_activity: [m.last_recv_secs, m.last_send_secs]
+                .into_iter()
+                .flatten()
+                .min()
+                .and_then(|ago| Instant::now().checked_sub(std::time::Duration::from_secs(ago))),
             lines,
             ..World::default()
         };
         rebuild_seen(&mut w, None);
         w
+    }
+
+    /// Up to six worlds other than the one shown, by their last line to or from the MUD,
+    /// newest first, with how long ago (the console's Recent Worlds popup).
+    pub fn recent_worlds(&self, now: Instant) -> Vec<(usize, std::time::Duration)> {
+        let mut list: Vec<(usize, std::time::Duration)> = self
+            .worlds
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.current)
+            .filter_map(|(i, w)| w.last_activity.map(|at| (i, now.saturating_duration_since(at))))
+            .collect();
+        list.sort_by_key(|&(_, ago)| ago);
+        list.truncate(6);
+        list
     }
 
     fn on_initial_state(
@@ -1388,6 +1416,10 @@ impl ClientCore {
             gap_fill = false;
         }
         let mut data = d.data;
+        if d.from_server && !gap_fill {
+            // Output from the MUD now, not a refill of history.
+            self.worlds[d.world_index].last_activity = Some(Instant::now());
+        }
         if d.from_server {
             let held = std::mem::take(&mut self.worlds[d.world_index].partial);
             if !held.is_empty() {

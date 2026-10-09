@@ -3002,3 +3002,11 @@ phase = 0
 status = "waived"
 feature = "handle SpellSuggestions"
 note = "the native GUI's Ctrl+Q uses its own spell checker"
+
+[[item]]
+id = "action:recent_worlds"
+section = "navigation"
+phase = 4
+status = "done"
+feature = "action recent_worlds"
+note = "the Recent Worlds dialog (dialogs/small.rs RecentWorlds; the console's popup)"

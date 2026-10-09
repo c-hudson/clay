@@ -87,7 +87,17 @@ impl ClayView {
             "filter_popup" => self.toggle_filter(window, cx),
             "search_popup" => self.toggle_search(window, cx),
             "toggle_limit" => self.toggle_limit(window, cx),
-            "clear_screen" | "refresh_line" => self.scroll.borrow_mut().follow_bottom(),
+            // TF CLEAR (Esc-^L): "clear screen (can be refilled with scrollback)" - the
+            // %textdiv=clear blank after the newest line, until the world is left.
+            "clear_screen" => {
+                // The world on screen counts as arrived at first, or a late arrival would
+                // take this visit's blank away again.
+                self.follow_world();
+                let after = self.session.core.worlds.get(self.session.core.current).and_then(super::textdiv::last_seq);
+                self.textdiv.visit = Some((after, "clear".into()));
+                self.scroll.borrow_mut().follow_bottom();
+            }
+            "refresh_line" => self.scroll.borrow_mut().follow_bottom(),
             "redraw" | "redraw_server_only" => {
                 let fx = self.session.core.redraw();
                 let rest = self.session.apply(fx);

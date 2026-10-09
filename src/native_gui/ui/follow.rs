@@ -29,6 +29,8 @@ pub struct Link {
     followers: Vec<(WeakEntity<ClayView>, AnyWindowHandle)>,
     /// A follower's: the window whose connection it shares.
     pub leader: Option<WeakEntity<ClayView>>,
+    /// This view's own window (where a `/window` opened from it cascades from).
+    pub own_window: Option<AnyWindowHandle>,
     /// The main window's: the follower that asked last, the request count then, and when.
     reply_to: Option<(WeakEntity<ClayView>, u64, Instant)>,
 }
@@ -171,7 +173,17 @@ impl ClayView {
         let session = Session::follower(&self.session);
         let fonts = self.fonts.clone();
         cx.defer(move |cx| {
-            let how = super::ViewWindow { title: title.into(), size, is_main: false, leader: Some(me.clone()) };
+            // Down and right of this window, a step further for each window already open
+            // from it, rather than centred on the screen exactly over it.
+            let at = me.upgrade().map(|v| {
+                let v = v.read(cx);
+                (v.link.own_window, v.link.followers.iter().filter(|(f, _)| f.upgrade().is_some()).count())
+            });
+            let origin = at.and_then(|(own, open)| {
+                let step = gpui::px(32.0 * ((open % 8) + 1) as f32);
+                own?.update(cx, |_, window, _| window.bounds().origin).ok().map(|o| gpui::point(o.x + step, o.y + step))
+            });
+            let how = super::ViewWindow { title: title.into(), size, is_main: false, leader: Some(me.clone()), origin };
             if let Some(opened) = super::open_view_window(cx, fonts, session, None, mode, how) {
                 let _ = me.update(cx, |v, _| v.link.followers.push(opened));
             }

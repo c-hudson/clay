@@ -668,7 +668,9 @@ impl ClayView {
             let settings = self.session.core.settings.as_ref();
             let rows: Vec<(u64, Arc<StyledLine>)> = match self.textdiv.visit.as_ref().map(|v| v.1.as_str()) {
                 Some("clear") => {
-                    let n = self.scroll.borrow().view_rows.max(1) as u64;
+                    // One more than the whole rows that fit: following the bottom, the view
+                    // also paints the part-row above them, where the last line would show.
+                    let n = self.scroll.borrow().view_rows.max(1) as u64 + 1;
                     (0..n).map(|k| (textdiv::DIVIDER_ID + k, Arc::new(StyledLine::default()))).collect()
                 }
                 _ => {
@@ -980,7 +982,7 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         #[cfg(not(target_os = "windows"))]
         cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         let fonts = fonts::load(cx);
-        let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true, leader: None };
+        let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true, leader: None, origin: None };
         let Some((main, main_window)) = open_view_window(cx, fonts, session, Some(events), viewmode::ViewMode::default(), how) else {
             panic!("open the main window");
         };
@@ -1025,6 +1027,8 @@ pub(super) struct ViewWindow {
     pub is_main: bool,
     /// A `/window` or `--grep` window: the window whose connection it shares.
     pub leader: Option<gpui::WeakEntity<ClayView>>,
+    /// Where its top left goes (`None`: centred on the screen).
+    pub origin: Option<gpui::Point<gpui::Pixels>>,
 }
 
 /// A window of output: the main window, with its connection's reports on `events`, or a
@@ -1038,10 +1042,13 @@ pub(super) fn open_view_window(
     mode: viewmode::ViewMode,
     how: ViewWindow,
 ) -> Option<(gpui::WeakEntity<ClayView>, gpui::AnyWindowHandle)> {
-    let ViewWindow { title, size: (w, h), is_main, leader } = how;
+    let ViewWindow { title, size: (w, h), is_main, leader, origin } = how;
     // A follower's connection is already up (its leader's): only a window with its own starts one.
     let starts = events.is_some();
-    let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+    let bounds = match origin {
+        Some(origin) => Bounds::new(origin, size(px(w), px(h))),
+        None => Bounds::centered(None, size(px(w), px(h)), cx),
+    };
     let mut view = None;
     let window = cx
         .open_window(
@@ -1073,6 +1080,7 @@ pub(super) fn open_view_window(
         )
         .ok()?;
     let main = view?;
+    main.update(cx, |v, _| v.link.own_window = Some(window.into()));
     let weak = main.downgrade();
     // The connection's reports (a follower's come from its leader).
     if let Some(mut events) = events {

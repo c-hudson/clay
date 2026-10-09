@@ -6,6 +6,7 @@
 //! - a dialog's "?" help (`openPopupHelp`)
 //! - a MUD world's changed certificate (`showCertMismatchDialog`)
 //! - /import and its plaintext warning (`showImportDialog`, `showImportInsecureConfirmDialog`)
+//! - Recent Worlds (`showRecentWorldsModal`; the console's recent-worlds popup)
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
@@ -637,6 +638,111 @@ impl Render for ImportInsecure {
                     .child(k.button("import-insecure-cancel", "Cancel", Btn::Plain, Some(Box::new(cx.listener(|this, _, _, cx| this.cancel(cx))))))
                     .child(k.button("import-insecure-go", "Send unencrypted", Btn::Danger, Some(Box::new(cx.listener(|this, _, _, cx| this.go(cx)))))),
             )
+            .into_any_element()
+    }
+}
+
+// ---- Recent Worlds ------------------------------------------------------------------
+
+/// The recent_worlds action (the console's Recent Worlds popup): up to six other worlds by
+/// their last line to or from the MUD, newest first; Enter or a click switches to one.
+pub struct RecentWorlds {
+    main: WeakEntity<ClayView>,
+    focus: FocusHandle,
+    selected: usize,
+}
+
+impl RecentWorlds {
+    pub fn new(main: WeakEntity<ClayView>, cx: &mut Context<Self>) -> Self {
+        Self { main, focus: cx.focus_handle(), selected: 0 }
+    }
+
+    /// (world index, name, how long ago), as the console lists them.
+    fn entries(&self, cx: &App) -> Vec<(usize, String, String)> {
+        let Some(m) = self.main.upgrade() else { return Vec::new() };
+        let core = &m.read(cx).session.core;
+        core.recent_worlds(std::time::Instant::now())
+            .into_iter()
+            .map(|(i, ago)| {
+                let name = crate::util::strip_ansi_codes(&core.worlds[i].name).trim().to_string();
+                (i, name, crate::popup::definitions::connections::format_elapsed(Some(ago.as_secs())))
+            })
+            .collect()
+    }
+
+    fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(m) = self.main.upgrade() {
+            m.update(cx, |m, cx| m.switch_to(index, cx));
+        }
+        cx.emit(DialogEvent::Close);
+    }
+}
+
+impl EventEmitter<DialogEvent> for RecentWorlds {}
+impl Focusable for RecentWorlds {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for RecentWorlds {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(k) = kit(&self.main, cx) else { return div().into_any_element() };
+        let t = k.t.clone();
+        let entries = self.entries(cx);
+        self.selected = self.selected.min(entries.len().saturating_sub(1));
+        let rows: Vec<gpui::AnyElement> = if entries.is_empty() {
+            vec![k.note("No recently active worlds.").into_any_element()]
+        } else {
+            entries
+                .iter()
+                .enumerate()
+                .map(|(n, (i, name, ago))| {
+                    let i = *i;
+                    let selected = n == self.selected;
+                    let hover = t.hover;
+                    let row = div()
+                        .id(("recent-world", n))
+                        .flex()
+                        .justify_between()
+                        .gap(px(24.0))
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .child(div().min_w_0().overflow_hidden().whitespace_nowrap().child(SharedString::from(name.clone())))
+                        .child(div().flex_shrink_0().opacity(0.7).child(SharedString::from(ago.clone())))
+                        .on_click(cx.listener(move |this, _, _w, cx| this.choose(i, cx)));
+                    if selected { row.bg(t.accent).text_color(gpui::black()) } else { row.hover(move |s| s.bg(hover)) }.into_any_element()
+                })
+                .collect()
+        };
+        let indices: Vec<usize> = entries.iter().map(|e| e.0).collect();
+        k.panel("recent-worlds")
+            .track_focus(&self.focus)
+            .min_w(px(300.0))
+            .max_w(px(420.0))
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _w, cx| {
+                match ev.keystroke.key.as_str() {
+                    "escape" => cx.emit(DialogEvent::Close),
+                    "up" | "down" => {
+                        let by = if ev.keystroke.key == "up" { -1 } else { 1 };
+                        if let Some(at) = crate::native_gui::ui::kit::list_step(Some(this.selected), indices.len(), by) {
+                            this.selected = at;
+                        }
+                        cx.notify();
+                    }
+                    "enter" => match indices.get(this.selected) {
+                        Some(&i) => this.choose(i, cx),
+                        None => cx.emit(DialogEvent::Close),
+                    },
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
+            .child(k.header("recent-worlds-close", "Recent Worlds", cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Close))))
+            .child(div().flex().flex_col().gap(px(2.0)).py(px(4.0)).children(rows))
+            .child(k.note("↑↓ select, Enter switch, Esc close"))
             .into_any_element()
     }
 }

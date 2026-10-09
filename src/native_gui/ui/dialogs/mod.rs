@@ -36,6 +36,7 @@ pub enum Kind {
     /// The MUD's simpleedit text, over the whole window.
     McpEdit,
     AddTheme,
+    RecentWorlds,
 }
 
 struct Open {

@@ -868,3 +868,25 @@ fn a_line_without_a_seq_is_never_guessed() {
     let unnumbered = h.core.worlds[1].lines.iter().find(|l| l.text.starts_with("unnumbered")).expect("the line");
     assert_ne!(unnumbered.display_id, Some(me));
 }
+
+#[test]
+fn recent_worlds_are_the_others_by_their_last_line_newest_first() {
+    let mut h = H::password();
+    let mut a = world_msg(0, "A", 0..1, 9);
+    let mut b = world_msg(1, "B", 0..1, 9);
+    let mut c = world_msg(2, "C", 0..1, 9);
+    let d = world_msg(3, "D", 0..1, 9);
+    a.last_recv_secs = Some(5);
+    b.last_recv_secs = Some(600);
+    b.last_send_secs = Some(30); // the newer of the two counts
+    c.last_recv_secs = Some(120);
+    h.connect_and_login().initial(vec![a, b, c, d]);
+    // A is shown, D has never had a line.
+    let order: Vec<usize> = h.core.recent_worlds(Instant::now()).into_iter().map(|(i, _)| i).collect();
+    assert_eq!(order, vec![1, 2]);
+    // Output arriving moves a world to the front; so does sending to it.
+    h.msg(data(2, 1, "news\n"));
+    assert_eq!(h.core.recent_worlds(Instant::now())[0].0, 2);
+    let _ = h.core.send_message(WsMessage::SendCommand { world_index: 3, command: "hi".into() });
+    assert_eq!(h.core.recent_worlds(Instant::now())[0].0, 3);
+}
