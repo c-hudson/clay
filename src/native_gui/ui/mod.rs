@@ -4,16 +4,19 @@ mod actions;
 pub mod assets;
 mod bars;
 mod chrome;
+mod dialogs;
 pub mod emoji;
 mod find;
 pub mod fonts;
 pub mod ink;
 mod input_view;
 mod keymap;
+mod kit;
 mod native_spell;
 mod more;
 pub mod output;
 mod select;
+mod surfaces;
 mod textdiv;
 mod theme_bridge;
 #[cfg(feature = "native-gui-snapshot")]
@@ -117,6 +120,8 @@ pub struct ClayView {
     bridged_theme: String,
     /// The disk cache (the real window only).
     cache: Option<CacheSaver>,
+    /// Dialogs, and what they wait on.
+    surf: surfaces::Surfaces,
 }
 
 impl ClayView {
@@ -181,6 +186,7 @@ impl ClayView {
             input_height_seen: 0,
             bridged_theme: String::new(),
             cache: None,
+            surf: Default::default(),
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -204,6 +210,7 @@ impl ClayView {
                         }
                         changed = true;
                     }
+                    ref m if self.surface_message(m, cx) => {}
                     crate::websocket::WsMessage::ExecuteLocalCommand { command } => local.push(command),
                     // The server puts text in the input (TF's /input and the like).
                     crate::websocket::WsMessage::SetInputBuffer { text, cursor_start } => {
@@ -222,6 +229,7 @@ impl ClayView {
         for command in local {
             self.local_command(&command, cx);
         }
+        self.watch_status(cx);
         if changed {
             self.apply_settings();
             if self.bridged_theme != self.theme_json {
@@ -704,6 +712,7 @@ impl Render for ClayView {
                 crate::debug_log(true, &format!("native-gui: first frame {} ms after start", at.elapsed().as_millis()));
             }
         }
+        self.run_later(window, cx);
         self.report_view(window);
         let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
         if need_login && !self.login_focused {
@@ -829,6 +838,7 @@ impl Render for ClayView {
             .children(context_menu)
             .children(input_menu)
             .children(debug_dialog)
+            .children(self.surf.stack.render())
     }
 }
 

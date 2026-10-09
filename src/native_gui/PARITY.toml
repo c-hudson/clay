@@ -45,7 +45,7 @@ note = "core/client.rs on_auth_response"
 id = "msg:BanListResponse"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle BanListResponse"
 note = ""
 
@@ -61,7 +61,7 @@ note = "switches locally (core)"
 id = "msg:CertMismatch"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle CertMismatch"
 note = "a MUD world certificate changed (server-side TLS), not this connection"
 
@@ -85,7 +85,7 @@ note = "core on_claimed"
 id = "msg:ConnectionsListResponse"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle ConnectionsListResponse"
 note = ""
 
@@ -133,7 +133,7 @@ note = "[g] after the world name"
 id = "msg:ImportNeedsInsecureConfirm"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle ImportNeedsInsecureConfirm"
 note = ""
 
@@ -141,7 +141,7 @@ note = ""
 id = "msg:ImportResult"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle ImportResult"
 note = ""
 
@@ -245,7 +245,7 @@ note = "only the reply to CycleWorld, which this client never sends (it asks Cal
 id = "msg:PasswordChanged"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle PasswordChanged"
 note = ""
 
@@ -405,7 +405,7 @@ note = "colours applied live (GlobalSettingsUpdated follows with the same)"
 id = "msg:UnbanResult"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle UnbanResult"
 note = ""
 
@@ -1037,7 +1037,7 @@ note = "ui/actions.rs"
 id = "action:show_version"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "action show_version"
 note = ""
 
@@ -1047,7 +1047,7 @@ section = "input"
 phase = 3
 status = "done"
 feature = "action spell_check"
-note = "a no-op, as in app.js (suggestions are on the right-click menu)"
+note = "^Q: the suggestions for a misspelled word at the cursor, in the input menu at the caret (the console cycles them in; the web does nothing, B25)"
 
 [[item]]
 id = "action:suspend"
@@ -1293,9 +1293,9 @@ note = "sent by the web client; its dialog arrives in phase 4"
 id = "wire:ChangePassword"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ChangePassword"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "sent by its dialog (ui/dialogs/small.rs)"
 
 [[item]]
 id = "wire:PasswordChanged"
@@ -1597,9 +1597,9 @@ note = "handled: see msg:EchoMaskChanged"
 id = "wire:ToggleWorldGmcp"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ToggleWorldGmcp"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "sent by the toggle_gmcp_media action (ui/actions.rs)"
 
 [[item]]
 id = "wire:SendGmcp"
@@ -1661,9 +1661,9 @@ note = "handled: see msg:CertMismatch"
 id = "wire:TrustCertificate"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire TrustCertificate"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "sent by its dialog (ui/dialogs/small.rs)"
 
 [[item]]
 id = "wire:DisconnectWorld"
@@ -1821,9 +1821,9 @@ note = "sent by the web client; its dialog arrives in phase 4"
 id = "wire:BanListRequest"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "waived"
 feature = "wire BanListRequest"
-note = ""
+note = "app.js never sends it: /ban and /unban go as commands"
 
 [[item]]
 id = "wire:BanListResponse"
@@ -1837,9 +1837,9 @@ note = "handled: see msg:BanListResponse"
 id = "wire:UnbanRequest"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "waived"
 feature = "wire UnbanRequest"
-note = ""
+note = "app.js never sends it: /ban and /unban go as commands"
 
 [[item]]
 id = "wire:UnbanResult"
@@ -1885,9 +1885,9 @@ note = "handled: see msg:CalculatedWorld"
 id = "wire:RequestConnectionsList"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire RequestConnectionsList"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "sent for /connections and /l"
 
 [[item]]
 id = "wire:ConnectionsListResponse"
@@ -1997,9 +1997,9 @@ note = "handled: see msg:WorldSwitchResult"
 id = "wire:ImportSettings"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ImportSettings"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "sent by its dialog (ui/dialogs/small.rs)"
 
 [[item]]
 id = "wire:ImportNeedsInsecureConfirm"
@@ -2021,17 +2021,17 @@ note = "handled: see msg:ImportResult"
 id = "wire:RequestSettingsExport"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "waived"
 feature = "wire RequestSettingsExport"
-note = ""
+note = "between two Clay servers during an import; no client sends or reads it"
 
 [[item]]
 id = "wire:SettingsExport"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "waived"
 feature = "wire SettingsExport"
-note = ""
+note = "between two Clay servers during an import; no client sends or reads it"
 
 [[item]]
 id = "wire:RequestThemeEditorState"
@@ -2730,3 +2730,59 @@ phase = 2
 status = "done"
 feature = "5k-line scroll at 60 fps, 200 lines/s incoming, idle CPU near 0, RSS, cold start measured"
 note = "release builds. Frame cost (offscreen, 5k lines): scroll 1.5 ms mean / 2.0 worst; 200 lines/s at 60 fps 8.8% of a core. Real windows, idle 60 s, corpus page (WebView GUI in brackets): Linux 0.26% (0.41%), 191 MB (439 MB); macOS 11 0.01% (0.15%), 31 MB (128 MB); Windows VM 0.69% (0.42%, GPUI's per-vsync repaint), 52 MB (367 MB). First frame: 186 ms Linux, 185 ms Windows, 791 ms macOS (runtime Metal shader compile)"
+
+[[item]]
+id = "ui:dialog.connection_log"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the connection log: each attempt with its result and why, shown while attaching to another machine and after 5 failures; Retry, Settings"
+note = "app.js showConnectionLog"
+
+[[item]]
+id = "ui:dialog.reconnect"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "Connection Lost: a command typed while offline is held; Reconnect retries now and sends it to its world (by name) after the next InitialState"
+note = "app.js showReconnectModal"
+
+[[item]]
+id = "ui:dialog.password"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "Change Password (multiuser): three masked fields, the web's checks; PasswordChanged closes it or shows the error"
+note = "app.js showPasswordModal"
+
+[[item]]
+id = "ui:dialog.menu"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "/menu: the seven menuItems, arrows wrap, Enter runs, ? help (B22: the web's markup maps clicks wrongly)"
+note = "app.js openMenuPopup"
+
+[[item]]
+id = "ui:dialog.popup_help"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "a dialog's ? help, read from app.js popupHelpTexts, stacked over its dialog"
+note = "app.js openPopupHelp"
+
+[[item]]
+id = "ui:dialog.cert_mismatch"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "a MUD world's changed TLS certificate: old and new fingerprints; Trust sends TrustCertificate"
+note = "app.js showCertMismatchDialog"
+
+[[item]]
+id = "ui:dialog.import"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "/import and the menu's Import Settings: host, password, auth key; a plaintext confirm before resending without TLS"
+note = "app.js showImportDialog"

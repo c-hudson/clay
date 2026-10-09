@@ -435,7 +435,7 @@ impl ClayView {
 
         // The notes icon, when this world has notes.
         if world.and_then(|w| w.settings.as_ref()).is_some_and(|s| s.has_notes) {
-            row = row.child(self.icon_button("status-note", "note", "Notes", cx).on_click(cx.listener(|this, _, _w, _cx| this.open_surface("notes"))));
+            row = row.child(self.icon_button("status-note", "note", "Notes", cx).on_click(cx.listener(|this, _, w, cx| this.open_surface("notes", w, cx))));
         }
 
         row = row.child(self.font_slider(cx));
@@ -642,14 +642,9 @@ impl ClayView {
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
             }
-            other => self.open_surface(other),
+            other => self.open_surface(other, window, cx),
         }
         cx.notify();
-    }
-
-    /// A window or dialog the native GUI doesn't have yet.
-    pub(super) fn open_surface(&mut self, name: &str) {
-        crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: {name} is not available yet"));
     }
 
     /// Show world `index` (a menu, a tab).

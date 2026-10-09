@@ -95,7 +95,7 @@ impl Target {
         format!("{}:{}", self.host_for_url(), self.port)
     }
 
-    fn url(&self, web_path: &str) -> String {
+    pub fn url(&self, web_path: &str) -> String {
         let path = if web_path.is_empty() { "/ws".to_string() } else { format!("/{web_path}/ws") };
         format!("{}://{}:{}{}", if self.secure { "wss" } else { "ws" }, self.host_for_url(), self.port, path)
     }

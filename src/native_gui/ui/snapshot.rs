@@ -147,6 +147,35 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     .expect("type");
                     Vec::new()
                 }
+                // Keys typed into whatever has the focus (a dialog's fields), one at a time,
+                // as a keyboard without an input method sends them.
+                "text" => {
+                    for ch in arg.chars() {
+                        let name = if ch == ' ' { "space".to_string() } else { ch.to_string() };
+                        let keystroke = gpui::Keystroke::parse(&name).unwrap_or_else(|e| fail(&format!("bad key {ch}: {e}")));
+                        cx.update_window(window.into(), |_, w, app| {
+                            w.dispatch_keystroke(keystroke, app);
+                        })
+                        .expect("type a key");
+                        cx.run_until_parked();
+                        cx.update_window(window.into(), |_, w, app| {
+                            let _ = w.draw(app);
+                        })
+                        .expect("draw after a key");
+                    }
+                    Vec::new()
+                }
+                // A dialog by name (surfaces.rs `snapshot_open`).
+                "open" => {
+                    let what = arg.to_string();
+                    cx.update_window(window.into(), |_, w, app| view.update(app, |v, cx| v.snapshot_open(&what, w, cx))).expect("open");
+                    cx.run_until_parked();
+                    cx.update_window(window.into(), |_, w, app| {
+                        let _ = w.draw(app);
+                    })
+                    .expect("draw after open");
+                    Vec::new()
+                }
                 "sleep" => {
                     std::thread::sleep(Duration::from_millis(nums.first().copied().unwrap_or(0.0) as u64));
                     Vec::new()

@@ -352,6 +352,14 @@ impl ClayView {
         self.input.misspelled = found;
     }
 
+    /// Whether the checker in use knows `word` (with none, every word is fine).
+    fn word_is_valid(&self, word: &str) -> bool {
+        if let Some(n) = &self.input.native {
+            return n.is_valid(word);
+        }
+        self.speller().is_none_or(|sp| sp.is_valid(word))
+    }
+
     /// What a misspelled word might have been, from whichever checker is in use.
     fn suggest(&self, word: &str) -> Option<Vec<String>> {
         if let Some(n) = &self.input.native {
@@ -426,6 +434,27 @@ impl ClayView {
         }
         self.input.dragging = true;
         self.input_touched(cx);
+    }
+
+    /// ^Q (`spell_check`): a misspelled word at the cursor gets its suggestions, in the
+    /// input's menu at the caret. The console prints them and cycles them in; the web's
+    /// ^Q does nothing (B25). A word spelled right, or with none, does nothing either.
+    pub(super) fn spell_suggest(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.editor.cursor;
+        let Some(w) = crate::native_gui::core::spell::word_at(&self.editor.text, at) else { return };
+        let word = self.editor.text[w.clone()].to_string();
+        if self.word_is_valid(&word) {
+            return;
+        }
+        let Some(list) = self.suggest(&word).filter(|l| !l.is_empty()) else { return };
+        let layout = self.input.layout.borrow();
+        let Some(row) = layout.row_of(at) else { return };
+        let x = layout.x_of(at).unwrap_or(f32::from(layout.bounds.origin.x));
+        let y = layout.rows[row].top + layout.row_h;
+        drop(layout);
+        self.input.menu = Some((point(px(x), px(y)), Some((w, list))));
+        self.select.menu = None;
+        cx.notify();
     }
 
     /// Right-click in the input: Cut, Copy, Paste, Select All, and for a misspelled word
@@ -554,11 +583,26 @@ impl ClayView {
 impl ClayView {
     /// Enter: send what's typed (app.js `sendCommand`).
     pub(super) fn send_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = window;
+        // /import collects its password here, never sending it as a command line
+        // (app.js sendCommand).
+        let trimmed = self.editor.text.trim().to_string();
+        if trimmed == "/import" || trimmed.starts_with("/import ") {
+            let args: Vec<&str> = trimmed[7..].split_whitespace().collect();
+            let addr = match args.as_slice() {
+                [host, port, ..] => format!("{host}:{port}"),
+                [host] => host.to_string(),
+                [] => String::new(),
+            };
+            self.editor.remember(&trimmed, false);
+            self.editor.clear();
+            self.open_import(&addr, window, cx);
+            return;
+        }
         if !self.session.core.is_online() {
-            let fx = self.session.core.client_line("% Not connected to the Clay server.");
-            let rest = self.session.apply(fx);
-            self.after(rest, cx);
+            let command = self.editor.text.clone();
+            self.editor.remember(&command, false);
+            self.editor.clear();
+            self.connection_lost(command, window, cx);
             return;
         }
         // Following the output: held lines come out and more-mode counts afresh. Scrolled
@@ -639,8 +683,12 @@ impl ClayView {
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
             }
+            "/menu" => self.later(|v, window, cx| v.open_surface("menu", window, cx), cx),
+            "/connections" | "/l" => {
+                let fx = self.session.send(crate::websocket::WsMessage::RequestConnectionsList);
+                self.after(fx, cx);
+            }
             _ => {
-                self.open_surface(&first);
                 let fx = self.session.core.client_line(&format!("% {first} opens a window the native GUI doesn't have yet."));
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);

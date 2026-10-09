@@ -223,6 +223,8 @@ enum Phase {
 }
 
 pub struct ClientCore {
+    /// How many `InitialState`s have come (a new one means the worlds were sent afresh).
+    pub initial_states: u64,
     creds: Credentials,
     client_uid: String,
     client_version: String,
@@ -278,6 +280,7 @@ pub struct ClientCore {
 impl ClientCore {
     pub fn new(creds: Credentials, client_uid: String, now: Instant) -> Self {
         ClientCore {
+            initial_states: 0,
             creds,
             client_uid,
             client_version: crate::VERSION.to_string(),
@@ -480,6 +483,17 @@ impl ClientCore {
                 self.restarting = true;
                 self.out.push(Effect::Disconnect);
             }
+        }
+        self.take()
+    }
+
+    /// Try again now rather than wait out the countdown (app.js `forceReconnect`: the
+    /// connection log's Retry, Connection Lost's Reconnect).
+    pub fn reconnect_now(&mut self) -> Vec<Effect> {
+        if self.phase == Phase::Closed && matches!(self.status, Status::Reconnecting { .. } | Status::Stopped(_)) {
+            self.held = false;
+            self.connect();
+            self.changed();
         }
         self.take()
     }
@@ -821,6 +835,7 @@ impl ClientCore {
                 self.changed();
             }
             WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, .. } => {
+                self.initial_states += 1;
                 self.actions = actions;
                 self.splash_lines = splash_lines;
                 self.on_initial_state(worlds, settings, current_world_index, your_display_id, now);

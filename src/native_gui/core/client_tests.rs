@@ -702,3 +702,27 @@ fn the_server_can_fill_the_input_and_change_the_keys() {
     h.msg(WsMessage::KeybindingsUpdated { bindings_json: r#"{"F3":"redraw"}"#.into() });
     assert_eq!(h.core.settings.as_ref().unwrap().keybindings_json, r#"{"F3":"redraw"}"#);
 }
+
+#[test]
+fn reconnect_now_skips_the_countdown_and_only_when_closed() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 1)]);
+    assert_eq!(h.core.initial_states, 1);
+    // Online: nothing to do.
+    let e = h.core.reconnect_now();
+    assert!(!e.iter().any(|e| matches!(e, Effect::Connect)));
+    h.input(Input::Closed("network".into()));
+    h.drain();
+    // Counting down: connects at once, not after the backoff.
+    let e = h.core.reconnect_now();
+    assert!(e.iter().any(|e| matches!(e, Effect::Connect)));
+    assert!(matches!(h.core.status(), Status::Connecting { .. }));
+    // Already connecting: not again.
+    let e = h.core.reconnect_now();
+    assert!(!e.iter().any(|e| matches!(e, Effect::Connect)));
+    h.input(Input::Opened);
+    h.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: "c2".into() });
+    h.msg(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false });
+    h.initial(vec![world_msg(0, "A", 0..2, 1)]);
+    assert_eq!(h.core.initial_states, 2, "a held command waits for this");
+}

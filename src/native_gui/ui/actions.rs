@@ -132,7 +132,7 @@ impl ClayView {
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
             }
-            "help" | "emoji_picker" | "spell_check" | "recent_worlds" => self.open_surface(action),
+            "help" | "emoji_picker" | "spell_check" | "recent_worlds" => self.open_surface(action, window, cx),
             a if self.edit_action(a, cx) => {}
             "kbnum_negative" => {
                 self.kbnum = None;

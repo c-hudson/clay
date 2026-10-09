@@ -40,6 +40,12 @@ impl Session {
         (Session { core, target, transport }, rx)
     }
 
+    /// The address the next connection goes to (`wss://host:port/clay/ws`).
+    pub fn url(&self) -> String {
+        let web_path = self.transport.web_path.lock().map(|p| p.clone()).unwrap_or_default();
+        self.target.url(self.target.path.as_deref().unwrap_or(&web_path))
+    }
+
     /// Carry out the effects that are ours; return the rest (`Changed`, `Event`).
     pub fn apply(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
         let mut rest = Vec::new();
