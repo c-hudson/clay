@@ -45,6 +45,9 @@ use output::{OutputSnapshot, ScrollHandle, hsla, output_view};
 /// `web_font_size_desktop`'s default.
 const DEFAULT_FONT_SIZE: f32 = 18.0;
 
+/// When `ui::run` began, for the first frame's startup time in the debug log.
+static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 /// When to write the world cache.
 #[derive(Default)]
 struct CacheSaver {
@@ -594,6 +597,12 @@ impl Focusable for ClayView {
 
 impl Render for ClayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(at) = STARTED.get() {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::debug_log(true, &format!("native-gui: first frame {} ms after start", at.elapsed().as_millis()));
+            }
+        }
         self.report_view(window);
         let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
         if need_login && !self.login_focused {
@@ -714,6 +723,7 @@ impl Render for ClayView {
 
 /// Open the main window and run the session in it.
 pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
+    let _ = STARTED.set(Instant::now());
     gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         // The web client's output is `-webkit-font-smoothing: antialiased`, which WebKit
