@@ -196,6 +196,24 @@ impl Kit {
             .on_click(on_click)
     }
 
+    /// `.toggle`: a 32x18 switch, the knob right and the track cyan when on.
+    pub fn toggle(&self, id: impl Into<ElementId>, on: bool, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
+        let (track, border, knob) = if on { (hsla(PRIMARY), hsla(PRIMARY), hsla(ON_PRIMARY)) } else { (self.field_bg, self.t.border_subtle, self.t.muted) };
+        div()
+            .id(id)
+            .w(px(32.0))
+            .h(px(18.0))
+            .flex_shrink_0()
+            .relative()
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(border)
+            .bg(track)
+            .cursor_pointer()
+            .child(div().absolute().top(px(2.0)).left(px(if on { 16.0 } else { 2.0 })).size(px(12.0)).rounded_full().bg(knob))
+            .on_click(on_click)
+    }
+
     /// A labelled text field: the label above, the field across the box.
     pub fn field(&self, label: impl Into<SharedString>, input: &Entity<InputState>) -> Div {
         div().flex().flex_col().gap(px(4.0)).child(div().text_color(self.t.fg2).child(label.into())).child(self.input(input))

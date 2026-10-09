@@ -239,6 +239,7 @@ impl ClayView {
             if std::mem::take(&mut self.surf.actions_changed) {
                 cx.emit(windows::MainEvent::Actions);
             }
+            self.watch_worlds(cx);
             if self.bridged_theme != self.theme_json {
                 theme_bridge::apply(&self.theme, &self.fonts, cx);
                 self.bridged_theme = self.theme_json.clone();

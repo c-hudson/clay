@@ -6,6 +6,7 @@
 
 pub mod actions;
 pub mod help;
+pub mod worlds;
 
 use std::collections::HashMap;
 
@@ -45,6 +46,8 @@ pub enum MainEvent {
     Restyled,
     /// The actions changed.
     Actions,
+    /// What the Worlds window shows changed.
+    Worlds,
 }
 
 impl EventEmitter<MainEvent> for ClayView {}
@@ -110,6 +113,11 @@ impl Windows {
 
     #[cfg(feature = "native-gui-snapshot")]
     pub fn handle(&self, kind: Kind) -> Option<gpui::AnyWindowHandle> {
+        self.handle_of(kind)
+    }
+
+    /// The window of `kind`, to act in it.
+    pub fn handle_of(&self, kind: Kind) -> Option<gpui::AnyWindowHandle> {
         self.open.get(&kind).map(|h| (*h).into())
     }
 }

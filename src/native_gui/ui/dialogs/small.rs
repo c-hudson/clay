@@ -390,11 +390,13 @@ pub struct Confirm {
     focus: FocusHandle,
     text: String,
     yes: OnYes,
+    /// Y or Enter for Yes, N for No (the world confirm's keys; the action one has only Esc).
+    pub yn_keys: bool,
 }
 
 impl Confirm {
     pub fn new(main: WeakEntity<ClayView>, text: String, yes: OnYes, cx: &mut Context<Self>) -> Self {
-        Self { main, focus: cx.focus_handle(), text, yes }
+        Self { main, focus: cx.focus_handle(), text, yes, yn_keys: false }
     }
 }
 
@@ -411,7 +413,18 @@ impl Render for Confirm {
         k.panel("confirm")
             .track_focus(&self.focus)
             .max_w(px(420.0))
-            .on_key_down(cx.listener(keys::<Self>(None)))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                let key = ev.keystroke.key.as_str();
+                let yes = this.yn_keys && (key == "enter" || key.eq_ignore_ascii_case("y"));
+                let no = key == "escape" || (this.yn_keys && key.eq_ignore_ascii_case("n"));
+                if yes {
+                    (this.yes)(window, cx);
+                }
+                if yes || no {
+                    cx.emit(DialogEvent::Close);
+                    cx.stop_propagation();
+                }
+            }))
             .child(k.text(self.text.clone()))
             .child(
                 k.buttons()

@@ -140,15 +140,20 @@ pub fn open_help<H: Host>(host: &mut H, main: gpui::WeakEntity<super::ClayView>,
     open(host, Kind::Help, v, window, cx);
 }
 
-/// Ask a yes/no question; `yes` runs on Yes.
+/// Ask a yes/no question; `yes` runs on Yes. `yn_keys`: Y and Enter answer Yes, N No.
 pub fn confirm<H: Host>(
     host: &mut H,
     main: gpui::WeakEntity<super::ClayView>,
     text: String,
+    yn_keys: bool,
     yes: impl Fn(&mut Window, &mut gpui::App) + 'static,
     window: &mut Window,
     cx: &mut Context<H>,
 ) {
-    let v = cx.new(|cx| small::Confirm::new(main, text, Box::new(yes), cx));
+    let v = cx.new(|cx| {
+        let mut c = small::Confirm::new(main, text, Box::new(yes), cx);
+        c.yn_keys = yn_keys;
+        c
+    });
     open(host, Kind::Confirm, v, window, cx);
 }

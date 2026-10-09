@@ -69,9 +69,9 @@ note = "a MUD world certificate changed (server-side TLS), not this connection"
 id = "msg:ChatLookupResult"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle ChatLookupResult"
-note = ""
+note = "fills the world editor's Fetch picker"
 
 [[item]]
 id = "msg:ClaimedNew"
@@ -445,9 +445,9 @@ note = "core"
 id = "msg:WorldCreated"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle WorldCreated"
-note = ""
+note = "opens the new world's editor in the Worlds window"
 
 [[item]]
 id = "msg:WorldDisconnected"
@@ -477,9 +477,9 @@ note = "core"
 id = "msg:WorldSettingsUpdated"
 section = "dialogs"
 phase = 4
-status = "todo"
+status = "done"
 feature = "handle WorldSettingsUpdated"
-note = ""
+note = "the core keeps it; the Worlds window redraws (MainEvent::Worlds)"
 
 [[item]]
 id = "msg:WorldStateResponse"
@@ -1645,9 +1645,9 @@ note = "not used by the web GUI (console/server only)"
 id = "wire:ConnectWorld"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ConnectWorld"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "the Worlds window's Connect"
 
 [[item]]
 id = "wire:CertMismatch"
@@ -1677,17 +1677,17 @@ note = "not used by the web GUI (console/server only)"
 id = "wire:DeleteWorld"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire DeleteWorld"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "the world editor's Delete, after asking"
 
 [[item]]
 id = "wire:CreateWorld"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire CreateWorld"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "the selector's Add and /worlds -e <new name>"
 
 [[item]]
 id = "wire:ReleasePending"
@@ -1757,17 +1757,17 @@ note = "handled: see msg:WorldStateResponse"
 id = "wire:UpdateWorldSettings"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire UpdateWorldSettings"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "the world editor's Save (chat fields authoritative, as app.js)"
 
 [[item]]
 id = "wire:ChatLookup"
 section = "wire"
 phase = 4
-status = "todo"
+status = "done"
 feature = "wire ChatLookup"
-note = "sent by the web client; its dialog arrives in phase 4"
+note = "the world editor's Fetch"
 
 [[item]]
 id = "wire:ChatLookupResult"
@@ -2834,3 +2834,27 @@ phase = 4
 status = "done"
 feature = "Delete action 'x'? Yes/No (from the list or the editor)"
 note = "app.js openActionsConfirmPopup"
+
+[[item]]
+id = "ui:window.worlds"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Worlds window: filter (name, host, user), state dots, current world, Connected-only toggle, arrows wrap, wheel steps, Enter or double-click connects the main window, Add/Edit/Close/Connect, ? help"
+note = "app.js openWorldSelectorPopup"
+
+[[item]]
+id = "ui:dialog.world_editor"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the world editor: Server/Login(Channels)/Options sections with a side bar (both columns from 900x640), rows gated by type, toggles, selects, Fetch picker, Save/Connect, Delete asks"
+note = "app.js openWorldEditorPopup"
+
+[[item]]
+id = "ui:dialog.world_confirm"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "Delete world 'x'? (Y/Enter yes, N/Esc no; never the last world)"
+note = "app.js deleteWorldFromEditor"

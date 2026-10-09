@@ -123,7 +123,7 @@ impl Tokens {
 }
 
 /// app.js `isWorldReconnecting`: off, but auto-reconnect is set and it was connected.
-fn reconnecting(w: &World) -> bool {
+pub(super) fn reconnecting(w: &World) -> bool {
     !w.connected && w.was_connected && w.settings.as_ref().is_some_and(|s| auto_reconnect_secs(&s.auto_reconnect_secs) > 0)
 }
 

@@ -684,6 +684,11 @@ impl ClayView {
                 self.after(rest, cx);
             }
             "/menu" => self.later(|v, window, cx| v.open_surface("menu", window, cx), cx),
+            "/help" => self.later(|v, window, cx| v.open_surface("help", window, cx), cx),
+            "/worlds" | "/world" => {
+                let args: Vec<&str> = command.split_whitespace().skip(1).collect();
+                self.worlds_command(&args, cx);
+            }
             "/actions" => {
                 let world = command.split_whitespace().nth(1).map(str::to_string);
                 self.open_actions(world, cx);

@@ -210,10 +210,10 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                 })
                 .expect("dispatch an event");
                 cx.run_until_parked();
-                cx.update_window(target, |_, window, app| {
+                // A click can close the window it was in (Close, Ok): that's fine.
+                let _ = cx.update_window(target, |_, window, app| {
                     let _ = window.draw(app);
-                })
-                .expect("draw after an event");
+                });
             }
         }
         if let Some(text) = cx.update(|app| app.read_from_clipboard()).and_then(|c| c.text()) {

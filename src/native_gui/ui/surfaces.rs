@@ -46,6 +46,8 @@ pub struct Surfaces {
     pub pending_import: Option<ImportCreds>,
     /// The actions changed since the windows were last told.
     pub actions_changed: bool,
+    /// What the Worlds window shows, hashed: when it changes, the windows are told.
+    worlds_sig: u64,
 }
 
 impl Host for ClayView {
@@ -137,6 +139,7 @@ impl ClayView {
                 dialogs::open(self, Kind::Emoji, v, window, cx);
             }
             "actions" => self.open_actions(None, cx),
+            "world-selector" => self.open_worlds(super::windows::worlds::Show::Selector, cx),
             "help" => self.open_window(super::windows::Kind::Help, |main, _w, cx| cx.new(|cx| super::windows::help::HelpView::new(main, cx)), |_, _, _| {}, cx),
             // Until the native editors (phase 4h-4j): the server's own pages, in the browser.
             "theme-editor" | "keybind-editor" | "action-editor" => cx.open_url(&self.server_page(name)),
@@ -154,6 +157,45 @@ impl ClayView {
             move |view, window, cx| view.update(cx, |v, cx| v.set_world(again, window, cx)),
             cx,
         );
+    }
+
+    /// The Worlds window: the selector, or a world's editor.
+    pub(super) fn open_worlds(&mut self, show: super::windows::worlds::Show, cx: &mut Context<Self>) {
+        use super::windows::{Kind as Win, worlds::WorldsView};
+        let again = show.clone();
+        self.open_window(
+            Win::Worlds,
+            move |main, window, cx| cx.new(|cx| WorldsView::new(main, show, window, cx)),
+            move |view, window, cx| view.update(cx, |v, cx| v.show(again, window, cx)),
+            cx,
+        );
+    }
+
+    /// `/worlds` and `/world` sent back by the server (app.js `executeLocalCommand`):
+    /// none opens the selector, `-e [name]` an editor (creating the world if it's new),
+    /// a name (or `-l name`) switches to that world, which the server has connected.
+    pub(super) fn worlds_command(&mut self, args: &[&str], cx: &mut Context<Self>) {
+        use super::windows::worlds::Show;
+        let find = |v: &Self, name: &str| v.session.core.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name));
+        match args {
+            [] => self.open_worlds(Show::Selector, cx),
+            ["-e"] => {
+                let current = self.session.core.current;
+                self.open_worlds(Show::Edit(current), cx);
+            }
+            ["-e", name @ ..] => {
+                let name = name.join(" ");
+                match find(self, &name) {
+                    Some(i) => self.open_worlds(Show::Edit(i), cx),
+                    None => self.send_message(WsMessage::CreateWorld { name }, cx),
+                }
+            }
+            ["-l", name @ ..] | name @ [..] => {
+                if let Some(i) = find(self, &name.join(" ")) {
+                    self.switch_to(i, cx);
+                }
+            }
+        }
     }
 
     pub(super) fn open_import(&mut self, prefill: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -251,11 +293,46 @@ impl ClayView {
                     self.client_line(line, cx);
                 }
             }
+            // A world this client asked for: its editor (app.js opens it the same way).
+            WsMessage::WorldCreated { world_index } => self.open_worlds(super::windows::worlds::Show::Edit(*world_index), cx),
+            // A Fetch's answer, for the world editor that asked.
+            WsMessage::ChatLookupResult { request_id, result, .. } => {
+                if let Some(frame) = self.windows.frame(super::windows::Kind::Worlds) {
+                    if let Some(view) = frame.read(cx).content::<super::windows::worlds::WorldsView>() {
+                        let (id, r) = (*request_id, result.clone());
+                        let handle = self.windows.handle_of(super::windows::Kind::Worlds);
+                        cx.defer(move |cx| {
+                            if let Some(h) = handle {
+                                let _ = h.update(cx, |_, window, cx| view.update(cx, |v, cx| v.chat_result(id, &r, window, cx)));
+                            }
+                        });
+                    }
+                }
+            }
             // Their text already came as output; the web does nothing more with them.
             WsMessage::BanListResponse { .. } | WsMessage::UnbanResult { .. } => {}
             _ => return false,
         }
         true
+    }
+
+    /// Tell the other windows when what the Worlds window shows has changed (names,
+    /// states, addresses, which is current) - not on every line of output.
+    pub(super) fn watch_worlds(&mut self, cx: &mut Context<Self>) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.session.core.current.hash(&mut h);
+        for w in &self.session.core.worlds {
+            (&w.name, w.connected, w.was_connected).hash(&mut h);
+            if let Some(s) = &w.settings {
+                (&s.hostname, &s.port, &s.user, &s.world_type, &s.auto_reconnect_secs).hash(&mut h);
+            }
+        }
+        let sig = h.finish();
+        if sig != self.surf.worlds_sig {
+            self.surf.worlds_sig = sig;
+            cx.emit(super::windows::MainEvent::Worlds);
+        }
     }
 
     /// Follow the connection: the log's rows, when it shows, and a held command.

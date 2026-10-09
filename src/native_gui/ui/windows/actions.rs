@@ -258,6 +258,7 @@ impl ActionsView {
             self,
             main,
             format!("Delete action '{name}'?"),
+            false,
             move |window, cx| {
                 let _ = me.update(cx, |this, cx| {
                     let mut actions = this.actions(cx);
