@@ -84,6 +84,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
     app.tf_event_tx = Some(event_tx.clone());
+    // Shell worlds (src/shell) report back on this channel, and `spawn_shell_connect`
+    // reads it off the App rather than being handed it.
+    app.event_tx = Some(event_tx.clone());
     // TF's SIGTERM/SIGHUP/SIGUSR2 hooks (and a clean end on TERM/HUP) - a SIGHUP that
     // `nohup` ignored stays ignored.
     #[cfg(all(unix, not(target_os = "android")))]
@@ -262,7 +265,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             app.current_world_index = saved_current_world;
                         }
                     }
-                    AppEvent::Chat(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
+                    AppEvent::Chat(..) | AppEvent::Shell(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
                     AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
                         app.apply_chat_lookup_result(client_id, request_id, world_index, result);
                     }
@@ -546,6 +549,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
             // some world's stats are dirty (see the bottom-of-loop rearm below).
             _ = &mut stats_flush_sleep => {
                 app.flush_dirty_stats();
+                app.flush_shell_frames();
                 stats_flush_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
             }
         }
@@ -1122,6 +1126,12 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 // Connect command - use daemon connection logic
                 Command::Connect { .. } => {
                     if world_index < app.worlds.len() && !app.worlds[world_index].connected {
+                        // A shell world runs a local terminal (crate::shell).
+                        if app.worlds[world_index].settings.world_type.is_shell() {
+                            app.emit_client_text(world_index, "Starting shell...", true);
+                            app.spawn_shell_connect(world_index);
+                            return;
+                        }
                         // Slack/Discord worlds run a background chat session instead of
                         // connect_daemon_world (MUD-only) - see crate::chat.
                         if !app.worlds[world_index].settings.world_type.is_mud() {
@@ -1206,6 +1216,11 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         }
         WsMessage::ConnectWorld { world_index } => {
             if world_index < app.worlds.len() && !app.worlds[world_index].connected {
+                // A shell world runs a local terminal (crate::shell).
+                if app.worlds[world_index].settings.world_type.is_shell() {
+                    app.spawn_shell_connect(world_index);
+                    return;
+                }
                 let settings = app.worlds[world_index].settings.clone();
 
                 // Check if world has connection settings
@@ -1301,6 +1316,19 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     let name = app.worlds[world_index].name.clone();
                     app.fire_tf_hook(Some(world_index), crate::tf::TfHookEvent::World, &name, true);
                 }
+                // A shell world: the client now views it; send the whole screen and resize.
+                app.send_shell_full_frame(client_id, world_index);
+                app.resize_shell_worlds();
+            }
+        }
+        WsMessage::ShellInput { world_index, key, text, paste } => {
+            if world_index < app.worlds.len() {
+                app.shell_input(world_index, key, text, paste);
+            }
+        }
+        WsMessage::ShellMouse { world_index, kind, button, col, row, ctrl, alt, shift } => {
+            if world_index < app.worlds.len() {
+                app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
         WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
@@ -1601,6 +1629,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 let paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
                 let visible = app.ws_client_worlds.get(&client_id).map(|v| v.visible).unwrap_or(true);
                 app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
+                app.resize_shell_worlds();
             }
         }
         // Was entirely absent from this handler (T40) - a daemon-attached client reporting its
@@ -1612,6 +1641,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 state.dimensions = Some((width, height));
                 if old_dims != Some((width, height)) {
                     app.send_naws_to_all_worlds();
+                    app.resize_shell_worlds();
                 }
             }
         }
@@ -1816,6 +1846,12 @@ keep_alive_type=Generic
         if world.owner.is_none() {
             eprintln!("Error: World '{}' has no owner.", world.name);
             eprintln!("Use [world:{}:OWNERNAME] format in settings file.", world.name);
+            return Ok(());
+        }
+        // A shell world is a shell on the server as the server user: never in multiuser,
+        // where that shell would be handed to whichever user owns the world.
+        if world.settings.world_type.is_shell() {
+            eprintln!("Error: World '{}' is a shell world, which multiuser mode does not allow.", world.name);
             return Ok(());
         }
     }
@@ -2145,6 +2181,7 @@ keep_alive_type=Generic
             // timer's own declaration above for why it is dormant in practice today.
             _ = &mut stats_flush_sleep => {
                 app.flush_dirty_stats();
+                app.flush_shell_frames();
                 stats_flush_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE_MU);
             }
         }
@@ -2989,6 +3026,9 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 } else {
                     Vec::new()
                 },
+                // Multiuser refuses shell worlds (a shell runs as the server user), so a
+                // multiuser world never has a screen.
+                shell: None,
             }
         }).collect();
 
@@ -4223,6 +4263,8 @@ mod multiuser_stats_flush_tests {
 
         app.flush_dirty_stats();
 
+        app.flush_shell_frames();
+
         let (world_index, stats) = try_recv_stats_update(&mut alice_rx)
             .expect("alice (the owner) must receive the StatsUpdate");
         assert_eq!(world_index, 0);
@@ -4246,6 +4288,7 @@ mod multiuser_stats_flush_tests {
         app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
         app.worlds[0].protocol.stats_dirty = true;
         app.flush_dirty_stats();
+        app.flush_shell_frames();
 
         assert!(someone_rx.try_recv().is_err(), "an unowned world's stats must reach no one");
     }
@@ -4386,6 +4429,8 @@ mod multiuser_telnet_tests {
         assert!(bob_rx.try_recv().is_err());
 
         app.flush_dirty_stats();
+
+        app.flush_shell_frames();
         assert!(!app.user_connections[&(0, "alice".to_string())].protocol.stats_dirty,
             "flush must clear the dirty flag");
         match try_recv_msg(&mut alice_rx) {

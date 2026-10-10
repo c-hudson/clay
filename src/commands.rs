@@ -1042,6 +1042,13 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     app.spawn_chat_connect(idx, &event_tx);
                     return false;
                 }
+                WorldType::Shell => {
+                    // A local terminal (crate::shell); reports back via AppEvent::Shell.
+                    app.add_output("Starting shell...");
+                    let idx = app.current_world_index;
+                    app.spawn_shell_connect(idx);
+                    return false;
+                }
                 WorldType::Mud | WorldType::MudTimedPrompt => {
                     // Continue with MUD connection below
                 }
@@ -2342,6 +2349,14 @@ pub(crate) fn execute_disconnect_command(
 /// connection id moves on first, so anything that reader still reports is stale.
 pub(crate) fn disconnect_world(app: &mut App, idx: usize, is_daemon_mode: bool) {
     let world = &mut app.worlds[idx];
+    // A shell world ends by dropping its session (clear_connection_state does that: SIGHUP
+    // + reap on the session's wrapper thread, and the screen freezes). The stale Exited
+    // event the wrapper later sends is ignored on the bumped connection_id.
+    if world.shell.is_some() {
+        world.clear_connection_state(true, true);
+        app.ws_broadcast(WsMessage::WorldDisconnected { world_index: idx });
+        return;
+    }
     if world.chat.is_none() {
         if let Some(tx) = &world.command_tx {
             let _ = tx.try_send(WriteCommand::Shutdown);

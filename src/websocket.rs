@@ -95,6 +95,7 @@ pub(crate) fn message_world_index(msg: &WsMessage) -> Option<usize> {
         | WsMessage::OutputLines { world_index, .. }
         | WsMessage::NoteEditorState { world_index, .. }
         | WsMessage::NotesChanged { world_index, .. }
+        | WsMessage::ShellScreen { world_index, .. }
         | WsMessage::ResyncRequired { world_index, .. } => Some(*world_index),
         _ => None,
     }
@@ -1153,6 +1154,128 @@ pub enum WsMessage {
         /// `ScrollbackContinue`.
         complete: bool,
     },
+
+    // ----- Shell worlds (see src/shell) -----
+    /// Server -> client. A shell world's screen, as rows of ANSI text. `base_frame: None`
+    /// is a full frame (every row); `Some(n)` is a delta of only the changed rows, valid
+    /// only against the client's frame `n` - a client holding another frame drops it and
+    /// sends `RequestWorldState`. Sent only to clients viewing this world.
+    ShellScreen {
+        world_index: usize,
+        frame: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_frame: Option<u64>,
+        cols: u16,
+        rows: u16,
+        /// `(row, text)` for the rows in this frame.
+        lines: Vec<(u16, String)>,
+        cursor: ShellCursorMsg,
+        mode: ShellModeMsg,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        bell: bool,
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        live: bool,
+    },
+    /// Client -> server. A key, typed/pasted text, or both, for a shell world's program.
+    ShellInput {
+        world_index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<ShellKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        paste: bool,
+    },
+    /// Client -> server. A mouse event over a shell world's grid. The server decides what,
+    /// if anything, the program receives (`shell::keys::mouse`). `kind`: down/up/drag/move/
+    /// wheel_up/wheel_down; `button`: 0 left, 1 middle, 2 right.
+    ShellMouse {
+        world_index: usize,
+        kind: String,
+        #[serde(default)]
+        button: u8,
+        col: u16,
+        row: u16,
+        #[serde(default, skip_serializing_if = "is_false")]
+        ctrl: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        alt: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        shift: bool,
+    },
+}
+
+/// A key for a shell world's program: a name plus modifier bits. The name is a single
+/// printable character, or one of Enter, Tab, Backspace, Delete, Insert, Escape, Up, Down,
+/// Left, Right, Home, End, PageUp, PageDown, F1..F12. The server encodes it
+/// (`shell::keys::encode`); no client has an encoder of its own.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ShellKey {
+    pub key: String,
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub shift: bool,
+}
+
+/// A shell world's cursor, for the client to draw.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ShellCursorMsg {
+    pub col: u16,
+    pub row: u16,
+    /// 0 block, 1 underline, 2 beam, 3 hollow block.
+    #[serde(default)]
+    pub shape: u8,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub blink: bool,
+}
+
+/// A shell world's emulator modes, as a client and the key encoder need them.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ShellModeMsg {
+    #[serde(default)]
+    pub mouse_click: bool,
+    #[serde(default)]
+    pub mouse_drag: bool,
+    #[serde(default)]
+    pub mouse_motion: bool,
+    #[serde(default)]
+    pub sgr_mouse: bool,
+    #[serde(default)]
+    pub utf8_mouse: bool,
+    #[serde(default)]
+    pub alt_screen: bool,
+    #[serde(default)]
+    pub bracketed_paste: bool,
+    #[serde(default)]
+    pub app_cursor: bool,
+    #[serde(default)]
+    pub app_keypad: bool,
+    #[serde(default)]
+    pub alternate_scroll: bool,
+}
+
+/// A shell world's screen inside `WorldStateMsg` (and so `InitialState`): a full snapshot
+/// a client starts from. A live screen is kept up to date by `ShellScreen` deltas.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ShellScreenMsg {
+    pub frame: u64,
+    pub cols: u16,
+    pub rows: u16,
+    /// Every row, in order.
+    pub lines: Vec<String>,
+    pub cursor: ShellCursorMsg,
+    pub mode: ShellModeMsg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default = "default_true")]
+    pub live: bool,
 }
 
 /// One world's entry in a client's `ScrollbackSyncRequest`.
@@ -1414,6 +1537,11 @@ pub struct WorldStateMsg {
     /// same as every other field this pattern covers.
     #[serde(default)]
     pub stats: Vec<crate::stats::StatEntry>,
+    /// A shell world's screen (see src/shell); `None` for every other world type, and for
+    /// a shell world not connected. Carried in `InitialState` and on reconnect so a client
+    /// starts from the full screen before deltas arrive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellScreenMsg>,
 }
 
 /// Chat-world settings in `UpdateWorldSettings` (see its `chat` field).

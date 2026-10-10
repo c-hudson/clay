@@ -2227,7 +2227,10 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             writeln!(file, "is_temporary=true")?;
         }
         writeln!(file, "scroll_offset={}", world.scroll_offset)?;
-        writeln!(file, "connected={}", world.connected)?;
+        // A shell world's PTY does not (yet) survive the reload exec, so it is saved as
+        // disconnected - the restore path must not try to resume it as a chat world.
+        let connected = world.connected && !world.settings.world_type.is_shell();
+        writeln!(file, "connected={}", connected)?;
         writeln!(file, "unseen_lines={}", world.unseen_lines)?;
         // The console More indicator (rendering::more_indicator_count) depends on
         // paused + visual_line_offset (+ lines_since_pause) persisting together —

@@ -19,6 +19,7 @@ pub mod actions;
 pub mod http;
 pub mod persistence;
 pub mod chat;
+pub mod shell;
 
 /// Current `WorldSettings::chat_settings_version` (2 = the server-per-world model with
 /// Send To / Show Only; see `persistence::migrate_chat_settings`).
@@ -1961,6 +1962,11 @@ pub enum WorldType {
     MudTimedPrompt,
     Slack,
     Discord,
+    /// A local terminal: Clay runs the login shell (or the "Command") in a PTY and shows
+    /// its screen. See src/shell. Not a MUD, not a chat: `is_mud()` is false and
+    /// `ChatKind::from_world_type` is None, so every MUD/chat branch skips it and the
+    /// shell path (connect, input, frames) takes over.
+    Shell,
 }
 
 impl WorldType {
@@ -1970,6 +1976,7 @@ impl WorldType {
             WorldType::MudTimedPrompt => "mud_timed_prompt",
             WorldType::Slack => "slack",
             WorldType::Discord => "discord",
+            WorldType::Shell => "shell",
         }
     }
 
@@ -1978,8 +1985,14 @@ impl WorldType {
             "mud_timed_prompt" => WorldType::MudTimedPrompt,
             "slack" => WorldType::Slack,
             "discord" => WorldType::Discord,
+            "shell" => WorldType::Shell,
             _ => WorldType::Mud,
         }
+    }
+
+    /// A local terminal world (see src/shell).
+    fn is_shell(&self) -> bool {
+        matches!(self, WorldType::Shell)
     }
 
     /// True for any MUD-family type (`Mud` and `MudTimedPrompt`). Use this instead of
@@ -2147,6 +2160,9 @@ impl WorldSettings {
             WorldType::Mud | WorldType::MudTimedPrompt => !self.hostname.is_empty() && !self.port.is_empty(),
             WorldType::Slack => !self.slack_token.is_empty(),
             WorldType::Discord => !self.discord_token.is_empty(),
+            // A shell world always "connects": the login shell needs no settings, and an
+            // optional Command rides in `hostname`.
+            WorldType::Shell => true,
         }
     }
 
@@ -3701,6 +3717,14 @@ pub struct World {
     /// Set by a hot reload's state restore for a chat world that was connected: the
     /// session send target (a spec) and Discord resume data, consumed by the reconnect.
     pub(crate) chat_restore: Option<(String, Option<chat::ResumeState>)>,
+    /// Shell world (see src/shell): the running PTY + emulator. `Some` from connect until
+    /// the shell exits or is disconnected; dropping it ends the session.
+    pub(crate) shell: Option<shell::ShellSession>,
+    /// A shell world's screen, kept here so the console draws from it and clients get full
+    /// frames. Stays (frozen) after the shell exits until the world reconnects.
+    pub(crate) shell_screen: Option<shell::ShellScreen>,
+    /// When this shell world last broadcast a screen delta (frame coalescing).
+    pub(crate) shell_last_frame_at: Option<std::time::Instant>,
     is_tls: bool,                // Track if using TLS
     /// MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): set by
     /// `App::should_defer_reload_for_mccp2` right before it sends `IAC DONT MCCP2` and
@@ -4021,6 +4045,9 @@ impl World {
             chat: None,
             chat_target: None,
             chat_restore: None,
+            shell: None,
+            shell_screen: None,
+            shell_last_frame_at: None,
             is_tls: false,
             mccp2_resume_after_reload: false,
             telnet_mode: false,
@@ -4169,6 +4196,14 @@ impl World {
         // and the bump makes any of its events still in the channel stale.
         if self.chat.take().is_some() {
             self.connection_id += 1;
+        }
+        // Shell worlds: dropping the session ends the PTY the same way (see src/shell).
+        // The screen stays, frozen, so a client still shows the last state.
+        if self.shell.take().is_some() {
+            self.connection_id += 1;
+            if let Some(screen) = self.shell_screen.as_mut() {
+                screen.set_exited();
+            }
         }
         self.chat_target = None;
         self.command_tx = None;
@@ -8778,6 +8813,8 @@ impl App {
             recent_lines,
             deliverable_high_seq: world.deliverable_high_seq().unwrap_or(0),
         });
+        // A shell world: the full current screen, so a resyncing client is whole again.
+        self.send_shell_full_frame(client_id, world_index);
     }
 
     /// `WsMessage::MarkWorldSeen` handling — shared by master-WS and daemon single-user
@@ -8832,6 +8869,10 @@ impl App {
         self.needs_output_redraw = true;
         if switched {
             self.ws_send_active_media_to_client(client_id, world_index);
+            // A shell world: this client now views it, so send the whole screen and let
+            // the PTY re-size to whoever is smallest among the viewers.
+            self.send_shell_full_frame(client_id, world_index);
+            self.resize_shell_worlds();
         }
     }
 
@@ -9597,6 +9638,8 @@ impl App {
             seq_epoch: 0,
             // Brand-new world: no GMCP/MSDP has ever arrived for it.
             stats: Vec::new(),
+            // Brand-new world: not connected, so no shell screen yet.
+            shell: None,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
     }
@@ -12649,6 +12692,11 @@ impl App {
             if self.worlds[idx].connected || !self.worlds[idx].settings.has_connection_settings() {
                 continue;
             }
+            // A shell world never auto-reconnects (the editor hides Reconnect), and must
+            // never fall through to a TCP connect with an empty host.
+            if self.worlds[idx].settings.world_type.is_shell() {
+                continue;
+            }
             if let Some(kind) = chat::ChatKind::from_world_type(&self.worlds[idx].settings.world_type) {
                 self.emit_reconnect_status(idx, &format!("Connecting to {}...", kind.name()));
                 self.spawn_chat_connect(idx, event_tx);
@@ -12787,6 +12835,7 @@ impl App {
     pub(crate) fn preprocess_event(&mut self, event: AppEvent) -> Option<AppEvent> {
         match event {
             AppEvent::Chat(owner, conn_id, ev) => self.handle_chat_event(owner, conn_id, ev),
+            AppEvent::Shell(world, conn_id, ev) => self.handle_shell_event(world, conn_id, ev),
             AppEvent::CloseNotice(world_name, conn_id, reason) => self.close_notice(&world_name, conn_id, &reason),
             AppEvent::TlsCipher(world_name, conn_id, cipher) => {
                 if let Some(idx) = self.find_world_index(&world_name) {
@@ -15403,6 +15452,13 @@ impl App {
                 self.handle_client_visibility(client_id, visible);
             }
             WsMessage::SendCommand { world_index, command } => {
+                // A live shell world: a line of text (not a Clay command) is typed at the
+                // shell, so a client's ordinary input box still works. A "/..." command
+                // falls through to normal handling, so /dc and friends still reach it.
+                if self.shell_live(world_index) && !command.starts_with('/') {
+                    self.shell_input(world_index, None, Some(format!("{command}\r")), false);
+                    return WsAsyncAction::Done;
+                }
                 // Reset more-mode counter when ANY client sends a command
                 if world_index < self.worlds.len() {
                     self.worlds[world_index].lines_since_pause = 0;
@@ -15477,6 +15533,10 @@ impl App {
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                     // Send active media for the new world
                     self.ws_send_active_media_to_client(client_id, world_index);
+                    // A shell world: the newly-viewing client needs the whole screen, and
+                    // the PTY may now have a new smallest viewer.
+                    self.send_shell_full_frame(client_id, world_index);
+                    self.resize_shell_worlds();
                 }
             }
             WsMessage::ConnectWorld { world_index } => {
@@ -15563,6 +15623,8 @@ impl App {
                     self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
                     // Update client's world in WebSocket server so broadcast_to_world_viewers works
                     self.ws_set_client_world(client_id, Some(world_index));
+                    // This client's size may now be the smallest viewing a shell world.
+                    self.resize_shell_worlds();
                 }
             }
             WsMessage::UpdateDimensions { width, height } => {
@@ -15573,7 +15635,18 @@ impl App {
                     // If dimensions changed, send NAWS updates to all worlds
                     if old_dims != Some((width, height)) {
                         self.send_naws_to_all_worlds();
+                        self.resize_shell_worlds();
                     }
+                }
+            }
+            WsMessage::ShellInput { world_index, key, text, paste } => {
+                if world_index < self.worlds.len() {
+                    self.shell_input(world_index, key, text, paste);
+                }
+            }
+            WsMessage::ShellMouse { world_index, kind, button, col, row, ctrl, alt, shift } => {
+                if world_index < self.worlds.len() {
+                    self.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
                 }
             }
             WsMessage::ReleasePending { world_index, count } => {
@@ -16354,6 +16427,9 @@ impl App {
                 // (re)connecting client shows it immediately rather than waiting for the
                 // next coalesced StatsUpdate (plan D4, up to ~150ms away).
                 stats: world.protocol.stats.entries().to_vec(),
+                // A shell world's full screen, so a (re)connecting client starts whole and
+                // then follows with deltas; None for every other world type.
+                shell: world.shell_screen.as_ref().map(|s| s.to_state_msg()),
             }
         }).collect();
 
@@ -17137,6 +17213,9 @@ pub enum AppEvent {
     /// to, the connection_id it was started under, and what happened. Every event loop
     /// hands these to `App::handle_chat_event` before its own `match`.
     Chat(chat::ChatOwner, u64, chat::ChatEvent),
+    /// A shell world's session reported something (see `crate::shell`): the world name,
+    /// the connection_id it started under, and the event. `App::handle_shell_event`.
+    Shell(String, u64, shell::ShellEvent),
     /// A world editor Fetch finished (`App::spawn_chat_lookup`): requesting client id
     /// (0 = the console), request id, world index, result.
     ChatLookupResult(u64, u64, usize, websocket::ChatDirectoryMsg),
@@ -21019,7 +21098,7 @@ pub async fn run_app_headless(
                             app.current_world_index = saved_current_world;
                         }
                     }
-                    AppEvent::Chat(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
+                    AppEvent::Chat(..) | AppEvent::Shell(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
                     AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
                         app.apply_chat_lookup_result(client_id, request_id, world_index, result);
                     }
@@ -21344,6 +21423,7 @@ pub async fn run_app_headless(
                 // adding a second one - see the bottom-of-loop block below for how this
                 // timer gets rearmed while a world stays dirty.
                 app.flush_dirty_stats();
+                app.flush_shell_frames();
                 // Deferred emissions: this loop holds a mutable borrow of app.worlds, so
                 // anything that has to go out through `app` (push_and_broadcast_line,
                 // PromptUpdate) is collected here and flushed after the loop. Both were
@@ -22774,7 +22854,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
-                    AppEvent::Chat(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
+                    AppEvent::Chat(..) | AppEvent::Shell(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
                     AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
                         app.apply_chat_lookup_result(client_id, request_id, world_index, result);
                     }
@@ -23157,6 +23237,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // adding a second one - see the bottom-of-loop block below for how this
                 // timer gets rearmed while a world stays dirty.
                 app.flush_dirty_stats();
+                app.flush_shell_frames();
                 // Deferred emissions: this loop holds a mutable borrow of app.worlds, so
                 // anything that has to go out through `app` (push_and_broadcast_line,
                 // PromptUpdate) is collected here and flushed after the loop. Both were
@@ -23418,7 +23499,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.current_world_index = saved_current_world;
                     }
                 }
-                AppEvent::Chat(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
+                AppEvent::Chat(..) | AppEvent::Shell(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
                 AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
                     app.apply_chat_lookup_result(client_id, request_id, world_index, result);
                 }

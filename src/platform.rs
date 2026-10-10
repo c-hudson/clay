@@ -576,12 +576,16 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
 /// This should be called periodically from the main event loop.
 #[cfg(all(unix, not(target_os = "android")))]
 pub fn reap_zombie_children() {
-    // Call waitpid with -1 (any child) and WNOHANG (don't block) to reap zombies
-    // Keep calling until no more zombies are found
+    // Reap only children in OUR process group (pgid 0 = the caller's group), not any
+    // child (-1). A shell world's PTY child runs in its own session/group (alacritty's
+    // `setsid`), and alacritty's own event loop must be the one to collect its exit
+    // status - a generic `waitpid(-1)` here used to steal it, leaving that loop to spin
+    // on the dead PTY (Linux EIO) forever. Clay's TLS proxies stay in our group, so they
+    // are still reaped. Keep calling until no more zombies are found.
     unsafe {
         loop {
             let mut status: libc::c_int = 0;
-            let result = libc::waitpid(-1, &mut status, libc::WNOHANG);
+            let result = libc::waitpid(0, &mut status, libc::WNOHANG);
             if result <= 0 {
                 // No more zombies to reap (0 = no status available, -1 = error/no children)
                 break;
@@ -1704,6 +1708,15 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // never sees a channel disconnect and would otherwise lose whatever is still
     // batched.
     app.flush_scrollback();
+
+    // Shell worlds (src/shell) do not survive the exec yet (Phase 7): hang up each child
+    // now, synchronously, since the wrapper thread that would normally end it is wiped by
+    // the exec. Saved as disconnected (persistence::save_reload_state_to).
+    for world in &app.worlds {
+        if let Some(shell) = world.shell.as_ref() {
+            shell.hangup();
+        }
+    }
 
     // Save the current state
     debug_log(is_debug_enabled(), "RELOAD: Saving state...");

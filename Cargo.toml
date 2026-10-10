@@ -13,6 +13,12 @@ bytes = "1"
 strsim = "0.11"
 socket2 = { version = "0.5", features = ["all"] }
 unicode-width = "0.1"
+# Shell worlds (src/shell): the PTY and terminal emulator. No serde: the screen crosses
+# the wire as Clay's own ShellScreen rows, never as alacritty's types.
+alacritty_terminal = { version = "0.26", default-features = false }
+# alacritty_terminal reports PTY failures only through `log`; src/shell installs a logger
+# that forwards them to debug.log.
+log = "0.4"
 regex = "1"
 futures = "0.3"
 aes-gcm = "0.10"
