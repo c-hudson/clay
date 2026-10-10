@@ -2382,10 +2382,31 @@
     }
 
     // Get visible column count in output area (approximate from container width and font size)
-    function getVisibleColumnCount() {
+    // The monospace cell width, measured in the output's own font (cached per font size).
+    // A measured width keeps a shell world's PTY from being sized wider than the view,
+    // which would wrap its rows; it is also a better NAWS width than the 0.6 estimate.
+    let measuredCellCache = { fontSize: null, width: 0 };
+    function measuredCharWidth() {
         const fontSize = currentFontSize || 14;
-        const charWidth = fontSize * 0.6; // monospace approximate
-        return Math.floor(elements.outputContainer.clientWidth / charWidth);
+        if (measuredCellCache.fontSize === fontSize && measuredCellCache.width > 0) {
+            return measuredCellCache.width;
+        }
+        let width = fontSize * 0.6;
+        try {
+            const probe = document.createElement('span');
+            probe.textContent = '0'.repeat(50);
+            probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;left:-9999px;';
+            elements.output.appendChild(probe);
+            const w = probe.getBoundingClientRect().width / 50;
+            elements.output.removeChild(probe);
+            if (w > 0) width = w;
+        } catch (e) { /* fall back to the estimate */ }
+        measuredCellCache = { fontSize, width };
+        return width;
+    }
+
+    function getVisibleColumnCount() {
+        return Math.max(1, Math.floor(elements.outputContainer.clientWidth / measuredCharWidth()));
     }
 
     // Send UpdateViewState to server for synchronized more-mode
@@ -4408,8 +4429,17 @@
             case 'WorldDisconnected':
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].connected = false;
+                    // A shell world (src/shell): freeze its screen, the session is gone.
+                    if (worlds[msg.world_index].shell) {
+                        worlds[msg.world_index].shell.live = false;
+                        if (msg.world_index === currentWorldIndex) renderOutput();
+                    }
                     updateStatusBar();
                 }
+                break;
+
+            case 'ShellScreen':
+                handleShellScreen(msg);
                 break;
 
             case 'CertMismatch':
@@ -8619,6 +8649,112 @@
     // place; another world starts at its bottom.
     let lastRenderedWorld = null;
 
+    // ----- Shell worlds (src/shell): the output area is a live terminal grid -----
+    let shellComposing = false;
+    let shellEscArmedAt = 0;
+    const SHELL_SWITCH_ACTIONS = new Set([
+        'world_next', 'world_prev', 'world_all_next', 'world_all_prev', 'world_activity',
+        'world_previous', 'world_forward', 'recent_worlds', 'world_socket_prev', 'world_socket_next',
+    ]);
+
+    // The current world is a shell world (src/shell) whose session the server reports live.
+    function shellActive() {
+        const w = worlds[currentWorldIndex];
+        return !!(w && w.shell && w.shell.live);
+    }
+
+    // Apply a ShellScreen frame. A full frame (no base_frame) replaces the screen; a delta
+    // applies only if it builds on the frame we hold, else we ask for the whole screen.
+    function handleShellScreen(msg) {
+        const w = worlds[msg.world_index];
+        if (!w) return;
+        const full = msg.base_frame === undefined || msg.base_frame === null;
+        if (full) {
+            const lines = new Array(msg.rows).fill('');
+            (msg.lines || []).forEach(function(pair) { lines[pair[0]] = pair[1]; });
+            w.shell = { cols: msg.cols, rows: msg.rows, lines, cursor: msg.cursor, mode: msg.mode, title: msg.title, frame: msg.frame, live: msg.live !== false };
+        } else {
+            const s = w.shell;
+            if (!s || s.frame !== msg.base_frame || s.cols !== msg.cols || s.rows !== msg.rows) {
+                send({ type: 'RequestWorldState', world_index: msg.world_index });
+                return;
+            }
+            (msg.lines || []).forEach(function(pair) { if (pair[0] < s.lines.length) s.lines[pair[0]] = pair[1]; });
+            s.cursor = msg.cursor; s.mode = msg.mode; s.title = msg.title; s.frame = msg.frame; s.live = msg.live !== false;
+        }
+        if (msg.world_index === currentWorldIndex) renderOutput();
+    }
+
+    // Draw the grid: one `.shell-row` per row (drawn with the same parseAnsi as MUD lines,
+    // but never through lineHtml, which would strip a `[user@host]$`-style prompt), plus
+    // the cursor positioned by cell (`ch`) and line height.
+    function renderShellScreen(world) {
+        const s = world.shell;
+        const lh = lineHeightPx();
+        let html = '<div class="shell-screen" style="position:relative;--shell-line-h:' + lh + 'px;">';
+        for (let i = 0; i < s.lines.length; i++) {
+            const inner = parseAnsi(s.lines[i] || '');
+            html += '<div class="shell-row">' + (inner || '&#8203;') + '</div>';
+        }
+        if (s.live && s.cursor && s.cursor.visible) {
+            const shape = ['blk', 'und', 'bar', 'hol'][s.cursor.shape] || 'blk';
+            html += '<div id="shell-cursor" class="shell-cursor shell-cursor-' + shape + '" style="left:' + s.cursor.col + 'ch;top:' + (s.cursor.row * lh) + 'px;"></div>';
+        }
+        html += '</div>';
+        elements.output.innerHTML = sanitizeHtml(html);
+    }
+
+    // A ShellKey {key,ctrl,alt,shift} for a non-text key (arrows, Enter, Tab, function keys,
+    // Ctrl-combos); null for a plain printable character (which the `input` event sends, so
+    // IMEs and soft keyboards work) or a bare modifier.
+    function shellKeyFromEvent(e) {
+        const named = {
+            Enter: 'Enter', Tab: 'Tab', Backspace: 'Backspace', Delete: 'Delete', Insert: 'Insert',
+            Escape: 'Escape', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+            Home: 'Home', End: 'End', PageUp: 'PageUp', PageDown: 'PageDown',
+        };
+        let key = named[e.key];
+        if (!key && /^F([0-9]|1[0-9]|20)$/.test(e.key)) key = e.key;
+        if (!key && e.key.length === 1 && (e.ctrlKey || e.altKey)) key = e.key;
+        if (!key) return null;
+        return { key: key, ctrl: !!e.ctrlKey, alt: !!e.altKey, shift: !!e.shiftKey };
+    }
+
+    // The shell carve-out, mirroring input_handler::shell_key_intercept. Returns true if it
+    // handled the keystroke (the caller then stops).
+    function handleShellKeydown(e) {
+        if (e.metaKey && e.key.toLowerCase() === 'v') return false; // let paste through
+        // A bare Escape goes to the PTY now and arms the Esc chord window.
+        if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+            send({ type: 'ShellInput', world_index: currentWorldIndex, key: { key: 'Escape', ctrl: false, alt: false, shift: false } });
+            shellEscArmedAt = Date.now();
+            e.preventDefault();
+            return true;
+        }
+        const armed = shellEscArmedAt && (Date.now() - shellEscArmedAt) < 500;
+        shellEscArmedAt = 0;
+        // A world switch: either an armed Esc-<key>, or a key bound to a switch action.
+        if (armed) {
+            const inner = escapeKeyToToken(e);
+            const action = inner && lookupBinding('Esc-' + inner);
+            if (action && SHELL_SWITCH_ACTIONS.has(action)) { e.preventDefault(); dispatchAction(action); return true; }
+        }
+        const name = keyEventToToken(e);
+        const bound = name && lookupBinding(name);
+        if (bound && SHELL_SWITCH_ACTIONS.has(bound)) { e.preventDefault(); dispatchAction(bound); return true; }
+        // A non-text key goes to the PTY; a plain character waits for the `input` event.
+        const sk = shellKeyFromEvent(e);
+        if (sk) { e.preventDefault(); send({ type: 'ShellInput', world_index: currentWorldIndex, key: sk }); return true; }
+        return false;
+    }
+
+    // Typed/IME/pasted text to the PTY, and clear the (hidden) input line.
+    function shellSendText(text, paste) {
+        if (!text) return;
+        send({ type: 'ShellInput', world_index: currentWorldIndex, text: text, paste: !!paste });
+        elements.input.value = '';
+    }
+
     function renderOutput(opts) {
         boxDrawingRefresh();
         const preserveScroll = !!(opts && opts.preserveScroll);
@@ -8648,6 +8784,12 @@
                 '<div style="color:#ff87ff;font-style:italic;">A 90dies mud client written today</div>' +
                 '<div style="color:#888;">/help for how to use clay</div>' +
                 '</div>';
+            return;
+        }
+
+        // A shell world (src/shell): the output area is a terminal grid, not MUD lines.
+        if (world.shell) {
+            renderShellScreen(world);
             return;
         }
 
@@ -8956,7 +9098,7 @@
         function applyReverseVideo(classes, fgStyle, bgStyle) {
             const fgRgb = getFgRgb(classes, fgStyle);
             const bgRgb = getBgRgb(classes, bgStyle) || getThemeBgRgb();
-            const kept = classes.filter(c => c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
+            const kept = classes.filter(c => c === 'ansi-bold' || c === 'ansi-dim' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink' || c === 'ansi-strike');
             return {
                 classes: kept,
                 fgStyle: `color:rgb(${bgRgb[0]},${bgRgb[1]},${bgRgb[2]});`,
@@ -9167,6 +9309,9 @@
                             break;
                         }
                     }
+                } else if (code === 2) {
+                    // Dim (faint) - shell output (ls, vim) uses it; see src/shell.
+                    currentClasses.push('ansi-dim');
                 } else if (code === 3) {
                     currentClasses.push('ansi-italic');
                 } else if (code === 4) {
@@ -9175,11 +9320,23 @@
                     currentClasses.push('ansi-blink');
                 } else if (code === 7) {
                     currentReversed = true;
+                } else if (code === 9) {
+                    currentClasses.push('ansi-strike');
+                } else if (code === 22) {
+                    currentClasses = currentClasses.filter(c => c !== 'ansi-bold' && c !== 'ansi-dim');
+                } else if (code === 23) {
+                    currentClasses = currentClasses.filter(c => c !== 'ansi-italic');
+                } else if (code === 24) {
+                    currentClasses = currentClasses.filter(c => c !== 'ansi-underline');
+                } else if (code === 25) {
+                    currentClasses = currentClasses.filter(c => c !== 'ansi-blink');
                 } else if (code === 27) {
                     currentReversed = false;
+                } else if (code === 29) {
+                    currentClasses = currentClasses.filter(c => c !== 'ansi-strike');
                 } else if (code >= 30 && code <= 37) {
                     // Basic foreground colors - use bright variant if bold is active
-                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-dim' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink' || c === 'ansi-strike');
                     currentFgStyle = '';
                     const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
                     const isBold = currentClasses.includes('ansi-bold');
@@ -9190,7 +9347,7 @@
                         // 256-color mode: 38;5;N
                         const colorNum = codes[i + 2];
                         const rgb = color256ToRgb(colorNum);
-                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
+                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-dim' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink' || c === 'ansi-strike');
                         currentFgStyle = `color:rgb(${rgb[0]},${rgb[1]},${rgb[2]});`;
                         i += 2;
                     } else if (codes[i + 1] === 2 && codes.length > i + 4) {
@@ -9198,13 +9355,13 @@
                         const r = codes[i + 2];
                         const g = codes[i + 3];
                         const b = codes[i + 4];
-                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
+                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-dim' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink' || c === 'ansi-strike');
                         currentFgStyle = `color:rgb(${r},${g},${b});`;
                         i += 4;
                     }
                 } else if (code === 39) {
                     // Default foreground color
-                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-dim' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink' || c === 'ansi-strike');
                     currentFgStyle = '';
                 } else if (code >= 40 && code <= 47) {
                     // Basic background colors
@@ -9236,7 +9393,7 @@
                     currentBgStyle = '';
                 } else if (code >= 90 && code <= 97) {
                     // Bright foreground colors
-                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-dim' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink' || c === 'ansi-strike');
                     currentFgStyle = '';
                     const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
                     currentClasses.push('ansi-bright-' + colors[code - 90]);
@@ -13219,12 +13376,23 @@
         const isMud = type === 'mud' || type === 'mud_timed_prompt';
         const isSlack = type === 'slack';
         const isDiscord = type === 'discord';
+        // A shell world (src/shell): the login shell, or the Command (held in hostname).
+        const isShell = type === 'shell';
 
         WORLD_EDIT_MUD_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isMud));
         WORLD_EDIT_SLACK_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isSlack));
         WORLD_EDIT_DISCORD_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isDiscord));
-        // Reconnect applies to every world type (chat worlds reconnect too).
-        elements.worldEditAutoReconnectField?.classList.add('visible');
+        // A shell world shows only the Hostname row, relabelled "Command".
+        if (isShell) {
+            elements.worldEditHostnameField?.classList.add('visible');
+        }
+        const hostnameLabel = document.getElementById('world-edit-hostname-label');
+        if (hostnameLabel) hostnameLabel.textContent = isShell ? 'Command' : 'Hostname';
+        // Reconnect applies to every world type except shell (a shell never reconnects).
+        elements.worldEditAutoReconnectField?.classList.toggle('visible', !isShell);
+        // A shell world logs nothing.
+        const loggingField = document.getElementById('world-edit-logging-field');
+        if (loggingField) loggingField.style.display = isShell ? 'none' : '';
         elements.worldEditChatFetchField?.classList.toggle('visible', isSlack || isDiscord);
         // Chat worlds have no login - that section holds Send To / Show Only instead.
         elements.worldEditorModal.querySelectorAll('.we-login-label').forEach(el => {
@@ -15704,6 +15872,13 @@
         elements.outputContainer.addEventListener('touchcancel', endRevealTouch, { passive: true });
 
         elements.outputContainer.addEventListener('wheel', function(e) {
+            // A live shell world (src/shell): forward the wheel; the server decides what,
+            // if anything, the program receives (no scrollback).
+            if (shellActive()) {
+                e.preventDefault();
+                send({ type: 'ShellMouse', world_index: currentWorldIndex, kind: e.deltaY < 0 ? 'wheel_up' : 'wheel_down', button: 0, col: 0, row: 0, ctrl: !!e.ctrlKey, alt: !!e.altKey, shift: !!e.shiftKey });
+                return;
+            }
             const dy = wheelDeltaToPx(e);
             if (dy <= 0 || !canRevealPending()) return;
             revealAccumPx += dy;
@@ -16342,6 +16517,11 @@
             // is tf_bound_keys_json (RunKeyBinding) first, then the local action table.
             if (document.activeElement !== elements.input &&
                 document.activeElement !== elements.filterInput) {
+                // A live shell world (src/shell) captures the keyboard wherever focus is
+                // (the grid is not a focusable input) - all the modal/popup early-returns
+                // above have had their say first. The input-element keydown handler covers
+                // the case where the input itself is focused, so exactly one path fires.
+                if (shellActive()) { handleShellKeydown(e); return; }
                 const resolution = resolveKeyName(e);
                 if (resolution.type === 'pending') {
                     e.preventDefault();
@@ -16403,6 +16583,11 @@
             // openEmojiPopup/emojiSetZone), but returning here unconditionally
             // costs nothing and closes that race off for good.
             if (emojiPopupOpen) return;
+            // A live shell world (src/shell) captures the keyboard: a world-switch key or a
+            // non-text key goes to the PTY here; a plain character falls through to the
+            // `input` event (so IMEs and soft keyboards work). Best effort in a browser -
+            // Ctrl+W/T/N and the like stay the browser's.
+            if (shellActive()) { handleShellKeydown(e); return; }
             const resolution = resolveKeyName(e);
 
             if (resolution.type === 'pending') {
@@ -16482,7 +16667,25 @@
 
         // Reset command completion state when input changes (typing, not Tab)
         // Also check for temperature conversion
+        // A live shell world: typed/IME/pasted text goes to the PTY, not the input line.
+        elements.input.addEventListener('compositionstart', function() { shellComposing = true; });
+        elements.input.addEventListener('compositionend', function() {
+            shellComposing = false;
+            if (shellActive()) shellSendText(elements.input.value, false);
+        });
+        elements.input.addEventListener('paste', function(e) {
+            if (!shellActive()) return;
+            e.preventDefault();
+            const text = (e.clipboardData || window.clipboardData).getData('text');
+            shellSendText(text, true);
+        });
+
         elements.input.addEventListener('input', function(e) {
+            if (shellActive()) {
+                // IME composition flushes on compositionend, not here.
+                if (!shellComposing) shellSendText(elements.input.value, false);
+                return;
+            }
             spellCycle = null; // the user's own edit ends a Ctrl+Q round
             resetCompletion();
             // Mirrors Rust's last_input_was_delete: any deleteContent*/deleteBy*

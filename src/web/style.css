@@ -353,6 +353,19 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
 .ansi-underline { text-decoration: underline; }
 .ansi-blink { animation: ansi-blink 1s step-end infinite; }
 @keyframes ansi-blink { 0%, 75% { opacity: 1; } 76%, 100% { opacity: 0; } }
+/* Shell worlds (src/shell): SGR dim (2) and strike (9). */
+.ansi-dim { opacity: 0.6; }
+.ansi-strike { text-decoration: line-through; }
+.ansi-underline.ansi-strike { text-decoration: underline line-through; }
+
+/* A shell world's terminal grid: rows keep their exact spacing (no wrap), and the cursor
+   is a cell-sized block/bar/underline positioned by column (ch) and row (line height). */
+.shell-screen { position: relative; }
+.shell-row { white-space: pre; overflow: hidden; }
+.shell-cursor { position: absolute; width: 1ch; height: var(--shell-line-h); pointer-events: none; background: var(--theme-fg, #e8e4ec); opacity: 0.55; }
+.shell-cursor-und { height: 2px; transform: translateY(calc(var(--shell-line-h) - 2px)); opacity: 0.9; }
+.shell-cursor-bar { width: 2px; opacity: 0.9; }
+.shell-cursor-hol { background: transparent; border: 1px solid var(--theme-fg, #e8e4ec); opacity: 0.7; }
 
 /* ANSI background colors */
 .ansi-bg-black { background-color: var(--theme-ansi-0, #000000); }

@@ -3034,3 +3034,11 @@ phase = 6
 status = "done"
 feature = "wire ShellMouse"
 note = "mouse over a shell world's grid (core::shell_mouse); wheel now, clicks server-encoded"
+
+[[item]]
+id = "msg:ShellScreen"
+section = "output"
+phase = 3
+status = "done"
+feature = "handle ShellScreen"
+note = "a shell world's grid: core::client applies the frame, ui draws rows + cursor (src/shell)"
