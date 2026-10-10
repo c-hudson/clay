@@ -9466,6 +9466,31 @@ third
         assert_eq!(app.worlds[0].settings.slack_token, "xoxb-new");
     }
 
+    /// A Shell world (src/shell): the type round-trips through update_world_settings, and
+    /// `has_connection_settings()` is true even with no host/port (the login shell needs
+    /// none) so `/worlds`/connect will start it.
+    #[test]
+    fn test_update_world_settings_applies_shell_type() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("sh"));
+
+        app.update_world_settings(
+            0, "sh".to_string(), "top".to_string(), String::new(), String::new(),
+            String::new(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(), true, true, true,
+            "shell".to_string(), 0, None, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
+            None,
+        );
+
+        assert_eq!(app.worlds[0].settings.world_type, WorldType::Shell);
+        // The Command rides in `hostname`.
+        assert_eq!(app.worlds[0].settings.hostname, "top");
+        assert!(app.worlds[0].settings.has_connection_settings(), "a shell world always has enough to connect");
+    }
+
     /// A world_type change away from `MudTimedPrompt` must clear any parked
     /// `timed_prompt_since` - otherwise a promotion could still fire for a partial that
     /// was parked while the type was still Timed (see `App::promote_due_timed_prompts`'s

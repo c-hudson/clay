@@ -66,6 +66,7 @@ pub enum WorldType {
     MudTimedPrompt,
     Slack,
     Discord,
+    Shell,
 }
 
 impl WorldType {
@@ -74,6 +75,7 @@ impl WorldType {
             "mud_timed_prompt" => WorldType::MudTimedPrompt,
             "slack" => WorldType::Slack,
             "discord" => WorldType::Discord,
+            "shell" => WorldType::Shell,
             _ => WorldType::Mud,
         }
     }
@@ -84,6 +86,7 @@ impl WorldType {
             WorldType::MudTimedPrompt => "mud_timed_prompt",
             WorldType::Slack => "slack",
             WorldType::Discord => "discord",
+            WorldType::Shell => "shell",
         }
     }
 
@@ -91,6 +94,11 @@ impl WorldType {
     /// method on the other `WorldType` enum in `main.rs`.
     pub fn is_mud(&self) -> bool {
         matches!(self, WorldType::Mud | WorldType::MudTimedPrompt)
+    }
+
+    /// A local terminal world (see src/shell).
+    pub fn is_shell(&self) -> bool {
+        matches!(self, WorldType::Shell)
     }
 }
 
@@ -101,6 +109,7 @@ pub fn world_type_options() -> Vec<SelectOption> {
         SelectOption::new("mud_timed_prompt", "MUD - Timed Prompt"),
         SelectOption::new("slack", "Slack"),
         SelectOption::new("discord", "Discord"),
+        SelectOption::new("shell", "Shell"),
     ]
 }
 
@@ -182,6 +191,7 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
         WorldType::MudTimedPrompt => 1,
         WorldType::Slack => 2,
         WorldType::Discord => 3,
+        WorldType::Shell => 4,
     };
 
     let encoding_idx = match settings.encoding.as_str() {
@@ -419,7 +429,12 @@ fn world_editor_help_text() -> Vec<String> {
         "",
         "World: A unique name for this connection.",
         "",
-        "Type: MUD (telnet game server), MUD - Timed Prompt, Slack, or Discord.",
+        "Type: MUD (telnet game server), MUD - Timed Prompt, Slack, Discord, or Shell.",
+        "",
+        "Shell: a local terminal running your login shell (or the Command). Every key",
+        "goes to it except the world-switch keys. Anyone who can log in to Clay remotely",
+        "gets this shell as you - do not expose Clay to untrusted networks with a shell",
+        "world. Not allowed in multiuser mode.",
         "",
         "--- Slack / Discord ---",
         "",
@@ -549,6 +564,15 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         }
     }
 
+    // A shell world (src/shell) shows only the Hostname row, relabelled "Command" (blank
+    // runs the login shell). Every other MUD field stays hidden.
+    if let Some(field) = def.get_field_mut(WORLD_FIELD_HOSTNAME) {
+        field.label = if world_type.is_shell() { "Command".to_string() } else { "Hostname".to_string() };
+        if world_type.is_shell() {
+            field.visible = true;
+        }
+    }
+
     // Keep-alive command only visible for MUD with custom keep-alive
     if let Some(field) = def.get_field_mut(WORLD_FIELD_KEEP_ALIVE_CMD) {
         field.visible = world_type.is_mud() && show_keep_alive_cmd;
@@ -561,10 +585,11 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         field.visible = world_type == WorldType::MudTimedPrompt;
     }
 
-    // Log file and Reconnect are visible for all types (chat worlds reconnect too)
+    // Log file and Reconnect are visible for all types except shell (a shell world logs
+    // nothing and never reconnects); chat worlds reconnect too.
     for id in [WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_AUTO_RECONNECT] {
         if let Some(field) = def.get_field_mut(id) {
-            field.visible = true;
+            field.visible = !world_type.is_shell();
         }
     }
 

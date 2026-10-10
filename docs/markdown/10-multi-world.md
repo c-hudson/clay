@@ -11,6 +11,11 @@ Each world has:
 - Per-world settings (encoding, auto-login, logging)
 - Unseen line counter for background activity
 
+A world is usually a MUD, but it can also be a Slack or Discord channel (see
+[Slack and Discord](21-chat-worlds.md)) or a local terminal (see
+[Shell worlds](23-shell-worlds.md)) — a world whose Type is **Shell** runs your login
+shell where the output would be, and all your other worlds stay one switch-key away.
+
 ## World Switching
 
 ### Active World Cycling (Up/Down)

@@ -104,6 +104,7 @@ Clay has built-in help (F1, or `/help <topic>`) and a manual:
 [Switching from TinyFugue](docs/markdown/22-switching-from-tinyfugue.md) ·
 [TinyFugue commands](docs/markdown/06-tf-commands.md) ·
 [Slack and Discord](docs/markdown/21-chat-worlds.md) ·
+[Shell worlds](docs/markdown/23-shell-worlds.md) ·
 [Remote access](docs/markdown/11-web-interface.md#reaching-clay-from-outside-your-network) ·
 [Troubleshooting](docs/markdown/20-troubleshooting.md) ·
 [all chapters](docs/markdown)

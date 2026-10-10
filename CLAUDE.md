@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Critical Rules
 
-**All UI changes must be reflected in ALL interfaces.** Any new field, option, or window added to one interface (console TUI, web, webview-GUI) must be added to all three. New world/settings fields must also be saved to `~/.clay/settings.dat` in `persistence.rs` and loaded on startup and `/reload`.
+**All UI changes must be reflected in ALL interfaces.** Any new field, option, or window added to one interface (console TUI, web, webview-GUI, and the native GPUI GUI in `src/native_gui/`) must be added to all of them (the SSH remote console shares the console TUI's renderer, so it usually follows for free). New world/settings fields must also be saved to `~/.clay/settings.dat` in `persistence.rs` and loaded on startup and `/reload`.
 
 **World passwords are stored encrypted in `~/.clay/settings.dat` but sent as plaintext to authenticated WebSocket clients and displayed as readable text in all UI editors.** Do not hide or mask world passwords in the world editor — the encryption is for at-rest storage only. The `has_password` field mirrors whether the password is non-empty.
 
@@ -75,6 +75,9 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 
 **Chat worlds (Slack/Discord):**
 - `src/chat/` - `mod.rs` (session start/`ChatHandle`/`ChatEvent`, rate-limit-aware HTTP), `discord.rs` (gateway v10: HELLO heartbeat + ACK/zombie, RESUME, close-code table, REST sender, Fetch lookup), `slack.rs` (Socket Mode + Web API, two tokens), `directory.rs` (per-session channel/user cache + name resolution), `spec.rs` (`name`, `#name`, `@user`, id, picker `name (id)`), `render.rs` (line shape + sanitising), `test_support.rs` (fake REST/gateway for tests). User docs: `docs/markdown/21-chat-worlds.md`.
+
+**Shell worlds (`WorldType::Shell`):**
+- `src/shell/` - a world that is a local terminal (PTY + `alacritty_terminal`). `mod.rs` (`ShellSession`: the `Term` + event loop + a wrapper thread for bounded teardown; the `Proxy` that forwards emulator events as `AppEvent::Shell`), `screen.rs` (`ShellScreen`: render the grid to ANSI rows + a plain projection, track dirty rows and a lockstep frame counter, build/apply full & delta frames; activity = a cell gained a non-space char), `keys.rs` (one xterm key encoder + the shared `classify` carve-out), `app.rs` (`App` glue: connect, read the screen, activity, input, per-viewer sizing, frame coalescing, exit). Clients render the screen with their existing line pipeline (console `render_shell_crossterm`, native `shell_output`+`OutputSnapshot.shell_cursor`, web `renderShellScreen`). Wire: `WsMessage::ShellScreen`/`ShellInput`/`ShellMouse`, `WorldStateMsg.shell`. User docs: `docs/markdown/23-shell-worlds.md`. Three rules that bite: the `Proxy`'s `send_event` is called under the `Term` lock onto a bounded channel, so it must `try_send` only and never touch the `Term` (coalesce the wakeup); teardown runs on the wrapper thread (the PTY's `Drop` blocks); `platform::reap_zombie_children` must be `waitpid(0)` (our process group), not `-1`, or the PTY child's exit is stolen and the emulator loop spins. A shell world's output never enters `output_lines`, the log, the archive, TF or triggers. Multiuser refuses shell worlds.
 
 **Theme:**
 - `src/theme.rs` - ThemeColors (42 customizable color vars), ThemeFile for `~/.clay/theme.dat`. GUI/web only; console uses Theme enum from encoding.rs.

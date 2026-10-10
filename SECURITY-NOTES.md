@@ -235,3 +235,21 @@ unencrypted, and never appears in a URL:
 MUD world passwords are separate: they go to the MUD exactly as the MUD's own connection
 requires (unencrypted on a non-SSL world).
 
+
+# Shell worlds give remote clients a shell
+
+A world whose Type is **Shell** (see `docs/markdown/23-shell-worlds.md`) runs a terminal —
+your login shell by default — on the machine where Clay runs, as the user running Clay.
+Every client that can connect to that Clay can type into it: the local console, the
+desktop GUI, the web/Android client and a remote console over SSH. This is the same reach
+the existing `/sh` command gives those clients, but it bears repeating:
+
+- **Do not create a shell world on a Clay instance you expose to a network you do not
+  fully trust.** Anyone who gets past the login (or shares the session) has a shell as you.
+- Shell worlds are refused outright in multiuser mode — there the shell would run as the
+  server operator on behalf of whichever account owns the world, which is never wanted.
+- A shell world never reads or writes your clipboard through the terminal (OSC 52 is
+  disabled), and its output is never logged or archived.
+
+If you want Clay reachable remotely but without this exposure, simply do not define any
+shell worlds; nothing else changes.
