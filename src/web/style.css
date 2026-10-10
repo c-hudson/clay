@@ -550,6 +550,14 @@ body.theme-light .icon-bar {
     --icon-tile-hover-fg: var(--theme-bg, #e8e8e8);
 }
 
+/* No color-mix() (WebKit 16: Safari / macOS 11): the variables above are invalid there and
+   the tiles lost their plate. The same lift as see-through white over the bar the tile
+   sits on - color-mix's 100% + 15% (35%) normalizes to 13% (26%) white. */
+@supports not (color: color-mix(in srgb, red 50%, white)) {
+    .icon-bar { --icon-tile-rest-bg: rgba(255, 255, 255, 0.13); }
+    body.theme-light .icon-bar { --icon-tile-rest-bg: rgba(255, 255, 255, 0.26); }
+}
+
 .icon-tile {
     display: flex;
     flex-direction: column;
