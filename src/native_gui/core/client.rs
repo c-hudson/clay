@@ -180,6 +180,9 @@ pub struct World {
     /// Bumped whenever `lines` change.
     pub revision: u64,
     pub seen: SeenRanges,
+    /// A shell world's screen (see `crate::shell`): `Some` for a shell world, kept current
+    /// by `ShellScreen` frames. `None` for every other world type.
+    pub shell: Option<crate::shell::ShellScreen>,
     epoch: u64,
     /// Text after the last newline, held until the rest of its line arrives.
     partial: String,
@@ -613,6 +616,41 @@ impl ClientCore {
         self.take()
     }
 
+    /// True if the current world is a shell world the server still reports live (keys go
+    /// to it, src/shell).
+    pub fn current_is_live_shell(&self) -> bool {
+        self.worlds.get(self.current).and_then(|w| w.shell.as_ref()).is_some_and(|s| s.live)
+    }
+
+    /// Send a key to the current shell world's program.
+    pub fn shell_key(&mut self, key: crate::websocket::ShellKey) -> Vec<Effect> {
+        let world_index = self.current;
+        self.send(WsMessage::ShellInput { world_index, key: Some(key), text: None, paste: false });
+        self.take()
+    }
+
+    /// Send typed/IME text to the current shell world's program.
+    pub fn shell_text(&mut self, text: String) -> Vec<Effect> {
+        let world_index = self.current;
+        self.send(WsMessage::ShellInput { world_index, key: None, text: Some(text), paste: false });
+        self.take()
+    }
+
+    /// Send a paste to the current shell world's program.
+    pub fn shell_paste(&mut self, text: String) -> Vec<Effect> {
+        let world_index = self.current;
+        self.send(WsMessage::ShellInput { world_index, key: None, text: Some(text), paste: true });
+        self.take()
+    }
+
+    /// Send a mouse event over the current shell world's grid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn shell_mouse(&mut self, kind: &str, button: u8, col: u16, row: u16, ctrl: bool, alt: bool, shift: bool) -> Vec<Effect> {
+        let world_index = self.current;
+        self.send(WsMessage::ShellMouse { world_index, kind: kind.to_string(), button, col, row, ctrl, alt, shift });
+        self.take()
+    }
+
     fn switch_to(&mut self, index: usize, now: Instant) {
         if index < self.worlds.len() && index != self.current {
             let previous = self.current;
@@ -1027,8 +1065,32 @@ impl ClientCore {
             WsMessage::WorldDisconnected { world_index } => {
                 if let Some(w) = self.worlds.get_mut(world_index) {
                     w.connected = false;
+                    // A shell world: freeze its screen (the session is gone server-side).
+                    if let Some(screen) = w.shell.as_mut() {
+                        screen.set_exited();
+                    }
                     self.changed();
                 }
+            }
+            WsMessage::ShellScreen { world_index, frame, base_frame, cols, rows, lines, cursor, mode, title, live, .. } => {
+                let accepted = match self.worlds.get_mut(world_index) {
+                    Some(w) => match w.shell.as_mut() {
+                        Some(screen) => screen.apply_msg(frame, base_frame, cols, rows, &lines, cursor, mode, title.clone(), live),
+                        None if base_frame.is_none() => {
+                            let mut screen = crate::shell::ShellScreen::new(cols, rows);
+                            let ok = screen.apply_msg(frame, None, cols, rows, &lines, cursor, mode, title.clone(), live);
+                            w.shell = Some(screen);
+                            ok
+                        }
+                        None => false,
+                    },
+                    None => true,
+                };
+                if !accepted {
+                    // A delta we can't build on: ask for the whole screen.
+                    self.send(WsMessage::RequestWorldState { world_index });
+                }
+                self.changed();
             }
             WsMessage::WorldAdded { world } => {
                 let at = world.index.min(self.worlds.len());
@@ -1289,6 +1351,7 @@ impl ClientCore {
             gmcp_user_enabled: m.gmcp_user_enabled,
             echo_masked: m.echo_masked,
             stats: m.stats.clone(),
+            shell: m.shell.as_ref().map(crate::shell::ShellScreen::from_state_msg),
             last_activity: [m.last_recv_secs, m.last_send_secs]
                 .into_iter()
                 .flatten()

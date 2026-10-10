@@ -71,6 +71,11 @@ impl Keys {
         self.bindings.get_action(key)
     }
 
+    /// The key→action table, for the shell-world carve-out (`shell::keys::classify`).
+    pub fn bindings(&self) -> &KeyBindings {
+        &self.bindings
+    }
+
     fn lookup(&self, name: String) -> Resolved {
         if self.server_bound.contains(&name) {
             return Resolved::Server(name);

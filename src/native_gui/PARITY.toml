@@ -3010,3 +3010,27 @@ phase = 4
 status = "done"
 feature = "action recent_worlds"
 note = "the Recent Worlds dialog (dialogs/small.rs RecentWorlds; the console's popup)"
+
+[[item]]
+id = "wire:ShellScreen"
+section = "wire"
+phase = 3
+status = "done"
+feature = "wire ShellScreen"
+note = "the shell world's screen as ANSI rows; core::client applies deltas, ui draws the grid + cursor"
+
+[[item]]
+id = "wire:ShellInput"
+section = "wire"
+phase = 3
+status = "done"
+feature = "wire ShellInput"
+note = "keys/text/paste to a shell world's PTY (key_down classify, input_view IME/paste)"
+
+[[item]]
+id = "wire:ShellMouse"
+section = "wire"
+phase = 6
+status = "done"
+feature = "wire ShellMouse"
+note = "mouse over a shell world's grid (core::shell_mouse); wheel now, clicks server-encoded"

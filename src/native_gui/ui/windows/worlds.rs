@@ -247,7 +247,7 @@ impl WorldsView {
             index,
             from_selector,
             section: Section::Server,
-            world_type: Pick::new(&[("mud", "MUD"), ("mud_timed_prompt", "MUD - Timed Prompt"), ("slack", "Slack"), ("discord", "Discord")], &s.world_type, window, cx),
+            world_type: Pick::new(&[("mud", "MUD"), ("mud_timed_prompt", "MUD - Timed Prompt"), ("slack", "Slack"), ("discord", "Discord"), ("shell", "Shell")], &s.world_type, window, cx),
             auto_login: Pick::new(&[("Connect", "Connect"), ("Prompt", "Prompt"), ("MOO_prompt", "MOO_prompt"), ("Lines", "Lines"), ("None", "None")], &s.auto_connect_type, window, cx),
             keep_alive: Pick::new(&[("NOP", "NOP"), ("Custom", "Custom"), ("Generic", "Generic"), ("None", "None")], &s.keep_alive_type, window, cx),
             encoding: Pick::new(&[("utf8", "UTF-8"), ("latin1", "Latin1"), ("fansi", "Fansi")], &s.encoding, window, cx),
@@ -647,6 +647,8 @@ impl WorldsView {
         let ty = ed.world_type.value(cx);
         let is_mud = ty == "mud" || ty == "mud_timed_prompt";
         let (is_slack, is_discord) = (ty == "slack", ty == "discord");
+        // A shell world (src/shell): the login shell, or the Command (held in `hostname`).
+        let is_shell = ty == "shell";
         let custom_keep_alive = ed.keep_alive.value(cx) == "Custom";
         let login_label = if is_slack || is_discord { "Channels" } else { "Login" };
         let mono = k.fonts.primary.clone();
@@ -662,6 +664,10 @@ impl WorldsView {
         let chat_list = |l: &Option<ChatList>| l.as_ref().map(|l| div().mt(px(4.0)).child(Select::new(&l.state).w_full().placeholder("(choose from list...)")));
         let with_pick = |name: &str, l: &Option<ChatList>| div().flex().flex_col().child(input(name)).children(chat_list(l)).into_any_element();
         let mut server = div().flex().flex_col().gap(px(6.0)).child(row("Name", input("name"))).child(row("Type", select(&ed.world_type)));
+        if is_shell {
+            // The Host field carries the command; blank runs the login shell.
+            server = server.child(row("Command", input("hostname")));
+        }
         if is_mud {
             server = server.child(row("Hostname", input("hostname"))).child(row("Port", input("port"))).child(row(
                 "Use SSL",
@@ -714,7 +720,9 @@ impl WorldsView {
         if is_discord {
             login = login.child(row("Send To", with_pick("discord_channel", &ed.chat.channels))).child(row("Show Only", input("discord_channels")));
         }
-        login = login.child(row("Reconnect", input("auto_reconnect")));
+        if !is_shell {
+            login = login.child(row("Reconnect", input("auto_reconnect")));
+        }
         let mut options = div().flex().flex_col().gap(px(6.0));
         if is_mud {
             options = options.child(row("Keep Alive", select(&ed.keep_alive)));
@@ -731,7 +739,11 @@ impl WorldsView {
                 cx.notify();
             })))
         };
-        let mut toggles = div().grid().grid_cols(2).gap(px(6.0)).pt(px(4.0)).child(toggle_cell("Logging", "world-logging", ed.logging, |e| e.logging = !e.logging, cx));
+        // A shell world logs nothing, so it has no Logging toggle (and no options at all).
+        let mut toggles = div().grid().grid_cols(2).gap(px(6.0)).pt(px(4.0));
+        if !is_shell {
+            toggles = toggles.child(toggle_cell("Logging", "world-logging", ed.logging, |e| e.logging = !e.logging, cx));
+        }
         if is_mud {
             toggles = toggles
                 .child(toggle_cell("MSP Sound", "world-msp", ed.msp, |e| e.msp = !e.msp, cx))

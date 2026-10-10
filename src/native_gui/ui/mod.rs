@@ -103,6 +103,9 @@ pub struct ClayView {
     /// TF's numeric prefix (`%kbnum`), shown as [N] after the world name.
     kbnum: Option<i64>,
     kbnum_sign: i64,
+    /// A shell world (src/shell): a bare Escape was sent to the PTY and we are waiting one
+    /// chord window for a possible `Esc-<key>` world switch.
+    shell_esc_armed: Option<Instant>,
     /// F8: lines matching an enabled action get a highlight.
     action_highlight: bool,
     /// The world the output last showed (a switch resets more-mode and the scroll).
@@ -191,6 +194,7 @@ impl ClayView {
             more: MoreMode::default(),
             keys: Keys::default(),
             kbnum: None,
+            shell_esc_armed: None,
             kbnum_sign: 1,
             action_highlight: false,
             shown_world: None,
@@ -415,6 +419,37 @@ impl ClayView {
             return true;
         }
         let Some((code, mods)) = keymap::console_key(ks) else { return false };
+        // A live shell world (src/shell) captures the keyboard: only the ten world-switch
+        // actions run; everything else goes to the PTY. Clipboard shortcuts above still win.
+        if self.session.core.current_is_live_shell() {
+            use crossterm::event::KeyCode;
+            if code == KeyCode::Esc && mods.is_empty() {
+                let fx = self.session.core.shell_key(crate::websocket::ShellKey { key: "Escape".into(), ..Default::default() });
+                self.after(fx, cx);
+                self.shell_esc_armed = Some(Instant::now());
+                return true;
+            }
+            let esc_armed = self.shell_esc_armed.map(|t| t.elapsed() < std::time::Duration::from_millis(500)).unwrap_or(false);
+            self.shell_esc_armed = None;
+            match crate::shell::keys::classify(code, mods, self.keys.bindings(), esc_armed) {
+                crate::shell::keys::Decision::Switch(action) => {
+                    self.run_action(&action, window, cx);
+                    return true;
+                }
+                crate::shell::keys::Decision::Forward(k) => {
+                    let fx = self.session.core.shell_key(k);
+                    self.after(fx, cx);
+                    return true;
+                }
+                crate::shell::keys::Decision::Text(c) => {
+                    if c != '\0' {
+                        let fx = self.session.core.shell_text(c.to_string());
+                        self.after(fx, cx);
+                    }
+                    return true;
+                }
+            }
+        }
         let resolved = self.keys.resolve(code, mods, Instant::now());
         // A history search ends at any key but its own.
         match &resolved {
@@ -593,6 +628,30 @@ impl ClayView {
         if restyle {
             self.restyle();
         }
+    }
+
+    /// A shell world's screen as output rows plus its cursor (src/shell). Each row's id
+    /// mixes its index with a hash of its text, so a row that changes re-lays-out while the
+    /// unchanged rows stay cached. `None` if the current world is not a shell world.
+    fn shell_output(&self) -> Option<(Vec<(u64, Arc<StyledLine>)>, Option<output::ShellCursor>)> {
+        use std::hash::{Hash, Hasher};
+        const SHELL_ID_BASE: u64 = 0xE000_0000_0000_0000;
+        let screen = self.session.core.current_world()?.shell.as_ref()?;
+        let lines = screen
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(row, text)| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                text.hash(&mut h);
+                let id = SHELL_ID_BASE | ((row as u64) << 32) | (h.finish() & 0xffff_ffff);
+                (id, Arc::new(crate::native_gui::core::style::style_line(text, &self.palette, &self.style)))
+            })
+            .collect();
+        let c = &screen.cursor;
+        let cursor = (c.visible && (c.row as usize) < screen.lines.len())
+            .then(|| output::ShellCursor { col: c.col, row: c.row, shape: c.shape, color: self.palette.fg });
+        Some((lines, cursor))
     }
 
     /// The current world's lines as the output shows them, with their ids.
@@ -824,13 +883,21 @@ impl Render for ClayView {
             Status::CertMismatch(m) => self.mismatch_screen(&m.host, &m.old_fingerprint, &m.new_fingerprint, cx).into_any_element(),
             _ if self.session.core.current_world().is_some_and(|w| w.showing_splash) => self.splash().into_any_element(),
             _ => {
+                // A shell world draws its grid with no wrapping and the real cursor; an
+                // ordinary world draws its (wrapped, selectable) lines.
+                let shell = self.shell_output();
+                let (lines, shell_cursor) = match shell {
+                    Some((lines, cursor)) => (lines, cursor),
+                    None => (self.visible_lines(), None),
+                };
+                let is_shell = shell_cursor.is_some() || self.session.core.current_world().is_some_and(|w| w.shell.is_some());
                 let snapshot = OutputSnapshot {
-                    lines: self.visible_lines(),
+                    lines,
                     background: self.palette.bg,
                     font_size: self.font_size,
                     fonts: self.fonts.clone(),
-                    wrapspace: self.wrapspace,
-                    wrap_columns: self.wrap_columns,
+                    wrapspace: if is_shell { 0 } else { self.wrapspace },
+                    wrap_columns: if is_shell { 0 } else { self.wrap_columns },
                     letter_spacing: self.letter_spacing,
                     word_spacing: self.word_spacing,
                     style_epoch: self.style_epoch,
@@ -839,6 +906,7 @@ impl Render for ClayView {
                     selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],
                     hover_link: self.select.hover_link.clone(),
                     scrollbar: self.mode.grep.is_some(),
+                    shell_cursor,
                 };
                 let link = self.select.hover_link.is_some();
                 div()

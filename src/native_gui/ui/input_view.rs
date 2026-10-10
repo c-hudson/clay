@@ -571,6 +571,12 @@ impl ClayView {
 
     pub(super) fn paste(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+            // A live shell world (src/shell): the paste goes to the PTY, not the input box.
+            if self.session.core.current_is_live_shell() {
+                let fx = self.session.core.shell_paste(text);
+                self.after(fx, cx);
+                return;
+            }
             self.editor.insert(&text);
             self.typed(cx);
         }
@@ -774,6 +780,13 @@ impl EntityInputHandler for ClayView {
     }
 
     fn replace_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, _w: &mut Window, cx: &mut Context<Self>) {
+        // A live shell world (src/shell): committed/IME text goes to the PTY, not the input
+        // box. (This is how CJK/IME input reaches a shell program.)
+        if self.session.core.current_is_live_shell() && range.is_none() && self.editor.marked.is_none() {
+            let fx = self.session.core.shell_text(text.to_string());
+            self.after(fx, cx);
+            return;
+        }
         let e = &mut self.editor;
         let r = range.map(|r| e.from_utf16(r.start)..e.from_utf16(r.end)).or(e.marked.clone()).or(e.selection()).unwrap_or(e.cursor..e.cursor);
         e.set_cursor(r.start, false);

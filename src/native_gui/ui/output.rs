@@ -76,6 +76,19 @@ pub struct OutputSnapshot {
     /// A scrollbar that stays, with its track, rather than the thumb that shows for a
     /// moment after a scroll: a grep window's, which has nothing else on screen.
     pub scrollbar: bool,
+    /// A shell world's cursor, drawn in the grid (src/shell). `None` for an ordinary world
+    /// or a hidden cursor.
+    pub shell_cursor: Option<ShellCursor>,
+}
+
+/// Where and how to draw a shell world's cursor. One grid cell at (col, row).
+#[derive(Clone, Copy)]
+pub struct ShellCursor {
+    pub col: u16,
+    pub row: u16,
+    /// 0 block, 1 underline, 2 beam, 3 hollow block.
+    pub shape: u8,
+    pub color: Rgb,
 }
 
 /// A grep window's scrollbar, as last laid out (window coordinates).
@@ -986,6 +999,25 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                     Look::Failed => paint_emoji_name(window, &p, e, run, x, baseline),
                     Look::Loading => {}
                 }
+            }
+        }
+        // A shell world's cursor, in the grid. The grid is monospace, so the column's x is
+        // col * ch; the row's top comes from the laid-out row (no wrapping on a shell).
+        if let Some(c) = p.snapshot.shell_cursor {
+            if let Some(vr) = p.rows.iter().find(|vr| vr.line == c.row as usize && vr.row == 0) {
+                let left = f32::from(p.content.origin.x);
+                let x = left + c.col as f32 * m.ch;
+                let top = vr.top;
+                let cell = match c.shape {
+                    // Underline: a bar along the bottom of the cell.
+                    1 => Bounds::new(point(px(x), px(top + m.row - 2.0)), size(px(m.ch), px(2.0))),
+                    // Beam: a bar down the left of the cell.
+                    2 => Bounds::new(point(px(x), px(top)), size(px(2.0), px(m.row))),
+                    // Block / hollow: the whole cell.
+                    _ => Bounds::new(point(px(x), px(top)), size(px(m.ch), px(m.row))),
+                };
+                let alpha = if c.shape == 3 { 0.30 } else { 0.55 };
+                window.paint_quad(fill(cell, hsla_alpha(c.color, alpha)));
             }
         }
         if blinking {
