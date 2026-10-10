@@ -1842,7 +1842,25 @@ mod local_server_bind_tests {
 
 #[cfg(test)]
 mod web_asset_tests {
-    use super::WEB_STYLE_CSS;
+    use super::{WEB_APP_JS, WEB_STYLE_CSS};
+
+    /// Every tab of Settings has a "?" text in app.js's popupHelpTexts (the Font tab's
+    /// was missing, so its "?" did nothing: B27), and the Web tab's no longer describes
+    /// the settings D8 removed.
+    #[test]
+    fn settings_help_texts_exist_and_are_current() {
+        let js = WEB_APP_JS;
+        let start = js.find("const popupHelpTexts = {").expect("popupHelpTexts");
+        let body = &js[start..start + js[start..].find("\n    };").expect("its end")];
+        for key in ["setup", "web", "font", "clay-server"] {
+            assert!(body.contains(&format!("\n        {key}: [")) || body.contains(&format!("'{key}': [")), "no help text for {key}");
+        }
+        let web = &body[body.find("\n        web: [").unwrap()..];
+        let web = &web[..web.find("\n        ],").unwrap()];
+        for gone in ["Protocol:", "HTTP Enabled", "HTTP Port"] {
+            assert!(!web.contains(gone), "the Web help still describes {gone}");
+        }
+    }
 
     /// A comment in style.css ends only where it means to (B15). "--theme-*/derived" once
     /// closed one early, and the browser threw away the whole `.stats-panel` rule after it.

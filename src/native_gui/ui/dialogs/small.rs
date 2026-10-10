@@ -757,10 +757,20 @@ mod tests {
         assert!(world.iter().any(|l| !l.is_empty()));
         assert!(help_text("clay-server").is_some(), "a quoted key");
         assert!(help_text("nonesuch").is_none());
-        // Every key a dialog asks for exists.
-        for key in ["setup", "web", "worldEditor", "worldSelector", "actionsList", "actionEditor", "connections"] {
+        // Every key a dialog asks for exists (Settings' Font tab asked for "font", which
+        // had none, so its "?" did nothing: B27).
+        for key in ["setup", "web", "font", "clay-server", "worldEditor", "worldSelector", "actionsList", "actionEditor", "connections"] {
             assert!(help_text(key).is_some_and(|l| !l.is_empty()), "{key}");
         }
+        // The Web tab's help describes the tab as it is now.
+        let web = help_text("web").expect("web help").join("\n");
+        for field in ["Port:", "Web Path:", "Remote Lines:", "Allow List:", "Password:", "Custom Cert File:", "Auth Key:", "Remote Access:"] {
+            assert!(web.contains(field), "web help has no {field}");
+        }
+        for gone in ["Protocol:", "HTTP Enabled", "HTTP Port"] {
+            assert!(!web.contains(gone), "web help still describes {gone}");
+        }
+        assert!(help_text("font").expect("font help").iter().any(|l| l.starts_with("Input Ht:")));
     }
 
     #[test]
