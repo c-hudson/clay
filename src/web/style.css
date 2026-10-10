@@ -138,6 +138,45 @@ body {
     font-family: 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', 'Twemoji Mozilla', 'EmojiOne Color', sans-serif;
 }
 
+/* A box-drawing character (app.js BOX_DRAWING): one cell, its lines a mask in the text
+   colour; the mask itself is a per-character rule in the #box-drawing stylesheet. */
+.blk.bx {
+    width: 1ch;
+}
+.bx::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: currentColor;
+    -webkit-mask-size: 100% 100%;
+    mask-size: 100% 100%;
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    pointer-events: none;
+}
+
+/* A symbol in its text form (app.js wrapEmoji: ✌ ♥ ☺︎): the output's font, then the
+   symbol fonts, rather than the colour emoji font the browser falls back to. */
+#output .emoji-text {
+    font-family: var(--mono-override, var(--mono)), 'Noto Sans Symbols 2', 'Noto Sans Symbols2', 'Segoe UI Symbol', 'Apple Symbols', 'DejaVu Sans', 'Symbola', sans-serif;
+    font-variant-emoji: text;
+    /* A symbol font is taller than the output's: on the baseline still, but its row stays
+       one line tall. */
+    line-height: 0;
+}
+
+/* A Discord emoji (app.js convertDiscordEmojis): a little taller than the text, as on
+   Discord, but the negative margins keep it from making its row taller than the others
+   (the native GUI's rows are one line each too, and the History count assumes it). */
+.discord-emoji {
+    height: 1.2em;
+    vertical-align: middle;
+    margin-block: -0.5em;
+}
+
 /* A shade cell (░▒▓): the text colour at the shade's opacity over the cell. */
 .blk-shade {
     position: absolute;

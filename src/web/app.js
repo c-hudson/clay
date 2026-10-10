@@ -6783,21 +6783,45 @@
     }
 
     // Transpose two characters before cursor (Ctrl+T)
+    // Whole characters as a reader sees them - a ZWJ family, a flag, a letter with its
+    // accents - so a cursor step, a delete or ^T never stops inside one and leaves half an
+    // emoji behind (the native GUI's input does the same). Positions are the textarea's
+    // UTF-16 offsets. Without Intl.Segmenter (Firefox before 125), whole code points.
+    const GRAPHEMES = (typeof Intl !== 'undefined' && Intl.Segmenter)
+        ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+    function graphemeBefore(text, pos) {
+        if (pos <= 0) return 0;
+        if (GRAPHEMES) return GRAPHEMES.segment(text).containing(pos - 1).index;
+        const low = text.charCodeAt(pos - 1);
+        return (low & 0xFC00) === 0xDC00 && pos >= 2 && (text.charCodeAt(pos - 2) & 0xFC00) === 0xD800 ? pos - 2 : pos - 1;
+    }
+    function graphemeAfter(text, pos) {
+        if (pos >= text.length) return text.length;
+        if (GRAPHEMES) {
+            const g = GRAPHEMES.segment(text).containing(pos);
+            return g.index + g.segment.length;
+        }
+        const high = text.charCodeAt(pos);
+        return (high & 0xFC00) === 0xD800 && pos + 1 < text.length && (text.charCodeAt(pos + 1) & 0xFC00) === 0xDC00 ? pos + 2 : pos + 1;
+    }
+
+    // ^T: swap the two characters before the cursor at the end of the line, else the two
+    // around it, and leave the cursor after them.
     function transposeChars() {
         const input = elements.input;
         const text = input.value;
         const pos = input.selectionStart;
-        if (text.length < 2 || pos === 0) return;
-        let a, b;
-        if (pos >= text.length) {
-            a = text.length - 2; b = text.length - 1;
-        } else {
-            a = pos - 1; b = pos;
-        }
-        const chars = text.split('');
-        const tmp = chars[a]; chars[a] = chars[b]; chars[b] = tmp;
-        input.value = chars.join('');
-        input.selectionStart = input.selectionEnd = b + 1;
+        if (pos === 0) return;
+        const starts = [];
+        for (let p = 0; p < text.length; p = graphemeAfter(text, p)) starts.push(p);
+        if (starts.length < 2) return;
+        let at = starts.findIndex(p => p >= pos);
+        if (at === -1) at = starts.length;
+        const [a, b] = at >= starts.length ? [starts.length - 2, starts.length - 1] : [at - 1, at];
+        const end = b + 1 < starts.length ? starts[b + 1] : text.length;
+        const first = text.substring(starts[a], starts[b]), second = text.substring(starts[b], end);
+        input.value = text.substring(0, starts[a]) + second + first + text.substring(end);
+        input.selectionStart = input.selectionEnd = end;
     }
 
     // Collapse multiple spaces around cursor to one (Esc+Space)
@@ -8462,14 +8486,26 @@
     }
 
     // An emoji cluster as a browser shows it in colour: a character whose default form is
-    // emoji (unless VS15, U+FE0E, asks for text), or any one with VS16 (U+FE0F), with its
-    // skin tone and ZWJ-joined parts; a flag (two regional indicators); a keycap.
+    // emoji (unless VS15, U+FE0E, asks for text), or any one with VS16 (U+FE0F), a skin
+    // tone or a ZWJ after it (✌🏻 and ❤‍🔥 need no VS16), with its
+    // skin tone or tag sequence (the Scotland and England flags are a black flag followed
+    // by tag characters - split from them, it's drawn as a plain black flag) and its
+    // ZWJ-joined parts; a flag (two regional indicators); a keycap.
     // Text-default symbols (©, ™, ↔) stay text.
     const EMOJI_CLUSTER = new RegExp(
         '(?:\\p{RI}\\p{RI}' +
         '|[#*0-9]\\uFE0F?\\u20E3' +
-        '|(?:\\p{Emoji_Presentation}(?!\\uFE0E)|\\p{Extended_Pictographic}\\uFE0F)\\p{EMod}?' +
+        '|(?:\\p{Emoji_Presentation}(?!\\uFE0E)|\\p{Extended_Pictographic}(?:\\uFE0F|(?=[\\p{EMod}\\u200D])))(?:\\p{EMod}|[\\u{E0020}-\\u{E007E}]+\\u{E007F})?' +
         '(?:\\u200D(?:\\p{Emoji_Presentation}|\\p{Extended_Pictographic})\\uFE0F?\\p{EMod}?)*)', 'gu');
+
+    // Or a pictograph outside such a cluster, which is in its text form: a text-default
+    // symbol with no VS16 (✌, ♥, ©), or any one with VS15 (☺︎). One the output's font
+    // lacks fell back to the colour emoji font all the same, so it gets the output's font
+    // and then the symbol fonts (.emoji-text) - as the native GUI draws it. A VS15 goes
+    // just after the span: WebKit wants one font with both characters, the symbol fonts
+    // have no VS15, and with it inside the colour font won again. It draws as nothing, and
+    // a copy still has it.
+    const EMOJI_OR_TEXT_FORM = new RegExp(EMOJI_CLUSTER.source + '|(\\p{Extended_Pictographic})(\\uFE0E?)', 'gu');
 
     // Emoji in the colour emoji font. A font earlier in the output's font list can have its
     // own black-and-white glyph for an emoji - Windows' Cascadia Code draws ⬛⬜ as a filled
@@ -8478,7 +8514,9 @@
     function wrapEmoji(html) {
         if (!/[\u00A9-\u{1FAFF}]/u.test(html)) return html;
         return html.split(/(<[^>]*>)/).map((part, i) =>
-            i % 2 === 1 ? part : part.replace(EMOJI_CLUSTER, m => '<span class="emoji">' + m + '</span>')).join('');
+            i % 2 === 1 ? part : part.replace(EMOJI_OR_TEXT_FORM, (m, symbol, vs15) => symbol === undefined
+                ? '<span class="emoji">' + m + '</span>'
+                : '<span class="emoji-text">' + symbol + '</span>' + vs15)).join('');
     }
 
     // One drawn line's HTML, the same for both paths. `o`: ts, fromServer, archiveSourced,
@@ -8498,6 +8536,8 @@
         // Mirrors OutputLine::shows_archive_prefix(): both flags mean "text from scrollback.db".
         const archivePrefix = (o.fromArchive || o.archiveSourced) ? '🛢️ ' : '';
         let html = tsPrefix + newLinePrefix + archivePrefix + wrapEmoji(showTags ? processed : convertDiscordEmojis(processed));
+        const lang = cjkLang(cleanLine);
+        if (lang) html = '<span lang="' + lang + '">' + html + '</span>';
         // Apply /highlight color from action command (takes priority)
         if (o.highlightColor !== null && o.highlightColor !== undefined) {
             html = `<span style="background-color: ${colorNameToCss(o.highlightColor)}; display: block;">${html}</span>`;
@@ -8507,6 +8547,29 @@
             html = `<span class="action-highlight">${html}</span>`;
         }
         return html;
+    }
+
+    // Han characters and CJK punctuation are drawn in Japanese, Simplified Chinese,
+    // Traditional Chinese or Korean forms (、 and 。 sit in the corner in Japanese and
+    // Simplified Chinese, centred in Traditional), and the browser picks the form from the
+    // text's language. Given none, it used one font for all of it - WebKitGTK picked
+    // Traditional Chinese, so even Japanese got centred punctuation. So a line with CJK text
+    // names its language: kana make it Japanese, Hangul Korean, and Han alone follows the
+    // user's own language when that is Chinese, Japanese or Korean, else Simplified Chinese
+    // (what the native GUI draws).
+    const CJK_DEFAULT_LANG = (function() {
+        const l = String((typeof navigator !== 'undefined' && navigator.language) || '').toLowerCase();
+        if (/^zh-(tw|hk|mo)\b|^zh-hant/.test(l)) return 'zh-Hant';
+        if (l.startsWith('zh')) return 'zh-Hans';
+        if (l.startsWith('ja')) return 'ja';
+        if (l.startsWith('ko')) return 'ko';
+        return 'zh-Hans';
+    })();
+    function cjkLang(text) {
+        if (!/[\u1100-\u11FF\u3000-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFFEF]/.test(text)) return null;
+        if (/[\u3040-\u30FF\u31F0-\u31FF\uFF66-\uFF9F]/.test(text)) return 'ja';
+        if (/[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]/.test(text)) return 'ko';
+        return CJK_DEFAULT_LANG;
     }
 
     // The line's element. data-seq names the line for good (Debug Selection, the view anchor);
@@ -8557,6 +8620,7 @@
     let lastRenderedWorld = null;
 
     function renderOutput(opts) {
+        boxDrawingRefresh();
         const preserveScroll = !!(opts && opts.preserveScroll);
         noteScrollCause(preserveScroll ? 'render-keep' : 'render');
         const world = worlds[currentWorldIndex];
@@ -9295,6 +9359,220 @@
         return '<span class="blk" style="' + style + '">' + text + '</span>';
     }
 
+    // Box drawing (U+2500-U+257F) as exact cell geometry, the way terminals draw it - a port
+    // of the native GUI's core/boxdraw.rs, so both draw the same lines. The output's
+    // JetBrains Mono has no box-drawing glyphs, so they came from a fallback font whose
+    // columns are a little narrower or wider (Windows' Cascadia Code is 2% narrower: a box's
+    // edges drifted off its corners along a row) and whose glyphs are made for taller lines
+    // than the output's one-line rows (vertical lines broke between rows). Here each
+    // character is one cell, its lines a mask in the text colour (.bx), computed in device
+    // pixels so a line leaving one cell enters the next at the same pixel.
+    const BOX_DRAWING = (function() {
+        const N = 0, L = 1, H = 2, D = 3;
+        const f = Math.fround; // the native code's f32 arithmetic, so the two agree exactly
+        // U+2500-U+254B: left, right, up, down.
+        const LINES = [
+            [L, L, N, N], [H, H, N, N], [N, N, L, L], [N, N, H, H],
+            [N, N, N, N], [N, N, N, N], [N, N, N, N], [N, N, N, N], [N, N, N, N], [N, N, N, N], [N, N, N, N], [N, N, N, N],
+            [N, L, N, L], [N, H, N, L], [N, L, N, H], [N, H, N, H],
+            [L, N, N, L], [H, N, N, L], [L, N, N, H], [H, N, N, H],
+            [N, L, L, N], [N, H, L, N], [N, L, H, N], [N, H, H, N],
+            [L, N, L, N], [H, N, L, N], [L, N, H, N], [H, N, H, N],
+            [N, L, L, L], [N, H, L, L], [N, L, H, L], [N, L, L, H],
+            [N, L, H, H], [N, H, H, L], [N, H, L, H], [N, H, H, H],
+            [L, N, L, L], [H, N, L, L], [L, N, H, L], [L, N, L, H],
+            [L, N, H, H], [H, N, H, L], [H, N, L, H], [H, N, H, H],
+            [L, L, N, L], [H, L, N, L], [L, H, N, L], [H, H, N, L],
+            [L, L, N, H], [H, L, N, H], [L, H, N, H], [H, H, N, H],
+            [L, L, L, N], [H, L, L, N], [L, H, L, N], [H, H, L, N],
+            [L, L, H, N], [H, L, H, N], [L, H, H, N], [H, H, H, N],
+            [L, L, L, L], [H, L, L, L], [L, H, L, L], [H, H, L, L],
+            [L, L, H, L], [L, L, L, H], [L, L, H, H], [H, L, H, L],
+            [L, H, H, L], [H, L, L, H], [L, H, L, H], [H, H, H, L],
+            [H, H, L, H], [H, L, H, H], [L, H, H, H], [H, H, H, H],
+        ];
+        // U+2550-U+256C.
+        const DOUBLES = [
+            [D, D, N, N], [N, N, D, D],
+            [N, D, N, L], [N, L, N, D], [N, D, N, D],
+            [D, N, N, L], [L, N, N, D], [D, N, N, D],
+            [N, D, L, N], [N, L, D, N], [N, D, D, N],
+            [D, N, L, N], [L, N, D, N], [D, N, D, N],
+            [N, D, L, L], [N, L, D, D], [N, D, D, D],
+            [D, N, L, L], [L, N, D, D], [D, N, D, D],
+            [D, D, N, L], [L, L, N, D], [D, D, N, D],
+            [D, D, L, N], [L, L, D, N], [D, D, D, N],
+            [D, D, L, L], [L, L, D, D], [D, D, D, D],
+        ];
+        // U+2574-U+257F: half lines.
+        const HALVES = [
+            [L, N, N, N], [N, N, L, N], [N, L, N, N], [N, N, N, L],
+            [H, N, N, N], [N, N, H, N], [N, H, N, N], [N, N, N, H],
+            [L, H, N, N], [N, N, L, H], [H, L, N, N], [N, N, H, L],
+        ];
+        function glyph(n) {
+            if (n >= 0x2504 && n <= 0x250B) {
+                const k = n - 0x2504;
+                return { dashes: { horizontal: k % 4 < 2, heavy: k % 2 === 1, count: k < 4 ? 3 : 4 } };
+            }
+            if (n >= 0x254C && n <= 0x254F) {
+                const k = n - 0x254C;
+                return { dashes: { horizontal: k < 2, heavy: k % 2 === 1, count: 2 } };
+            }
+            if (n >= 0x2500 && n <= 0x254B) return { lines: LINES[n - 0x2500] };
+            if (n >= 0x2550 && n <= 0x256C) return { lines: DOUBLES[n - 0x2550] };
+            if (n >= 0x256D && n <= 0x2570) return { arc: { right: n === 0x256D || n === 0x2570, down: n <= 0x256E } };
+            if (n >= 0x2571 && n <= 0x2573) return { diagonal: { rising: n !== 0x2572, falling: n !== 0x2571 } };
+            if (n >= 0x2574 && n <= 0x257F) return { lines: HALVES[n - 0x2574] };
+            return null;
+        }
+        // Line thicknesses for a row this many device pixels tall.
+        function thickness(rowPx) {
+            const light = Math.max(1, Math.round(f(f(rowPx) * f(0.075))));
+            return { light: light, heavy: Math.max(light + 1, Math.round(f(f(rowPx) * f(0.16)))) };
+        }
+        // The strips a line of this weight occupies across its direction, centred on
+        // `centre`: one, or two for a double line (each light-thick, light apart).
+        function bands(centre, weight, t) {
+            const one = (w) => { const s = centre - Math.floor(w / 2); return [s, s + w]; };
+            if (weight === N) return [];
+            if (weight === L) return [one(t.light)];
+            if (weight === H) return [one(t.heavy)];
+            const span = 3 * t.light, s = centre - Math.floor(span / 2);
+            return [[s, s + t.light], [s + 2 * t.light, s + span]];
+        }
+        // How far toward the centre line k of an arm reaches (boxdraw.rs `reach`).
+        function reach(plusSide, dbl, k, minus, plus, opposite, centre) {
+            const start = (b) => plusSide ? b[0] : b[1];
+            if (dbl) {
+                const same = k === 0 ? minus : plus, other = k === 0 ? plus : minus;
+                const near = (b) => plusSide ? b[b.length - 1] : b[0];
+                const far = (b) => plusSide ? b[0] : b[b.length - 1];
+                if (same.length) return start(near(same));
+                if (other.length) return start(far(other));
+                return centre;
+            }
+            if (opposite) return centre;
+            const all = minus.concat(plus).sort((a, b) => a[0] - b[0]);
+            if (!all.length) return centre;
+            const near = plusSide ? all[all.length - 1] : all[0];
+            const far = plusSide ? all[0] : all[all.length - 1];
+            const crossing = minus.length > 0 && plus.length > 0;
+            return crossing && (minus.length === 2 || plus.length === 2) ? start(near) : start(far);
+        }
+        // What to paint for character n in a cell: filled rects [x0, y0, x1, y1] and
+        // stroked paths [width, [[op, ...points]]], in device pixels.
+        function shape(n, cell, t) {
+            const g = glyph(n);
+            if (!g) return null;
+            const x0 = cell.x0, x1 = cell.x1, y0 = cell.y0, y1 = cell.y1;
+            const cx = x0 + Math.floor((x1 - x0) / 2), cy = y0 + Math.floor((y1 - y0) / 2);
+            const rects = [], strokes = [];
+            if (g.lines) {
+                const [left, right, up, down] = g.lines;
+                const hL = bands(cy, left, t), hR = bands(cy, right, t), vU = bands(cx, up, t), vD = bands(cx, down, t);
+                hL.forEach((b, k) => rects.push([x0, b[0], reach(false, left === D, k, vU, vD, right !== N, cx), b[1]]));
+                hR.forEach((b, k) => rects.push([reach(true, right === D, k, vU, vD, left !== N, cx), b[0], x1, b[1]]));
+                vU.forEach((b, k) => rects.push([b[0], y0, b[1], reach(false, up === D, k, hL, hR, down !== N, cy)]));
+                vD.forEach((b, k) => rects.push([b[0], reach(true, down === D, k, hL, hR, up !== N, cy), b[1], y1]));
+                return { rects: rects.filter(r => r[2] > r[0] && r[3] > r[1]), strokes: strokes };
+            }
+            if (g.dashes) {
+                const d = g.dashes;
+                const lo = d.horizontal ? x0 : y0, hi = d.horizontal ? x1 : y1;
+                const band = bands(d.horizontal ? cy : cx, d.heavy ? H : L, t)[0];
+                const seg = f(f(hi - lo) / d.count);
+                const gap = Math.max(1, Math.round(f(seg * f(0.35))));
+                for (let i = 0; i < d.count; i++) {
+                    const a = Math.round(f(f(lo + f(seg * i)) + gap / 2));
+                    const b = Math.round(f(f(lo + f(seg * (i + 1))) - gap / 2));
+                    if (b > a) rects.push(d.horizontal ? [a, band[0], b, band[1]] : [band[0], a, band[1], b]);
+                }
+                return { rects: rects, strokes: strokes };
+            }
+            if (g.arc) {
+                // The line's centre is where a straight light line's centre is, so the arc
+                // meets its neighbours exactly.
+                const h = bands(cy, L, t)[0], v = bands(cx, L, t)[0];
+                const ly = (h[0] + h[1]) / 2, lx = (v[0] + v[1]) / 2;
+                const ex = g.arc.right ? x1 : x0, ey = g.arc.down ? y1 : y0;
+                const r = Math.min(Math.abs(ex - lx), Math.abs(ey - ly));
+                const sx = g.arc.right ? 1 : -1, sy = g.arc.down ? 1 : -1;
+                const K = 0.5522848; // a quarter circle as one cubic
+                strokes.push([t.light, [['M', ex, ly], ['L', lx + sx * r, ly],
+                    ['C', lx + sx * r * (1 - K), ly, lx, ly + sy * r * (1 - K), lx, ly + sy * r], ['L', lx, ey]]]);
+                return { rects: rects, strokes: strokes };
+            }
+            if (g.diagonal.rising) strokes.push([t.light, [['M', x0, y1], ['L', x1, y0]]]);
+            if (g.diagonal.falling) strokes.push([t.light, [['M', x0, y0], ['L', x1, y1]]]);
+            return { rects: rects, strokes: strokes };
+        }
+        // Character n in a w x h device-pixel cell, as an SVG to mask with.
+        function svg(n, w, h) {
+            const sh = shape(n, { x0: 0, x1: w, y0: 0, y1: h }, thickness(h));
+            let body = '';
+            for (const r of sh.rects) {
+                body += '<rect x="' + r[0] + '" y="' + r[1] + '" width="' + (r[2] - r[0]) + '" height="' + (r[3] - r[1]) + '"/>';
+            }
+            for (const [width, segs] of sh.strokes) {
+                const d = segs.map(s => s[0] + s.slice(1).map(v => +v.toFixed(3)).join(' ')).join(' ');
+                body += '<path fill="none" stroke="#000" stroke-width="' + width + '" shape-rendering="geometricPrecision" d="' + d + '"/>';
+            }
+            return '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h +
+                '" preserveAspectRatio="none" shape-rendering="crispEdges">' + body + '</svg>';
+        }
+        return { glyph: glyph, shape: shape, svg: svg, thickness: thickness };
+    })();
+
+    // The masks live in one stylesheet, a rule per character drawn so far, made for the
+    // output's cell in device pixels; boxDrawingRefresh() remakes them when that changes.
+    const boxDrawingRules = { cell: null, codes: new Set(), sheet: null };
+    function boxDrawingCell() {
+        const probe = document.createElement('span');
+        probe.textContent = '0'.repeat(50);
+        probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;';
+        elements.output.appendChild(probe);
+        const chPx = probe.getBoundingClientRect().width / 50;
+        probe.remove();
+        const dpr = window.devicePixelRatio || 1;
+        return { w: Math.max(1, Math.round(chPx * dpr)), h: Math.max(1, Math.round(lineHeightPx() * dpr)) };
+    }
+    function boxDrawingWriteRules() {
+        const c = boxDrawingRules.cell;
+        let css = '';
+        for (const n of boxDrawingRules.codes) {
+            const url = 'url("data:image/svg+xml,' + encodeURIComponent(BOX_DRAWING.svg(n, c.w, c.h)) + '")';
+            css += '.bx-' + n.toString(16) + '::before{-webkit-mask-image:' + url + ';mask-image:' + url + ';}\n';
+        }
+        if (!boxDrawingRules.sheet) {
+            boxDrawingRules.sheet = document.createElement('style');
+            boxDrawingRules.sheet.id = 'box-drawing';
+            document.head.appendChild(boxDrawingRules.sheet);
+        }
+        boxDrawingRules.sheet.textContent = css;
+    }
+    // The font, its size or the screen's scale may have changed: remake the masks if the cell did.
+    function boxDrawingRefresh() {
+        if (!boxDrawingRules.codes.size || !elements.output) return;
+        const cell = boxDrawingCell();
+        const old = boxDrawingRules.cell;
+        if (old && old.w === cell.w && old.h === cell.h) return;
+        boxDrawingRules.cell = cell;
+        boxDrawingWriteRules();
+    }
+    // A run of one box-drawing character: a cell each, so a long rule still wraps.
+    function boxDrawingCells(run, ch) {
+        const n = ch.charCodeAt(0);
+        if (!BOX_DRAWING.glyph(n)) return run;
+        if (!boxDrawingRules.codes.has(n)) {
+            boxDrawingRules.codes.add(n);
+            if (!boxDrawingRules.cell) boxDrawingRules.cell = boxDrawingCell();
+            boxDrawingWriteRules();
+        }
+        const cell = '<span class="blk bx bx-' + n.toString(16) + '">' + ch + '</span>';
+        return cell.repeat(run.length);
+    }
+
     function renderBlockElements(html) {
         // Spaces inside a span with a background (an ANSI bg colour or class): the
         // art's solid-colour cells. Only text directly inside such a span is touched.
@@ -9303,8 +9581,9 @@
                 return open + text.replace(/ +/g, function(sp) { return cellSpan(sp, null); });
             });
         }
-        if (!/[▀-▟]/.test(html)) return html;
-        return html.replace(/([▀-▟])\1*/g, function(run, ch) {
+        if (!/[─-▟]/.test(html)) return html;
+        return html.replace(/([─-▟])\1*/g, function(run, ch) {
+            if (ch < '▀') return boxDrawingCells(run, ch);
             const layers = BLOCK_ELEMENT_LAYERS[ch];
             return layers ? cellSpan(run, layers) : run;
         });
@@ -9322,8 +9601,25 @@
             const safeName = escapeHtml(name);
             const safeId = escapeHtml(id);
             const url = `https://cdn.discordapp.com/emojis/${safeId}.${ext}`;
-            return `<img src="${url}" alt=":${safeName}:" title=":${safeName}:" class="discord-emoji" style="height: 1.2em; vertical-align: middle;">`;
+            // One that didn't load before (deleted from Discord, or no network) is its name,
+            // as the native GUI shows it, not a broken-image box.
+            if (failedDiscordEmoji.has(url)) return `:${safeName}:`;
+            return `<img src="${url}" alt=":${safeName}:" title=":${safeName}:" class="discord-emoji">`;
         });
+    }
+
+    // Discord emoji images that failed to load (see convertDiscordEmojis).
+    const failedDiscordEmoji = new Set();
+
+    // An emoji image that fails to load becomes its name, and is drawn as its name from then
+    // on. 'error' doesn't bubble, so this listens in the capture phase.
+    function watchDiscordEmojiErrors(container) {
+        container.addEventListener('error', function(e) {
+            const img = e.target;
+            if (!img || img.tagName !== 'IMG' || !img.classList.contains('discord-emoji')) return;
+            failedDiscordEmoji.add(img.src);
+            img.replaceWith(document.createTextNode(img.alt));
+        }, true);
     }
 
     // Escape HTML
@@ -13893,20 +14189,20 @@
             case 'cursor_left': {
                 const input = elements.input;
                 const n = takeKbnum();
-                const dir = n >= 0 ? -1 : 1;
+                const back = n >= 0;
                 for (let i = 0; i < Math.abs(n); i++) {
-                    const pos = input.selectionStart + dir;
-                    if (pos >= 0 && pos <= input.value.length) input.selectionStart = input.selectionEnd = pos;
+                    const p = input.selectionStart;
+                    input.selectionStart = input.selectionEnd = back ? graphemeBefore(input.value, p) : graphemeAfter(input.value, p);
                 }
                 return true;
             }
             case 'cursor_right': {
                 const input = elements.input;
                 const n = takeKbnum();
-                const dir = n >= 0 ? 1 : -1;
+                const back = n < 0;
                 for (let i = 0; i < Math.abs(n); i++) {
-                    const pos = input.selectionStart + dir;
-                    if (pos >= 0 && pos <= input.value.length) input.selectionStart = input.selectionEnd = pos;
+                    const p = input.selectionStart;
+                    input.selectionStart = input.selectionEnd = back ? graphemeBefore(input.value, p) : graphemeAfter(input.value, p);
                 }
                 return true;
             }
@@ -13983,10 +14279,11 @@
                     const pos = input.selectionStart;
                     const text = input.value;
                     if (forward) {
-                        if (pos < text.length) { input.value = text.substring(0, pos) + text.substring(pos + 1); input.selectionStart = input.selectionEnd = pos; }
+                        if (pos < text.length) { input.value = text.substring(0, pos) + text.substring(graphemeAfter(text, pos)); input.selectionStart = input.selectionEnd = pos; }
                     } else if (pos > 0) {
-                        input.value = text.substring(0, pos - 1) + text.substring(pos);
-                        input.selectionStart = input.selectionEnd = pos - 1;
+                        const from = graphemeBefore(text, pos);
+                        input.value = text.substring(0, from) + text.substring(pos);
+                        input.selectionStart = input.selectionEnd = from;
                     }
                 }
                 return true;
@@ -14000,10 +14297,11 @@
                     const pos = input.selectionStart;
                     const text = input.value;
                     if (forward) {
-                        if (pos < text.length) { input.value = text.substring(0, pos) + text.substring(pos + 1); input.selectionStart = input.selectionEnd = pos; }
+                        if (pos < text.length) { input.value = text.substring(0, pos) + text.substring(graphemeAfter(text, pos)); input.selectionStart = input.selectionEnd = pos; }
                     } else if (pos > 0) {
-                        input.value = text.substring(0, pos - 1) + text.substring(pos);
-                        input.selectionStart = input.selectionEnd = pos - 1;
+                        const from = graphemeBefore(text, pos);
+                        input.value = text.substring(0, from) + text.substring(pos);
+                        input.selectionStart = input.selectionEnd = from;
                     }
                 }
                 return true;
@@ -15414,6 +15712,8 @@
         }, { passive: false });
 
         // Strip zero-width spaces from copied text (inserted by insertWordBreaks for wrapping)
+        watchDiscordEmojiErrors(elements.output);
+
         document.addEventListener('copy', function(e) {
             const selection = window.getSelection();
             if (selection && selection.toString().length > 0) {
@@ -15425,6 +15725,8 @@
 
         // Window resize handler to update separator fill and maintain scroll position
         window.addEventListener('resize', function() {
+            // A move to a screen of another scale changes the device-pixel cell.
+            boxDrawingRefresh();
             // If we were following the bottom before resize, stay at bottom
             if (followBottom) {
                 scrollToBottom();
