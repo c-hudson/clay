@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::process::Command;
-use strsim::levenshtein;
+use strsim::osa_distance;
 
 // System dictionary paths to try (in order of preference)
 const SYSTEM_DICT_PATHS: &[&str] = &[
@@ -211,23 +211,35 @@ impl SpellChecker {
 
     pub fn suggestions(&self, word: &str, count: usize) -> Vec<String> {
         let word_lower = word.to_lowercase();
-        let mut candidates: Vec<(String, usize)> = self
+        // A word's letters in order: the same letters as the typo means a swapped pair.
+        let letters = |s: &str| {
+            let mut c: Vec<char> = s.chars().collect();
+            c.sort_unstable();
+            c
+        };
+        let mine = letters(&word_lower);
+        let first = word_lower.chars().next();
+        let mut candidates: Vec<(usize, bool, bool, usize, &String)> = self
             .words
             .iter()
             .filter(|w| {
                 let len_diff = (w.len() as i32 - word_lower.len() as i32).abs();
                 len_diff <= 3
             })
-            .map(|w| {
-                let dist = levenshtein(&word_lower, w);
-                (w.clone(), dist)
-            })
-            .filter(|(_, dist)| *dist <= 3)
+            // A swapped pair counts as one edit (optimal string alignment), as the typo it
+            // usually is: plain Levenshtein made "teh" -> "the" two, behind every one-letter
+            // change ("tex", "meh").
+            .map(|w| (osa_distance(&word_lower, w), w))
+            .filter(|(dist, _)| *dist <= 3)
+            .map(|(dist, w)| (dist, letters(w) != mine, w.chars().next() != first, w.len().abs_diff(word_lower.len()), w))
             .collect();
 
-        candidates.sort_by_key(|(_, dist)| *dist);
+        // Closest first; among equals the same letters (a swap), the same first letter, the
+        // nearest length, then alphabetical - never the HashSet's order, which changed from
+        // run to run.
+        candidates.sort();
         candidates.truncate(count);
-        candidates.into_iter().map(|(w, _)| w).collect()
+        candidates.into_iter().map(|(_, _, _, _, w)| w.clone()).collect()
     }
 }
 
@@ -269,5 +281,27 @@ impl SpellState {
 impl Default for SpellState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checker(words: &[&str]) -> SpellChecker {
+        SpellChecker { words: words.iter().map(|w| w.to_string()).collect() }
+    }
+
+    #[test]
+    fn a_swapped_pair_ranks_first_and_the_order_is_fixed() {
+        let c = checker(&["tex", "meh", "ten", "tea", "the", "tee", "eh", "thee", "zebra"]);
+        let got = c.suggestions("teh", 6);
+        assert_eq!(got[0], "the", "a swap is one edit, and the same letters win ties: {got:?}");
+        // Then one-letter changes starting with the same letter, alphabetically; then the
+        // rest, the same length ("meh") before a shorter one ("eh").
+        assert_eq!(got, vec!["the", "tea", "tee", "ten", "tex", "meh"]);
+        for _ in 0..5 {
+            assert_eq!(checker(&["tex", "meh", "ten", "tea", "the", "tee", "eh", "thee"]).suggestions("teh", 6), got);
+        }
     }
 }
