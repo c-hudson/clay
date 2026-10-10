@@ -3000,6 +3000,16 @@ fn run_shell_on_terminal(app: &App, command: Option<&str>) -> Result<i32, String
 /// that was ignored when Clay started stays ignored, as TF leaves it: `nohup clay -D` must
 /// survive its terminal closing.
 #[cfg(all(unix, not(target_os = "android")))]
+/// Crossterm mouse button to the code `shell::keys::mouse` expects (0 left, 1 middle,
+/// 2 right).
+fn mouse_button_code(b: MouseButton) -> u8 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
 pub(crate) fn spawn_tf_signal_handlers(event_tx: &mpsc::Sender<AppEvent>) {
     for (kind, signum, event) in [
         (SignalKind::terminate(), libc::SIGTERM, tf::TfHookEvent::Sigterm),
@@ -5328,6 +5338,9 @@ pub struct App {
     /// immediate expiry without sleeping for real.
     pub chord_window: std::time::Duration,
     pub literal_next: bool, // When true, next keypress inserts literally (Ctrl+V)
+    /// A shell world (src/shell): a bare Escape was sent to the PTY and we are waiting one
+    /// chord window for a possible `Esc-<key>` world switch. None otherwise.
+    pub shell_esc_armed_at: Option<std::time::Instant>,
     pub show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
     pub highlight_actions: bool, // F8 toggles - highlight lines matching action patterns
     // WebSocket server (ws:// or wss:// depending on web_secure setting)
@@ -5624,6 +5637,7 @@ impl App {
             chord: chords::ChordState::new(),
             chord_window: chords::DEFAULT_CHORD_WINDOW,
             literal_next: false,
+            shell_esc_armed_at: None,
             show_tags: false, // Default: hide tags
             highlight_actions: false, // Default: don't highlight action matches
             ws_server: None,
@@ -6986,7 +7000,39 @@ impl App {
                     // nothing else here ever clears them.
                     world.stats_line_shown = false;
                     world.mirrored_stats.clear();
+                    // A shell world: freeze its screen (the session is gone server-side).
+                    if let Some(screen) = world.shell_screen.as_mut() {
+                        screen.set_exited();
+                    }
                     self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::ShellScreen { world_index, frame, base_frame, cols, rows, lines, cursor, mode, title, live, .. } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    let accepted = match world.shell_screen.as_mut() {
+                        Some(screen) => screen.apply_msg(frame, base_frame, cols, rows, &lines, cursor, mode, title.clone(), live),
+                        None => {
+                            // First frame for this world: a delta we can't build on means
+                            // we never got the full screen - ask for it. A full frame
+                            // (base None) starts a fresh screen.
+                            if base_frame.is_none() {
+                                let mut screen = shell::ShellScreen::new(cols, rows);
+                                let ok = screen.apply_msg(frame, None, cols, rows, &lines, cursor, mode, title.clone(), live);
+                                world.shell_screen = Some(screen);
+                                ok
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if !accepted {
+                        if let Some(tx) = &self.ws_client_tx {
+                            let _ = tx.send(WsMessage::RequestWorldState { world_index });
+                        }
+                    }
+                    if world_index == self.current_world_index {
+                        self.needs_output_redraw = true;
+                    }
                 }
             }
             WsMessage::WorldSwitched { new_index } => {
@@ -7689,6 +7735,9 @@ impl App {
         world.prompt = w.prompt;
         world.showing_splash = w.showing_splash;
         world.gmcp_user_enabled = w.gmcp_user_enabled;
+        // A shell world's full screen, so the SSH remote console renders it through the
+        // same render_output_crossterm path the master console uses (src/shell).
+        world.shell_screen = w.shell.map(|s| shell::ShellScreen::from_state_msg(&s));
         // ECHO masking (plan Phase 3, step 3.4): hydrate this SSH remote console's
         // own mirrored World so its shared render_input/render_input_area (and the
         // crossterm replica in render_output_crossterm) mask correctly from the very
@@ -8033,6 +8082,11 @@ impl App {
 
     pub fn switch_world(&mut self, index: usize) {
         if index < self.worlds.len() && index != self.current_world_index {
+            // A half-entered chord (or a shell world's armed Escape) must not carry across
+            // a switch into another world - least of all into a shell world, which reads
+            // keys raw.
+            self.chord.cancel();
+            self.shell_esc_armed_at = None;
             // Stop media for old world (audio only plays for current world)
             self.stop_world_media(self.current_world_index);
             // Reset lines_since_pause for the old world if more-mode hasn't triggered
@@ -22535,6 +22589,30 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             _ => { continue; }
                         }
+                    } else if app.shell_live(app.current_world_index) {
+                        // A live shell world: forward the mouse. Clicks/drags reach a
+                        // program that enabled mouse reporting; the wheel otherwise does
+                        // nothing (no scrollback). `mouse.row`/`column` are 1-based in
+                        // crossterm; the grid is 0-based.
+                        let idx = app.current_world_index;
+                        let col = mouse.column.saturating_sub(1);
+                        let row = mouse.row;
+                        let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
+                        let alt = mouse.modifiers.contains(KeyModifiers::ALT);
+                        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                        let (kind, button): (&str, u8) = match mouse.kind {
+                            MouseEventKind::ScrollUp => ("wheel_up", 0),
+                            MouseEventKind::ScrollDown => ("wheel_down", 0),
+                            MouseEventKind::Down(b) => ("down", mouse_button_code(b)),
+                            MouseEventKind::Up(b) => ("up", mouse_button_code(b)),
+                            MouseEventKind::Drag(b) => ("drag", mouse_button_code(b)),
+                            MouseEventKind::Moved => ("move", 0),
+                            _ => { continue; }
+                        };
+                        if row >= 1 {
+                            app.shell_mouse(idx, kind, button, col, row - 1, ctrl, alt, shift);
+                        }
+                        continue;
                     } else {
                         continue;
                     }
@@ -23834,7 +23912,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
             // Toggle mouse capture when popup visibility changes
             if app.settings.mouse_enabled {
-                let want_mouse = any_popup_visible;
+                // A live shell world wants the mouse too, so the wheel and any mouse-mode
+                // program (vi, tmux, htop) work; otherwise only popups capture it.
+                let want_mouse = any_popup_visible || app.shell_live_current();
                 if want_mouse && !app.mouse_capture_active {
                     let _ = execute!(std::io::stdout(), EnableMouseCapture);
                     app.mouse_capture_active = true;

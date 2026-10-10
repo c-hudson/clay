@@ -1092,7 +1092,17 @@ pub(crate) fn render_output_crossterm(app: &App) {
         return;
     }
 
+    // A shell world: the output area is a live terminal, drawn row for row with the real
+    // cursor parked in the grid (src/shell). Nothing else about the frame changes.
+    if app.current_world().shell_screen.is_some() {
+        render_shell_crossterm(app);
+        return;
+    }
+
     let mut stdout = std::io::stdout();
+    // Undo any shell-world cursor shape (a prior frame on a shell world) now that an
+    // ordinary world is drawn again.
+    let _ = stdout.queue(crossterm::cursor::SetCursorStyle::DefaultUserShape);
 
     let world = app.current_world();
     let visible_height = (app.output_height as usize).max(1);
@@ -1576,6 +1586,49 @@ pub(crate) fn render_output_crossterm(app: &App) {
     let _ = stdout.flush();
 }
 
+/// Draw a shell world's screen into the output area: each row as it stands, the real
+/// cursor parked in the grid (src/shell). The separator bar and input area are still drawn
+/// by ratatui in the same frame; this just owns the output rows and the cursor.
+fn render_shell_crossterm(app: &App) {
+    use std::io::Write;
+    use crossterm::cursor::{Hide, MoveTo, SetCursorStyle, Show};
+    use crossterm::style::Print;
+    use crossterm::QueueableCommand;
+
+    let mut stdout = std::io::stdout();
+    let visible_height = app.output_height.max(1);
+    let Some(screen) = app.current_world().shell_screen.as_ref() else { return };
+
+    for y in 0..visible_height {
+        let _ = stdout.queue(MoveTo(0, y));
+        if let Some(line) = screen.lines.get(y as usize) {
+            // The row carries its own SGR; reset + clear to end so nothing bleeds.
+            let _ = stdout.queue(Print("\x1b[0m"));
+            let _ = stdout.queue(Print(line));
+        }
+        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
+    }
+
+    // The cursor, in the grid, with its shape - unless it is off-screen or hidden.
+    let c = &screen.cursor;
+    if c.visible && c.row < visible_height {
+        let style = match (c.shape, c.blink) {
+            (1, true) => SetCursorStyle::BlinkingUnderScore,
+            (1, false) => SetCursorStyle::SteadyUnderScore,
+            (2, true) => SetCursorStyle::BlinkingBar,
+            (2, false) => SetCursorStyle::SteadyBar,
+            (_, true) => SetCursorStyle::BlinkingBlock,
+            (_, false) => SetCursorStyle::SteadyBlock,
+        };
+        let _ = stdout.queue(style);
+        let _ = stdout.queue(MoveTo(c.col, c.row));
+        let _ = stdout.queue(Show);
+    } else {
+        let _ = stdout.queue(Hide);
+    }
+    let _ = stdout.flush();
+}
+
 /// Write an ANSI-colored string directly to a ratatui buffer at (x, y).
 /// Parses ANSI SGR escape sequences and sets cell styles accordingly.
 /// This bypasses ansi_to_tui and Paragraph for reliable color reproduction.
@@ -1735,6 +1788,19 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         let output_text = render_splash_centered(world, visible_height, area_width);
         let output_paragraph = Paragraph::new(output_text);
         f.render_widget(output_paragraph, area);
+        return;
+    }
+
+    // A shell world's screen, behind a popup (crossterm is skipped while a popup is up, so
+    // draw the rows into the ratatui buffer here). Without a popup the crossterm path owns
+    // it, same as ordinary output below.
+    if world.shell_screen.is_some() && (app.confirm_dialog.visible || app.has_new_popup()) {
+        f.render_widget(ratatui::widgets::Clear, area);
+        if let Some(screen) = world.shell_screen.as_ref() {
+            for (y, line) in screen.lines.iter().enumerate().take(visible_height) {
+                ansi_string_to_buffer(f.buffer_mut(), area.x, area.y + y as u16, line, area.width);
+            }
+        }
         return;
     }
 
@@ -2411,6 +2477,18 @@ fn input_cursor_char_width(c: char, masked: bool) -> usize {
 }
 
 pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
+    // A live shell world owns the keyboard (keys go to the PTY), so the input line would
+    // only mislead. Show a dim hint instead, and leave the real cursor in the grid (the
+    // crossterm pass positions it; nothing is set here).
+    if app.shell_live(app.current_world_index) {
+        let theme = app.settings.theme;
+        let hint = Paragraph::new(Line::from(Span::styled(
+            " shell — keys go to the terminal · Alt+} / Alt+{ switch worlds",
+            Style::default().fg(theme.fg_dim()),
+        )));
+        f.render_widget(hint, area);
+        return;
+    }
     // Get prompt for current world only (clone to avoid borrow conflict)
     let prompt = app.current_world().prompt.clone();
     // Use visible length (without ANSI codes) for cursor positioning

@@ -1222,6 +1222,13 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
+    // A live shell world (src/shell) captures the keyboard: only the ten world-switch
+    // actions still run; everything else goes to the PTY. Overlays (confirm/editor/popup/
+    // F4/F5) were handled above and returned, so reaching here means ordinary input.
+    if let Some(action) = shell_key_intercept(key, app) {
+        return action;
+    }
+
     // Handle Tab - more-mode takes priority over command completion
     // Check more-mode first: scroll down when viewing history, release pending when at bottom and paused
     if key.code == KeyCode::Tab && key.modifiers.is_empty() {
@@ -1466,6 +1473,17 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) {
         return;
     }
 
+    // A live shell world (src/shell): a paste goes to the PTY (bracketed when the program
+    // asked), not the command line.
+    if app.shell_live(app.current_world_index) {
+        if let Some(msg) = oversized_paste_message(text) {
+            app.add_tf_output(&msg);
+            return;
+        }
+        app.shell_input(app.current_world_index, None, Some(text.to_string()), true);
+        return;
+    }
+
     // Nothing above claimed it: the command line. It's multi-line capable, so
     // keep literal newlines, same as today's behavior.
     if let Some(msg) = oversized_paste_message(text) {
@@ -1473,6 +1491,42 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) {
         return;
     }
     app.input.insert_str(&sanitize_paste(text, true));
+}
+
+/// A live shell world captures the keyboard. Returns `Some(KeyAction)` when the key was
+/// for the shell (a world switch, or forwarded to the PTY), `None` to let ordinary input
+/// handling continue (no shell world, or no live session). See src/shell.
+fn shell_key_intercept(key: KeyEvent, app: &mut App) -> Option<KeyAction> {
+    let idx = app.current_world_index;
+    if !app.shell_live(idx) {
+        app.shell_esc_armed_at = None;
+        return None;
+    }
+    // A bare Escape goes to the PTY now (vi needs it) and opens the chord window, so a
+    // slow "Esc, }" still switches worlds.
+    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        app.shell_input(idx, Some(crate::websocket::ShellKey { key: "Escape".into(), ..Default::default() }), None, false);
+        app.shell_esc_armed_at = Some(std::time::Instant::now());
+        return Some(KeyAction::None);
+    }
+    let esc_armed = app
+        .shell_esc_armed_at
+        .map(|t| t.elapsed() < app.chord_window)
+        .unwrap_or(false);
+    app.shell_esc_armed_at = None;
+    match crate::shell::keys::classify(key.code, key.modifiers, &app.keybindings, esc_armed) {
+        crate::shell::keys::Decision::Switch(action) => Some(dispatch_action(&action, app)),
+        crate::shell::keys::Decision::Forward(k) => {
+            app.shell_input(idx, Some(k), None, false);
+            Some(KeyAction::None)
+        }
+        crate::shell::keys::Decision::Text(c) => {
+            if c != '\0' {
+                app.shell_input(idx, None, Some(c.to_string()), false);
+            }
+            Some(KeyAction::None)
+        }
+    }
 }
 
 /// Tab-style `/`-command (and `/worlds`/`/world` name) completion against the current

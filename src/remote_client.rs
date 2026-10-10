@@ -1161,7 +1161,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 
             // Toggle mouse capture when popup visibility changes
             if app.settings.mouse_enabled {
-                let want_mouse = any_popup_visible;
+                let want_mouse = any_popup_visible || app.shell_live(app.current_world_index);
                 if want_mouse && !app.mouse_capture_active {
                     let _ = execute!(std::io::stdout(), EnableMouseCapture);
                     app.mouse_capture_active = true;
@@ -1207,6 +1207,31 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             maybe_event = event_stream.next() => {
                 if let Some(Ok(event)) = maybe_event {
                     match event {
+                        Event::Mouse(mouse) if app.settings.mouse_enabled && !app.has_new_popup() && app.shell_live(app.current_world_index) => {
+                            // A live shell world: forward the mouse to the server (it
+                            // decides what the program receives). 1-based → 0-based grid.
+                            let kind = match mouse.kind {
+                                MouseEventKind::ScrollUp => Some(("wheel_up", 0u8)),
+                                MouseEventKind::ScrollDown => Some(("wheel_down", 0)),
+                                MouseEventKind::Down(b) => Some(("down", remote_mouse_button(b))),
+                                MouseEventKind::Up(b) => Some(("up", remote_mouse_button(b))),
+                                MouseEventKind::Drag(b) => Some(("drag", remote_mouse_button(b))),
+                                MouseEventKind::Moved => Some(("move", 0)),
+                                _ => None,
+                            };
+                            if let (Some((kind, button)), true) = (kind, mouse.row >= 1) {
+                                let _ = ws_tx.send(WsMessage::ShellMouse {
+                                    world_index: app.current_world_index,
+                                    kind: kind.to_string(),
+                                    button,
+                                    col: mouse.column.saturating_sub(1),
+                                    row: mouse.row - 1,
+                                    ctrl: mouse.modifiers.contains(KeyModifiers::CONTROL),
+                                    alt: mouse.modifiers.contains(KeyModifiers::ALT),
+                                    shift: mouse.modifiers.contains(KeyModifiers::SHIFT),
+                                });
+                            }
+                        }
                         Event::Mouse(mouse) if app.settings.mouse_enabled && app.has_new_popup() => {
                             match mouse.kind {
                                 MouseEventKind::Down(MouseButton::Left) => {
@@ -1249,6 +1274,20 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     continue; // Skip full redraw
                                 }
                                 _ => {}
+                            }
+                            needs_redraw = true;
+                        }
+                        Event::Paste(text) if app.shell_live(app.current_world_index) => {
+                            // A live shell world: the paste goes to the PTY over the wire.
+                            if let Some(msg) = crate::input_handler::oversized_paste_message(&text) {
+                                app.add_output(&msg);
+                            } else {
+                                let _ = ws_tx.send(WsMessage::ShellInput {
+                                    world_index: app.current_world_index,
+                                    key: None,
+                                    text: Some(text),
+                                    paste: true,
+                                });
                             }
                             needs_redraw = true;
                         }
@@ -1484,6 +1523,16 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 }
 /// Handle key events for remote console client mode
 /// Returns true if quit was requested
+/// Crossterm mouse button → the code `shell::keys::mouse` expects (0 left, 1 middle, 2
+/// right).
+fn remote_mouse_button(b: MouseButton) -> u8 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
 pub(crate) fn handle_remote_client_key(
     app: &mut App,
     key: KeyEvent,
@@ -2055,6 +2104,38 @@ pub(crate) fn handle_remote_client_key(
             app.input.insert_char(c);
         }
         return false;
+    }
+
+    // A live shell world (src/shell): the keyboard goes to the PTY over the wire, except
+    // the ten world-switch actions. Mirrors input_handler::shell_key_intercept, but sends
+    // ShellInput rather than calling the local (absent) session.
+    let shell_idx = app.current_world_index;
+    if app.shell_live(shell_idx) {
+        if key.code == Esc && key.modifiers.is_empty() {
+            let _ = ws_tx.send(WsMessage::ShellInput {
+                world_index: shell_idx,
+                key: Some(crate::websocket::ShellKey { key: "Escape".into(), ..Default::default() }),
+                text: None,
+                paste: false,
+            });
+            app.shell_esc_armed_at = Some(std::time::Instant::now());
+            return false;
+        }
+        let esc_armed = app.shell_esc_armed_at.map(|t| t.elapsed() < app.chord_window).unwrap_or(false);
+        app.shell_esc_armed_at = None;
+        match crate::shell::keys::classify(key.code, key.modifiers, &app.keybindings, esc_armed) {
+            crate::shell::keys::Decision::Switch(action) => return dispatch_remote_action(&action, app, ws_tx),
+            crate::shell::keys::Decision::Forward(k) => {
+                let _ = ws_tx.send(WsMessage::ShellInput { world_index: shell_idx, key: Some(k), text: None, paste: false });
+                return false;
+            }
+            crate::shell::keys::Decision::Text(c) => {
+                if c != '\0' {
+                    let _ = ws_tx.send(WsMessage::ShellInput { world_index: shell_idx, key: None, text: Some(c.to_string()), paste: false });
+                }
+                return false;
+            }
+        }
     }
 
     // Resolve this keystroke through the shared chord machinery (plan Phase
