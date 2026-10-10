@@ -128,6 +128,12 @@ gdk = { version = "0.18", optional = true }
 gtk = { version = "0.18", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Shell worlds surviving /reload (src/shell/adopt.rs): to re-attach the PTY of a shell
+# world across the exec, an AdoptedPty implements alacritty_terminal's EventedReadWrite/
+# EventedPty, whose trait methods take `polling` types - so we reference the same crate
+# alacritty resolves (already in the tree; this just names it). Linux-only (uses pidfd to
+# watch the adopted child); other platforms close shell worlds on reload.
+polling = "3"
 # Used only to probe whether the AT-SPI accessibility bus is reachable before
 # GTK's atk-bridge loads (see webview_gui.rs::disable_a11y_bridge_if_broken) -
 # both already resolved transitively via gtk, this just lets us call them

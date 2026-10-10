@@ -2227,10 +2227,21 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             writeln!(file, "is_temporary=true")?;
         }
         writeln!(file, "scroll_offset={}", world.scroll_offset)?;
-        // A shell world's PTY does not (yet) survive the reload exec, so it is saved as
-        // disconnected - the restore path must not try to resume it as a chat world.
-        let connected = world.connected && !world.settings.world_type.is_shell();
+        // A shell world (src/shell): on Linux its PTY is carried across the reload exec
+        // (exec_reload set shell_reload_fd/pid), so save it connected with the fd+pid for
+        // the restore path to adopt. Without a carried fd (other platforms, or adoption
+        // not set up) it is saved disconnected and comes back as a dead shell.
+        #[cfg(target_os = "linux")]
+        let shell_carried = world.settings.world_type.is_shell() && world.shell_reload_fd.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let shell_carried = false;
+        let connected = if world.settings.world_type.is_shell() { shell_carried } else { world.connected };
         writeln!(file, "connected={}", connected)?;
+        #[cfg(target_os = "linux")]
+        if shell_carried {
+            writeln!(file, "shell_fd={}", world.shell_reload_fd.unwrap())?;
+            writeln!(file, "shell_pid={}", world.shell_reload_pid.unwrap_or(0))?;
+        }
         writeln!(file, "unseen_lines={}", world.unseen_lines)?;
         // The console More indicator (rendering::more_indicator_count) depends on
         // paused + visual_line_offset (+ lines_since_pause) persisting together —
@@ -2656,6 +2667,11 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         socket_fd: Option<RawFd>,
         #[cfg(not(unix))]
         socket_fd: Option<i64>,
+        // A shell world's carried-across-reload PTY master fd and child pid (Linux).
+        #[cfg(target_os = "linux")]
+        shell_fd: Option<RawFd>,
+        #[cfg(target_os = "linux")]
+        shell_pid: Option<u32>,
         proxy_pid: Option<u32>,
         proxy_socket_path: Option<PathBuf>,
         #[cfg(unix)]
@@ -2828,6 +2844,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         scroll_offset: 0,
                         connected: false,
                         socket_fd: None,
+                        #[cfg(target_os = "linux")]
+                        shell_fd: None,
+                        #[cfg(target_os = "linux")]
+                        shell_pid: None,
                         proxy_pid: None,
                         proxy_socket_path: None,
                         proxy_socket_fd: None,
@@ -3284,6 +3304,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                                 tw.prompt = if p.is_empty() { p } else { format!("{} ", p.trim_end()) };
                             }
                             "socket_fd" => tw.socket_fd = value.parse().ok(),
+                            #[cfg(target_os = "linux")]
+                            "shell_fd" => tw.shell_fd = value.parse().ok(),
+                            #[cfg(target_os = "linux")]
+                            "shell_pid" => tw.shell_pid = value.parse().ok(),
                             "proxy_pid" => tw.proxy_pid = value.parse().ok(),
                             "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
                             "proxy_socket_fd" => tw.proxy_socket_fd = value.parse().ok(),
@@ -3473,7 +3497,15 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
         migrate_chat_settings(&mut world.settings);
-        if !world.settings.world_type.is_mud() && tw.connected {
+        // A shell world carried across the exec (Linux): its PTY master fd + child pid, for
+        // the restore path to adopt (see shell::adopt). Must be checked before the chat
+        // branch below, since a shell world is also `!is_mud()`.
+        #[cfg(target_os = "linux")]
+        if world.settings.world_type.is_shell() && tw.connected {
+            world.shell_reload_fd = tw.shell_fd;
+            world.shell_reload_pid = tw.shell_pid;
+        }
+        if crate::chat::ChatKind::from_world_type(&world.settings.world_type).is_some() && tw.connected {
             // Reconnected (resumed) by the reload restore path - see World::chat_restore.
             let resume = tw.chat_resume.filter(|r| !r.session_id.is_empty());
             world.chat_restore = Some((tw.chat_session_target, resume));

@@ -1297,6 +1297,7 @@ dependencies = [
  "native-tls",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "polling",
  "ratatui",
  "raw-window-handle",
  "rcgen",

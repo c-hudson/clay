@@ -22,6 +22,9 @@
 pub mod app;
 pub mod keys;
 pub mod screen;
+/// Re-attaching a PTY across a `/reload` (Linux only; see the module).
+#[cfg(target_os = "linux")]
+pub mod adopt;
 #[cfg(test)]
 mod tests;
 
@@ -230,61 +233,15 @@ impl ShellSession {
         };
         #[cfg(windows)]
         let pid = pty.child_watcher().pid().map(|p| p.get());
-
-        let wakeup = Arc::new(AtomicBool::new(false));
-        let exit_code = Arc::new(Mutex::new(None));
-        let size_cell = Arc::new(Mutex::new(size));
-        let proxy = Proxy {
-            world: world.to_string(),
-            conn_id,
-            events: events.clone(),
-            pty: Arc::new(OnceLock::new()),
-            wakeup: wakeup.clone(),
-            exit_code: exit_code.clone(),
-            size: size_cell.clone(),
-        };
-        let config = Config { scrolling_history: 0, kitty_keyboard: false, osc52: Osc52::Disabled, ..Config::default() };
-        let term = Arc::new(FairMutex::new(Term::new(config, &size, proxy.clone())));
-        let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, true, false)?;
-        let tx = event_loop.channel();
-        let _ = proxy.pty.set(tx.clone());
-        let live = Arc::new(AtomicBool::new(true));
-        let loop_thread = event_loop.spawn();
-
-        let wrapper = {
-            let world = world.to_string();
-            let live = live.clone();
-            let exit_code = exit_code.clone();
-            std::thread::Builder::new().name(format!("clay-shell-{world}")).spawn(move || {
-                let joined = loop_thread.join();
-                live.store(false, Ordering::Release);
-                let mut code = exit_code.lock().unwrap_or_else(|e| e.into_inner()).take();
-                if let Ok((event_loop, _state)) = joined {
-                    #[cfg(unix)]
-                    if let Some(pid) = pid {
-                        code = code.or(end_child(pid));
-                    }
-                    // Pty::drop: SIGHUP and a wait, on a child that is already gone.
-                    drop(event_loop);
-                }
-                let _ = events.blocking_send(crate::AppEvent::Shell(world, conn_id, ShellEvent::Exited(code)));
-            })
-        };
-        if let Err(e) = wrapper {
-            let _ = tx.send(Msg::Shutdown);
-            return Err(e);
+        #[cfg(unix)]
+        let mut session = spawn_loop(world, conn_id, pty, size, events, pid)?;
+        #[cfg(unix)]
+        {
+            session.master_fd = master_fd;
         }
-        Ok(ShellSession {
-            term,
-            tx,
-            conn_id,
-            pid,
-            #[cfg(unix)]
-            master_fd,
-            size: size_cell,
-            wakeup,
-            live,
-        })
+        #[cfg(not(unix))]
+        let session = spawn_loop(world, conn_id, pty, size, events, pid)?;
+        Ok(session)
     }
 
     /// The loop is still running (the shell may still be exiting).
@@ -362,6 +319,76 @@ impl Drop for ShellSession {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Build the emulator, run alacritty's event loop over `pty` on its own thread, and wrap
+/// it in a thread that reports `Exited` and does the bounded teardown off the main thread.
+/// Shared by `start` (a fresh `tty::Pty`) and `adopt` (an `AdoptedPty` across a reload).
+fn spawn_loop<P>(
+    world: &str,
+    conn_id: u64,
+    pty: P,
+    size: Size,
+    events: tokio::sync::mpsc::Sender<crate::AppEvent>,
+    pid: Option<u32>,
+) -> io::Result<ShellSession>
+where
+    P: alacritty_terminal::tty::EventedPty + alacritty_terminal::event::OnResize + Send + 'static,
+{
+    let wakeup = Arc::new(AtomicBool::new(false));
+    let exit_code = Arc::new(Mutex::new(None));
+    let size_cell = Arc::new(Mutex::new(size));
+    let proxy = Proxy {
+        world: world.to_string(),
+        conn_id,
+        events: events.clone(),
+        pty: Arc::new(OnceLock::new()),
+        wakeup: wakeup.clone(),
+        exit_code: exit_code.clone(),
+        size: size_cell.clone(),
+    };
+    let config = Config { scrolling_history: 0, kitty_keyboard: false, osc52: Osc52::Disabled, ..Config::default() };
+    let term = Arc::new(FairMutex::new(Term::new(config, &size, proxy.clone())));
+    let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, true, false)?;
+    let tx = event_loop.channel();
+    let _ = proxy.pty.set(tx.clone());
+    let live = Arc::new(AtomicBool::new(true));
+    let loop_thread = event_loop.spawn();
+
+    let wrapper = {
+        let world = world.to_string();
+        let live = live.clone();
+        let exit_code = exit_code.clone();
+        std::thread::Builder::new().name(format!("clay-shell-{world}")).spawn(move || {
+            let joined = loop_thread.join();
+            live.store(false, Ordering::Release);
+            let mut code = exit_code.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Ok((event_loop, _state)) = joined {
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    code = code.or(end_child(pid));
+                }
+                // The pty's Drop: SIGHUP and a wait, on a child that is already gone.
+                drop(event_loop);
+            }
+            let _ = events.blocking_send(crate::AppEvent::Shell(world, conn_id, ShellEvent::Exited(code)));
+        })
+    };
+    if let Err(e) = wrapper {
+        let _ = tx.send(Msg::Shutdown);
+        return Err(e);
+    }
+    Ok(ShellSession {
+        term,
+        tx,
+        conn_id,
+        pid,
+        #[cfg(unix)]
+        master_fd: -1,
+        size: size_cell,
+        wakeup,
+        live,
+    })
 }
 
 /// The loop has ended; make sure the child has too, and collect its status when alacritty

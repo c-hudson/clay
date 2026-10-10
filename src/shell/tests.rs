@@ -190,3 +190,71 @@ fn real_pty_runs_and_exits() {
         assert_eq!(exit_code, Some(Some(3)), "the shell's exit code was reported");
     });
 }
+
+/// Phase 7: an AdoptedPty built from an existing PTY master + a running child (as a reload
+/// hands it over) runs the emulator, shows what the child wrote, and reports its exit.
+#[cfg(target_os = "linux")]
+#[test]
+fn adopted_pty_runs_and_exits() {
+    use crate::shell::{ShellSession, Size};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    // A real PTY pair.
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let r = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
+    assert_eq!(r, 0, "openpty");
+
+    // A child on the slave, in its own session (as the real spawn does), that writes a
+    // marker and then waits - the "already-running program" a reload re-attaches.
+    let slave_owned = unsafe { OwnedFd::from_raw_fd(slave) };
+    let (sin, sout, serr) = (slave_owned.try_clone().unwrap(), slave_owned.try_clone().unwrap(), slave_owned);
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg("printf ADOPTED_OK; exec sleep 5");
+    cmd.stdin(Stdio::from(sin)).stdout(Stdio::from(sout)).stderr(Stdio::from(serr));
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("spawn child on the pty slave");
+    let pid = child.id();
+    // The AdoptedPty owns the child from here (its Drop reaps it); don't let std wait too.
+    std::mem::forget(child);
+
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::AppEvent>(100);
+        let session = ShellSession::adopt("reloaded", 1, master, pid, Size { cols: 40, rows: 10 }, tx).expect("adopt");
+
+        // The child's marker reaches the screen.
+        let mut saw = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !saw {
+            if tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_ok() {
+                let snap = session.with_term(crate::shell::screen::render_rows);
+                if snap.lines.iter().any(|l| l.contains("ADOPTED_OK")) {
+                    saw = true;
+                }
+            }
+        }
+        assert!(saw, "the re-attached child's output reached the screen");
+
+        // Ending the session hangs the child up and reports its exit.
+        drop(session);
+        let mut exited = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(crate::AppEvent::Shell(_, _, crate::shell::ShellEvent::Exited(_)))) => { exited = true; break; }
+                Ok(Some(_)) => {}
+                _ => {}
+            }
+        }
+        assert!(exited, "the re-attached session reported Exited after shutdown");
+    });
+}

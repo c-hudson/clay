@@ -196,7 +196,7 @@ impl crate::App {
                 .shell_screen
                 .as_ref()
                 .is_some_and(|s| s.has_changes())
-                && self.worlds[idx].shell_last_frame_at.map_or(true, |t| now.duration_since(t) >= FRAME_INTERVAL);
+                && self.worlds[idx].shell_last_frame_at.is_none_or(|t| now.duration_since(t) >= FRAME_INTERVAL);
             if due {
                 self.flush_one_shell_frame(idx);
                 self.worlds[idx].shell_last_frame_at = Some(now);

@@ -463,6 +463,7 @@ impl ShellScreen {
     /// Apply a `ShellScreen` frame from the server (the SSH mirror and the native GUI).
     /// Returns false when the delta doesn't build on the frame held, so the caller knows
     /// to ask for a full one.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_msg(
         &mut self,
         frame: u64,

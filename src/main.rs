@@ -3735,6 +3735,13 @@ pub struct World {
     pub(crate) shell_screen: Option<shell::ShellScreen>,
     /// When this shell world last broadcast a screen delta (frame coalescing).
     pub(crate) shell_last_frame_at: Option<std::time::Instant>,
+    /// A shell world's PTY master fd and child pid to re-attach after a `/reload` exec
+    /// (Linux only; see `shell::adopt`). Set by `exec_reload`, saved to the reload state,
+    /// and consumed by the restore path. Not in settings.dat.
+    #[cfg(target_os = "linux")]
+    pub(crate) shell_reload_fd: Option<std::os::fd::RawFd>,
+    #[cfg(target_os = "linux")]
+    pub(crate) shell_reload_pid: Option<u32>,
     is_tls: bool,                // Track if using TLS
     /// MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): set by
     /// `App::should_defer_reload_for_mccp2` right before it sends `IAC DONT MCCP2` and
@@ -4058,6 +4065,10 @@ impl World {
             shell: None,
             shell_screen: None,
             shell_last_frame_at: None,
+            #[cfg(target_os = "linux")]
+            shell_reload_fd: None,
+            #[cfg(target_os = "linux")]
+            shell_reload_pid: None,
             is_tls: false,
             mccp2_resume_after_reload: false,
             telnet_mode: false,
@@ -12865,6 +12876,41 @@ impl App {
         }
     }
 
+    /// Re-attach shell worlds whose PTY was carried across a `/reload` exec (Linux; see
+    /// `shell::adopt`). The grid starts empty, so a note is injected and the size nudged so
+    /// a full-screen program repaints.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn adopt_shell_worlds_after_reload(&mut self) {
+        let Some(events) = self.event_tx.clone() else { return };
+        for idx in 0..self.worlds.len() {
+            let Some(fd) = self.worlds[idx].shell_reload_fd.take() else { continue };
+            let pid = self.worlds[idx].shell_reload_pid.take().unwrap_or(0);
+            let name = self.worlds[idx].name.clone();
+            let size = self.shell_dimensions(idx);
+            self.worlds[idx].connection_id += 1;
+            let conn_id = self.worlds[idx].connection_id;
+            match shell::ShellSession::adopt(&name, conn_id, fd, pid, size, events.clone()) {
+                Ok(session) => {
+                    session.inject(b"\r\n[Clay reloaded]\r\n");
+                    let mut screen = shell::ShellScreen::new(size.cols, size.rows);
+                    screen.apply(session.with_term(shell::screen::render_rows));
+                    self.worlds[idx].shell = Some(session);
+                    self.worlds[idx].shell_screen = Some(screen);
+                    self.worlds[idx].connected = true;
+                    self.worlds[idx].was_connected = true;
+                    self.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name });
+                    if idx == self.current_world_index {
+                        self.needs_output_redraw = true;
+                    }
+                }
+                Err(e) => {
+                    self.worlds[idx].connected = false;
+                    self.add_output_to_world(idx, &format!("Shell world could not be re-attached after reload: {e}"));
+                }
+            }
+        }
+    }
+
     /// Show a chat world's send target as its prompt (`[#general] `), which every
     /// interface already renders, and tell remote clients.
     pub(crate) fn refresh_chat_prompt(&mut self, idx: usize) {
@@ -20900,6 +20946,8 @@ pub async fn run_app_headless(
         }
 
         app.resume_chat_worlds_after_reload(&event_tx);
+        #[cfg(target_os = "linux")]
+        app.adopt_shell_worlds_after_reload();
         // Cleanup: mark disconnected worlds that claim to be connected but have no command channel
         for world in &mut app.worlds {
             if world.connected && world.command_tx.is_none() {
@@ -22203,6 +22251,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
 
         app.resume_chat_worlds_after_reload(&event_tx);
+        #[cfg(target_os = "linux")]
+        app.adopt_shell_worlds_after_reload();
         // Final cleanup pass: mark any world as disconnected if it claims to be connected
         // but has no command channel (meaning the connection wasn't successfully reconstructed)
         for world in &mut app.worlds {

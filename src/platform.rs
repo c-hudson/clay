@@ -1709,10 +1709,31 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // batched.
     app.flush_scrollback();
 
-    // Shell worlds (src/shell) do not survive the exec yet (Phase 7): hang up each child
-    // now, synchronously, since the wrapper thread that would normally end it is wiped by
-    // the exec. Saved as disconnected (persistence::save_reload_state_to).
-    for world in &app.worlds {
+    // Shell worlds (src/shell). On Linux the PTY survives the exec: clear FD_CLOEXEC on
+    // each live master so the successor inherits it, and record world:fd:pid for the
+    // restore path (persistence::save_reload_state_to reads world.shell_reload_fd/pid).
+    // Elsewhere a shell world cannot be carried across, so hang the child up now (the
+    // wrapper thread that would do it is wiped by the exec) and it comes back disconnected.
+    for world in &mut app.worlds {
+        #[cfg(target_os = "linux")]
+        {
+            let carried = world.shell.as_ref().and_then(|shell| {
+                let fd = shell.master_fd;
+                (fd >= 0 && clear_cloexec(fd).is_ok()).then_some((fd, shell.pid))
+            });
+            match carried {
+                Some((fd, pid)) => {
+                    world.shell_reload_fd = Some(fd);
+                    world.shell_reload_pid = pid;
+                }
+                None => {
+                    if let Some(shell) = world.shell.as_ref() {
+                        shell.hangup();
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         if let Some(shell) = world.shell.as_ref() {
             shell.hangup();
         }
@@ -1733,6 +1754,12 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
                 fds_to_keep.push(fd);
             }
             // If clear_cloexec fails, the FD is stale - just skip it
+        }
+        // A shell world's master fd, kept open across the exec (Linux). clear_cloexec
+        // already ran above; include it so the fd-list log reflects it too.
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = world.shell_reload_fd {
+            fds_to_keep.push(fd);
         }
     }
     debug_log(is_debug_enabled(), &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));

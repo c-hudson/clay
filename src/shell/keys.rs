@@ -243,6 +243,7 @@ pub fn text_bytes(text: &str, paste: bool, mode: &ShellModeMsg) -> Vec<u8> {
 /// "move"/"wheel_up"/"wheel_down"; `button`: 0 left, 1 middle, 2 right. `col`/`row` are
 /// zero-based cells. None when the program isn't tracking the mouse (or this kind of it),
 /// or when a wheel on the alt screen should instead become arrow keys (`wheel_arrows`).
+#[allow(clippy::too_many_arguments)]
 pub fn mouse(
     kind: &str,
     button: u8,
