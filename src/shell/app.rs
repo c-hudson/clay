@@ -15,9 +15,13 @@ use crate::{tf, AppEvent};
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 impl crate::App {
-    /// True if world `idx` is a Shell world whose session is running.
+    /// True if world `idx` is a live shell world: a running session on the server, or (on
+    /// a client that has no session of its own, like the SSH remote console) a screen the
+    /// server still reports as live.
     pub(crate) fn shell_live(&self, idx: usize) -> bool {
-        self.worlds.get(idx).is_some_and(|w| w.shell.as_ref().is_some_and(|s| s.is_live()))
+        self.worlds.get(idx).is_some_and(|w| {
+            w.shell.as_ref().is_some_and(|s| s.is_live()) || (w.shell.is_none() && w.shell_screen.as_ref().is_some_and(|s| s.live))
+        })
     }
 
     /// True if the console is currently showing a live shell world.
