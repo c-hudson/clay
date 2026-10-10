@@ -40,8 +40,9 @@ begins a world-switch chord, so a slow "Escape then `}`" also switches.
 Because Clay's own commands are keystrokes to the shell, to run a Clay command (or quit
 Clay) from a shell world, switch to another world first.
 
-Scrolling the mouse wheel is passed to a program that asked for the mouse (like `vi` or
-`tmux`); there is no separate scrollback for a shell world.
+The mouse is passed to a program that asked for it (like `vi` or `tmux`): the wheel on
+every interface, and clicks and drags in the console and the web/WebView client. There is
+no separate scrollback for a shell world, so the wheel does nothing at a plain prompt.
 
 ## In a browser
 

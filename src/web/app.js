@@ -15886,6 +15886,41 @@
             scheduleReveal();
         }, { passive: false });
 
+        // Shell worlds (src/shell): forward mouse clicks/drags to a program that enabled
+        // mouse reporting. The grid cell is derived from the cell size; the server drops
+        // the report when the program isn't tracking the mouse, so this is cheap otherwise.
+        let shellMouseDown = false;
+        function shellMouseCell(e) {
+            const screen = elements.output.querySelector('.shell-screen') || elements.output;
+            const rect = screen.getBoundingClientRect();
+            const col = Math.max(0, Math.floor((e.clientX - rect.left) / measuredCharWidth()));
+            const row = Math.max(0, Math.floor((e.clientY - rect.top) / lineHeightPx()));
+            return { col, row };
+        }
+        function shellMouseActive() {
+            const w = worlds[currentWorldIndex];
+            return !!(w && w.shell && w.shell.live && w.shell.mode && w.shell.mode.mouse_click);
+        }
+        elements.outputContainer.addEventListener('mousedown', function(e) {
+            if (!shellMouseActive() || e.button > 2) return;
+            shellMouseDown = true;
+            const c = shellMouseCell(e);
+            send({ type: 'ShellMouse', world_index: currentWorldIndex, kind: 'down', button: e.button, col: c.col, row: c.row, ctrl: !!e.ctrlKey, alt: !!e.altKey, shift: !!e.shiftKey });
+            e.preventDefault();
+        });
+        elements.outputContainer.addEventListener('mousemove', function(e) {
+            if (!shellMouseDown || !shellMouseActive()) return;
+            const c = shellMouseCell(e);
+            send({ type: 'ShellMouse', world_index: currentWorldIndex, kind: 'drag', button: e.buttons & 1 ? 0 : e.buttons & 2 ? 2 : e.buttons & 4 ? 1 : 0, col: c.col, row: c.row, ctrl: !!e.ctrlKey, alt: !!e.altKey, shift: !!e.shiftKey });
+        });
+        window.addEventListener('mouseup', function(e) {
+            if (!shellMouseDown) return;
+            shellMouseDown = false;
+            if (!shellMouseActive() || e.button > 2) return;
+            const c = shellMouseCell(e);
+            send({ type: 'ShellMouse', world_index: currentWorldIndex, kind: 'up', button: e.button, col: c.col, row: c.row, ctrl: !!e.ctrlKey, alt: !!e.altKey, shift: !!e.shiftKey });
+        });
+
         // Strip zero-width spaces from copied text (inserted by insertWordBreaks for wrapping)
         watchDiscordEmojiErrors(elements.output);
 
