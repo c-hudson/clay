@@ -143,6 +143,9 @@ impl SettingsView {
         subs.push(cx.subscribe(&transparency, |this, _, ev: &SliderEvent, cx| {
             if let SliderEvent::Change(v) = ev {
                 this.edit.gui_transparency = v.start() / 100.0;
+                // Live, on every window, as the WebView GUI's slider does; closing without
+                // Save puts it back.
+                this.preview(cx);
                 cx.notify();
             }
         }));
@@ -242,7 +245,7 @@ impl SettingsView {
         (v.message.map(|m| m.to_string()), v.blocks_save)
     }
 
-    /// Show the font as edited on the main window.
+    /// Show the font and Transparency as edited.
     fn preview(&self, cx: &mut Context<Self>) {
         let edit = self.edit.clone();
         let _ = self.main.update(cx, |v, cx| v.preview_settings(Some(edit), cx));

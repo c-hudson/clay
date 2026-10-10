@@ -803,7 +803,8 @@ impl Render for ClayView {
         }
         self.run_later(window, cx);
         self.report_view(window);
-        let alpha = self.transparency();
+        // A `/window` takes its main window's, which a Transparency being previewed is on.
+        let alpha = self.link.leader.as_ref().and_then(|l| l.upgrade()).map_or_else(|| self.transparency(), |l| l.read(cx).transparency());
         self.opacity.apply(window, alpha);
         let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
         if need_login && !self.login_focused {

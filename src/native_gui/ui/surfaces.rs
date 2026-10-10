@@ -487,7 +487,9 @@ impl ClayView {
         self.surf.preview = s;
         self.surf.preview_until = None;
         self.apply_settings();
-        cx.notify();
+        // The other windows take the Transparency from here.
+        self.restyled(cx);
+        self.repaint_all(cx);
     }
 
     /// Settings were saved: keep the preview until the server's answer arrives.

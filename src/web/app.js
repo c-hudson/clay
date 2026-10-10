@@ -1482,6 +1482,9 @@
     // The saved font settings while the Settings popup is open (null otherwise, and
     // after Save), so closing without saving can undo previewFontEdit's live preview.
     let fontPreviewSaved = null;
+    // The Transparency the settings popup opened with: its slider previews live, and a
+    // close without Save puts this back (null when nothing is being previewed).
+    let transparencyPreviewSaved = null;
 
     // Font families offered in Settings > Font: [value saved as font_name, label].
     // Covers Linux, macOS and Windows; renderFontFamilyList() shows only the ones this
@@ -11540,6 +11543,7 @@
         // Load font edit state, and remember the saved font so a cancel can undo the
         // live preview (previewFontEdit) the font tab applies while it's open.
         fontPreviewSaved = currentFontSettings();
+        transparencyPreviewSaved = guiTransparency;
         fontEditName = fontName;
         fontEditSizePhone = Math.round(webFontSizePhone);
         fontEditSizeTablet = Math.round(webFontSizeTablet);
@@ -11566,6 +11570,11 @@
         // Closed without Save (Cancel, the X, Escape, another popup taking over):
         // undo the font preview. saveSettingsAll clears fontPreviewSaved first.
         revertFontPreview();
+        if (transparencyPreviewSaved !== null) {
+            const alpha = transparencyPreviewSaved;
+            transparencyPreviewSaved = null;
+            applyTransparency(alpha);
+        }
         settingsPopupOpen = false;
         elements.settingsModal.className = 'modal';
         elements.settingsModal.style.display = 'none';
@@ -11869,6 +11878,7 @@
         // not revert it
         _saveFontSettingsInline();
         fontPreviewSaved = null;
+        transparencyPreviewSaved = null;
         // The main window keeps the previewed font instead of reverting when this
         // window closes; the server's GlobalSettingsUpdated then confirms it.
         if (settingsWindowMode) sendIpc('font-preview:"commit"');
