@@ -353,6 +353,7 @@ pub(crate) fn crash_restart() {
         args.push("--crash".to_string());
 
         // This replaces the current process if successful
+        give_back_stderr();
         let _ = std::process::Command::new(&exe).args(&args).exec();
     }
 }
@@ -1752,12 +1753,21 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect());
     args.push("--reload".to_string());
     debug_log(is_debug_enabled(), &format!("RELOAD: About to exec {} with args={:?} fds={}", exe.display(), args, fds_str));
+    give_back_stderr();
     let err = std::process::Command::new(&exe)
         .args(&args)
         .exec();
 
     // If we get here, exec failed
     Err(io::Error::other(format!("exec failed: {} (path: {})", err, exe.display())))
+}
+
+/// The native GUI sends stderr to debug.log (native_gui/quiet.rs): the process that
+/// replaces this one gets the terminal back instead of a pipe nobody reads.
+#[cfg(unix)]
+fn give_back_stderr() {
+    #[cfg(feature = "native-gui")]
+    crate::native_gui::quiet::release();
 }
 
 /// Hot reload on Windows: spawn new process and exit old one.
@@ -1989,6 +1999,7 @@ fn exec_relaunch_with_args(args: Vec<String>, use_gui: bool) -> io::Result<()> {
     }
 
     debug_log(is_debug_enabled(), &format!("RELAUNCH: About to exec {} with args={:?}", exe.display(), args));
+    give_back_stderr();
     let err = std::process::Command::new(&exe).args(&args).exec();
 
     // If we get here, exec failed — restore the terminal so the caller isn't left broken.

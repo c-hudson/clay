@@ -7,6 +7,7 @@
 //! `ui` is the GPUI side.
 
 pub mod core;
+pub mod quiet;
 mod ui;
 #[cfg(test)]
 mod parity_tests;
@@ -25,9 +26,16 @@ pub fn runs_clay() -> bool {
 /// client headless and check its buffer (both attach, to this machine when no host).
 pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>, ssh: bool) -> std::io::Result<()> {
     log_crashes();
-    // Looked at while Clay starts or the target is worked out: it loads the GPU's driver.
+    // The window's run: what the graphics drivers print goes to debug.log (quiet.rs). With
+    // --ssh only once the tunnel is up, since it may ask for a passphrase on the terminal.
+    let interactive = snapshot.is_none() && verify.is_none();
+    if interactive && !ssh {
+        quiet::capture();
+    }
+    // Looked at while Clay starts or the target is worked out: it loads the GPU's driver
+    // (with --ssh, after the passphrase prompt, which its warnings could land in).
     #[cfg(target_os = "linux")]
-    let vulkan = std::thread::spawn(vulkan_is_software_only);
+    let vulkan = (!ssh).then(|| std::thread::spawn(vulkan_is_software_only));
     let runtime = tokio::runtime::Handle::current();
     let local = target.is_none() && !ssh && snapshot.is_none() && verify.is_none();
     // Optional: without it (and without a stored key for this server) the window asks.
@@ -42,11 +50,16 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
         match core::net::Target::parse(target.as_deref()) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("Error: {e}");
+                quiet::terminal(&format!("Error: {e}"));
                 std::process::exit(1);
             }
         }
     };
+    if interactive && ssh {
+        quiet::capture();
+    }
+    #[cfg(target_os = "linux")]
+    let vulkan = vulkan.unwrap_or_else(|| std::thread::spawn(vulkan_is_software_only));
     // An auth key to use instead of the one remembered for this server (scripts, tests).
     let auth_key = std::env::var("CLAY_AUTH_KEY").ok().filter(|k| !k.is_empty());
     // WebKitGTK blends text linearly; GPUI's Linux renderer defaults to gamma 1.8, which
@@ -157,7 +170,7 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
 /// Starting Clay failed: said on the terminal and in debug.log, since a GUI started from
 /// the desktop (or by a /reload on Windows) has no terminal to say it on.
 fn fail(message: String) -> ! {
-    eprintln!("{message}");
+    quiet::terminal(&message);
     crate::debug_log(true, &format!("native-gui: {message}"));
     std::process::exit(1);
 }
