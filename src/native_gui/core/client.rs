@@ -1118,8 +1118,12 @@ impl ClientCore {
                     self.changed();
                 }
             }
+            // The server's answer to Esc-w / Esc-{ / Esc-} (or a /world). switch_to, not
+            // switch_world: that one takes the queued effects, and dropping them here threw
+            // away the MarkWorldSeen that clears the world's activity on the server and
+            // releases this client's ▶ in the world it left.
             WsMessage::CalculatedWorld { index: Some(index) } => {
-                let _ = self.switch_world(index, now);
+                self.switch_to(index, now);
                 self.out.push(Effect::Changed);
             }
             WsMessage::CalculatedWorld { index: None } => {}
@@ -1127,7 +1131,7 @@ impl ClientCore {
                 if let Some(w) = self.worlds.get_mut(world_index) {
                     w.pending_count = pending_count;
                 }
-                let _ = self.switch_world(world_index, now);
+                self.switch_to(world_index, now);
                 self.out.push(Effect::Changed);
             }
             other => self.out.push(Effect::Event(Box::new(other))),

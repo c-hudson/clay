@@ -890,3 +890,22 @@ fn recent_worlds_are_the_others_by_their_last_line_newest_first() {
     let _ = h.core.send_message(WsMessage::SendCommand { world_index: 3, command: "hi".into() });
     assert_eq!(h.core.recent_worlds(Instant::now())[0].0, 3);
 }
+
+#[test]
+fn a_switch_the_server_worked_out_tells_the_server_what_is_seen() {
+    // Esc-w / Esc-{ / Esc-} ask the server (CalculateNextWorld...) and switch on its answer.
+    // That switch has to say so: MarkWorldSeen is what clears the world's activity on the
+    // server and drops this client's ▶ in the world it left. It used to be queued and then
+    // thrown away with the switch's other effects.
+    for answer in [WsMessage::CalculatedWorld { index: Some(1) },
+                   WsMessage::WorldSwitchResult { world_index: 1, world_name: "B".into(), pending_count: 0, paused: false }] {
+        let mut h = H::password();
+        h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..2, 9)]);
+        h.effects.clear();
+        h.msg(answer);
+        assert_eq!(h.core.current, 1);
+        let sent = h.sent();
+        assert!(sent.iter().any(|m| matches!(m, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) })), "{sent:?}");
+        assert!(sent.iter().any(|m| matches!(m, WsMessage::RequestWorldState { world_index: 1 })), "{sent:?}");
+    }
+}
