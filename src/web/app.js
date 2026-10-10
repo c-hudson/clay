@@ -13833,6 +13833,32 @@
         }
     }
 
+    // The caret's display row in the input and the input's last row, as the textarea wraps
+    // its text: a hidden copy with the same font, width and wrapping, with markers at the
+    // caret and the end. Up on the first row / Down on the last recall history (TF).
+    function inputCaretRow() {
+        const ta = elements.input;
+        const cs = getComputedStyle(ta);
+        const m = document.createElement('div');
+        for (const p of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'wordSpacing',
+                         'lineHeight', 'textIndent', 'tabSize', 'fontVariantLigatures', 'textTransform']) {
+            m.style[p] = cs[p];
+        }
+        const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+        Object.assign(m.style, { position: 'absolute', visibility: 'hidden', left: '-9999px', top: '0',
+            whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: cs.wordBreak, boxSizing: 'content-box',
+            padding: '0', border: '0', width: Math.max(1, ta.clientWidth - padX) + 'px' });
+        const caret = document.createElement('span');
+        const end = document.createElement('span');
+        caret.textContent = end.textContent = '\u200b';
+        m.append(ta.value.slice(0, ta.selectionStart), caret, ta.value.slice(ta.selectionStart), end);
+        document.body.appendChild(m);
+        const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.2;
+        const at = { row: Math.round(caret.offsetTop / lh), last: Math.round(end.offsetTop / lh) };
+        m.remove();
+        return at;
+    }
+
     // Tab completion, factored out of tab_key's own more-mode-priority handling so it can
     // also be bound standalone (Esc-Tab default, TF-parity plan Job 22b/P2.7 - mirrors
     // input_handler::perform_completion's own factoring, Job 19). Returns true if a
@@ -13921,10 +13947,19 @@
                 elements.input.selectionStart = elements.input.selectionEnd = len;
                 return true;
             }
+            // TF's kb_up_or_recallb / kb_down_or_recallf, as the console: within a
+            // multi-row input the caret moves a row (the browser does that), and from the
+            // first row Up recalls history, from the last row Down does.
             case 'cursor_up':
-            case 'cursor_down':
-                // Multi-line cursor movement - let browser handle natively in textarea
+            case 'cursor_down': {
+                const input = elements.input;
+                if (input.selectionStart !== input.selectionEnd) return false;
+                const at = inputCaretRow();
+                if (actionId === 'cursor_up' ? at.row === 0 : at.row === at.last) {
+                    return dispatchActionImpl(actionId === 'cursor_up' ? 'history_prev' : 'history_next');
+                }
                 return false;
+            }
 
             // Editing - deletion actions honor kbnum the same way (TF-parity plan Job
             // 22b/P2.7).

@@ -66,7 +66,7 @@ key — bind them in `keybindings.dat` or the keybind editor.
 | `Esc-f` / `Ctrl-Right` | Word right |
 | `^A` / `Home` | Jump to start of line |
 | `^E` / `End` | Jump to end of line |
-| `Up` / `Down` | Cursor up/down (multi-line input) |
+| `Up` / `Down` | Cursor up/down within a multi-row input; from its first row Up recalls the previous command, from its last row Down the next (TF's `kb_up_or_recallb`), in every interface |
 | `Backspace` | Delete backward |
 | `Delete` / `^D` | Delete forward |
 | `^W` | Delete word backward |

@@ -193,13 +193,17 @@ impl ClayView {
             "cursor_end" => self.editor.end(),
             // A row up or down in the text; past the first (last) row, to the start (end),
             // as a text area does.
+            // TF's kb_up_or_recallb / kb_down_or_recallf, as the console: a row up or down
+            // within the input, and from its first row Up recalls history (Down from its last).
             "cursor_up" | "cursor_down" => {
                 let down = action == "cursor_down";
                 let to = self.input.layout.borrow().vertical(self.editor.cursor, down);
                 match to {
                     Some(at) => self.editor.set_cursor(at, false),
-                    None if down => self.editor.end(),
-                    None => self.editor.home(),
+                    None => {
+                        let n = self.take_kbnum() as i64;
+                        if down { self.editor.history_next(n) } else { self.editor.history_prev(n) }
+                    }
                 }
             }
             "delete_backward" => {
