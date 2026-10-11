@@ -203,3 +203,12 @@ path = "src/bin/clay-test-server.rs"
 # emoji font can be requested by name. See vendor/gpui-pre-wgpu/CLAY-PATCH.md.
 [patch.crates-io]
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+
+# Debug builds default to full DWARF debug info (`debug = 2`), which is the bulk of
+# `target/*/debug` - tens of GB of dependency symbols across every debug target dir.
+# `line-tables-only` keeps backtraces with file/line numbers (enough for almost all
+# debugging here) but drops the heavy variable/type info, roughly halving the debug
+# artifacts. Release builds are unaffected (that is `[profile.release]`), so `/release`
+# output is unchanged. Bump this back to `2` temporarily if you need deep gdb inspection.
+[profile.dev]
+debug = "line-tables-only"
