@@ -2996,10 +2996,6 @@ fn run_shell_on_terminal(app: &App, command: Option<&str>) -> Result<i32, String
     cmd.status().map(|s| s.code().unwrap_or(-1)).map_err(|e| e.to_string())
 }
 
-/// Turn SIGTERM, SIGHUP and SIGUSR2 into `AppEvent::TfSignal`s (see that variant). A signal
-/// that was ignored when Clay started stays ignored, as TF leaves it: `nohup clay -D` must
-/// survive its terminal closing.
-#[cfg(all(unix, not(target_os = "android")))]
 /// Crossterm mouse button to the code `shell::keys::mouse` expects (0 left, 1 middle,
 /// 2 right).
 fn mouse_button_code(b: MouseButton) -> u8 {
@@ -3010,6 +3006,10 @@ fn mouse_button_code(b: MouseButton) -> u8 {
     }
 }
 
+/// Turn SIGTERM, SIGHUP and SIGUSR2 into `AppEvent::TfSignal`s (see that variant). A signal
+/// that was ignored when Clay started stays ignored, as TF leaves it: `nohup clay -D` must
+/// survive its terminal closing.
+#[cfg(all(unix, not(target_os = "android")))]
 pub(crate) fn spawn_tf_signal_handlers(event_tx: &mpsc::Sender<AppEvent>) {
     for (kind, signum, event) in [
         (SignalKind::terminate(), libc::SIGTERM, tf::TfHookEvent::Sigterm),
