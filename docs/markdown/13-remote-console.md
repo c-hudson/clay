@@ -18,7 +18,7 @@ Examples:
 A server reached from another machine accepts the connection only at its Web Path
 (`web_path`, `clay` unless changed in its `/web` settings) and drops anything else without
 a reply. If the server's Web Path isn't `clay`, add it after the port, as above. The same
-form works for `--gui=`, `--grep=` and `/import`.
+form works for `--gui=`, `--web-gui=`, `--grep=` and `/import`.
 
 No special build features required - works with the standard musl build.
 
@@ -203,7 +203,7 @@ firewall at all, `/reach` and the Web Interface chapter's "Reaching Clay from
 outside your network" walk through every option; the SSH tunnel below is the one
 that needs no open port.
 
-Clay can tunnel `--console=`/`--gui=` over SSH itself instead of relying on a manual
+Clay can tunnel `--console=`/`--gui=`/`--web-gui=` over SSH itself instead of relying on a manual
 port-forward — pass `--ssh` and give the target in
 `[user@]host[:clayport[:sshport]]` form:
 

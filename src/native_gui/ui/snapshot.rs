@@ -1,4 +1,4 @@
-//! `clay --native-gui=host --native-gui-snapshot=out.png`: connect, collect what the server
+//! `clay --gui=host --gui-snapshot=out.png`: connect, collect what the server
 //! sends, render the main window offscreen with GPUI's headless renderer and save it as a
 //! PNG. For comparing the native GUI's rendering against the WebView without opening a
 //! window on anyone's desktop (`native-gui-snapshot` feature; Linux and macOS, where GPUI

@@ -1,8 +1,8 @@
 //! Native (non-WebView) GUI, behind the `native-gui` feature.
 //!
 //! Talks to Clay over its WebSocket protocol, as the web and Android clients do: to a
-//! Clay elsewhere (`--native-gui=host`), or to the one it runs in this process
-//! (`--native-gui` alone, as `--gui` runs the WebView GUI). `core` holds everything that
+//! Clay elsewhere (`--gui=host`), or to the one it runs in this process (`--gui` alone;
+//! `--web-gui` runs the WebView GUI instead). `core` holds everything that
 //! doesn't touch GPUI (connection, text styling, wrapping) so it can be unit-tested;
 //! `ui` is the GPUI side.
 
@@ -14,15 +14,15 @@ mod parity_tests;
 
 static LOCAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether this GUI runs Clay itself (`--native-gui` alone): its /reload is then the
+/// Whether this GUI runs Clay itself (`--gui` alone): its /reload is then the
 /// server's hot reload, which keeps the MUD connections.
 pub fn runs_clay() -> bool {
     LOCAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `clay --native-gui[=host[:port]]`: with a host, attach to that Clay; alone, run Clay
-/// here. With `snapshot` set (`--native-gui-snapshot=<png>`) render one frame offscreen
-/// to that file and exit; with `verify` set (`--native-gui-verify[=SECONDS]`) run the
+/// `clay --gui[=host[:port]]`: with a host, attach to that Clay; alone, run Clay
+/// here. With `snapshot` set (`--gui-snapshot=<png>`) render one frame offscreen
+/// to that file and exit; with `verify` set (`--gui-verify[=SECONDS]`) run the
 /// client headless and check its buffer (both attach, to this machine when no host).
 pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>, ssh: bool) -> std::io::Result<()> {
     log_crashes();
@@ -93,7 +93,7 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
         #[cfg(not(feature = "native-gui-snapshot"))]
         {
             let _ = (out, session, events);
-            eprintln!("Error: --native-gui-snapshot needs a build with the 'native-gui-snapshot' feature.");
+            eprintln!("Error: --gui-snapshot needs a build with the 'native-gui-snapshot' feature.");
             std::process::exit(1);
         }
     }
@@ -102,7 +102,7 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
     let key = session.target.key();
     session.core.set_cache(core::cache::load(&key));
     session.core.prefer_world(core::store::server(&key).last_world);
-    // Started from a desktop: no console window behind it (as `--gui` does).
+    // Started from a desktop: no console window behind it (as `--web-gui` does).
     #[cfg(windows)]
     {
         extern "system" {
@@ -114,7 +114,7 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
     Ok(())
 }
 
-/// `--native-gui` alone: Clay itself, in this process, as `--gui` runs it
+/// `--gui` alone: Clay itself, in this process, as `--web-gui` runs it
 /// (webview_gui::run_master_webgui): the app on the settings' port with a session
 /// password of its own (the server listens for remote clients too, so it mustn't be
 /// guessable), and this window logged in to it over the loopback.
@@ -129,7 +129,7 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
     if !std::env::args().any(|a| a == "--reload") {
         if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
             if e.kind() == std::io::ErrorKind::AddrInUse {
-                fail(format!("Clay is already running (port {port} is in use). Only one Clay runs at a time; to attach to it: clay --native-gui=127.0.0.1:{port}"));
+                fail(format!("Clay is already running (port {port} is in use). Only one Clay runs at a time; to attach to it: clay --gui=127.0.0.1:{port}"));
             }
             fail(format!("Clay failed to start: could not bind port {port}: {e}"));
         }
@@ -192,7 +192,7 @@ fn disable_font_smoothing() {
 /// any window (no TUI here, so errors and a passphrase prompt use the terminal).
 fn ssh_target(spec: Option<&str>, runtime: &tokio::runtime::Handle) -> core::net::Target {
     let Some(spec) = spec else {
-        eprintln!("Error: --ssh requires --native-gui=<[user@]host[:clayport[:sshport]]>.");
+        eprintln!("Error: --ssh requires --gui=<[user@]host[:clayport[:sshport]]>.");
         std::process::exit(1);
     };
     #[cfg(feature = "ssh-transport")]

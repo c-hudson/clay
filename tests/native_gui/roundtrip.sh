@@ -18,7 +18,7 @@ run() {   # run <name> <window> <steps> <pattern> [file under ~/.clay, default s
     python3 -I "$(dirname "$0")/echo-mud.py" $MUD "$WORK/mud.log" & local mud=$!
     HOME=$WORK/home CLAY_WS_PASSWORD=bench "$BIN/clay" --local-server --port=$WEB > "$WORK/ls.log" 2>&1 & local ls=$!
     sleep 2
-    HOME=$WORK/home CLAY_PASSWORD=bench CLAY_SNAPSHOT_WINDOW="$2" CLAY_SNAPSHOT_INPUT="$3" "$BIN/clay" --native-gui=127.0.0.1:$WEB --native-gui-snapshot="$OUT/$1.png" > "$WORK/snap.log" 2>&1
+    HOME=$WORK/home CLAY_PASSWORD=bench CLAY_SNAPSHOT_WINDOW="$2" CLAY_SNAPSHOT_INPUT="$3" "$BIN/clay" --gui=127.0.0.1:$WEB --gui-snapshot="$OUT/$1.png" > "$WORK/snap.log" 2>&1
     sleep 0.5
     local file="$WORK/home/.clay/${5:-settings.dat}"
     # The whole file as one string (-z), lines anchored with ^ as usual ((?m)).

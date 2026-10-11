@@ -25,7 +25,7 @@ timeout /t 1 /nobreak >nul
 
 if "%~1"=="webview" (
     set USERPROFILE=%WORK%\home-webview
-    start "" "%BIN%\clay.exe" --gui
+    start "" "%BIN%\clay.exe" --web-gui
     goto :eof
 )
 set USERPROFILE=%WORK%\home-native
@@ -33,7 +33,7 @@ set CLAY_WS_PASSWORD=bench
 start "" /b "%BIN%\clay.exe" --local-server --port=19202
 timeout /t 3 /nobreak >nul
 set CLAY_PASSWORD=bench
-start "" "%BIN%\clay.exe" --native-gui=127.0.0.1:19202
+start "" "%BIN%\clay.exe" --gui=127.0.0.1:19202
 goto :eof
 
 :home

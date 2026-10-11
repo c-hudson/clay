@@ -105,8 +105,9 @@ cargo build --release --no-default-features --features rustls-backend,ssh-transp
 |--------|-------------|
 | *(none)* | Console on Linux/Termux, GUI on Windows/macOS |
 | `--console[=host[:port]]` | Console mode, or attach to a remote server (port 9000) |
-| `--gui[=host[:port]]` | WebView GUI, or attach to a remote server (port 9000) |
-| `--ssh` | Tunnel `--console=`/`--gui=` through SSH: `[user@]host[:clayport[:sshport]]` |
+| `--gui[=host[:port]]` | Native GUI (a build without it opens the WebView one), or attach to a remote server (port 9000) |
+| `--web-gui[=host[:port]]` | WebView GUI, or attach to a remote server (port 9000) |
+| `--ssh` | Tunnel `--console=`/`--gui=`/`--web-gui=` through SSH: `[user@]host[:clayport[:sshport]]` |
 | `-D` | Headless daemon server |
 | `--multiuser` | Multiuser server |
 | `--local-server` | Headless, loopback-only, for an embedding client (needs `CLAY_WS_PASSWORD`); `--port=<N>` overrides the port |

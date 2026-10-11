@@ -66,7 +66,7 @@ web() {   # web <name> <w> <h> <path> <setup js> <after js>
         python3 "$ROOT/tests/native_gui/webview-snapshot-gtk.py" "http://127.0.0.1:$WEB/$4" "$OUT/web/$1.png" "$HASH" "$2" "$3" 6 2 2>&1 | grep -v '^$' | sed "s|$OUT/||" | grep -E 'snapshot|rror' | head -2
 }
 native() {   # native <name> <window kind or ""> <steps>
-    HOME=$WORK/home CLAY_PASSWORD=bench CLAY_SNAPSHOT_WINDOW="$2" CLAY_SNAPSHOT_INPUT="$3" "$BIN/clay" --native-gui=127.0.0.1:$WEB --native-gui-snapshot="$OUT/native/$1.png" 2>&1 | sed "s|$OUT/||" | grep -E 'snapshot|panic|error' | head -2
+    HOME=$WORK/home CLAY_PASSWORD=bench CLAY_SNAPSHOT_WINDOW="$2" CLAY_SNAPSHOT_INPUT="$3" "$BIN/clay" --gui=127.0.0.1:$WEB --gui-snapshot="$OUT/native/$1.png" 2>&1 | sed "s|$OUT/||" | grep -E 'snapshot|panic|error' | head -2
 }
 type_cmd() { echo "var i=document.getElementById('input'); i.value='$1'; i.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,bubbles:true}));"; }
 editor_login() { echo "document.getElementById('authPassword').value='bench'; doAuth(); ${1:-}"; }

@@ -1,6 +1,6 @@
 //! The native GUI's connection to a Clay server: TCP, then the CLAY-KNOCK preamble when
 //! it has an auth key, then TLS pinned trust-on-first-use (`TofuVerifier`, shared
-//! `~/.clay/known_hosts.dat` with `--console` and `--gui`), then the WebSocket.
+//! `~/.clay/known_hosts.dat` with `--console` and `--web-gui`), then the WebSocket.
 //!
 //! Plaintext `ws://` only ever goes to this machine (CLAUDE.md "Connection Security":
 //! the server serves loopback plain and everything else TLS). Policy — when to connect,

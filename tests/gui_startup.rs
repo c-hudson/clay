@@ -1,4 +1,4 @@
-//! Starts the real desktop GUI (`clay --gui`) on a headless GTK Broadway display and
+//! Starts the real desktop GUI (`clay --web-gui`) on a headless GTK Broadway display and
 //! checks what it prints to the terminal.
 //!
 //! Only built with the GUI (`cargo test --features webview-gui`) on Linux, and skipped
@@ -72,7 +72,7 @@ fn gui_startup_prints_no_webkit_signal_warning() {
     let stderr_file = std::fs::File::create(&stderr_path).unwrap();
 
     let gui = Command::new(env!("CARGO_BIN_EXE_clay"))
-        .arg("--gui")
+        .arg("--web-gui")
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
@@ -85,7 +85,7 @@ fn gui_startup_prints_no_webkit_signal_warning() {
         .stdout(Stdio::null())
         .stderr(stderr_file)
         .spawn()
-        .expect("failed to start clay --gui");
+        .expect("failed to start clay --web-gui");
     let mut gui = KillOnDrop(gui);
 
     // Long enough for the window, the webview and the page's first IPC/script calls
@@ -96,7 +96,7 @@ fn gui_startup_prints_no_webkit_signal_warning() {
             let mut err = String::new();
             let _ = std::fs::File::open(&stderr_path).and_then(|mut f| f.read_to_string(&mut err));
             let _ = std::fs::remove_dir_all(&home);
-            panic!("clay --gui exited early ({status}); stderr:\n{err}");
+            panic!("clay --web-gui exited early ({status}); stderr:\n{err}");
         }
         std::thread::sleep(Duration::from_millis(250));
     }

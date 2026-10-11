@@ -1,4 +1,4 @@
-//! `clay [--native-gui=host] --native-gui-verify[=SECONDS]`: run the native GUI's client
+//! `clay [--gui=host] --gui-verify[=SECONDS]`: run the native GUI's client
 //! with no window for a while, then check it holds exactly what the server has.
 //!
 //! The Rust counterpart of `reference/ws-verify-client.py`, but driving the real client

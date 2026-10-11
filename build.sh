@@ -487,13 +487,14 @@ echo "Run Clay:"
 echo "  ./$BINARY_PATH"
 if echo "$FEATURES" | grep -q "webview-gui"; then
     echo ""
-    echo "Run as GUI client (connects to running instance):"
-    echo "  ./$BINARY_PATH --gui=hostname:port"
+    echo "Run the WebView GUI, or attach it to a running Clay:"
+    echo "  ./$BINARY_PATH --web-gui"
+    echo "  ./$BINARY_PATH --web-gui=hostname:port"
 fi
 if echo "$FEATURES" | grep -q "native-gui"; then
     echo ""
     echo "Run Clay with the native GUI, or attach it to a running Clay:"
-    echo "  ./$BINARY_PATH --native-gui"
-    echo "  ./$BINARY_PATH --native-gui=hostname:port"
+    echo "  ./$BINARY_PATH --gui"
+    echo "  ./$BINARY_PATH --gui=hostname:port"
 fi
 echo ""

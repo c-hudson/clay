@@ -4,7 +4,7 @@
 //! Connection events, server messages and clock ticks go in; [`Effect`]s come out (send
 //! this message, open a connection, close it, store this key, redraw). The transport
 //! (`net`) and the GUI carry the effects out, and the headless verifier
-//! (`--native-gui-verify`) drives the very same core, so what it proves is what the GUI
+//! (`--gui-verify`) drives the very same core, so what it proves is what the GUI
 //! does.
 //!
 //! The rules are app.js's, which is the protocol's reference client

@@ -34,7 +34,7 @@ Platform → assets built and uploaded:
 |------|--------|-----------------------|
 | `--android` | Android APK | `clay-android.apk` |
 | `--mac` | macOS universal (x86_64 + aarch64 via lipo) | `clay-macos-universal` |
-| `--linux` | Linux musl + Linux GUI+audio | `clay-linux-x86_64-musl`, `clay-linux-x86_64-gui` |
+| `--linux` | Linux musl + Linux GUI (native + WebView + audio) | `clay-linux-x86_64-musl`, `clay-linux-x86_64-gui` |
 | `--windows` | Windows x86_64 via Windows VM (192.168.2.14) | `clay-windows-x86_64.exe` |
 
 Examples:
@@ -141,7 +141,10 @@ APK (whose `buildNativeServer` task shells out to cargo).
 Build in this order, each to completion before starting the next:
 
 1. **Linux musl** — see machines.md for exact command
-2. **Linux GUI+audio** — see machines.md for exact command
+2. **Linux GUI (native GUI + WebView GUI + audio)** — see machines.md: it goes through
+   `tests/native_gui/cargo-native.sh` (toolchain 1.98.1, target dir `target/native-gui/`),
+   with `NATIVE_GUI_FEATURES=webview-gui,native-audio,native-gui`. The artifact is
+   `target/native-gui/release/clay`, not `target/release/clay`.
 3. **Termux armv7 / aarch64 / aarch64-GUI cross-builds** — see below
 4. **Android APK** — see machines.md for build, align, and sign commands
 
@@ -248,6 +251,24 @@ strings /tmp/<asset> | grep -c '<string-added-in-this-release>'   # must be > 0
 ```
 A `0` means you built stale source: re-sync and rebuild. Do this for *every* asset before Step 8 — it is the only check that catches a silent stale build.
 
+#### Long remote builds
+
+The GUI builds with the native GUI are long (Windows ~21 min cold, macOS two targets). A
+remote `cargo` started inside a single `ssh` command dies with that session, so a harness
+timeout on the SSH command kills the build mid-way and leaves a half-linked binary. Start the
+build detached on the remote and poll its log instead:
+
+```bash
+# Mac VM (bash): nohup keeps cargo alive after the ssh command returns
+~/VMs/macos/macvm.sh ssh 'cd ~/clay && nohup bash -c "<build command>" > build.log 2>&1 < /dev/null & echo started'
+~/VMs/macos/macvm.sh ssh 'tail -3 ~/clay/build.log'            # poll until Finished/error
+```
+On the Windows VM (cmd.exe) the equivalent is a scheduled task or `start /b` with output
+redirected to a file; the simplest reliable form is to run the ssh command from a
+`setsid nohup ssh ... > log &` on this host, so the local tool timeout cannot kill the ssh
+client, and poll the local log. Whichever form, read the log's tail for `Finished` or
+`error` before copying the binary back — the detached start always "succeeds".
+
 #### 6a. Mac VM (localhost, QEMU/KVM)
 
 macOS is built **only** on the Mac VM (macOS 26 Tahoe, `~/VMs/macos`) — the physical Mac
@@ -261,7 +282,9 @@ VirtualBox VM: finish 6a (including the stop) before starting 6b.
 2. Sync per **Syncing a remote**, through `macvm.sh ssh '...'` (a bash remote, dir `~/clay`),
    and assert `git rev-parse HEAD` equals `EXPECTED_SHA`.
 3. Run the Mac VM build command from machines.md (it exports `MACOSX_DEPLOYMENT_TARGET=11.0`,
-   builds both `x86_64-apple-darwin` and `aarch64-apple-darwin`, and `lipo`s them).
+   builds both `x86_64-apple-darwin` and `aarch64-apple-darwin` with `cargo +1.98.1` and the
+   `webview-gui,native-audio,native-gui` features, and `lipo`s them). Run it detached (see
+   "Long remote builds" below); it is a long build.
 4. Copy it back:
    `scp -P 2222 -o UserKnownHostsFile=$HOME/VMs/macos/known_hosts adrick@127.0.0.1:clay/clay-macos-universal /tmp/clay-macos-universal`,
    then verify it contains this release's code, like any other asset.
@@ -299,9 +322,12 @@ ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no adrick@192.
 **Build (cmd.exe — this VM is NOT bash; see the cmd.exe note in "Syncing a remote"):**
 1. Sync + build in one cmd.exe invocation, then read the printed SHA and confirm it equals `EXPECTED_SHA` before trusting the binary:
    ```cmd
-   cd clay && git checkout -- Cargo.lock && git pull && git rev-parse HEAD && set RUSTFLAGS=-C target-feature=+crt-static && cargo build --release --features webview-gui,native-audio
+   cd clay && git checkout -- Cargo.lock && git pull && git rev-parse HEAD && set RUSTFLAGS=-C target-feature=+crt-static && cargo +1.98.1 build --release --features webview-gui,native-audio,native-gui
    ```
-   (`set VAR=val && cargo ...` in the same line is how cmd passes an env var to the build; that part was already correct in machines.md — the sync prefix is the new part.)
+   (`set VAR=val && cargo ...` in the same line is how cmd passes an env var to the build; that part was already correct in machines.md — the sync prefix is the new part.) `+1.98.1` is the
+   native GUI's toolchain (installed on the VM). A cold build takes ~21 minutes: run it
+   detached (see "Long remote builds" below) rather than inside one SSH command that a tool
+   timeout can kill mid-link.
 2. `scp` the binary back: `scp adrick@192.168.2.14:clay/target/release/clay.exe /tmp/clay-windows-x86_64.exe`
 3. **Verify** it contains this release's code (`strings /tmp/clay-windows-x86_64.exe | grep -c '<release-marker>'` must be > 0). A `0` here means the cmd.exe sync didn't take and you built stale source — re-run step 1 and re-check the printed SHA.
 
@@ -367,7 +393,7 @@ For a full release:
 | Source | Local Path | Asset Name |
 |--------|-----------|------------|
 | Linux musl | `target/x86_64-unknown-linux-musl/release/clay` | `clay-linux-x86_64-musl` |
-| Linux GUI | `/tmp/clay-linux-x86_64-gui` | `clay-linux-x86_64-gui` |
+| Linux GUI (native + WebView) | `/tmp/clay-linux-x86_64-gui` | `clay-linux-x86_64-gui` |
 | Windows (if reachable) | `/tmp/clay-windows-x86_64.exe` | `clay-windows-x86_64.exe` |
 | Android | `android/clay-android.apk` | `clay-android.apk` |
 | Mac (Mac VM) | `/tmp/clay-macos-universal` | `clay-macos-universal` |

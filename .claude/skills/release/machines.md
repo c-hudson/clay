@@ -31,14 +31,25 @@ cargo build --release --target x86_64-unknown-linux-musl --no-default-features -
 - Binary: `target/x86_64-unknown-linux-musl/release/clay`
 - Release asset name: `clay-linux-x86_64-musl`
 
-### Linux GUI+audio (x86_64, non-static)
+### Linux GUI (native GUI + WebView GUI + audio, x86_64, non-static)
 ```bash
-cargo build --release --features webview-gui,native-audio
-cp target/release/clay /tmp/clay-linux-x86_64-gui
+NATIVE_GUI_FEATURES=webview-gui,native-audio,native-gui tests/native_gui/cargo-native.sh build --release
+cp target/native-gui/release/clay /tmp/clay-linux-x86_64-gui
 ```
-- Binary: `target/release/clay` → copy to `/tmp/clay-linux-x86_64-gui` (avoids filename collision with musl build during upload)
+- Binary: `target/native-gui/release/clay` → copy to `/tmp/clay-linux-x86_64-gui` (avoids filename collision with musl build during upload)
 - Release asset name: `clay-linux-x86_64-gui`
-- Non-static (links glibc dynamically), includes WebView GUI and audio support
+- Non-static (links glibc dynamically). One binary with BOTH GUIs: `--gui` is the native
+  (GPUI) GUI, `--web-gui` the WebView one, plus audio. About 97 MB unstripped (v1.7.0).
+- **The native GUI needs Rust 1.98.1** (GPUI; the host default toolchain is too old), so the
+  build goes through `tests/native_gui/cargo-native.sh`: it runs `cargo +1.98.1` with the
+  features in `NATIVE_GUI_FEATURES`, in its own target dir `target/native-gui/` (a separate
+  cargo lock - still run it one at a time with the other local builds), and on Linux adds a
+  `-L native=target/native-gui-link` for the libxkbcommon-x11 symlink when only the runtime
+  library is installed. One-time setup: `rustup toolchain install 1.98.1`, plus the
+  pkg-config dev packages GPUI links (xkbcommon, wayland, fontconfig, freetype; see
+  `build.sh`'s `check_native_gui`). A plain `cargo build --features webview-gui,native-audio`
+  on the default toolchain is the fallback *without* the native GUI - never ship that as the
+  GUI asset without saying so, since `--gui` then silently opens the WebView GUI.
 
 ### Windows (pre-built by user)
 
@@ -48,7 +59,7 @@ project root before running `/release`.
 
 ```cmd
 set RUSTFLAGS=-C target-feature=+crt-static
-cargo build --release --features webview-gui,native-audio
+cargo +1.98.1 build --release --features webview-gui,native-audio,native-gui
 ```
 
 - Binary: `clay.exe` (project root, fallback only)
@@ -213,7 +224,11 @@ release); `-f` prevents the staleness from being introduced in the first place.
 2. After `modifymedium --resize` (done while the VM is off), the guest **will not see the new size** even after `diskpart rescan` while running — a full poweroff + startvm cycle is required before Windows reports the new disk size (confirmed via `Get-Disk`).
 3. A recurring `BLKCACHE_IOERR` VM-pause during/after the resize was originally (2026-07-29) misdiagnosed as a VirtualBox I/O quirk fixable by `VBoxManage controlvm clay-win11 resume`. **Actual root cause (per the user, 2026-07-30): the NTFS partition table ended up claiming 70GB while the underlying virtual disk medium was still actually 50GB** — a genuine size mismatch, not a transient bug. `Get-Disk` inside the guest reported 70GB correctly but that didn't guarantee the backing medium truly matched. User has since fixed this directly; nothing outstanding. **Next resize: verify the medium's actual resized capacity is real before trusting `diskpart extend`, not just what the guest reports.**
 
-### Windows x86_64 binary (MSVC, GUI + audio)
+### Windows x86_64 binary (MSVC, native GUI + WebView GUI + audio)
+
+Toolchain **1.98.1** (installed on the VM; `rustup toolchain list` shows it) for the native
+GUI, hence `cargo +1.98.1`. About 60 MB, static CRT. A cold build takes ~21 minutes (a warm
+one a few), so run it detached from the SSH session (see SKILL.md "Long remote builds").
 
 This VM runs **cmd.exe**, not bash — use `&&` (not `;`), no `2>/dev/null`, no `test "$()"`.
 `git checkout -- Cargo.lock` first: cargo rewrites `Cargo.lock` on every build, and a bare
@@ -221,7 +236,7 @@ This VM runs **cmd.exe**, not bash — use `&&` (not `;`), no `2>/dev/null`, no 
 stops on the abort, which is why the chain form below is safe — but only if the discard
 runs first). Confirm the printed SHA equals the release commit before trusting the binary.
 ```cmd
-cd clay && git checkout -- Cargo.lock && git pull && git rev-parse HEAD && set RUSTFLAGS=-C target-feature=+crt-static && cargo build --release --features webview-gui,native-audio
+cd clay && git checkout -- Cargo.lock && git pull && git rev-parse HEAD && set RUSTFLAGS=-C target-feature=+crt-static && cargo +1.98.1 build --release --features webview-gui,native-audio,native-gui
 ```
 - Binary: `target\release\clay.exe`
 - Release asset name: `clay-windows-x86_64.exe`
@@ -244,8 +259,9 @@ at `~/VMs/OSX-KVM`), running on this AMD host. It is the only macOS builder for 
   (disk `~/VMs/macos/mac_hdd.qcow2`, 100 GB sparse; VNC on `127.0.0.1:5905` for the GUI).
 - SSH: user `adrick`, `127.0.0.1` port **2222** (QEMU user-net forward), known-hosts file
   `~/VMs/macos/known_hosts`. `macvm.sh ssh '<cmd>'` wraps the right options.
-- Toolchain: Xcode Command Line Tools 26.6 (no full Xcode), rustup stable with
-  `x86_64-apple-darwin` + `aarch64-apple-darwin`. Checkout at `~/clay`.
+- Toolchain: Xcode Command Line Tools 26.6 (no full Xcode), rustup stable AND **1.98.1**
+  (for the native GUI), each with `x86_64-apple-darwin` + `aarch64-apple-darwin`. Checkout
+  at `~/clay`. The VM has no Metal, so it can build the native GUI but not run it.
 - **Never run it at the same time as a VirtualBox VM** (the Windows VM): KVM and
   VirtualBox both need AMD-V. `macvm.sh start` refuses while a VirtualBox VM is running.
 - **Stop it gracefully** with `macvm.sh stop`: it shuts macOS down over SSH (passwordless
@@ -269,16 +285,18 @@ at `~/VMs/OSX-KVM`), running on this AMD host. It is the only macOS builder for 
 - The host needs `kvm ignore_msrs=1` (`/etc/modprobe.d/kvm.conf`, installed from
   OSX-KVM's `kvm_amd.conf`), or macOS crashes at boot.
 
-### macOS universal binary (Mac VM)
+### macOS universal binary (Mac VM, native GUI + WebView GUI + audio)
 ```bash
 ~/VMs/macos/macvm.sh ssh 'source ~/.cargo/env; cd ~/clay && git stash push -- Cargo.lock; git pull && git rev-parse HEAD'
-# compare the printed SHA to EXPECTED_SHA, then:
+# compare the printed SHA to EXPECTED_SHA, then (detached - see SKILL.md "Long remote builds"):
 ~/VMs/macos/macvm.sh ssh 'source ~/.cargo/env; cd ~/clay && export MACOSX_DEPLOYMENT_TARGET=11.0 && set -e &&
-  cargo build --release --target x86_64-apple-darwin --features webview-gui,native-audio &&
-  cargo build --release --target aarch64-apple-darwin --features webview-gui,native-audio &&
+  cargo +1.98.1 build --release --target x86_64-apple-darwin --features webview-gui,native-audio,native-gui &&
+  cargo +1.98.1 build --release --target aarch64-apple-darwin --features webview-gui,native-audio,native-gui &&
+  rm -f clay-macos-universal &&
   lipo -create target/x86_64-apple-darwin/release/clay target/aarch64-apple-darwin/release/clay -output clay-macos-universal'
 scp -P 2222 -o UserKnownHostsFile=$HOME/VMs/macos/known_hosts adrick@127.0.0.1:clay/clay-macos-universal /tmp/clay-macos-universal
 ```
+About 121 MB (two architectures, both GUIs).
 `MACOSX_DEPLOYMENT_TARGET=11.0` is required: the VM's SDK is macOS 26. Rust code already
 defaults to an old minimum, but C dependencies built by `cc`/clang (SQLite, ring, ...) default
 to the SDK's own version, which would stop the binary loading on older macOS. 11.0 matches

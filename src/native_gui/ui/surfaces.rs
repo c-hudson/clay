@@ -718,8 +718,8 @@ impl ClayView {
 /// target and `--ssh` (a new target is reached directly unless asked again), plus the new
 /// one (platform::exec_relaunch's rule for the WebView GUI).
 pub(super) fn relaunch_args(args: &[String], target: &str) -> Vec<String> {
-    let mut out: Vec<String> = args.iter().filter(|a| *a != "--native-gui" && !a.starts_with("--native-gui=") && *a != "--ssh").cloned().collect();
-    out.push(format!("--native-gui={target}"));
+    let mut out: Vec<String> = args.iter().filter(|a| *a != "--gui" && !a.starts_with("--gui=") && *a != "--ssh").cloned().collect();
+    out.push(format!("--gui={target}"));
     out
 }
 
@@ -729,7 +729,7 @@ mod relaunch_tests {
 
     #[test]
     fn a_new_target_replaces_the_old_and_drops_ssh() {
-        let args: Vec<String> = ["--conf=/x/settings.dat", "--native-gui=old:9000", "--ssh"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(relaunch_args(&args, "new.example:9001"), vec!["--conf=/x/settings.dat".to_string(), "--native-gui=new.example:9001".to_string()]);
+        let args: Vec<String> = ["--conf=/x/settings.dat", "--gui=old:9000", "--ssh"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(relaunch_args(&args, "new.example:9001"), vec!["--conf=/x/settings.dat".to_string(), "--gui=new.example:9001".to_string()]);
     }
 }

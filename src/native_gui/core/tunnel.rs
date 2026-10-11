@@ -1,5 +1,5 @@
-//! `--native-gui=[user@]host[:clayport[:sshport]] --ssh`: the server reached through SSH,
-//! as `--gui`/`--console` reach it (src/ssh.rs). The SSH session opens before any window
+//! `--gui=[user@]host[:clayport[:sshport]] --ssh`: the server reached through SSH,
+//! as `--web-gui`/`--console` reach it (src/ssh.rs). The SSH session opens before any window
 //! does, so a key's passphrase can be asked for on the terminal (the remote console's
 //! rule); then a loopback port forwards each connection the client makes through a fresh
 //! channel of it. The far end is the server's own loopback, so the client speaks plain

@@ -126,9 +126,10 @@ cargo build --release --features webview-gui
 |---------|-------------|
 | `rustls-backend` | Use rustls for TLS (recommended for musl) |
 | `native-tls-backend` | Use native TLS (requires OpenSSL) |
-| `webview-gui` | Build the native WebView GUI client (requires display; `--gui`) |
+| `native-gui` | Build the native GUI (GPUI; needs Rust 1.98 or newer and a display; `--gui`) |
+| `webview-gui` | Build the WebView GUI client (requires display; `--web-gui`, and `--gui` in a build without `native-gui`) |
 | `native-audio` | ANSI music / MSP sound playback via rodio (on by default) |
-| `ssh-transport` | SSH-tunneled `--console`/`--gui` and Android's SSH proxy (on by default) |
+| `ssh-transport` | SSH-tunneled `--console`/`--gui`/`--web-gui` and Android's SSH proxy (on by default) |
 
 ## Verifying the Installation
 
@@ -152,14 +153,15 @@ On first run, Clay creates a settings file at `~/.clay.dat` and displays a color
 | `-v`, `--version` | Show version and exit |
 | `--conf=<path>` | Use alternate config file instead of `~/.clay/settings.dat` |
 | `--console[=host[:port]]` | Console (TUI) mode; with an address, connects to a running Clay instance instead of starting a local one (default port: 9000) |
-| `--gui[=host[:port]]` | WebView GUI mode (requires the `webview-gui` feature); same local-vs-remote distinction as `--console` |
-| `--ssh` | Tunnel `--console=`/`--gui=` through SSH instead of connecting directly (requires the `ssh-transport` feature) |
+| `--gui[=host[:port]]` | GUI mode: the native GUI (`native-gui` feature; a build without it opens the WebView GUI instead); same local-vs-remote distinction as `--console` |
+| `--web-gui[=host[:port]]` | WebView GUI mode (requires the `webview-gui` feature); same local-vs-remote distinction as `--console` |
+| `--ssh` | Tunnel `--console=`/`--gui=`/`--web-gui=` through SSH instead of connecting directly (requires the `ssh-transport` feature) |
 | `-D` | Run as a headless daemon server |
 | `--multiuser` | Run as a multiuser server (separate config, one process serves several independent accounts) |
 | `--local-server` | Run headless, loopback-only, for an embedding client (e.g. the Android app) |
 | `--port=<N>` | Override the listen port (used with `--local-server`) |
 
-Remote connections always use `--console=host:port` or `--gui=host:port` — there is
+Remote connections always use `--console=host:port`, `--gui=host:port` or `--web-gui=host:port` — there is
 no separate flag for it.
 
 **Example using alternate config:**

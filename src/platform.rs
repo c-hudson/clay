@@ -1901,10 +1901,11 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     let mut args: Vec<String> = crate::tfstartup::clay_args_only(
         std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect());
     args.push("--reload".to_string());
-    // On Windows/macOS, GUI is the default mode (no --gui flag in args).
-    // Ensure the reload child also runs in GUI mode (the native GUI's flag already does).
-    if is_headless && !args.iter().any(|a| a == "--gui" || a.starts_with("--gui=") || a == "--native-gui" || a.starts_with("--native-gui=")) {
-        args.push("--gui".to_string());
+    // On Windows/macOS, the GUI is the default mode (no flag in args). Make the reload
+    // child run the same GUI: the native one (`--gui`) when it is built in, else the
+    // WebView one (`--web-gui`).
+    if is_headless && !args.iter().any(|a| a == "--gui" || a.starts_with("--gui=") || a == "--web-gui" || a.starts_with("--web-gui=")) {
+        args.push(if cfg!(feature = "native-gui") { "--gui" } else { "--web-gui" }.to_string());
     }
     debug_log(is_debug_enabled(), &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
 
@@ -1991,7 +1992,7 @@ pub fn exec_relaunch(connect_addr: Option<&str>, use_gui: bool) -> io::Result<()
     ));
 
     // Keep the existing argv (e.g. --conf=...) but drop any previous mode/reload flags —
-    // detaching/switching must not carry over a stale --console=/--gui= target. --ssh is
+    // detaching/switching must not carry over a stale --console=/--web-gui= target. --ssh is
     // dropped for the same reason: it's meaningless without a target (detach case), and
     // would otherwise silently keep applying to whatever new target this relaunch is for
     // (switch case) even though the user didn't ask for an SSH tunnel to it. A `/server`
@@ -2000,12 +2001,12 @@ pub fn exec_relaunch(connect_addr: Option<&str>, use_gui: bool) -> io::Result<()
     // --ssh, since a reload should resume the same SSH-tunneled session.
     let mut args: Vec<String> = crate::tfstartup::clay_args_only(std::env::args().skip(1).filter(|a| {
         a != "--reload" && a != "--crash"
-            && a != "--console" && a != "--gui" && a != "--ssh"
-            && !a.starts_with("--console=") && !a.starts_with("--gui=")
+            && a != "--console" && a != "--gui" && a != "--web-gui" && a != "--ssh"
+            && !a.starts_with("--console=") && !a.starts_with("--gui=") && !a.starts_with("--web-gui=")
     }).collect());
     let mode_flag = match (use_gui, connect_addr) {
-        (true, Some(addr)) => format!("--gui={}", addr),
-        (true, None) => "--gui".to_string(),
+        (true, Some(addr)) => format!("--web-gui={}", addr),
+        (true, None) => "--web-gui".to_string(),
         (false, Some(addr)) => format!("--console={}", addr),
         (false, None) => "--console".to_string(),
     };

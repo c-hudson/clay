@@ -1,8 +1,9 @@
 // WebView GUI client using wry (native WebView window)
 //
 // Provides two modes:
-// --gui            Master mode: runs App headlessly + opens WebView window (local WS connection)
-// --gui=host:port  Remote mode: opens WebView window connected to remote Clay instance
+// --web-gui            Master mode: runs App headlessly + opens WebView window (local WS connection)
+// --web-gui=host:port  Remote mode: opens WebView window connected to remote Clay instance
+// (`--gui` is the native GUI, src/native_gui; a build without it opens this one for --gui too)
 
 use std::borrow::Cow;
 use std::collections::HashMap;

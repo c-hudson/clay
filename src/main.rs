@@ -5708,7 +5708,7 @@ impl App {
             backfill_next: None,
             next_scrollback_request_id: 1,
             pending_scrollback_requests: std::collections::HashMap::new(),
-            gui_tx: None, // Set when running in master GUI mode (--gui)
+            gui_tx: None, // Set when running in master WebView GUI mode (--web-gui)
             gui_repaint: None,
             audio_backend: audio::AudioBackend::None, // Lazy init on first use
             media_cache_dir: clay_config_dir().join("media"),
@@ -19795,8 +19795,8 @@ async fn main() -> io::Result<()> {
     #[allow(unused_variables)]
     let mut tls_proxy_config: Option<String> = None;
     let mut console_arg: Option<Option<String>> = None;  // None=not set, Some(None)=bare, Some(Some(addr))=with addr
-    let mut gui_arg: Option<Option<String>> = None;
-    let mut native_gui_arg: Option<Option<String>> = None;
+    let mut gui_arg: Option<Option<String>> = None;      // --gui: the native GUI (a build without it opens the WebView one)
+    let mut web_gui_arg: Option<Option<String>> = None;  // --web-gui: the WebView GUI
     let mut native_gui_snapshot: Option<String> = None;
     let mut native_gui_verify: Option<u64> = None;
     let mut ssh_mode = false;
@@ -19842,7 +19842,7 @@ async fn main() -> io::Result<()> {
                 "--crash" => is_crash_arg = true,
                 "--console" => console_arg = Some(None),
                 "--gui" => gui_arg = Some(None),
-                "--native-gui" => native_gui_arg = Some(None),
+                "--web-gui" => web_gui_arg = Some(None),
                 "--ssh" => ssh_mode = true,
                 "--ssh-proxy" => ssh_proxy_mode = true,
                 "--dump" => dump_mode = true,
@@ -19869,12 +19869,12 @@ async fn main() -> io::Result<()> {
                 },
                 _ if arg.starts_with("--console=") => console_arg = Some(Some(arg[10..].to_string())),
                 _ if arg.starts_with("--gui=") => gui_arg = Some(Some(arg[6..].to_string())),
-                _ if arg.starts_with("--native-gui=") => native_gui_arg = Some(Some(arg[13..].to_string())),
-                _ if arg.starts_with("--native-gui-snapshot=") => native_gui_snapshot = Some(arg[22..].to_string()),
-                "--native-gui-verify" => native_gui_verify = Some(30),
-                _ if arg.starts_with("--native-gui-verify=") => {
-                    native_gui_verify = Some(arg[20..].parse().unwrap_or_else(|_| {
-                        eprintln!("Error: --native-gui-verify=SECONDS");
+                _ if arg.starts_with("--web-gui=") => web_gui_arg = Some(Some(arg[10..].to_string())),
+                _ if arg.starts_with("--gui-snapshot=") => native_gui_snapshot = Some(arg[15..].to_string()),
+                "--gui-verify" => native_gui_verify = Some(30),
+                _ if arg.starts_with("--gui-verify=") => {
+                    native_gui_verify = Some(arg[13..].parse().unwrap_or_else(|_| {
+                        eprintln!("Error: --gui-verify=SECONDS");
                         std::process::exit(1);
                     }))
                 }
@@ -19893,6 +19893,7 @@ async fn main() -> io::Result<()> {
     if tf_startup_opts.given {
         let clash = if matches!(console_arg, Some(Some(_))) { Some("--console=") }
             else if matches!(gui_arg, Some(Some(_))) { Some("--gui=") }
+            else if matches!(web_gui_arg, Some(Some(_))) { Some("--web-gui=") }
             else if multiuser_mode { Some("--multiuser") }
             else if grep_arg.is_some() || grep_archive_mode { Some("--grep") }
             else if dump_mode { Some("--dump") }
@@ -19915,13 +19916,11 @@ async fn main() -> io::Result<()> {
         println!("Options:");
         println!("    --console            Run in console (TUI) mode");
         println!("    --console=host[:port][/path] Connect to a Clay server via console (default port: 9000, web path clay)");
-        println!("    --gui                Run in GUI (webview) mode");
-        println!("    --gui=host[:port][/path] Connect to a Clay server via GUI (default port: 9000, web path clay)");
-        #[cfg(feature = "native-gui")]
-        println!("    --native-gui         Run Clay with the native GUI (as --gui runs the WebView one)");
-        #[cfg(feature = "native-gui")]
-        println!("    --native-gui=host[:port] Attach the native GUI to a Clay server (--ssh too)");
-        println!("    --ssh                Tunnel --console=/--gui= through SSH instead of connecting");
+        println!("    --gui                Run Clay with the GUI (the native one; a build without it opens the WebView one)");
+        println!("    --gui=host[:port]    Attach the GUI to a Clay server (default port: 9000)");
+        println!("    --web-gui            Run Clay with the WebView GUI (the web interface in a window)");
+        println!("    --web-gui=host[:port][/path] Connect to a Clay server via the WebView GUI (web path clay)");
+        println!("    --ssh                Tunnel --console=/--gui=/--web-gui= through SSH instead of connecting");
         println!("                         directly. Target grammar becomes:");
         println!("                           [user@]host[:clayport[:sshport]]");
         println!("                         clayport defaults to 9000, sshport to 22, user to");
@@ -19997,17 +19996,41 @@ async fn main() -> io::Result<()> {
         set_custom_config_path(PathBuf::from(path));
     }
 
-    // Native GUI (branch native-gui): attaches to a running Clay, like --gui=host.
-    if let Some(target) = native_gui_arg.or_else(|| native_gui_verify.map(|_| None)) {
-        #[cfg(feature = "native-gui")]
-        {
+    // `--gui` is the native GUI (src/native_gui) when it is built in: alone it runs Clay
+    // in this process, with a host it attaches to that Clay. It is also what Windows and
+    // macOS start with no flag at all. A build without the native GUI opens the WebView
+    // one for `--gui` instead (Termux, a plain `--features webview-gui` build), so the
+    // platform default and old command lines keep working; `--web-gui` always means the
+    // WebView one.
+    if gui_arg.is_some() && (console_arg.is_some() || web_gui_arg.is_some()) {
+        eprintln!("Error: --gui cannot be combined with --console or --web-gui.");
+        std::process::exit(1);
+    }
+    if gui_arg.is_some() && (daemon_mode || multiuser_mode) {
+        eprintln!("Error: -D/--multiuser cannot be combined with --gui.");
+        std::process::exit(1);
+    }
+    #[cfg(feature = "native-gui")]
+    {
+        let other_mode = console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode
+            || local_server_mode || ssh_proxy_mode || dump_mode || grep_arg.is_some() || grep_archive_mode
+            || tls_proxy_config.is_some();
+        let platform_default = (cfg!(target_os = "macos") || cfg!(windows)) && !other_mode && !ssh_mode;
+        let target = gui_arg.clone()
+            .or_else(|| native_gui_verify.map(|_| None))
+            .or_else(|| platform_default.then_some(None));
+        if let Some(target) = target {
             return native_gui::run(target, native_gui_snapshot, native_gui_verify, ssh_mode);
         }
-        #[cfg(not(feature = "native-gui"))]
-        {
-            let _ = (target, native_gui_snapshot, native_gui_verify, ssh_mode);
-            eprintln!("Error: --native-gui requires a build with the 'native-gui' feature.");
+    }
+    #[cfg(not(feature = "native-gui"))]
+    {
+        if native_gui_snapshot.is_some() || native_gui_verify.is_some() {
+            eprintln!("Error: --gui-snapshot and --gui-verify need a build with the 'native-gui' feature.");
             std::process::exit(1);
+        }
+        if let Some(target) = gui_arg.take() {
+            web_gui_arg = Some(target);
         }
     }
 
@@ -20026,7 +20049,7 @@ async fn main() -> io::Result<()> {
     migrate_legacy_config_files();
 
     // Always log startup (not gated by debug flag) for reload/crash diagnostics
-    debug_log(is_debug_enabled(), &format!("STARTUP: {} (reload={}, crash={}, gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg));
+    debug_log(is_debug_enabled(), &format!("STARTUP: {} (reload={}, crash={}, gui={:?}, web_gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg, web_gui_arg));
 
     // Parse --grep / --grep-archive extra args
     let mut grep_world_filter: Option<String> = None;
@@ -20075,16 +20098,16 @@ async fn main() -> io::Result<()> {
     }
 
     // Validate mutual exclusivity
-    if console_arg.is_some() && gui_arg.is_some() {
-        eprintln!("Error: --console and --gui are mutually exclusive.");
+    if console_arg.is_some() && web_gui_arg.is_some() {
+        eprintln!("Error: --console and --web-gui are mutually exclusive.");
         std::process::exit(1);
     }
-    if (daemon_mode || multiuser_mode) && (console_arg.is_some() || gui_arg.is_some()) {
-        eprintln!("Error: -D/--multiuser cannot be combined with --console/--gui.");
+    if (daemon_mode || multiuser_mode) && (console_arg.is_some() || web_gui_arg.is_some()) {
+        eprintln!("Error: -D/--multiuser cannot be combined with --console/--web-gui.");
         std::process::exit(1);
     }
-    if ssh_mode && !matches!(console_arg, Some(Some(_))) && !matches!(gui_arg, Some(Some(_))) {
-        eprintln!("Error: --ssh requires --console=<target> or --gui=<target>.");
+    if ssh_mode && !matches!(console_arg, Some(Some(_))) && !matches!(web_gui_arg, Some(Some(_))) {
+        eprintln!("Error: --ssh requires --console=<target>, --gui=<target> or --web-gui=<target>.");
         std::process::exit(1);
     }
     // Catch a [user@]host:clayport:sshport address typed without --ssh early, with a
@@ -20092,7 +20115,7 @@ async fn main() -> io::Result<()> {
     // with a low-level, confusing error (an '@'/extra ':' isn't valid in a plain
     // host[:port] address).
     if !ssh_mode {
-        let addr_to_check = match (&console_arg, &gui_arg) {
+        let addr_to_check = match (&console_arg, &web_gui_arg) {
             (Some(Some(addr)), _) => Some(addr.as_str()),
             (_, Some(Some(addr))) => Some(addr.as_str()),
             _ => None,
@@ -20110,21 +20133,21 @@ async fn main() -> io::Result<()> {
         eprintln!("clay: rebuild with: cargo build --features ssh-transport");
         std::process::exit(1);
     }
-    if ssh_proxy_mode && (console_arg.is_some() || gui_arg.is_some() || ssh_mode || daemon_mode
+    if ssh_proxy_mode && (console_arg.is_some() || web_gui_arg.is_some() || ssh_mode || daemon_mode
         || multiuser_mode || local_server_mode || grep_arg.is_some() || grep_archive_mode || dump_mode)
     {
         eprintln!("Error: --ssh-proxy cannot be combined with other modes.");
         std::process::exit(1);
     }
-    if grep_arg.is_some() && (console_arg.is_some() || gui_arg.is_some() || daemon_mode || multiuser_mode) {
-        eprintln!("Error: --grep cannot be combined with --console/--gui/-D/--multiuser.");
+    if grep_arg.is_some() && (console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode) {
+        eprintln!("Error: --grep cannot be combined with --console/--gui/--web-gui/-D/--multiuser.");
         std::process::exit(1);
     }
-    if grep_archive_mode && (grep_arg.is_some() || console_arg.is_some() || gui_arg.is_some() || daemon_mode || multiuser_mode) {
+    if grep_archive_mode && (grep_arg.is_some() || console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode) {
         eprintln!("Error: --grep-archive cannot be combined with other modes.");
         std::process::exit(1);
     }
-    if dump_mode && (grep_arg.is_some() || grep_archive_mode || console_arg.is_some() || gui_arg.is_some() || daemon_mode || multiuser_mode) {
+    if dump_mode && (grep_arg.is_some() || grep_archive_mode || console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode) {
         eprintln!("Error: --dump cannot be combined with other modes.");
         std::process::exit(1);
     }
@@ -20270,8 +20293,8 @@ async fn main() -> io::Result<()> {
     }
 
     // Determine interface mode: GUI vs Console
-    let has_gui_flag = gui_arg.is_some();
-    let (use_gui, remote_addr) = if let Some(addr_opt) = gui_arg {
+    let has_gui_flag = web_gui_arg.is_some();
+    let (use_gui, remote_addr) = if let Some(addr_opt) = web_gui_arg {
         (true, addr_opt)
     } else if let Some(addr_opt) = console_arg {
         (false, addr_opt)
@@ -20282,13 +20305,13 @@ async fn main() -> io::Result<()> {
         (default_gui, None)
     };
 
-    // Exit immediately if --gui was requested but webview-gui feature not compiled in
+    // Exit immediately if the WebView GUI was asked for but the webview-gui feature is not compiled in
     let use_gui = use_gui && cfg!(feature = "webview-gui");
     if has_gui_flag && !use_gui {
         #[cfg(not(feature = "webview-gui"))]
         {
-            eprintln!("clay: --gui requires the 'webview-gui' feature.");
-            eprintln!("clay: rebuild with: cargo build --features webview-gui");
+            eprintln!("clay: this build has no GUI: --gui needs the 'native-gui' feature, --web-gui the 'webview-gui' feature.");
+            eprintln!("clay: rebuild with: cargo build --features native-gui  (or webview-gui)");
             std::process::exit(1);
         }
     }
@@ -20307,7 +20330,7 @@ async fn main() -> io::Result<()> {
                     std::process::exit(1);
                 }
             },
-            None => unreachable!("validated above: --ssh requires a --console=/--gui= target"),
+            None => unreachable!("validated above: --ssh requires a --console=/--web-gui= target"),
         }
     } else {
         None

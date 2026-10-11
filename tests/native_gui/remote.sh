@@ -43,7 +43,7 @@ stop_server() { kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null; }
 verify() {  # verify <label> <expect: ok|fail> [env...]
     local label=$1 expect=$2; shift 2
     echo "=== $label ==="
-    env HOME=$WORK/client "$@" timeout 90 "$CLAY" --native-gui=$IP:$WEB --native-gui-verify=6 > "$WORK/v.log" 2>&1
+    env HOME=$WORK/client "$@" timeout 90 "$CLAY" --gui=$IP:$WEB --gui-verify=6 > "$WORK/v.log" 2>&1
     local rc=$?
     grep -E "VERIFY|connection closed|lines," "$WORK/v.log" | head -6
     if { [ $expect = ok ] && [ $rc -eq 0 ]; } || { [ $expect = fail ] && [ $rc -ne 0 ]; }; then

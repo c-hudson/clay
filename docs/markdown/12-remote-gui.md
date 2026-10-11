@@ -3,18 +3,31 @@
 Clay's graphical client is not a separate native toolkit application — it is a native
 window (built with [wry](https://github.com/tauri-apps/wry)/[tao](https://github.com/tauri-apps/tao))
 that hosts the exact same HTML/CSS/JS interface the browser-based **Web Interface**
-chapter describes. Building the `webview-gui` feature gives you a `--gui` flag that opens
+chapter describes. Building the `webview-gui` feature gives you a `--web-gui` flag that opens
 this window instead of (or alongside) the terminal UI. An earlier, different Rust GUI
 toolkit and Cargo feature name are no longer part of the codebase — if you find a build
 instruction or dependency list elsewhere referring to one, it's stale.
 
-`--gui` runs in one of two modes:
+## Two GUIs
 
-- **Master mode** (`--gui`, no address): runs the whole `App` headlessly in this same
+Clay has two graphical clients, and the flags tell them apart:
+
+- **`--gui`** is the native GUI: its own window, drawn with GPUI rather than a web engine
+  (the `native-gui` feature; it needs Rust 1.98 or newer to build and is in the release GUI
+  binaries for Linux, Windows and macOS). Alone it runs Clay in this process; `--gui=host[:port]`
+  attaches it to a Clay running elsewhere, and `--ssh` tunnels that connection. It is what
+  Windows and macOS start with no flag at all. A build without it (the Termux GUI binary, or a
+  `--features webview-gui` build of your own) opens the WebView GUI for `--gui` instead.
+- **`--web-gui`** is the WebView GUI this chapter describes: the web interface in a window. It
+  stays available as the fallback, and for anything the native GUI does not do yet.
+
+`--web-gui` runs in one of two modes:
+
+- **Master mode** (`--web-gui`, no address): runs the whole `App` headlessly in this same
   process and opens a WebView window connected to it over a local, loopback-only
-  WebSocket. This is the default startup mode on Windows and macOS (no flag needed) —
-  Linux/Termux default to `--console`.
-- **Remote mode** (`--gui=host[:port]`): opens a WebView window that connects to an
+  WebSocket. This is what Windows and macOS start with no flag when the build has no
+  native GUI (see above) — Linux/Termux default to `--console`.
+- **Remote mode** (`--web-gui=host[:port]`): opens a WebView window that connects to an
   *already-running* Clay instance elsewhere, exactly like the remote console in the next
   chapter, just rendered in a native window instead of a terminal. Default port: 9000.
 
@@ -50,9 +63,9 @@ on Android regardless of GUI support.
 ## Running
 
 ```bash
-./clay --gui                    # Master mode: local instance + WebView window
-./clay --gui=hostname:port      # Remote mode: connect to a running Clay instance
-./clay --gui=hostname --ssh     # Remote mode, tunneled over SSH (see next chapter)
+./clay --web-gui                    # Master mode: local instance + WebView window
+./clay --web-gui=hostname:port      # Remote mode: connect to a running Clay instance
+./clay --web-gui=hostname --ssh     # Remote mode, tunneled over SSH (see next chapter)
 ```
 
 ## Login

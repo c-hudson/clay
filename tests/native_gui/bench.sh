@@ -85,12 +85,12 @@ capture() {   # capture <name> <pid>
 }
 
 # One GUI at a time, so neither can cover the other.
-HOME=$WORK/home-webview "$WEBVIEW" --gui > "$WORK/webview.log" 2>&1 &
+HOME=$WORK/home-webview "$WEBVIEW" --web-gui > "$WORK/webview.log" 2>&1 &
 WEBVIEW_PID=$!; PIDS+=($WEBVIEW_PID)
 sleep 4
 [ $CAPTURE = 1 ] && capture webview $WEBVIEW_PID
 if [ $KEEP = 0 ]; then kill $WEBVIEW_PID 2>/dev/null; wait $WEBVIEW_PID 2>/dev/null; fi
-HOME=$WORK/home-native CLAY_PASSWORD=$PW "$NATIVE" --native-gui=127.0.0.1:$WEB_B > "$WORK/native.log" 2>&1 &
+HOME=$WORK/home-native CLAY_PASSWORD=$PW "$NATIVE" --gui=127.0.0.1:$WEB_B > "$WORK/native.log" 2>&1 &
 NATIVE_PID=$!; PIDS+=($NATIVE_PID)
 sleep 4
 [ $CAPTURE = 1 ] && capture native $NATIVE_PID

@@ -741,9 +741,6 @@ impl ClayView {
                 let fx = self.session.send(crate::websocket::WsMessage::RequestConnectionsList);
                 self.after(fx, cx);
             }
-            // The releases have no native GUI build to update to yet: updating would put a
-            // binary without it in this one's place.
-            "/update" => self.client_line("% There's no native GUI release to update to yet.", cx),
             // Anything else is the server's after all (app.js's default).
             _ => {
                 let world_index = self.session.core.current;

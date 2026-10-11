@@ -2,7 +2,7 @@
 # End-to-end output-sync checks for the native GUI's client: a real Clay server
 # (`clay --local-server`) connected to reference/fake-mud-server.py (bursts of lines,
 # escape-only lines, blanks and partial prompts every 150 ms), and the client running
-# headless (`--native-gui-verify`), which checks its buffer against the server's.
+# headless (`--gui-verify`), which checks its buffer against the server's.
 #   tests/native_gui/e2e.sh [scenario...]     (default: all)
 # Scenarios: baseline, drops (the client's connection cut three times mid-burst),
 # reload (the server hot-reloads mid-burst), more (more-mode holding output back).
@@ -42,7 +42,7 @@ EOF
     sleep 3
     echo "=== $name ==="
     if HOME=$work/client CLAY_PASSWORD=e2e CLAY_VERIFY_ACTIONS="$actions" \
-        "$CLAY" --native-gui=127.0.0.1:$WEB --native-gui-verify="$SECS" > "$work/verify.log" 2>&1; then
+        "$CLAY" --gui=127.0.0.1:$WEB --gui-verify="$SECS" > "$work/verify.log" 2>&1; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))

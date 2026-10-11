@@ -2,7 +2,7 @@
 # Offscreen native-GUI snapshots of the rendering corpus (Linux and macOS: GPUI's
 # headless renderer), one PNG per page. Needs a build with --features native-gui-snapshot.
 #   tests/native_gui/snapshot.sh <outdir>
-# Opens no window: test server -> `clay --local-server` -> `clay --native-gui-snapshot`.
+# Opens no window: test server -> `clay --local-server` -> `clay --gui-snapshot`.
 set -u
 OUT=${1:?usage: snapshot.sh <outdir>}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -34,7 +34,7 @@ while IFS= read -r page; do
     HOME=$WORK/home CLAY_WS_PASSWORD=bench "$BIN/clay" --local-server --port=$WEB > "$WORK/ls.log" 2>&1 &
     ls_pid=$!
     sleep 3
-    HOME=$WORK/home CLAY_PASSWORD=bench "$BIN/clay" --native-gui=127.0.0.1:$WEB --native-gui-snapshot="$OUT/page$i.png" 2>&1 | grep snapshot
+    HOME=$WORK/home CLAY_PASSWORD=bench "$BIN/clay" --gui=127.0.0.1:$WEB --gui-snapshot="$OUT/page$i.png" 2>&1 | grep snapshot
     kill $ts $ls_pid 2>/dev/null; wait $ts $ls_pid 2>/dev/null
     rm -rf "$WORK/home/.clay/logs" "$WORK/home/.clay/scrollback.db"
 done <<'PAGES'

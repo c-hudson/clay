@@ -36,7 +36,7 @@ EOF
     CLAY_CORPUS_SECTIONS="$page" "$BIN/clay-test-server" --ports=$MUD-$MUD --scenarios=corpus > "$WORK/ts.log" 2>&1 &
     ts=$!
     sleep 1
-    HOME=$WORK/home "$BIN/clay" --gui > "$WORK/gui.log" 2>&1 &
+    HOME=$WORK/home "$BIN/clay" --web-gui > "$WORK/gui.log" 2>&1 &
     gui=$!
     sleep 10
     screencapture -x "$OUT/page$i.png"

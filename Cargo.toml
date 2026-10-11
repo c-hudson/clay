@@ -106,7 +106,7 @@ unicode-properties = { version = "0.1.4", optional = true, default-features = fa
 # Bidi classes: rows holding right-to-left text are reshaped on their own for display.
 unicode-bidi = { version = "0.3", optional = true }
 # Discord emoji (PNG, animated GIF) decoded for the output view, and
-# --native-gui-snapshot's PNG output. The same image crate GPUI uses.
+# --gui-snapshot's PNG output. The same image crate GPUI uses.
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "gif"] }
 # Glyph outlines of the bundled JetBrains Mono: where an underline skips the ink of
 # descenders (CSS text-decoration-skip-ink). Already in the tree through GPUI.
