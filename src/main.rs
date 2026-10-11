@@ -19980,7 +19980,10 @@ async fn main() -> io::Result<()> {
         let mut features = Vec::new();
         if cfg!(feature = "rustls-backend") { features.push("rustls"); }
         if cfg!(feature = "native-tls-backend") { features.push("native-tls"); }
+        if cfg!(feature = "native-gui") { features.push("native-gui"); }
         if cfg!(feature = "webview-gui") { features.push("webview-gui"); }
+        if cfg!(feature = "native-audio") { features.push("native-audio"); }
+        if cfg!(feature = "ssh-transport") { features.push("ssh-transport"); }
         let features_str = if features.is_empty() {
             "none".to_string()
         } else {
