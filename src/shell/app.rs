@@ -5,14 +5,11 @@
 //! `output_lines`, the log, the archive, TF or the triggers - it lives entirely in the
 //! emulator (`ShellSession`) and the screen cache (`World::shell_screen`).
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::shell::{self, screen, ShellEvent, ShellScreen, ShellSession, Size};
 use crate::websocket::{ShellKey, WsMessage};
 use crate::{tf, AppEvent};
-
-/// A shell world sends a delta at most this often (coalescing a burst of output).
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 impl crate::App {
     /// True if world `idx` is a live shell world: a running session on the server, or (on
@@ -183,23 +180,20 @@ impl crate::App {
         }
     }
 
-    /// Send any shell world's pending screen change to its viewers. Called once per event
-    /// loop pass, beside the stats flush.
+    /// Send any shell world's pending screen change to its viewers. Called at the bottom of
+    /// every event-loop pass, so a frame goes out as soon as the loop wakes (on the Wakeup
+    /// that produced it) rather than waiting on a timer. alacritty already coalesces a burst
+    /// of PTY output into one Wakeup, and the loop only iterates per event, so this is
+    /// naturally rate-limited without a wall-clock gate (which used to strand the tail
+    /// frame of a burst).
     pub(crate) fn flush_shell_frames(&mut self) {
-        let now = Instant::now();
         for idx in 0..self.worlds.len() {
             // A live session may have more to show; read it first.
             if self.shell_live(idx) {
                 self.refresh_shell_screen(idx);
             }
-            let due = self.worlds[idx]
-                .shell_screen
-                .as_ref()
-                .is_some_and(|s| s.has_changes())
-                && self.worlds[idx].shell_last_frame_at.is_none_or(|t| now.duration_since(t) >= FRAME_INTERVAL);
-            if due {
+            if self.worlds[idx].shell_screen.as_ref().is_some_and(|s| s.has_changes()) {
                 self.flush_one_shell_frame(idx);
-                self.worlds[idx].shell_last_frame_at = Some(now);
             }
         }
     }

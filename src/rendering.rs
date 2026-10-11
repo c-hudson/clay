@@ -2265,14 +2265,15 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // Status indicator - always reserve space for "More XXXX" or "Hist XXXX" (9 chars)
     // Priority: Hist (when scrolled back) > More (when paused) > underscores
     const STATUS_INDICATOR_LEN: usize = 9;
-    let (status_str, status_active) = if !world.is_at_bottom() {
+    // A shell world (src/shell) has no scrollback and no pending output, so it never shows
+    // a Hist/More indicator - its screen is always "the whole thing, now".
+    let is_shell = world.settings.world_type.is_shell();
+    let more = if is_shell { None } else { more_indicator_count(world, &RowMetrics::for_console(app)) };
+    let (status_str, status_active) = if !is_shell && !world.is_at_bottom() {
         // Show History indicator when scrolled back (takes precedence over More)
         let lines_back = world.lines_from_bottom(app.show_tags);
         (format!("Hist {}", format_more_count(lines_back)), true)
-    } else if let Some(count) = more_indicator_count(
-        world,
-        &RowMetrics::for_console(app),
-    ) {
+    } else if let Some(count) = more {
         // Show More indicator when paused with pending lines, or when
         // visual_line_offset truncation is hiding rows of the current world
         (format!("More {}", format_more_count(count)), true)

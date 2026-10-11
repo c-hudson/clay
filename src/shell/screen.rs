@@ -287,6 +287,9 @@ pub struct ShellScreen {
     /// Something a viewer would see changed since the last delta (rows, cursor, mode,
     /// title or liveness) - a delta is due.
     changed: bool,
+    /// No frame has been broadcast for this screen yet, so the first one is sent full (not
+    /// a delta a viewing client with no screen would have to reject and re-request).
+    fresh: bool,
     /// A resize just happened: suppress the reflow as activity for one rendering.
     resized: bool,
 }
@@ -315,6 +318,7 @@ impl ShellScreen {
             frame: 1,
             dirty: vec![true; rows as usize],
             changed: true,
+            fresh: true,
             resized: false,
         }
     }
@@ -391,6 +395,16 @@ impl ShellScreen {
     /// then advancing that frame. Clears the dirty/changed state. Broadcast to every
     /// viewer at once, so they stay in lockstep.
     pub fn delta_msg(&mut self, world_index: usize) -> WsMessage {
+        // The very first frame for a screen is sent full: a client already viewing the
+        // world when its shell connects has no screen yet and would otherwise have to
+        // reject a delta and re-request.
+        if std::mem::take(&mut self.fresh) {
+            self.changed = false;
+            for d in &mut self.dirty {
+                *d = false;
+            }
+            return self.full_msg(world_index);
+        }
         let base = self.frame;
         self.frame += 1;
         let lines: Vec<(u16, String)> = self
@@ -456,6 +470,7 @@ impl ShellScreen {
             frame: msg.frame,
             dirty: Vec::new(),
             changed: false,
+            fresh: false,
             resized: false,
         }
     }

@@ -229,10 +229,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
                 // loop (App::preprocess_event). What comes back - chat lines or a close message
                 // as ServerData, a lost chat session as Disconnected - is handled below exactly
                 // as if it had arrived by itself.
-                let event = match app.preprocess_event(event) {
-                    Some(e) => e,
-                    None => continue,
-                };
+                // A fully-handled event (None) must still fall through to the loop tail
+                // (NOT `continue`): a shell world's Wakeup is handled here and its frame is
+                // flushed below, which `continue` would skip (src/shell).
+                if let Some(event) = app.preprocess_event(event) {
                 match event {
                     AppEvent::ServerData(ref world_name, bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
@@ -445,6 +445,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     }
                     _ => {}
                 }
+                }
             }
 
             // MUD keepalive timer (mirrors run_app_headless in main.rs): pokes any world
@@ -549,7 +550,6 @@ pub async fn run_daemon_server() -> io::Result<()> {
             // some world's stats are dirty (see the bottom-of-loop rearm below).
             _ = &mut stats_flush_sleep => {
                 app.flush_dirty_stats();
-                app.flush_shell_frames();
                 stats_flush_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
             }
         }
@@ -570,6 +570,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
         // TF's mail check, and its status area when a script has it, to the clients
         app.check_tf_mail();
         app.refresh_tf_status();
+        // Shell worlds (src/shell): send any live PTY's screen change to clients every
+        // iteration (not on a timer), so a `-D`-attached client sees output at once.
+        app.flush_shell_frames();
 
         // Arm the process timer for the next process due (processes may have been added
         // during this iteration)

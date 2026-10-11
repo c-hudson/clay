@@ -3733,8 +3733,6 @@ pub struct World {
     /// A shell world's screen, kept here so the console draws from it and clients get full
     /// frames. Stays (frozen) after the shell exits until the world reconnects.
     pub(crate) shell_screen: Option<shell::ShellScreen>,
-    /// When this shell world last broadcast a screen delta (frame coalescing).
-    pub(crate) shell_last_frame_at: Option<std::time::Instant>,
     /// A shell world's PTY master fd and child pid to re-attach after a `/reload` exec
     /// (Linux only; see `shell::adopt`). Set by `exec_reload`, saved to the reload state,
     /// and consumed by the restore path. Not in settings.dat.
@@ -4064,7 +4062,6 @@ impl World {
             chat_restore: None,
             shell: None,
             shell_screen: None,
-            shell_last_frame_at: None,
             #[cfg(target_os = "linux")]
             shell_reload_fd: None,
             #[cfg(target_os = "linux")]
@@ -21183,10 +21180,10 @@ pub async fn run_app_headless(
                 // loop (App::preprocess_event). What comes back - chat lines or a close message
                 // as ServerData, a lost chat session as Disconnected - is handled below exactly
                 // as if it had arrived by itself.
-                let event = match app.preprocess_event(event) {
-                    Some(e) => e,
-                    None => continue,
-                };
+                // A fully-handled event (None) must still fall through to the draw/flush at
+                // the bottom (NOT `continue`): a shell world's Wakeup is handled here and
+                // its frame is flushed to clients below, which `continue` would skip.
+                if let Some(event) = app.preprocess_event(event) {
                 match event {
                     AppEvent::ServerData(ref world_name, ref bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
@@ -21453,6 +21450,7 @@ pub async fn run_app_headless(
                     }
                     _ => {}
                 }
+                }
             }
 
             // GUI messages (same format as WsMessage - reuse daemon handler)
@@ -21551,7 +21549,6 @@ pub async fn run_app_headless(
                 // adding a second one - see the bottom-of-loop block below for how this
                 // timer gets rearmed while a world stays dirty.
                 app.flush_dirty_stats();
-                app.flush_shell_frames();
                 // Deferred emissions: this loop holds a mutable borrow of app.worlds, so
                 // anything that has to go out through `app` (push_and_broadcast_line,
                 // PromptUpdate) is collected here and flushed after the loop. Both were
@@ -21767,6 +21764,9 @@ pub async fn run_app_headless(
         // TF's mail check, and its status area when a script has it, to the clients
         app.check_tf_mail();
         app.refresh_tf_status();
+        // Shell worlds (src/shell): send any live PTY's screen change to clients now, every
+        // iteration, so a shell world's output isn't stranded waiting on a timer.
+        app.flush_shell_frames();
 
         // Arm the process timer for the next process due (processes may have been added
         // during this iteration)
@@ -22940,14 +22940,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Server events (data from MUD connections)
             Some(event) = event_rx.recv() => {
                 needs_draw = true;
-                // Slack/Discord events and connection-close notices: handled once, for every
-                // loop (App::preprocess_event). What comes back - chat lines or a close message
-                // as ServerData, a lost chat session as Disconnected - is handled below exactly
-                // as if it had arrived by itself.
-                let event = match app.preprocess_event(event) {
-                    Some(e) => e,
-                    None => continue,
-                };
+                // Slack/Discord/shell events and connection-close notices: handled once, for
+                // every loop (App::preprocess_event). What comes back - chat lines or a close
+                // message as ServerData, a lost chat session as Disconnected - is handled below
+                // exactly as if it had arrived by itself. A fully-handled event (None) must
+                // still fall through to the draw below (NOT `continue`, which would skip it) -
+                // a shell world's Wakeup sets needs_output_redraw here and would otherwise not
+                // repaint until the next keystroke or timer, making the terminal feel ~seconds
+                // behind.
+                if let Some(event) = app.preprocess_event(event) {
                 match event {
                     AppEvent::ServerData(ref world_name, bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
@@ -23279,6 +23280,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.handle_import_result(client_id, addr, result);
                     }
                 }
+                }
             }
 
             // Periodic timer for clock updates and keepalive checks (once per minute)
@@ -23391,7 +23393,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // adding a second one - see the bottom-of-loop block below for how this
                 // timer gets rearmed while a world stays dirty.
                 app.flush_dirty_stats();
-                app.flush_shell_frames();
                 // Deferred emissions: this loop holds a mutable borrow of app.worlds, so
                 // anything that has to go out through `app` (push_and_broadcast_line,
                 // PromptUpdate) is collected here and flushed after the loop. Both were
@@ -23966,6 +23967,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         if app.release_orphaned_pending() {
             needs_draw = true;
         }
+
+        // Shell worlds (src/shell): read each live PTY's screen and send any change to
+        // viewers now, every iteration - the loop woke on the Wakeup that produced it, so
+        // the echo/output appears at once rather than on a timer.
+        app.flush_shell_frames();
 
         // Skip drawing when no visible state changed (e.g., pending update WS broadcast)
         if needs_draw {

@@ -123,12 +123,28 @@ mod rendered {
 
     #[test]
     fn delta_then_full_frame_shape() {
-        let (_t, mut screen) = term_with(&[b"line one"]);
-        // full_msg does not advance the frame; delta_msg does.
+        use crate::websocket::WsMessage;
+        let (term, mut screen) = term_with(&[b"line one"]);
         let before = screen.frame;
+        // full_msg does not advance the frame.
         let _full = screen.full_msg(0);
         assert_eq!(screen.frame, before, "a full frame does not advance");
-        let _delta = screen.delta_msg(0);
+        // The FIRST delta for a fresh screen is sent as a full frame (base_frame None), so
+        // a client already viewing the world when the shell connects can apply it directly.
+        match screen.delta_msg(0) {
+            WsMessage::ShellScreen { base_frame, .. } => assert!(base_frame.is_none(), "the first frame is full"),
+            _ => panic!("expected ShellScreen"),
+        }
+        assert_eq!(screen.frame, before, "the first (full) frame does not advance either");
+        // A real change now produces a delta that advances the frame.
+        let mut parser: Processor = Processor::new();
+        let mut term = term;
+        parser.advance(&mut term, b"\r\nline two");
+        screen.apply(render_rows(&term));
+        match screen.delta_msg(0) {
+            WsMessage::ShellScreen { base_frame, .. } => assert_eq!(base_frame, Some(before), "a later delta builds on the held frame"),
+            _ => panic!("expected ShellScreen"),
+        }
         assert_eq!(screen.frame, before + 1, "a delta advances the frame");
         assert!(!screen.has_changes(), "a delta clears the changed flag");
     }
