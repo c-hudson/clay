@@ -24,6 +24,31 @@ is_patched() {
     [ -f "$dir/.patched" ] && [ -d "$dir/src" ] && [ "$(find "$dir/src" -name '*.rs' | wc -l)" -gt 1 ]
 }
 
+# Wire the patched crates into Cargo.toml. Cargo.toml may already carry a
+# [patch.crates-io] section of its own (the native GUI patches gpui-pre-wgpu there), and
+# TOML refuses a second header for the same table, so the entries go into the existing
+# section when there is one. Checking for the section header alone is what silently
+# skipped the entries (and built the unpatched registry tao/wry) once that section existed.
+ensure_patch_entries() {
+    if grep -q '^tao = { path = "tao-0.34.5-patched" }' Cargo.toml \
+        && grep -q '^wry = { path = "wry-0.48.1-patched" }' Cargo.toml; then
+        return 0
+    fi
+    echo "Adding tao/wry to [patch.crates-io] in Cargo.toml..."
+    sed -i '/^tao = { path = "tao-0.34.5-patched" }$/d; /^wry = { path = "wry-0.48.1-patched" }$/d' Cargo.toml
+    if grep -q '^\[patch\.crates-io\]' Cargo.toml; then
+        sed -i '/^\[patch\.crates-io\]/a wry = { path = "wry-0.48.1-patched" }' Cargo.toml
+        sed -i '/^\[patch\.crates-io\]/a tao = { path = "tao-0.34.5-patched" }' Cargo.toml
+    else
+        cat >> Cargo.toml <<'PATCH'
+
+[patch.crates-io]
+tao = { path = "tao-0.34.5-patched" }
+wry = { path = "wry-0.48.1-patched" }
+PATCH
+    fi
+}
+
 all_done=true
 for i in "${!CRATE_NAMES[@]}"; do
     if ! is_patched "${PATCHED_DIRS[$i]}"; then
@@ -33,16 +58,8 @@ for i in "${!CRATE_NAMES[@]}"; do
 done
 
 if $all_done; then
-    # Patched dirs exist, but Cargo.toml may have lost [patch.crates-io] (e.g., after git stash)
-    if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then
-        echo "Re-adding [patch.crates-io] to Cargo.toml..."
-        cat >> Cargo.toml <<'PATCH'
-
-[patch.crates-io]
-tao = { path = "tao-0.34.5-patched" }
-wry = { path = "wry-0.48.1-patched" }
-PATCH
-    fi
+    # Patched dirs exist, but Cargo.toml may have lost the entries (e.g., after git stash)
+    ensure_patch_entries
     echo "All patches already applied."
     exit 0
 fi
@@ -106,17 +123,9 @@ for i in "${!CRATE_NAMES[@]}"; do
     echo "  $crate: done"
 done
 
-# Step 4: Add [patch.crates-io] to Cargo.toml if not already present
-if ! grep -q '\[patch.crates-io\]' Cargo.toml; then
-    echo ""
-    echo "Adding [patch.crates-io] to Cargo.toml..."
-    cat >> Cargo.toml <<'PATCH'
-
-[patch.crates-io]
-tao = { path = "tao-0.34.5-patched" }
-wry = { path = "wry-0.48.1-patched" }
-PATCH
-fi
+# Step 4: Wire the patched crates into Cargo.toml
+echo ""
+ensure_patch_entries
 
 echo ""
 echo "All patches applied. Ready to build with: cargo build --no-default-features --features rustls-backend,webview-gui,ssh-transport"
