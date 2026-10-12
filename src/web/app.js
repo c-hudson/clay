@@ -8755,6 +8755,33 @@
         elements.input.value = '';
     }
 
+    // While a live shell world is current, turn off the input field's autocorrect /
+    // suggestions / spellcheck so a soft keyboard (Android GBoard especially) stops
+    // *composing* each word - composition buffers keystrokes and only commits them at a
+    // space/Return, which made shell input feel like line mode. With composition off each
+    // key is a discrete `input` event that goes straight to the PTY. Restored for ordinary
+    // worlds, which want suggestions. The attributes take effect the next time the field is
+    // focused, which on a shell world is when the user taps in to type.
+    function setShellInputMode(on) {
+        const el = elements.input;
+        if (!el) return;
+        const already = el.dataset.shellMode === '1';
+        if (on === already) return;
+        if (on) {
+            el.dataset.shellMode = '1';
+            el.spellcheck = false;
+            el.setAttribute('autocorrect', 'off');
+            el.setAttribute('autocapitalize', 'none');
+            el.setAttribute('autocomplete', 'off');
+        } else {
+            delete el.dataset.shellMode;
+            el.spellcheck = true;
+            el.removeAttribute('autocorrect');
+            el.setAttribute('autocapitalize', 'off');
+            el.setAttribute('autocomplete', 'off');
+        }
+    }
+
     function renderOutput(opts) {
         boxDrawingRefresh();
         const preserveScroll = !!(opts && opts.preserveScroll);
@@ -8788,6 +8815,7 @@
         }
 
         // A shell world (src/shell): the output area is a terminal grid, not MUD lines.
+        setShellInputMode(!!(world.shell && world.shell.live));
         if (world.shell) {
             renderShellScreen(world);
             return;
@@ -16715,9 +16743,36 @@
             shellSendText(text, true);
         });
 
+        // A live shell world: send each insertion/deletion/newline to the PTY as it
+        // happens. `beforeinput` carries the inputType and data even for a soft keyboard
+        // (where keydown is "Unidentified"/229), and is cancelable, so the character never
+        // lands in the input box. Composition (CJK IME) is not cancelable here - it is left
+        // to accumulate and flushed by `compositionend` below.
+        elements.input.addEventListener('beforeinput', function(e) {
+            if (!shellActive()) return;
+            const t = e.inputType;
+            if (t === 'insertText' || t === 'insertReplacementText') {
+                if (e.data != null) shellSendText(e.data, false);
+                e.preventDefault();
+            } else if (t === 'insertLineBreak' || t === 'insertParagraph') {
+                send({ type: 'ShellInput', world_index: currentWorldIndex, key: { key: 'Enter', ctrl: false, alt: false, shift: false } });
+                e.preventDefault();
+            } else if (t === 'deleteContentBackward') {
+                send({ type: 'ShellInput', world_index: currentWorldIndex, key: { key: 'Backspace', ctrl: false, alt: false, shift: false } });
+                e.preventDefault();
+            } else if (t === 'deleteWordBackward') {
+                send({ type: 'ShellInput', world_index: currentWorldIndex, key: { key: 'w', ctrl: true, alt: false, shift: false } });
+                e.preventDefault();
+            }
+            // Other inputTypes (insertCompositionText, etc.) fall through to the textarea
+            // and are handled by compositionend.
+        });
+
         elements.input.addEventListener('input', function(e) {
             if (shellActive()) {
-                // IME composition flushes on compositionend, not here.
+                // Fallback for any insert `beforeinput` didn't cancel (e.g. a keyboard that
+                // fires no beforeinput): send what's in the box when not composing. When
+                // beforeinput already sent + prevented, the box is empty, so this is a no-op.
                 if (!shellComposing) shellSendText(elements.input.value, false);
                 return;
             }
