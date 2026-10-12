@@ -2376,9 +2376,15 @@
         return px > 0 ? px : (currentFontSize || 14);
     }
 
-    // Get visible line count in output area
+    // Get visible line count in output area: whole rows in the container's content box.
+    // clientHeight includes the container's padding, which holds no row - counting it
+    // made a shell world's PTY a row taller than the view at some heights, its last row
+    // cut off.
     function getVisibleLineCount() {
-        return Math.floor(elements.outputContainer.clientHeight / lineHeightPx());
+        const c = elements.outputContainer;
+        const cs = getComputedStyle(c);
+        const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+        return Math.max(1, Math.floor((c.clientHeight - pad) / lineHeightPx()));
     }
 
     // Get visible column count in output area (approximate from container width and font size)
@@ -2418,13 +2424,16 @@
             lastSentViewState.worldIndex !== newState.worldIndex ||
             lastSentViewState.visibleLines !== newState.visibleLines ||
             lastSentViewState.visibleColumns !== newState.visibleColumns) {
-            send({
+            // Remembered only once actually sent: one dropped while offline must still go
+            // out later.
+            if (send({
                 type: 'UpdateViewState',
                 world_index: currentWorldIndex,
                 visible_lines: visibleLines,
                 visible_columns: visibleColumns
-            });
-            lastSentViewState = newState;
+            })) {
+                lastSentViewState = newState;
+            }
         }
     }
 
@@ -3962,7 +3971,10 @@
                         elements.prompt.textContent = '';
                     }
                 }
-                // Send initial view state for synchronized more-mode
+                // Send initial view state for synchronized more-mode. Unconditionally: a
+                // reconnect is a new client to the server, which knows nothing of this
+                // view yet (and sizes a shell world's PTY by it).
+                lastSentViewState = null;
                 sendViewStateIfChanged();
                 // Warn once per session if this client's bundled version differs from the
                 // server's (only GUI-remote/Android can genuinely drift - see plan doc).
@@ -15861,6 +15873,10 @@
                     if (el.style.height !== h) el.style.height = h;
                 });
                 if (followBottom) scrollToBottom();
+                // The server sizes more-mode and a shell world's PTY by this view, and
+                // most of these changes are not a window resize (deduplicated: only a
+                // real change in rows or columns is sent).
+                sendViewStateIfChanged();
             });
             repinObserver.observe(elements.outputContainer);
             repinObserver.observe(elements.output);

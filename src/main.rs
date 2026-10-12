@@ -8051,10 +8051,11 @@ impl App {
     /// world's newest line, and the world it came to gets TF's %textdiv divider when a
     /// script has set one ("on" only when something arrived meanwhile). Done here rather
     /// than in each way of switching worlds, which differ between the two consoles.
-    pub(crate) fn track_console_world(&mut self) {
-        let Some(now) = self.worlds.get(self.current_world_index).map(|w| w.name.clone()) else { return };
+    /// Returns true when the console shows a different world than it drew last.
+    pub(crate) fn track_console_world(&mut self) -> bool {
+        let Some(now) = self.worlds.get(self.current_world_index).map(|w| w.name.clone()) else { return false };
         match self.console_drawn_world.as_deref() {
-            Some(prev) if prev == now => return,
+            Some(prev) if prev == now => return false,
             None => {
                 // The first draw since starting (or a reload): what's there counts as seen.
                 for world in &mut self.worlds {
@@ -8079,6 +8080,7 @@ impl App {
             }
         }
         self.console_drawn_world = Some(now);
+        true
     }
 
     /// Where TF's %textdiv divider is on the console's current world, and its rows

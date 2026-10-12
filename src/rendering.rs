@@ -278,7 +278,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let total_height = f.size().height.max(3);  // Minimum 3 lines for output + separator + input
 
     // A world switch, however it happened: TF's %textdiv for the world now shown.
-    app.track_console_world();
+    let console_switched = app.track_console_world();
 
     // Status display line (mud-status-display.md Job 4, plan D3): 0 or 1 rows, latched
     // via World::stats_line_shown rather than read live off World::current_stat_entries()
@@ -326,6 +326,14 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         app.send_naws_to_all_worlds();
         // TF's RESIZE hook, run from the event loop rather than in the middle of a draw.
         app.tf_resize = Some((f.size().width, f.size().height));
+    }
+    // A shell world's PTY is as big as the output area of whoever shows it, the console
+    // included: re-size it when that area changes (a terminal resize, the input area, a
+    // status line) and when the console comes to or leaves a shell world. Otherwise the
+    // PTY keeps the size it started at, and any rows it has beyond the output area are
+    // drawn off the bottom - the newest text and the prompt. No-op if nothing changed.
+    if dimensions_changed || console_switched {
+        app.resize_shell_worlds();
     }
 
     let chunks = Layout::default()

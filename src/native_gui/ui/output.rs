@@ -141,6 +141,8 @@ pub struct Scroll {
     pub rows_below: usize,
     /// After the last layout: whole rows the view holds.
     pub view_rows: usize,
+    /// After the last layout: whole cells of the font across the view.
+    pub view_cols: usize,
     /// Rows per line at the current width, font and style, so counting rows below the
     /// view costs a layout only once per line.
     rows_cache: (u32, u32, u64),
@@ -169,6 +171,7 @@ impl Default for Scroll {
             pending: 0,
             rows_below: 0,
             view_rows: 24,
+            view_cols: 80,
             rows_cache: (0, 0, 0),
             rows: HashMap::new(),
             hits: Vec::new(),
@@ -594,6 +597,7 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     let width = f32::from(content.size.width).max(metrics.ch);
     let height = f32::from(content.size.height);
     let view_rows = ((height / metrics.row).floor() as usize).max(1);
+    let view_cols = ((width / metrics.ch).floor() as usize).max(1);
     let n = snapshot.lines.len();
     let scroll = snapshot.scroll.clone();
     let mut st = scroll.borrow_mut();
@@ -637,7 +641,13 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         }
     }
     st.rows_below = below;
+    // The server sizes more-mode and a shell world's PTY by this, reported as the view
+    // renders (`report_view`); a new size needs a render after this layout to go out.
+    if (st.view_rows, st.view_cols) != (view_rows, view_cols) {
+        window.request_animation_frame();
+    }
     st.view_rows = view_rows;
+    st.view_cols = view_cols;
     // Rows in all (lines not laid out yet count one each), for the thumb.
     let total: usize = snapshot.lines.iter().map(|(id, _)| st.rows.get(id).copied().unwrap_or(1)).sum();
     let key = (st.top, below, total);

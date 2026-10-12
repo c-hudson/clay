@@ -1145,6 +1145,9 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     // Channel for local /update results
     let (update_tx, mut update_rx) = mpsc::channel::<Result<UpdateSuccess, String>>(1);
 
+    // The output area's size as last reported to the server (UpdateViewState).
+    let mut reported_view: Option<(u16, u16)> = None;
+
     loop {
         // Draw if needed
         if needs_redraw || app.needs_output_redraw {
@@ -1201,6 +1204,19 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             render_output_crossterm(&app);
             needs_redraw = false;
             app.needs_output_redraw = false;
+            // The output area as just laid out - not the terminal's height less a guess at
+            // the rest - since the server sizes more-mode and a shell world's PTY by it: a
+            // PTY taller than this area has its bottom rows drawn off the screen. Sent on
+            // any change (a terminal resize, the input area, a status line).
+            let view = (app.output_height, app.output_width);
+            if reported_view != Some(view) {
+                reported_view = Some(view);
+                let _ = ws_tx.send(WsMessage::UpdateViewState {
+                    world_index: app.current_world_index,
+                    visible_lines: view.0 as usize,
+                    visible_columns: Some(view.1 as usize),
+                });
+            }
         }
 
         tokio::select! {
@@ -1403,14 +1419,9 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             }
                             needs_redraw = true;
                         }
-                        Event::Resize(width, height) => {
-                            // Send updated view state for more-mode sync
-                            let visible_lines = height.saturating_sub(4) as usize;
-                            let _ = ws_tx.send(WsMessage::UpdateViewState {
-                                world_index: app.current_world_index,
-                                visible_lines,
-                                visible_columns: Some(width as usize),
-                            });
+                        Event::Resize(_, _) => {
+                            // The redraw lays the output area out again and reports its
+                            // new size (see reported_view above).
                             needs_redraw = true;
                         }
                         _ => {}

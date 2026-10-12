@@ -760,12 +760,17 @@ impl ClayView {
         })
     }
 
-    /// Tell the server how much the output shows (it sizes more-mode and history by it).
-    fn report_view(&mut self, window: &Window) {
-        let vp = window.viewport_size();
-        // The rows the output showed when last laid out (the bars around it take the rest).
-        let rows = self.scroll.borrow().view_rows.max(1);
-        let cols = ((f32::from(vp.width) - 8.0) / (self.font_size * 0.6)).floor().max(1.0) as usize;
+    /// Tell the server how much the output shows (it sizes more-mode, history and a shell
+    /// world's PTY by it).
+    fn report_view(&mut self) {
+        // The rows and font cells the output held when last laid out - measured there, not
+        // estimated from the window: a column count from the window's width and a nominal
+        // cell made a shell's PTY wider than the output beside a panel or in a wider font,
+        // wrapping its rows.
+        let (rows, cols) = {
+            let scroll = self.scroll.borrow();
+            (scroll.view_rows.max(1), scroll.view_cols.max(1))
+        };
         let fx = self.session.core.set_view(rows, cols);
         let _ = self.session.apply(fx);
     }
@@ -861,7 +866,7 @@ impl Render for ClayView {
             }
         }
         self.run_later(window, cx);
-        self.report_view(window);
+        self.report_view();
         // A `/window` takes its main window's, which a Transparency being previewed is on.
         let alpha = self.link.leader.as_ref().and_then(|l| l.upgrade()).map_or_else(|| self.transparency(), |l| l.read(cx).transparency());
         self.opacity.apply(window, alpha);
