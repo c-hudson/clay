@@ -1520,6 +1520,18 @@ pub(crate) fn render_output_crossterm(app: &App) {
         let _ = stdout.queue(Print(border_bottom));
     }
 
+    queue_input_cursor(app, &mut stdout);
+
+    let _ = stdout.flush();
+}
+
+/// Queue the real cursor's move to its spot in the input area, for the crossterm pass
+/// (`render_output_crossterm`), which runs after ratatui's draw and must leave the cursor
+/// where typing goes.
+fn queue_input_cursor(app: &App, stdout: &mut std::io::Stdout) {
+    use crossterm::QueueableCommand;
+    let term_width = (app.output_width as usize).max(1);
+
     // Calculate and set cursor position in input area
     // This replicates the logic from render_input_area to avoid Save/Restore timing issues.
     // ECHO masking (plan Phase 3, step 3.4): this is the "second, crossterm-based replica"
@@ -1582,8 +1594,6 @@ pub(crate) fn render_output_crossterm(app: &App) {
         let max_y = input_area_y + app.input_height - 1;
         let _ = stdout.queue(cursor::MoveTo(cursor_x, cursor_y.min(max_y)));
     }
-
-    let _ = stdout.flush();
 }
 
 /// Draw a shell world's screen into the output area: each row as it stands, the real
@@ -1599,6 +1609,8 @@ fn render_shell_crossterm(app: &App) {
     let visible_height = app.output_height.max(1);
     let Some(screen) = app.current_world().shell_screen.as_ref() else { return };
 
+    // Hidden while the rows are written, so it doesn't sweep across them.
+    let _ = stdout.queue(Hide);
     for y in 0..visible_height {
         let _ = stdout.queue(MoveTo(0, y));
         if let Some(line) = screen.lines.get(y as usize) {
@@ -1609,24 +1621,42 @@ fn render_shell_crossterm(app: &App) {
         let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
     }
 
-    // The cursor, in the grid, with its shape - unless it is off-screen or hidden.
-    let c = &screen.cursor;
-    if c.visible && c.row < visible_height {
-        let style = match (c.shape, c.blink) {
-            (1, true) => SetCursorStyle::BlinkingUnderScore,
-            (1, false) => SetCursorStyle::SteadyUnderScore,
-            (2, true) => SetCursorStyle::BlinkingBar,
-            (2, false) => SetCursorStyle::SteadyBar,
-            (_, true) => SetCursorStyle::BlinkingBlock,
-            (_, false) => SetCursorStyle::SteadyBlock,
-        };
-        let _ = stdout.queue(style);
-        let _ = stdout.queue(MoveTo(c.col, c.row));
-        let _ = stdout.queue(Show);
+    if app.shell_live(app.current_world_index) {
+        // The cursor, in the grid, with its shape - unless it is off-screen or hidden.
+        if let Some((col, row)) = shell_grid_cursor(app) {
+            let c = &screen.cursor;
+            let style = match (c.shape, c.blink) {
+                (1, true) => SetCursorStyle::BlinkingUnderScore,
+                (1, false) => SetCursorStyle::SteadyUnderScore,
+                (2, true) => SetCursorStyle::BlinkingBar,
+                (2, false) => SetCursorStyle::SteadyBar,
+                (_, true) => SetCursorStyle::BlinkingBlock,
+                (_, false) => SetCursorStyle::SteadyBlock,
+            };
+            let _ = stdout.queue(style);
+            let _ = stdout.queue(MoveTo(col, row));
+            let _ = stdout.queue(Show);
+        }
     } else {
-        let _ = stdout.queue(Hide);
+        // The shell has exited: typing goes to the input area again (to /connect), so the
+        // cursor goes back there too, with its normal shape.
+        let _ = stdout.queue(SetCursorStyle::DefaultUserShape);
+        queue_input_cursor(app, &mut stdout);
+        let _ = stdout.queue(Show);
     }
     let _ = stdout.flush();
+}
+
+/// Where the cursor of the shell world on screen sits, while that shell is live: the
+/// terminal's own cursor cell, or `None` when the program has hidden it (or it is below
+/// the output area). The ratatui frame and the crossterm pass both place the cursor from
+/// this, so a draw that doesn't repaint the grid can't move it anywhere else.
+fn shell_grid_cursor(app: &App) -> Option<(u16, u16)> {
+    if !app.shell_live(app.current_world_index) {
+        return None;
+    }
+    let c = &app.current_world().shell_screen.as_ref()?.cursor;
+    (c.visible && c.row < app.output_height.max(1)).then_some((c.col, c.row))
 }
 
 /// Write an ANSI-colored string directly to a ratatui buffer at (x, y).
@@ -2478,18 +2508,9 @@ fn input_cursor_char_width(c: char, masked: bool) -> usize {
 }
 
 pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
-    // A live shell world owns the keyboard (keys go to the PTY), so the input line would
-    // only mislead. Show a dim hint instead, and leave the real cursor in the grid (the
-    // crossterm pass positions it; nothing is set here).
-    if app.shell_live(app.current_world_index) {
-        let theme = app.settings.theme;
-        let hint = Paragraph::new(Line::from(Span::styled(
-            " shell — keys go to the terminal · Alt+} / Alt+{ switch worlds",
-            Style::default().fg(theme.fg_dim()),
-        )));
-        f.render_widget(hint, area);
-        return;
-    }
+    // A live shell world owns the keyboard (keys go to the PTY, not this buffer), so the
+    // input area is inert here - but it is still drawn normally so whatever text was
+    // already in it stays visible. Its cursor is placed in the grid instead (below).
     // Get prompt for current world only (clone to avoid borrow conflict)
     let prompt = app.current_world().prompt.clone();
     // Use visible length (without ANSI codes) for cursor positioning
@@ -2499,6 +2520,18 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
 
     let input_paragraph = Paragraph::new(input_text);
     f.render_widget(input_paragraph, area);
+
+    // A live shell world's cursor belongs in its grid, where render_shell_crossterm puts
+    // it. This frame has to agree: ratatui moves the cursor to whatever is set here at the
+    // end of every draw, including the many that don't repaint the grid, so pointing it at
+    // the input area pulled it down there after each keystroke's echo. No position (the
+    // program hid its cursor) makes ratatui hide it, as render_shell_crossterm does.
+    if app.shell_live(app.current_world_index) {
+        if let Some((x, y)) = shell_grid_cursor(app) {
+            f.set_cursor(x, y);
+        }
+        return;
+    }
 
     // Set cursor position (offset by prompt length on first line)
     let cursor_line = app.input.cursor_line();

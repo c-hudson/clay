@@ -20972,8 +20972,9 @@ pub async fn run_app_headless(
         #[cfg(target_os = "linux")]
         app.adopt_shell_worlds_after_reload();
         // Cleanup: mark disconnected worlds that claim to be connected but have no command channel
+        // (a re-adopted shell world has none - its session is its connection)
         for world in &mut app.worlds {
-            if world.connected && world.command_tx.is_none() {
+            if world.connected && world.command_tx.is_none() && world.shell.is_none() {
                 debug_log(is_debug_enabled(), &format!(
                     "HEADLESS RELOAD CLEANUP: World '{}' connected but no command_tx — marking disconnected (socket_fd={:?})",
                     world.name, world.socket_fd
@@ -22280,9 +22281,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         #[cfg(target_os = "linux")]
         app.adopt_shell_worlds_after_reload();
         // Final cleanup pass: mark any world as disconnected if it claims to be connected
-        // but has no command channel (meaning the connection wasn't successfully reconstructed)
+        // but has no command channel (meaning the connection wasn't successfully reconstructed).
+        // A re-adopted shell world has none - its session is its connection.
         for world in &mut app.worlds {
-            if world.connected && world.command_tx.is_none() {
+            if world.connected && world.command_tx.is_none() && world.shell.is_none() {
                 world.connected = false;
                 world.socket_fd = None;
                 let seq = world.next_seq;
