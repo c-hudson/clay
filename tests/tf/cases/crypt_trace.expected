@@ -1,0 +1,11 @@
+shown gagme
+P1=says, P2=plain text first=p
+branch=plain
+glob-match-ok
+glob-nomatch-ok
+colon-nomatch-ok
+P1=says, P2=\coded first=\
+branch=backslash
+glob-match-ok
+glob-nomatch-ok
+colon-nomatch-ok

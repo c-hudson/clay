@@ -96,7 +96,14 @@ fn is_load_noise_line(line: &str) -> bool {
 fn record_effect(transcript: &mut Transcript, effect: super::effects::TfEffect) {
     use super::effects::TfEffect;
     match effect {
-        TfEffect::Output { text, .. } => {
+        TfEffect::Output { text, attrs, .. } => {
+            // A gagged line (`/echo -ag`, `/substitute -ag`) is kept by the App but never
+            // shown, so it is not part of what the user saw - real tf prints nothing for
+            // it either (crypt_trace.tf). It used to land in `echoed` and fail every
+            // fixture whose trigger gags its own line.
+            if super::TfAttributes::parse(&attrs).is_ok_and(|a| a.gag) {
+                return;
+            }
             // Split as `App::emit_client_text` does: a final newline ends the text, it
             // doesn't add an empty line.
             transcript.echoed.extend(
