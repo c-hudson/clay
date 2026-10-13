@@ -418,6 +418,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "input_height={}", app.input_height)?;
+    writeln!(file, "input_height_phone={}", app.settings.input_height_phone)?;
+    writeln!(file, "input_height_tablet={}", app.settings.input_height_tablet)?;
+    writeln!(file, "input_height_desktop={}", app.settings.input_height_desktop)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "separator_style={}", app.settings.separator_style.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme)?;
@@ -887,6 +890,8 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
         .filter_map(|l| l.trim().strip_prefix("tf_globals_version="))
         .any(|v| v.parse::<u32>().unwrap_or(0) >= TF_GLOBALS_VERSION);
     let mut dropped_tf_globals: Vec<String> = Vec::new();
+    // Whether this file knows the per-interface input heights (see the end).
+    let mut split_heights_seen = false;
 
     for line in content.lines() {
         let line = line.trim();
@@ -1111,6 +1116,17 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         if let Ok(h) = value.parse::<u16>() {
                             app.input_height = h.clamp(1, 15);
                             app.input.visible_height = app.input_height;
+                        }
+                    }
+                    "input_height_phone" | "input_height_tablet" | "input_height_desktop" => {
+                        if let Ok(h) = value.parse::<u16>() {
+                            let h = h.clamp(1, 15);
+                            match key {
+                                "input_height_phone" => app.settings.input_height_phone = h,
+                                "input_height_tablet" => app.settings.input_height_tablet = h,
+                                _ => app.settings.input_height_desktop = h,
+                            }
+                            split_heights_seen = true;
                         }
                     }
                     "theme" => {
@@ -1419,6 +1435,13 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
 
     for world in &mut app.worlds {
         migrate_chat_settings(&mut world.settings);
+    }
+    // A settings.dat from before the input height was split by interface: every
+    // interface starts at the console's, the height they all showed until now.
+    if !split_heights_seen {
+        app.settings.input_height_phone = app.input_height;
+        app.settings.input_height_tablet = app.input_height;
+        app.settings.input_height_desktop = app.input_height;
     }
     // A saved %wrapsize, %clock_format or %textdiv (a [tf_globals] entry) applies from the
     // start.
@@ -2103,6 +2126,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "[reload]")?;
     writeln!(file, "current_world_index={}", app.current_world_index)?;
     writeln!(file, "input_height={}", app.input_height)?;
+    writeln!(file, "input_height_phone={}", app.settings.input_height_phone)?;
+    writeln!(file, "input_height_tablet={}", app.settings.input_height_tablet)?;
+    writeln!(file, "input_height_desktop={}", app.settings.input_height_desktop)?;
     writeln!(file, "more_mode={}", app.settings.more_mode_enabled)?;
     writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
     writeln!(file, "temp_convert={}", app.settings.temp_convert_enabled)?;
@@ -2973,6 +2999,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         app.input_height = value.parse().unwrap_or(3);
                         app.input.visible_height = app.input_height;
                     }
+                    "input_height_phone" => app.settings.input_height_phone = value.parse::<u16>().unwrap_or(3).clamp(1, 15),
+                    "input_height_tablet" => app.settings.input_height_tablet = value.parse::<u16>().unwrap_or(3).clamp(1, 15),
+                    "input_height_desktop" => app.settings.input_height_desktop = value.parse::<u16>().unwrap_or(3).clamp(1, 15),
                     "more_mode" => {
                         app.settings.more_mode_enabled = value == "true";
                     }
@@ -3740,6 +3769,9 @@ mod tests {
             web_font_size_phone: 12.0,         // default: 10.0
             web_font_size_tablet: 16.0,        // default: 14.0
             web_font_size_desktop: 20.0,       // default: 18.0
+            input_height_phone: 4,             // default: 3
+            input_height_tablet: 5,            // default: 3
+            input_height_desktop: 6,           // default: 3
             web_font_weight: 200,              // default: 400
             web_secure: true,                  // default: false
             http_enabled: true,                // default: false
@@ -3856,6 +3888,9 @@ mod tests {
         assert_eq!(a.web_font_size_phone, b.web_font_size_phone, "{context}: web_font_size_phone");
         assert_eq!(a.web_font_size_tablet, b.web_font_size_tablet, "{context}: web_font_size_tablet");
         assert_eq!(a.web_font_size_desktop, b.web_font_size_desktop, "{context}: web_font_size_desktop");
+        assert_eq!(a.input_height_phone, b.input_height_phone, "{context}: input_height_phone");
+        assert_eq!(a.input_height_tablet, b.input_height_tablet, "{context}: input_height_tablet");
+        assert_eq!(a.input_height_desktop, b.input_height_desktop, "{context}: input_height_desktop");
         assert_eq!(a.web_font_weight, b.web_font_weight, "{context}: web_font_weight");
         assert_eq!(a.web_secure, b.web_secure, "{context}: web_secure");
         assert_eq!(a.http_enabled, b.http_enabled, "{context}: http_enabled");
@@ -4813,6 +4848,23 @@ mod tests {
     }
 
     #[test]
+    fn input_heights_split_by_interface_seed_from_the_consoles() {
+        // A file from before the split: every interface starts at the console's height.
+        let mut app = App::new();
+        load_settings_from_str(&mut app, "[global]\ninput_height=7\n");
+        assert_eq!((app.input_height, app.settings.input_height_phone, app.settings.input_height_tablet, app.settings.input_height_desktop), (7, 7, 7, 7));
+        // One that knows it: each its own.
+        let mut app = App::new();
+        load_settings_from_str(&mut app, "[global]\ninput_height=7\ninput_height_phone=2\ninput_height_tablet=4\ninput_height_desktop=9\n");
+        assert_eq!((app.input_height, app.settings.input_height_phone, app.settings.input_height_tablet, app.settings.input_height_desktop), (7, 2, 4, 9));
+        // Clamped, and the ones a knowing file leaves out keep their defaults.
+        let mut app = App::new();
+        load_settings_from_str(&mut app, "[global]\ninput_height=7\ninput_height_desktop=40\n");
+        assert_eq!(app.settings.input_height_desktop, 15, "clamped");
+        assert_eq!(app.settings.input_height_phone, 3);
+    }
+
+    #[test]
     fn test_settings_save_load_roundtrip() {
         let tmp = std::env::temp_dir().join("clay_test_settings_roundtrip.dat");
         // Ensure clean state
@@ -5097,6 +5149,9 @@ pattern=foo
         assert_ne!(non_default.web_font_size_phone, default.web_font_size_phone, "web_font_size_phone should differ");
         assert_ne!(non_default.web_font_size_tablet, default.web_font_size_tablet, "web_font_size_tablet should differ");
         assert_ne!(non_default.web_font_size_desktop, default.web_font_size_desktop, "web_font_size_desktop should differ");
+        assert_ne!(non_default.input_height_phone, default.input_height_phone, "input_height_phone should differ");
+        assert_ne!(non_default.input_height_tablet, default.input_height_tablet, "input_height_tablet should differ");
+        assert_ne!(non_default.input_height_desktop, default.input_height_desktop, "input_height_desktop should differ");
         assert_ne!(non_default.web_font_weight, default.web_font_weight, "web_font_weight should differ");
         assert_ne!(non_default.web_secure, default.web_secure, "web_secure should differ");
         assert_ne!(non_default.http_enabled, default.http_enabled, "http_enabled should differ");

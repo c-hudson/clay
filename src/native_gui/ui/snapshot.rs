@@ -113,6 +113,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         "theme" => super::windows::Kind::ThemeEditor,
         "keybind" => super::windows::Kind::KeybindEditor,
         "action" => super::windows::Kind::ActionEditor,
+        "emoji" => super::windows::Kind::Emoji,
         other => fail(&format!("no window kind {other}")),
     };
     // CLAY_SNAPSHOT_INPUT: mouse and key events to replay before the capture, for

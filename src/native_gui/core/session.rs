@@ -207,6 +207,19 @@ impl Session {
         let e = self.core.send_message(msg);
         self.apply(e)
     }
+
+    /// Start the connection over, everything fetched again (the menu's Reload and Resync).
+    /// A follower has no connection to start over: nothing happens here, and the window
+    /// asks its leader instead (`ClayView::restart_connection`). Running the core's
+    /// restart on a follower would clear its worlds and wait for a reconnect that never
+    /// comes - the splash screen with nothing behind it.
+    pub fn restart(&mut self) -> Vec<Effect> {
+        if self.is_follower() {
+            return Vec::new();
+        }
+        let e = self.core.restart();
+        self.apply(e)
+    }
 }
 
 #[cfg(test)]
@@ -237,5 +250,23 @@ mod tests {
         assert!(matches!(out.as_slice(), [WsMessage::SendCommand { .. }, WsMessage::ReleasePending { .. }]), "{out:?}");
         assert!(s.take_outbox().is_empty());
         assert!(s.tick().is_empty(), "the leader's clock keeps the connection");
+    }
+
+    #[test]
+    fn a_followers_restart_is_its_leaders_to_do() {
+        let mut s = follower();
+        let now = Instant::now();
+        // As a leader's copy is: logged in, with the worlds.
+        let _ = s.core.start(now);
+        let _ = s.core.handle(Input::Opened, now);
+        let _ = s.core.handle(Input::Message(Box::new(WsMessage::ServerHello { multiuser_mode: false, challenge: "abc123".into() })), now);
+        let _ = s.core.handle(Input::Message(Box::new(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false })), now);
+        let mut app = crate::App::new();
+        app.worlds = vec![crate::World::new("Mini")];
+        let _ = s.core.handle(Input::Message(Box::new(app.build_initial_state(0))), now);
+        assert_eq!(s.core.worlds.len(), 1, "the state came in");
+        assert!(s.restart().is_empty(), "nothing to do here");
+        assert_eq!(s.core.worlds.len(), 1, "the worlds stay: the fresh state comes through the leader");
+        assert!(s.take_outbox().is_empty());
     }
 }

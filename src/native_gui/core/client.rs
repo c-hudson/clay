@@ -113,6 +113,9 @@ pub enum Effect {
     Changed,
     /// A message the core doesn't handle itself, for the GUI.
     Event(Box<WsMessage>),
+    /// `/update`, its own half (src/selfupdate.rs): the server's is over - update this
+    /// program's binary now and restart attached again.
+    SelfUpdate { force: bool },
 }
 
 /// Which world to ask the server for.
@@ -251,6 +254,8 @@ pub struct ClientCore {
     failures: u32,
     reconnect_at: Option<Instant>,
     reload_retries: Option<u32>,
+    /// Where a `/update` stands while the server's half runs (src/selfupdate.rs).
+    update_flow: Option<crate::selfupdate::ClientFlow>,
     /// The user asked to start over: reconnect the moment the old connection is gone.
     restarting: bool,
     hello_deadline: Option<Instant>,
@@ -311,6 +316,7 @@ impl ClientCore {
             failures: 0,
             reconnect_at: None,
             reload_retries: None,
+            update_flow: None,
             restarting: false,
             hello_deadline: None,
             last_rx: now,
@@ -537,6 +543,24 @@ impl ClientCore {
 
     /// A line this client shows itself, in the current world and never sent anywhere
     /// (app.js `appendClientLine`).
+    /// `/update` typed here (src/selfupdate.rs): the server's half first - its answer
+    /// (`UpdateOutcome`), an old server's bounce, a reconnect after its reload, or the
+    /// timeout in `tick` then yields `Effect::SelfUpdate` for this program's own half.
+    pub fn start_update(&mut self, force: bool, now: Instant) -> Vec<Effect> {
+        if self.update_flow.is_some() {
+            return self.client_line("An update is already in progress.");
+        }
+        self.update_flow = Some(crate::selfupdate::ClientFlow::WaitingServer { force, since: now });
+        let world_index = self.current;
+        self.send(WsMessage::SendCommand { world_index, command: (if force { "/update -f" } else { "/update" }).to_string() });
+        self.take()
+    }
+
+    /// Is a `/update` under way (waiting for the server, or for it to come back)?
+    pub fn update_in_progress(&self) -> bool {
+        self.update_flow.is_some()
+    }
+
     pub fn client_line(&mut self, text: &str) -> Vec<Effect> {
         let mut line = self.new_line(text, unix_now(), None);
         line.from_server = false;
@@ -810,6 +834,14 @@ impl ClientCore {
             self.hello_deadline = None;
             self.out.push(Effect::Disconnect);
         }
+        // The server never answered the /update: go on with our own half.
+        if let Some(crate::selfupdate::ClientFlow::WaitingServer { force, since }) = self.update_flow {
+            if now.saturating_duration_since(since) >= crate::selfupdate::SERVER_ANSWER_TIMEOUT {
+                self.update_flow = None;
+                self.client_line(&crate::selfupdate::server_no_answer());
+                self.out.push(Effect::SelfUpdate { force });
+            }
+        }
         if self.is_online() {
             if slept && self.wake_deadline.is_none() {
                 // The machine slept: a socket can look open and be long dead.
@@ -914,6 +946,24 @@ impl ClientCore {
                     }
                 }
             }
+            // The server's half of this client's /update is over (src/selfupdate.rs):
+            // wait to be connected again if it reloads, else go on with our own.
+            WsMessage::UpdateOutcome { reloading, .. } => {
+                if let Some(flow) = self.update_flow.take() {
+                    if reloading {
+                        self.update_flow = Some(crate::selfupdate::ClientFlow::WaitingReconnect { force: flow.force() });
+                    } else {
+                        self.out.push(Effect::SelfUpdate { force: flow.force() });
+                    }
+                }
+            }
+            // A server from before UpdateOutcome bounces /update back instead of
+            // answering it: it can't be updated from here, so go on with our own.
+            WsMessage::ExecuteLocalCommand { command } if self.update_flow.is_some() && is_update_command(&command) => {
+                let flow = self.update_flow.take().expect("checked");
+                self.client_line(&crate::selfupdate::server_too_old());
+                self.out.push(Effect::SelfUpdate { force: flow.force() });
+            }
             // A command the server parsed that opens something on this side (app.js
             // `executeLocalCommand`): the window acts on it.
             m @ (WsMessage::ExecuteLocalCommand { .. } | WsMessage::SetInputBuffer { .. }) => self.out.push(Effect::Event(Box::new(m))),
@@ -944,6 +994,10 @@ impl ClientCore {
                 self.actions = actions;
                 self.splash_lines = splash_lines;
                 self.on_initial_state(worlds, settings, current_world_index, your_display_id, now);
+                // Connected again after the server's /update reload: our own half now.
+                if let Some(crate::selfupdate::ClientFlow::WaitingReconnect { force }) = self.update_flow.take() {
+                    self.out.push(Effect::SelfUpdate { force });
+                }
                 for entry in tf_status {
                     if let Some(w) = self.worlds.get_mut(entry.world_index) {
                         w.tf_status = Some(entry.view);
@@ -1891,6 +1945,10 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         wrapspace: s.wrapspace,
         remote_initial_lines: s.remote_initial_lines,
         input_height: s.input_height,
+        // 0 = a server from before the split sent none: leave them be.
+        input_height_phone: (s.input_height_phone > 0).then_some(s.input_height_phone),
+        input_height_tablet: (s.input_height_tablet > 0).then_some(s.input_height_tablet),
+        input_height_desktop: (s.input_height_desktop > 0).then_some(s.input_height_desktop),
         font_name: s.font_name.clone(),
         font_size: s.font_size,
         web_font_size_phone: s.web_font_size_phone,
@@ -1923,6 +1981,11 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         tabs: s.tabs.clone(),
         icon_bar: s.icon_bar.clone(),
     }
+}
+
+/// `/update` or `/update -f`, as the server echoes it back (src/selfupdate.rs).
+fn is_update_command(command: &str) -> bool {
+    command.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/update"))
 }
 
 pub fn hidden_line(text: &str) -> bool {

@@ -630,11 +630,7 @@ impl ClayView {
         self.chrome.menu = None;
         match action {
             "toggle-tags" => self.run_action("toggle_tags", window, cx),
-            "reload" | "resync" => {
-                let fx = self.session.core.restart();
-                let rest = self.session.apply(fx);
-                self.after(rest, cx);
-            }
+            "reload" | "resync" => self.restart_connection(cx),
             "filter" => self.toggle_filter(window, cx),
             "search" => self.toggle_search(window, cx),
             "logout" => {
@@ -645,6 +641,23 @@ impl ClayView {
             other => self.open_surface(other, window, cx),
         }
         cx.notify();
+    }
+
+    /// The menu's Reload and Resync: the connection starts over, everything fetched
+    /// again, and every window on it refreshed by the state that comes back. A window
+    /// opened with New Window (or `/window`) has no connection of its own, so its
+    /// Resync is the main window's to do - it used to run the core's restart on the
+    /// window's own copy, which cleared that window's worlds and left it waiting for a
+    /// reconnect it can never make: the text splash screen, no world name, no switching.
+    pub(super) fn restart_connection(&mut self, cx: &mut Context<Self>) {
+        if let Some(leader) = self.link.leader.clone() {
+            cx.defer(move |cx| {
+                let _ = leader.update(cx, |v, cx| v.restart_connection(cx));
+            });
+            return;
+        }
+        let rest = self.session.restart();
+        self.after(rest, cx);
     }
 
     /// Show world `index` (a menu, a tab).

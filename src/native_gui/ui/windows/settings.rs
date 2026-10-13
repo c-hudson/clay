@@ -263,7 +263,8 @@ impl SettingsView {
         s.tts_speak_mode = self.speak.value(cx);
         s.tabs = self.tabs.value(cx);
         s.icon_bar = self.icon_bar.value(cx);
-        s.input_height = s.input_height.clamp(1, 15);
+        let rows = super::super::input_view::input_height_of(&s).clamp(1, 15);
+        super::super::input_view::set_input_height(&mut s, rows);
         s.color_offset_percent = s.color_offset_percent.min(100);
         s.wrapspace = s.wrapspace.min(20);
         let mut password = String::new();
@@ -358,7 +359,7 @@ impl SettingsView {
     fn general(&mut self, k: &Kit, cx: &mut Context<Self>) -> gpui::AnyElement {
         let e = &self.edit;
         let offset = if e.color_offset_percent == 0 { "OFF".to_string() } else { format!("{}%", e.color_offset_percent) };
-        let (height, wrap) = (e.input_height.to_string(), e.wrapspace.to_string());
+        let (height, wrap) = (super::super::input_view::input_height_of(e).to_string(), e.wrapspace.to_string());
         let (archive, transparency) = (e.scrollback_enabled, (e.gui_transparency * 100.0).round() as u32);
         let toggles = |pairs: Vec<Toggle>, cx: &mut Context<Self>| {
             div().flex_1().flex().flex_col().children(pairs.into_iter().map(|(label, on, flip)| {
@@ -402,7 +403,7 @@ impl SettingsView {
                     .child(row(k, "World switching", self.world_switch.view()))
                     .child(row(k, "Theme", self.theme.view()))
                     .child(row(k, "Color Offset", self.stepper(k, "color-offset", offset, |v| v.edit.color_offset_percent = v.edit.color_offset_percent.saturating_sub(5), |v| v.edit.color_offset_percent = (v.edit.color_offset_percent + 5).min(100), cx)))
-                    .child(row(k, "Input height", self.stepper(k, "input-height", height, |v| v.edit.input_height = v.edit.input_height.saturating_sub(1).max(1), |v| v.edit.input_height = (v.edit.input_height + 1).min(15), cx)))
+                    .child(row(k, "Input height", self.stepper(k, "input-height", height, |v| step_input_height(&mut v.edit, -1), |v| step_input_height(&mut v.edit, 1), cx)))
                     .child(row(k, "Wrap Space", self.stepper(k, "wrapspace", wrap, |v| v.edit.wrapspace = v.edit.wrapspace.saturating_sub(1), |v| v.edit.wrapspace = (v.edit.wrapspace + 1).min(20), cx)))
                     .child(row(
                         k,
@@ -666,3 +667,10 @@ mod tests {
         assert_eq!(step(-5.0, -0.5, (-5.0, 10.0)), -5.0);
     }
 }
+
+/// The Input height stepper: this GUI's height (`input_view::input_height_of`), 1-15.
+fn step_input_height(s: &mut crate::websocket::GlobalSettingsMsg, by: i32) {
+    let rows = (i32::from(super::super::input_view::input_height_of(s)) + by).clamp(1, 15) as u16;
+    super::super::input_view::set_input_height(s, rows);
+}
+

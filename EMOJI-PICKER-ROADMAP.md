@@ -797,3 +797,37 @@ exact failing case.
 `--no-default-features --features rustls-backend,ssh-transport`. 1780 passed (baseline
 1778 + 2 net new), 0 failed, clippy clean. No pty verification — the user does that
 themselves for this entry.
+
+## Mouse picks stay open, and the native GUI's own window (2026-10-13)
+
+User report: the native GUI's picker "doesn't seem to be an actual window", and a
+console click should put the emoji in the input without closing the picker (several
+picks in a row), with an `[x]` in the upper-right corner to close it.
+
+- **Console** (`handle_popup_mouse_click`): a grid cell maps through the renderer's own
+  layout (`console_renderer::grid_cell_at`, `CELL_STRIDE` and the clamped scroll) - it is
+  selected, inserted with `InputArea::insert_str`, and the popup stays. A tab maps
+  through `tab_at_column` (the same `compute_tab_window` the strip is drawn with) and is a
+  deliberate category pick: query cleared, grid homed, refiltered. The `[x]` is
+  `PopupDefinition::with_close_button` → drawn on the top border one cell in from the
+  corner, recorded as a hit area for `POPUP_BTN_CLOSE`, closes on click. The wheel moves
+  the grid selection a row. Trap: `handle_popup_mouse_highlight_start` runs first and
+  used to swallow every grid click as a text highlight (the grid has a content area for
+  its scrollbar); it now declines a Grid field so the click reaches the cell.
+- **Web/WebView/Android** (`insertEmoji(e, stayOpen)`): a cell click inserts at the
+  input's caret without focusing it (the caret is set while unfocused so the next pick
+  lands after this one), the picker stays, focus goes back to the search box (the cell is
+  a `<button>` and took it). Enter inserts and closes as before; the ✕ was already there.
+- **Native GUI**: the picker is `windows::Kind::Emoji`, a real OS window
+  (`ui/windows/emoji.rs`, moved from `ui/dialogs/`), opened for the view that asked so a
+  `/window`'s picks go into that window's input; asking again brings it forward and
+  retargets it. The grid's column count follows the window's width (`columns_for`) and a
+  page its drawn height (`ScrollHandle::bounds`). Click inserts and stays; Enter inserts
+  and closes; Esc/✕ close. Size (user ruling: no bigger than it has to be, but Smileys -
+  the first tab - must not run off the bottom): 420 wide, cells 32px with 2px gaps so
+  twelve fit a row (the web's 38px cells gave ten), and `height()` is the chrome plus
+  the rows the largest category needs (Smileys, 82 → 7 rows), so no tab scrolls; only a
+  broad search does. `CHROME` is measured from a capture - a padding change in `render`
+  must be mirrored there.
+- Enter is deliberately unchanged everywhere: the keyboard flow picks one and goes.
+

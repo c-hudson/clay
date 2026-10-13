@@ -377,10 +377,7 @@ impl ClayView {
         let masked = world.is_some_and(|w| w.echo_masked);
         let mono = self.fonts.primary.clone();
         let rows = self.input.rows.clamp(1, 15);
-        // The input's line height (Settings > Font > Input Ht, web_font_line_height); the
-        // output's rows stay at 1.0.
-        let line_height = self.session.core.settings.as_ref().map_or(1.2, |s| s.web_font_line_height).clamp(0.5, 3.0);
-        let row_h = line_height * self.font_size;
+        let row_h = self.input_row_h();
         let height = rows as f32 * row_h + 2.0 * PAD;
         let field = Field {
             text: self.editor.text.clone(),
@@ -403,7 +400,30 @@ impl ClayView {
         // The input is its own surface, a step up from the output, with a line along its
         // top (the status bar's bottom line is subtle; this one is the medium border).
         let (surface, border) = (self.chrome.tokens.surface, self.chrome.tokens.border);
-        let mut bar = div().flex().items_start().flex_shrink_0().px(px(4.0)).py(px(2.0)).bg(surface).border_t_1().border_color(border).font_family(mono.clone()).text_size(px(self.font_size)).line_height(px(row_h)).text_color(hsla(self.palette.fg));
+        let mut bar = div()
+            .relative()
+            .flex()
+            .items_start()
+            .flex_shrink_0()
+            .px(px(4.0))
+            .py(px(2.0))
+            .bg(surface)
+            .border_t_1()
+            .border_color(border)
+            .font_family(mono.clone())
+            .text_size(px(self.font_size))
+            .line_height(px(row_h))
+            .text_color(hsla(self.palette.fg))
+            // The top edge, a few pixels either side of the line: drag it up or down to
+            // resize the input (the root's mouse-move and -up carry the drag on, see
+            // `input_resize_to`).
+            .child(div().id("input-resize").absolute().top(px(-3.0)).left_0().right_0().h(px(7.0)).cursor_ns_resize().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                    this.input.resize_drag = Some((f32::from(ev.position.y), this.input.rows));
+                    cx.stop_propagation();
+                }),
+            ));
         // The prompt sits on the field's first row, at its height (the web centres it in
         // the whole input area, so a multi-row input showed it beside the second row).
         if !prompt.is_empty() {
@@ -425,6 +445,57 @@ impl ClayView {
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _w, _cx| this.input.dragging = false)),
         )
         .into_any_element()
+    }
+
+    /// The input's line height (Settings > Font > Input Ht, web_font_line_height); the
+    /// output's rows stay at 1.0.
+    pub(super) fn input_row_h(&self) -> f32 {
+        let line_height = self.session.core.settings.as_ref().map_or(1.2, |s| s.web_font_line_height).clamp(0.5, 3.0);
+        line_height * self.font_size
+    }
+
+    /// The mouse, dragging the input's top edge, is at window `y` now: a row more for
+    /// every row's height it went up.
+    pub(super) fn input_resize_to(&mut self, y: f32, cx: &mut Context<Self>) {
+        let Some((from_y, from_rows)) = self.input.resize_drag else { return };
+        let rows = (from_rows as f32 + (from_y - y) / self.input_row_h()).round().clamp(1.0, 15.0) as usize;
+        if rows != self.input.rows {
+            self.input.rows = rows;
+            cx.notify();
+        }
+    }
+
+    /// The drag let go: the rows it ended on are saved.
+    pub(super) fn input_resize_end(&mut self, cx: &mut Context<Self>) {
+        if self.input.resize_drag.take().is_some() {
+            self.save_input_rows(cx);
+        }
+    }
+
+    /// The input `rows` high (1-15), shown and saved (Alt-Up/Down).
+    pub(super) fn set_input_rows(&mut self, rows: usize, cx: &mut Context<Self>) {
+        self.input.rows = rows.clamp(1, 15);
+        self.save_input_rows(cx);
+        cx.notify();
+    }
+
+    /// Keep the rows shown: they are the `input_height_desktop` setting (this GUI's, the
+    /// WebView GUI's and a desktop browser's - the input height is split by interface as
+    /// the font sizes are), so they come back at the next start and after `/reload`.
+    /// Saved as the font slider saves its size - the settings as the server sent them,
+    /// with this one changed.
+    fn save_input_rows(&mut self, cx: &mut Context<Self>) {
+        let rows = self.input.rows as u16;
+        if rows == self.input_height_seen {
+            return;
+        }
+        self.input_height_seen = rows;
+        if let Some(s) = self.session.core.settings.as_mut() {
+            set_input_height(s, rows);
+            let msg = crate::native_gui::core::client::settings_update(s);
+            let fx = self.session.send(msg);
+            self.after(fx, cx);
+        }
     }
 
     fn input_mouse_down(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
@@ -683,6 +754,23 @@ impl ClayView {
         }
         let trimmed = cmd.trim();
         let first = trimmed.split_whitespace().next().unwrap_or("");
+        // /update (src/selfupdate.rs). Attached to another Clay: the server's half
+        // first, then this GUI's own (Effect::SelfUpdate). Running Clay itself: the
+        // server's update restarts this window with it, so it goes there like any command.
+        if first.eq_ignore_ascii_case("/update") && !crate::native_gui::runs_clay() {
+            let force = trimmed.split_whitespace().skip(1).any(|a| a == "-f" || a == "--force");
+            let fx = self.session.core.start_update(force, Instant::now());
+            let rest = self.session.apply(fx);
+            self.after(rest, cx);
+            self.editor.remember(&cmd, masked);
+            self.editor.clear();
+            // As for any sent command: the splash goes, or the replies would sit behind it.
+            let fx = self.session.core.command_sent();
+            let rest = self.session.apply(fx);
+            self.after(rest, cx);
+            self.input_touched(cx);
+            return;
+        }
         // What this client does itself rather than send.
         let local = match first {
             // A remote GUI's /reload restarts the GUI, not the server.
@@ -744,11 +832,11 @@ impl ClayView {
                 let fx = self.session.send(crate::websocket::WsMessage::RequestConnectionsList);
                 self.after(fx, cx);
             }
-            // Anything else is the server's after all (app.js's default).
-            _ => {
-                let world_index = self.session.core.current;
-                self.send_message(crate::websocket::WsMessage::SendCommand { world_index, command: command.to_string() }, cx);
-            }
+            // A command this GUI has no window for. It used to go back to the server
+            // (app.js's default, which is for *typed* commands) - but this is only ever
+            // reached for a command the server already sent here, so sending it back
+            // made a silent ping-pong (/update, before the server answered it itself).
+            _ => self.client_line(&format!("% {first} isn't available in this GUI."), cx),
         }
     }
 }
@@ -833,11 +921,30 @@ impl EntityInputHandler for ClayView {
     }
 }
 
+/// This GUI's input height in the server's settings: `input_height_desktop`, or, from a
+/// server before the split (it sends 0), `input_height`, the one every interface shared.
+pub(super) fn input_height_of(s: &crate::websocket::GlobalSettingsMsg) -> u16 {
+    if s.input_height_desktop > 0 { s.input_height_desktop } else { s.input_height }
+}
+
+/// Set this GUI's input height in `s`: the desktop clients' setting, or the shared one
+/// when the server has only that.
+pub(super) fn set_input_height(s: &mut crate::websocket::GlobalSettingsMsg, rows: u16) {
+    if s.input_height_desktop > 0 {
+        s.input_height_desktop = rows;
+    } else {
+        s.input_height = rows;
+    }
+}
+
 /// The input line's own state in the view.
 pub struct InputState {
     pub layout: InputHandle,
     /// `input_height`: rows shown (1-15).
     pub rows: usize,
+    /// A drag of the input's top edge in progress: the window y it started at, and the
+    /// rows then. The rows follow the mouse; let go, they are saved.
+    pub resize_drag: Option<(f32, usize)>,
     pub activity: Instant,
     caret_was: bool,
     pub dragging: bool,
@@ -863,6 +970,7 @@ impl Default for InputState {
         InputState {
             layout: Rc::new(RefCell::new(InputLayout::default())),
             rows: 3,
+            resize_drag: None,
             activity: Instant::now(),
             caret_was: true,
             dragging: false,

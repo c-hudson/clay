@@ -1,11 +1,12 @@
-//! The GUI's other windows: Settings, Help, Actions and Worlds open in OS windows of
-//! their own (webview_gui.rs's popup windows). Unlike the WebView's, these don't log in
+//! The GUI's other windows: Settings, Help, Actions, Worlds and the emoji picker open in
+//! OS windows of their own (webview_gui.rs's popup windows). Unlike the WebView's, these don't log in
 //! again: they share the main window's connection.
 //! - One window per kind; asking again brings it forward with what was asked for.
 //! - A window closes when its content does.
 
 pub mod action_editor;
 pub mod actions;
+pub mod emoji;
 pub mod help;
 pub mod keybind_editor;
 pub mod notes;
@@ -16,8 +17,8 @@ pub mod worlds;
 use std::collections::HashMap;
 
 use gpui::{
-    AnyView, App, AppContext, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled, Subscription,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, div, px, size,
+    AnyView, App, AppContext, Bounds, Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Size, Styled,
+    Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, px, size,
 };
 
 use super::ClayView;
@@ -35,6 +36,8 @@ pub enum Kind {
     ThemeEditor,
     KeybindEditor,
     ActionEditor,
+    /// The emoji picker (Esc-e): a window, so it can stay up while several are picked.
+    Emoji,
 }
 
 impl Kind {
@@ -50,6 +53,7 @@ impl Kind {
             Kind::ThemeEditor => ("Clay - Theme Editor", 1000.0, 720.0),
             Kind::KeybindEditor => ("Clay - Keybind Editor", 1000.0, 700.0),
             Kind::ActionEditor => ("Clay - Action Editor", 960.0, 700.0),
+            Kind::Emoji => ("Clay - Emoji", emoji::WIDTH, emoji::height()),
         }
     }
 }
@@ -142,6 +146,33 @@ impl Windows {
     }
 }
 
+/// Where a window `size` big opens: centred on `over` (the window that asked), moved as
+/// little as needed to stay inside `screen` (that window's display); `fallback` (the
+/// display's centre) when the asking window is unknown. gpui's own default centres on
+/// the whole X screen, which with more than one monitor is a seam, and the user ruled
+/// the windows open relative to the GUI window.
+fn bounds_over(over: Option<Bounds<Pixels>>, screen: Option<Bounds<Pixels>>, size: Size<Pixels>, fallback: Bounds<Pixels>) -> Bounds<Pixels> {
+    let Some(over) = over else { return fallback };
+    let mut b = Bounds::centered_at(over.center(), size);
+    if let Some(s) = screen {
+        let max_x = s.origin.x + s.size.width - size.width;
+        let max_y = s.origin.y + s.size.height - size.height;
+        b.origin.x = b.origin.x.min(max_x).max(s.origin.x);
+        b.origin.y = b.origin.y.min(max_y).max(s.origin.y);
+    }
+    b
+}
+
+/// On Linux, a window of ours is a floating one: gpui marks it a transient of the window
+/// with the keyboard (WM_TRANSIENT_FOR under X11, the toplevel's parent under Wayland),
+/// so the window manager places it over that window and keeps it with it - most ignore
+/// a plain window's requested position. Elsewhere a normal window at `bounds_over`'s
+/// position, which macOS and Windows honour; macOS's floating kind is a panel above
+/// every application's windows, not wanted.
+fn popup_kind() -> WindowKind {
+    if cfg!(target_os = "linux") { WindowKind::Floating } else { WindowKind::Normal }
+}
+
 impl ClayView {
     /// Bring the window of `kind` forward, or open it with `build`'s content. `again`
     /// hands an open one what was asked for this time (webview_gui.rs's `__clayPopupArg`).
@@ -155,6 +186,8 @@ impl ClayView {
     ) {
         // A follower's windows are the main window's (one Settings, one Help...).
         let main = self.owner(cx);
+        // The new window opens over the window that asked.
+        let asked_from = self.link.own_window;
         cx.defer(move |cx| {
             let existing = main.upgrade().and_then(|m| {
                 let m = m.read(cx);
@@ -172,12 +205,15 @@ impl ClayView {
                 }
             }
             let (title, w, h) = kind.spec();
-            let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+            let size = size(px(w), px(h));
+            let over = asked_from.and_then(|h| cx.update_window(h, |_, window, cx| (window.bounds(), window.display(cx).map(|d| d.visible_bounds()))).ok());
+            let bounds = bounds_over(over.map(|o| o.0), over.and_then(|o| o.1), size, Bounds::centered(None, size, cx));
             let mut frame = None;
             let opened = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions { title: Some(title.into()), ..Default::default() }),
+                    kind: popup_kind(),
                     ..Default::default()
                 },
                 |window, cx| {
@@ -204,3 +240,35 @@ impl ClayView {
         cx.emit(MainEvent::Restyled);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::point;
+
+    fn b(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+    }
+
+    #[test]
+    fn a_window_opens_centred_on_the_one_that_asked_and_on_its_screen() {
+        let screen = Some(b(0.0, 0.0, 1920.0, 1080.0));
+        let fallback = b(1.0, 1.0, 1.0, 1.0);
+        let main = Some(b(400.0, 200.0, 800.0, 600.0));
+        assert_eq!(bounds_over(main, screen, size(px(420.0), px(373.0)), fallback), b(590.0, 313.5, 420.0, 373.0));
+        // Asked from a window at the screen's bottom right: moved just enough to stay on it.
+        let corner = Some(b(1600.0, 900.0, 800.0, 600.0));
+        assert_eq!(bounds_over(corner, screen, size(px(420.0), px(373.0)), fallback), b(1500.0, 707.0, 420.0, 373.0));
+        // Taller than the screen: pinned at its top, never off its edge.
+        assert_eq!(bounds_over(main, screen, size(px(420.0), px(1200.0)), fallback).origin, point(px(590.0), px(0.0)));
+        // On a second monitor to the right: that monitor's bounds, not the first's (the
+        // window's centre is 3900,400; the right edge pushes it back to 3420).
+        let right = Some(b(1920.0, 0.0, 1920.0, 1080.0));
+        assert_eq!(bounds_over(Some(b(3500.0, 100.0, 800.0, 600.0)), right, size(px(420.0), px(373.0)), fallback).origin, point(px(3420.0), px(213.5)));
+        // No window to centre on: the display's centre.
+        assert_eq!(bounds_over(None, screen, size(px(10.0), px(10.0)), fallback), fallback);
+        // No screen known: centred, unclamped.
+        assert_eq!(bounds_over(corner, None, size(px(420.0), px(373.0)), fallback).origin, point(px(1790.0), px(1013.5)));
+    }
+}
+

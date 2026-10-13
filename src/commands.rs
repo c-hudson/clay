@@ -32,11 +32,11 @@ use crate::platform::enable_tcp_keepalive;
 
 #[cfg(all(unix, not(target_os = "android")))]
 use crate::platform::{
-    get_executable_path, exec_reload, check_and_download_update,
+    get_executable_path, exec_reload,
 };
 #[cfg(windows)]
 use crate::platform::{
-    get_executable_path, exec_reload, check_and_download_update,
+    get_executable_path, exec_reload,
     kill_proxy_process,
 };
 
@@ -1446,21 +1446,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
         }
         Command::Update { force } => {
-            #[cfg(target_os = "android")]
-            {
-                let _ = force;
-                app.add_output("Update is not available on this platform.");
-            }
-
-            #[cfg(not(target_os = "android"))]
-            {
-                app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
-                let event_tx_clone = event_tx.clone();
-                tokio::spawn(async move {
-                    let result = check_and_download_update(force).await;
-                    let _ = event_tx_clone.send(AppEvent::UpdateResult(result)).await;
-                });
-            }
+            // The console is the server: its /update is the server's own update
+            // (src/selfupdate.rs); the result comes back as AppEvent::UpdateResult.
+            app.start_server_update(force, None, &event_tx);
         }
         Command::Remote => {
             // requesting_client_id 0 = console (results displayed via add_output in RemoteListResult handler)

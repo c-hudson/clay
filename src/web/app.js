@@ -886,6 +886,10 @@
     let historyIndex = -1;
     let connectionFailures = 0;
     let reloadReconnect = false;
+    // /update (src/selfupdate.rs), while the server's half runs: {force, stage, timer}
+    // with stage 'server' (waiting for its UpdateOutcome) or 'reconnect' (it updated and
+    // is reloading; our own half follows the next InitialState).
+    let updateFlow = null;
     let reloadReconnectAttempts = 0;
     let inputHeight = 1;
     let splashLines = [];  // Splash screen lines for multiuser mode
@@ -3773,7 +3777,11 @@
                 try {
                 if (msg.settings) {
                     if (msg.settings.input_height) {
-                        setInputHeight(msg.settings.input_height);
+                        serverInputHeights = {
+                            input_height: msg.settings.input_height,
+                            split: !!(msg.settings.input_height_phone || msg.settings.input_height_tablet || msg.settings.input_height_desktop),
+                        };
+                        setInputHeight(inputHeightFromSettings(msg.settings));
                     }
                     if (msg.settings.more_mode_enabled !== undefined) {
                         moreModeEnabled = msg.settings.more_mode_enabled;
@@ -4160,6 +4168,12 @@
                     }
                 } catch (e) {
                     console.error('Clay: error sending connect-time MarkWorldSeen', e);
+                }
+                // Connected again after the server's /update reload: our own half now.
+                if (updateFlow && updateFlow.stage === 'reconnect') {
+                    const f = updateFlow.force;
+                    updateFlow = null;
+                    proceedOwnUpdate(f);
                 }
                 break;
 
@@ -4656,7 +4670,11 @@
             case 'GlobalSettingsUpdated':
                 if (msg.settings) {
                     if (msg.settings.input_height) {
-                        setInputHeight(msg.settings.input_height);
+                        serverInputHeights = {
+                            input_height: msg.settings.input_height,
+                            split: !!(msg.settings.input_height_phone || msg.settings.input_height_tablet || msg.settings.input_height_desktop),
+                        };
+                        setInputHeight(inputHeightFromSettings(msg.settings));
                     }
                     if (msg.settings.more_mode_enabled !== undefined) {
                         moreModeEnabled = msg.settings.more_mode_enabled;
@@ -5127,7 +5145,22 @@
             case 'ExecuteLocalCommand':
                 // Server wants us to execute a command locally (from action)
                 if (msg.command) {
-                    executeLocalCommand(msg.command);
+                    executeLocalCommand(msg.command, true);
+                }
+                break;
+
+            case 'UpdateOutcome':
+                // The server's half of our /update is over (src/selfupdate.rs): if it
+                // is reloading, our own half waits for the next InitialState.
+                if (updateFlow) {
+                    clearTimeout(updateFlow.timer);
+                    if (msg.reloading) {
+                        updateFlow.stage = 'reconnect';
+                    } else {
+                        const f = updateFlow.force;
+                        updateFlow = null;
+                        proceedOwnUpdate(f);
+                    }
                 }
                 break;
 
@@ -7124,7 +7157,22 @@
     // Execute a command locally (called from server via ExecuteLocalCommand message).
     // The server's parse_command() is the single source of truth for command parsing.
     // This function only handles the UI/popup side of commands.
-    function executeLocalCommand(cmd) {
+    // /update, this program's own half (src/selfupdate.rs): the server's is over.
+    function proceedOwnUpdate(force) {
+        if (window.WEBVIEW_MODE) {
+            // The desktop GUI's binary: the native side checks, downloads, installs and
+            // restarts this window attached again, reporting through showUpdateStatus.
+            sendIpc(force ? 'update-force' : 'update');
+        } else if (window.Android) {
+            appendClientLine('This app: update it by installing the latest clay-android.apk from https://github.com/c-hudson/clay/releases');
+        } else {
+            appendClientLine('This page: a browser has nothing to update.');
+        }
+    }
+
+    // `fromServer`: the server sent this back as ExecuteLocalCommand (an action, a
+    // popup command, or an older server bouncing /update) rather than the user typing it.
+    function executeLocalCommand(cmd, fromServer) {
         const trimmed = cmd.trim();
         const parts = trimmed.split(/\s+/);
         const firstWord = parts[0].toLowerCase();
@@ -7230,18 +7278,50 @@
                 }
                 break;
 
-            case '/update':
-                // Update the local client binary
-                if (window.WEBVIEW_MODE) {
-                    // WebView GUI: delegate to native side via IPC
-                    const forceFlag = args.length > 0 && (args[0] === '-f' || args[0] === '--force');
-                    sendIpc(forceFlag ? 'update-force' : 'update');
-                    appendClientLine('Checking for updates...');
-                } else {
-                    // Browser: can't update
-                    appendClientLine('Update is only available in the desktop app. Download the latest version from https://github.com/c-hudson/clay/releases');
+            case '/update': {
+                // /update updates what can be updated (src/selfupdate.rs): the server
+                // first, then - once it has answered, and come back if it reloaded - this
+                // program's own binary (the desktop WebView GUI). Each line says which
+                // program it is about; the two never run at the same time.
+                const forceFlag = args.length > 0 && (args[0] === '-f' || args[0] === '--force');
+                const serverCmd = forceFlag ? '/update -f' : '/update';
+                if (fromServer) {
+                    // An older server bounced /update back instead of answering it: it
+                    // can't be updated from here, so go on with our own half.
+                    if (updateFlow) {
+                        clearTimeout(updateFlow.timer);
+                        updateFlow = null;
+                        appendClientLine('Server: this Clay is too old to be updated from a client (before v1.7.5); update it where it runs.');
+                        proceedOwnUpdate(forceFlag);
+                    }
+                    promptAfter = false;
+                    break;
                 }
+                if (window.WEBVIEW_MASTER) {
+                    // This page runs Clay in-process: its /update is the server's own,
+                    // whose hot reload starts this window again.
+                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: serverCmd });
+                    promptAfter = false;
+                    break;
+                }
+                if (updateFlow) {
+                    appendClientLine('An update is already in progress.');
+                    break;
+                }
+                updateFlow = {
+                    force: forceFlag,
+                    stage: 'server',
+                    timer: setTimeout(function() {
+                        if (!updateFlow) return;
+                        updateFlow = null;
+                        appendClientLine('Server: no answer to the update request; going on with this program\'s own update.');
+                        proceedOwnUpdate(forceFlag);
+                    }, 90000)
+                };
+                send({ type: 'SendCommand', world_index: currentWorldIndex, command: serverCmd });
+                promptAfter = false;
                 break;
+            }
 
             default:
                 // For commands not handled locally, send to server
@@ -10968,6 +11048,61 @@
         elements.input.rows = inputHeight;
     }
 
+    // The input height is split by interface: the console has input_height, and phone,
+    // tablet and desktop clients (the device classes the font sizes use; the WebView
+    // GUI is a desktop) each have their own, input_height_<class>. A server from before
+    // the split sends none of the three - then the one setting every interface shared.
+    let serverInputHeights = null;   // what the server holds, to echo the console's back unchanged
+    function inputHeightKey() {
+        return 'input_height_' + (deviceType === 'phone' ? 'phone' : deviceType === 'tablet' ? 'tablet' : 'desktop');
+    }
+    function inputHeightFromSettings(s) {
+        return s[inputHeightKey()] || s.input_height;
+    }
+    // The UpdateGlobalSettings fields for `mine`, this device's rows: its own key, and the
+    // console's as the server sent it (not optional on the wire) - or, for a server that
+    // has only the shared setting, that one.
+    function inputHeightFields(mine) {
+        const split = !!(serverInputHeights && serverInputHeights.split);
+        const f = { input_height: split ? serverInputHeights.input_height : mine };
+        f[inputHeightKey()] = mine;
+        return f;
+    }
+
+    // The input's height in rows, kept: it is this device's input height setting
+    // (Settings > Input height), so Alt-Up/Down and a drag of the input's top edge save
+    // it the same way and it comes back on the next start and after /reload.
+    function setInputHeightAndSave(lines) {
+        const before = inputHeight;
+        setInputHeight(lines);
+        if (inputHeight !== before) sendGlobalSettings();
+    }
+
+    // Dragging the input's top edge (#input-resize-handle) up or down: the height follows
+    // in whole rows while the pointer moves, and is saved when it is let go. Pointer
+    // capture keeps the move and release coming to the handle once the pointer has left
+    // it, mouse and touch alike.
+    let inputResizeDrag = null; // { y: where the drag started, rows: the height then }
+    function startInputResize(e) {
+        if (e.button !== undefined && e.button !== 0) return;
+        inputResizeDrag = { y: e.clientY, rows: inputHeight };
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* a mouse event without capture */ }
+        e.preventDefault();
+    }
+    function moveInputResize(e) {
+        if (!inputResizeDrag) return;
+        const rowH = (webFontLineHeight || 1.2) * (currentFontSize || 14);
+        const rows = Math.max(1, Math.min(15, Math.round(inputResizeDrag.rows + (inputResizeDrag.y - e.clientY) / rowH)));
+        if (rows !== inputHeight) setInputHeight(rows);
+        e.preventDefault();
+    }
+    function endInputResize(e) {
+        if (!inputResizeDrag) return;
+        const from = inputResizeDrag.rows;
+        inputResizeDrag = null;
+        if (inputHeight !== from) sendGlobalSettings();
+    }
+
     // Force browser to repaint (fixes delayed rendering when tab isn't focused)
     function forceRepaint(element) {
         void element.offsetHeight;
@@ -11690,7 +11825,7 @@
             if (i === emojiSelectedIndex) btn.setAttribute('aria-selected', 'true');
             btn.addEventListener('click', function() {
                 emojiSelectedIndex = i;
-                insertEmoji(e);
+                insertEmoji(e, true);
             });
             grid.appendChild(btn);
         });
@@ -11710,15 +11845,26 @@
     // .value fires no 'input' event, and focusInputWithKeyboard() forces the
     // caret to the end of the input on phone/tablet, so it must be overridden
     // after, not before (same pattern as the overwrite-mode keydown path).
-    function insertEmoji(e) {
+    //
+    // `stayOpen` (a click or tap on a cell): the picker stays up for the next pick
+    // - the user may want several - and the keyboard stays in its search box; the
+    // ✕ (or Esc) closes it. Enter inserts and closes, as before.
+    function insertEmoji(e, stayOpen) {
         if (!e) return;
         const input = elements.input;
         const pos = input.selectionStart == null ? input.value.length : input.selectionStart;
         const end = input.selectionEnd == null ? pos : input.selectionEnd;
         input.value = input.value.slice(0, pos) + e.ch + input.value.slice(end);
         const newPos = pos + e.ch.length;
-        closeEmojiPopup();
         resetCompletion();
+        if (stayOpen) {
+            // Set while unfocused, so the next insert lands after this one; the
+            // clicked cell is a <button> and took the focus, so put it back.
+            input.selectionStart = input.selectionEnd = newPos;
+            if (elements.emojiSearch) elements.emojiSearch.focus();
+            return;
+        }
+        closeEmojiPopup();
         focusInputWithKeyboard();
         input.selectionStart = input.selectionEnd = newPos;
     }
@@ -12174,6 +12320,11 @@
 
     // Build an UpdateGlobalSettings message with current state
     function buildUpdateGlobalSettings() {
+        const msg = buildUpdateGlobalSettingsBase();
+        Object.assign(msg, inputHeightFields(inputHeight));
+        return msg;
+    }
+    function buildUpdateGlobalSettingsBase() {
         return {
             type: 'UpdateGlobalSettings',
             more_mode_enabled: moreModeEnabled,
@@ -12182,7 +12333,6 @@
             world_switch_mode: worldSwitchMode,
             show_tags: showTags,
             ansi_music_enabled: ansiMusicEnabled,
-            input_height: inputHeight,
             console_theme: consoleTheme,
             gui_theme: guiTheme,
             gui_transparency: guiTransparency,
@@ -12382,7 +12532,7 @@
         // Send combined update to server
         if (settingsSynced) {
             const msg = buildUpdateGlobalSettings();
-            msg.input_height = setupInputHeightValue;
+            Object.assign(msg, inputHeightFields(setupInputHeightValue));
             send(msg);
         } else {
             console.warn('Clay: suppressed UpdateGlobalSettings push before initial settings sync');
@@ -14920,10 +15070,10 @@
                 send({ type: 'ToggleWorldGmcp', world_index: currentWorldIndex });
                 return true;
             case 'input_grow':
-                if (inputHeight < 15) setInputHeight(inputHeight + 1);
+                setInputHeightAndSave(inputHeight + 1);
                 return true;
             case 'input_shrink':
-                if (inputHeight > 1) setInputHeight(inputHeight - 1);
+                setInputHeightAndSave(inputHeight - 1);
                 return true;
 
             default:
@@ -16902,6 +17052,14 @@
         // renderEmojiTabs() itself, since the buttons are built there from
         // emojiCategories rather than existing statically in the DOM.
         if (elements.emojiCloseBtn) elements.emojiCloseBtn.onclick = closeEmojiPopup;
+        // The input's top edge resizes it (see startInputResize).
+        const inputResizeHandle = document.getElementById('input-resize-handle');
+        if (inputResizeHandle) {
+            inputResizeHandle.addEventListener('pointerdown', startInputResize);
+            inputResizeHandle.addEventListener('pointermove', moveInputResize);
+            inputResizeHandle.addEventListener('pointerup', endInputResize);
+            inputResizeHandle.addEventListener('pointercancel', endInputResize);
+        }
         if (elements.emojiSearch) elements.emojiSearch.oninput = updateEmojiFilter;
 
         // Actions Editor popup

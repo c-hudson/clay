@@ -134,8 +134,15 @@ impl ClayView {
                 dialogs::open(self, Kind::RecentWorlds, v, window, cx);
             }
             "emoji_picker" => {
-                let v = cx.new(|cx| super::dialogs::emoji::EmojiPicker::new(main, window, cx));
-                dialogs::open(self, Kind::Emoji, v, window, cx);
+                // Its picks go into the input of the window that asked (a /window's own).
+                use super::windows::{Kind as Win, emoji::EmojiPicker};
+                let opener = main.clone();
+                self.open_window(
+                    Win::Emoji,
+                    move |_owner, window, cx| cx.new(|cx| EmojiPicker::new(opener, window, cx)),
+                    move |picker, _window, cx| picker.update(cx, |p, cx| p.retarget(main, cx)),
+                    cx,
+                );
             }
             "actions" => self.open_actions(None, cx),
             "world-selector" => self.open_worlds(super::windows::worlds::Show::Selector, cx),
@@ -264,6 +271,65 @@ impl ClayView {
             Some(t) => relaunch_args(&args, t),
             None => args,
         };
+        if let Err(e) = crate::platform::exec_with_args(args) {
+            self.client_line(&format!("% Couldn't start again: {e}"), cx);
+        }
+    }
+
+    /// `/update`, this GUI's own half (src/selfupdate.rs): the server's is over. When
+    /// the server's install already replaced this binary (same machine, same file)
+    /// there is nothing to download - just the restart.
+    pub(super) fn self_update(&mut self, force: bool, cx: &mut Context<Self>) {
+        const LABEL: &str = "This GUI";
+        let attached = self.session.target.key();
+        if crate::selfupdate::exe_replaced() {
+            self.client_line(&crate::selfupdate::replaced_on_disk(LABEL, &attached), cx);
+            self.restart_now(cx);
+            return;
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = force;
+            self.client_line(&crate::selfupdate::unavailable(LABEL), cx);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let Some(runtime) = super::emoji::runtime() else {
+                self.client_line(&format!("{LABEL}: no runtime to download with."), cx);
+                return;
+            };
+            self.client_line(&crate::selfupdate::checking(LABEL, force), cx);
+            let (tx, rx) = futures::channel::oneshot::channel();
+            runtime.spawn(async move {
+                let _ = tx.send(crate::platform::check_and_download_update(force).await);
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(result) = rx.await {
+                    let _ = this.update(cx, |v, cx| v.self_update_done(result, cx));
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// The download is over: install it and start this GUI again, attached as before.
+    #[cfg(not(target_os = "android"))]
+    fn self_update_done(&mut self, result: Result<crate::UpdateSuccess, String>, cx: &mut Context<Self>) {
+        let outcome: Result<String, String> = match result {
+            Ok(success) => crate::platform::install_update(&success.temp_path).map(|()| success.version),
+            Err(e) => Err(e),
+        };
+        let attached = self.session.target.key();
+        self.client_line(&crate::selfupdate::client_result("This GUI", &outcome, &attached), cx);
+        if outcome.is_ok() {
+            self.restart_now(cx);
+        }
+    }
+
+    /// Start this GUI again as it was started (its binary is new now). Returns only if
+    /// that failed.
+    fn restart_now(&mut self, cx: &mut Context<Self>) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
         if let Err(e) = crate::platform::exec_with_args(args) {
             self.client_line(&format!("% Couldn't start again: {e}"), cx);
         }

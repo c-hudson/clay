@@ -23,6 +23,12 @@ pub struct ButtonId(pub u32);
 /// Common button ID for the help button used across all popups
 pub const POPUP_BTN_HELP: ButtonId = ButtonId(99);
 
+/// The `[x]` a popup can carry in the top-right corner of its border
+/// (`PopupDefinition::with_close_button`). It is a mouse target only - never
+/// focusable, never in the button row - and a click on it closes the popup as
+/// `Esc` would (`handle_popup_mouse_click`).
+pub const POPUP_BTN_CLOSE: ButtonId = ButtonId(98);
+
 /// Type-safe popup identifier
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PopupId(pub &'static str);
@@ -734,6 +740,10 @@ pub struct PopupDefinition {
     pub custom_data: std::collections::HashMap<String, String>,
     /// Help text lines shown when the user presses the ? button
     pub help_lines: Vec<String>,
+    /// Draw a `[x]` in the top-right corner of the border, for the mouse to close
+    /// the popup with (`POPUP_BTN_CLOSE`). For a popup that stays open across
+    /// several picks and has no button row of its own (the emoji picker).
+    pub close_button: bool,
 }
 
 impl PopupDefinition {
@@ -746,6 +756,7 @@ impl PopupDefinition {
             layout: PopupLayout::default(),
             custom_data: std::collections::HashMap::new(),
             help_lines: Vec::new(),
+            close_button: false,
         }
     }
 
@@ -772,6 +783,13 @@ impl PopupDefinition {
     pub fn with_help(mut self, lines: Vec<String>) -> Self {
         self.help_lines = lines;
         self.buttons.insert(0, Button::new(POPUP_BTN_HELP, "?").left_align().with_shortcut('?'));
+        self
+    }
+
+    /// Draw a `[x]` in the top-right corner of the border that closes the popup
+    /// when clicked (see `POPUP_BTN_CLOSE`).
+    pub fn with_close_button(mut self) -> Self {
+        self.close_button = true;
         self
     }
 
@@ -2099,6 +2117,12 @@ impl PopupState {
                 return;
             }
         }
+        // A Grid (the emoji picker): the wheel moves the selection a row, as it moves
+        // a list's.
+        if self.definition.fields.iter().any(|f| matches!(&f.kind, FieldKind::Grid { .. })) {
+            self.grid_move(0, -1);
+            return;
+        }
         if self.definition.fields.iter().any(|f| matches!(&f.kind, FieldKind::ScrollableContent { .. })) {
             // Scroll the first scrollable content field (works even when button is selected)
             self.scroll_any_content_up(1);
@@ -2119,6 +2143,10 @@ impl PopupState {
                 self.list_select_down();
                 return;
             }
+        }
+        if self.definition.fields.iter().any(|f| matches!(&f.kind, FieldKind::Grid { .. })) {
+            self.grid_move(0, 1);
+            return;
         }
         if self.definition.fields.iter().any(|f| matches!(&f.kind, FieldKind::ScrollableContent { .. })) {
             // Scroll the first scrollable content field (works even when button is selected)

@@ -17,7 +17,7 @@ Open with `/setup` command:
 | Temp convert | Auto-convert temperatures in input | Off |
 | World Switching | World cycling behavior | Unseen First |
 | Show tags | Show MUD tags at line start | Off |
-| Input height | Default input area height (1-15) | 3 |
+| Input height | Input area height in lines (1-15), kept per interface: the console's here, and one each for phone, tablet and desktop clients (the GUIs and a desktop browser are desktops), each set from that interface's own Settings, `Alt-Up/Down` or a drag of the input's top edge. In `settings.dat`: `input_height` (console), `input_height_phone`, `input_height_tablet`, `input_height_desktop`; a file from before the split starts all three at the console's | 3 |
 | Console Theme | Terminal color scheme | Dark |
 | GUI Theme | Remote GUI color scheme | Dark |
 | TLS Proxy | Preserve TLS connections across reload | Off |

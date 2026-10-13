@@ -84,7 +84,7 @@ key — bind them in `keybindings.dat` or the keybind editor.
 | `Esc-.` / `Esc-_` | Insert the last word of the previous history entry |
 | `Esc-^E` | Expand line (substitute `%var`/`$[...]`/`$(...)` in the input line in place — TF `kb_expand_line`) |
 | `Esc-Tab` | Command completion (`Tab` itself keeps its own more-mode-priority paging behavior — see Output/Scrollback below) |
-| `Alt-Up` / `Alt-Down` | Grow/shrink the input area (1-15 lines) |
+| `Alt-Up` / `Alt-Down` | Grow/shrink the input area (1-15 lines; saved as the Input height setting, as a mouse drag of the separator bar is) |
 | `^Q` | Spell suggestions (Clay keeps this; TF's own `^Q` is literal-next, which Clay puts on `^V`) |
 
 **Kill ring:** `^K`, `^U`, `^W`, `Esc-d`, and `Esc-Backspace` all push the
@@ -301,6 +301,13 @@ through the tab strip with `Up`/`Down` does not change or clear the search — o
 deliberate `Left`/`Right`/`Home`/`End` *on* the tab row switches category, and that's
 the only thing that clears it.
 
+**With the mouse** (console, web, GUI alike): clicking an emoji puts it in the input
+and leaves the picker open, so several can be picked in a row; clicking a tab switches
+category (clearing the search, like `Left`/`Right` on the tab row); the `[x]` in the
+top-right corner (the ✕ on web and GUI) closes it, as `Esc` does. `Enter` still inserts
+the highlighted emoji and closes. The native GUI opens the picker in a window of its
+own, like Settings and Help, so it can sit beside the main window while you type.
+
 ## Confirmation Dialogs
 
 | Key | Action |
@@ -315,8 +322,12 @@ the only thing that clears it.
 
 - Click popup buttons and fields to interact
 - Click list items to select them
-- Scroll wheel to scroll lists and scrollable content in popups
+- Scroll wheel to scroll lists and scrollable content in popups (and the emoji grid)
 - Click and drag to highlight lines in scrollable content
+- The emoji picker: click an emoji to insert it (the picker stays open), a tab to switch
+  category, and the `[x]` in its top-right corner to close it
+- Drag the separator bar up or down to resize the input area; the height is saved when
+  you let go (the SSH console sends it to the server it is attached to)
 
 ---
 

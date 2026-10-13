@@ -443,6 +443,14 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     AppEvent::ImportResult(client_id, addr, result) => {
                         app.handle_import_result(client_id, addr, result);
                     }
+                    AppEvent::UpdateResult { result, reply_to } => {
+                        // src/selfupdate.rs: a client's /update reached this -D daemon;
+                        // install, answer, and hot reload like the Sigusr1Received arm.
+                        if app.finish_server_update(result, reply_to) {
+                            crate::exec_reload(&mut app)?;
+                            return Ok(());
+                        }
+                    }
                     _ => {}
                 }
                 }
@@ -1076,9 +1084,12 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     });
                 }
                 // Commands that execute locally on the client
-                Command::Quit | Command::Update { .. } => {
+                Command::Quit => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                 }
+                // The server's half of a client's /update (src/selfupdate.rs); a
+                // multiuser server refuses inside start_server_update.
+                Command::Update { force } => app.start_server_update(force, Some((client_id, world_index)), event_tx),
                 Command::Menu => app.ws_menu_is_console_only(client_id, world_index),
                 // UI popup commands - send back to client for local handling
                 Command::Help | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
@@ -1334,12 +1345,12 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
                 gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines,
-                input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet,
+                input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet,
                 web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,

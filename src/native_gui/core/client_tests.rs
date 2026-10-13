@@ -460,6 +460,89 @@ fn after_a_server_reload_it_reconnects_quickly() {
     assert!(h.drain().iter().any(|e| matches!(e, Effect::Connect)), "1 s after the first retry");
 }
 
+/// `/update` (src/selfupdate.rs): the server's half first, this GUI's own only after.
+#[test]
+fn update_asks_the_server_and_goes_on_with_its_own_half_when_the_server_answers() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    h.drain();
+    let e = h.core.start_update(false, h.now);
+    h.keep(e);
+    assert!(h.sent().iter().any(|m| matches!(m, WsMessage::SendCommand { command, .. } if command == "/update")));
+    assert!(h.core.update_in_progress());
+    // Nothing of our own until the server has answered.
+    h.advance(Duration::from_secs(5));
+    assert!(!h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { .. })));
+    h.msg(WsMessage::UpdateOutcome { ok: false, reloading: false, version: String::new() });
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { force: false })));
+    assert!(!h.core.update_in_progress());
+}
+
+#[test]
+fn update_waits_for_the_reconnect_when_the_server_reloads() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    let e = h.core.start_update(true, h.now);
+    h.keep(e);
+    h.drain();
+    h.msg(WsMessage::UpdateOutcome { ok: true, reloading: true, version: "9.9.9".into() });
+    assert!(!h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { .. })), "not while the server reloads");
+    h.msg(WsMessage::ServerReloading);
+    h.input(Input::Closed("reload".into()));
+    h.drain();
+    h.advance(Duration::from_secs(2));
+    h.input(Input::Opened);
+    h.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: CHALLENGE.into() });
+    h.msg(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false });
+    h.drain();
+    h.initial(vec![world_msg(0, "A", 0..1, 9)]);
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { force: true })), "once connected again");
+}
+
+#[test]
+fn update_treats_an_old_servers_bounce_as_no_server_update() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    let e = h.core.start_update(false, h.now);
+    h.keep(e);
+    h.drain();
+    // An older server answers /update by sending it back as ExecuteLocalCommand.
+    h.msg(WsMessage::ExecuteLocalCommand { command: "/update".into() });
+    let effects = h.drain();
+    assert!(effects.iter().any(|e| matches!(e, Effect::SelfUpdate { force: false })));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::Event(m) if matches!(**m, WsMessage::ExecuteLocalCommand { .. }))),
+        "the bounce is consumed, never handed to the window (which would send it back: the old ping-pong)");
+    assert!(h.texts(0).iter().any(|t| t.contains("too old")));
+    assert!(h.sent().is_empty(), "and nothing goes back to the server");
+}
+
+#[test]
+fn update_gives_up_waiting_for_the_server_after_the_timeout() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    let e = h.core.start_update(false, h.now);
+    h.keep(e);
+    h.drain();
+    h.advance(crate::selfupdate::SERVER_ANSWER_TIMEOUT - Duration::from_secs(1));
+    assert!(!h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { .. })));
+    h.advance(Duration::from_secs(2));
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { force: false })));
+    assert!(h.texts(0).iter().any(|t| t.contains("no answer")));
+}
+
+#[test]
+fn a_second_update_while_one_runs_is_refused() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    let e = h.core.start_update(false, h.now);
+    h.keep(e);
+    h.drain();
+    let e = h.core.start_update(false, h.now);
+    h.keep(e);
+    assert!(h.sent().is_empty());
+    assert!(h.texts(0).iter().any(|t| t.contains("already in progress")));
+}
+
 #[test]
 fn backoff_grows_and_never_stops() {
     let mut h = H::password();

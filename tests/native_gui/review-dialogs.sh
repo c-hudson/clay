@@ -83,7 +83,7 @@ want world-edit && { web world-edit 640 680 "" "$(popup worlds "{current:'Corpus
 want notes && { web notes 700 500 "" "window.NOTE_MODE = { world_index: 0 };" ""; native notes notes "open:notes;pump:800"; }
 want menu && { web menu 800 600 "" "" "$(type_cmd /menu)"; native menu "" "open:menu;wait:200"; }
 want import && { web import 800 600 "" "" "$(type_cmd /import)"; native import "" "open:import;wait:200"; }
-want emoji && { web emoji 800 600 "" "" "var i=document.getElementById('input'); i.focus(); i.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',keyCode:27,bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown',{key:'e',code:'KeyE',keyCode:69,bubbles:true}));"; native emoji "" "open:emoji_picker;wait:200"; }
+want emoji && { web emoji 800 600 "" "" "var i=document.getElementById('input'); i.focus(); i.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',keyCode:27,bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown',{key:'e',code:'KeyE',keyCode:69,bubbles:true}));"; native emoji emoji "open:emoji_picker;wait:200"; }
 want theme-editor && { web theme-editor 1000 720 theme-editor "" "$(editor_login)"; native theme-editor theme "open:theme-editor;pump:800"; }
 want keybind-editor && { web keybind-editor 1000 700 keybind-editor "" "$(editor_login)"; native keybind-editor keybind "open:keybind-editor;pump:800"; }
 want action-editor && { web action-editor 960 700 action-editor "" "$(editor_login "setTimeout(function(){ [...document.querySelectorAll('.list-item')].find(e => e.textContent.indexOf('heal') >= 0).click(); }, 800);")"; native action-editor action "open:action-editor;pump:800;win:action;down:120,215;up:120,215;wait:200"; }

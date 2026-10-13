@@ -9792,7 +9792,7 @@ third
             "unseen".to_string(), false, false, true,
             "dark".to_string(), "dark".to_string(),
             gui_transparency, color_offset_percent, 0, 500,
-            input_height, "monospace".to_string(), font_size,
+            input_height, None, None, None, "monospace".to_string(), font_size,
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), ws_password.to_string(),

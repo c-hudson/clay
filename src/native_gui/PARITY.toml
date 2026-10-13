@@ -103,7 +103,7 @@ section = "misc"
 phase = 4
 status = "done"
 feature = "handle ExecuteLocalCommand"
-note = "input_view local_command: the same commands as app.js executeLocalCommand, anything else back as SendCommand; /reload restarts this GUI; /update says there is no native GUI release yet (phase 6 adds them); /server and /reload typed here never reach the server (app.js remote-GUI branch)"
+note = "input_view local_command: the same commands as app.js executeLocalCommand; anything else prints a line (never back to the server: a bounced command re-sent is a ping-pong); /reload restarts this GUI; /update typed here runs src/selfupdate.rs's two halves (server first, then this binary) and is answered by UpdateOutcome, not a bounce; /server and /reload typed here never reach the server (app.js remote-GUI branch)"
 
 [[item]]
 id = "msg:GlobalSettingsUpdated"
@@ -344,6 +344,14 @@ phase = 1
 status = "done"
 feature = "handle ServerHello"
 note = ""
+
+[[item]]
+id = "msg:UpdateOutcome"
+section = "connection"
+phase = 7
+status = "done"
+feature = "handle UpdateOutcome"
+note = "core client.rs: the server's half of this client's /update is over (src/selfupdate.rs); wait for the reconnect if it reloads, else Effect::SelfUpdate for this binary (ui surfaces.rs self_update)"
 
 [[item]]
 id = "msg:ServerReloading"
@@ -1480,6 +1488,14 @@ phase = 1
 status = "see"
 feature = "wire ShowTagsChanged"
 note = "handled: see msg:ShowTagsChanged"
+
+[[item]]
+id = "wire:UpdateOutcome"
+section = "wire"
+phase = 7
+status = "see"
+feature = "wire UpdateOutcome"
+note = "handled: see msg:UpdateOutcome"
 
 [[item]]
 id = "wire:ServerReloading"
@@ -2648,7 +2664,7 @@ id = "ui:input.line"
 section = "input"
 phase = 3
 status = "done"
-feature = "input line under the status bar: prompt beside the text, input_height rows, wrapping, scrolls to the caret, caret blinks 10 s after an edit"
+feature = "input line under the status bar: prompt beside the text, input_height_desktop rows (input_height from a server before the split), wrapping, scrolls to the caret, caret blinks 10 s after an edit"
 note = "core/input.rs + ui/input_view.rs"
 
 [[item]]
@@ -2809,7 +2825,7 @@ section = "dialogs"
 phase = 4
 status = "done"
 feature = "the emoji picker: tabs, search, grid, three arrow-key zones, insert at the caret; the console's filter_emoji"
-note = "app.js openEmojiPopup"
+note = "app.js openEmojiPopup; a window of its own here (ui/windows/emoji.rs): a click inserts and leaves it open, Enter inserts and closes"
 
 [[item]]
 id = "ui:window.actions"

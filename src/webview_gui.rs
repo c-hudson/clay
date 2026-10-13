@@ -941,11 +941,13 @@ fn build_html(params: &WebViewParams) -> String {
         );
     }
 
-    // Inject AUTO_PASSWORD into the template's existing <script> block
+    // Inject AUTO_PASSWORD into the template's existing <script> block. WEBVIEW_MASTER
+    // tells app.js this page runs Clay in-process (its /update is the server's own,
+    // src/selfupdate.rs); a remote WebView leaves it undefined.
     if let Some(ref pw_hash) = params.auto_password {
         html = html.replace(
             &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
-            &format!("window.WS_PROTOCOL = '{}';\n        window.AUTO_PASSWORD = '{}';", params.ws_protocol, pw_hash),
+            &format!("window.WS_PROTOCOL = '{}';\n        window.AUTO_PASSWORD = '{}';\n        window.WEBVIEW_MASTER = true;", params.ws_protocol, pw_hash),
         );
     }
 
@@ -1152,6 +1154,49 @@ document.addEventListener('DOMContentLoaded', function() {
 
 /// Build a WebView for a given window, returning the WebView.
 /// Extracts WebView construction so it can be reused for new windows.
+/// A remote WebView GUI updating its own binary (src/selfupdate.rs), off the event
+/// loop: check, download, install, then restart this GUI attached to the same server
+/// (`WvEvent::Reload`, the same argv). Every line names this program. When the
+/// server's install already replaced this binary (same machine, same file) there is
+/// nothing to download - just the restart.
+fn self_update_thread(force: bool, proxy: EventLoopProxy<WvEvent>) {
+    const LABEL: &str = "This GUI";
+    let attached = crate::selfupdate::attached_target_from_args().unwrap_or_else(|| "the same server".to_string());
+    let say = |text: String| { let _ = proxy.send_event(WvEvent::UpdateStatus(text)); };
+    if crate::selfupdate::exe_replaced() {
+        say(crate::selfupdate::replaced_on_disk(LABEL, &attached));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = proxy.send_event(WvEvent::Reload);
+        return;
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = force;
+        say(crate::selfupdate::unavailable(LABEL));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        say(crate::selfupdate::checking(LABEL, force));
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                say(format!("{LABEL}: failed to start the update: {e}"));
+                return;
+            }
+        };
+        let outcome: Result<String, String> = match rt.block_on(crate::platform::check_and_download_update(force)) {
+            Ok(success) => crate::platform::install_update(&success.temp_path).map(|()| success.version),
+            Err(e) => Err(e),
+        };
+        say(crate::selfupdate::client_result(LABEL, &outcome, &attached));
+        if outcome.is_ok() {
+            // Let the line reach the page before the process is replaced.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = proxy.send_event(WvEvent::Reload);
+        }
+    }
+}
+
 /// Handle an IPC message from the JS side (either via window.webkit.messageHandlers
 /// or via the clay://localhost/ipc protocol fallback used on Termux/WebKit2GTK).
 fn dispatch_ipc_message(
@@ -1217,54 +1262,21 @@ fn dispatch_ipc_message(
         // this is what a spawned window's own Cancel/close button should use.
         let _ = proxy.send_event(WvEvent::CloseWindow(window_id));
     } else if body == "update" || body == "update-force" {
-        #[cfg(not(target_os = "android"))]
-        {
-            let force = body == "update-force";
-            let proxy_clone = proxy.clone();
-            let reload_tx_clone = reload_tx.clone();
-            std::thread::spawn(move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = proxy_clone.send_event(WvEvent::UpdateStatus(
-                            format!("Failed to start update: {}", e)
-                        ));
-                        return;
-                    }
-                };
-                let result = rt.block_on(crate::platform::check_and_download_update(force));
-                match result {
-                    Ok(success) => {
-                        let msg = match crate::platform::install_update(&success.temp_path) {
-                            Ok(()) => format!("Updated to Clay v{} — reloading...", success.version),
-                            Err(e) => e,
-                        };
-                        let is_success = msg.starts_with("Updated to");
-                        let _ = proxy_clone.send_event(WvEvent::UpdateStatus(msg));
-                        if is_success {
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                            if is_master {
-                                crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-                                if let Some(ref tx) = reload_tx_clone {
-                                    let _ = tx.send(crate::WsMessage::SendCommand {
-                                        world_index: 0,
-                                        command: "/reload".to_string(),
-                                    });
-                                }
-                            } else {
-                                let _ = proxy_clone.send_event(WvEvent::Reload);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = proxy_clone.send_event(WvEvent::UpdateStatus(e));
-                    }
-                }
-            });
-        }
-        #[cfg(target_os = "android")]
-        {
-            let _ = proxy.send_event(WvEvent::UpdateStatus("Update not available on Android".to_string()));
+        // This GUI's own half of /update (src/selfupdate.rs): app.js asks for it once
+        // the server's half is over. The master runs Clay in-process, so it has no
+        // separate binary: its /update is the server's own, whose hot reload starts
+        // this window again (app.js sends it there itself; this is for an older page).
+        let force = body == "update-force";
+        if is_master {
+            if let Some(ref tx) = reload_tx {
+                let _ = tx.send(crate::WsMessage::SendCommand {
+                    world_index: 0,
+                    command: (if force { "/update -f" } else { "/update" }).to_string(),
+                });
+            }
+        } else {
+            let proxy = proxy.clone();
+            std::thread::spawn(move || self_update_thread(force, proxy));
         }
     } else if body == "reload" {
         if is_master {

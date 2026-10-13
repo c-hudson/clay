@@ -748,6 +748,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
         println!("Connecting to {}...", ws_url);
 
         let host_port_key = remote.host_port.clone();
+        // Relaunched by /update while the server reloads: give it time to come back.
+        wait_for_server_if_relaunched(&remote.host_port).await;
 
         // Connect to WebSocket server - for wss:// we need to configure TLS to accept self-signed
         // certs (trust-on-first-use pinned via ~/.clay/known_hosts.dat, see platform::danger_rustls).
@@ -1144,6 +1146,12 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 
     // Channel for local /update results
     let (update_tx, mut update_rx) = mpsc::channel::<Result<UpdateSuccess, String>>(1);
+    // /update (src/selfupdate.rs): this console's own download is running; the socket
+    // closed under it (the server reloaded); the wait for the server's answer.
+    let mut own_update_running = false;
+    let mut ws_closed = false;
+    let mut update_timeout = std::pin::pin!(tokio::time::sleep(crate::selfupdate::SERVER_ANSWER_TIMEOUT));
+    let mut update_timeout_armed = false;
 
     // The output area's size as last reported to the server (UpdateViewState).
     let mut reported_view: Option<(u16, u16)> = None;
@@ -1219,10 +1227,43 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             }
         }
 
+        // Arm the wait for the server's /update answer when a request starts; disarm it
+        // once the answer (or an old server's bounce) has moved things on.
+        match app.update_flow {
+            Some(crate::selfupdate::ClientFlow::WaitingServer { since, .. }) if !update_timeout_armed => {
+                update_timeout.as_mut().reset(tokio::time::Instant::from_std(since + crate::selfupdate::SERVER_ANSWER_TIMEOUT));
+                update_timeout_armed = true;
+            }
+            Some(_) => {}
+            None => update_timeout_armed = false,
+        }
+
         tokio::select! {
             maybe_event = event_stream.next() => {
                 if let Some(Ok(event)) = maybe_event {
                     match event {
+                        Event::Mouse(mouse)
+                            if app.settings.mouse_enabled
+                                && !app.has_new_popup()
+                                && (app.input_resize_drag.is_some()
+                                    || (matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && app.on_separator_row(mouse.row))) =>
+                        {
+                            // The separator bar (the input's top edge): drag it up or down
+                            // to resize the input; the height goes to the server, which
+                            // keeps it, when it's let go.
+                            match mouse.kind {
+                                MouseEventKind::Down(MouseButton::Left) => app.input_resize_drag = Some((mouse.row, app.input_height)),
+                                MouseEventKind::Drag(MouseButton::Left) => {
+                                    app.input_resize_drag_to(mouse.row);
+                                }
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    if app.input_resize_end() {
+                                        send_global_settings(&mut app, String::new(), &ws_tx);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         Event::Mouse(mouse) if app.settings.mouse_enabled && !app.has_new_popup() && app.shell_live(app.current_world_index) => {
                             // A live shell world: forward the mouse to the server (it
                             // decides what the program receives). 1-based → 0-based grid.
@@ -1358,33 +1399,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             // Check if a /reload was requested (re-exec local binary)
                             if app.pending_reload {
                                 app.pending_reload = false;
-                                #[cfg(all(unix, not(target_os = "android")))]
-                                {
-                                    let _ = crossterm::terminal::disable_raw_mode();
-                                    let _ = crossterm::execute!(
-                                        std::io::stdout(),
-                                        crossterm::terminal::LeaveAlternateScreen
-                                    );
-                                    if let Ok((exe, _)) = get_executable_path() {
-                                        use std::os::unix::process::CommandExt;
-                                        let args: Vec<String> = std::env::args().skip(1).collect();
-                                        let err = std::process::Command::new(&exe).args(&args).exec();
-                                        // If exec failed, restore terminal and show error
-                                        let _ = crossterm::terminal::enable_raw_mode();
-                                        let _ = crossterm::execute!(
-                                            std::io::stdout(),
-                                            crossterm::terminal::EnterAlternateScreen,
-                                            crossterm::event::EnableBracketedPaste
-                                        );
-                                        app.add_output(&format!("Reload failed: {}", err));
-                                    } else {
-                                        app.add_output("Reload failed: cannot find executable path");
-                                    }
-                                }
-                                #[cfg(not(all(unix, not(target_os = "android"))))]
-                                {
-                                    app.add_output("Reload is not available on this platform.");
-                                }
+                                relaunch_console(&mut app);
                             }
                             // Check if a /server --close was requested (detach and become
                             // an independent master)
@@ -1401,21 +1416,9 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     app.add_output(&format!("Connect failed: {}", e));
                                 }
                             }
-                            // Check if an /update was requested
+                            // The server's half of /update is over: this console's own.
                             if let Some(force) = app.pending_update.take() {
-                                app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
-                                #[cfg(not(target_os = "android"))]
-                                {
-                                    let update_tx_clone = update_tx.clone();
-                                    tokio::spawn(async move {
-                                        let result = check_and_download_update(force).await;
-                                        let _ = update_tx_clone.send(result).await;
-                                    });
-                                }
-                                #[cfg(target_os = "android")]
-                                {
-                                    app.add_output("Update is not available on this platform.");
-                                }
+                                own_update_running = start_own_update(&mut app, &update_tx, force);
                             }
                             needs_redraw = true;
                         }
@@ -1428,7 +1431,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                     }
                 }
             }
-            msg = ws_read.next() => {
+            msg = ws_read.next(), if !ws_closed => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<WsMessage>(&text) {
@@ -1444,21 +1447,10 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     request_id: Some(request_id),
                                 });
                             }
-                            // Check if an /update was requested via ExecuteLocalCommand
+                            // The server's half of /update is over (UpdateOutcome, or an
+                            // old server's bounce): this console's own.
                             if let Some(force) = app.pending_update.take() {
-                                app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
-                                #[cfg(not(target_os = "android"))]
-                                {
-                                    let update_tx_clone = update_tx.clone();
-                                    tokio::spawn(async move {
-                                        let result = check_and_download_update(force).await;
-                                        let _ = update_tx_clone.send(result).await;
-                                    });
-                                }
-                                #[cfg(target_os = "android")]
-                                {
-                                    app.add_output("Update is not available on this platform.");
-                                }
+                                own_update_running = start_own_update(&mut app, &update_tx, force);
                             }
                             needs_redraw = true;
                         }
@@ -1479,30 +1471,38 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                         // Respond to ping - handled by tungstenite automatically
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        break;
+                        // The server reloading under a /update takes the connection with
+                        // it; this console restarts itself (attached again) once its own
+                        // update is done, so keep going without the socket until then.
+                        if own_update_running || app.pending_update.is_some() || app.update_flow.is_some() {
+                            ws_closed = true;
+                            app.update_server_reloading = true;
+                        } else {
+                            break;
+                        }
                     }
                     _ => {}
                 }
             }
-            // Handle /update result
+            // This console's own /update is over (src/selfupdate.rs).
             result = update_rx.recv() => {
                 if let Some(result) = result {
-                    match result {
-                        Ok(success) => {
-                            #[cfg(not(target_os = "android"))]
-                            match install_update(&success.temp_path) {
-                                Ok(()) => app.add_output(&format!("Updated to Clay v{} — please restart.", success.version)),
-                                Err(e) => app.add_output(&e),
-                            }
-                            #[cfg(target_os = "android")]
-                            {
-                                app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
-                            }
-                        }
-                        Err(e) => {
-                            app.add_output(&e);
-                        }
+                    own_update_running = false;
+                    finish_own_update(&mut app, result);
+                    if ws_closed {
+                        // The server is gone and the relaunch didn't happen (or failed).
+                        app.add_output("Connection closed by the server's reload; start this console again.");
+                        break;
                     }
+                    needs_redraw = true;
+                }
+            }
+            // The server never answered the /update: go on with this console's own.
+            () = &mut update_timeout, if update_timeout_armed => {
+                update_timeout_armed = false;
+                if let Some(crate::selfupdate::ClientFlow::WaitingServer { force, .. }) = app.update_flow.take() {
+                    app.add_output(&crate::selfupdate::server_no_answer());
+                    own_update_running = start_own_update(&mut app, &update_tx, force);
                     needs_redraw = true;
                 }
             }
@@ -1536,6 +1536,128 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 /// Returns true if quit was requested
 /// Crossterm mouse button → the code `shell::keys::mouse` expects (0 left, 1 middle, 2
 /// right).
+/// What this console calls itself in `/update`'s lines (src/selfupdate.rs).
+const OWN_LABEL: &str = "This console";
+
+/// The server this console restarts against, for `/update`'s lines.
+fn attached_to() -> String {
+    crate::selfupdate::attached_target_from_args().unwrap_or_else(|| "the same server".to_string())
+}
+
+/// This console starts again as it was started: `/reload`, and the end of `/update`.
+/// Returns only if the exec failed (the terminal is then back as it was).
+fn relaunch_console(app: &mut App) {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen
+        );
+        if let Ok((exe, _)) = get_executable_path() {
+            use std::os::unix::process::CommandExt;
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            // The new process may start while the server is still coming back from
+            // its own reload: let it wait for the port (run_console_client).
+            std::env::set_var(CONNECT_RETRY_ENV, "1");
+            let err = std::process::Command::new(&exe).args(&args).exec();
+            std::env::remove_var(CONNECT_RETRY_ENV);
+            // If exec failed, restore terminal and show error
+            let _ = crossterm::terminal::enable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::EnterAlternateScreen,
+                crossterm::event::EnableBracketedPaste
+            );
+            app.add_output(&format!("Reload failed: {}", err));
+        } else {
+            app.add_output("Reload failed: cannot find executable path");
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "android"))))]
+    {
+        app.add_output("Reload is not available on this platform.");
+    }
+}
+
+/// Set in the environment of a console relaunched by `/update`: its first connect waits
+/// for the server, which may still be restarting, instead of failing at once.
+const CONNECT_RETRY_ENV: &str = "CLAY_CONNECT_RETRY";
+
+/// A relaunched console's wait for the server's port (see `CONNECT_RETRY_ENV`): up to
+/// this long, probing once a second. Not a reconnect loop - once the port answers, the
+/// ordinary connect follows.
+async fn wait_for_server_if_relaunched(host_port: &str) {
+    if std::env::var_os(CONNECT_RETRY_ENV).is_none() {
+        return;
+    }
+    std::env::remove_var(CONNECT_RETRY_ENV);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut said = false;
+    while std::time::Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(host_port).await.is_ok() {
+            return;
+        }
+        if !said {
+            println!("Waiting for {} to come back...", host_port);
+            said = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// This console's own half of `/update` (src/selfupdate.rs), once the server's is
+/// over. Returns true when a download is running (its result comes through
+/// `update_tx`); false when there was nothing to download - the server's install
+/// already replaced this binary (same machine, same file), so the console restarts
+/// at once - or when this platform can't self-update.
+fn start_own_update(app: &mut App, update_tx: &mpsc::Sender<Result<UpdateSuccess, String>>, force: bool) -> bool {
+    if crate::selfupdate::exe_replaced() {
+        app.add_output(&crate::selfupdate::replaced_on_disk(OWN_LABEL, &attached_to()));
+        relaunch_console(app);
+        return false;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        app.add_output(&crate::selfupdate::checking(OWN_LABEL, force));
+        let update_tx = update_tx.clone();
+        tokio::spawn(async move {
+            let result = check_and_download_update(force).await;
+            let _ = update_tx.send(result).await;
+        });
+        true
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = (update_tx, force);
+        app.add_output(&crate::selfupdate::unavailable(OWN_LABEL));
+        if app.update_server_reloading {
+            relaunch_console(app);
+        }
+        false
+    }
+}
+
+/// This console's own download is over: install it and restart attached again. With
+/// the server reloading under us the restart happens whatever the result - it is how
+/// this console gets its connection back.
+fn finish_own_update(app: &mut App, result: Result<UpdateSuccess, String>) {
+    let outcome: Result<String, String> = match result {
+        #[cfg(not(target_os = "android"))]
+        Ok(success) => install_update(&success.temp_path).map(|()| success.version),
+        #[cfg(target_os = "android")]
+        Ok(success) => Err(format!(
+            "update v{} downloaded to {}; replace the binary by hand and restart.",
+            success.version, success.temp_path.display()
+        )),
+        Err(e) => Err(e),
+    };
+    app.add_output(&crate::selfupdate::client_result(OWN_LABEL, &outcome, &attached_to()));
+    if outcome.is_ok() || app.update_server_reloading {
+        relaunch_console(app);
+    }
+}
+
 fn remote_mouse_button(b: MouseButton) -> u8 {
     match b {
         MouseButton::Left => 0,
@@ -1722,6 +1844,9 @@ pub(crate) fn handle_remote_client_key(
                     // last changed it.
                     remote_initial_lines: app.settings.remote_initial_lines,
                     input_height: app.input_height,
+                    input_height_phone: None,
+                    input_height_tablet: None,
+                    input_height_desktop: None,
                     font_name: app.settings.font_name.clone(),
                     font_size: app.settings.font_size,
                     web_font_size_phone: app.settings.web_font_size_phone,
@@ -2346,8 +2471,19 @@ pub(crate) fn handle_remote_client_key(
                         }
                     }
                     Command::Update { force } => {
-                        // Signal to the outer run_console_client loop to handle locally
-                        app.pending_update = Some(force);
+                        // /update updates what can be updated (src/selfupdate.rs): the
+                        // server first, then - once it has answered (and come back, if it
+                        // reloaded) - this console's own binary. The answer arrives as
+                        // UpdateOutcome (App::handle_remote_ws_message).
+                        if app.update_flow.is_some() || app.pending_update.is_some() {
+                            app.add_output("An update is already in progress.");
+                        } else {
+                            app.update_flow = Some(crate::selfupdate::ClientFlow::WaitingServer { force, since: std::time::Instant::now() });
+                            let _ = ws_tx.send(WsMessage::SendCommand {
+                                world_index: app.current_world_index,
+                                command: (if force { "/update -f" } else { "/update" }).to_string(),
+                            });
+                        }
                     }
                     Command::Reload => {
                         // Reload the local remote client binary
@@ -2836,11 +2972,12 @@ pub(crate) fn dispatch_remote_action(
             }
             app.needs_output_redraw = true;
         }
-        "input_grow" => {
-            if app.input_height < 15 { app.input_height += 1; }
-        }
-        "input_shrink" => {
-            if app.input_height > 1 { app.input_height -= 1; }
+        "input_grow" | "input_shrink" => {
+            let rows = if action == "input_grow" { app.input_height + 1 } else { app.input_height.saturating_sub(1) }.clamp(1, 15);
+            if rows != app.input_height {
+                app.apply_input_height(rows);
+                send_global_settings(app, String::new(), ws_tx);
+            }
         }
         "emoji_picker" => {
             app.open_emoji_popup();
@@ -2874,6 +3011,15 @@ pub(crate) fn apply_remote_web_settings(
     }
     app.settings.remote_initial_lines = settings.remote_initial_lines.clamp(10, 5000) as u16;
 
+    send_global_settings(app, settings.ws_password.clone(), ws_tx);
+}
+
+/// Send the daemon every global setting as this client holds it, with `ws_password`
+/// (empty = unchanged). The web popup's save, and the input height after Alt-Up/Down or
+/// a drag of the separator bar - the SSH console keeps no settings.dat of its own, so a
+/// setting it changes is kept by the server it is attached to.
+pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &tokio::sync::mpsc::UnboundedSender<crate::websocket::WsMessage>) {
+
     let _ = ws_tx.send(crate::websocket::WsMessage::UpdateGlobalSettings {
         more_mode_enabled: app.settings.more_mode_enabled,
         spell_check_enabled: app.settings.spell_check_enabled,
@@ -2891,6 +3037,9 @@ pub(crate) fn apply_remote_web_settings(
         // Remote Lines now lives on the web popup.
         remote_initial_lines: app.settings.remote_initial_lines,
         input_height: app.input_height,
+        input_height_phone: None,
+        input_height_tablet: None,
+        input_height_desktop: None,
         font_name: app.settings.font_name.clone(),
         font_size: app.settings.font_size,
         web_font_size_phone: app.settings.web_font_size_phone,
@@ -2911,7 +3060,7 @@ pub(crate) fn apply_remote_web_settings(
         ws_key_file: app.settings.websocket_key_file.clone(),
         // Empty = unchanged (the server never sends us its password, so the popup's
         // field starts blank); a value typed into the popup sets a new one.
-        ws_password: settings.ws_password.clone(),
+        ws_password,
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
         dictionary_path: app.settings.dictionary_path.clone(),
         mouse_enabled: app.settings.mouse_enabled,

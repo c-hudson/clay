@@ -113,7 +113,7 @@ Open the Global Settings popup.
 - Temp convert - Auto-convert temperatures in input
 - World Switching - Cycling behavior (Unseen First, Alphabetical)
 - Show tags - Show/hide MUD tags (also F2)
-- Input height - Default input area height (1-15)
+- Input height - The console's input area height (1-15); the GUI, the web page and the Android app each keep their own, set from their own Settings
 - Console Theme - Dark or Light
 - GUI Theme - Dark, Light, Dark - New or Light - New (see Themes in the Interface chapter)
 - TLS Proxy - Enable TLS connection preservation
@@ -164,6 +164,34 @@ Also triggered by:
 - `SIGUSR1` signal (`kill -USR1 $(pgrep clay)`)
 
 See the **Hot Reload** chapter for details.
+
+### /update
+Update Clay to the latest GitHub release.
+
+```
+/update [-f]
+```
+
+Typed in the console (or in a GUI that runs Clay itself), it checks GitHub, downloads
+this platform's build, installs it over the running binary and hot-reloads, keeping your
+connections. `-f` installs the latest release even when it is not newer.
+
+Typed in a remote client - the desktop GUI attached with `--gui=host`, the SSH console,
+the web page, the Android app - it updates what can be updated: first the Clay you are
+attached to (it hot-reloads; the client reconnects), then the client's own binary, which
+restarts attached to the same server. Every line says which program it is about:
+
+```
+Server (Clay v1.7.4, linux/x86_64): checking for updates...
+Server: updated to Clay v1.7.5 — hot reloading, connections kept.
+This GUI (Clay v1.7.4, linux/x86_64): checking for updates...
+This GUI: updated to Clay v1.7.5 — restarting, still attached to mini:9000.
+```
+
+The two steps never run at the same time. When the client and the server are the same
+binary on the same machine, the client notices that the server's install already
+replaced its file and simply restarts. A browser page or the Android app has no binary of
+its own to update; a multiuser server is not updated by its users.
 
 ### /testmusic
 Play a test ANSI music sequence (C-D-E-F-G) to verify audio.

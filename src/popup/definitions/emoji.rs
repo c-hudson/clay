@@ -114,6 +114,9 @@ pub fn create_emoji_popup(visible_rows: usize, columns: usize) -> PopupDefinitio
     let cells = filter_emoji_console(None, "");
 
     PopupDefinition::new(PopupId("emoji"), "Emoji")
+        // A mouse pick leaves the picker open (several emoji in a row), so the
+        // mouse needs something to close it with.
+        .with_close_button()
         .with_field(
             Field::new(
                 EMOJI_FIELD_SEARCH,
@@ -579,6 +582,7 @@ mod tests {
             vec![EMOJI_FIELD_SEARCH, EMOJI_FIELD_TABS, EMOJI_FIELD_GRID],
             "field order must be Search, Tabs, Grid"
         );
+        assert!(def.close_button, "the mouse closes the picker with the [x]");
     }
 
     #[test]

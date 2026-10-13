@@ -135,8 +135,8 @@ impl ClayView {
                 let fx = self.session.send(WsMessage::ToggleWorldGmcp { world_index: world });
                 self.after(fx, cx);
             }
-            "input_grow" => self.input.rows = (self.input.rows + 1).min(15),
-            "input_shrink" => self.input.rows = self.input.rows.saturating_sub(1).max(1),
+            "input_grow" => self.set_input_rows(self.input.rows + 1, cx),
+            "input_shrink" => self.set_input_rows(self.input.rows.saturating_sub(1), cx),
             "reload" => self.relaunch(None, cx),
             "help" | "emoji_picker" | "spell_check" | "recent_worlds" => self.open_surface(action, window, cx),
             a if self.edit_action(a, cx) => {}

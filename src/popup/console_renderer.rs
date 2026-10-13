@@ -56,6 +56,29 @@ pub fn render_popup(f: &mut Frame, state: &mut PopupState, theme: &Theme) {
 
     // Render content inside the block
     render_popup_content(f, state, inner_area, theme);
+
+    // The `[x]` on the top border, after the content pass (which clears hit areas).
+    if state.definition.close_button {
+        if let Some(area) = close_button_area(popup_area) {
+            let x = Line::from(vec![
+                Span::styled("[", Style::default().fg(theme.popup_border()).bg(theme.popup_bg())),
+                Span::styled("x", Style::default().fg(theme.fg()).bg(theme.popup_bg()).add_modifier(Modifier::BOLD)),
+                Span::styled("]", Style::default().fg(theme.popup_border()).bg(theme.popup_bg())),
+            ]);
+            f.render_widget(Paragraph::new(x), area);
+            state.hit_areas.push((area, ElementSelection::Button(super::POPUP_BTN_CLOSE)));
+        }
+    }
+}
+
+/// Where a popup's `[x]` goes: on the top border, one border cell in from the
+/// top-right corner. `None` when the popup is too narrow to hold it.
+pub fn close_button_area(popup_area: Rect) -> Option<Rect> {
+    const W: u16 = 3;
+    if popup_area.width < W + 4 {
+        return None;
+    }
+    Some(Rect::new(popup_area.x + popup_area.width - 1 - 1 - W, popup_area.y, W, 1))
 }
 
 /// Calculate popup area based on layout settings
@@ -1782,6 +1805,46 @@ fn compute_tab_underline_offset(
     (prefix_width, active_label_width)
 }
 
+/// The tab under column `col` of a `Tabs` field's strip (`col` counted from the
+/// field's left edge), as `render_tabs_field` lays it out for `width` columns:
+/// the same window `compute_tab_window` picks, a `‹ ` prefix when the left end
+/// is hidden, labels two columns apart. A column on the gap between two labels,
+/// on an indicator, or past the strip is `None`.
+pub fn tab_at_column(labels: &[String], selected_index: usize, width: usize, col: usize) -> Option<usize> {
+    if labels.is_empty() {
+        return None;
+    }
+    let (start, end, hidden_left, _) = compute_tab_window(labels, selected_index, width);
+    let mut x = if hidden_left { 2 } else { 0 };
+    for (i, label) in labels.iter().enumerate().take(end).skip(start) {
+        let w = display_width(label);
+        if col >= x && col < x + w {
+            return Some(i);
+        }
+        x += w + 2;
+    }
+    None
+}
+
+/// The cell under (`col`, `row`) of a `Grid` field, counted from the field's
+/// top-left, as `render_grid_field` lays it out: `CELL_STRIDE` columns per cell,
+/// rows from the (clamped) scroll offset. `None` off the grid or past its last
+/// cell.
+pub fn grid_cell_at(cells: usize, columns: usize, scroll_offset: usize, visible_rows: usize, col: usize, row: usize) -> Option<usize> {
+    let columns = columns.max(1);
+    if cells == 0 || row >= visible_rows {
+        return None;
+    }
+    let c = col / CELL_STRIDE;
+    if c >= columns {
+        return None;
+    }
+    let total_rows = cells.div_ceil(columns);
+    let scroll = scroll_offset.min(total_rows.saturating_sub(visible_rows));
+    let index = (scroll + row) * columns + c;
+    (index < cells).then_some(index)
+}
+
 /// Render a `Tabs` field: two rows, the windowed label strip (with `‹`/`›`
 /// when either end is hidden) and, while `active`, a `═` underline beneath
 /// the active label. Three visual states (see `EMOJI-PICKER-ROADMAP.md`'s
@@ -2230,6 +2293,45 @@ pub fn render_filter_popup_new(
 mod tests {
     use super::*;
     use crate::popup::{Button, ButtonId, Field, FieldId, PopupDefinition, PopupId};
+
+    #[test]
+    fn close_button_sits_one_cell_in_from_the_top_right_corner() {
+        let area = close_button_area(Rect::new(10, 2, 40, 12)).unwrap();
+        assert_eq!((area.x, area.y, area.width, area.height), (10 + 40 - 5, 2, 3, 1));
+        assert_eq!(close_button_area(Rect::new(0, 0, 6, 5)), None, "too narrow");
+    }
+
+    #[test]
+    fn tab_at_column_follows_the_strip_layout() {
+        let labels: Vec<String> = ["😀", "🐶", "🍔", "⚽"].iter().map(|s| s.to_string()).collect();
+        // Every glyph is two columns; labels two apart: 😀 at 0-1, 🐶 at 4-5, 🍔 at 8-9, ⚽ at 12-13.
+        assert_eq!(tab_at_column(&labels, 0, 40, 0), Some(0));
+        assert_eq!(tab_at_column(&labels, 0, 40, 1), Some(0));
+        assert_eq!(tab_at_column(&labels, 0, 40, 2), None, "the gap");
+        assert_eq!(tab_at_column(&labels, 0, 40, 5), Some(1));
+        assert_eq!(tab_at_column(&labels, 0, 40, 12), Some(3));
+        assert_eq!(tab_at_column(&labels, 0, 40, 14), None, "past the strip");
+        assert_eq!(tab_at_column(&[], 0, 40, 0), None);
+        // A narrow strip windowed onto the last tab: `‹ ` first, then the shown labels.
+        let (start, _, hidden_left, _) = compute_tab_window(&labels, 3, 6);
+        assert!(hidden_left && start > 0);
+        assert_eq!(tab_at_column(&labels, 3, 6, 0), None, "the ‹ indicator");
+        assert_eq!(tab_at_column(&labels, 3, 6, 2), Some(start));
+    }
+
+    #[test]
+    fn grid_cell_at_uses_the_cell_stride_and_scroll() {
+        // 23 cells, 10 columns, 2 rows visible, scrolled to row 1 (rows 1-2 shown).
+        assert_eq!(grid_cell_at(23, 10, 1, 2, 0, 0), Some(10));
+        assert_eq!(grid_cell_at(23, 10, 1, 2, 3, 0), Some(10), "anywhere in the 4-column cell");
+        assert_eq!(grid_cell_at(23, 10, 1, 2, 4, 0), Some(11));
+        assert_eq!(grid_cell_at(23, 10, 1, 2, 8, 1), Some(22), "the short last row's last cell");
+        assert_eq!(grid_cell_at(23, 10, 1, 2, 12, 1), None, "past the last cell");
+        assert_eq!(grid_cell_at(23, 10, 1, 2, 40, 0), None, "past the last column");
+        assert_eq!(grid_cell_at(23, 10, 1, 2, 0, 2), None, "below the visible rows");
+        assert_eq!(grid_cell_at(23, 10, 9, 2, 0, 0), Some(10), "scroll clamps as the renderer's does");
+        assert_eq!(grid_cell_at(0, 10, 0, 2, 0, 0), None);
+    }
 
     #[test]
     fn test_truncate_str() {

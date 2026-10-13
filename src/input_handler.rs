@@ -101,15 +101,24 @@ pub(crate) enum KeyAction {
 
 /// Handle a mouse click on a popup. Returns true if a button was activated (caller should
 /// then call handle_new_popup_key with Enter to trigger the button action).
+///
+/// The emoji picker's parts act on the click itself, so the caller has nothing to
+/// synthesize: a grid cell is inserted into the input and the picker **stays open**
+/// (the user may want several); a tab switches category; the `[x]` closes it.
 pub(crate) fn handle_popup_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
     if let Some(state) = app.popup_manager.current_mut() {
-        for (rect, element) in &state.hit_areas {
-            if column >= rect.x && column < rect.x + rect.width
-                && row >= rect.y && row < rect.y + rect.height
+        let is_emoji = state.definition.id == popup::PopupId("emoji");
+        let hit = state
+            .hit_areas
+            .iter()
+            .find(|(rect, _)| column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height)
+            .map(|(rect, element)| (*rect, element.clone()));
+        if let Some((rect, element)) = hit {
             {
-                match element {
+                match &element {
                     popup::ElementSelection::Field(field_id) => {
                         let field_id = *field_id;
+                        let (rel_col, rel_row) = ((column - rect.x) as usize, (row - rect.y) as usize);
                         // If currently editing a different field, commit the edit first
                         if state.editing {
                             if let popup::ElementSelection::Field(current_id) = &state.selected {
@@ -133,6 +142,33 @@ pub(crate) fn handle_popup_mouse_click(app: &mut App, column: u16, row: u16) -> 
                                         state.start_edit();
                                     }
                                 }
+                                popup::FieldKind::Grid { cells, columns, scroll_offset, visible_rows, .. } => {
+                                    let hit = popup::console_renderer::grid_cell_at(cells.len(), *columns, *scroll_offset, *visible_rows, rel_col, rel_row);
+                                    if let Some(index) = hit {
+                                        state.grid_select(index);
+                                        if is_emoji {
+                                            if let Some(text) = state.get_selected_grid_item().map(|item| item.id.clone()) {
+                                                app.input.insert_str(&text);
+                                            }
+                                        }
+                                    }
+                                }
+                                popup::FieldKind::Tabs { labels, selected_index, .. } => {
+                                    // The strip is the field's first row; its underline is the second.
+                                    let hit = popup::console_renderer::tab_at_column(labels, *selected_index, rect.width as usize, rel_col);
+                                    if let Some(tab) = hit {
+                                        if let Some(popup::FieldKind::Tabs { selected_index, .. }) = state.field_mut(field_id).map(|f| &mut f.kind) {
+                                            *selected_index = tab;
+                                        }
+                                        if is_emoji {
+                                            // A deliberate category pick: the console's Left/Right-on-Tabs rule.
+                                            use popup::definitions::emoji::{emoji_query_clear, refilter_emoji_console};
+                                            emoji_query_clear(state);
+                                            state.grid_home();
+                                            refilter_emoji_console(state);
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -140,6 +176,11 @@ pub(crate) fn handle_popup_mouse_click(app: &mut App, column: u16, row: u16) -> 
                     }
                     popup::ElementSelection::Button(button_id) => {
                         let button_id = *button_id;
+                        if button_id == popup::POPUP_BTN_CLOSE {
+                            // The border's [x]: close, as Esc would.
+                            app.popup_manager.close();
+                            return false;
+                        }
                         if state.editing {
                             state.commit_edit();
                         }
@@ -207,6 +248,11 @@ pub(crate) fn handle_popup_mouse_highlight_start(app: &mut App, column: u16, row
 
     if let Some((field_id, line)) = screen_to_content_line(app, column, row) {
         if let Some(state) = app.popup_manager.current_mut() {
+            // A Grid's rows are cells, not text: its clicks are `handle_popup_mouse_click`'s
+            // (the content area exists for the scrollbar above).
+            if state.field(field_id).is_some_and(|f| matches!(f.kind, popup::FieldKind::Grid { .. })) {
+                return false;
+            }
             // Select this field
             state.selected = popup::ElementSelection::Field(field_id);
 

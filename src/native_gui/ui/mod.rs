@@ -120,7 +120,8 @@ pub struct ClayView {
     /// The input line's text and editing state.
     editor: crate::native_gui::core::input::Editor,
     input: input_view::InputState,
-    /// The `input_height` last taken from the server (input_grow/shrink change the rows
+    /// The input height last taken from the server - `input_height_desktop`, this GUI's,
+    /// or `input_height` from a server before the split (input_grow/shrink change the rows
     /// locally until it changes, as app.js does).
     input_height_seen: u16,
     /// The theme gpui-component's widgets were last given.
@@ -275,6 +276,7 @@ impl ClayView {
                     }
                     _ => {}
                 },
+                Effect::SelfUpdate { force } => self.self_update(force, cx),
                 _ => {}
             }
         }
@@ -588,9 +590,10 @@ impl ClayView {
         }
         restyle |= self.fonts.set_user(&s.font_name, s.web_font_weight);
         let (spell_on, dict) = (s.spell_check_enabled, s.dictionary_path.clone());
-        if s.input_height != self.input_height_seen {
-            self.input_height_seen = s.input_height;
-            self.input.rows = (s.input_height as usize).clamp(1, 15);
+        let height = input_view::input_height_of(s);
+        if height != self.input_height_seen {
+            self.input_height_seen = height;
+            self.input.rows = (height as usize).clamp(1, 15);
         }
         self.spell_settings(spell_on, &dict);
         let Some(s) = self.surf.preview.as_ref().or(self.session.core.settings.as_ref()) else { return };
@@ -980,7 +983,7 @@ impl Render for ClayView {
                 }
                 cx.notify();
             }))
-            // Dragging the font slider, and the end of a press.
+            // Dragging the font slider or the input's top edge, and the end of a press.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
                 if this.chrome.slider_drag {
                     if ev.pressed_button == Some(MouseButton::Left) {
@@ -989,12 +992,20 @@ impl Render for ClayView {
                         this.chrome.slider_drag = false;
                     }
                 }
+                if this.input.resize_drag.is_some() {
+                    if ev.pressed_button == Some(MouseButton::Left) {
+                        this.input_resize_to(f32::from(ev.position.y), cx);
+                    } else {
+                        this.input_resize_end(cx);
+                    }
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _window, _cx| {
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                     this.chrome.slider_drag = false;
                     this.chrome.closed_by_press = None;
+                    this.input_resize_end(cx);
                 }),
             )
             .children(icon_bar)
@@ -1027,7 +1038,7 @@ pub(super) fn bind_main_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", MainCopyCtrl, Some(MAIN_CONTEXT)),
         KeyBinding::new("cmd-c", MainCopyCmd, Some(MAIN_CONTEXT)),
     ]);
-    dialogs::emoji::bind_keys(cx);
+    windows::emoji::bind_keys(cx);
     kit::bind_list_keys(cx);
     windows::keybind_editor::bind_keys(cx);
 }

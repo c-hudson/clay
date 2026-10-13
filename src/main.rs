@@ -44,6 +44,7 @@ pub mod tfrun;
 mod tfstartup;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
+pub mod selfupdate;
 #[cfg(feature = "native-gui")]
 pub mod native_gui;
 pub mod testserver;
@@ -128,7 +129,7 @@ pub fn get_custom_config_path() -> Option<&'static PathBuf> {
 /// Termux always sets (e.g. `/data/data/com.termux/files/usr`) — added so a user's
 /// `/version` output tells us at a glance whether a report came from a Termux-hosted
 /// instance (relevant to connection-health bugs like D-Termux-lines) vs. the app.
-fn platform_tag() -> String {
+pub(crate) fn platform_tag() -> String {
     #[cfg(target_os = "android")]
     {
         let is_termux = std::env::var("PREFIX")
@@ -1802,6 +1803,12 @@ pub struct Settings {
     web_font_size_phone: f32,
     web_font_size_tablet: f32,
     web_font_size_desktop: f32,
+    // The input area's height in rows (1-15) for the phone, tablet and desktop clients
+    // (the GUIs are desktops), split by interface as the font sizes are; the console's is
+    // `App::input_height` (TF's %isize).
+    input_height_phone: u16,
+    input_height_tablet: u16,
+    input_height_desktop: u16,
     web_font_weight: u16,
     web_font_line_height: f32,     // The INPUT line's line height multiplier (default 1.2); output rows stay 1.0
     web_font_letter_spacing: f32,  // Letter spacing in px (default 0)
@@ -1914,6 +1921,9 @@ impl Default for Settings {
             web_font_size_phone: 10.0,   // Default for phones
             web_font_size_tablet: 14.0,  // Default for tablets
             web_font_size_desktop: 18.0, // Default for desktop
+            input_height_phone: 3,
+            input_height_tablet: 3,
+            input_height_desktop: 3,
             web_font_weight: 400,      // Default font weight (normal)
             web_font_line_height: 1.2,
             web_font_letter_spacing: 0.0,
@@ -5311,6 +5321,9 @@ pub struct App {
     pub previous_world_index: Option<usize>, // For Alt+w fallback when no unseen/pending
     pub input: InputArea,
     pub input_height: u16,
+    /// A mouse drag of the separator bar (the input's top edge) in progress: the row it
+    /// started on and the input height then. Released, the height is saved.
+    pub input_resize_drag: Option<(u16, u16)>,
     pub output_height: u16,
     pub output_width: u16,
     pub spell_checker: SpellChecker,
@@ -5468,8 +5481,15 @@ pub struct App {
     pub(crate) tf_bound_keys: std::collections::HashSet<String>,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
-    /// Remote client mode: pending /update request (Some(force_flag))
+    /// Remote client mode: this console's own binary is to be updated now (Some(force)) -
+    /// set once the server's part of `/update` is over (src/selfupdate.rs).
     pub pending_update: Option<bool>,
+    /// Remote client mode: where a `/update` stands while the server's part runs.
+    pub update_flow: Option<selfupdate::ClientFlow>,
+    /// Remote client mode: the server updated and is reloading, so this connection is
+    /// going away; the console restarts itself (attached again) once its own update is
+    /// over, whatever that update's result.
+    pub update_server_reloading: bool,
     /// Remote client mode: pending /reload request (re-exec local binary)
     pub pending_reload: bool,
     /// MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): `Some`
@@ -5628,6 +5648,7 @@ impl App {
             previous_world_index: None,
             input: InputArea::new(3),
             input_height: 3,
+            input_resize_drag: None,
             output_height: 20, // Will be updated by ui()
             output_width: 80,  // Will be updated by ui()
             spell_checker: SpellChecker::new(""),
@@ -5694,6 +5715,8 @@ impl App {
             tf_bound_keys: std::collections::HashSet::new(),
             ws_client_tx: None, // Set when running as remote client (--console mode)
             pending_update: None,
+            update_flow: None,
+            update_server_reloading: false,
             pending_reload: false,
             #[cfg(not(target_os = "android"))]
             mccp2_reload_deadline: None,
@@ -5875,6 +5898,9 @@ impl App {
             textdiv_str: self.settings.textdiv_str.clone(),
             remote_initial_lines: self.settings.remote_initial_lines,
             input_height: self.input_height,
+            input_height_phone: self.settings.input_height_phone,
+            input_height_tablet: self.settings.input_height_tablet,
+            input_height_desktop: self.settings.input_height_desktop,
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
             web_font_size_phone: self.settings.web_font_size_phone,
@@ -5941,6 +5967,16 @@ impl App {
         self.settings.remote_initial_lines = settings.remote_initial_lines;
         self.input_height = settings.input_height;
         self.input.visible_height = self.input_height;
+        // 0: a server from before the split sent none.
+        if settings.input_height_phone > 0 {
+            self.settings.input_height_phone = settings.input_height_phone.clamp(1, 15);
+        }
+        if settings.input_height_tablet > 0 {
+            self.settings.input_height_tablet = settings.input_height_tablet.clamp(1, 15);
+        }
+        if settings.input_height_desktop > 0 {
+            self.settings.input_height_desktop = settings.input_height_desktop.clamp(1, 15);
+        }
         self.settings.font_name = settings.font_name.clone();
         self.settings.font_size = settings.font_size;
         self.settings.web_font_size_phone = settings.web_font_size_phone;
@@ -7272,6 +7308,16 @@ impl App {
                 }
                 self.needs_output_redraw = true;
             }
+            WsMessage::UpdateOutcome { reloading, .. } => {
+                // The server's half of this console's /update is over
+                // (src/selfupdate.rs): now this console's own binary. If the server is
+                // reloading, this connection is about to close; the console restarts
+                // itself once its own update is done (run_console_client).
+                if let Some(flow) = self.update_flow.take() {
+                    self.update_server_reloading = reloading;
+                    self.pending_update = Some(flow.force());
+                }
+            }
             WsMessage::ExecuteLocalCommand { command } => {
                 // Server wants us to execute a command locally (from action)
                 let parsed = parse_command(&command);
@@ -7318,7 +7364,12 @@ impl App {
                         // Remote GUI opens its own font popup
                     }
                     Command::Update { force } => {
-                        // Signal to the outer run_console_client loop to handle locally
+                        // A server from before UpdateOutcome bounces /update back here
+                        // (src/selfupdate.rs): it can't be updated from a client, so go
+                        // on with this console's own update.
+                        if self.update_flow.take().is_some() {
+                            self.add_output(&selfupdate::server_too_old());
+                        }
                         self.pending_update = Some(force);
                     }
                     Command::Quit => {
@@ -9957,6 +10008,9 @@ impl App {
         wrapspace: u8,
         remote_initial_lines: u16,
         input_height: u16,
+        input_height_phone: Option<u16>,
+        input_height_tablet: Option<u16>,
+        input_height_desktop: Option<u16>,
         font_name: String,
         font_size: f32,
         web_font_size_phone: f32,
@@ -10012,6 +10066,16 @@ impl App {
         self.settings.remote_initial_lines = remote_initial_lines.clamp(10, 5000);
         self.input_height = input_height.clamp(1, 15);
         self.input.visible_height = self.input_height;
+        // Each interface's own; a client that doesn't know the split leaves them be.
+        if let Some(h) = input_height_phone {
+            self.settings.input_height_phone = h.clamp(1, 15);
+        }
+        if let Some(h) = input_height_tablet {
+            self.settings.input_height_tablet = h.clamp(1, 15);
+        }
+        if let Some(h) = input_height_desktop {
+            self.settings.input_height_desktop = h.clamp(1, 15);
+        }
         self.settings.font_name = font_name;
         self.settings.font_size = font_size.clamp(8.0, 48.0);
         self.settings.web_font_size_phone = web_font_size_phone.clamp(MIN_WEB_FONT_SIZE, 48.0);
@@ -14174,6 +14238,86 @@ impl App {
     /// the console, `Some((client_id, world_index))` a WebSocket client — shown as
     /// client text in the world it was looking at, like `/version` over the wire —
     /// and `None` nobody (the reachability broadcast alone carries the new state).
+    /// A `/update` line to whoever asked (src/selfupdate.rs): the console's own output,
+    /// or one remote client's current world as client text.
+    pub(crate) fn reply_update_line(&mut self, reply_to: Option<(u64, usize)>, line: &str) {
+        match reply_to {
+            None => self.add_output(line),
+            Some((client_id, world_index)) => self.ws_send_to_client(client_id, WsMessage::ServerData {
+                archive_sourced: false,
+                world_index,
+                data: line.to_string(),
+                is_viewed: false,
+                ts: current_timestamp_secs(),
+                from_server: false,
+                seq: 0, end_seq: None,
+                flush: false, gagged: false, highlight_colors: Vec::new(),
+            }),
+        }
+    }
+
+    /// The server's half of `/update` (src/selfupdate.rs): check GitHub and download in
+    /// the background; `finish_server_update` installs and reloads when the result
+    /// comes back as `AppEvent::UpdateResult`. `reply_to` None = the console asked.
+    /// The multiuser server refuses: its users aren't its operator.
+    pub(crate) fn start_server_update(&mut self, force: bool, reply_to: Option<(u64, usize)>, event_tx: &mpsc::Sender<AppEvent>) {
+        if self.multiuser_mode {
+            self.reply_update_line(reply_to, &selfupdate::multiuser_refused());
+            self.send_update_outcome(reply_to, false, false, "");
+            return;
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = (force, event_tx);
+            self.reply_update_line(reply_to, &selfupdate::unavailable(selfupdate::SERVER));
+            self.send_update_outcome(reply_to, false, false, "");
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            self.reply_update_line(reply_to, &selfupdate::checking(selfupdate::SERVER, force));
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let result = check_and_download_update(force).await;
+                let _ = event_tx.send(AppEvent::UpdateResult { result, reply_to }).await;
+            });
+        }
+    }
+
+    /// The server's half of `/update` is over: install the download, tell whoever asked
+    /// how it went, and, when a new binary is in place, broadcast `ServerReloading` and
+    /// say whether to exec the reload now (false = nothing to reload, or the MCCP2
+    /// drain deferred it - the loop's bottom-of-loop poll fires it then).
+    pub(crate) fn finish_server_update(&mut self, result: Result<UpdateSuccess, String>, reply_to: Option<(u64, usize)>) -> bool {
+        let outcome: Result<String, String> = match result {
+            #[cfg(not(target_os = "android"))]
+            Ok(success) => platform::install_update(&success.temp_path).map(|()| success.version),
+            #[cfg(target_os = "android")]
+            Ok(success) => Err(format!(
+                "update v{} downloaded to {}; replace the binary by hand and restart.",
+                success.version, success.temp_path.display()
+            )),
+            Err(e) => Err(e),
+        };
+        self.reply_update_line(reply_to, &selfupdate::server_result(&outcome));
+        match outcome {
+            Ok(version) => {
+                self.send_update_outcome(reply_to, true, true, &version);
+                self.ws_broadcast(WsMessage::ServerReloading);
+                !self.should_defer_reload_for_mccp2()
+            }
+            Err(_) => {
+                self.send_update_outcome(reply_to, false, false, "");
+                false
+            }
+        }
+    }
+
+    fn send_update_outcome(&mut self, reply_to: Option<(u64, usize)>, ok: bool, reloading: bool, version: &str) {
+        if let Some((client_id, _)) = reply_to {
+            self.ws_send_to_client(client_id, WsMessage::UpdateOutcome { ok, reloading, version: version.to_string() });
+        }
+    }
+
     pub fn reply_reach_line(&mut self, reply_to: Option<(u64, usize)>, line: &str) {
         match reply_to {
             Some((0, _)) => self.add_output(line),
@@ -15268,9 +15412,13 @@ impl App {
                 // Server keeps running — /quit only affects the remote client
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: "/quit".to_string() });
             }
-            Command::Update { .. } => {
-                // Bounce back to client — /update should run locally on the client's machine
-                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
+            Command::Update { force } => {
+                // The server's half of a client's /update (src/selfupdate.rs): check,
+                // download, install, hot reload - answering the client with an
+                // UpdateOutcome so it then updates itself. (This used to bounce the
+                // command back to the client as ExecuteLocalCommand, which the native GUI
+                // forwarded to the server again: a silent ping-pong.)
+                self.start_server_update(force, Some((client_id, world_index)), event_tx);
             }
             Command::Reload => {
                 return WsAsyncAction::Reload;
@@ -15765,12 +15913,12 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
                     gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines,
-                    input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet,
+                    input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet,
                     web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
@@ -16555,18 +16703,67 @@ impl App {
     }
 
     fn increase_input_height(&mut self) {
-        if self.input_height < 15 {
-            self.input_height += 1;
-            self.input.visible_height = self.input_height;
-        }
+        self.set_input_height(self.input_height + 1);
     }
 
     fn decrease_input_height(&mut self) {
-        if self.input_height > 1 {
-            self.input_height -= 1;
-            self.input.visible_height = self.input_height;
-            self.input.adjust_viewport();
+        self.set_input_height(self.input_height.saturating_sub(1));
+    }
+
+    /// The input's height in rows (1-15), shown at once and kept: it is the
+    /// `input_height` setting (saved to settings.dat, told to every client), so it comes
+    /// back at the next start and through `/reload`. Alt-Up/Down, and the end of a drag
+    /// of the separator bar.
+    pub(crate) fn set_input_height(&mut self, rows: u16) {
+        let rows = rows.clamp(1, 15);
+        if rows == self.input_height {
+            return;
         }
+        self.apply_input_height(rows);
+        self.persist_input_height();
+    }
+
+    /// Show the input `rows` high, nothing saved yet (a drag in progress; the SSH console,
+    /// which has no settings.dat and tells its server instead).
+    pub(crate) fn apply_input_height(&mut self, rows: u16) {
+        self.input_height = rows.clamp(1, 15);
+        self.input.visible_height = self.input_height;
+        self.input.adjust_viewport();
+        self.needs_output_redraw = true;
+    }
+
+    /// Save the input height and tell every client.
+    pub(crate) fn persist_input_height(&mut self) {
+        let _ = persistence::save_settings(self);
+        let settings_msg = self.build_global_settings_msg();
+        self.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: self.input_height });
+    }
+
+    /// Is terminal row `row` (0-based) on the separator bar, the input's top edge? A
+    /// mouse drag from there resizes the input.
+    pub(crate) fn on_separator_row(&self, row: u16) -> bool {
+        let stats = u16::from(self.current_world().stats_line_shown);
+        let top = self.output_height + stats;
+        row >= top && row < top + self.separator_rows()
+    }
+
+    /// The mouse, dragging the separator bar, is on `row` now: the input is a row taller
+    /// for every row the bar went up. True when the height changed.
+    pub(crate) fn input_resize_drag_to(&mut self, row: u16) -> bool {
+        let Some((from_row, from_rows)) = self.input_resize_drag else { return false };
+        let rows = (i32::from(from_rows) + i32::from(from_row) - i32::from(row)).clamp(1, 15) as u16;
+        if rows == self.input_height {
+            return false;
+        }
+        self.apply_input_height(rows);
+        true
+    }
+
+    /// The drag let go: true when the input is a different height than when it started
+    /// (the caller saves it its own way - the console to settings.dat, the SSH console
+    /// to its server).
+    pub(crate) fn input_resize_end(&mut self) -> bool {
+        self.input_resize_drag.take().is_some_and(|(_, from_rows)| from_rows != self.input_height)
     }
 
     fn handle_spell_check(&mut self) {
@@ -17359,8 +17556,10 @@ pub enum AppEvent {
     ApiLookupResult(u64, usize, Result<String, String>, bool),  // client_id, world_index, Ok(input_text) or Err(error), cursor_start
     // /remote ping check result (after 2s timeout)
     RemoteListResult(u64, usize, Vec<String>),  // requesting_client_id (0 = console), world_index, output lines
-    // Result from background update check/download
-    UpdateResult(Result<UpdateSuccess, String>),
+    // The server's own /update check/download is over (src/selfupdate.rs). `reply_to`
+    // is who asked: None = the console, Some((client_id, world_index)) = a remote client
+    // (which also gets a WsMessage::UpdateOutcome so it can go on with its own update).
+    UpdateResult { result: Result<UpdateSuccess, String>, reply_to: Option<(u64, usize)> },
     // Result from a background /import attempt: requesting client_id, target addr, and
     // Ok((settings_dat, theme_dat, keybindings_dat)) or the failure reason. See
     // handle_import_result and plan `i-d-like-to-make-snuggly-rain.md`.
@@ -19767,6 +19966,9 @@ async fn main() -> io::Result<()> {
     // Remove any leftover .old exe from a previous self-update.
     #[cfg(not(target_os = "android"))]
     platform::cleanup_old_exe();
+    // What our binary looks like now: a client's /update checks later whether the
+    // server's install (same machine, same file) already replaced it.
+    selfupdate::stamp_exe();
 
     // =========================================================================
     // CLI argument parsing - single structured pass with validation
@@ -21410,35 +21612,14 @@ pub async fn run_app_headless(
                         let line = app.apply_port_map_result(status);
                         app.reply_reach_line(reply_to, &line);
                     }
-                    AppEvent::UpdateResult(result) => {
-                        match result {
-                            Ok(success) => {
-                                #[cfg(not(target_os = "android"))]
-                                match platform::install_update(&success.temp_path) {
-                                    Ok(()) => {
-                                        app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
-                                        app.ws_broadcast(WsMessage::ServerReloading);
-                                        // MCCP2 hot-reload drain (job 2 of 2): defer
-                                        // instead of exec'ing now if any connected world
-                                        // is compressed - see the Sigusr1Received arm
-                                        // above and the bottom-of-loop poll.
-                                        if !app.should_defer_reload_for_mccp2() {
-                                            exec_reload(&mut app)?;
-                                            return Ok(());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        app.add_output(&e);
-                                    }
-                                }
-                                #[cfg(target_os = "android")]
-                                {
-                                    app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
-                                }
-                            }
-                            Err(e) => {
-                                app.add_output(&e);
-                            }
+                    AppEvent::UpdateResult { result, reply_to } => {
+                        // src/selfupdate.rs: install + answer whoever asked; on a new
+                        // binary, hot reload (deferred by the MCCP2 drain when a
+                        // connected world is compressed - see the Sigusr1Received arm
+                        // above and the bottom-of-loop poll).
+                        if app.finish_server_update(result, reply_to) {
+                            exec_reload(&mut app)?;
+                            return Ok(());
                         }
                     }
                     AppEvent::ImportResult(client_id, addr, result) => {
@@ -22667,6 +22848,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             _ => { continue; }
                         }
+                    } else if app.input_resize_drag.is_some()
+                        || (matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && app.on_separator_row(mouse.row))
+                    {
+                        // The separator bar (the input's top edge): drag it up or down to
+                        // resize the input; the height is saved when it's let go.
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                app.input_resize_drag = Some((mouse.row, app.input_height));
+                                continue;
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                if !app.input_resize_drag_to(mouse.row) {
+                                    continue;
+                                }
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                if app.input_resize_end() {
+                                    app.persist_input_height();
+                                }
+                            }
+                            _ => {}
+                        }
+                        // Fall through to the draw at the end of the loop.
                     } else if app.shell_live(app.current_world_index) {
                         // A live shell world: forward the mouse. Clicks/drags reach a
                         // program that enabled mouse reporting; the wheel otherwise does
@@ -23245,37 +23449,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let line = app.apply_port_map_result(status);
                         app.reply_reach_line(reply_to, &line);
                     }
-                    AppEvent::UpdateResult(result) => {
-                        match result {
-                            Ok(success) => {
-                                #[cfg(not(target_os = "android"))]
-                                match platform::install_update(&success.temp_path) {
-                                    Ok(()) => {
-                                        app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
-                                        app.ws_broadcast(WsMessage::ServerReloading);
-                                        // MCCP2 hot-reload drain (job 2 of 2): defer
-                                        // instead of exec'ing now if any connected world
-                                        // is compressed - see the WsAsyncAction::Reload
-                                        // arm above and the bottom-of-loop poll.
-                                        if !app.should_defer_reload_for_mccp2() {
-                                            restore_terminal_for_exec();
-                                            app.mouse_capture_active = false;
-                                            exec_reload(&mut app)?;
-                                            return Ok(());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        app.add_output(&e);
-                                    }
-                                }
-                                #[cfg(target_os = "android")]
-                                {
-                                    app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
-                                }
-                            }
-                            Err(e) => {
-                                app.add_output(&e);
-                            }
+                    AppEvent::UpdateResult { result, reply_to } => {
+                        // src/selfupdate.rs: install + answer whoever asked; on a new
+                        // binary, hot reload (deferred by the MCCP2 drain when a
+                        // connected world is compressed - see the WsAsyncAction::Reload
+                        // arm above and the bottom-of-loop poll).
+                        if app.finish_server_update(result, reply_to) {
+                            restore_terminal_for_exec();
+                            app.mouse_capture_active = false;
+                            exec_reload(&mut app)?;
+                            return Ok(());
                         }
                     }
                     AppEvent::ImportResult(client_id, addr, result) => {
@@ -23749,27 +23932,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::TfShellDone(world_idx, output, status) => {
                     app.finish_tf_shell(world_idx, &output, status, false);
                 }
-                AppEvent::UpdateResult(result) => {
-                    match result {
-                        Ok(success) => {
-                            // Live reload isn't wired up on this path (multiuser/headless
-                            // event loop) — install the binary so it's in place, but
-                            // report that a manual restart is needed rather than
-                            // exec_reload-ing out from under any connected clients.
-                            #[cfg(not(target_os = "android"))]
-                            match platform::install_update(&success.temp_path) {
-                                Ok(()) => app.add_output(&format!(
-                                    "Updated to Clay v{} — restart to apply.",
-                                    success.version
-                                )),
-                                Err(e) => app.add_output(&e),
-                            }
-                            #[cfg(target_os = "android")]
-                            {
-                                app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
-                            }
-                        }
-                        Err(e) => { app.add_output(&e); }
+                AppEvent::UpdateResult { result, reply_to } => {
+                    // src/selfupdate.rs. No live reload on this loop: the binary is
+                    // installed, and whoever asked is told to restart it.
+                    if app.finish_server_update(result, reply_to) {
+                        app.reply_update_line(reply_to, "Server: restart Clay to run the new version (this mode has no hot reload).");
                     }
                 }
                 AppEvent::ImportResult(client_id, addr, result) => {

@@ -199,6 +199,9 @@
 
         <!-- Input area -->
         <div id="input-container">
+            <!-- The input's top edge: drag it up or down to resize the input (app.js
+                 startInputResize); the row count is saved as the Input height setting. -->
+            <div id="input-resize-handle" title="Drag to resize the input"></div>
             <span id="prompt"></span>
             <textarea id="input" autocomplete="off" autocapitalize="off" spellcheck="true" inputmode="text" autofocus rows="1"></textarea>
             <button id="send-btn">Send</button>

@@ -508,6 +508,13 @@ pub enum WsMessage {
     ShowTagsChanged { show_tags: bool },
     /// Server is about to reload - clients should auto-reconnect
     ServerReloading,
+    /// The server's own `/update` attempt, asked for by this client, is over
+    /// (`src/selfupdate.rs`). `reloading` = it installed a new binary and a
+    /// `ServerReloading` follows; the client then waits to be connected again before
+    /// updating itself. `ok == false` with `reloading == false` = nothing to do or it
+    /// failed; the lines saying why were sent separately, as ordinary client text. An
+    /// older server never sends this (it bounces `/update` as `ExecuteLocalCommand`).
+    UpdateOutcome { ok: bool, reloading: bool, #[serde(default)] version: String },
     /// Clear all output for a world (from /flush command)
     WorldFlushed { world_index: usize },
     /// Tell client to execute a command locally (for action commands like /worlds)
@@ -749,6 +756,16 @@ pub enum WsMessage {
         #[serde(default = "default_remote_initial_lines")]
         remote_initial_lines: u16,
         input_height: u16,
+        /// The input's height for one kind of client - phone, tablet or desktop, the
+        /// browser's device classes; the GUIs are desktops - 1 to 15 rows. `None` leaves
+        /// the server's value as it is (an older client sends none). The console's is
+        /// `input_height`.
+        #[serde(default)]
+        input_height_phone: Option<u16>,
+        #[serde(default)]
+        input_height_tablet: Option<u16>,
+        #[serde(default)]
+        input_height_desktop: Option<u16>,
         font_name: String,
         font_size: f32,
         web_font_size_phone: f32,
@@ -1739,6 +1756,15 @@ pub struct GlobalSettingsMsg {
     #[serde(default = "default_remote_initial_lines")]
     pub remote_initial_lines: u16,
     pub input_height: u16,
+    /// The input's height for a phone, tablet or desktop client (1-15), split by
+    /// interface as the font sizes are. 0 from a server that predates the split: a client
+    /// then uses `input_height`, the one setting every interface shared.
+    #[serde(default)]
+    pub input_height_phone: u16,
+    #[serde(default)]
+    pub input_height_tablet: u16,
+    #[serde(default)]
+    pub input_height_desktop: u16,
     pub font_name: String,
     pub font_size: f32,
     #[serde(default = "default_web_font_size_phone")]

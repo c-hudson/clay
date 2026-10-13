@@ -69,6 +69,14 @@ This allows seamless workflow:
 3. Type `/reload` or press `Ctrl+R`
 4. New code is active, connections preserved
 
+## Updating (/update)
+
+`/update` downloads the latest release for this platform, installs it over the running
+binary and hot-reloads, so an update keeps your connections exactly as `/reload` does.
+From a remote client it updates the server you are attached to first and then the
+client's own binary - see `/update` in the **Commands** chapter for how the two steps
+are ordered and how their messages are told apart.
+
 ## Limitations
 
 ### TLS/SSL Connections

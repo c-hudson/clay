@@ -52,7 +52,7 @@ The separator bar (made of underscores) contains several indicators:
 The input area is where you type commands:
 
 - **Prompt display**: Server prompts (detected via telnet GA/EOR, or by timing on MUD - Timed Prompt worlds) shown in cyan
-- **Multi-line support**: Resize with `Alt+Up/Down` (1-15 lines)
+- **Multi-line support**: Resize with `Alt+Up/Down` (1-15 lines), or drag its top edge — the separator bar in the console, the line above the input in the GUI and web — up or down with the mouse. Either way the height is kept (it is that interface's Input height setting: the console, phones, tablets and desktop clients each have their own) and comes back on the next start and after `/reload`
 - **Cursor**: Standard text cursor with left/right movement
 - **Spell checking**: Misspelled words highlighted in red
 

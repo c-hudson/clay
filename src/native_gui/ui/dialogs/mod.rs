@@ -2,7 +2,6 @@
 //! dialogs app.js builds, one stack per window. A dialog is a view of its own; it closes
 //! itself by emitting `Close`, and talks to the server through the main view.
 
-pub mod emoji;
 pub mod small;
 pub mod web;
 
@@ -29,7 +28,6 @@ pub enum Kind {
     CertMismatch,
     Import,
     ImportInsecure,
-    Emoji,
     Confirm,
     ModifyKey,
     RemoteAccess,

@@ -154,7 +154,7 @@ and the Android app since all three run the same interface code.
 | `Ctrl+W` | Delete word |
 | `Ctrl+A` | Move to start of line |
 | `Ctrl+Up/Down` | Previous/next command history |
-| `Alt+Up/Down` | Resize input area |
+| `Alt+Up/Down` | Resize input area (or drag its top edge; the height is saved) |
 | `F2` | Toggle MUD tags |
 | `F4` | Open filter popup |
 | `F8` | Toggle action highlighting |
