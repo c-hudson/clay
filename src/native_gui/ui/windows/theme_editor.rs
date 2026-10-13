@@ -64,9 +64,9 @@ fn ansi_key(i: usize) -> &'static str {
 
 type Colors = BTreeMap<String, String>;
 
-/// A theme's colours over the built-in ones (dark, or light for "light").
+/// A theme's colours over its built-in ones (a custom theme's over dark's).
 fn with_defaults(name: &str, given: &serde_json::Map<String, serde_json::Value>) -> Colors {
-    let base = if name == "light" { ThemeColors::light_default() } else { ThemeColors::dark_default() };
+    let base = ThemeColors::builtin(name).unwrap_or_else(ThemeColors::dark_default);
     let mut out: Colors = serde_json::from_str(&base.to_json()).unwrap_or_default();
     for (k, v) in given {
         if let Some(hex) = v.as_str().filter(|h| ThemeColor::from_hex(h).is_some()) {
@@ -74,6 +74,11 @@ fn with_defaults(name: &str, given: &serde_json::Map<String, serde_json::Value>)
         }
     }
     out
+}
+
+/// Every built-in theme at its defaults (`theme::BUILTIN_THEMES`).
+fn builtin_themes() -> BTreeMap<String, Colors> {
+    crate::theme::BUILTIN_THEMES.iter().map(|(name, _)| (name.to_string(), defaults(name))).collect()
 }
 
 fn defaults(name: &str) -> Colors {
@@ -174,7 +179,7 @@ impl ThemeEditor {
         Self {
             main,
             focus: cx.focus_handle(),
-            themes: BTreeMap::from([("dark".into(), defaults("dark")), ("light".into(), defaults("light"))]),
+            themes: builtin_themes(),
             saved: String::new(),
             current: "dark".into(),
             selected: None,
@@ -202,7 +207,7 @@ impl ThemeEditor {
             self.themes = all.iter().map(|(name, v)| (name.clone(), with_defaults(name, v.as_object().unwrap_or(&serde_json::Map::new())))).collect();
         }
         if self.themes.is_empty() {
-            self.themes = BTreeMap::from([("dark".into(), defaults("dark")), ("light".into(), defaults("light"))]);
+            self.themes = builtin_themes();
         }
         self.separator = if separator == "web" { "web".into() } else { "tinyfugue".into() };
         self.saved_separator = self.separator.clone();
@@ -402,7 +407,7 @@ impl ThemeEditor {
 
     fn load_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let go = |this: &mut ThemeEditor, window: &mut Window, cx: &mut Context<ThemeEditor>| {
-            this.themes = BTreeMap::from([("dark".into(), defaults("dark")), ("light".into(), defaults("light"))]);
+            this.themes = builtin_themes();
             this.current = "dark".into();
             this.selected = None;
             for (name, c) in &this.themes {

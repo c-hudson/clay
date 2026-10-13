@@ -9,7 +9,7 @@
 
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative, svg,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
@@ -17,13 +17,9 @@ use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use super::MainEvent;
 use crate::native_gui::ui::ClayView;
 use crate::native_gui::ui::assets::icon;
-use crate::native_gui::ui::chrome::alpha;
 use crate::native_gui::ui::dialogs::{self, DialogEvent, Host};
 use crate::native_gui::ui::kit::{Btn, Kit, Pick};
-use crate::native_gui::ui::output::hsla;
 use crate::websocket::{GlobalSettingsMsg, WsMessage};
-
-const CYAN: [u8; 3] = [0x08, 0x91, 0xb2];
 
 /// A switch of the General tab: its label, its state, and how to flip it.
 type Toggle = (&'static str, bool, fn(&mut GlobalSettingsMsg));
@@ -183,7 +179,7 @@ impl SettingsView {
         let advanced = edit.web_font_line_height != 1.2 || edit.web_font_letter_spacing != 0.0 || edit.web_font_word_spacing != 0.0;
         let v = Self {
             world_switch: Pick::new(&[("Unseen First", "Unseen First"), ("Alphabetical", "Alphabetical")], &edit.world_switch_mode, window, cx),
-            theme: Pick::new(&[("dark", "Dark"), ("light", "Light")], &edit.gui_theme, window, cx),
+            theme: Pick::new(&crate::theme::BUILTIN_THEMES, &edit.gui_theme, window, cx),
             tts: Pick::new(&[("off", "Off"), ("local", "Local"), ("edge", "Edge")], &edit.tts_mode, window, cx),
             speak: Pick::new(&[("all", "All"), ("limit", "Limit")], &edit.tts_speak_mode, window, cx),
             tabs: Pick::new(&[("none", "None"), ("top", "Show Top Ribbon"), ("bottom", "Show Bottom Ribbon")], &edit.tabs, window, cx),
@@ -393,21 +389,28 @@ impl SettingsView {
             .child(row(k, "Speak Mode", self.speak.view()))
             .child(row(k, "Tabs", self.tabs.view()))
             .child(row(k, "Icon Bar", self.icon_bar.view()));
+        // Two cards: the values, then the switches and the remaining choices.
         div()
             .flex()
             .flex_col()
-            .gap(px(6.0))
-            .child(row(k, "World switching", self.world_switch.view()))
-            .child(row(k, "Theme", self.theme.view()))
-            .child(row(k, "Color Offset", self.stepper(k, "color-offset", offset, |v| v.edit.color_offset_percent = v.edit.color_offset_percent.saturating_sub(5), |v| v.edit.color_offset_percent = (v.edit.color_offset_percent + 5).min(100), cx)))
-            .child(row(k, "Input height", self.stepper(k, "input-height", height, |v| v.edit.input_height = v.edit.input_height.saturating_sub(1).max(1), |v| v.edit.input_height = (v.edit.input_height + 1).min(15), cx)))
-            .child(row(k, "Wrap Space", self.stepper(k, "wrapspace", wrap, |v| v.edit.wrapspace = v.edit.wrapspace.saturating_sub(1), |v| v.edit.wrapspace = (v.edit.wrapspace + 1).min(20), cx)))
-            .child(row(
-                k,
-                "Transparency",
-                div().flex().items_center().gap(px(8.0)).child(div().flex_1().child(Slider::new(&self.transparency))).child(div().w(px(36.0)).text_size(px(12.0)).child(format!("{transparency}%"))).into_any_element(),
-            ))
-            .child(div().flex().gap(px(8.0)).mt(px(4.0)).child(left).child(right))
+            .gap(px(10.0))
+            .child(
+                k.card()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(row(k, "World switching", self.world_switch.view()))
+                    .child(row(k, "Theme", self.theme.view()))
+                    .child(row(k, "Color Offset", self.stepper(k, "color-offset", offset, |v| v.edit.color_offset_percent = v.edit.color_offset_percent.saturating_sub(5), |v| v.edit.color_offset_percent = (v.edit.color_offset_percent + 5).min(100), cx)))
+                    .child(row(k, "Input height", self.stepper(k, "input-height", height, |v| v.edit.input_height = v.edit.input_height.saturating_sub(1).max(1), |v| v.edit.input_height = (v.edit.input_height + 1).min(15), cx)))
+                    .child(row(k, "Wrap Space", self.stepper(k, "wrapspace", wrap, |v| v.edit.wrapspace = v.edit.wrapspace.saturating_sub(1), |v| v.edit.wrapspace = (v.edit.wrapspace + 1).min(20), cx)))
+                    .child(row(
+                        k,
+                        "Transparency",
+                        div().flex().items_center().gap(px(8.0)).child(div().flex_1().child(Slider::new(&self.transparency))).child(div().w(px(36.0)).text_size(px(12.0)).child(format!("{transparency}%"))).into_any_element(),
+                    )),
+            )
+            .child(k.card().child(div().flex().gap(px(8.0)).child(left).child(right)))
             .into_any_element()
     }
 
@@ -416,39 +419,42 @@ impl SettingsView {
         let input = |e: &Entity<InputState>| k.input(e).font_family(k.fonts.ui.clone()).text_size(px(12.0)).into_any_element();
         let custom_port = self.port_mode.value(cx) == "custom";
         let custom_cert = self.custom_cert.value(cx) == "yes";
-        let mut body = div().flex().flex_col().gap(px(6.0)).child(row(k, "Port", self.port_mode.view()));
+        // Two cards: the server (where it listens), then access (who may reach it).
+        let mut server = k.card().flex().flex_col().gap(px(6.0)).child(row(k, "Port", self.port_mode.view()));
         if custom_port {
-            body = body.child(row(k, "Custom Port", input(&f.custom_port)));
+            server = server.child(row(k, "Custom Port", input(&f.custom_port)));
         }
-        body = body
+        server = server
             .child(row(k, "Web Path", input(&f.web_path)))
-            .child(row(k, "Remote Lines", div().w(px(80.0)).child(input(&f.remote_lines)).into_any_element()))
+            .child(row(k, "Remote Lines", div().w(px(80.0)).child(input(&f.remote_lines)).into_any_element()));
+        let mut access = k.card().flex().flex_col().gap(px(6.0))
             .child(row(k, "Allow List", input(&f.allow_list)))
             .child(row(k, "Password", input(&f.password)))
             .child(row(k, "Custom Cert File", self.custom_cert.view()));
         if custom_cert {
-            body = body.child(row(k, "Cert File", input(&f.cert_file))).child(row(k, "Key File", input(&f.key_file)));
+            access = access.child(row(k, "Cert File", input(&f.cert_file))).child(row(k, "Key File", input(&f.key_file)));
         }
         if let Some(e) = &self.error {
-            body = body.child(div().pl(px(98.0)).text_size(px(12.0)).text_color(k.t.error).child(e.clone()));
+            access = access.child(div().pl(px(98.0)).text_size(px(12.0)).text_color(k.t.error).child(e.clone()));
         }
-        body.child(row(
-            k,
-            "Auth Key",
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .child(div().flex_1().min_w_0().child(k.input(&f.auth_key).disabled(true).font_family(k.fonts.primary.clone()).text_size(px(10.5))))
-                .child(k.button("web-modify-key", "Modify Key", Btn::Plain, Some(Box::new(cx.listener(|this, _, w, cx| this.open_dialog("modify-key", w, cx))))).px(px(8.0)).py(px(2.0)))
-                .into_any_element(),
-        ))
-        .child(row(
-            k,
-            "Remote Access",
-            div().flex().child(k.button("web-remote-access", "Open", Btn::Plain, Some(Box::new(cx.listener(|this, _, w, cx| this.open_dialog("remote", w, cx))))).px(px(8.0)).py(px(2.0))).into_any_element(),
-        ))
-        .into_any_element()
+        access = access
+            .child(row(
+                k,
+                "Auth Key",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(div().flex_1().min_w_0().child(k.input(&f.auth_key).disabled(true).font_family(k.fonts.primary.clone()).text_size(px(10.5))))
+                    .child(k.button("web-modify-key", "Modify Key", Btn::Plain, Some(Box::new(cx.listener(|this, _, w, cx| this.open_dialog("modify-key", w, cx))))).px(px(8.0)).py(px(2.0)))
+                    .into_any_element(),
+            ))
+            .child(row(
+                k,
+                "Remote Access",
+                div().flex().child(k.button("web-remote-access", "Open", Btn::Plain, Some(Box::new(cx.listener(|this, _, w, cx| this.open_dialog("remote", w, cx))))).px(px(8.0)).py(px(2.0))).into_any_element(),
+            ));
+        div().flex().flex_col().gap(px(10.0)).child(server).child(access).into_any_element()
     }
 
     fn font(&mut self, k: &Kit, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -469,7 +475,7 @@ impl SettingsView {
                 .whitespace_nowrap()
                 .font_family(family)
                 .cursor_pointer()
-                .when(selected, |d| d.bg(alpha(CYAN, 0.3)).text_color(hsla([0x22, 0xd3, 0xee])))
+                .when(selected, |d| d.bg(t.accent).text_color(k.field_bg))
                 .when(!selected, |d| d.text_color(t.fg).hover(move |s| s.bg(hover)))
                 .child(label)
                 .on_click(cx.listener(move |this, _, _w, cx| {
@@ -480,42 +486,60 @@ impl SettingsView {
         });
         let num = |v: f32| format!("{v:.1}");
         let advanced = self.advanced;
+        // Three cards: the family, the sizes, the advanced spacing.
         div()
             .flex()
             .flex_col()
-            .gap(px(6.0))
-            .child(div().text_size(px(12.0)).text_color(t.fg2).child("Font family"))
-            .child(div().id("font-family-list").max_h(px(200.0)).overflow_y_scroll().bg(k.field_bg).border_1().border_color(t.border_subtle).rounded(px(4.0)).p(px(2.0)).children(items))
-            .child(row(k, "Weight", self.stepper(k, "font-weight", e.web_font_weight.to_string(), |v| v.edit.web_font_weight = v.edit.web_font_weight.saturating_sub(50).max(1), |v| v.edit.web_font_weight = (v.edit.web_font_weight + 50).min(900), cx)))
-            .child(row(k, "Phone", self.stepper(k, "font-phone", (e.web_font_size_phone.round() as i32).to_string(), |v| v.edit.web_font_size_phone = (v.edit.web_font_size_phone.round() - 1.0).max(7.0), |v| v.edit.web_font_size_phone = (v.edit.web_font_size_phone.round() + 1.0).min(20.0), cx)))
-            .child(row(k, "Tablet", self.stepper(k, "font-tablet", (e.web_font_size_tablet.round() as i32).to_string(), |v| v.edit.web_font_size_tablet = (v.edit.web_font_size_tablet.round() - 1.0).max(7.0), |v| v.edit.web_font_size_tablet = (v.edit.web_font_size_tablet.round() + 1.0).min(20.0), cx)))
-            .child(row(k, "Desktop", self.stepper(k, "font-desktop", (e.web_font_size_desktop.round() as i32).to_string(), |v| v.edit.web_font_size_desktop = (v.edit.web_font_size_desktop.round() - 1.0).max(7.0), |v| v.edit.web_font_size_desktop = (v.edit.web_font_size_desktop.round() + 1.0).min(20.0), cx)))
+            .gap(px(10.0))
             .child(
-                div()
-                    .id("font-advanced")
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .mt(px(6.0))
-                    .text_size(px(11.0))
-                    .text_color(t.muted)
-                    .cursor_pointer()
-                    .child(div().size(px(12.0)).rounded(px(2.0)).border_1().border_color(t.muted).when(advanced, |d| d.bg(hsla(CYAN))))
-                    .child("Advanced")
-                    .on_click(cx.listener(|this, _, _w, cx| {
-                        this.advanced = !this.advanced;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
+                k.card()
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
-                    .when(!advanced, |d| d.opacity(0.35))
-                    .child(row(k, "Input Ht", self.stepper(k, "font-lineheight", num(e.web_font_line_height), |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, -0.1, (0.5, 3.0)) }, |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, 0.1, (0.5, 3.0)) }, cx)))
-                    .child(row(k, "Letter", self.stepper(k, "font-letter", num(e.web_font_letter_spacing), |v| if v.advanced { v.edit.web_font_letter_spacing = step(v.edit.web_font_letter_spacing, -0.5, (-5.0, 10.0)) }, |v| if v.advanced { v.edit.web_font_letter_spacing = step(v.edit.web_font_letter_spacing, 0.5, (-5.0, 10.0)) }, cx)))
-                    .child(row(k, "Word", self.stepper(k, "font-word", num(e.web_font_word_spacing), |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, -0.5, (-5.0, 20.0)) }, |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, 0.5, (-5.0, 20.0)) }, cx))),
+                    .child(div().text_size(px(12.0)).text_color(t.fg2).child("Font family"))
+                    .child(div().id("font-family-list").max_h(px(200.0)).overflow_y_scroll().bg(k.field_bg).border_1().border_color(t.border).rounded(px(6.0)).p(px(2.0)).children(items)),
+            )
+            .child(
+                k.card()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(row(k, "Weight", self.stepper(k, "font-weight", e.web_font_weight.to_string(), |v| v.edit.web_font_weight = v.edit.web_font_weight.saturating_sub(50).max(1), |v| v.edit.web_font_weight = (v.edit.web_font_weight + 50).min(900), cx)))
+                    .child(row(k, "Phone", self.stepper(k, "font-phone", (e.web_font_size_phone.round() as i32).to_string(), |v| v.edit.web_font_size_phone = (v.edit.web_font_size_phone.round() - 1.0).max(7.0), |v| v.edit.web_font_size_phone = (v.edit.web_font_size_phone.round() + 1.0).min(20.0), cx)))
+                    .child(row(k, "Tablet", self.stepper(k, "font-tablet", (e.web_font_size_tablet.round() as i32).to_string(), |v| v.edit.web_font_size_tablet = (v.edit.web_font_size_tablet.round() - 1.0).max(7.0), |v| v.edit.web_font_size_tablet = (v.edit.web_font_size_tablet.round() + 1.0).min(20.0), cx)))
+                    .child(row(k, "Desktop", self.stepper(k, "font-desktop", (e.web_font_size_desktop.round() as i32).to_string(), |v| v.edit.web_font_size_desktop = (v.edit.web_font_size_desktop.round() - 1.0).max(7.0), |v| v.edit.web_font_size_desktop = (v.edit.web_font_size_desktop.round() + 1.0).min(20.0), cx))),
+            )
+            .child(
+                k.card()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("font-advanced")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(t.muted)
+                            .cursor_pointer()
+                            .child(div().size(px(12.0)).rounded(px(2.0)).border_1().border_color(t.muted).when(advanced, |d| d.bg(t.accent)))
+                            .child("Advanced")
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.advanced = !this.advanced;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .when(!advanced, |d| d.opacity(0.35))
+                            .child(row(k, "Input Ht", self.stepper(k, "font-lineheight", num(e.web_font_line_height), |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, -0.1, (0.5, 3.0)) }, |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, 0.1, (0.5, 3.0)) }, cx)))
+                            .child(row(k, "Letter", self.stepper(k, "font-letter", num(e.web_font_letter_spacing), |v| if v.advanced { v.edit.web_font_letter_spacing = step(v.edit.web_font_letter_spacing, -0.5, (-5.0, 10.0)) }, |v| if v.advanced { v.edit.web_font_letter_spacing = step(v.edit.web_font_letter_spacing, 0.5, (-5.0, 10.0)) }, cx)))
+                            .child(row(k, "Word", self.stepper(k, "font-word", num(e.web_font_word_spacing), |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, -0.5, (-5.0, 20.0)) }, |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, 0.5, (-5.0, 20.0)) }, cx))),
+                    ),
             )
             .into_any_element()
     }
@@ -552,64 +576,28 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(k) = self.main.upgrade().map(|m| m.read(cx).kit()) else { return div().into_any_element() };
         let t = k.t.clone();
+        // The sidebar: the three tabs, then the editors, each an icon over its word.
         let tab_btn = |tab: Tab, ic: &'static str, cx: &mut Context<Self>| {
             let active = self.tab == tab;
-            let (fg, hover) = (if active { hsla(CYAN) } else { t.muted }, t.fg2);
-            div()
-                .id(tab.title())
-                .size(px(34.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(7.0))
-                .cursor_pointer()
-                .when(active, |d| d.bg(alpha(CYAN, 0.12)))
-                .when(!active, |d| d.hover(move |s| s.bg(alpha([255, 255, 255], 0.05))))
-                .child(svg().path(icon(ic)).size(px(16.0)).text_color(fg))
-                .on_click(cx.listener(move |this, _, _w, cx| {
-                    this.tab = tab;
-                    cx.notify();
-                }))
-                .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tab.title()).build(w, cx))
-                .text_color(hover)
+            k.side_tile(tab.title(), icon(ic), tab.title(), active).on_click(cx.listener(move |this, _, _w, cx| {
+                this.tab = tab;
+                cx.notify();
+            }))
         };
-        let link = |id: &'static str, label: &'static str, surface: &'static str, cx: &mut Context<Self>| {
-            let (fg, hover) = (t.muted, t.fg2);
-            div()
-                .id(id)
-                .w(px(40.0))
-                .py(px(6.0))
-                .flex()
-                .justify_center()
-                .rounded(px(7.0))
-                .text_size(px(8.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(fg)
-                .cursor_pointer()
-                .hover(move |s| s.text_color(hover).bg(alpha([255, 255, 255], 0.05)))
-                .child(label.to_uppercase())
-                .on_click(cx.listener(move |this, _, w, cx| {
-                    let _ = this.main.update(cx, |v, cx| v.open_surface(surface, w, cx));
-                }))
+        let link = |id: &'static str, label: &'static str, ic: &'static str, surface: &'static str, cx: &mut Context<Self>| {
+            k.side_tile(id, icon(ic), label, false).on_click(cx.listener(move |this, _, w, cx| {
+                let _ = this.main.update(cx, |v, cx| v.open_surface(surface, w, cx));
+            }))
         };
-        let sidebar = div()
-            .w(px(48.0))
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(2.0))
-            .py(px(10.0))
-            .bg(k.field_bg)
-            .border_r_1()
-            .border_color(t.border_subtle)
+        let sidebar = k
+            .sidebar()
             .child(tab_btn(Tab::General, "set-general", cx))
             .child(tab_btn(Tab::Web, "set-web", cx))
             .child(tab_btn(Tab::Font, "set-font", cx))
-            .child(div().w(px(24.0)).h(px(1.0)).my(px(6.0)).bg(t.border_subtle))
-            .child(link("settings-theme", "Theme", "theme-editor", cx))
-            .child(link("settings-keybind", "Keybind", "keybind-editor", cx))
-            .child(link("settings-actions", "Actions", "action-editor", cx));
+            .child(k.sidebar_divider())
+            .child(link("settings-theme", "Theme", "set-theme", "theme-editor", cx))
+            .child(link("settings-keybind", "Keybind", "set-keybind", "keybind-editor", cx))
+            .child(link("settings-actions", "Actions", "actions", "action-editor", cx));
         let body = match self.tab {
             Tab::General => self.general(&k, cx),
             Tab::Web => self.web(&k, cx),

@@ -5,6 +5,29 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// The built-in GUI themes: `(name, label)`. The name is the `gui_theme` setting's value
+/// and the theme's `[theme:name]` section in theme.dat; the label is what the pickers
+/// show. "dark-new"/"light-new" are the Slate/Paper looks (2026-10); "dark"/"light" are
+/// the originals, kept so an existing install looks the same until the user switches.
+pub const BUILTIN_THEMES: [(&str, &str); 4] = [("dark", "Dark"), ("light", "Light"), ("dark-new", "Dark - New"), ("light-new", "Light - New")];
+
+/// The label a picker shows for a theme name (a custom theme shows its own name).
+pub fn display_name(name: &str) -> String {
+    BUILTIN_THEMES.iter().find(|(n, _)| *n == name).map(|(_, l)| l.to_string()).unwrap_or_else(|| name.to_string())
+}
+
+/// A `gui_theme` value as stored and compared: trimmed, the built-in names in lower case
+/// (the web client once sent "Dark"/"Light"), empty meaning "dark". A custom theme's name
+/// is kept exactly, since theme.dat sections are case-sensitive.
+pub fn normalize_theme_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "dark".to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if BUILTIN_THEMES.iter().any(|(n, _)| *n == lower) { lower } else { trimmed.to_string() }
+}
+
 /// A single RGB color value
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThemeColor {
@@ -204,6 +227,96 @@ impl ThemeColors {
                 ThemeColor::new(40, 40, 40),      // 15: bright white (near black for light bg)
             ],
         }
+    }
+
+    /// "Dark - New": one hue family built from the separator bar's #284b63 - the window a
+    /// darker step of it, menus and cards lighter steps - with one warm accent (the
+    /// prompt's orange). Chosen for its text contrast: muted text is 4.2:1 on the bar
+    /// where the original dark theme's is 1.7:1. The ANSI palette is the dark theme's.
+    pub fn dark_new() -> Self {
+        let mut t = Self::dark_default();
+        t.bg = ThemeColor::new(0x0f, 0x1b, 0x26);
+        t.bg_deep = ThemeColor::new(0x0b, 0x15, 0x20);
+        t.bg_surface = ThemeColor::new(0x17, 0x29, 0x3a);
+        t.bg_elevated = ThemeColor::new(0x1e, 0x34, 0x48);
+        t.bg_hover = ThemeColor::new(0x2f, 0x55, 0x70);
+        t.fg = ThemeColor::new(0xee, 0xf3, 0xf7);
+        t.fg_secondary = ThemeColor::new(0xb8, 0xc9, 0xd6);
+        t.fg_muted = ThemeColor::new(0x9a, 0xb3, 0xc6);
+        t.fg_dim = ThemeColor::new(0x6f, 0x8a, 0xa0);
+        t.accent = ThemeColor::new(0xe8, 0x96, 0x5f);
+        t.accent_dim = ThemeColor::new(0xc9, 0x7a, 0x46);
+        t.highlight = ThemeColor::new(0xf0, 0xc6, 0x74);
+        t.success = ThemeColor::new(0x7e, 0xcf, 0x8b);
+        t.error = ThemeColor::new(0xff, 0x7b, 0x7b);
+        t.error_dim = ThemeColor::new(0x5f, 0x1f, 0x1f);
+        t.status_bar_bg = ThemeColor::new(0x28, 0x4b, 0x63);
+        t.menu_bar_bg = ThemeColor::new(0x1b, 0x34, 0x47);
+        t.selection_bg = ThemeColor::new(0x3a, 0x6a, 0x8e);
+        t.link = ThemeColor::new(0x9e, 0xc5, 0xea);
+        t.prompt = ThemeColor::new(0xe8, 0x96, 0x5f);
+        t.border_subtle = ThemeColor::new(0x1f, 0x3a, 0x4f);
+        t.border_medium = ThemeColor::new(0x3b, 0x65, 0x84);
+        t.button_selected_bg = ThemeColor::new(0xee, 0xf3, 0xf7);
+        t.button_selected_fg = ThemeColor::new(0x0f, 0x1b, 0x26);
+        t.more_indicator_bg = ThemeColor::new(0x5f, 0x1f, 0x1f);
+        t.activity_bg = ThemeColor::new(0xf5, 0xe6, 0xb8);
+        t
+    }
+
+    /// "Light - New": a warm off-white ground, charcoal text, a darker beige bar and a
+    /// terracotta accent. The ANSI palette is the light theme's.
+    pub fn light_new() -> Self {
+        let mut t = Self::light_default();
+        t.bg = ThemeColor::new(0xf6, 0xf2, 0xea);
+        t.bg_deep = ThemeColor::new(0xf6, 0xf2, 0xea);
+        t.bg_surface = ThemeColor::new(0xef, 0xe9, 0xde);
+        t.bg_elevated = ThemeColor::new(0xfb, 0xf8, 0xf2);
+        t.bg_hover = ThemeColor::new(0xe8, 0xe0, 0xd2);
+        t.fg = ThemeColor::new(0x1f, 0x1b, 0x17);
+        t.fg_secondary = ThemeColor::new(0x4f, 0x46, 0x3d);
+        t.fg_muted = ThemeColor::new(0x6f, 0x65, 0x5a);
+        t.fg_dim = ThemeColor::new(0x9a, 0x90, 0x86);
+        t.accent = ThemeColor::new(0xb5, 0x55, 0x2b);
+        t.accent_dim = ThemeColor::new(0xa0, 0x4a, 0x24);
+        t.highlight = ThemeColor::new(0xe0, 0xa9, 0x3a);
+        t.success = ThemeColor::new(0x2e, 0x8b, 0x57);
+        t.error = ThemeColor::new(0xc6, 0x28, 0x28);
+        t.error_dim = ThemeColor::new(0x5f, 0x00, 0x00);
+        t.status_bar_bg = ThemeColor::new(0xe4, 0xdc, 0xcd);
+        t.menu_bar_bg = ThemeColor::new(0xdd, 0xd4, 0xc4);
+        t.selection_bg = ThemeColor::new(0xcf, 0xe0, 0xf5);
+        t.link = ThemeColor::new(0x1a, 0x5f, 0xa8);
+        t.prompt = ThemeColor::new(0xa8, 0x4a, 0x22);
+        t.border_subtle = ThemeColor::new(0xdd, 0xd4, 0xc4);
+        t.border_medium = ThemeColor::new(0xcd, 0xc3, 0xb2);
+        t.button_selected_bg = ThemeColor::new(0x1f, 0x1b, 0x17);
+        t.button_selected_fg = ThemeColor::new(0xf6, 0xf2, 0xea);
+        t.more_indicator_bg = ThemeColor::new(0x5f, 0x00, 0x00);
+        t.activity_bg = ThemeColor::new(0xf1, 0xc8, 0x5c);
+        t
+    }
+
+    /// A built-in theme by name (`BUILTIN_THEMES`), or None for a custom one.
+    pub fn builtin(name: &str) -> Option<Self> {
+        match name {
+            "dark" => Some(Self::dark_default()),
+            "light" => Some(Self::light_default()),
+            "dark-new" => Some(Self::dark_new()),
+            "light-new" => Some(Self::light_new()),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a light theme (a light window background): what used to be decided
+    /// by the theme's name being "light", so a custom or new theme gets the right
+    /// light-theme treatment (tile mix, the WebView's window theme, `body.theme-light`).
+    pub fn is_light(&self) -> bool {
+        let lin = |c: u8| {
+            let v = c as f32 / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * lin(self.bg.r) + 0.7152 * lin(self.bg.g) + 0.0722 * lin(self.bg.b) > 0.4
     }
 
     /// Set a named color variable from a key-value pair
@@ -410,11 +523,9 @@ pub struct ThemeFile {
 }
 
 impl ThemeFile {
-    /// Create a new ThemeFile with just the built-in dark and light defaults
+    /// Create a new ThemeFile with just the built-in themes (`BUILTIN_THEMES`)
     pub fn with_defaults() -> Self {
-        let mut themes = HashMap::new();
-        themes.insert("dark".to_string(), ThemeColors::dark_default());
-        themes.insert("light".to_string(), ThemeColors::light_default());
+        let themes = BUILTIN_THEMES.iter().filter_map(|(name, _)| ThemeColors::builtin(name).map(|c| (name.to_string(), c))).collect();
         Self { themes }
     }
 
@@ -447,9 +558,11 @@ impl ThemeFile {
                 let inner = &line[1..line.len() - 1];
                 if let Some(name) = inner.strip_prefix("theme:") {
                     let name = name.trim().to_string();
-                    // If this theme doesn't exist yet, start from dark defaults
+                    // If this theme doesn't exist yet, start from its built-in colours
+                    // (an unknown name from dark's), so a section listing only a few
+                    // keys reads as that theme with those keys changed.
                     if !file.themes.contains_key(&name) {
-                        file.themes.insert(name.clone(), ThemeColors::dark_default());
+                        file.themes.insert(name.clone(), ThemeColors::builtin(&name).unwrap_or_else(ThemeColors::dark_default));
                     }
                     current_theme = Some(name);
                 }
@@ -551,10 +664,12 @@ impl ThemeFile {
         s.push_str("# Colors are #RRGGBB hex values. Lines starting with # are comments.\n");
         s.push_str("# Edit colors and restart Clay (or /reload) to apply changes.\n");
         s.push_str("# Delete this file to regenerate defaults.\n");
-        s.push_str("\n[theme:dark]\n");
-        s.push_str(&ThemeColors::dark_default().to_theme_file_section());
-        s.push_str("\n[theme:light]\n");
-        s.push_str(&ThemeColors::light_default().to_theme_file_section());
+        for (name, _) in BUILTIN_THEMES {
+            if let Some(colors) = ThemeColors::builtin(name) {
+                s.push_str(&format!("\n[theme:{name}]\n"));
+                s.push_str(&colors.to_theme_file_section());
+            }
+        }
         s
     }
 }
@@ -562,6 +677,58 @@ impl ThemeFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_four_builtin_themes_exist_and_load_by_name() {
+        let file = ThemeFile::with_defaults();
+        for (name, label) in BUILTIN_THEMES {
+            assert!(file.themes.contains_key(name), "{name} is built in");
+            assert_eq!(ThemeColors::builtin(name).as_ref(), file.themes.get(name), "{name}");
+            assert_eq!(display_name(name), label);
+        }
+        assert_eq!(file.themes.len(), 4);
+        assert!(ThemeColors::builtin("midnight").is_none());
+        assert_eq!(display_name("midnight"), "midnight", "a custom theme shows its own name");
+        // The new dark theme keeps the separator bar colour it was built from.
+        assert_eq!(ThemeColors::dark_new().status_bar_bg, ThemeColors::dark_default().status_bar_bg);
+        assert_eq!(ThemeColors::dark_new().ansi, ThemeColors::dark_default().ansi, "the ANSI palette is the dark theme's");
+        assert_eq!(ThemeColors::light_new().ansi, ThemeColors::light_default().ansi);
+    }
+
+    #[test]
+    fn light_is_decided_by_the_background_not_the_name() {
+        assert!(!ThemeColors::dark_default().is_light());
+        assert!(!ThemeColors::dark_new().is_light());
+        assert!(ThemeColors::light_default().is_light());
+        assert!(ThemeColors::light_new().is_light());
+    }
+
+    #[test]
+    fn theme_names_normalize_as_the_settings_store_them() {
+        assert_eq!(normalize_theme_name("Light"), "light", "the web client once sent capitalised names");
+        assert_eq!(normalize_theme_name(" Dark - New ".replace(" - ", "-").to_lowercase().trim()), "dark-new");
+        assert_eq!(normalize_theme_name("LIGHT-NEW"), "light-new");
+        assert_eq!(normalize_theme_name(""), "dark");
+        assert_eq!(normalize_theme_name("MyTheme"), "MyTheme", "a custom name keeps its case");
+    }
+
+    #[test]
+    fn a_theme_dat_from_before_the_new_themes_still_has_them() {
+        // The file only lists the two originals (and tweaks one), as every install's did.
+        let file = ThemeFile::parse("[theme:dark]\nbg = #000000\n\n[theme:light]\n");
+        assert_eq!(file.get("dark").bg, ThemeColor::new(0, 0, 0));
+        assert_eq!(file.get("dark-new"), &ThemeColors::dark_new());
+        assert_eq!(file.get("light-new"), &ThemeColors::light_new());
+        // A partial section of a new theme starts from that theme, not from dark.
+        let file = ThemeFile::parse("[theme:light-new]\naccent = #000000\n");
+        assert_eq!(file.get("light-new").bg, ThemeColors::light_new().bg);
+        assert_eq!(file.get("light-new").accent, ThemeColor::new(0, 0, 0));
+        // The generated default file carries all four.
+        let text = ThemeFile::generate_default_file();
+        for (name, _) in BUILTIN_THEMES {
+            assert!(text.contains(&format!("[theme:{name}]")), "{name}");
+        }
+    }
 
     #[test]
     fn test_theme_color_from_hex() {

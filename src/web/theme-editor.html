@@ -1177,7 +1177,7 @@ function handleWsMessage(msg) {
         // Convert to our format (fill in missing keys from defaults)
         themes = {};
         for (const [name, colors] of Object.entries(parsed)) {
-          const base = name === 'light' ? lightDefaults() : darkDefaults();
+          const base = /^light/.test(name) ? lightDefaults() : darkDefaults();
           themes[name] = Object.assign({}, base, colors);
         }
       }
@@ -2048,7 +2048,7 @@ function parseThemeFile(content) {
         var name = inner.slice(6).trim();
         currentName = name;
         if (!result[name]) {
-          result[name] = name === 'light' ? lightDefaults() : darkDefaults();
+          result[name] = /^light/.test(name) ? lightDefaults() : darkDefaults();
         }
       }
       continue;

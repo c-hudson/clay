@@ -240,7 +240,7 @@ impl Render for EmojiPicker {
             let tab = if filled {
                 tab.bg(t.accent).border_color(t.accent).text_color(gpui::black())
             } else if active {
-                tab.bg(alpha([8, 145, 178], 0.09)).border_color(t.accent).text_color(t.accent)
+                tab.bg(gpui::Hsla { a: 0.12, ..t.accent }).border_color(t.accent).text_color(t.accent)
             } else {
                 tab.border_color(gpui::transparent_black()).text_color(fg).hover(move |s| s.bg(alpha([255, 255, 255], 0.05)).text_color(hover_fg))
             };

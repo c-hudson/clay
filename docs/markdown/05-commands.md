@@ -115,7 +115,7 @@ Open the Global Settings popup.
 - Show tags - Show/hide MUD tags (also F2)
 - Input height - Default input area height (1-15)
 - Console Theme - Dark or Light
-- GUI Theme - Dark or Light
+- GUI Theme - Dark, Light, Dark - New or Light - New (see Themes in the Interface chapter)
 - TLS Proxy - Enable TLS connection preservation
 - ANSI Music - Enable music playback
 

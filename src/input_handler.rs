@@ -11,7 +11,7 @@ use crate::{
     popup, persistence, chords,
     SpellChecker,
     WsMessage,
-    Theme, WorldSwitchMode,
+    WorldSwitchMode,
     Encoding, AutoConnectType, KeepAliveType, WorldType,
     App, World, EditorFocus, EditorSide, TabsMode, IconBarMode, DEBUG_ENABLED,
     handle_new_popup_key, NewPopupAction,
@@ -641,7 +641,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 DEBUG_ENABLED.store(settings.debug, Ordering::Relaxed);
                 // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 app.input_height = settings.input_height as u16;
-                app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
+                app.settings.gui_theme = crate::theme::normalize_theme_name(&settings.gui_theme);
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
                 if app.settings.dictionary_path != settings.dictionary_path {
                     app.settings.dictionary_path = settings.dictionary_path.clone();

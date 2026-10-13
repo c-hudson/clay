@@ -311,7 +311,7 @@ impl ActionsView {
             let rows = list.iter().map(|&i| {
                 let a = &actions[i];
                 let selected = self.selected == Some(i);
-                let (fg, world_fg, pat_fg) = if selected { (gpui::black(), gpui::black(), gpui::black()) } else { (t.fg, t.muted, t.dim) };
+                let (fg, world_fg, pat_fg) = if selected { (k.field_bg, k.field_bg, k.field_bg) } else { (t.fg, t.muted, t.dim) };
                 let hover = t.hover;
                 let row = div()
                     .id(("action-row", i))
@@ -364,16 +364,12 @@ impl ActionsView {
                     .when(!self.world.is_empty(), |d| d.child(div().text_color(t.accent).text_size(px(12.0)).child(format!("World: {}", self.world)))),
             )
             .child(
-                div()
-                    .id("actions-list")
+                k.card_frame()
                     .flex_1()
                     .min_h(px(80.0))
-                    .overflow_y_scroll()
-                    .border_1()
-                    .border_color(t.border)
-                    .bg(k.field_bg)
-                    .font_family(mono)
-                    .child(body),
+                    .flex()
+                    .flex_col()
+                    .child(div().id("actions-list").flex_1().min_h_0().overflow_y_scroll().font_family(mono).child(body)),
             )
             .child(
                 k.buttons()
@@ -464,39 +460,52 @@ impl ActionsView {
                     .pr(px(16.0))
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
-                    .child(row("Name:", k.input(&ed.name).font_family(mono.clone()).into_any_element()))
-                    .child(row("World:", k.input(&ed.world).font_family(mono.clone()).into_any_element()))
-                    .child(row("Match Type:", select(&ed.match_type)))
+                    .gap(px(10.0))
+                    // Two cards: what the action matches, then how it behaves.
                     .child(
-                        div()
+                        k.card()
                             .flex()
-                            .items_start()
-                            .gap(px(10.0))
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(row("Name:", k.input(&ed.name).font_family(mono.clone()).into_any_element()))
+                            .child(row("World:", k.input(&ed.world).font_family(mono.clone()).into_any_element()))
+                            .child(row("Match Type:", select(&ed.match_type)))
                             .child(
                                 div()
-                                    .w(px(90.0))
-                                    .flex_shrink_0()
-                                    .text_right()
-                                    .text_color(t.fg2)
-                                    .child("Patterns:")
-                                    .child(div().text_size(px(11.0)).opacity(0.7).child("(any match fires; first supplies $1..$9)")),
-                            )
-                            .child(patterns),
+                                    .flex()
+                                    .items_start()
+                                    .gap(px(10.0))
+                                    .child(
+                                        div()
+                                            .w(px(90.0))
+                                            .flex_shrink_0()
+                                            .text_right()
+                                            .text_color(t.fg2)
+                                            .child("Patterns:")
+                                            .child(div().text_size(px(11.0)).opacity(0.7).child("(any match fires; first supplies $1..$9)")),
+                                    )
+                                    .child(patterns),
+                            ),
                     )
-                    .child(row("Enabled:", select(&ed.enabled)))
-                    .child(row("Startup:", select(&ed.startup)))
-                    .child(row("GUI Menu Shortcut:", select(&ed.shortcut)))
-                    .child(row("Suppress Blanks:", select(&ed.blanks)))
                     .child(
-                        div()
+                        k.card()
                             .flex()
-                            .items_start()
-                            .gap(px(10.0))
-                            .child(label("Command:"))
-                            .child(Textarea::new(&ed.command).w(px(350.0)).bg(k.field_bg).text_color(t.fg).font_family(k.fonts.primary.clone()).text_size(px(13.0))),
-                    )
-                    .child(k.error(ed.error.as_deref())),
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(row("Enabled:", select(&ed.enabled)))
+                            .child(row("Startup:", select(&ed.startup)))
+                            .child(row("GUI Menu Shortcut:", select(&ed.shortcut)))
+                            .child(row("Suppress Blanks:", select(&ed.blanks)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .gap(px(10.0))
+                                    .child(label("Command:"))
+                                    .child(Textarea::new(&ed.command).w(px(350.0)).bg(k.field_bg).text_color(t.fg).font_family(k.fonts.primary.clone()).text_size(px(13.0))),
+                            )
+                            .child(k.error(ed.error.as_deref())),
+                    ),
             )
             .child(
                 k.buttons()

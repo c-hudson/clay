@@ -1375,7 +1375,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::RequestThemeEditorState => {
             let themes_json = app.theme_file.to_json_all();
             let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-            let active_theme = app.settings.gui_theme.name().to_string();
+            let active_theme = app.settings.gui_theme.clone();
             let separator_style = app.settings.separator_style.name().to_string();
             app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                 themes_json,
@@ -1385,15 +1385,11 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             });
         }
         WsMessage::UpdateThemeColors { theme_name, colors_json } => {
-            let base = if theme_name == "light" {
-                theme::ThemeColors::light_default()
-            } else {
-                theme::ThemeColors::dark_default()
-            };
+            let base = theme::ThemeColors::builtin(&theme_name).unwrap_or_else(theme::ThemeColors::dark_default);
             let colors = theme::ThemeColors::from_json(&colors_json, &base);
             app.theme_file.set_theme(&theme_name, colors);
             // If updated theme is the active GUI theme, broadcast CSS vars update
-            if theme_name == app.settings.gui_theme.name() {
+            if theme_name == app.settings.gui_theme {
                 let css_vars = app.gui_theme_colors().to_css_vars();
                 let colors_json = app.gui_theme_colors().to_json();
                 app.ws_broadcast(WsMessage::ThemeCssVarsUpdated {
@@ -1413,7 +1409,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             app.theme_file.set_theme(&name, base_colors);
             let themes_json = app.theme_file.to_json_all();
             let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-            let active_theme = app.settings.gui_theme.name().to_string();
+            let active_theme = app.settings.gui_theme.clone();
             let separator_style = app.settings.separator_style.name().to_string();
             app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                 themes_json,
@@ -1426,7 +1422,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             app.theme_file.remove_theme(&name);
             let themes_json = app.theme_file.to_json_all();
             let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-            let active_theme = app.settings.gui_theme.name().to_string();
+            let active_theme = app.settings.gui_theme.clone();
             let separator_style = app.settings.separator_style.name().to_string();
             app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                 themes_json,

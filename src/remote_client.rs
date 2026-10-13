@@ -1675,7 +1675,7 @@ pub(crate) fn handle_remote_client_key(
                 // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 app.input_height = settings.input_height as u16;
                 app.input.visible_height = app.input_height;
-                app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
+                app.settings.gui_theme = crate::theme::normalize_theme_name(&settings.gui_theme);
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
                 if app.settings.dictionary_path != settings.dictionary_path {
                     app.settings.dictionary_path = settings.dictionary_path.clone();
@@ -1712,7 +1712,7 @@ pub(crate) fn handle_remote_client_key(
                     debug_enabled: app.settings.debug_enabled,
                     ansi_music_enabled: app.settings.ansi_music_enabled,
                     console_theme: app.settings.theme.name().to_string(),
-                    gui_theme: app.settings.gui_theme.name().to_string(),
+                    gui_theme: app.settings.gui_theme.clone(),
                     gui_transparency: app.settings.gui_transparency,
                     color_offset_percent: app.settings.color_offset_percent,
                     // app.settings.wrapspace was already updated from the popup above.
@@ -2883,7 +2883,7 @@ pub(crate) fn apply_remote_web_settings(
         debug_enabled: app.settings.debug_enabled,
         ansi_music_enabled: app.settings.ansi_music_enabled,
         console_theme: app.settings.theme.name().to_string(),
-        gui_theme: app.settings.gui_theme.name().to_string(),
+        gui_theme: app.settings.gui_theme.clone(),
         gui_transparency: app.settings.gui_transparency,
         color_offset_percent: app.settings.color_offset_percent,
         wrapspace: app.settings.wrapspace,  // unchanged — this function only touches web settings

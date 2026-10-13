@@ -420,7 +420,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "input_height={}", app.input_height)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "separator_style={}", app.settings.separator_style.name())?;
-    writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
+    writeln!(file, "gui_theme={}", app.settings.gui_theme)?;
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
@@ -1117,7 +1117,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         app.settings.theme = Theme::from_name(value);
                     }
                     "gui_theme" => {
-                        app.settings.gui_theme = Theme::from_name(value);
+                        app.settings.gui_theme = crate::theme::normalize_theme_name(value);
                     }
                     "font_name" => {
                         app.settings.font_name = value.to_string();
@@ -2112,7 +2112,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "show_tags={}", app.show_tags)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "separator_style={}", app.settings.separator_style.name())?;
-    writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
+    writeln!(file, "gui_theme={}", app.settings.gui_theme)?;
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
@@ -3009,7 +3009,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         app.settings.theme = Theme::from_name(value);
                     }
                     "gui_theme" => {
-                        app.settings.gui_theme = Theme::from_name(value);
+                        app.settings.gui_theme = crate::theme::normalize_theme_name(value);
                     }
                     "font_name" => {
                         app.settings.font_name = value.to_string();
@@ -3720,7 +3720,7 @@ mod tests {
             ansi_music_enabled: false,         // default: true
             theme: Theme::Light,               // default: Dark
             separator_style: SeparatorStyle::TinyFugue, // default: Web
-            gui_theme: Theme::Light,           // default: Dark
+            gui_theme: "light-new".to_string(), // default: "dark"
             gui_transparency: 0.7,             // default: 1.0
             color_offset_percent: 42,          // default: 0
             wrapspace: 7,                      // default: 0
@@ -3845,7 +3845,7 @@ mod tests {
         assert_eq!(a.ansi_music_enabled, b.ansi_music_enabled, "{context}: ansi_music_enabled");
         assert_eq!(a.theme.name(), b.theme.name(), "{context}: theme");
         assert_eq!(a.separator_style.name(), b.separator_style.name(), "{context}: separator_style");
-        assert_eq!(a.gui_theme.name(), b.gui_theme.name(), "{context}: gui_theme");
+        assert_eq!(a.gui_theme, b.gui_theme, "{context}: gui_theme");
         assert_eq!(a.gui_transparency, b.gui_transparency, "{context}: gui_transparency");
         assert_eq!(a.color_offset_percent, b.color_offset_percent, "{context}: color_offset_percent");
         assert_eq!(a.wrapspace, b.wrapspace, "{context}: wrapspace");
@@ -5086,7 +5086,7 @@ pattern=foo
         assert_ne!(non_default.ansi_music_enabled, default.ansi_music_enabled, "ansi_music_enabled should differ");
         assert_ne!(non_default.theme.name(), default.theme.name(), "theme should differ");
         assert_ne!(non_default.separator_style.name(), default.separator_style.name(), "separator_style should differ");
-        assert_ne!(non_default.gui_theme.name(), default.gui_theme.name(), "gui_theme should differ");
+        assert_ne!(non_default.gui_theme, default.gui_theme, "gui_theme should differ");
         assert_ne!(non_default.gui_transparency, default.gui_transparency, "gui_transparency should differ");
         assert_ne!(non_default.color_offset_percent, default.color_offset_percent, "color_offset_percent should differ");
         assert_ne!(non_default.wrapspace, default.wrapspace, "wrapspace should differ");

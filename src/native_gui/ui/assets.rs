@@ -19,8 +19,8 @@ const ICONS: &[(&str, &[u8])] =
         "help-connect", "help-switch", "help-send", "help-catchup", "help-actions", "help-yours", "help-remote", "help-notes", "help-chevron",
         // The world editor's section bar.
         "we-server", "we-login", "we-options",
-        // The Settings window's tabs.
-        "set-general", "set-web", "set-font",
+        // The Settings window's sidebar: its tabs and the editors it links to.
+        "set-general", "set-web", "set-font", "set-theme", "set-keybind",
     ];
 
 /// The path of one of our icons, for `gpui::svg().path(..)`.

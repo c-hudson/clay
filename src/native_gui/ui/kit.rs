@@ -5,7 +5,7 @@
 
 use gpui::{
     App, BoxShadow, ClickEvent, Div, ElementId, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Stateful, StatefulInteractiveElement, Styled, Window, div, point, px, relative,
+    Stateful, StatefulInteractiveElement, Styled, Window, div, point, prelude::*, px, relative, svg,
 };
 use gpui_component::input::{Input, InputState};
 
@@ -13,10 +13,6 @@ use super::chrome::{MONO_LH, SANS_LH, Tokens, alpha};
 use super::fonts::Fonts;
 use super::output::hsla;
 
-/// `.btn-primary`: its own cyan, not a theme colour, with dark text (and lighter on hover).
-const PRIMARY: [u8; 3] = [0x08, 0x91, 0xb2];
-const PRIMARY_HOVER: [u8; 3] = [0x22, 0xd3, 0xee];
-const ON_PRIMARY: [u8; 3] = [0x08, 0x08, 0x0a];
 /// `.btn-danger:hover`.
 const DANGER_HOVER: [u8; 3] = [0xef, 0x44, 0x44];
 
@@ -67,6 +63,67 @@ impl Kit {
             .text_size(px(13.0))
             .line_height(relative(SANS_LH))
             .text_color(self.t.fg)
+    }
+
+    /// A card: a group of rows lifted off the window on its own rounded panel, in the
+    /// surface colour with the medium border as its edge. The Settings, Worlds and
+    /// Actions windows group their rows this way.
+    pub fn card(&self) -> Div {
+        self.card_frame().px(px(12.0)).py(px(10.0))
+    }
+
+    /// A card with no padding of its own, for a list that fills it edge to edge (put the
+    /// scrolling element inside it).
+    pub fn card_frame(&self) -> Div {
+        div()
+            .bg(self.t.surface)
+            .border_1()
+            .border_color(self.t.border)
+            .rounded(px(8.0))
+            .overflow_hidden()
+            .shadow(vec![BoxShadow {
+                color: alpha([0, 0, 0], 0.35),
+                offset: point(px(0.0), px(4.0)),
+                blur_radius: px(16.0),
+                spread_radius: px(0.0),
+                inset: false,
+            }])
+    }
+
+    /// The sidebar the Settings and World editor windows have: in the card colour, with
+    /// the card edge as its line, holding `side_tile`s.
+    pub fn sidebar(&self) -> Div {
+        div().w(px(74.0)).flex_shrink_0().flex().flex_col().items_center().gap(px(4.0)).pt(px(8.0)).bg(self.t.surface).border_r_1().border_color(self.t.border)
+    }
+
+    /// A line between a sidebar's groups of tiles.
+    pub fn sidebar_divider(&self) -> Div {
+        div().w(px(44.0)).h(px(1.0)).my(px(6.0)).bg(self.t.border)
+    }
+
+    /// A sidebar tile: an icon over its label, in the accent on a faint accent plate when
+    /// it is the current section (the web's phone/tablet layouts keep icons alone; the
+    /// desktop has the room for the words).
+    pub fn side_tile(&self, id: impl Into<ElementId>, icon_path: SharedString, label: impl Into<SharedString>, active: bool) -> Stateful<Div> {
+        let t = &self.t;
+        let (fg, bg) = if active { (t.accent, Hsla { a: 0.14, ..t.accent }) } else { (t.fg2, gpui::transparent_black()) };
+        let hover_bg = Hsla { a: 0.08, ..t.fg };
+        div()
+            .id(id)
+            .w(px(64.0))
+            .pt(px(6.0))
+            .pb(px(5.0))
+            .rounded(px(7.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(3.0))
+            .bg(bg)
+            .text_color(fg)
+            .cursor_pointer()
+            .when(!active, |d| d.hover(move |s| s.bg(hover_bg)))
+            .child(svg().path(icon_path).size(px(20.0)).text_color(fg))
+            .child(div().font_family(self.fonts.ui.clone()).text_size(px(9.5)).font_weight(FontWeight::BOLD).line_height(relative(1.1)).child(label.into()))
     }
 
     /// `.modal-content h2`: the title of the older dialogs, in the accent.
@@ -150,14 +207,16 @@ impl Kit {
     /// A button; `on_click` is left off when it's disabled.
     pub fn button(&self, id: impl Into<ElementId>, label: impl Into<SharedString>, kind: Btn, on_click: Option<Click>) -> Stateful<Div> {
         let t = &self.t;
+        // Primary is the theme's accent with the window ground as its text (it used to be
+        // its own cyan, which no theme could change).
         let (bg, fg, border) = match kind {
             Btn::Plain => (t.hover, t.fg, t.border),
-            Btn::Primary => (hsla(PRIMARY), hsla(ON_PRIMARY), hsla(PRIMARY)),
+            Btn::Primary => (t.accent, self.field_bg, t.accent),
             Btn::Danger => (t.error, gpui::white(), t.error),
         };
         let hover_bg = match kind {
             Btn::Plain => lighter(t.hover, 0.06),
-            Btn::Primary => hsla(PRIMARY_HOVER),
+            Btn::Primary => lighter(t.accent, 0.08),
             Btn::Danger => hsla(DANGER_HOVER),
         };
         let b = div()
@@ -199,9 +258,9 @@ impl Kit {
             .on_click(on_click)
     }
 
-    /// `.toggle`: a 32x18 switch, the knob right and the track cyan when on.
+    /// `.toggle`: a 32x18 switch, the knob right and the track in the accent when on.
     pub fn toggle(&self, id: impl Into<ElementId>, on: bool, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
-        let (track, border, knob) = if on { (hsla(PRIMARY), hsla(PRIMARY), hsla(ON_PRIMARY)) } else { (self.field_bg, self.t.border_subtle, self.t.muted) };
+        let (track, border, knob) = if on { (self.t.accent, self.t.accent, self.field_bg) } else { (self.field_bg, self.t.border_subtle, self.t.muted) };
         div()
             .id(id)
             .w(px(32.0))

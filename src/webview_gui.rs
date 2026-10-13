@@ -239,12 +239,14 @@ fn load_gui_theme_name() -> String {
 /// Load the user's GUI theme CSS vars for initial HTML rendering.
 /// Reads gui_theme name from ~/.clay/settings.dat and theme colors from ~/.clay/theme.dat.
 fn load_user_theme_css() -> String {
-    let gui_theme_name = load_gui_theme_name();
+    load_user_theme().to_css_vars()
+}
 
-    // Load theme colors from ~/.clay/theme.dat
+/// The user's GUI theme's colours (`gui_theme` in settings.dat, looked up in theme.dat).
+fn load_user_theme() -> crate::theme::ThemeColors {
+    let gui_theme_name = crate::theme::normalize_theme_name(&load_gui_theme_name());
     let theme_path = crate::clay_config_path("theme.dat");
-    let theme_file = ThemeFile::load(&theme_path);
-    theme_file.get(&gui_theme_name).to_css_vars()
+    ThemeFile::load(&theme_path).get(&gui_theme_name).clone()
 }
 
 /// Show a modal error dialog. On Windows this uses MessageBoxW; elsewhere prints to stderr.
@@ -1498,7 +1500,7 @@ fn create_webview_window(
     let event_loop = EventLoopBuilder::<WvEvent>::with_user_event().build();
     let proxy: EventLoopProxy<WvEvent> = event_loop.create_proxy();
 
-    let window_theme = if load_gui_theme_name() == "light" {
+    let window_theme = if load_user_theme().is_light() {
         Some(tao::window::Theme::Light)
     } else {
         Some(tao::window::Theme::Dark)

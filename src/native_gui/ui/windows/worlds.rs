@@ -9,7 +9,7 @@
 
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative, svg,
+    Render, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative,
 };
 use gpui_component::IndexPath;
 use gpui_component::input::{InputEvent, InputState};
@@ -19,15 +19,11 @@ use super::MainEvent;
 use crate::native_gui::core::client::World;
 use crate::native_gui::ui::ClayView;
 use crate::native_gui::ui::assets::icon;
-use crate::native_gui::ui::chrome::alpha;
 use crate::native_gui::ui::dialogs::{self, DialogEvent, Host};
 use crate::native_gui::ui::kit::{self, Btn, Kit, ListDown, ListEnter, ListEscape, ListUp, Pick};
 use crate::native_gui::ui::output::hsla;
 use crate::websocket::{ChatDirectoryMsg, ChatPickItem, ChatSettingsUpdate, WsMessage};
 
-/// The world editor's rows that only a MUD-family world shows (app.js
-/// `WORLD_EDIT_MUD_FIELD_IDS`; the console's `update_field_visibility`).
-const CYAN: [u8; 3] = [0x08, 0x91, 0xb2];
 
 /// The worlds the selector shows: by name, hostname or user, and only connected ones
 /// when the toggle is on (app.js `getFilteredWorldIndices`).
@@ -518,7 +514,7 @@ impl WorldsView {
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .flex()
-                .when(is_current, |d| d.child(div().text_color(if selected { gpui::black() } else { t.highlight }).child("* ")))
+                .when(is_current, |d| d.child(div().text_color(if selected { k.field_bg } else { t.highlight }).child("* ")))
                 .child(name);
             let hover = t.hover;
             let row = div()
@@ -540,7 +536,7 @@ impl WorldsView {
                     cx.notify();
                 }));
             if selected {
-                row.bg(t.accent).text_color(gpui::black())
+                row.bg(t.accent).text_color(k.field_bg)
             } else if is_current {
                 row.bg(t.hover).hover(move |s| s.bg(hover))
             } else {
@@ -561,7 +557,7 @@ impl WorldsView {
             .child(k.heading("Worlds"))
             .child(k.input(&self.filter).font_family(k.fonts.primary.clone()))
             .child(
-                div()
+                k.card_frame()
                     .flex_1()
                     .min_h_0()
                     .flex()
@@ -694,7 +690,7 @@ impl WorldsView {
                     .flex()
                     .gap(px(4.0))
                     .child("Add the bot to a server:")
-                    .child(div().id("chat-invite").text_color(hsla(CYAN)).cursor_pointer().child("invite link").on_click(move |_, _, cx| cx.open_url(&u)))
+                    .child(div().id("chat-invite").text_color(t.accent).cursor_pointer().child("invite link").on_click(move |_, _, cx| cx.open_url(&u)))
             });
             server = server.child(row(
                 "",
@@ -751,7 +747,7 @@ impl WorldsView {
                 .child(toggle_cell("MCCP2", "world-mccp2", ed.mccp2, |e| e.mccp2 = !e.mccp2, cx));
         }
         options = options.child(toggles);
-        let section_title = |s: &'static str| div().text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(CYAN)).pt(px(6.0)).pb(px(2.0)).child(s.to_uppercase());
+        let section_title = |s: &'static str| div().text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(t.accent).pt(px(6.0)).pb(px(2.0)).child(s.to_uppercase());
         let body: gpui::AnyElement = if wide {
             div()
                 .flex()
@@ -766,46 +762,18 @@ impl WorldsView {
                 Section::Options => options.into_any_element(),
             }
         };
+        // The section sidebar: the Settings window's tiles (icon over word).
         let nav = (!wide).then(|| {
             let item = |s: Section, ic: &'static str, label: &'static str, cx: &mut Context<Self>| {
                 let active = ed.section == s;
-                let (fg, hover_fg) = (if active { hsla(CYAN) } else { t.muted }, t.fg2);
-                div()
-                    .id(label)
-                    .w(px(60.0))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(3.0))
-                    .py(px(7.0))
-                    .px(px(2.0))
-                    .rounded(px(7.0))
-                    .text_size(px(10.0))
-                    .text_color(fg)
-                    .cursor_pointer()
-                    .relative()
-                    .when(active, |d| d.bg(alpha(CYAN, 0.12)).child(div().absolute().left(px(-6.0)).top(px(14.0)).w(px(3.0)).h(px(16.0)).rounded_r(px(2.0)).bg(hsla(CYAN))))
-                    .when(!active, |d| d.hover(move |s| s.bg(alpha([255, 255, 255], 0.05)).text_color(hover_fg)))
-                    .child(svg().path(icon(ic)).size(px(18.0)).text_color(fg))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _w, cx| {
-                        if let Some(ed) = &mut this.editor {
-                            ed.section = s;
-                        }
-                        cx.notify();
-                    }))
+                k.side_tile(label, icon(ic), label, active).on_click(cx.listener(move |this, _, _w, cx| {
+                    if let Some(ed) = &mut this.editor {
+                        ed.section = s;
+                    }
+                    cx.notify();
+                }))
             };
-            div()
-                .w(px(72.0))
-                .flex_shrink_0()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(4.0))
-                .py(px(10.0))
-                .border_r_1()
-                .border_color(t.border_subtle)
-                .bg(k.field_bg)
+            k.sidebar()
                 .child(item(Section::Server, "we-server", "Server", cx))
                 .child(item(Section::Login, "we-login", login_label, cx))
                 .child(item(Section::Options, "we-options", "Options", cx))
@@ -837,7 +805,7 @@ impl WorldsView {
                     .min_h_0()
                     .flex()
                     .children(nav)
-                    .child(div().id("world-editor-body").flex_1().min_w_0().overflow_y_scroll().px(px(16.0)).pt(px(8.0)).pb(px(16.0)).child(body)),
+                    .child(div().id("world-editor-body").flex_1().min_w_0().overflow_y_scroll().px(px(16.0)).pt(px(8.0)).pb(px(16.0)).child(k.card().child(body))),
             )
             .child(
                 div()

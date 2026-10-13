@@ -400,7 +400,10 @@ impl ClayView {
             focus: self.focus.clone(),
             view: cx.entity(),
         };
-        let mut bar = div().flex().items_start().flex_shrink_0().px(px(4.0)).py(px(2.0)).bg(hsla(self.palette.bg)).font_family(mono.clone()).text_size(px(self.font_size)).line_height(px(row_h)).text_color(hsla(self.palette.fg));
+        // The input is its own surface, a step up from the output, with a line along its
+        // top (the status bar's bottom line is subtle; this one is the medium border).
+        let (surface, border) = (self.chrome.tokens.surface, self.chrome.tokens.border);
+        let mut bar = div().flex().items_start().flex_shrink_0().px(px(4.0)).py(px(2.0)).bg(surface).border_t_1().border_color(border).font_family(mono.clone()).text_size(px(self.font_size)).line_height(px(row_h)).text_color(hsla(self.palette.fg));
         // The prompt sits on the field's first row, at its height (the web centres it in
         // the whole input area, so a multi-row input showed it beside the second row).
         if !prompt.is_empty() {

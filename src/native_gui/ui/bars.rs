@@ -108,7 +108,7 @@ impl ClayView {
                     .justify_center()
                     .text_center()
                     .font_family(self.fonts.ui.clone()).line_height(relative(SANS_LH))
-                    .text_size(px(8.5))
+                    .text_size(px(9.5))
                     .font_weight(FontWeight::BOLD)
                     .line_height(relative(1.1))
                     .text_color(fg)
@@ -227,6 +227,9 @@ impl ClayView {
         for (i, name) in connected {
             let active = i == core.current;
             let (hover, fg) = (t.hover, t.fg);
+            // Every tab has the tab shape; the current one is lifted onto the elevated
+            // colour with the accent as its top edge, the others sit on a faint lift with
+            // the border as theirs - so the ribbon needs no line of its own above them.
             let mut tab = div()
                 .id(format!("tab-{i}"))
                 .flex()
@@ -234,7 +237,7 @@ impl ClayView {
                 .flex_shrink_0()
                 .px(px(12.0))
                 .pt(px(4.0))
-                .pb(px(4.0))
+                .pb(px(3.0))
                 .rounded_tl(px(6.0))
                 .rounded_tr(px(6.0))
                 .border_t_2()
@@ -246,7 +249,7 @@ impl ClayView {
             tab = if active {
                 tab.bg(t.elevated).border_color(t.accent).text_color(t.fg).font_weight(FontWeight::BOLD)
             } else {
-                tab.border_color(gpui::transparent_black()).text_color(t.fg2).hover(move |s| s.bg(hover).text_color(fg))
+                tab.bg(gpui::Hsla { a: 0.07, ..t.fg }).border_color(t.border).text_color(t.fg2).hover(move |s| s.bg(hover).text_color(fg))
             };
             tabs = tabs.child(tab.on_click(cx.listener(move |this, _, _w, cx| this.switch_to(i, cx))));
         }
@@ -274,10 +277,12 @@ impl ClayView {
                 });
             if overflowing { a } else { invisible(a) }
         };
+        // The tabs sit on the ribbon's top edge (no top line: each tab's own edge is the
+        // line, and only where a tab is); the ribbon keeps its bottom line.
         let row = div()
             .flex()
-            .items_center()
-            .h(px(super::chrome::BAR_HEIGHT - 2.0))
+            .items_start()
+            .h(px(super::chrome::BAR_HEIGHT - 1.0))
             .px(px(4.0))
             .gap(px(4.0))
             .child(arrow("tabs-ribbon-left", "◀", "Scroll left", -ARROW_STEP))
@@ -289,7 +294,6 @@ impl ClayView {
                 .flex_col()
                 .flex_shrink_0()
                 .bg(t.bar)
-                .child(div().h(px(1.0)).bg(t.border))
                 .child(row)
                 .child(div().h(px(1.0)).bg(t.border_subtle))
                 .into_any_element(),

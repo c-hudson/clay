@@ -49,10 +49,7 @@ pub fn world_switching_options() -> Vec<SelectOption> {
 
 /// Theme options
 pub fn theme_options() -> Vec<SelectOption> {
-    vec![
-        SelectOption::new("dark", "Dark"),
-        SelectOption::new("light", "Light"),
-    ]
+    crate::theme::BUILTIN_THEMES.iter().map(|(name, label)| SelectOption::new(*name, *label)).collect()
 }
 
 /// Editor side options
@@ -125,7 +122,7 @@ pub fn create_setup_popup(
     icon_bar: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
-    let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
+    let gui_theme_idx = crate::theme::BUILTIN_THEMES.iter().position(|(name, _)| *name == gui_theme).unwrap_or(0);
     let editor_side_idx = if editor_side == "right" { 1 } else { 0 };
     let tts_mode_idx = match tts_mode {
         "local" => 1,

@@ -117,9 +117,13 @@ Clay supports light and dark themes for both console and GUI:
 - Dark (default): Light text on dark background
 - Light: Dark text on light background
 
-**GUI themes** (set in `/setup`):
-- Dark (default): Dark mode interface
-- Light: Light mode interface
+**GUI themes** (set in `/setup`; the web and GUI share them):
+- Dark (default): the original dark interface
+- Light: the original light interface
+- Dark - New: slate blues built from the separator bar's colour, with a warm orange accent and higher-contrast text
+- Light - New: a warm off-white interface with charcoal text and a terracotta accent
+
+Each is a `[theme:name]` section in `~/.clay/theme.dat` (`dark`, `light`, `dark-new`, `light-new`) and can be edited in the theme editor.
 
 ## Colored Square Emoji
 

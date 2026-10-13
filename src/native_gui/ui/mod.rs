@@ -170,7 +170,7 @@ impl ClayView {
         let mut session = session;
         let _ = session.core.set_visible(window.is_visible(), Instant::now());
         let theme = ThemeColors::dark_default();
-        let tokens = Tokens::new(&theme, false);
+        let tokens = Tokens::new(&theme, theme.is_light());
         let mut view = ClayView {
             focus: cx.focus_handle(),
             fonts,
@@ -594,7 +594,7 @@ impl ClayView {
         }
         self.spell_settings(spell_on, &dict);
         let Some(s) = self.surf.preview.as_ref().or(self.session.core.settings.as_ref()) else { return };
-        let tokens = Tokens::new(&self.theme, s.gui_theme == "light");
+        let tokens = Tokens::new(&self.theme, self.theme.is_light());
         if tokens != self.chrome.tokens {
             self.chrome.tokens = tokens;
         }

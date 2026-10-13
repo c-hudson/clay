@@ -1772,7 +1772,9 @@ pub struct Settings {
     // How the console separator bar is drawn: TinyFugue underscores, or the
     // web interface's flat status-bar coloring. Console/TUI only.
     pub separator_style: SeparatorStyle,
-    gui_theme: Theme,       // GUI theme (separate from console)
+    // The GUI theme's name (separate from the console's): a theme.dat section, one of
+    // `theme::BUILTIN_THEMES` or a custom one. Always `theme::normalize_theme_name`d.
+    gui_theme: String,
     gui_transparency: f32,  // GUI window transparency (0.0-1.0)
     // Color contrast adjustment for web/GUI (0 = disabled, 1-100 = adjustment percentage)
     color_offset_percent: u8,
@@ -1898,7 +1900,7 @@ impl Default for Settings {
             ansi_music_enabled: true,  // ANSI music enabled by default
             theme: Theme::Dark,
             separator_style: SeparatorStyle::Web,
-            gui_theme: Theme::Dark,
+            gui_theme: "dark".to_string(),
             gui_transparency: 1.0,
             color_offset_percent: 0,   // 0 = disabled, 1-100 = adjustment percentage
             wrapspace: 0,   // 0 = no hanging indent (current behavior); TF itself defaults differently
@@ -5796,7 +5798,7 @@ impl App {
 
     /// Get theme colors for the current GUI theme
     pub fn gui_theme_colors(&self) -> &theme::ThemeColors {
-        self.theme_file.get(self.settings.gui_theme.name())
+        self.theme_file.get(&self.settings.gui_theme)
     }
 
     /// JSON array of every canonical key name (`crate::keynames` grammar) currently
@@ -5863,7 +5865,7 @@ impl App {
             ansi_music_enabled: self.settings.ansi_music_enabled,
             console_theme: self.settings.theme.name().to_string(),
             separator_style: self.settings.separator_style.name().to_string(),
-            gui_theme: self.settings.gui_theme.name().to_string(),
+            gui_theme: self.settings.gui_theme.clone(),
             gui_transparency: self.settings.gui_transparency,
             color_offset_percent: self.settings.color_offset_percent,
             wrapspace: self.settings.wrapspace,
@@ -5928,7 +5930,7 @@ impl App {
         self.settings.ansi_music_enabled = settings.ansi_music_enabled;
         self.settings.theme = Theme::from_name(&settings.console_theme);
         self.settings.separator_style = SeparatorStyle::from_name(&settings.separator_style);
-        self.settings.gui_theme = Theme::from_name(&settings.gui_theme);
+        self.settings.gui_theme = theme::normalize_theme_name(&settings.gui_theme);
         self.settings.gui_transparency = settings.gui_transparency;
         self.settings.color_offset_percent = settings.color_offset_percent;
         self.settings.wrapspace = settings.wrapspace;
@@ -6571,7 +6573,7 @@ impl App {
             world_switching,
             self.settings.debug_enabled,
             self.input_height as i64,
-            self.settings.gui_theme.name(),
+            &self.settings.gui_theme,
             self.settings.tls_proxy_enabled,
             &self.settings.dictionary_path,
             self.settings.editor_side.name(),
@@ -9996,7 +9998,7 @@ impl App {
         // Console theme affects the TUI on the server
         self.settings.theme = Theme::from_name(&console_theme);
         // GUI theme is stored for sending back to GUI clients
-        self.settings.gui_theme = Theme::from_name(&gui_theme);
+        self.settings.gui_theme = theme::normalize_theme_name(&gui_theme);
         self.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
         self.settings.color_offset_percent = color_offset_percent.min(100);
         // No clamp on wrapspace itself — wrap_ansi_line/visual_line_count clamp the
@@ -15837,7 +15839,7 @@ impl App {
             WsMessage::RequestThemeEditorState => {
                 let themes_json = self.theme_file.to_json_all();
                 let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
-                let active_theme = self.settings.gui_theme.name().to_string();
+                let active_theme = self.settings.gui_theme.clone();
                 let separator_style = self.settings.separator_style.name().to_string();
                 self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                     themes_json,
@@ -15847,15 +15849,11 @@ impl App {
                 });
             }
             WsMessage::UpdateThemeColors { theme_name, colors_json } => {
-                let base = if theme_name == "light" {
-                    theme::ThemeColors::light_default()
-                } else {
-                    theme::ThemeColors::dark_default()
-                };
+                let base = theme::ThemeColors::builtin(&theme_name).unwrap_or_else(theme::ThemeColors::dark_default);
                 let colors = theme::ThemeColors::from_json(&colors_json, &base);
                 self.theme_file.set_theme(&theme_name, colors);
                 // If updated theme is the active GUI theme, broadcast CSS vars update
-                if theme_name == self.settings.gui_theme.name() {
+                if theme_name == self.settings.gui_theme {
                     let css_vars = self.gui_theme_colors().to_css_vars();
                     let colors_json = self.gui_theme_colors().to_json();
                     self.ws_broadcast(WsMessage::ThemeCssVarsUpdated {
@@ -15876,7 +15874,7 @@ impl App {
                 // Send updated state back to editor
                 let themes_json = self.theme_file.to_json_all();
                 let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
-                let active_theme = self.settings.gui_theme.name().to_string();
+                let active_theme = self.settings.gui_theme.clone();
                 let separator_style = self.settings.separator_style.name().to_string();
                 self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                     themes_json,
@@ -15890,7 +15888,7 @@ impl App {
                 // Send updated state back to editor
                 let themes_json = self.theme_file.to_json_all();
                 let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
-                let active_theme = self.settings.gui_theme.name().to_string();
+                let active_theme = self.settings.gui_theme.clone();
                 let separator_style = self.settings.separator_style.name().to_string();
                 self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                     themes_json,

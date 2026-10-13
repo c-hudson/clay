@@ -1683,9 +1683,10 @@
     // Theme Application
     // ============================================================================
 
-    // Apply theme to the document body
+    // Apply theme to the document body: the light themes ("light", "light-new") get the
+    // light-theme rules (style.css `body.theme-light`).
     function applyTheme(theme) {
-        if (theme === 'light') {
+        if (theme === 'light' || theme === 'light-new') {
             document.body.classList.add('theme-light');
         } else {
             document.body.classList.remove('theme-light');
@@ -12159,7 +12160,9 @@
         // Color offset stepper
         elements.setupColorOffsetValue.textContent = setupColorOffset === 0 ? 'OFF' : setupColorOffset + '%';
         // Theme dropdown
-        elements.setupThemeSelect.value = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
+        // The option values are the theme names the server uses (theme::BUILTIN_THEMES).
+        elements.setupThemeSelect.value = setupGuiTheme;
+        if (elements.setupThemeSelect.value !== setupGuiTheme) elements.setupThemeSelect.value = 'dark';
         updateCustomDropdown(elements.setupThemeSelect);
         // Transparency slider (webview mode only)
         if (window.WEBVIEW_MODE && elements.setupTransparencyRow) {
@@ -17124,7 +17127,7 @@
             }
         };
         elements.setupThemeSelect.onchange = function() {
-            setupGuiTheme = this.value.toLowerCase();
+            setupGuiTheme = this.value;
         };
         if (elements.setupTransparencySlider) {
             elements.setupTransparencySlider.oninput = function() {
