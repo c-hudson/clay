@@ -14303,7 +14303,13 @@ impl App {
             Ok(version) => {
                 self.send_update_outcome(reply_to, true, true, &version);
                 self.ws_broadcast(WsMessage::ServerReloading);
-                !self.should_defer_reload_for_mccp2()
+                #[cfg(not(target_os = "android"))]
+                let reload_now = !self.should_defer_reload_for_mccp2();
+                // Android never gets here (the install above is refused) and has no hot
+                // reload to defer anyway.
+                #[cfg(target_os = "android")]
+                let reload_now = false;
+                reload_now
             }
             Err(_) => {
                 self.send_update_outcome(reply_to, false, false, "");
@@ -21617,9 +21623,17 @@ pub async fn run_app_headless(
                         // binary, hot reload (deferred by the MCCP2 drain when a
                         // connected world is compressed - see the Sigusr1Received arm
                         // above and the bottom-of-loop poll).
-                        if app.finish_server_update(result, reply_to) {
-                            exec_reload(&mut app)?;
-                            return Ok(());
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            if app.finish_server_update(result, reply_to) {
+                                exec_reload(&mut app)?;
+                                return Ok(());
+                            }
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            // No hot reload on Android; the install is refused upstream.
+                            let _ = app.finish_server_update(result, reply_to);
                         }
                     }
                     AppEvent::ImportResult(client_id, addr, result) => {
@@ -23454,11 +23468,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // binary, hot reload (deferred by the MCCP2 drain when a
                         // connected world is compressed - see the WsAsyncAction::Reload
                         // arm above and the bottom-of-loop poll).
-                        if app.finish_server_update(result, reply_to) {
-                            restore_terminal_for_exec();
-                            app.mouse_capture_active = false;
-                            exec_reload(&mut app)?;
-                            return Ok(());
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            if app.finish_server_update(result, reply_to) {
+                                restore_terminal_for_exec();
+                                app.mouse_capture_active = false;
+                                exec_reload(&mut app)?;
+                                return Ok(());
+                            }
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            // No hot reload on Android; the install is refused upstream.
+                            let _ = app.finish_server_update(result, reply_to);
                         }
                     }
                     AppEvent::ImportResult(client_id, addr, result) => {

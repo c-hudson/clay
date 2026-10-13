@@ -446,9 +446,17 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     AppEvent::UpdateResult { result, reply_to } => {
                         // src/selfupdate.rs: a client's /update reached this -D daemon;
                         // install, answer, and hot reload like the Sigusr1Received arm.
-                        if app.finish_server_update(result, reply_to) {
-                            crate::exec_reload(&mut app)?;
-                            return Ok(());
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            if app.finish_server_update(result, reply_to) {
+                                crate::exec_reload(&mut app)?;
+                                return Ok(());
+                            }
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            // No hot reload on Android; the install is refused upstream.
+                            let _ = app.finish_server_update(result, reply_to);
                         }
                     }
                     _ => {}

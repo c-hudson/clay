@@ -20,7 +20,9 @@
 //! (`src/websocket.rs`); an older server, which bounces `/update` back as
 //! `ExecuteLocalCommand`, is answered by the client moving on to its own step.
 
+#[cfg(not(target_os = "android"))]
 use std::path::Path;
+#[cfg(not(target_os = "android"))]
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -118,6 +120,7 @@ pub(crate) fn attached_target(args: impl IntoIterator<Item = String>) -> Option<
 
 /// What this program's binary looked like when it started: enough to tell, later, that
 /// the file at that path is a different one.
+#[cfg(not(target_os = "android"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExeStamp {
     len: u64,
@@ -128,6 +131,7 @@ pub struct ExeStamp {
     dev: u64,
 }
 
+#[cfg(not(target_os = "android"))]
 impl ExeStamp {
     pub fn of(path: &Path) -> Option<Self> {
         let md = std::fs::metadata(path).ok()?;
@@ -144,10 +148,12 @@ impl ExeStamp {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 static STARTED_AS: OnceLock<Option<ExeStamp>> = OnceLock::new();
 
 /// Record what this program's binary looks like now. Called once, early in `main`;
 /// [`exe_replaced`] compares against it.
+#[cfg(not(target_os = "android"))]
 pub fn stamp_exe() {
     let stamp = crate::platform::get_executable_path().ok().and_then(|(p, _)| ExeStamp::of(&p));
     let _ = STARTED_AS.set(stamp);
@@ -156,6 +162,7 @@ pub fn stamp_exe() {
 /// Is the file at this program's own path no longer the one it started from? True after
 /// the server (same machine, same file) installed an update over it; false when nothing
 /// changed, when the file is gone, or when the start-up stamp was never taken.
+#[cfg(not(target_os = "android"))]
 pub fn exe_replaced() -> bool {
     let Some(Some(started)) = STARTED_AS.get() else { return false };
     let Ok((path, _)) = crate::platform::get_executable_path() else { return false };
@@ -163,6 +170,18 @@ pub fn exe_replaced() -> bool {
         Some(now) => now != *started,
         None => false,
     }
+}
+
+/// Android (Termux) has no self-install: a server there never writes over its binary
+/// (`finish_server_update` leaves the download for the user to install), so nothing can
+/// have replaced this one, and there is no stamp to take - `platform` has no
+/// `get_executable_path` for it either.
+#[cfg(target_os = "android")]
+pub fn stamp_exe() {}
+
+#[cfg(target_os = "android")]
+pub fn exe_replaced() -> bool {
+    false
 }
 
 #[cfg(test)]
