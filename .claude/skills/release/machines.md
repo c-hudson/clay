@@ -217,7 +217,16 @@ release); `-f` prevents the staleness from being introduced in the first place.
   proceeds against the **old checkout** and ships a stale binary. Repair is
   `del .git\index` then `git reset` (the index is a rebuildable cache; no commits or
   working-tree content are lost).
-- **Disk:** C: is ~70GB (resized from 50GB on 2026-07-29; disk UUID `7effa39a-7122-44d7-a15b-286616b4cd34`, the current differencing/snapshot medium attached at SATA-0-0 — resize `VBoxManage modifymedium disk <uuid> --resize <MB>` targets that medium, not the base `clay-win11.vdi`).
+- **Disk:** C: is ~70GB (resized from 50GB on 2026-07-29). Since 2026-10-12 there are **no
+  snapshots**: both ("provisioned", "Provision+20G") were merged into the single
+  `clay-win11.vdi` (UUID `5d1c7350-94a5-45d4-bc1e-5033b72a949a`, attached at SATA-0-0), which
+  was then zero-filled (`sdelete64 -z C:`) and compacted, 117 GB -> 47 GB on the host. A
+  snapshot makes every later write land in a differencing image that never shrinks (that
+  chain had grown to 117 GB for a 70 GB disk), so prefer a copy (`VBoxManage clonemedium`)
+  over a live snapshot as a rollback point. To shrink it again: clean up inside, `sdelete64
+  -z C:` (in `C:\Users\adrick\sdelete`), graceful shutdown, `VBoxManage modifymedium disk
+  5d1c7350-94a5-45d4-bc1e-5033b72a949a --compact`. Only toolchain is 1.98.1 (the default;
+  `stable` was removed).
 
 **Resizing this disk again — known gotchas (hit 2026-07-29, corrected 2026-07-30):**
 1. The trailing WinRE recovery partition sits at the very end of the disk, so newly-added virtual space isn't adjacent to C: until that partition is deleted (`diskpart`: `select partition N` / `delete partition override`) and C: is extended into the reclaimed + new space.
@@ -259,9 +268,19 @@ at `~/VMs/OSX-KVM`), running on this AMD host. It is the only macOS builder for 
   (disk `~/VMs/macos/mac_hdd.qcow2`, 100 GB sparse; VNC on `127.0.0.1:5905` for the GUI).
 - SSH: user `adrick`, `127.0.0.1` port **2222** (QEMU user-net forward), known-hosts file
   `~/VMs/macos/known_hosts`. `macvm.sh ssh '<cmd>'` wraps the right options.
-- Toolchain: Xcode Command Line Tools 26.6 (no full Xcode), rustup stable AND **1.98.1**
-  (for the native GUI), each with `x86_64-apple-darwin` + `aarch64-apple-darwin`. Checkout
-  at `~/clay`. The VM has no Metal, so it can build the native GUI but not run it.
+- Toolchain: Xcode Command Line Tools 26.6 (no full Xcode), rustup **1.98.1** only (the
+  default; `stable` was removed 2026-10-12), with `x86_64-apple-darwin` +
+  `aarch64-apple-darwin`. Checkout at `~/clay`. The VM has no Metal, so it can build the
+  native GUI but not run it.
+- **Keep `~/clay/target/release`** even though the release builds into
+  `target/{x86_64,aarch64}-apple-darwin`: with an explicit `--target`, cargo puts the build
+  scripts and proc-macros (built for the host) in `target/release`, and deleting it costs a
+  ~10-minute rebuild of both targets (found 2026-10-12).
+- Disk space goes back to the host: `macvm.sh` attaches the disk with `rotation_rate=1` (macOS
+  sees an SSD with TRIM Support: Yes, no `trimforce` needed), `discard=unmap` and
+  `detect-zeroes=unmap`, so APFS's TRIM of deleted files shrinks `mac_hdd.qcow2`'s allocation
+  (42.6 -> 37 GiB on 2026-10-12). Automatic macOS update downloads are still on
+  (`softwareupdate --schedule off` is ignored on macOS 26); turning them off needs a password.
 - **Never run it at the same time as a VirtualBox VM** (the Windows VM): KVM and
   VirtualBox both need AMD-V. `macvm.sh start` refuses while a VirtualBox VM is running.
 - **Stop it gracefully** with `macvm.sh stop`: it shuts macOS down over SSH (passwordless
