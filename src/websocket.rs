@@ -806,6 +806,9 @@ pub enum WsMessage {
         tts_mode: String,
         #[serde(default)]
         tts_speak_mode: String,
+        /// The Kokoro voice (src/kokoro.rs); empty = unchanged (an older client).
+        #[serde(default)]
+        tts_voice: String,
         #[serde(default)]
         scrollback_enabled: bool,
         /// See `Settings::log_input_enabled`'s doc comment in main.rs.
@@ -1810,6 +1813,9 @@ pub struct GlobalSettingsMsg {
     pub tts_mode: String,
     #[serde(default)]
     pub tts_speak_mode: String,
+    /// The Kokoro voice (src/kokoro.rs); empty from a server before it existed.
+    #[serde(default)]
+    pub tts_voice: String,
     #[serde(default)]
     pub scrollback_enabled: bool,
     /// See `Settings::log_input_enabled`'s doc comment in main.rs.

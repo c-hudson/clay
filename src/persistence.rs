@@ -486,6 +486,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "keyboard_always_visible={}", app.settings.keyboard_always_visible)?;
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
+    writeln!(file, "tts_voice={}", app.settings.tts_voice)?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
@@ -601,7 +602,10 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if !world.settings.slack_channels.is_empty() {
             writeln!(file, "slack_channels={}", world.settings.slack_channels)?;
         }
-        writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
+        // Only a chat world has a chat-settings model to record (see migrate_chat_settings).
+        if matches!(world.settings.world_type, WorldType::Slack | WorldType::Discord) {
+            writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
+        }
         // Notes (escape newlines and special chars)
         if !world.settings.notes.is_empty() {
             let escaped_notes = world.settings.notes
@@ -847,6 +851,14 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
 /// Idempotent: guarded by the version, which every writer then records.
 pub(crate) fn migrate_chat_settings(s: &mut crate::WorldSettings) {
     if s.chat_settings_version >= crate::CHAT_SETTINGS_VERSION {
+        return;
+    }
+    // Only a Slack or Discord world has anything to upgrade. Any other kind is simply
+    // current: stamped in memory, so a world switched to a chat type later saves the
+    // version and is never taken for a legacy one, while its own file never carries the
+    // key (the writer leaves it out for every non-chat world).
+    if !matches!(s.world_type, crate::WorldType::Slack | crate::WorldType::Discord) {
+        s.chat_settings_version = crate::CHAT_SETTINGS_VERSION;
         return;
     }
     let dm = s.discord_dm_user.trim().to_string();
@@ -1338,6 +1350,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     }
                     "tts_speak_mode" => {
                         app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(value);
+                    }
+                    "tts_voice" => {
+                        app.settings.tts_voice = crate::kokoro::normalize_voice(value);
                     }
                     "tts_enabled" => {
                         // Legacy: convert bool to TtsMode
@@ -2203,6 +2218,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "keyboard_always_visible={}", app.settings.keyboard_always_visible)?;
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
+    writeln!(file, "tts_voice={}", app.settings.tts_voice)?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
@@ -3233,6 +3249,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "tts_speak_mode" => {
                         app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(value);
                     }
+                    "tts_voice" => {
+                        app.settings.tts_voice = crate::kokoro::normalize_voice(value);
+                    }
                     "tts_enabled" => {
                         // Legacy: convert bool to TtsMode
                         if value == "true" {
@@ -3817,6 +3836,7 @@ mod tests {
             new_line_indicator: true,             // default: false
             tts_mode: crate::tts::TtsMode::Edge,  // default: Off
             tts_speak_mode: crate::tts::TtsSpeakMode::All, // default: All
+            tts_voice: "am_michael".to_string(), // default: af_heart
             tts_muted: true,                   // default: false
             web_font_letter_spacing: 1.5,      // default: 0.0
             web_font_line_height: 1.8,         // default: 1.2
@@ -3930,6 +3950,7 @@ mod tests {
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
         assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
         assert_eq!(a.tts_mode, b.tts_mode, "{context}: tts_mode");
+        assert_eq!(a.tts_voice, b.tts_voice, "{context}: tts_voice");
         assert_eq!(a.scrollback_enabled, b.scrollback_enabled, "{context}: scrollback_enabled");
         assert_eq!(a.log_input_enabled, b.log_input_enabled, "{context}: log_input_enabled");
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
@@ -4487,7 +4508,7 @@ mod tests {
     fn test_chat_settings_migration_keeps_old_behaviour_once() {
         // A pre-overhaul Discord world showed only its one channel: after migration the
         // channel is both Send To and Show Only.
-        let mut s = WorldSettings { chat_settings_version: 0, ..WorldSettings::default() };
+        let mut s = WorldSettings { chat_settings_version: 0, world_type: WorldType::Discord, ..WorldSettings::default() };
         s.discord_channel = "123456789012345678".to_string();
         migrate_chat_settings(&mut s);
         assert_eq!(s.discord_channel, "123456789012345678");
@@ -4499,7 +4520,7 @@ mod tests {
         assert!(s.discord_channels.is_empty());
 
         // DM-only world: Send To @user, Show Only matches no channel (DMs always show).
-        let mut s = WorldSettings { chat_settings_version: 0, ..WorldSettings::default() };
+        let mut s = WorldSettings { chat_settings_version: 0, world_type: WorldType::Discord, ..WorldSettings::default() };
         s.discord_dm_user = "223456789012345678".to_string();
         migrate_chat_settings(&mut s);
         assert_eq!(s.discord_channel, "@223456789012345678");
@@ -4507,7 +4528,7 @@ mod tests {
         assert!(s.discord_dm_user.is_empty());
 
         // Slack: an app token pasted into the one old token field moves to its own field.
-        let mut s = WorldSettings { chat_settings_version: 0, ..WorldSettings::default() };
+        let mut s = WorldSettings { chat_settings_version: 0, world_type: WorldType::Slack, ..WorldSettings::default() };
         s.slack_token = "xapp-1-abc".to_string();
         s.slack_channel = "C0123ABCD".to_string();
         migrate_chat_settings(&mut s);
@@ -4549,6 +4570,36 @@ mod tests {
         }
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("chat_settings_version=2"), "{text}");
+    }
+
+    /// Only a chat world carries the version key: a MUD has nothing to upgrade, so its
+    /// section stays free of it, and - loaded without one - it is current in memory, so
+    /// switching it to Discord later saves the stamp rather than a legacy "0".
+    #[test]
+    fn test_chat_settings_version_is_only_written_for_chat_worlds() {
+        let mut app = App::new();
+        app.worlds.clear();
+        load_settings_from_str(&mut app, "[world:M]\nworld_type=mud\nhostname=h\nport=1\n\n[world:D]\nworld_type=discord\ndiscord_token=t\n");
+        let mud = app.worlds.iter().find(|w| w.name == "M").unwrap();
+        assert_eq!(mud.settings.chat_settings_version, crate::CHAT_SETTINGS_VERSION, "current in memory without the key");
+        let section = |text: &str, name: &str| -> String {
+            let i = text.find(&format!("[world:{name}]")).unwrap();
+            let rest = &text[i + 1..];
+            let end = rest.find("\n[").map(|e| e + 1).unwrap_or(rest.len());
+            text[i..i + end].to_string()
+        };
+        let mut out = Vec::new();
+        write_settings_dat(&app, &mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!section(&text, "M").contains("chat_settings_version"), "a MUD carries no key:\n{}", section(&text, "M"));
+        assert!(section(&text, "D").contains("chat_settings_version=2"), "a Discord world does:\n{}", section(&text, "D"));
+        // Switched to Discord in the editor: the save stamps it, so no upgrade runs later.
+        let idx = app.worlds.iter().position(|w| w.name == "M").unwrap();
+        app.worlds[idx].settings.world_type = WorldType::Discord;
+        let mut out = Vec::new();
+        write_settings_dat(&app, &mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(section(&text, "M").contains("chat_settings_version=2"), "{}", section(&text, "M"));
     }
 
     #[test]
@@ -5173,6 +5224,7 @@ pattern=foo
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
         assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
         assert_ne!(non_default.tts_mode, default.tts_mode, "tts_mode should differ");
+        assert_ne!(non_default.tts_voice, default.tts_voice, "tts_voice should differ");
         assert_ne!(non_default.scrollback_enabled, default.scrollback_enabled, "scrollback_enabled should differ");
         assert_ne!(non_default.log_input_enabled, default.log_input_enabled, "log_input_enabled should differ");
         assert_ne!(non_default.keyboard_always_visible, default.keyboard_always_visible, "keyboard_always_visible should differ");

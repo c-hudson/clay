@@ -1,14 +1,17 @@
 //! Text-to-speech backend for Clay MUD client.
 //!
-//! Two backends:
+//! Three backends:
 //! - **Local**: External TTS commands (espeak, say, PowerShell). Works offline.
+//! - **Kokoro**: the Kokoro-82M neural voice, in-process through a runtime that
+//!   `/tts install` downloads (`src/kokoro.rs`). Offline; falls back to Local until the
+//!   files are installed.
 //! - **Edge**: Microsoft Edge neural TTS via cloud WebSocket API. Higher quality, needs internet.
 //!   Uses the same tokio-tungstenite + rustls stack as the rest of Clay (no openssl needed).
 //!
 //! Web/Android clients use the browser's Web Speech API via ServerSpeak WebSocket messages.
 
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// TTS mode setting
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -16,6 +19,7 @@ pub enum TtsMode {
     #[default]
     Off,
     Local,  // espeak, say, PowerShell
+    Kokoro, // Kokoro-82M through sherpa-onnx (src/kokoro.rs)
     Edge,   // Microsoft Edge neural TTS
 }
 
@@ -24,6 +28,7 @@ impl TtsMode {
         match self {
             TtsMode::Off => "off",
             TtsMode::Local => "local",
+            TtsMode::Kokoro => "kokoro",
             TtsMode::Edge => "edge",
         }
     }
@@ -31,10 +36,15 @@ impl TtsMode {
     pub fn from_name(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "local" => TtsMode::Local,
+            "kokoro" => TtsMode::Kokoro,
             "edge" => TtsMode::Edge,
             _ => TtsMode::Off,
         }
     }
+
+    /// The selector entries every settings UI lists, in order.
+    pub const OPTIONS: [(&'static str, &'static str); 4] =
+        [("off", "Off"), ("local", "Local"), ("kokoro", "Kokoro"), ("edge", "Edge")];
 }
 
 /// TTS speak mode — controls which lines are spoken
@@ -101,6 +111,9 @@ pub struct TtsBackend {
     current_process: Arc<Mutex<Option<std::process::Child>>>,
     /// Queue for Edge TTS — ensures utterances play one at a time
     edge_queue_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// The Kokoro engine, started on the first Kokoro utterance (its worker thread loads
+    /// the model then; see src/kokoro.rs).
+    kokoro: OnceLock<crate::kokoro::Engine>,
 }
 
 // Safety: TtsBackend is only accessed from the App's owning task/thread.
@@ -129,6 +142,7 @@ pub fn init_tts() -> TtsBackend {
         local_command: detect_tts_command(),
         current_process: Arc::new(Mutex::new(None)),
         edge_queue_tx,
+        kokoro: OnceLock::new(),
     }
 }
 
@@ -162,19 +176,65 @@ fn detect_tts_command() -> Option<String> {
     }
 }
 
-/// Speak text aloud using the specified TTS mode.
-pub fn speak(backend: &TtsBackend, text: &str, mode: TtsMode) {
+/// Speak text aloud using the specified TTS mode. `voice` is the Kokoro voice name
+/// (`Settings::tts_voice`); the other modes ignore it. Returns true when Kokoro was asked
+/// for but its files are not installed here, so the Local engine spoke instead - the
+/// caller tells the user, since a silently different voice reads as "the setting does
+/// nothing".
+pub fn speak(backend: &TtsBackend, text: &str, mode: TtsMode, voice: &str) -> bool {
     let clean_text = crate::util::strip_ansi_codes(text);
     let clean_text = clean_text.trim().to_string();
 
     if clean_text.is_empty() {
-        return;
+        return false;
     }
 
     match mode {
         TtsMode::Off => {}
         TtsMode::Local => speak_local(backend, &clean_text),
+        TtsMode::Kokoro => return speak_kokoro(backend, &clean_text, voice),
         TtsMode::Edge => speak_edge(backend, &clean_text),
+    }
+    false
+}
+
+/// Speak with Kokoro (src/kokoro.rs), or with the Local engine while its files are not
+/// installed - so choosing the mode before `/tts install` still says something.
+/// Returns true when it fell back to the Local engine because Kokoro is not installed.
+fn speak_kokoro(backend: &TtsBackend, text: &str, voice: &str) -> bool {
+    if !crate::kokoro::install().complete() {
+        crate::debug_log(crate::is_debug_enabled(), "Kokoro: not installed, speaking with the local engine instead");
+        speak_local(backend, text);
+        return true;
+    }
+    stop_local(backend);
+    backend.kokoro.get_or_init(crate::kokoro::Engine::new).speak(text, voice);
+    false
+}
+
+/// The Kokoro engine, if an utterance has started it (for `/tts status`).
+pub fn kokoro_engine(backend: &TtsBackend) -> Option<&crate::kokoro::Engine> {
+    backend.kokoro.get()
+}
+
+/// Load the Kokoro model for `voice` now, in the background, so the first line spoken
+/// does not pay for it (`kokoro::Engine::warm`). Nothing without the files.
+pub fn warm_kokoro(backend: &TtsBackend, voice: &str) {
+    if backend.kokoro.get().is_none() {
+        // No session yet in this process: the one moment a leftover build can go.
+        crate::kokoro::remove_stale_build();
+    }
+    if crate::kokoro::install().complete() {
+        backend.kokoro.get_or_init(crate::kokoro::Engine::new).warm(voice);
+    }
+}
+
+/// Kokoro is no longer the engine: unload its model and close its audio stream, if an
+/// engine exists (`kokoro::Engine::release`). The engine itself stays for a later
+/// return to Kokoro. Nothing to do when no line or warm-up ever started one.
+pub fn release_kokoro(backend: &TtsBackend) {
+    if let Some(k) = backend.kokoro.get() {
+        k.release();
     }
 }
 
@@ -434,6 +494,9 @@ async fn play_mp3_bytes_async(data: Vec<u8>) {
 /// Stop any currently running TTS.
 pub fn stop(backend: &TtsBackend) {
     stop_local(backend);
+    if let Some(k) = backend.kokoro.get() {
+        k.stop();
+    }
 }
 
 fn stop_local(backend: &TtsBackend) {
@@ -454,4 +517,46 @@ pub fn is_available(backend: &TtsBackend) -> bool {
 /// Returns the name of the detected local TTS command, if any.
 pub fn command_name(backend: &TtsBackend) -> Option<&str> {
     backend.local_command.as_deref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend that speaks to nobody: no local command, no Edge queue.
+    fn silent() -> TtsBackend {
+        TtsBackend {
+            local_command: None,
+            current_process: Arc::new(Mutex::new(None)),
+            edge_queue_tx: None,
+            kokoro: OnceLock::new(),
+        }
+    }
+
+    /// Kokoro chosen without its files (the test home has none): the Local engine is used
+    /// and the caller is told, so it can say so; the other modes never report a fallback.
+    #[test]
+    fn kokoro_without_files_reports_the_fallback() {
+        let backend = silent();
+        assert!(!crate::kokoro::install().complete(), "the test home has no Kokoro files");
+        assert!(speak(&backend, "hello", TtsMode::Kokoro, "af_heart"), "Kokoro asked for, Local spoke: say so");
+        assert!(!speak(&backend, "hello", TtsMode::Local, "af_heart"));
+        assert!(!speak(&backend, "hello", TtsMode::Off, "af_heart"));
+        assert!(!speak(&backend, "   ", TtsMode::Kokoro, "af_heart"), "nothing to say: nothing to report");
+    }
+
+    /// Leaving Kokoro tells the engine to unload (and is nothing without an engine).
+    #[test]
+    fn release_reaches_the_engine_when_there_is_one() {
+        let backend = silent();
+        release_kokoro(&backend);
+        assert!(backend.kokoro.get().is_none(), "a release starts no engine");
+        let engine = backend.kokoro.get_or_init(crate::kokoro::Engine::new);
+        release_kokoro(&backend);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.releases() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(engine.releases(), 1);
+    }
 }

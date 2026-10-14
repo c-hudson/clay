@@ -254,15 +254,40 @@ impl Media {
 
     /// The server's text-to-speech, in the voice the settings name (local when off: the
     /// server only asks when something should be spoken, as the web client assumes).
-    pub fn speak(&mut self, text: &str, mode: TtsMode) {
+    /// Returns true when Kokoro was asked for but is not installed on this machine, so
+    /// the local engine spoke (`tts::speak`).
+    pub fn speak(&mut self, text: &str, mode: TtsMode, voice: &str) -> bool {
         let mode = if mode == TtsMode::Off { TtsMode::Local } else { mode };
         if self.tts.is_none() {
             // Edge's voices run on the runtime.
             let _guard = self.runtime.as_ref().map(|r| r.enter());
             self.tts = Some(tts::init_tts());
         }
+        self.tts.as_ref().is_some_and(|t| tts::speak(t, text, mode, voice))
+    }
+
+    /// The Kokoro engine, once an utterance has started it (`/tts status`, `/tts remove`).
+    pub fn kokoro_engine(&self) -> Option<&crate::kokoro::Engine> {
+        self.tts.as_ref().and_then(tts::kokoro_engine)
+    }
+
+    /// Kokoro is no longer the engine: unload its model and close its audio stream
+    /// (`tts::release_kokoro`; nothing when no engine was ever started).
+    pub fn release_kokoro(&self) {
         if let Some(t) = &self.tts {
-            tts::speak(t, text, mode);
+            tts::release_kokoro(t);
+        }
+    }
+
+    /// Load the Kokoro model for `voice` in the background, so this GUI's first line
+    /// does not wait for it (`tts::warm_kokoro`; nothing without the files here).
+    pub fn warm_kokoro(&mut self, voice: &str) {
+        if self.tts.is_none() {
+            let _guard = self.runtime.as_ref().map(|r| r.enter());
+            self.tts = Some(tts::init_tts());
+        }
+        if let Some(t) = &self.tts {
+            tts::warm_kokoro(t, voice);
         }
     }
 }

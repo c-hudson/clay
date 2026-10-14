@@ -99,12 +99,56 @@ impl PlayHandle {
     }
 }
 
+/// The ALSA devices that are a sound server rather than a card. Playing through one puts
+/// the stream under the desktop's mixer - its volume control, the per-application volume,
+/// the sink's own level (a 150% boost on an HDMI output, say) - and shares the card.
+#[cfg(all(target_os = "linux", feature = "native-audio"))]
+const SOUND_SERVER_DEVICES: [&str; 2] = ["pipewire", "pulse"];
+
+#[cfg(all(target_os = "linux", feature = "native-audio"))]
+pub(crate) fn is_sound_server_device(name: &str) -> bool {
+    SOUND_SERVER_DEVICES.contains(&name)
+}
+
+/// Open the output stream Clay plays through - the MUD's sounds and the Kokoro voice
+/// alike. Returns the stream, its handle and the device's name (for `/tts status`).
+///
+/// On Linux, ALSA's `default` is not always the sound server: a PipeWire desktop with
+/// the PulseAudio compatibility plugin but neither `pipewire-alsa` nor the package that
+/// maps `default` to that plugin has `default` pointing at the sound card itself. Clay
+/// then played straight to the hardware, outside the desktop's mixer - no volume control
+/// reached it and the sink's boost never applied ("I turned the volume up and can still
+/// barely hear it"), while espeak, which talks to the server itself, was loud. So the
+/// `pipewire` and `pulse` devices are preferred when they exist; `default` is the
+/// fallback, and the only choice on every other platform. cpal opens each device as it
+/// lists them, so the walk stops at the first match, before the cards.
+#[cfg(feature = "native-audio")]
+pub fn open_output_stream() -> Option<(rodio::OutputStream, rodio::OutputStreamHandle, String)> {
+    // ALSA complains on stderr about every device it cannot open while cpal probes
+    // them; in the console that would land on the screen.
+    let _stderr = crate::platform::StderrToLog::new();
+    #[cfg(target_os = "linux")]
+    {
+        use rodio::cpal::traits::{DeviceTrait, HostTrait};
+        if let Ok(mut devices) = rodio::cpal::default_host().output_devices() {
+            if let Some(device) = devices.find(|d| d.name().map(|n| is_sound_server_device(&n)).unwrap_or(false)) {
+                let name = device.name().unwrap_or_default();
+                if let Ok((stream, handle)) = rodio::OutputStream::try_from_device(&device) {
+                    return Some((stream, handle, name));
+                }
+            }
+        }
+    }
+    let (stream, handle) = rodio::OutputStream::try_default().ok()?;
+    Some((stream, handle, "default".to_string()))
+}
+
 /// Initialize the audio backend.
 /// Tries rodio first (if compiled in), falls back to external player detection.
 pub fn init_audio() -> AudioBackend {
     #[cfg(feature = "native-audio")]
     {
-        if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
+        if let Some((stream, handle, _device)) = open_output_stream() {
             return AudioBackend::Native {
                 _stream: stream,
                 stream_handle: handle,
@@ -603,5 +647,22 @@ mod msp_path_tests {
         std::fs::write(base.join("real.wav"), b"RIFF....").unwrap();
         std::os::unix::fs::symlink(base.join("real.wav"), base.join("alias.wav")).unwrap();
         assert!(resolve_msp_local_path("alias.wav", &base).is_ok());
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "native-audio"))]
+mod sound_server_device_tests {
+    use super::is_sound_server_device;
+
+    /// The sound server's ALSA devices are preferred over `default`, which on a PipeWire
+    /// desktop without the `pipewire-alsa` package can be the card itself - the stream then
+    /// plays outside the desktop's mixer and no volume control reaches it.
+    #[test]
+    fn only_the_sound_servers_devices_are_preferred() {
+        assert!(is_sound_server_device("pipewire"));
+        assert!(is_sound_server_device("pulse"));
+        for card in ["default", "sysdefault:CARD=PCH", "hdmi:CARD=HDMI,DEV=0", "dmix", "null", "lavrate"] {
+            assert!(!is_sound_server_device(card), "{card} is a card or a plugin, not the server");
+        }
     }
 }

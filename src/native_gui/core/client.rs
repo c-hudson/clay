@@ -1119,6 +1119,9 @@ impl ClientCore {
             WsMessage::WorldDisconnected { world_index } => {
                 if let Some(w) = self.worlds.get_mut(world_index) {
                     w.connected = false;
+                    // The connection's echo mask (a password prompt's IAC WILL ECHO) ends
+                    // with it; keeping it masked every key typed into the next connection.
+                    w.echo_masked = false;
                     // A shell world: freeze its screen (the session is gone server-side).
                     if let Some(screen) = w.shell.as_mut() {
                         screen.set_exited();
@@ -1975,6 +1978,7 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         new_line_indicator: s.new_line_indicator,
         tts_mode: s.tts_mode.clone(),
         tts_speak_mode: s.tts_speak_mode.clone(),
+        tts_voice: s.tts_voice.clone(),
         scrollback_enabled: s.scrollback_enabled,
         log_input_enabled: s.log_input_enabled,
         keyboard_always_visible: s.keyboard_always_visible,

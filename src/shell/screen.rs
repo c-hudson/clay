@@ -292,6 +292,14 @@ pub struct ShellScreen {
     fresh: bool,
     /// A resize just happened: suppress the reflow as activity for one rendering.
     resized: bool,
+    /// Until this instant, what appears on the screen is not activity: the repaint a
+    /// program does after a `/reload` re-attaches it (the size nudge, the injected note)
+    /// is Clay's doing, not news from the program, and used to light the world's activity
+    /// indicator on every reload.
+    quiet_until: Option<std::time::Instant>,
+    /// Client side: a delta didn't build on the frame held and the whole screen has been
+    /// asked for. Until it arrives every delta is stale, so none of them asks again.
+    awaiting_full: bool,
 }
 
 /// What applying a rendering did.
@@ -320,12 +328,27 @@ impl ShellScreen {
             changed: true,
             fresh: true,
             resized: false,
+            quiet_until: None,
+            awaiting_full: false,
         }
+    }
+
+    /// Nothing that appears before `until` counts as activity (see `quiet_until`).
+    pub fn ignore_activity_until(&mut self, until: std::time::Instant) {
+        self.quiet_until = Some(until);
     }
 
     /// The next rendering of the emulator. Returns what changed (activity, repaint).
     pub fn apply(&mut self, snap: RowsSnapshot) -> Applied {
         let resized = snap.cols != self.cols || snap.rows != self.rows;
+        let quiet = match self.quiet_until {
+            Some(until) if std::time::Instant::now() < until => true,
+            Some(_) => {
+                self.quiet_until = None;
+                false
+            }
+            None => false,
+        };
         let mut gained_printable = false;
         let mut changed = resized;
         if resized {
@@ -342,8 +365,9 @@ impl ShellScreen {
                     *d = true;
                 }
             }
-            // Activity: a cell gained a non-space it didn't have (reflow excepted).
-            if !resized && !self.resized {
+            // Activity: a cell gained a non-space it didn't have (reflow and a reload's
+            // repaint excepted).
+            if !resized && !self.resized && !quiet {
                 let old = self.plain.get(y);
                 for (x, &ch) in snap.plain[y].iter().enumerate() {
                     if ch != ' ' && old.and_then(|row| row.get(x)).copied().unwrap_or(' ') != ch {
@@ -472,12 +496,17 @@ impl ShellScreen {
             changed: false,
             fresh: false,
             resized: false,
+            quiet_until: None,
+            awaiting_full: false,
         }
     }
 
     /// Apply a `ShellScreen` frame from the server (the SSH mirror and the native GUI).
     /// Returns false when the delta doesn't build on the frame held, so the caller knows
-    /// to ask for a full one.
+    /// to ask for a full one - once: the deltas still in flight until that full frame
+    /// arrives can't build on it either, and each used to cost another request and
+    /// another full frame (a resize while a program was writing sent a dozen). They are
+    /// dropped (true) until the full frame lands; a delta rejected after it asks again.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_msg(
         &mut self,
@@ -493,6 +522,7 @@ impl ShellScreen {
     ) -> bool {
         match base_frame {
             None => {
+                self.awaiting_full = false;
                 self.lines = vec![String::new(); rows as usize];
                 for (i, s) in lines {
                     if let Some(row) = self.lines.get_mut(*i as usize) {
@@ -502,7 +532,8 @@ impl ShellScreen {
             }
             Some(base) => {
                 if base != self.frame || cols != self.cols || rows != self.rows {
-                    return false;
+                    let already_asked = std::mem::replace(&mut self.awaiting_full, true);
+                    return already_asked;
                 }
                 for (i, s) in lines {
                     if let Some(row) = self.lines.get_mut(*i as usize) {

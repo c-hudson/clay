@@ -72,7 +72,8 @@ behalf of whichever account owns the world.
 
 Surviving a reload: on Linux, a `/reload` keeps shell worlds running — the program you
 left open (your editor, `top`, an `ssh` session) is still there afterward, and repaints
-itself. On macOS and Windows a reload closes shell worlds (the program ends), like other
+itself (that repaint does not count as activity in a shell world you are not looking
+at). On macOS and Windows a reload closes shell worlds (the program ends), like other
 non-MUD worlds. Note that, because every key goes to the terminal, you cannot type
 `/reload` *in* a shell world; switch to another world first (or Clay reloads on its own
 after an update).

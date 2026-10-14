@@ -992,3 +992,19 @@ fn a_switch_the_server_worked_out_tells_the_server_what_is_seen() {
         assert!(sent.iter().any(|m| matches!(m, WsMessage::RequestWorldState { world_index: 1 })), "{sent:?}");
     }
 }
+
+// ---- the telnet echo mask ----
+
+/// A password prompt's echo mask (the server's `EchoMaskChanged{true}`) ends with the
+/// connection: `WorldDisconnected` clears it here, beside the server's own
+/// `EchoMaskChanged{false}`, so nothing typed into the next connection shows as `*`.
+#[test]
+fn a_disconnect_ends_the_echo_mask() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 9)]);
+    h.msg(WsMessage::EchoMaskChanged { world_index: 0, masked: true });
+    assert!(h.core.worlds[0].echo_masked, "precondition: the mask was taken");
+    h.msg(WsMessage::WorldDisconnected { world_index: 0 });
+    assert!(!h.core.worlds[0].echo_masked, "the mask ends with the connection");
+    assert!(!h.core.worlds[0].connected);
+}

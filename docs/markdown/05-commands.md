@@ -193,6 +193,68 @@ binary on the same machine, the client notices that the server's install already
 replaced its file and simply restarts. A browser page or the Android app has no binary of
 its own to update; a multiuser server is not updated by its users.
 
+### /say
+Speak text aloud.
+
+```
+/say <text>
+```
+
+Reads `<text>` with the text-to-speech engine chosen in `/setup` (TTS: Local, Kokoro or
+Edge - see the Settings chapter); a browser page or the Android app reads it with the
+device's own voice. With TTS off the console says nothing but still shows the line.
+
+### /tts
+Text-to-speech status, and the Kokoro voice's files.
+
+```
+/tts                  status: mode, voice, what is installed
+/tts install          download Kokoro's runtime and model
+/tts remove           delete them again
+/tts voices           list the 54 Kokoro voices
+/tts voice <name>     pick one (af_heart, am_michael, bf_emma, ...)
+/tts test             speak a test line in the current mode
+```
+
+Kokoro is an offline neural voice (Kokoro-82M, Apache-2.0). It is not built into Clay:
+`/tts install` fetches its runtime (sherpa-onnx, for this machine's platform) and the
+model from the sherpa-onnx GitHub releases into `~/.clay/tts` (`~/clay/tts` on Windows;
+`CLAY_TTS_DIR` overrides). The model comes in two builds and the install picks the one
+this CPU runs fastest: the small int8 build (about 160 MB to download, 230 MB on disk)
+where the CPU has 8-bit matrix instructions - x86 with AVX-512 VNNI, and ARM - and the
+full-precision build (about 340 MB, 400 MB on disk) on an x86 CPU with only AVX2, where
+int8 runs up to four times slower and can fall behind real time. `/tts status` names the
+build installed, and `/tts install` on a machine that has the other switches it. The
+install runs in the background and reports as it goes; afterwards set TTS to Kokoro in
+`/setup`. Until
+the files are there, Kokoro mode speaks with the Local engine, so nothing goes silent -
+and Clay says so: once when Kokoro is selected without them, and once more the first
+time a line is spoken that way, naming the command to run.
+
+The model (about a second to load) is loaded in the background as soon as Kokoro is
+selected, or at startup when it already is, so the first line spoken is as quick as any
+other; each sentence plays as soon as it is synthesized. Kokoro is the most natural of
+the three engines and also the heaviest: it uses every CPU the machine has (up to eight)
+for the moment it takes to make a sentence, and on a desktop CPU that is a few times
+faster than speaking, which is enough for a MUD, but not on a Raspberry Pi. With debug
+mode on, `debug.log` records how long each line took to start. A new line always cuts
+off the one being spoken, as with the Local engine. Between lines Kokoro costs nothing:
+its audio stream is opened by the first line and closed again after half a minute of
+silence (an open stream keeps the sound server mixing), and switching TTS to another
+engine, or `/tts remove`, unloads the model and its threads until Kokoro is chosen again.
+
+Where it works: the GUI builds on Linux, Windows and macOS, and the console when run
+from one of those binaries (`clay` with no flags). The static Linux console build
+(`clay-linux-x86_64-musl`) cannot load the runtime and says so; the Android app and
+Termux keep their own engines. On Linux the voice (and the MUD's sounds) play through
+the `pipewire` or `pulse` ALSA device when one exists, so they sit under the desktop's
+mixer and volume like any other program; `/tts status` names the device after the first
+line spoken. The voice plays wherever the lines are spoken: on the Clay itself for its
+console, and on your own machine for a desktop GUI attached to a Clay elsewhere. In that GUI, `/tts`, `/tts install`, `/tts remove` and `/tts test` are about
+your machine's files, and its notice says "not installed on this machine"; `/tts voices`
+and `/tts voice` are the shared setting and go to the server. (`clay --tts-install` on
+that machine does the same install from a shell.)
+
 ### /testmusic
 Play a test ANSI music sequence (C-D-E-F-G) to verify audio.
 

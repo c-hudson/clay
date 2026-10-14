@@ -34,6 +34,8 @@ pub const SETUP_FIELD_ICON_BAR: FieldId = FieldId(25);
 // Only visible while SETUP_FIELD_SCROLLBACK ("Archive Input/Output") is checked - see
 // update_setup_visibility/update_setup_visibility_def below.
 pub const SETUP_FIELD_LOG_INPUT: FieldId = FieldId(26);
+/// The Kokoro voice name (src/kokoro.rs; `/tts voices` lists them).
+pub const SETUP_FIELD_TTS_VOICE: FieldId = FieldId(27);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -60,13 +62,9 @@ pub fn editor_side_options() -> Vec<SelectOption> {
     ]
 }
 
-/// TTS mode options
+/// TTS mode options (the one list every UI shows, `TtsMode::OPTIONS`)
 pub fn tts_mode_options() -> Vec<SelectOption> {
-    vec![
-        SelectOption::new("off", "Off"),
-        SelectOption::new("local", "Local"),
-        SelectOption::new("edge", "Edge"),
-    ]
+    crate::tts::TtsMode::OPTIONS.iter().map(|(v, l)| SelectOption::new(*v, *l)).collect()
 }
 
 /// TTS speak mode options (which lines to speak)
@@ -114,6 +112,7 @@ pub fn create_setup_popup(
     new_line_indicator: bool,
     tts_mode: &str,
     tts_speak_mode: &str,
+    tts_voice: &str,
     scrollback: bool,
     log_input: bool,
     wrapspace: i64,
@@ -124,11 +123,7 @@ pub fn create_setup_popup(
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = crate::theme::BUILTIN_THEMES.iter().position(|(name, _)| *name == gui_theme).unwrap_or(0);
     let editor_side_idx = if editor_side == "right" { 1 } else { 0 };
-    let tts_mode_idx = match tts_mode {
-        "local" => 1,
-        "edge" => 2,
-        _ => 0,  // "off"
-    };
+    let tts_mode_idx = crate::tts::TtsMode::OPTIONS.iter().position(|(v, _)| *v == tts_mode).unwrap_or(0);
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
     let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
     let icon_bar_idx = icon_bar_options().iter().position(|o| o.value == icon_bar).unwrap_or(1);
@@ -218,6 +213,11 @@ pub fn create_setup_popup(
             SETUP_FIELD_TTS_SPEAK_MODE,
             "Speak Mode",
             FieldKind::select(tts_speak_mode_options(), tts_speak_mode_idx),
+        ))
+        .with_field(Field::new(
+            SETUP_FIELD_TTS_VOICE,
+            "Kokoro Voice",
+            FieldKind::text_with_placeholder(tts_voice, crate::kokoro::DEFAULT_VOICE),
         ))
         .with_field(Field::new(
             SETUP_FIELD_SCROLLBACK,
@@ -344,9 +344,15 @@ fn setup_help_text() -> Vec<String> {
         "",
         "TTS: Text-to-speech mode for MUD output.",
         "  Off: disabled. Local: uses espeak/say subprocess.",
+        "  Kokoro: the Kokoro neural voice, offline; needs",
+        "  /tts install once (230 MB in ~/.clay/tts).",
         "  Edge: Microsoft Edge neural TTS (needs internet).",
         "  Web/Android always use the browser's Speech API.",
         "  Use /say <text> to speak manually when TTS is off.",
+        "",
+        "Kokoro Voice: which of Kokoro's 54 voices speaks,",
+        "  e.g. af_heart, am_michael, bf_emma; /tts voices",
+        "  lists them all.",
         "",
         "Archive Input/Output: Saves all world output to",
         "  ~/.clay/scrollback.db for permanent storage.",
@@ -389,13 +395,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", false, false, 0, true, "none", "app_tablet",
+            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet",
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 22);
+        assert_eq!(state.definition.fields.len(), 23);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -404,10 +410,12 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, "edge", "sentences", true, false, 4, false, "top", "all",
+            false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all",
         );
         let state = PopupState::new(def);
 
+        assert_eq!(state.get_selected(SETUP_FIELD_TTS), Some("edge"));
+        assert_eq!(state.get_text(SETUP_FIELD_TTS_VOICE), Some("bm_george"));
         assert_eq!(state.get_bool(SETUP_FIELD_MORE_MODE), Some(true));
         assert_eq!(state.get_bool(SETUP_FIELD_SPELL_CHECK), Some(false));
         assert_eq!(state.get_bool(SETUP_FIELD_TEMP_CONVERT), Some(true));

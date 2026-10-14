@@ -771,6 +771,21 @@ impl ClayView {
             self.input_touched(cx);
             return;
         }
+        // /tts on a GUI attached to another Clay: the voice plays on this machine, so
+        // the files it asks about are this machine's (surfaces.rs tts_command). The
+        // shared setting - voices, voice - still goes to the server.
+        if first.eq_ignore_ascii_case("/tts") && !crate::native_gui::runs_clay() {
+            let args: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+            if self.tts_command(&args, cx) {
+                self.editor.remember(&cmd, masked);
+                self.editor.clear();
+                let fx = self.session.core.command_sent();
+                let rest = self.session.apply(fx);
+                self.after(rest, cx);
+                self.input_touched(cx);
+                return;
+            }
+        }
         // What this client does itself rather than send.
         let local = match first {
             // A remote GUI's /reload restarts the GUI, not the server.

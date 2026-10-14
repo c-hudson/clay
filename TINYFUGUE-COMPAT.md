@@ -65,6 +65,12 @@ name to an action id with no chord/kbnum/insert support at all. The rewrite:
 | `^S`, `Insert`, `Esc-v`, `Ctrl-Left/Right`, `Ctrl-Home/End`, `Ctrl-PgDn`, `Esc-<`/`>`, `Esc-^N`/`^P`, `Esc-^L`, `Esc-^E`, `Esc-L`, `Esc-0..9`, `^X^R ^X^V ^X^? ^X[ ^X] ^X{ ^X}`, `^]` | bound | unbound | **added** (pure additions, no conflict) |
 | `^Y`, `Shift-Up/Down`, `Alt-PageUp/PageDown`, `Esc-PageUp/PageDown`, `F2 F4 F5 F8 F9`, `Alt-Up/Down`, double-`^C`, `Esc-w`, `Esc-e`, `Esc-m`/`Esc-M` | unbound | bound | **kept** (Clay extras) |
 
+`Esc-w` is bound by TF's own library, not its core: `world-q.tf` defines `^[w` as
+`/to_active_or_prev_world` — the active worlds in the order their activity began, and when
+the queue is empty "the last world you visited that is still connected" (walking back past
+any that disconnected). Clay's `world_activity` follows that rule, per viewer (the console's
+history and each client's are separate; validated 2026-10-13 against tf5's `world-q.tf`).
+
 Identical already (no change either direction): `^A ^B ^D ^E ^F ^G ^K ^N ^P ^T ^V ^W`,
 `Esc-b/f/c/d/l/u`, `Esc-Space`, `Esc-.`/`_`, `Esc-p/n`, `Esc-j/J`, `Esc-h`,
 `Esc-Backspace`, `Up/Down`, `Home/End`, `PgUp/PgDn`, `Delete`, `F1`.

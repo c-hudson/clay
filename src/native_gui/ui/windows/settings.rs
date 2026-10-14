@@ -73,6 +73,8 @@ fn step(v: f32, by: f32, (min, max): (f32, f32)) -> f32 {
 }
 
 struct Fields {
+    /// The Kokoro voice name (src/kokoro.rs).
+    voice: Entity<InputState>,
     custom_port: Entity<InputState>,
     web_path: Entity<InputState>,
     remote_lines: Entity<InputState>,
@@ -117,6 +119,7 @@ impl SettingsView {
         // A custom cert the server has but whose paths it didn't send shows "Configured".
         let configured = |path: &str| if edit.tls_configured && path.is_empty() { "Configured" } else { "" };
         let fields = Fields {
+            voice: text(edit.tts_voice.clone(), crate::kokoro::DEFAULT_VOICE, window, cx),
             custom_port: text(edit.http_port.to_string(), "", window, cx),
             web_path: text(edit.web_path.clone(), "clay", window, cx),
             remote_lines: text(edit.remote_initial_lines.to_string(), "", window, cx),
@@ -180,7 +183,7 @@ impl SettingsView {
         let v = Self {
             world_switch: Pick::new(&[("Unseen First", "Unseen First"), ("Alphabetical", "Alphabetical")], &edit.world_switch_mode, window, cx),
             theme: Pick::new(&crate::theme::BUILTIN_THEMES, &edit.gui_theme, window, cx),
-            tts: Pick::new(&[("off", "Off"), ("local", "Local"), ("edge", "Edge")], &edit.tts_mode, window, cx),
+            tts: Pick::new(&crate::tts::TtsMode::OPTIONS, &edit.tts_mode, window, cx),
             speak: Pick::new(&[("all", "All"), ("limit", "Limit")], &edit.tts_speak_mode, window, cx),
             tabs: Pick::new(&[("none", "None"), ("top", "Show Top Ribbon"), ("bottom", "Show Bottom Ribbon")], &edit.tabs, window, cx),
             icon_bar: Pick::new(&[("none", "None"), ("app_tablet", "App/Tablet"), ("all", "All")], &edit.icon_bar, window, cx),
@@ -261,6 +264,7 @@ impl SettingsView {
         s.gui_theme = self.theme.value(cx);
         s.tts_mode = self.tts.value(cx);
         s.tts_speak_mode = self.speak.value(cx);
+        s.tts_voice = crate::kokoro::normalize_voice(&self.text(&self.fields.voice, cx));
         s.tabs = self.tabs.value(cx);
         s.icon_bar = self.icon_bar.value(cx);
         let rows = super::super::input_view::input_height_of(&s).clamp(1, 15);
@@ -388,6 +392,7 @@ impl SettingsView {
         let right = toggles(right_toggles, cx)
             .child(row(k, "TTS", self.tts.view()))
             .child(row(k, "Speak Mode", self.speak.view()))
+            .child(row(k, "Kokoro Voice", k.input(&self.fields.voice).font_family(k.fonts.ui.clone()).text_size(px(12.0)).into_any_element()))
             .child(row(k, "Tabs", self.tabs.view()))
             .child(row(k, "Icon Bar", self.icon_bar.view()));
         // Two cards: the values, then the switches and the remaining choices.

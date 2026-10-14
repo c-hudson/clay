@@ -1817,6 +1817,8 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
+                app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
+                app.settings.tts_voice = crate::kokoro::normalize_voice(&settings.tts_voice);
                 app.settings.scrollback_enabled = settings.scrollback;
                 app.settings.log_input_enabled = settings.log_input;
                 // No local needs_output_redraw here — this is a remote console client; the
@@ -1873,6 +1875,7 @@ pub(crate) fn handle_remote_client_key(
                     new_line_indicator: app.settings.new_line_indicator,
                     tts_mode: app.settings.tts_mode.name().to_string(),
                     tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
+                    tts_voice: app.settings.tts_voice.clone(),
                     scrollback_enabled: app.settings.scrollback_enabled,
                     log_input_enabled: app.settings.log_input_enabled,
                     keyboard_always_visible: app.settings.keyboard_always_visible,
@@ -3068,6 +3071,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         new_line_indicator: app.settings.new_line_indicator,
         tts_mode: app.settings.tts_mode.name().to_string(),
         tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
+        tts_voice: app.settings.tts_voice.clone(),
         scrollback_enabled: app.settings.scrollback_enabled,
         log_input_enabled: app.settings.log_input_enabled,  // unchanged — this function only touches web settings
         keyboard_always_visible: app.settings.keyboard_always_visible,

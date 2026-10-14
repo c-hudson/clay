@@ -140,6 +140,12 @@ pub struct ClayView {
     /// The MUD's sounds and the server's speech: the main window's (the others get the
     /// same messages, and mustn't play them again).
     media: Option<crate::native_gui::core::media::Media>,
+    /// This GUI has said once that Kokoro is not installed on its machine (`after`).
+    kokoro_missing_told: bool,
+    /// The voice whose model this GUI asked to have loaded ahead (`warm_kokoro_if_wanted`);
+    /// `Some("")` once it found the files missing, so it does not look again until a
+    /// local `/tts install` finishes.
+    kokoro_warmed: Option<String>,
     /// The current world and whether its media is on, as last seen: turning it off
     /// stops what it started (app.js `GmcpUserToggled`).
     media_gate: Option<(usize, bool)>,
@@ -215,6 +221,8 @@ impl ClayView {
             mode: Default::default(),
             link: Default::default(),
             media: None,
+            kokoro_missing_told: false,
+            kokoro_warmed: None,
             media_gate: None,
             opacity: Default::default(),
         };
@@ -224,8 +232,15 @@ impl ClayView {
         view
     }
 
-    /// Effects the session left for us: redraw, and the GUI's own messages.
+    /// What the core's effects mean here. The session does its part first - a `Send`
+    /// goes out on the connection (or to a follower's leader) - and the window shows the
+    /// rest: a redraw, and the GUI's own messages. An effect the session already applied
+    /// passes through unchanged, so a caller may hand this either the core's effects or
+    /// the session's leftovers. Applying here is what makes a core call safe to use on
+    /// its own: a shell world's keys (`shell_key`/`shell_text`/`shell_paste`) came here
+    /// unapplied and were silently never sent.
     fn after(&mut self, effects: Vec<Effect>, cx: &mut Context<Self>) {
+        let effects = self.session.apply(effects);
         let mut changed = false;
         let mut local = Vec::new();
         for e in effects {
@@ -258,9 +273,16 @@ impl ClayView {
                         }
                     }
                     crate::websocket::WsMessage::ServerSpeak { text, .. } => {
-                        let mode = crate::tts::TtsMode::from_name(self.session.core.settings.as_ref().map_or("", |s| s.tts_mode.as_str()));
-                        if let Some(m) = self.media.as_mut() {
-                            m.speak(&text, mode);
+                        let settings = self.session.core.settings.as_ref();
+                        let mode = crate::tts::TtsMode::from_name(settings.map_or("", |s| s.tts_mode.as_str()));
+                        let voice = settings.map_or(crate::kokoro::DEFAULT_VOICE, |s| s.tts_voice.as_str()).to_string();
+                        let fell_back = self.media.as_mut().is_some_and(|m| m.speak(&text, mode, &voice));
+                        // Attached to another Clay, the voice is this machine's: say once
+                        // when Kokoro was chosen but its files aren't here. (Running Clay
+                        // itself, the server's own notice covers it - same files.)
+                        if fell_back && !self.kokoro_missing_told && !crate::native_gui::runs_clay() {
+                            self.kokoro_missing_told = true;
+                            self.client_line(Self::KOKORO_MISSING_HERE, cx);
                         }
                     }
                     // The web client passes these to Android's notifications only.
@@ -288,6 +310,7 @@ impl ClayView {
         self.watch_media();
         if changed {
             self.apply_settings();
+            self.warm_kokoro_if_wanted();
             if std::mem::take(&mut self.surf.actions_changed) {
                 cx.emit(windows::MainEvent::Actions);
             }
@@ -569,6 +592,39 @@ impl ClayView {
     }
 
     /// The server's display settings, whenever they change.
+    /// Attached to another Clay with Kokoro as the engine and its files on this machine:
+    /// load the model now, once per voice, so the first line spoken does not wait for
+    /// it. (Running Clay itself, the server warms its own, the one that speaks.) The
+    /// files are looked for once; a local `/tts install` resets that.
+    pub(super) fn warm_kokoro_if_wanted(&mut self) {
+        if crate::native_gui::runs_clay() {
+            return;
+        }
+        let Some(s) = self.session.core.settings.as_ref() else { return };
+        if crate::tts::TtsMode::from_name(&s.tts_mode) != crate::tts::TtsMode::Kokoro {
+            // Switched away: let the model and the audio stream go (nothing without an
+            // engine), and warm again should the setting come back.
+            self.kokoro_warmed = None;
+            if let Some(m) = self.media.as_ref() {
+                m.release_kokoro();
+            }
+            return;
+        }
+        let voice = crate::kokoro::normalize_voice(&s.tts_voice);
+        if self.kokoro_warmed.as_deref().is_some_and(|w| w.is_empty() || w == voice) {
+            return;
+        }
+        // No media backend yet (the window attaches it after construction): try again
+        // when there is one, so nothing is marked done here.
+        let Some(m) = self.media.as_mut() else { return };
+        if !crate::kokoro::install().complete() {
+            self.kokoro_warmed = Some(String::new());
+            return;
+        }
+        m.warm_kokoro(&voice);
+        self.kokoro_warmed = Some(voice);
+    }
+
     fn apply_settings(&mut self) {
         let Some(s) = self.surf.preview.as_ref().or(self.session.core.settings.as_ref()) else { return };
         self.keys.update(s);
@@ -1154,6 +1210,7 @@ pub(super) fn open_view_window(
                     // The window with the connection plays the sounds.
                     if starts {
                         v.media = Some(crate::native_gui::core::media::Media::new(emoji::runtime()));
+                        v.warm_kokoro_if_wanted();
                     }
                     v
                 });

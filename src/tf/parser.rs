@@ -1988,7 +1988,7 @@ Keybind editor: open http://localhost:<port>/keybind-editor in a browser
                 "/send [-W] [-T<type>] [-w[<world>]] [-n] [-h] text\n\nSend text to a world (or several), bypassing macro/alias expansion.\n\nOptions:\n  -W          Send to every connected world\n  -T<type>    Send to every connected world whose type matches <type>\n  -w<world>   Send to <world> (attached, no space; bare -w means the current world)\n  -n          Do not append an end-of-line marker\n  -h          Fire the SEND hook first (by default /send does not run hooks)\n\nExamples:\n  /send say Hello everyone!\n  /send -wOtherMUD look\n  /send -W quit\n  /send -Tmud who".to_string()
             )),
             "say" => TfCommandResult::Success(Some(
-                "/say <text>\n\nSpeak text aloud via text-to-speech.\nConsole: uses espeak, espeak-ng, say (macOS), or PowerShell (Windows).\nWeb/Android: uses the browser's Web Speech API.\n\nExample: /say Hello world\n\nEnable automatic TTS for MUD output in Setup > TTS.".to_string()
+                "/say <text>\n\nSpeak text aloud via text-to-speech.\nConsole/GUI: the TTS mode set in /setup - Local (espeak, say, PowerShell), Kokoro (the neural voice from /tts install) or Edge (cloud).\nWeb/Android: uses the browser's Web Speech API.\n\nExample: /say Hello world\n\nEnable automatic TTS for MUD output in Setup > TTS.".to_string()
             )),
             "def" => TfCommandResult::Success(Some(
                 r#"/def [options] name = body
@@ -2465,7 +2465,7 @@ Settings:
   /insert  /borg  /redef  /shpause  /sockmload  /background  /clearfull
   /cleardone  /gpri  /hpri  /isize  /ptime  /wrapspace  /kecho  /mecho  /qecho
   /input  /grab  /trigger  /more  /wrap  /restrict  /core
-  /features  /ver  /man  /say
+  /features  /ver  /man  /say  /tts
 Legacy/stub (accepted for script compatibility; mapped to a Clay
 equivalent or a no-op - see /help <command>):
   /telnet  /finger  /getfile  /putfile  /liststreams  /changes
@@ -4648,7 +4648,7 @@ mod tests {
         const CLAY_NATIVE_ONLY: &[&str] = &[
             "actions", "chat", "dict", "dump", "flush", "font", "import",
             "menu", "msdp", "mssp", "note", "notify", "reload", "remote", "server", "setup", "stats", "tag",
-            "testmusic", "tfgag", "tfhelp", "translate", "unban", "update",
+            "testmusic", "tfgag", "tfhelp", "translate", "tts", "unban", "update",
             "urban", "url", "web", "window",
         ];
 

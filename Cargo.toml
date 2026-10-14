@@ -75,6 +75,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # UUID for Edge TTS request IDs
 uuid = { version = "1", features = ["v4"] }
+# Kokoro TTS (src/kokoro.rs): the sherpa-onnx runtime is downloaded at runtime and loaded
+# with libloading; its tarballs and the model's are .tar.bz2 (pure-Rust bzip2 backend).
+libloading = "0.8"
+tar = "0.4"
+bzip2 = "0.6"   # its default backend is the pure-Rust libbz2-rs-sys
 
 # Long-term output archive (scrollback storage)
 rusqlite = { version = "0.31", features = ["bundled"] }

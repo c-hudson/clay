@@ -148,6 +148,48 @@ mod rendered {
         assert_eq!(screen.frame, before + 1, "a delta advances the frame");
         assert!(!screen.has_changes(), "a delta clears the changed flag");
     }
+
+    /// After a `/reload` re-attaches a shell, the program's repaint is not activity: text
+    /// appearing inside the quiet window is not counted, text after it is.
+    #[test]
+    fn a_reloads_repaint_is_not_activity() {
+        use std::time::{Duration, Instant};
+        let (term, mut screen) = term_with(&[b"$ "]);
+        let mut parser: Processor = Processor::new();
+        let mut term = term;
+        screen.ignore_activity_until(Instant::now() + Duration::from_secs(60));
+        parser.advance(&mut term, b"\r\n[Clay reloaded]\r\n$ ");
+        let repaint = screen.apply(render_rows(&term));
+        assert!(repaint.changed, "the screen did change");
+        assert!(!repaint.gained_printable, "but a reload's repaint is not news");
+        // The window over: real output counts again.
+        screen.ignore_activity_until(Instant::now() - Duration::from_secs(1));
+        parser.advance(&mut term, b"You have new mail.");
+        let later = screen.apply(render_rows(&term));
+        assert!(later.gained_printable, "text after the window is activity");
+    }
+
+    /// The client side: a delta that doesn't build on the frame held asks for the whole
+    /// screen once; the stale deltas in flight until it arrives are dropped without
+    /// asking again, and a delta rejected after the full frame asks afresh.
+    #[test]
+    fn stale_deltas_ask_for_a_full_frame_once() {
+        use crate::websocket::{ShellCursorMsg, ShellModeMsg};
+        let (cur, mode) = (ShellCursorMsg::default(), ShellModeMsg::default());
+        let mut client = ShellScreen::new(80, 24);
+        assert!(client.apply_msg(7, None, 80, 24, &[(0, "$ ".into())], cur, mode, None, true), "a full frame always applies");
+        assert!(client.apply_msg(8, Some(7), 80, 24, &[(0, "$ x".into())], cur, mode, None, true), "a delta on the held frame applies");
+        assert_eq!(client.frame, 8);
+        // A resize on the server: the next delta carries other dimensions.
+        assert!(!client.apply_msg(9, Some(8), 73, 24, &[], cur, mode, None, true), "out of step: ask for the screen");
+        assert!(client.apply_msg(10, Some(9), 73, 24, &[], cur, mode, None, true), "still waiting: dropped, no second request");
+        assert!(client.apply_msg(11, Some(10), 73, 24, &[], cur, mode, None, true), "and again");
+        assert_eq!(client.frame, 8, "nothing stale was applied");
+        assert!(client.apply_msg(11, None, 73, 24, &[(0, "$ x".into())], cur, mode, None, true), "the full frame lands");
+        assert_eq!((client.frame, client.cols), (11, 73));
+        assert!(client.apply_msg(12, Some(11), 73, 24, &[], cur, mode, None, true), "back in step");
+        assert!(!client.apply_msg(14, Some(13), 73, 24, &[], cur, mode, None, true), "out of step after the full frame: asks again");
+    }
 }
 
 /// A real PTY: start a short-lived shell, see its output and its exit code, with Clay's

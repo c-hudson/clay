@@ -78,6 +78,10 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                 if let Ok(p) = std::env::var("CLAY_SNAPSHOT_GREP") {
                     view.mode.grep = Some(super::viewmode::Grep::new(&p, false));
                 }
+                // As the real window with the connection: it plays the sounds (and
+                // speaks), so a /tts or ServerSpeak step goes through the same path.
+                view.media = Some(crate::native_gui::core::media::Media::new(super::emoji::runtime()));
+                view.warm_kokoro_if_wanted();
                 window.focus(&view.focus.clone(), cx);
                 view
             });

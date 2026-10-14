@@ -326,6 +326,123 @@ impl ClayView {
         }
     }
 
+    /// What this GUI says, once, when Kokoro is the engine but its files aren't on this
+    /// machine (the server's are no use: the voice plays here).
+    pub(super) const KOKORO_MISSING_HERE: &'static str =
+        "Kokoro is not installed on this machine, so the local engine speaks instead. /tts install downloads it here (about 160 MB).";
+
+    /// `/tts` on a GUI attached to another Clay. The voice plays on *this* machine, so
+    /// status, install, remove and test are about this machine's files (`~/.clay/tts`
+    /// here), as the server's `App::tts_command` is about its own. `voices` and `voice`
+    /// are the shared setting and go to the server: returns false for those (and for
+    /// anything else, which the server answers with its usage line).
+    pub(super) fn tts_command(&mut self, args: &[&str], cx: &mut Context<Self>) -> bool {
+        use crate::kokoro;
+        use crate::tts::TtsMode;
+        let (mode, speak_mode, voice) = match self.session.core.settings.as_ref() {
+            Some(s) => (s.tts_mode.clone(), s.tts_speak_mode.clone(), s.tts_voice.clone()),
+            None => (String::new(), String::new(), kokoro::DEFAULT_VOICE.to_string()),
+        };
+        let sub = args.first().map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "status".to_string());
+        let lines: Vec<String> = match sub.as_str() {
+            "status" => {
+                let mut v = vec![format!("TTS: {mode} (speak mode {speak_mode}), Kokoro voice: {voice} - this GUI speaks, with this machine's files:")];
+                v.extend(kokoro::status_lines());
+                if let Some(engine) = self.media.as_ref().and_then(|m| m.kokoro_engine()) {
+                    v.push(format!("  engine: {}", if engine.loaded() { "model loaded" } else { "not loaded yet" }));
+                    if let Some(o) = engine.output_kind() {
+                        v.push(format!("  plays through: {o}"));
+                    }
+                    if let Some(e) = engine.last_error() {
+                        v.push(format!("  last error: {e}"));
+                    }
+                }
+                v
+            }
+            "install" => match kokoro::install_check() {
+                Err(why) => vec![why.replace("already installed", "already installed on this machine")],
+                Ok(note) => {
+                    match super::emoji::runtime() {
+                        None => vec!["Kokoro: no runtime to download with.".to_string()],
+                        Some(runtime) => {
+                            // The download runs on the tokio runtime; its progress lines
+                            // come back here through a channel, as the self-update does.
+                            let (tx, mut rx) = futures::channel::mpsc::unbounded::<(String, bool)>();
+                            runtime.spawn(async move {
+                                let say = |line: String, done: bool| {
+                                    let tx = tx.clone();
+                                    async move {
+                                        let _ = tx.unbounded_send((line, done));
+                                    }
+                                };
+                                match kokoro::install_files_with(&say).await {
+                                    Ok(summary) => say(summary, true).await,
+                                    Err(e) => say(format!("Kokoro: install failed: {e}"), true).await,
+                                }
+                            });
+                            cx.spawn(async move |this, cx| {
+                                use futures::StreamExt;
+                                while let Some((line, done)) = rx.next().await {
+                                    let shown = this.update(cx, |v, cx| {
+                                        v.client_line(&line, cx);
+                                        if done {
+                                            // The files may be here now: load the model
+                                            // ahead if Kokoro is the engine.
+                                            v.kokoro_warmed = None;
+                                            v.warm_kokoro_if_wanted();
+                                        }
+                                    });
+                                    if shown.is_err() || done {
+                                        break;
+                                    }
+                                }
+                            })
+                            .detach();
+                            vec![note]
+                        }
+                    }
+                }
+            }
+            "remove" => {
+                // Unload too: the Local engine speaks from here on.
+                if let Some(m) = self.media.as_ref() {
+                    m.release_kokoro();
+                }
+                self.kokoro_warmed = None;
+                vec![kokoro::remove_files().unwrap_or_else(|e| format!("Kokoro: {e}"))]
+            }
+            "test" => {
+                let installed = kokoro::install().complete();
+                let mode = match TtsMode::from_name(&mode) {
+                    TtsMode::Off if installed => TtsMode::Kokoro,
+                    TtsMode::Off => TtsMode::Local,
+                    m => m,
+                };
+                let engine = match mode {
+                    TtsMode::Kokoro if installed => format!("Kokoro voice {voice}"),
+                    TtsMode::Kokoro => "local engine (Kokoro is not installed on this machine yet - /tts install)".to_string(),
+                    TtsMode::Local => "local engine".to_string(),
+                    TtsMode::Edge => "Edge cloud voice".to_string(),
+                    TtsMode::Off => unreachable!(),
+                };
+                let text = "Hello from Clay. The dragon's lair lies north of the Misty Falls; bring torches, 3 rations and 40 gold.";
+                match self.media.as_mut() {
+                    Some(m) => {
+                        let loading = mode == TtsMode::Kokoro && installed && !m.kokoro_engine().is_some_and(|e| e.loaded());
+                        m.speak(text, mode, &voice);
+                        vec![format!("Speaking a test line with the {engine}{} (this GUI).", if loading { "; loading the model first" } else { "" })]
+                    }
+                    None => vec!["% This GUI has no audio backend to speak with.".to_string()],
+                }
+            }
+            _ => return false,
+        };
+        for line in lines {
+            self.client_line(&line, cx);
+        }
+        true
+    }
+
     /// Start this GUI again as it was started (its binary is new now). Returns only if
     /// that failed.
     fn restart_now(&mut self, cx: &mut Context<Self>) {

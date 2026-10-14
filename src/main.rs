@@ -37,6 +37,7 @@ pub mod commands;
 pub mod remote_client;
 pub mod ssh;
 pub mod tts;
+pub mod kokoro;
 pub mod scrollback;
 pub mod stats;
 pub mod protocol_state;
@@ -1859,6 +1860,8 @@ pub struct Settings {
     /// Icon bar visibility mode (web/GUI/Android only, see IconBarMode)
     pub icon_bar: IconBarMode,
     pub tts_speak_mode: tts::TtsSpeakMode,
+    /// The Kokoro voice (`kokoro::VOICES`; always a known name, `kokoro::normalize_voice`).
+    pub tts_voice: String,
     pub tts_muted: bool,  // Runtime-only, toggled by F9
     pub scrollback_enabled: bool,
     /// Whether captured user-typed input (see `OutputLine::is_input`) additionally gets
@@ -1952,6 +1955,7 @@ impl Default for Settings {
             tabs: TabsMode::None,
             icon_bar: IconBarMode::AppTablet,
             tts_speak_mode: tts::TtsSpeakMode::All,
+            tts_voice: kokoro::DEFAULT_VOICE.to_string(),
             tts_muted: false,
             scrollback_enabled: false,
             log_input_enabled: false,
@@ -2331,11 +2335,33 @@ pub(crate) const PUSH_MAX_CYCLE_BYTES: usize = 192 * 1024;
 #[allow(dead_code)]
 pub(crate) const PUSH_MIN_CHANNEL_SLOTS: usize = 8;
 
+/// How many visited worlds a viewer's history keeps (`App::world_history`,
+/// `ClientViewState::history`): Esc-w walks it back only as far as the first world that
+/// is still connected, so a short list is plenty.
+const WORLD_HISTORY_LEN: usize = 16;
+
+/// What this Clay says when Kokoro is the engine but its files are not here (the native
+/// GUI attached to another Clay has its own line, `ClayView::KOKORO_MISSING_HERE`: the
+/// voice plays on its machine).
+pub(crate) const KOKORO_MISSING: &str =
+    "Kokoro is not installed on this Clay yet, so the Local engine speaks until /tts install downloads it (about 160 MB).";
+
+/// `name` goes to the front of a visit history, once.
+fn push_visited(history: &mut Vec<String>, name: String) {
+    history.retain(|n| n != &name);
+    history.insert(0, name);
+    history.truncate(WORLD_HISTORY_LEN);
+}
+
 /// Tracks a WebSocket client's view state for synchronized more-mode
 #[derive(Clone, Debug)]
 pub struct ClientViewState {
     /// Which world the client is viewing
     pub world_index: usize,
+    /// The worlds this client viewed before, by name, most recent first and never the
+    /// current one: Esc-w's last tier is per viewer (`App::client_history_after`; the
+    /// console's own is `App::world_history`).
+    pub history: Vec<String>,
     /// Number of visible output lines in the client's display
     pub visible_lines: usize,
     /// Number of visible columns in the client's output area (0 = not reported)
@@ -2553,6 +2579,8 @@ pub enum Command {
     TinyUrlUsage,
     /// /say <text> - speak text aloud via TTS
     Say { text: String },
+    /// `/tts [status|install|remove|voices|voice <name>|test]` (src/kokoro.rs).
+    Tts { args: Vec<String> },
     /// /window [world] - open a new GUI/web window, optionally locked to a world
     Window { world: Option<String> },
     /// /<action_name> [args] - execute action
@@ -2728,6 +2756,7 @@ pub fn parse_command(input: &str) -> Command {
                 Command::TinyUrlUsage
             }
         }
+        "/tts" => Command::Tts { args: args.iter().map(|a| a.to_string()).collect() },
         "/say" => {
             if !args.is_empty() {
                 // Preserve the original text after /say (not split by whitespace)
@@ -5318,7 +5347,13 @@ type OutputRun<'a> = (bool, Vec<(&'a str, Option<String>)>);
 pub struct App {
     pub worlds: Vec<World>,
     pub current_world_index: usize,
-    pub previous_world_index: Option<usize>, // For Alt+w fallback when no unseen/pending
+    /// The console's visited worlds by name, most recent first and never the current one:
+    /// Esc-w's last tier (TinyFugue's `prev_worlds`). Names, so a world added or removed
+    /// needs no index fix-up; a renamed or deleted world simply no longer resolves.
+    pub world_history: Vec<String>,
+    /// Kokoro was asked for without its files and the user has been told (once per run;
+    /// `note_kokoro_missing`).
+    pub kokoro_missing_told: bool,
     pub input: InputArea,
     pub input_height: u16,
     /// A mouse drag of the separator bar (the input's top edge) in progress: the row it
@@ -5645,7 +5680,8 @@ impl App {
         Self {
             worlds: Vec::new(),
             current_world_index: 0,
-            previous_world_index: None,
+            world_history: Vec::new(),
+            kokoro_missing_told: false,
             input: InputArea::new(3),
             input_height: 3,
             input_resize_drag: None,
@@ -5927,6 +5963,7 @@ impl App {
             new_line_indicator: self.settings.new_line_indicator,
             tts_mode: self.settings.tts_mode.name().to_string(),
             tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
+            tts_voice: self.settings.tts_voice.clone(),
             scrollback_enabled: self.settings.scrollback_enabled,
             log_input_enabled: self.settings.log_input_enabled,
             keyboard_always_visible: self.settings.keyboard_always_visible,
@@ -6023,6 +6060,9 @@ impl App {
         let old_tts_mode = self.settings.tts_mode;
         self.settings.tts_mode = tts::TtsMode::from_name(&settings.tts_mode);
         self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
+        if !settings.tts_voice.is_empty() {
+            self.settings.tts_voice = kokoro::normalize_voice(&settings.tts_voice);
+        }
         // Auto-unmute when TTS is enabled
         if old_tts_mode == tts::TtsMode::Off && self.settings.tts_mode != tts::TtsMode::Off {
             self.settings.tts_muted = false;
@@ -6619,6 +6659,7 @@ impl App {
             self.settings.new_line_indicator,
             self.settings.tts_mode.name(),
             self.settings.tts_speak_mode.name(),
+            &self.settings.tts_voice,
             self.settings.scrollback_enabled,
             self.settings.log_input_enabled,
             self.settings.wrapspace as i64,
@@ -7046,6 +7087,9 @@ impl App {
                     // nothing else here ever clears them.
                     world.stats_line_shown = false;
                     world.mirrored_stats.clear();
+                    // The connection's echo mask ends with it (the server resets its own
+                    // in clear_connection_state and says so too; this is the belt).
+                    world.protocol.echo_masked = false;
                     // A shell world: freeze its screen (the session is gone server-side).
                     if let Some(screen) = world.shell_screen.as_mut() {
                         screen.set_exited();
@@ -7617,20 +7661,14 @@ impl App {
                 //     if (selectedWorldIndex >= insertIndex) selectedWorldIndex++;
                 //
                 // `selectedWorldIndex` is the web world-selector popup's own UI state with
-                // no counterpart here; `previous_world_index` is this client's analogous
-                // "other" index (Alt+w fallback) and gets the same bump instead. `idx` is
-                // clamped against our own length in case a racing/stale peer sends an
-                // index that's since gone out of range.
+                // no counterpart here (the visit history is kept by name, so it needs no
+                // bump). `idx` is clamped against our own length in case a racing/stale
+                // peer sends an index that's since gone out of range.
                 let idx = world.index.min(self.worlds.len());
                 let new_world = self.world_from_state_msg(*world);
                 self.worlds.insert(idx, new_world);
                 if self.current_world_index >= idx {
                     self.current_world_index += 1;
-                }
-                if let Some(prev) = self.previous_world_index {
-                    if prev >= idx {
-                        self.previous_world_index = Some(prev + 1);
-                    }
                 }
                 self.needs_output_redraw = true;
             }
@@ -8161,8 +8199,9 @@ impl App {
             // console's - a remote client sitting on that same world keeps its markers,
             // which is the behaviour the shared watermark could not provide.
             self.release_world_for(old_index, CONSOLE_DISPLAY_ID, None);
-            // Track previous world for Alt+w fallback
-            self.previous_world_index = Some(self.current_world_index);
+            // The world we leave goes to the front of the visit history (Esc-w's last tier).
+            let leaving = self.worlds[old_index].name.clone();
+            push_visited(&mut self.world_history, leaving);
             self.current_world_index = index;
             // ...and claim whatever accumulated unviewed on the world we're arriving at.
             self.claim_world_for(index, CONSOLE_DISPLAY_ID, None);
@@ -8184,53 +8223,18 @@ impl App {
         }
     }
 
-    /// Switch to a world with activity (Alt-w)
-    /// Priority: 1) oldest pending output, 2) any unseen output, 3) previous world
-    /// Returns true if switched, false if nowhere to switch
+    /// The console's Esc-w: switch to the world with activity, else back to the last world
+    /// visited that is still connected (`calculate_oldest_pending_world_from`, with the
+    /// console's own visit history). Returns true if switched, false if nowhere to switch.
     fn switch_to_oldest_pending(&mut self) -> bool {
-        // First, check for worlds with pending output (paused lines)
-        let mut oldest_idx: Option<usize> = None;
-        let mut oldest_time: Option<std::time::Instant> = None;
-
-        for (idx, world) in self.worlds.iter().enumerate() {
-            // Skip current world and worlds without pending output
-            if idx == self.current_world_index || world.pending_lines.is_empty() {
-                continue;
-            }
-            if let Some(pending_time) = world.pending_since {
-                if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
-                    oldest_time = Some(pending_time);
-                    oldest_idx = Some(idx);
-                }
-            }
-        }
-
-        if let Some(idx) = oldest_idx {
-            self.switch_world(idx);
-            return true;
-        }
-
-        // Second, check for worlds with unseen output (activity indicator),
-        // or worlds left paused with hidden VLO-truncated rows and nothing
-        // pending (e.g. viewed then switched away without releasing).
-        for (idx, world) in self.worlds.iter().enumerate() {
-            if idx != self.current_world_index
-                && (world.unseen_lines > 0 || (world.paused && world.visual_line_offset > 0))
-            {
+        let history = self.world_history.clone();
+        match self.calculate_oldest_pending_world_from(self.current_world_index, &history) {
+            Some(idx) => {
                 self.switch_world(idx);
-                return true;
+                true
             }
+            None => false,
         }
-
-        // Third, fall back to previous world if it exists and is different
-        if let Some(prev_idx) = self.previous_world_index {
-            if prev_idx < self.worlds.len() && prev_idx != self.current_world_index {
-                self.switch_world(prev_idx);
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Calculate minimum output dimensions across all connected instances (console + web clients)
@@ -8464,49 +8468,38 @@ impl App {
         crate::util::calculate_prev_world(&world_info, from_index, self.settings.world_switch_mode)
     }
 
-    /// `WsMessage::CalculateOldestPending` handling — shared by master-WS and daemon (T39).
-    /// Priority: 1) oldest pending output, 2) any unseen output, 3) the previously-viewed
-    /// world. Daemon's inline copy was missing tier 3 entirely (no `previous_world_index`
-    /// fallback), so "switch to the world needing attention" (Escape+w) had a strictly weaker
-    /// fallback for daemon-attached clients — if no world had pending or unseen output, it
-    /// returned nothing instead of falling back to wherever the client was previously.
-    fn calculate_oldest_pending_world_from(&self, current_index: usize) -> Option<usize> {
-        let mut oldest_idx: Option<usize> = None;
-        let mut oldest_time: Option<std::time::Instant> = None;
-
-        // Check for worlds with pending output
-        for (idx, world) in self.worlds.iter().enumerate() {
-            if idx == current_index || world.pending_lines.is_empty() {
-                continue;
-            }
-            if let Some(pending_time) = world.pending_since {
-                if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
-                    oldest_time = Some(pending_time);
-                    oldest_idx = Some(idx);
-                }
-            }
+    /// Where Esc-w goes from `current_index` - the console's (`switch_to_oldest_pending`)
+    /// and every client's (`WsMessage::CalculateOldestPending`, with that client's own
+    /// `ClientViewState::history`). The rule is TinyFugue's `world-q.tf`, which binds ESC-w
+    /// to `/to_active_or_prev_world`: the active worlds in the order their activity began,
+    /// and when none is left "the last world you visited that is still connected", walking
+    /// back through the visit history past any that disconnected. Here that is first the
+    /// world whose held (more-mode) output is oldest, then the world whose unseen output
+    /// arrived first (a world left paused with hidden rows counts too), and last the most
+    /// recent world in `history` that is connected and not the current one. None: stay.
+    fn calculate_oldest_pending_world_from(&self, current_index: usize, history: &[String]) -> Option<usize> {
+        // 1) Oldest held output.
+        let oldest_pending = self.worlds.iter().enumerate()
+            .filter(|(idx, w)| *idx != current_index && !w.pending_lines.is_empty())
+            .filter_map(|(idx, w)| w.pending_since.map(|t| (t, idx)))
+            .min_by_key(|(t, _)| *t)
+            .map(|(_, idx)| idx);
+        if oldest_pending.is_some() {
+            return oldest_pending;
         }
-
-        // If no pending, check for unseen output
-        if oldest_idx.is_none() {
-            for (idx, world) in self.worlds.iter().enumerate() {
-                if idx != current_index && world.unseen_lines > 0 {
-                    oldest_idx = Some(idx);
-                    break;
-                }
-            }
+        // 2) Oldest unseen output (a world with no timestamp - left paused with hidden
+        // VLO-truncated rows and nothing pending - comes after those that have one).
+        let oldest_unseen = self.worlds.iter().enumerate()
+            .filter(|(idx, w)| *idx != current_index && (w.unseen_lines > 0 || (w.paused && w.visual_line_offset > 0)))
+            .min_by_key(|(idx, w)| (w.first_unseen_at.is_none(), w.first_unseen_at, *idx))
+            .map(|(idx, _)| idx);
+        if oldest_unseen.is_some() {
+            return oldest_unseen;
         }
-
-        // If still none, use previous world
-        if oldest_idx.is_none() {
-            if let Some(prev_idx) = self.previous_world_index {
-                if prev_idx != current_index && prev_idx < self.worlds.len() {
-                    oldest_idx = Some(prev_idx);
-                }
-            }
-        }
-
-        oldest_idx
+        // 3) The last world visited that is still connected.
+        history.iter()
+            .filter_map(|name| self.find_world_index(name))
+            .find(|&idx| idx != current_index && self.worlds[idx].connected)
     }
 
     /// `WsMessage::CycleWorld` handling — shared by master-WS and daemon (T39). Confirmed
@@ -8532,8 +8525,10 @@ impl App {
         let dimensions = prev.and_then(|s| s.dimensions);
         let paused = prev.map(|s| s.paused).unwrap_or(false);
         let visible = prev.map(|s| s.visible).unwrap_or(true);
+        let history = self.client_history_after(client_id, None, idx);
         self.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: idx,
+            history,
             visible_lines,
             visible_columns,
             dimensions,
@@ -8934,6 +8929,23 @@ impl App {
         self.send_shell_full_frame(client_id, world_index);
     }
 
+    /// A client's visit history once it shows `world_index`: the world it leaves -
+    /// `leaving` when the client said which (`MarkWorldSeen`), else the one it was on -
+    /// goes to the front (TinyFugue's `prev_worlds`); staying on the same world changes
+    /// nothing. Every site that moves a client's `ClientViewState` to another world
+    /// stores this, or Esc-w has no world to fall back to for that client.
+    pub(crate) fn client_history_after(&self, client_id: u64, leaving: Option<usize>, world_index: usize) -> Vec<String> {
+        let prev = self.ws_client_worlds.get(&client_id);
+        let mut history = prev.map(|v| v.history.clone()).unwrap_or_default();
+        let leaving = leaving.or(prev.map(|v| v.world_index));
+        if let Some(from) = leaving.filter(|&from| from != world_index) {
+            if let Some(w) = self.worlds.get(from) {
+                push_visited(&mut history, w.name.clone());
+            }
+        }
+        history
+    }
+
     /// `WsMessage::MarkWorldSeen` handling — shared by master-WS and daemon single-user
     /// paths. `previous_world_index` (sent by the client when it knows the world it's
     /// leaving) takes priority over the `ws_client_worlds` lookup, which goes stale across
@@ -8967,7 +8979,8 @@ impl App {
         let dimensions = prev.and_then(|s| s.dimensions);
         let paused = prev.map(|v| v.paused).unwrap_or(false);
         let visible = prev.map(|v| v.visible).unwrap_or(true);
-        self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
+        let history = self.client_history_after(client_id, old_world_idx, world_index);
+        self.ws_client_worlds.insert(client_id, ClientViewState { world_index, history, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
         // Update client's world in WebSocket server (async state)
         self.ws_set_client_world(client_id, Some(world_index));
         // This client is now displaying the new world - claim whatever accumulated unviewed
@@ -9079,14 +9092,6 @@ impl App {
                 if self.current_world_index > idx {
                     self.current_world_index -= 1;
                 }
-                // Adjust previous_world_index if needed
-                if let Some(prev) = self.previous_world_index {
-                    if prev >= self.worlds.len() {
-                        self.previous_world_index = Some(self.worlds.len().saturating_sub(1));
-                    } else if prev > idx {
-                        self.previous_world_index = Some(prev - 1);
-                    }
-                }
             }
         }
     }
@@ -9105,13 +9110,6 @@ impl App {
             self.current_world_index -= 1;
         } else if self.current_world_index >= self.worlds.len() {
             self.current_world_index = self.worlds.len().saturating_sub(1);
-        }
-        if let Some(prev) = self.previous_world_index {
-            if prev >= self.worlds.len() {
-                self.previous_world_index = self.worlds.len().checked_sub(1);
-            } else if prev > world_index {
-                self.previous_world_index = Some(prev - 1);
-            }
         }
     }
 
@@ -9761,23 +9759,16 @@ impl App {
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
     }
 
-    /// Fix up `current_world_index`/`previous_world_index` after a world at `world_index`
-    /// has already been removed from `self.worlds` — shared by `delete_world`'s own
-    /// removal and the SSH remote console's `WorldRemoved` mirror (T1.13), so both stay
-    /// identical instead of drifting the way the mirror used to (it never called this at
-    /// all, see `handle_remote_ws_message`).
+    /// Fix up `current_world_index` after a world at `world_index` has already been
+    /// removed from `self.worlds` — shared by `delete_world`'s own removal and the SSH
+    /// remote console's `WorldRemoved` mirror (T1.13), so both stay identical instead of
+    /// drifting the way the mirror used to (it never called this at all, see
+    /// `handle_remote_ws_message`). The visit history is by name and needs nothing here.
     fn fixup_indices_after_remove(&mut self, world_index: usize) {
         if self.current_world_index >= self.worlds.len() {
             self.current_world_index = self.worlds.len().saturating_sub(1);
         } else if self.current_world_index > world_index {
             self.current_world_index -= 1;
-        }
-        if let Some(prev) = self.previous_world_index {
-            if prev >= self.worlds.len() {
-                self.previous_world_index = Some(self.worlds.len().saturating_sub(1));
-            } else if prev > world_index {
-                self.previous_world_index = Some(prev - 1);
-            }
         }
     }
 
@@ -10035,6 +10026,7 @@ impl App {
         new_line_indicator: bool,
         tts_mode: String,
         tts_speak_mode: String,
+        tts_voice: String,
         scrollback_enabled: bool,
         log_input_enabled: bool,
         keyboard_always_visible: bool,
@@ -10126,8 +10118,14 @@ impl App {
         self.settings.new_line_indicator = new_line_indicator;
         self.settings.tabs = TabsMode::from_name(&tabs);
         self.settings.icon_bar = IconBarMode::from_name(&icon_bar);
+        let tts_was = self.settings.tts_mode;
         self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
+        self.note_kokoro_selected(tts_was);
         self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
+        // Empty = unchanged: a client from before the Kokoro voice existed.
+        if !tts_voice.is_empty() {
+            self.settings.tts_voice = kokoro::normalize_voice(&tts_voice);
+        }
         if self.settings.dictionary_path != dictionary_path {
             self.settings.dictionary_path = dictionary_path;
             self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
@@ -10616,7 +10614,7 @@ impl App {
                 true
             }
             Command::Say { text } => {
-                tts::speak(&self.tts_backend, &text, self.settings.tts_mode);
+                self.speak_text(&text);
                 let clean_text = strip_ansi_codes(&text);
                 self.ws_broadcast(WsMessage::ServerSpeak { text: clean_text, world_index: world_idx });
                 true
@@ -11570,6 +11568,7 @@ impl App {
         } else if let Some(wi) = current_world {
             self.ws_client_worlds.insert(client_id, ClientViewState {
                 world_index: wi,
+                history: Vec::new(),
                 visible_lines: 0,
                 visible_columns: 0,
                 dimensions: None,
@@ -12633,7 +12632,8 @@ impl App {
                 let clean_text = speak_text.trim();
                 if !clean_text.is_empty() {
                     // Console: speak via local TTS subprocess (queued — waits for previous to finish)
-                    tts::speak(&self.tts_backend, clean_text, self.settings.tts_mode);
+                    let clean_text = clean_text.to_string();
+                    self.speak_text(&clean_text);
                     // Web/GUI: broadcast ServerSpeak to WebSocket clients
                     self.ws_broadcast(WsMessage::ServerSpeak {
                         text: clean_text.to_string(),
@@ -12703,6 +12703,11 @@ impl App {
             // a consumed seq nothing could account for.
             self.push_and_broadcast_line(world_idx, prompt_line, more_mode);
         }
+        // The echo mask (IAC WILL ECHO: a password prompt) dies with the connection:
+        // `clear_connection_state` resets this side, and the clients are told below, or an
+        // attached GUI keeps masking everything typed - `*` for every key - into the next
+        // connection, until the MUD happens to negotiate ECHO again.
+        let was_masked = self.worlds[world_idx].protocol.echo_masked;
         self.worlds[world_idx].clear_connection_state(true, true);
         if !gagged {
             // Show disconnection message
@@ -12746,6 +12751,9 @@ impl App {
             }
         }
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+        if was_masked {
+            self.ws_broadcast(WsMessage::EchoMaskChanged { world_index: world_idx, masked: false });
+        }
 
         // Schedule auto-reconnect if configured and world was previously connected
         let secs = self.worlds[world_idx].settings.auto_reconnect_secs;
@@ -12959,6 +12967,10 @@ impl App {
                     session.inject(b"\r\n[Clay reloaded]\r\n");
                     let mut screen = shell::ShellScreen::new(size.cols, size.rows);
                     screen.apply(session.with_term(shell::screen::render_rows));
+                    // The program's repaint after the nudge (and the note above) is the
+                    // reload's doing: for a moment it is not activity, or every reload
+                    // lit a background shell world's indicator.
+                    screen.ignore_activity_until(std::time::Instant::now() + std::time::Duration::from_secs(2));
                     self.worlds[idx].shell = Some(session);
                     self.worlds[idx].shell_screen = Some(screen);
                     self.worlds[idx].connected = true;
@@ -13015,6 +13027,14 @@ impl App {
                     if self.worlds[idx].connection_id == conn_id {
                         self.fire_iconfails(idx, &failures);
                     }
+                }
+                None
+            }
+            AppEvent::TtsLine { line, done, reply_to } => {
+                self.reply_update_line(reply_to, &line);
+                if done {
+                    // Installed (or not): if Kokoro is the engine, have the model ready.
+                    self.warm_kokoro();
                 }
                 None
             }
@@ -14256,6 +14276,142 @@ impl App {
         }
     }
 
+    /// `/tts [status|install|remove|voices|voice <name>|test]`: the Kokoro engine's files
+    /// and voice (src/kokoro.rs), and a test line in whatever mode is set. The install
+    /// runs in the background; its lines come back as `AppEvent::TtsLine`.
+    /// Speak `text` with the current engine (`Settings::tts_mode`), and say so - once -
+    /// when that is Kokoro but its files are not here, so the Local engine spoke instead.
+    pub(crate) fn speak_text(&mut self, text: &str) {
+        if tts::speak(&self.tts_backend, text, self.settings.tts_mode, &self.settings.tts_voice) {
+            self.note_kokoro_missing(false);
+        }
+    }
+
+    /// Kokoro was asked for without its files: say what speaks instead and how to get it.
+    /// `selected`: the setting was just chosen, which is always said; otherwise only the
+    /// first time a line falls back.
+    pub(crate) fn note_kokoro_missing(&mut self, selected: bool) {
+        if !selected && self.kokoro_missing_told {
+            return;
+        }
+        self.kokoro_missing_told = true;
+        let idx = self.current_world_index;
+        let daemon = !self.console_tui;
+        self.emit_client_text(idx, KOKORO_MISSING, daemon);
+    }
+
+    /// A settings change left Kokoro as the engine (it `was` another, or the same with
+    /// another voice): load the model now so the first line does not wait for it - or,
+    /// if its files are not here, say so at once rather than let the Local engine answer
+    /// silently (only when Kokoro was just chosen; a repeat save is not a new choice).
+    /// A change away from Kokoro unloads its model and closes its audio stream: an
+    /// engine that outlived the setting kept a few hundred megabytes, its threads and
+    /// a running stream, which cost CPU with TTS off.
+    pub(crate) fn note_kokoro_selected(&mut self, was: tts::TtsMode) {
+        if self.settings.tts_mode != tts::TtsMode::Kokoro {
+            tts::release_kokoro(&self.tts_backend);
+            return;
+        }
+        if kokoro::install().complete() {
+            tts::warm_kokoro(&self.tts_backend, &self.settings.tts_voice);
+        } else if was != tts::TtsMode::Kokoro {
+            self.note_kokoro_missing(true);
+        }
+    }
+
+    /// Kokoro is the engine: load its model in the background now (at startup, after an
+    /// install), not on the first line spoken.
+    pub(crate) fn warm_kokoro(&mut self) {
+        if self.settings.tts_mode == tts::TtsMode::Kokoro {
+            tts::warm_kokoro(&self.tts_backend, &self.settings.tts_voice);
+        }
+    }
+
+    pub(crate) fn tts_command(&mut self, args: &[String], reply_to: Option<(u64, usize)>, event_tx: &mpsc::Sender<AppEvent>) {
+        let sub = args.first().map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "status".to_string());
+        let lines: Vec<String> = match sub.as_str() {
+            "status" => {
+                let mut v = vec![format!(
+                    "TTS: {} (speak mode {}), Kokoro voice: {}",
+                    self.settings.tts_mode.name(), self.settings.tts_speak_mode.name(), self.settings.tts_voice
+                )];
+                v.extend(kokoro::status_lines());
+                if let Some(engine) = tts::kokoro_engine(&self.tts_backend) {
+                    v.push(format!("  engine: {}", if engine.loaded() { "model loaded" } else { "not loaded yet" }));
+                    if let Some(o) = engine.output_kind() {
+                        v.push(format!("  plays through: {o}"));
+                    }
+                    if let Some(e) = engine.last_error() {
+                        v.push(format!("  last error: {e}"));
+                    }
+                }
+                v
+            }
+            "install" | "remove" | "test" if self.multiuser_mode => {
+                vec!["Kokoro: a multiuser server has no voice of its own; run /tts on your own Clay.".to_string()]
+            }
+            "install" => match kokoro::install_check() {
+                Err(why) => vec![why],
+                Ok(note) => {
+                    tokio::spawn(kokoro::install_files(event_tx.clone(), reply_to));
+                    vec![note]
+                }
+            },
+            "remove" => {
+                // Unload too: the model stays usable from memory, but the Local engine
+                // speaks from here on, and the memory and stream would be idle.
+                tts::release_kokoro(&self.tts_backend);
+                vec![kokoro::remove_files().unwrap_or_else(|e| format!("Kokoro: {e}"))]
+            }
+            "voices" => {
+                let mut v = vec![format!("Kokoro voices ({}; current: {}):", kokoro::VOICES.len(), self.settings.tts_voice)];
+                v.extend(kokoro::voice_list_lines());
+                v.push("Pick one with /tts voice <name>, or in Settings.".to_string());
+                v
+            }
+            "voice" => match args.get(1) {
+                None => vec![format!("Kokoro voice: {} (/tts voice <name> changes it; /tts voices lists them)", self.settings.tts_voice)],
+                Some(name) => match kokoro::voice_id(name) {
+                    None => vec![format!("Kokoro: no voice named {name}; /tts voices lists them.")],
+                    Some(_) => {
+                        self.settings.tts_voice = kokoro::normalize_voice(name);
+                        let _ = persistence::save_settings(self);
+                        let settings_msg = self.build_global_settings_msg();
+                        self.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: self.input_height });
+                        // Another accent or language means another model load: now, not
+                        // on the next line.
+                        self.warm_kokoro();
+                        vec![format!("Kokoro voice: {}", self.settings.tts_voice)]
+                    }
+                },
+            },
+            "test" => {
+                let installed = kokoro::install().complete();
+                let mode = match self.settings.tts_mode {
+                    tts::TtsMode::Off if installed => tts::TtsMode::Kokoro,
+                    tts::TtsMode::Off => tts::TtsMode::Local,
+                    m => m,
+                };
+                let engine = match mode {
+                    tts::TtsMode::Kokoro if installed => format!("Kokoro voice {}", self.settings.tts_voice),
+                    tts::TtsMode::Kokoro => "local engine (Kokoro is not installed yet - /tts install)".to_string(),
+                    tts::TtsMode::Local => "local engine".to_string(),
+                    tts::TtsMode::Edge => "Edge cloud voice".to_string(),
+                    tts::TtsMode::Off => unreachable!(),
+                };
+                let text = "Hello from Clay. The dragon's lair lies north of the Misty Falls; bring torches, 3 rations and 40 gold.";
+                tts::speak(&self.tts_backend, text, mode, &self.settings.tts_voice);
+                let loading = mode == tts::TtsMode::Kokoro && installed
+                    && !tts::kokoro_engine(&self.tts_backend).is_some_and(|e| e.loaded());
+                vec![format!("Speaking a test line with the {engine}{}.", if loading { "; loading the model first" } else { "" })]
+            }
+            _ => vec!["Usage: /tts [status|install|remove|voices|voice <name>|test]".to_string()],
+        };
+        for line in lines {
+            self.reply_update_line(reply_to, &line);
+        }
+    }
+
     /// The server's half of `/update` (src/selfupdate.rs): check GitHub and download in
     /// the background; `finish_server_update` installs and reloads when the result
     /// comes back as `AppEvent::UpdateResult`. `reply_to` None = the console asked.
@@ -14644,6 +14800,7 @@ impl App {
         self.ws_set_client_world(client_id, Some(world_idx));
         self.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: world_idx,
+            history: Vec::new(),
             visible_lines: 0,
             visible_columns: 0,
             dimensions: None,
@@ -15366,7 +15523,7 @@ impl App {
             }
             Command::Say { text } => {
                 // Speak text via TTS (console subprocess + broadcast to web clients)
-                tts::speak(&self.tts_backend, &text, self.settings.tts_mode);
+                self.speak_text(&text);
                 let clean_text = strip_ansi_codes(&text);
                 self.ws_broadcast(WsMessage::ServerSpeak {
                     text: clean_text,
@@ -15418,6 +15575,7 @@ impl App {
                 // Server keeps running — /quit only affects the remote client
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: "/quit".to_string() });
             }
+            Command::Tts { args } => self.tts_command(&args, Some((client_id, world_index)), event_tx),
             Command::Update { force } => {
                 // The server's half of a client's /update (src/selfupdate.rs): check,
                 // download, install, hot reload - answering the client with an
@@ -15515,7 +15673,8 @@ impl App {
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
                     let visible = prev.map(|v| v.visible).unwrap_or(true);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
+                    let history = self.client_history_after(client_id, None, idx);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, history, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(idx));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                     // Also send ExecuteLocalCommand so web clients can switch their local view
@@ -15730,7 +15889,8 @@ impl App {
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
                     let visible = prev.map(|v| v.visible).unwrap_or(true);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
+                    let history = self.client_history_after(client_id, None, world_index);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, history, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(world_index));
                 }
 
@@ -15783,7 +15943,8 @@ impl App {
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
                     let visible = prev.map(|v| v.visible).unwrap_or(true);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
+                    let history = self.client_history_after(client_id, None, world_index);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, history, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(world_index));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                     // Send active media for the new world
@@ -15875,7 +16036,8 @@ impl App {
                     let vc = visible_columns.unwrap_or_else(|| self.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
                     let paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
                     let visible = self.ws_client_worlds.get(&client_id).map(|v| v.visible).unwrap_or(true);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
+                    let history = self.client_history_after(client_id, None, world_index);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, history, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
                     // Update client's world in WebSocket server so broadcast_to_world_viewers works
                     self.ws_set_client_world(client_id, Some(world_index));
                     // This client's size may now be the smallest viewing a shell world.
@@ -15919,7 +16081,7 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -15928,7 +16090,7 @@ impl App {
                     web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
-                    mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
+                    mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                     log_input_enabled, keyboard_always_visible, tabs, icon_bar,
                 );
             }
@@ -15944,7 +16106,9 @@ impl App {
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
             }
             WsMessage::CalculateOldestPending { current_index } => {
-                let oldest_idx = self.calculate_oldest_pending_world_from(current_index);
+                // The fallback world is this client's own last visit, not the console's.
+                let history = self.ws_client_worlds.get(&client_id).map(|v| v.history.clone()).unwrap_or_default();
+                let oldest_idx = self.calculate_oldest_pending_world_from(current_index, &history);
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
             }
             WsMessage::RequestState => {
@@ -17566,6 +17730,9 @@ pub enum AppEvent {
     // is who asked: None = the console, Some((client_id, world_index)) = a remote client
     // (which also gets a WsMessage::UpdateOutcome so it can go on with its own update).
     UpdateResult { result: Result<UpdateSuccess, String>, reply_to: Option<(u64, usize)> },
+    /// A line from `/tts install` (src/kokoro.rs), for the console or the client that
+    /// asked; `done` on the last one. Handled in `App::preprocess_event` for every loop.
+    TtsLine { line: String, done: bool, reply_to: Option<(u64, usize)> },
     // Result from a background /import attempt: requesting client_id, target addr, and
     // Ok((settings_dat, theme_dat, keybindings_dat)) or the failure reason. See
     // handle_import_result and plan `i-d-like-to-make-snuggly-rain.md`.
@@ -17822,6 +17989,7 @@ pub(crate) struct SetupSettings {
     pub(crate) new_line_indicator: bool,
     pub(crate) tts_mode: String,
     pub(crate) tts_speak_mode: String,
+    pub(crate) tts_voice: String,
     pub(crate) scrollback: bool,
     pub(crate) log_input: bool,
     pub(crate) wrapspace: i64,
@@ -17988,7 +18156,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
-        SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
+        SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE, SETUP_FIELD_TTS_VOICE,
         SETUP_FIELD_SCROLLBACK, SETUP_FIELD_LOG_INPUT, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
         SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
@@ -18382,6 +18550,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
                     tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
                     tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
+                    tts_voice: state.get_text(SETUP_FIELD_TTS_VOICE).unwrap_or(kokoro::DEFAULT_VOICE).to_string(),
                     scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
                     // Read regardless of the field's current visibility: if Archive
                     // Input/Output was just unchecked in this same edit (hiding Log
@@ -19994,6 +20163,7 @@ async fn main() -> io::Result<()> {
     let mut daemon_mode = false;
     let mut multiuser_mode = false;
     let mut local_server_mode = false;
+    let mut tts_install_mode = false;
     let mut local_server_port: Option<u16> = None;
     let mut is_reload_arg = false;
     let mut is_crash_arg = false;
@@ -20043,6 +20213,7 @@ async fn main() -> io::Result<()> {
                 "-D" => daemon_mode = true,
                 "--multiuser" => multiuser_mode = true,
                 "--local-server" => local_server_mode = true,
+                "--tts-install" => tts_install_mode = true,
                 "--reload" => is_reload_arg = true,
                 "--crash" => is_crash_arg = true,
                 "--console" => console_arg = Some(None),
@@ -20113,6 +20284,13 @@ async fn main() -> io::Result<()> {
     tfstartup::set_startup_opts(tf_startup_opts);
 
     // Handle -h / --help
+    if tts_install_mode {
+        // `clay --tts-install`: fetch the Kokoro files for this machine and exit. Before
+        // any TUI, so printing is fine. The same job as /tts install, for a machine that
+        // only runs a client (src/kokoro.rs).
+        std::process::exit(kokoro::install_files_cli().await);
+    }
+
     if show_help {
         println!("Clay MUD Client v{}", VERSION);
         println!();
@@ -20891,6 +21069,8 @@ pub async fn run_app_headless(
 
     // Pre-compile action regexes after loading settings or reload state
     compile_all_action_regexes(&mut app.settings.actions);
+    // Kokoro as the engine: load its model now, not on the first line spoken.
+    app.warm_kokoro();
 
     // Load theme file (~/.clay/theme.dat)
     load_theme_file(&mut app);
@@ -21636,6 +21816,8 @@ pub async fn run_app_headless(
                             let _ = app.finish_server_update(result, reply_to);
                         }
                     }
+                    // Consumed by App::preprocess_event above; never reaches here.
+                    AppEvent::TtsLine { .. } => {}
                     AppEvent::ImportResult(client_id, addr, result) => {
                         app.handle_import_result(client_id, addr, result);
                     }
@@ -22107,6 +22289,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     // Pre-compile action regexes after loading settings or reload state
     compile_all_action_regexes(&mut app.settings.actions);
+    // Kokoro as the engine: load its model now, not on the first line spoken.
+    app.warm_kokoro();
 
     // Load theme file (~/.clay/theme.dat)
     load_theme_file(&mut app);
@@ -23483,6 +23667,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let _ = app.finish_server_update(result, reply_to);
                         }
                     }
+                    // Consumed by App::preprocess_event above; never reaches here.
+                    AppEvent::TtsLine { .. } => {}
                     AppEvent::ImportResult(client_id, addr, result) => {
                         app.handle_import_result(client_id, addr, result);
                     }
@@ -23961,6 +24147,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.reply_update_line(reply_to, "Server: restart Clay to run the new version (this mode has no hot reload).");
                     }
                 }
+                // Consumed by App::preprocess_event above; never reaches here.
+                AppEvent::TtsLine { .. } => {}
                 AppEvent::ImportResult(client_id, addr, result) => {
                     app.handle_import_result(client_id, addr, result);
                 }

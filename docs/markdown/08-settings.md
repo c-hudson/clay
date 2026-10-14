@@ -22,6 +22,9 @@ Open with `/setup` command:
 | GUI Theme | Remote GUI color scheme | Dark |
 | TLS Proxy | Preserve TLS connections across reload | Off |
 | ANSI Music | Enable ANSI music playback | Off |
+| TTS | Text-to-speech for incoming lines: Off; Local (espeak or espeak-ng on Linux, `say` on macOS, the Windows voices); Kokoro (an offline neural voice, installed once with `/tts install`); Edge (Microsoft's cloud voices, needs internet). Browser and Android clients always use the device's own voice. F9 mutes. | Off |
+| Speak Mode | All: every line. Limit: only lines like `Name says, "..."` and later lines from the same speakers | All |
+| Kokoro Voice | Which of Kokoro's 54 voices speaks, e.g. `af_heart`, `am_michael`, `bf_emma`; `/tts voices` lists them by language. In `settings.dat`: `tts_voice` | af_heart |
 
 ### World Switching Modes
 

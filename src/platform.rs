@@ -2493,3 +2493,55 @@ mod tests {
     }
 }
 
+
+/// While a C library call runs, the process's stderr goes to `~/.clay/debug.log`.
+/// sherpa-onnx reports with `fprintf(stderr, ...)` (a lexicon's repeated words, a file it
+/// could not read) and ALSA prints an error for every device it cannot open while cpal
+/// probes them - and in the console anything written to stderr lands in the middle of
+/// the screen (CLAUDE.md's no-stderr rule, which a C library cannot be told). Held for
+/// the call only; dropping it puts stderr back. Unix only: Windows and macOS builds have
+/// no console of their own to corrupt, and the GUI never shows stderr.
+pub(crate) struct StderrToLog {
+    #[cfg(unix)]
+    saved: Option<i32>,
+}
+
+impl StderrToLog {
+    pub(crate) fn new() -> StderrToLog {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let log = crate::clay_config_path("debug.log");
+            let file = std::fs::OpenOptions::new().append(true).create(true).open(&log)
+                .or_else(|_| std::fs::OpenOptions::new().write(true).open("/dev/null"));
+            if let Ok(file) = file {
+                // Safety: plain fd calls; `file` stays open until its dup onto 2 is made.
+                let saved = unsafe { libc::dup(2) };
+                if saved >= 0 {
+                    if unsafe { libc::dup2(file.as_raw_fd(), 2) } >= 0 {
+                        return StderrToLog { saved: Some(saved) };
+                    }
+                    unsafe { libc::close(saved) };
+                }
+            }
+            StderrToLog { saved: None }
+        }
+        #[cfg(not(unix))]
+        {
+            StderrToLog {}
+        }
+    }
+}
+
+impl Drop for StderrToLog {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(saved) = self.saved.take() {
+            // Safety: `saved` is the dup of the original fd 2 made in `new`.
+            unsafe {
+                libc::dup2(saved, 2);
+                libc::close(saved);
+            }
+        }
+    }
+}

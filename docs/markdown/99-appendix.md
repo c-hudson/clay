@@ -95,6 +95,9 @@ console_theme=dark
 gui_theme=dark                      # dark, light, dark-new or light-new: a [theme:name] in theme.dat
 tls_proxy_enabled=false
 ansi_music_enabled=false
+tts_mode=off                        # off, local, kokoro or edge
+tts_speak_mode=all                  # all or limit
+tts_voice=af_heart                  # the Kokoro voice (/tts voices)
 websocket_enabled=false
 websocket_password_hash=<sha256>
 websocket_use_tls=false
@@ -129,10 +132,12 @@ keep_alive_cmd=
 Slack/Discord worlds use `discord_token`, `discord_guild` (Server), `discord_channel`
 (Send To), `discord_channels` (Show Only), `slack_token` (bot, `xoxb-`), `slack_app_token`
 (`xapp-`), `slack_workspace`, `slack_channel` and `slack_channels`; tokens are stored
-encrypted. `chat_settings_version` records which chat-settings model a world uses: a
-world without it is from before the server-per-world model and is upgraded once on load
-(its old channel becomes both Send To and Show Only, so it looks the same). The legacy
-`discord_dm_user` key is folded into Send To/Show Only by that upgrade.
+encrypted. `chat_settings_version`, written for Slack and Discord worlds only, records
+which chat-settings model the world uses: a chat world without it is from before the
+server-per-world model and is upgraded once on load (its old channel becomes both Send
+To and Show Only, so it looks the same). The legacy `discord_dm_user` key is folded into
+Send To/Show Only by that upgrade. MUD and shell worlds have nothing to upgrade and never
+carry the key.
 
 `world_type` is one of `mud`, `mud_timed_prompt`, `slack`, `discord` or `shell` (absent
 means `mud`). `prompt_wait_ms` (default 1000) applies to `mud_timed_prompt` worlds and is
@@ -192,6 +197,8 @@ the optional command to run instead of the login shell (see
 | `/actions` | Open actions editor |
 | `/reload` | Hot reload |
 | `/testmusic` | Test ANSI music |
+| `/say <text>` | Speak text aloud |
+| `/tts [install\|voices\|...]` | Text-to-speech status and the Kokoro voice files |
 | `/notify <msg>` | Send notification (Android) |
 | `/gag` | In actions: hide matched line |
 

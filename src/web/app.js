@@ -679,6 +679,7 @@
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
         setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
+        setupTtsVoiceInput: document.getElementById('setup-tts-voice-input'),
         setupTabsSelect: document.getElementById('setup-tabs-select'),
         setupIconBarSelect: document.getElementById('setup-iconbar-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
@@ -1609,8 +1610,9 @@
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
     let zwjEnabled = false;  // Will be synced from server settings
-    let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'edge')
+    let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'kokoro', 'edge')
     let ttsSpeakMode = 'all';  // 'all' or 'limit'
+    let ttsVoice = 'af_heart';  // The Kokoro voice (src/kokoro.rs); the server's engine uses it, not this page
     let newLineIndicator = false;  // Will be synced from server settings
     // TF's %textdiv, once a script has set it ('off', 'on', 'always' or 'clear'): what a
     // world brought forward shows between text this client already showed and text that
@@ -1800,7 +1802,7 @@
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'server', 'import',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'notify', 'addworld', 'note', 'tag', 'tags',
-        'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say',
+        'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say', 'tts',
         'log', 'unworld', 'chat', 'discord', 'slack',
         'cd', 'pwd', 'runtime', 'ismacro', 'isvar', 'features', 'restrict', 'sys',
         'xtitle', 'more', 'wrap', 'limit', 'unlimit', 'relimit', 'result',
@@ -3798,6 +3800,7 @@
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
+                    if (msg.settings.tts_voice) ttsVoice = msg.settings.tts_voice;
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.new_line_indicator !== undefined) {
@@ -4456,6 +4459,10 @@
             case 'WorldDisconnected':
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].connected = false;
+                    // The connection's echo mask (a password prompt's IAC WILL ECHO) ends
+                    // with it - or every key typed into the next connection shows as `*`.
+                    // updateStatusBar() below re-applies it to #input.
+                    worlds[msg.world_index].echo_masked = false;
                     // A shell world (src/shell): freeze its screen, the session is gone.
                     if (worlds[msg.world_index].shell) {
                         worlds[msg.world_index].shell.live = false;
@@ -4695,6 +4702,7 @@
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
+                    if (msg.settings.tts_voice) ttsVoice = msg.settings.tts_voice;
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.new_line_indicator !== undefined) {
@@ -7614,6 +7622,8 @@
             { l: '/reload', r: 'Hot reload binary' },
             { l: '/update [-f]', r: 'Download and install update' },
             { l: '/testmusic', r: 'Test ANSI music playback' },
+            { l: '/say &lt;text&gt;', r: 'Speak text aloud' },
+            { l: '/tts [install|voices|voice|test]', r: 'Text-to-speech status; Kokoro voice files' },
             { l: '/quit', r: 'Exit client' },
             { heading: 'Security' },
             { l: '/ban', r: 'Show banned hosts' },
@@ -8766,10 +8776,17 @@
             const lines = new Array(msg.rows).fill('');
             (msg.lines || []).forEach(function(pair) { lines[pair[0]] = pair[1]; });
             w.shell = { cols: msg.cols, rows: msg.rows, lines, cursor: msg.cursor, mode: msg.mode, title: msg.title, frame: msg.frame, live: msg.live !== false };
+            w.shellAwaitingFull = false;
         } else {
             const s = w.shell;
             if (!s || s.frame !== msg.base_frame || s.cols !== msg.cols || s.rows !== msg.rows) {
-                send({ type: 'RequestWorldState', world_index: msg.world_index });
+                // Out of step: ask for the whole screen once. Every delta still in flight
+                // until it arrives is stale too, and each used to cost another request and
+                // another full frame (the Rust ShellScreen::apply_msg does the same).
+                if (!w.shellAwaitingFull) {
+                    w.shellAwaitingFull = true;
+                    send({ type: 'RequestWorldState', world_index: msg.world_index });
+                }
                 return;
             }
             (msg.lines || []).forEach(function(pair) { if (pair[0] < s.lines.length) s.lines[pair[0]] = pair[1]; });
@@ -12160,7 +12177,7 @@
         setupWorldSwitchMode = worldSwitchMode;
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
-        setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'edge' ? 'Edge' : 'Off';
+        setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'kokoro' ? 'Kokoro' : ttsMode === 'edge' ? 'Edge' : 'Off';
         setupTabsMode = tabsMode;
         setupIconBarMode = iconBarMode;
         setupTlsProxy = tlsProxyEnabled;
@@ -12250,6 +12267,9 @@
         if (elements.setupTtsSpeakModeSelect) {
             elements.setupTtsSpeakModeSelect.value = ttsSpeakMode;
             updateCustomDropdown(elements.setupTtsSpeakModeSelect);
+        }
+        if (elements.setupTtsVoiceInput) {
+            elements.setupTtsVoiceInput.value = ttsVoice;
         }
         if (elements.setupTabsSelect) {
             elements.setupTabsSelect.value = setupTabsMode;
@@ -12364,6 +12384,7 @@
             zwj_enabled: zwjEnabled,
             tts_mode: ttsMode,
             tts_speak_mode: ttsSpeakMode,
+            tts_voice: ttsVoice,
             tabs: tabsMode,
             icon_bar: iconBarMode,
             new_line_indicator: newLineIndicator,
@@ -12486,6 +12507,10 @@
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
         ttsMode = setupTtsMode.toLowerCase();
+        if (elements.setupTtsVoiceInput) {
+            var typedVoice = elements.setupTtsVoiceInput.value.trim().toLowerCase();
+            if (typedVoice) ttsVoice = typedVoice;  // the server keeps only a name it knows
+        }
         applyTabsMode(setupTabsMode);
         applyIconBarMode(setupIconBarMode);
         tlsProxyEnabled = setupTlsProxy;

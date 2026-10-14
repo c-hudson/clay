@@ -38,7 +38,7 @@ sequences like `^[[1;5A`) — see `/help bind`.
 | `Esc-}` | Next active world (Clay's unseen-first cycling) |
 | `Shift-Up` | Next world, cycling through all worlds (including disconnected) |
 | `Shift-Down` | Previous world, cycling through all worlds |
-| `Esc-w` | Switch to the world with activity (oldest pending → unseen output → previous world) |
+| `Esc-w` | Switch to the world with activity, oldest first (held output, then unseen output); with none left, back to the last world you visited that is still connected — TinyFugue's `world-q.tf` ESC-w |
 | `^]` | Background all worlds (TF `/bg`) — a no-op in Clay's single-pane console, kept for scripting parity |
 
 `Alt-<key>` is a synonym for `Esc-<key>` on every named key, matching TF's own

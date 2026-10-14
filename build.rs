@@ -157,8 +157,9 @@ fn build_ico_from_png(png_path: &Path) -> Option<std::path::PathBuf> {
 /// Format a Unix timestamp as "YY/MM/DD HH:MM" in local time.
 /// No external dependencies — computes local time from /etc/localtime or TZ env.
 fn format_unix_timestamp(timestamp: u64) -> String {
-    // Try to get UTC offset from TZ environment or /etc/localtime
-    let offset_secs = get_local_utc_offset();
+    // Try to get UTC offset from TZ environment or /etc/localtime - the offset in effect
+    // at `timestamp` itself, so daylight-saving time is honoured
+    let offset_secs = get_local_utc_offset(timestamp as i64);
     let local_ts = timestamp as i64 + offset_secs;
 
     // Convert to calendar date/time (civil time from Unix epoch)
@@ -189,8 +190,9 @@ fn format_unix_timestamp(timestamp: u64) -> String {
     format!("{:02}/{:02}/{:02} {:02}:{:02}", y % 100, m, d, hours, minutes)
 }
 
-/// Get the local UTC offset in seconds by reading /etc/localtime TZif file.
-fn get_local_utc_offset() -> i64 {
+/// Get the local UTC offset in seconds, as in effect at `at` (a Unix time), by reading
+/// the /etc/localtime TZif file.
+fn get_local_utc_offset(at: i64) -> i64 {
     // Try TZ environment variable for simple offset formats
     if let Ok(tz) = std::env::var("TZ") {
         if let Some(offset) = parse_simple_tz_offset(&tz) {
@@ -200,7 +202,7 @@ fn get_local_utc_offset() -> i64 {
 
     // Try reading /etc/localtime (TZif binary format)
     if let Ok(data) = fs::read("/etc/localtime") {
-        if let Some(offset) = parse_tzif_offset(&data) {
+        if let Some(offset) = parse_tzif_offset(&data, at) {
             return offset;
         }
     }
@@ -235,8 +237,8 @@ fn parse_simple_tz_offset(tz: &str) -> Option<i64> {
     Some(-hours * 3600) // POSIX TZ is west-positive
 }
 
-/// Parse a TZif (timezone info) binary file and return the last transition's UTC offset.
-fn parse_tzif_offset(data: &[u8]) -> Option<i64> {
+/// Parse a TZif (timezone info) binary file and return the UTC offset in effect at `at`.
+fn parse_tzif_offset(data: &[u8], at: i64) -> Option<i64> {
     // TZif format: "TZif" magic, then header with counts
     if data.len() < 44 || &data[0..4] != b"TZif" {
         return None;
@@ -260,16 +262,19 @@ fn parse_tzif_offset(data: &[u8]) -> Option<i64> {
         if data.len() > v1_total + 44 && &data[v1_total..v1_total + 4] == b"TZif" {
             // Parse v2 header (uses 8-byte timestamps)
             let v2 = &data[v1_total..];
-            return parse_tzif_block(v2, 8);
+            return parse_tzif_block(v2, 8, at);
         }
     }
 
-    parse_tzif_block(data, 4)
+    parse_tzif_block(data, 4, at)
 }
 
-/// Parse a TZif data block and return the last ttinfo UTC offset.
-/// `time_size` is 4 for v1 (32-bit timestamps) or 8 for v2/v3 (64-bit timestamps).
-fn parse_tzif_block(data: &[u8], time_size: usize) -> Option<i64> {
+/// Parse a TZif data block and return the UTC offset of the transition in effect at
+/// `at` - the last one at or before it. (This used to take the block's *last* transition,
+/// which is decades away and in standard time, so for half of every year the build was
+/// stamped an hour early.) `time_size` is 4 for v1 (32-bit timestamps) or 8 for v2/v3
+/// (64-bit timestamps).
+fn parse_tzif_block(data: &[u8], time_size: usize, at: i64) -> Option<i64> {
     if data.len() < 44 {
         return None;
     }
@@ -290,12 +295,24 @@ fn parse_tzif_block(data: &[u8], time_size: usize) -> Option<i64> {
         return None;
     }
 
-    // Get the type index of the last transition (or type 0 if no transitions)
-    let type_idx = if tzh_timecnt > 0 {
-        data[types_start + tzh_timecnt - 1] as usize
-    } else {
-        0
+    // The type of the last transition at or before `at`; type 0 before the first
+    // transition, or with none at all. Transitions are stored in ascending order.
+    let read_time = |i: usize| -> Option<i64> {
+        let start = times_start + i * time_size;
+        let bytes = data.get(start..start + time_size)?;
+        Some(if time_size == 8 {
+            i64::from_be_bytes(bytes.try_into().ok()?)
+        } else {
+            i32::from_be_bytes(bytes.try_into().ok()?) as i64
+        })
     };
+    let mut type_idx = 0usize;
+    for i in 0..tzh_timecnt {
+        match read_time(i) {
+            Some(t) if t <= at => type_idx = data[types_start + i] as usize,
+            _ => break,
+        }
+    }
 
     if type_idx >= tzh_typecnt {
         return None;

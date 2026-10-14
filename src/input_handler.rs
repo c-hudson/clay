@@ -544,14 +544,6 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             } else if app.current_world_index > world_index {
                                 app.current_world_index -= 1;
                             }
-                            // Adjust previous_world_index if needed
-                            if let Some(prev) = app.previous_world_index {
-                                if prev >= app.worlds.len() {
-                                    app.previous_world_index = Some(app.worlds.len().saturating_sub(1));
-                                } else if prev > world_index {
-                                    app.previous_world_index = Some(prev - 1);
-                                }
-                            }
                             app.add_output(&format!("World '{}' deleted.", world_name));
                             // Reopen world selector to show updated list
                             app.open_world_selector_new();
@@ -708,7 +700,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
                 let old_tts_mode = app.settings.tts_mode;
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
+                app.note_kokoro_selected(old_tts_mode);
                 app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
+                app.settings.tts_voice = crate::kokoro::normalize_voice(&settings.tts_voice);
                 // Auto-unmute when TTS is enabled from Off
                 if old_tts_mode == crate::tts::TtsMode::Off && app.settings.tts_mode != crate::tts::TtsMode::Off {
                     app.settings.tts_muted = false;

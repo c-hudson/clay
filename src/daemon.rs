@@ -73,6 +73,8 @@ pub async fn run_daemon_server() -> io::Result<()> {
 
     // Pre-compile action regexes after loading settings
     crate::compile_all_action_regexes(&mut app.settings.actions);
+    // Kokoro as the engine: load its model now, not on the first line spoken.
+    app.warm_kokoro();
 
     // Ensure at least one world exists
     app.ensure_has_world();
@@ -613,6 +615,35 @@ pub async fn run_daemon_server() -> io::Result<()> {
     }
 }
 
+/// Start a shell or chat world for a client - the kinds that connect without a MUD
+/// socket - and say so in the world. Returns false for a MUD world, which the caller
+/// connects as it did. Every way a client connects a world through this handler goes
+/// here first: `/worlds <name>` (what TF's `/connect` becomes), `/worlds -b` and the
+/// world switch used to open a MUD connection to a shell world's empty address on a
+/// `-D` or GUI-master host ("Connecting to :..." then "no host and port set"), while the
+/// console's path (commands.rs) knew the world's type.
+fn start_non_mud_world(app: &mut App, idx: usize, event_tx: &mpsc::Sender<AppEvent>) -> bool {
+    let ty = app.worlds[idx].settings.world_type.clone();
+    if ty.is_shell() {
+        // A local terminal (crate::shell); reports back via AppEvent::Shell.
+        app.emit_client_text(idx, "Starting shell...", true);
+        app.spawn_shell_connect(idx);
+        true
+    } else if !ty.is_mud() {
+        // Slack/Discord worlds run a background chat session instead of
+        // connect_daemon_world (MUD-only) - see crate::chat.
+        if app.worlds[idx].settings.has_connection_settings() {
+            app.emit_client_text(idx, "Connecting...", true);
+            app.spawn_chat_connect(idx, event_tx);
+        } else {
+            app.emit_client_text(idx, "Set the bot token first (world editor).", true);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Handle WebSocket message in daemon mode. Thin wrapper around
 /// `handle_daemon_ws_message_impl` that also refreshes `tf_bound_keys_json` afterward
 /// (TF-parity plan Job 22a/P2.7 - see `App::refresh_tf_bound_keys_if_changed`'s own doc
@@ -999,7 +1030,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 }
                 Command::Say { text } => {
                     // Speak text via TTS (console subprocess + broadcast to web clients)
-                    tts::speak(&app.tts_backend, &text, app.settings.tts_mode);
+                    app.speak_text(&text);
                     let clean_text = strip_ansi_codes(&text);
                     app.ws_broadcast(WsMessage::ServerSpeak {
                         text: clean_text,
@@ -1098,6 +1129,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 // The server's half of a client's /update (src/selfupdate.rs); a
                 // multiuser server refuses inside start_server_update.
                 Command::Update { force } => app.start_server_update(force, Some((client_id, world_index)), event_tx),
+                Command::Tts { args } => app.tts_command(&args, Some((client_id, world_index)), event_tx),
                 Command::Menu => app.ws_menu_is_console_only(client_id, world_index),
                 // UI popup commands - send back to client for local handling
                 Command::Help | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
@@ -1148,21 +1180,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 // Connect command - use daemon connection logic
                 Command::Connect { .. } => {
                     if world_index < app.worlds.len() && !app.worlds[world_index].connected {
-                        // A shell world runs a local terminal (crate::shell).
-                        if app.worlds[world_index].settings.world_type.is_shell() {
-                            app.emit_client_text(world_index, "Starting shell...", true);
-                            app.spawn_shell_connect(world_index);
-                            return;
-                        }
-                        // Slack/Discord worlds run a background chat session instead of
-                        // connect_daemon_world (MUD-only) - see crate::chat.
-                        if !app.worlds[world_index].settings.world_type.is_mud() {
-                            if app.worlds[world_index].settings.has_connection_settings() {
-                                app.emit_client_text(world_index, "Connecting...", true);
-                                app.spawn_chat_connect(world_index, event_tx);
-                            } else {
-                                app.emit_client_text(world_index, "Set the bot token first (world editor).", true);
-                            }
+                        if start_non_mud_world(app, world_index, event_tx) {
                             return;
                         }
                         if app.worlds[world_index].settings.has_connection_settings() {
@@ -1197,7 +1215,9 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 }
                 Command::WorldConnectBackground { ref name, no_login } => {
                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
+                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings()
+                            && !start_non_mud_world(app, idx, event_tx)
+                        {
                             // In the background - see App::spawn_world_connect. `/worlds -b` never
                             // reported a failure, so it still doesn't.
                             // `/worlds -b` logs in unless -l (handle_connection_success reads the flag).
@@ -1217,6 +1237,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                         // Connect if not connected and has settings
                         if !app.worlds[idx].connected
                             && app.worlds[idx].settings.has_connection_settings()
+                            && !start_non_mud_world(app, idx, event_tx)
                         {
                             if matches!(parsed, Command::WorldConnectNoLogin { .. }) {
                                 app.worlds[idx].skip_auto_login = true;
@@ -1238,9 +1259,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         }
         WsMessage::ConnectWorld { world_index } => {
             if world_index < app.worlds.len() && !app.worlds[world_index].connected {
-                // A shell world runs a local terminal (crate::shell).
-                if app.worlds[world_index].settings.world_type.is_shell() {
-                    app.spawn_shell_connect(world_index);
+                if start_non_mud_world(app, world_index, event_tx) {
                     return;
                 }
                 let settings = app.worlds[world_index].settings.clone();
@@ -1353,7 +1372,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1362,7 +1381,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
-                mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
+                mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                 log_input_enabled, keyboard_always_visible, tabs, icon_bar,
             );
         }
@@ -1646,7 +1665,8 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 let vc = visible_columns.unwrap_or_else(|| app.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
                 let paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
                 let visible = app.ws_client_worlds.get(&client_id).map(|v| v.visible).unwrap_or(true);
-                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
+                let history = app.client_history_after(client_id, None, world_index);
+                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, history, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
                 app.resize_shell_worlds();
             }
         }
@@ -1753,7 +1773,9 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
         }
         WsMessage::CalculateOldestPending { current_index } => {
-            let oldest_idx = app.calculate_oldest_pending_world_from(current_index);
+            // The fallback world is this client's own last visit, not the console's.
+            let history = app.ws_client_worlds.get(&client_id).map(|v| v.history.clone()).unwrap_or_default();
+            let oldest_idx = app.calculate_oldest_pending_world_from(current_index, &history);
             app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
         }
         // /import export side: mirrors the handler in main.rs's App::handle_ws_message —
@@ -3452,7 +3474,8 @@ pub async fn handle_multiuser_ws_message(
                 let vc = visible_columns.unwrap_or_else(|| app.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
                 let paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
                 let visible = app.ws_client_worlds.get(&client_id).map(|v| v.visible).unwrap_or(true);
-                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
+                let history = app.client_history_after(client_id, None, world_index);
+                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, history, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
             }
         }
         WsMessage::UpdateDimensions { width, height } => {
@@ -4757,5 +4780,67 @@ mod telnet_reader_migration_tests {
         assert_eq!(json, "{\"foo\":\"bar\"}");
 
         let _ = server.await;
+    }
+}
+
+#[cfg(test)]
+mod shell_world_connect_tests {
+    //! A client connecting a shell world through this handler - `/worlds <name>` (what
+    //! TF's `/connect` becomes), `/worlds -b <name>` and the `ConnectWorld` message - must
+    //! start the shell, never a MUD connection to the world's empty address. Before
+    //! `start_non_mud_world`, only `ConnectWorld` and a bare `/connect` knew the world's
+    //! type; the other paths printed "Connecting to :..." and failed with "no host and
+    //! port set" on a `-D` or GUI-master host, while the console's own path (commands.rs)
+    //! started the shell. The native GUI's `/connect` reaches this handler as `/worlds`.
+    use super::*;
+
+    fn shell_app(tx: &mpsc::Sender<AppEvent>) -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("Sh");
+        w.settings.world_type = WorldType::Shell;
+        // The Command rides in `hostname`: one that exits at once, so no login shell is
+        // left behind by the test.
+        w.settings.hostname = "true".to_string();
+        app.worlds.push(w);
+        app.event_tx = Some(tx.clone());
+        app.tf_event_tx = Some(tx.clone());
+        app
+    }
+
+    async fn starts_the_shell(msg: WsMessage) {
+        let (tx, _rx) = mpsc::channel::<AppEvent>(100);
+        let mut app = shell_app(&tx);
+        handle_daemon_ws_message(&mut app, 1, msg, &tx).await;
+        let text: Vec<&str> = app.worlds[0].output_lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(app.worlds[0].shell.is_some(), "the shell session was started; output: {text:?}");
+        assert!(app.worlds[0].connected, "a shell world counts as connected once its shell runs");
+        assert!(!text.iter().any(|l| l.contains("Connecting to")), "no MUD connection for a shell world; output: {text:?}");
+        assert!(text.iter().any(|l| l.contains("Starting shell")), "the world says what happened; output: {text:?}");
+        app.worlds[0].shell = None;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worlds_name_starts_the_shell() {
+        starts_the_shell(WsMessage::SendCommand { world_index: 0, command: "/worlds Sh".to_string() }).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worlds_background_starts_the_shell() {
+        starts_the_shell(WsMessage::SendCommand { world_index: 0, command: "/worlds -b Sh".to_string() }).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_command_starts_the_shell() {
+        starts_the_shell(WsMessage::SendCommand { world_index: 0, command: "/connect".to_string() }).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_world_message_starts_the_shell() {
+        starts_the_shell(WsMessage::ConnectWorld { world_index: 0 }).await;
     }
 }

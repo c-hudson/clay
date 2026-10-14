@@ -8956,6 +8956,25 @@ third
     /// /`ScrollbackLines` round trip supplies the missing lines, splice them back into that
     /// exact position so the world's buffer ends up complete and in order - not tacked onto
     /// the front (the old blind-prepend behavior) or the back.
+    /// The SSH remote console mirrors the server's echo mask (`EchoMaskChanged`) and must
+    /// drop it when the connection ends: it never runs clear_connection_state itself, so
+    /// `WorldDisconnected` is its one signal, or it masks every key typed into the next
+    /// connection as `*`.
+    #[test]
+    fn test_console_client_clears_echo_mask_on_world_disconnected() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("world0"));
+        app.current_world_index = 0;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        app.ws_client_tx = Some(tx);
+
+        app.handle_remote_ws_message(WsMessage::EchoMaskChanged { world_index: 0, masked: true });
+        assert!(app.worlds[0].protocol.echo_masked, "precondition: the mirror took the mask");
+        app.handle_remote_ws_message(WsMessage::WorldDisconnected { world_index: 0 });
+        assert!(!app.worlds[0].protocol.echo_masked, "the mask ends with the connection");
+    }
+
     #[test]
     fn test_console_client_resync_gap_fill_restores_order_no_loss() {
         let mut app = App::new();
@@ -9797,7 +9816,7 @@ third
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), ws_password.to_string(),
             false, String::new(), true, true, false,
-            "off".to_string(), "off".to_string(), false, false, true,
+            "off".to_string(), "off".to_string(), String::new(), false, false, true,
             "none".to_string(), "app_tablet".to_string(),
         );
     }
@@ -9950,9 +9969,10 @@ third
     }
 
     // --- App::calculate_oldest_pending_world_from ---
-    // Pins the third fallback tier (T39): daemon's inline copy was missing it entirely, so
-    // "switch to the world needing attention" (Escape+w) had a strictly weaker fallback for
-    // daemon-attached clients.
+    // Esc-w's one rule, for the console and every client (T39 found daemon's inline copy
+    // missing the fallback tier entirely). The rule is TinyFugue's world-q.tf
+    // (`/to_active_or_prev_world`): active worlds oldest first, then "the last world you
+    // visited that is still connected".
 
     #[test]
     fn test_calculate_oldest_pending_falls_back_to_previous_world() {
@@ -9961,11 +9981,12 @@ third
         app.worlds.push(World::new("alpha"));
         app.worlds.push(World::new("beta"));
         app.worlds.push(World::new("gamma"));
+        app.worlds[2].connected = true;
         // No world has pending or unseen output - only the "previous world" tier can fire.
-        app.previous_world_index = Some(2);
+        let history = vec!["gamma".to_string()];
 
-        let result = app.calculate_oldest_pending_world_from(0);
-        assert_eq!(result, Some(2), "with no pending/unseen output anywhere, should fall back to previous_world_index");
+        let result = app.calculate_oldest_pending_world_from(0, &history);
+        assert_eq!(result, Some(2), "with no pending/unseen output anywhere, should fall back to the last world visited");
     }
 
     #[test]
@@ -9974,11 +9995,12 @@ third
         app.worlds.clear();
         app.worlds.push(World::new("alpha"));
         app.worlds.push(World::new("beta"));
+        app.worlds[0].connected = true;
         app.worlds[1].pending_lines.push(make_pending_line("line", false));
         app.worlds[1].pending_since = Some(std::time::Instant::now());
-        app.previous_world_index = Some(0);
+        let history = vec!["alpha".to_string()];
 
-        let result = app.calculate_oldest_pending_world_from(0);
+        let result = app.calculate_oldest_pending_world_from(0, &history);
         assert_eq!(result, Some(1), "a world with actual pending output should win over the previous-world fallback");
     }
 
@@ -9987,10 +10009,112 @@ third
         let mut app = App::new();
         app.worlds.clear();
         app.worlds.push(World::new("alpha"));
-        app.previous_world_index = None;
 
-        let result = app.calculate_oldest_pending_world_from(0);
+        let result = app.calculate_oldest_pending_world_from(0, &[]);
         assert_eq!(result, None);
+    }
+
+    /// TinyFugue's world-q.tf: with no active world, ESC-w goes to "the last world you
+    /// visited that is still connected" - the history is walked past a world that has
+    /// since disconnected, and a history with nothing connected goes nowhere.
+    #[test]
+    fn test_esc_w_previous_world_must_still_be_connected() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["alpha", "beta", "gamma"] {
+            app.worlds.push(World::new(name));
+        }
+        app.worlds[2].connected = true;
+        let history = vec!["beta".to_string(), "gamma".to_string()];
+        assert_eq!(app.calculate_oldest_pending_world_from(0, &history), Some(2), "beta is disconnected: walk back to gamma");
+        app.worlds[2].connected = false;
+        assert_eq!(app.calculate_oldest_pending_world_from(0, &history), None, "nothing connected in the history: stay");
+    }
+
+    /// The console's history is by name and follows switch_world, so Esc-w toggles back
+    /// and forth between the last two worlds (as TF's prev_worlds does) and survives a
+    /// world being removed in front of the remembered one.
+    #[test]
+    fn test_console_esc_w_returns_to_the_last_world_visited() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["alpha", "beta", "gamma"] {
+            let mut w = World::new(name);
+            w.connected = true;
+            app.worlds.push(w);
+        }
+        app.switch_world(1);
+        app.switch_world(2);
+        assert_eq!(app.world_history, vec!["beta".to_string(), "alpha".to_string()]);
+        assert!(app.switch_to_oldest_pending(), "no activity anywhere: back to beta");
+        assert_eq!(app.current_world_index, 1);
+        assert!(app.switch_to_oldest_pending());
+        assert_eq!(app.current_world_index, 2, "and forward again: the two toggle");
+        // Removing a world ahead of the remembered one shifts its index, not its name.
+        app.worlds.remove(0);
+        app.fixup_indices_after_remove(0);
+        assert_eq!(app.current_world_index, 1);
+        assert!(app.switch_to_oldest_pending());
+        assert_eq!(app.worlds[app.current_world_index].name, "beta");
+    }
+
+    /// A remote client's fallback is its own history, kept from MarkWorldSeen - not the
+    /// console's: a `--gui=host` that visited beta then gamma gets beta back even though
+    /// the console never switched at all (which used to leave it with nowhere to go).
+    #[test]
+    fn test_esc_w_previous_world_is_per_client() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["alpha", "beta", "gamma"] {
+            let mut w = World::new(name);
+            w.connected = true;
+            app.worlds.push(w);
+        }
+        app.handle_mark_world_seen(7, 1, Some(0));
+        app.handle_mark_world_seen(7, 2, Some(1));
+        let history = app.ws_client_worlds[&7].history.clone();
+        assert_eq!(history, vec!["beta".to_string(), "alpha".to_string()]);
+        assert_eq!(app.calculate_oldest_pending_world_from(2, &history), Some(1));
+        assert!(app.world_history.is_empty(), "the console never moved");
+        assert_eq!(app.calculate_oldest_pending_world_from(2, &[]), None);
+    }
+
+    /// Kokoro chosen without its files: the Local engine speaks, and Clay says so - at
+    /// the moment it is selected (every time), and once at most when lines fall back.
+    #[test]
+    fn test_kokoro_missing_is_said_on_select_and_once_when_speaking() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        assert!(!kokoro::install().complete(), "the test home has no Kokoro files");
+        let notes = |app: &App| app.worlds[0].output_lines.iter().filter(|l| l.text.contains("Kokoro is not installed")).count();
+        app.settings.tts_mode = tts::TtsMode::Kokoro; // as a settings.dat load would
+        app.note_kokoro_missing(false);
+        app.note_kokoro_missing(false);
+        assert_eq!(notes(&app), 1, "a fallback is reported once");
+        app.note_kokoro_selected(tts::TtsMode::Local);
+        assert_eq!(notes(&app), 2, "selecting it afresh says so again");
+        app.note_kokoro_selected(tts::TtsMode::Kokoro);
+        assert_eq!(notes(&app), 2, "but not when it was Kokoro already");
+        app.settings.tts_mode = tts::TtsMode::Local;
+        app.note_kokoro_selected(tts::TtsMode::Kokoro);
+        assert_eq!(notes(&app), 2, "nor when another engine is chosen");
+    }
+
+    /// Tier 2 is "the world whose activity began first" (TF's queue order), not list order.
+    #[test]
+    fn test_esc_w_unseen_tier_takes_the_oldest_activity_first() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["alpha", "beta", "gamma"] {
+            app.worlds.push(World::new(name));
+        }
+        let now = std::time::Instant::now();
+        app.worlds[1].unseen_lines = 3;
+        app.worlds[1].first_unseen_at = Some(now);
+        app.worlds[2].unseen_lines = 1;
+        app.worlds[2].first_unseen_at = Some(now - std::time::Duration::from_secs(5));
+        assert_eq!(app.calculate_oldest_pending_world_from(0, &[]), Some(2), "gamma's activity began earlier than beta's");
     }
 
     // --- App::handle_update_actions ---
@@ -10341,6 +10465,7 @@ third
         let client_id = 5;
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 0,
+            history: Vec::new(),
             visible_lines: 24,
             visible_columns: 80,
             dimensions: None,
@@ -10417,6 +10542,7 @@ third
         let client_id = 7;
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 0,
+            history: Vec::new(),
             visible_lines: 24,
             visible_columns: 80,
             dimensions: None,
@@ -10457,6 +10583,7 @@ third
         app.worlds.push(World::new("a"));
         app.ws_client_worlds.insert(1, ClientViewState {
             world_index: 0,
+            history: Vec::new(),
             visible_lines: 24,
             visible_columns: 80,
             dimensions: None,
@@ -10479,6 +10606,7 @@ third
             .expect("test host must have > 16 minutes of monotonic clock uptime");
         app.ws_client_worlds.insert(1, ClientViewState {
             world_index: 0,
+            history: Vec::new(),
             visible_lines: 24,
             visible_columns: 80,
             dimensions: None,
@@ -10498,12 +10626,14 @@ third
         // Actively connected client with the larger viewport.
         app.ws_client_worlds.insert(1, ClientViewState {
             world_index: 0, visible_lines: 40, visible_columns: 100,
+            history: Vec::new(),
             dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
         // Disconnected (but within grace) client with a smaller viewport - must not
         // constrain more-mode pagination for the still-present viewer above.
         app.ws_client_worlds.insert(2, ClientViewState {
             world_index: 0, visible_lines: 10, visible_columns: 40,
+            history: Vec::new(),
             dimensions: None, paused: false, visible: true, disconnected_at: Some(std::time::Instant::now()),
         });
         assert_eq!(app.min_viewer_lines(0), Some(40),
@@ -10520,15 +10650,15 @@ third
             .checked_sub(std::time::Duration::from_secs(16 * 60))
             .expect("test host must have > 16 minutes of monotonic clock uptime");
         app.ws_client_worlds.insert(1, ClientViewState { // still connected: keep
-            world_index: 0, visible_lines: 24, visible_columns: 80,
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
             dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
         app.ws_client_worlds.insert(2, ClientViewState { // disconnected, within grace: keep
-            world_index: 0, visible_lines: 24, visible_columns: 80,
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
             dimensions: None, paused: false, visible: true, disconnected_at: Some(std::time::Instant::now()),
         });
         app.ws_client_worlds.insert(3, ClientViewState { // disconnected, expired: reap
-            world_index: 0, visible_lines: 24, visible_columns: 80,
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
             dimensions: None, paused: false, visible: true, disconnected_at: Some(long_ago),
         });
 
@@ -10765,6 +10895,47 @@ third
     /// received, and the consumed seq left a permanent hole in every client's delivered-range
     /// tracking. The `"Disconnected."` line immediately below it was always broadcast, which
     /// is what made the omission so easy to miss.
+    /// A password prompt's echo mask (IAC WILL ECHO) ends with the connection, and the
+    /// clients are told so after `WorldDisconnected`: the server quietly reset its own copy
+    /// in `clear_connection_state`, and an attached GUI kept showing `*` for every key
+    /// typed into the next connection until the MUD negotiated ECHO again.
+    #[test]
+    fn test_disconnect_tells_clients_the_echo_mask_is_off() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = true;
+        w.protocol.echo_masked = true;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+
+        app.handle_disconnected(0, &crate::telnet_reader::CloseReason::ByServer);
+
+        assert!(!app.worlds[0].protocol.echo_masked, "the server's own copy is reset");
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let disconnected = log.iter().position(|m| matches!(m, WsMessage::WorldDisconnected { world_index: 0 }));
+        let unmasked = log.iter().position(|m| matches!(m, WsMessage::EchoMaskChanged { world_index: 0, masked: false }));
+        assert!(disconnected.is_some(), "WorldDisconnected is broadcast: {log:?}");
+        assert!(unmasked.is_some(), "and so is the end of the echo mask: {log:?}");
+        assert!(unmasked > disconnected, "in that order, so a client that resets on WorldDisconnected ends up unmasked either way");
+    }
+
+    /// An unmasked connection ending says nothing about the mask.
+    #[test]
+    fn test_disconnect_of_an_unmasked_world_sends_no_mask_message() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = true;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+
+        app.handle_disconnected(0, &crate::telnet_reader::CloseReason::ByServer);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(!log.iter().any(|m| matches!(m, WsMessage::EchoMaskChanged { .. })), "no mask message for a world that was never masked: {log:?}");
+    }
+
     #[test]
     fn test_disconnect_broadcasts_the_final_prompt_line() {
         let mut app = App::new();
@@ -11568,6 +11739,7 @@ third
         // The WS client is viewing world B.
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 1,
+            history: Vec::new(),
             visible_lines: 24,
             visible_columns: 80,
             dimensions: None,
@@ -11605,6 +11777,7 @@ third
         push_server_line(&mut app, 0, "arrived before we looked");
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 0, visible_lines: 24, visible_columns: 80,
+            history: Vec::new(),
             dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
 
@@ -11650,6 +11823,7 @@ third
         let (client_id, mut rx) = phase_c_register_client(&mut app);
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 0, visible_lines: 24, visible_columns: 80,
+            history: Vec::new(),
             dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
 
@@ -11692,6 +11866,7 @@ third
         let (client_id, mut rx) = phase_c_register_client(&mut app);
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 0, visible_lines: 24, visible_columns: 80,
+            history: Vec::new(),
             dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
 
@@ -11729,6 +11904,7 @@ third
         let (client_id, mut rx) = phase_c_register_client(&mut app);
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 0, visible_lines: 24, visible_columns: 80,
+            history: Vec::new(),
             dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
         assert!(app.ws_client_viewing(0), "precondition");
@@ -15950,6 +16126,7 @@ third
         let client_id = 99;
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 0,
+            history: Vec::new(),
             visible_lines: 24,
             visible_columns: 80,
             dimensions: None,

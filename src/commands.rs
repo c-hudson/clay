@@ -1445,6 +1445,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 }
             }
         }
+        Command::Tts { args } => app.tts_command(&args, None, &event_tx),
         Command::Update { force } => {
             // The console is the server: its /update is the server's own update
             // (src/selfupdate.rs); the result comes back as AppEvent::UpdateResult.
@@ -1541,7 +1542,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         Command::Say { text } => {
             // Speak text via TTS
             // Console: use local TTS subprocess
-            crate::tts::speak(&app.tts_backend, &text, app.settings.tts_mode);
+            app.speak_text(&text);
             // Web/GUI: broadcast ServerSpeak to WebSocket clients
             let world_index = app.current_world_index;
             app.ws_broadcast(WsMessage::ServerSpeak {
