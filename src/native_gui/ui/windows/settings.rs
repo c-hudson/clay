@@ -304,6 +304,23 @@ impl SettingsView {
         cx.emit(DialogEvent::Close);
     }
 
+    /// Import Settings (General; the menu used to have it): this window closes first, as
+    /// Cancel does - an import replaces these settings, so its values would be stale and
+    /// a Save after it would put the old ones back - and the main window shows the Import
+    /// dialog (a dialog there is opened with that window, hence `later`).
+    fn import(&mut self, cx: &mut Context<Self>) {
+        let _ = self.main.update(cx, |v, cx| {
+            v.later(
+                |v, window, cx| {
+                    window.activate_window();
+                    v.open_surface("import", window, cx);
+                },
+                cx,
+            )
+        });
+        cx.emit(DialogEvent::Close);
+    }
+
     fn help(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = match self.tab {
             Tab::General => "setup",
@@ -643,6 +660,9 @@ impl Render for SettingsView {
                             .px(px(14.0))
                             .pt(px(8.0))
                             .pb(px(10.0))
+                            .when(self.tab == Tab::General, |d| {
+                                d.child(k.button("settings-import", "Import Settings", Btn::Plain, Some(Box::new(cx.listener(|this, _, _, cx| this.import(cx))))))
+                            })
                             .child(k.help_button("settings-help", cx.listener(|this, _, w, cx| this.help(w, cx))))
                             .child(div().flex_1())
                             .child(k.button("settings-cancel", "Cancel", Btn::Plain, Some(Box::new(cx.listener(|this, _, _, cx| this.cancel(cx))))))

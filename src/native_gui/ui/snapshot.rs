@@ -20,6 +20,18 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const EMOJI_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out: &str, width: f32, height: f32) {
+    // CLAY_SNAPSHOT_CACHE=1: a cold start as the real window makes one, from the world
+    // cache (loaded here, and written after the capture as the real window writes it).
+    let use_cache = std::env::var_os("CLAY_SNAPSHOT_CACHE").is_some();
+    let cache_key = session.target.key();
+    if use_cache {
+        session.core.set_cache(crate::native_gui::core::cache::load(&cache_key));
+        session.core.prefer_world(crate::native_gui::core::store::server(&cache_key).last_world);
+    }
+    // CLAY_SNAPSHOT_SETTLE=ms: how long the output must be quiet before the view takes
+    // over. 0 hands the view the session as soon as the initial state is in, so what
+    // follows (a cold start's catch-up) reaches it as it does the real window: `pump:`.
+    let settle = std::env::var("CLAY_SNAPSHOT_SETTLE").ok().and_then(|s| s.parse().ok()).map_or(SETTLE, Duration::from_millis);
     // Run the session here until the output has settled: the headless app runs on a
     // deterministic test executor, so hand it a finished state rather than a live channel.
     let start = Instant::now();
@@ -43,7 +55,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     Status::Stopped(why) => fail(why),
                     _ => {}
                 }
-                if session.core.is_online() && !session.core.worlds.is_empty() && last.elapsed() >= SETTLE {
+                if session.core.is_online() && !session.core.worlds.is_empty() && last.elapsed() >= settle {
                     break;
                 }
                 if start.elapsed() >= TIMEOUT {
@@ -248,8 +260,85 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     });
                     Vec::new()
                 }
+                // The main window's output as last drawn, as text: more-mode's counts, the
+                // scroll, and the first and last rows painted (by seq), for measuring how
+                // far a key moved the view.
+                "state" => {
+                    cx.run_until_parked();
+                    let _ = cx.update_window(window.into(), |_, w, app| {
+                        let _ = w.draw(app);
+                    });
+                    cx.update(|app| {
+                        let v = view.read(app);
+                        let s = v.scroll.borrow();
+                        let world = v.session.core.current_world();
+                        let row = |id: u64| {
+                            let line = world.and_then(|w| w.lines.iter().find(|l| l.id == id));
+                            let seq = line.and_then(|l| l.seq).map_or("-".to_string(), |s| s.to_string());
+                            let text: String = line.map(|l| super::find::plain(&l.text)).unwrap_or_default().chars().take(24).collect();
+                            format!("{seq}:{text:?}")
+                        };
+                        let distinct = s.hits.iter().map(|h| h.id).collect::<std::collections::HashSet<_>>().len();
+                        let bar = s.bar.map_or("none".to_string(), |b| {
+                            format!("x={:.0} y={:.0}+{:.0} thumb={:.0}+{:.0} total={} hot={}", b.left, b.top, b.height, b.thumb_top, b.thumb_h, b.total, v.select.bar_hot())
+                        });
+                        println!(
+                            "snapshot-state: {arg} status={:?} conn_log={} lines={} held={} pending={} paused={} follow={} rows_below={} view_rows={} painted_rows={} painted_lines={} first={} last={} bar[{bar}]",
+                            v.session.core.status(),
+                            v.surf.stack.is_open(&super::dialogs::Kind::ConnectionLog),
+                            world.map_or(0, |w| w.lines.len()),
+                            v.more.held(),
+                            v.pending_total(),
+                            v.more.paused,
+                            s.follow,
+                            s.rows_below,
+                            s.view_rows,
+                            s.hits.len(),
+                            distinct,
+                            s.hits.first().map_or("none".into(), |h| row(h.id)),
+                            s.hits.last().map_or("none".into(), |h| row(h.id)),
+                        );
+                    });
+                    Vec::new()
+                }
+                // A capture of the main window now, as well as the one at the end.
+                "shot" => {
+                    cx.run_until_parked();
+                    let _ = cx.update_window(window.into(), |_, w, app| {
+                        let _ = w.draw(app);
+                    });
+                    match cx.capture_screenshot(window.into()) {
+                        Ok(image) => match image.save(arg) {
+                            Ok(()) => println!("snapshot: {arg} ({}x{})", image.width(), image.height()),
+                            Err(e) => fail(&format!("can't write {arg}: {e}")),
+                        },
+                        Err(e) => fail(&format!("rendering failed: {e:#}")),
+                    }
+                    Vec::new()
+                }
                 "sleep" => {
                     std::thread::sleep(Duration::from_millis(nums.first().copied().unwrap_or(0.0) as u64));
+                    Vec::new()
+                }
+                // The connection and its dialog as they stand, without drawing (`state:`
+                // draws first, which runs what the view queued for its next frame).
+                "peek" => {
+                    cx.update(|app| {
+                        let v = view.read(app);
+                        println!(
+                            "snapshot-peek: {arg} status={:?} conn_log={} queued_for_next_frame={}",
+                            v.session.core.status(),
+                            v.surf.stack.is_open(&super::dialogs::Kind::ConnectionLog),
+                            v.surf.later.len()
+                        );
+                    });
+                    Vec::new()
+                }
+                // The view's clock, once (the real window's 250 ms timer, which this
+                // harness doesn't run): keepalives, watchdogs, a reconnect that's due.
+                "tick" => {
+                    cx.update_window(window.into(), |_, w, app| view.update(app, |v, cx| v.tick(w, cx))).expect("tick");
+                    cx.run_until_parked();
                     Vec::new()
                 }
                 "wait" => {
@@ -317,6 +406,12 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         Err(e) => {
             eprintln!("snapshot: rendering failed: {e:#}");
             std::process::exit(1);
+        }
+    }
+    if use_cache {
+        let worlds = cx.update(|app| view.read(app).session.core.cache_snapshot());
+        if !worlds.is_empty() {
+            crate::native_gui::core::cache::save(&cache_key, &worlds);
         }
     }
 }

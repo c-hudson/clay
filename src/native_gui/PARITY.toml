@@ -2505,7 +2505,7 @@ section = "status"
 phase = 2
 status = "done"
 feature = "hamburger menu (dropdown upward); items open their features as those land"
-note = "Toggle Tags, Reload/Resync (fresh connection) and Logout work; Help/Worlds/Actions/Settings/Import/Find/Search/Change Password/New Window open surfaces that land in 2e and phase 4"
+note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab)"
 
 [[item]]
 id = "ui:status.world"
@@ -2800,7 +2800,7 @@ id = "ui:dialog.import"
 section = "dialogs"
 phase = 4
 status = "done"
-feature = "/import and the menu's Import Settings: host, password, auth key; a plaintext confirm before resending without TLS"
+feature = "/import and Settings' Import Settings button (General, before the ?; Settings closes first): host, password, auth key; a plaintext confirm before resending without TLS"
 note = "app.js showImportDialog"
 
 [[item]]

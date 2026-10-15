@@ -666,6 +666,7 @@
         settingsSaveBtn: document.getElementById('settings-save-btn'),
         settingsCancelBtn: document.getElementById('settings-cancel-btn'),
         settingsHelpBtn: document.getElementById('settings-help-btn'),
+        settingsImportBtn: document.getElementById('settings-import-btn'),
         settingsTitle: document.getElementById('settings-title'),
         settingsGeneralSection: document.getElementById('settings-general'),
         settingsWebSection: document.getElementById('settings-web'),
@@ -5744,12 +5745,16 @@
         const heldWorld = worlds[worldIndex];
         const obj = heldWorld && heldWorld.output_lines ? heldWorld.output_lines[lineIndex] : null;
 
+        // Counted in rows, as the console and the native GUI count: a screenful of wrapped
+        // prose is fewer lines than rows. A line that isn't drawn costs nothing.
+        const rows = (paused || !moreModeEnabled) ? 0 : lineRows(text, !!(obj && obj.gagged));
+
         if (paused) {
             // Already paused, queue the line info
             pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
             updateStatusBar();
-        } else if (moreModeEnabled && linesSincePause >= threshold) {
-            // Trigger pause
+        } else if (moreModeEnabled && rows > 0 && linesSincePause > 0 && linesSincePause + rows > threshold) {
+            // Trigger pause: this line would not fit in what's left of the screenful.
             paused = true;
             pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
             // Scroll to bottom to show what we have so far
@@ -5757,9 +5762,42 @@
             updateStatusBar();
         } else {
             // Normal display - append the line
-            linesSincePause++;
+            linesSincePause += rows;
             appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer, highlightColor, archiveSourced);
         }
+    }
+
+    // A character's width in cells: 0 for controls, combining marks, joiners and
+    // variation selectors, 2 for wide (CJK) characters and emoji, 1 otherwise.
+    function charCells(cp) {
+        if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
+        if ((cp >= 0x300 && cp < 0x370) || cp === 0x200b || cp === 0x200c || cp === 0x200d
+            || (cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0x1f3fb && cp <= 0x1f3ff)
+            || (cp >= 0xe0020 && cp <= 0xe007f)) return 0;
+        if ((cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf)
+            || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff)
+            || (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60)
+            || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f1e6 && cp <= 0x1f1ff)
+            || (cp >= 0x1f300 && cp <= 0x1faff) || (cp >= 0x20000 && cp <= 0x3fffd)) return 2;
+        return 1;
+    }
+
+    // How many screen rows a line takes at the output's current width - the same estimate
+    // the server makes for a client's width (rendering::RowMetrics): the ANSI and a hidden
+    // MUD tag take no room, a wide character takes two cells, continuation rows lose the
+    // wrapspace indent. 0 for a line that isn't drawn at all (gagged, filtered out).
+    // More-mode counts and releases in these rows.
+    function lineRows(text, gagged) {
+        const clean = String(text == null ? '' : text).replace(/[\r\n]+/g, '');
+        if (!lineIsDrawn(clean, gagged)) return 0;
+        let shown = stripAnsi(clean);
+        if (!showTags) shown = stripMudTag(shown);
+        let cells = 0;
+        for (const ch of shown) cells += charCells(ch.codePointAt(0));
+        const cols = getVisibleColumnCount();
+        if (cells <= cols) return 1;
+        const rest = Math.max(1, cols - (wrapspace || 0));
+        return 1 + Math.ceil((cells - cols) / rest);
     }
 
     // How many lines are held back for the current world, local queue plus the server's.
@@ -5772,6 +5810,14 @@
     // (WsMessage::ReleasePending, see World::release_pending) - a line wrapping to three rows
     // costs three - which is what makes it the right unit for the drag gesture, whose input is
     // also measured in screen rows. `count: 0` means "everything"; use releaseAll() for that.
+    //
+    // This client's own held lines go first (they are older than anything the server still
+    // holds), as many as fit in the budget's rows; the server is asked only once none are
+    // held here, and only for what is left of the budget. Asking it while lines were still
+    // held here released both at once - and the server's PendingReleased, which releases
+    // that many of this client's held lines too, then released as many again: one Page Down
+    // moved far more than a screen. Releasing `count` LINES of the local queue skipped rows
+    // the same way whenever the lines wrapped.
     function releaseLines(count) {
         const world = worlds[currentWorldIndex];
         const serverPending = world ? (world.pending_count || 0) : 0;
@@ -5779,19 +5825,18 @@
         // Check if there's anything to release (local or server)
         if (pendingLines.length === 0 && serverPending === 0) return;
 
-        // Release local pending lines
+        let left = count;
         if (pendingLines.length > 0) {
-            doReleasePending(count);
+            left = Math.max(0, count - releaseHeldRows(count));
         }
 
-        // Also request server to release pending lines
-        if (serverPending > 0) {
+        if (pendingLines.length === 0 && left > 0 && serverPending > 0) {
             // Optimistic UI update: immediately reduce pending_count so rapid PageDown
             // presses don't send redundant requests. Server will correct with PendingLinesUpdate.
-            const toRelease = Math.min(count, serverPending);
+            const toRelease = Math.min(left, serverPending);
             world.pending_count = Math.max(0, serverPending - toRelease);
             updateStatusBar();
-            send({ type: 'ReleasePending', world_index: currentWorldIndex, count: count });
+            send({ type: 'ReleasePending', world_index: currentWorldIndex, count: left });
         }
     }
 
@@ -5819,12 +5864,32 @@
         }
     }
 
-    // Actually release pending lines (called when server broadcasts PendingReleased)
+    // Show `count` held lines, oldest first (0: all of them). A LINE count: what the
+    // server's PendingReleased reports, and releaseAll's "everything".
     function doReleasePending(count) {
         if (pendingLines.length === 0) return;
+        showHeldLines(count === 0 ? pendingLines.length : Math.min(count, pendingLines.length));
+    }
 
-        const toRelease = count === 0 ? pendingLines.length : Math.min(count, pendingLines.length);
-        const released = pendingLines.splice(0, toRelease);
+    // Show held lines, oldest first, as many as fit in `budget` rows - at least one, so a
+    // line taller than the budget still comes out. Returns the rows shown.
+    function releaseHeldRows(budget) {
+        let used = 0;
+        let n = 0;
+        while (n < pendingLines.length) {
+            const item = pendingLines[n];
+            const rows = lineRows(item.text, !!(item.obj && item.obj.gagged));
+            if (used > 0 && used + rows > budget) break;
+            used += rows;
+            n++;
+        }
+        showHeldLines(n);
+        return used;
+    }
+
+    // Append the oldest `n` held lines; once none are held, output flows again.
+    function showHeldLines(n) {
+        const released = pendingLines.splice(0, n);
 
         released.forEach(item => {
             appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew, item.fromServer, item.highlightColor, item.archiveSourced);
@@ -7893,9 +7958,14 @@
         return true;
     }
 
-    // Main window end of that relay: the same switch / connect the in-page selector does.
+    // Main window end of that relay: the same switch / connect the in-page selector does,
+    // and the Settings window's Import Settings (openImportFromSettings).
     window.__clayMainAction = function(p) {
         if (popupWindowMode || !p || typeof p !== 'object') return;
+        if (p.importSettings) {
+            showImportDialog('');
+            return;
+        }
         if (p.switchWorld) {
             const idx = worlds.findIndex(w => (w.name || '').toLowerCase() === String(p.switchWorld).toLowerCase());
             if (idx < 0) return;
@@ -8075,7 +8145,10 @@
             'ANSI Music: Play ANSI music sequences from MUDs.', '',
             'ZWJ Sequence: For terminals that support combined',
             '  emoji (ZWJ). If unsupported, shows two separate',
-            '  emoji instead of one combined one.'
+            '  emoji instead of one combined one.', '',
+            'Import Settings: copy settings, theme and keybindings',
+            '  from another Clay (/import). Settings closes first;',
+            '  the import replaces what it shows.'
         ],
         web: [
             'Web Settings - Remote Access', '',
@@ -11305,10 +11378,6 @@
             dlBtn.style.display = isAndroid ? '' : 'none';
             if (isAndroid) { dlBtn.disabled = true; dlBtn.style.opacity = '0.4'; }
         }
-        // Show Reload menu item only in WebView GUI mode (not pure web)
-        document.querySelectorAll('.menu-reload').forEach(el => {
-            el.style.display = window.WEBVIEW_MODE ? '' : 'none';
-        });
         // Hide New Window on Android (can't open browser tabs from the app)
         if (isAndroid) {
             document.querySelectorAll('[data-action="new-window"]').forEach(el => {
@@ -12176,6 +12245,9 @@
         if (elements.settingsSaveBtn) {
             elements.settingsSaveBtn.textContent = tab === 'clay-server' ? 'Save & Connect' : 'Save';
         }
+        if (elements.settingsImportBtn) {
+            elements.settingsImportBtn.style.display = tab === 'general' ? '' : 'none';
+        }
         if (tab === 'clay-server') {
             populateClayServerTab();
         }
@@ -12259,6 +12331,20 @@
         updateWebPopupUI();
         renderFontFamilyList();
         updateFontPopupUI();
+    }
+
+    // Settings' Import Settings (General tab; the menu used to have it). Settings closes
+    // first, as Cancel does: an import replaces these settings, so the dialog's values
+    // would be stale and a Save after it would put the old ones back. The desktop GUI's
+    // Settings window has the main window show the Import dialog (main-action relay).
+    function openImportFromSettings() {
+        if (settingsWindowMode) {
+            sendIpc('main-action:' + JSON.stringify({ importSettings: true }));
+            closeSettingsPopup();
+            return;
+        }
+        closeSettingsPopup();
+        showImportDialog('');
     }
 
     function closeSettingsPopup() {
@@ -17638,6 +17724,7 @@
                           settingsActiveTab === 'clay-server' ? 'clay-server' : 'setup';
             openPopupHelp(helpTab);
         };
+        if (elements.settingsImportBtn) elements.settingsImportBtn.onclick = openImportFromSettings;
         if (elements.worldEditHelpBtn) elements.worldEditHelpBtn.onclick = function() { openPopupHelp('worldEditor'); };
         if (elements.worldSelectorHelpBtn) elements.worldSelectorHelpBtn.onclick = function() { openPopupHelp('worldSelector'); };
         if (elements.actionsListHelpBtn) elements.actionsListHelpBtn.onclick = function() { openPopupHelp('actionsList'); };

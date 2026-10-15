@@ -21,6 +21,7 @@ mod select;
 mod surfaces;
 mod textdiv;
 mod theme_bridge;
+mod titlebar;
 mod viewmode;
 mod windows;
 #[cfg(feature = "native-gui-snapshot")]
@@ -41,11 +42,12 @@ use gpui::{KeyBinding, Keystroke, SharedString};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 
-use crate::native_gui::core::client::{Credentials, Effect, Input as NetInput, Status, hidden_line};
+use crate::native_gui::core::client::{Credentials, Effect, Input as NetInput, Line, Status, hidden_line};
 use crate::native_gui::core::keys::{Keys, Resolved};
 use crate::native_gui::core::session::Session;
 use crate::native_gui::core::decor::{ActionMatcher, DecorOptions, LineFacts, decorate};
 use crate::native_gui::core::style::{Palette, StyleOptions, StyledLine};
+use crate::native_gui::core::wrap::rows_in_columns;
 use crate::theme::ThemeColors;
 use chrome::{Chrome, Tokens};
 use fonts::Fonts;
@@ -72,6 +74,44 @@ struct CacheSaver {
 struct LoginForm {
     username: Entity<InputState>,
     password: Entity<InputState>,
+}
+
+/// Lines as the output draws them, decorated once and kept by `Line::id` in
+/// `ClayView::styled` (restyled when the line's ▶ comes or goes).
+struct Styler<'a> {
+    styled: &'a mut HashMap<u64, (bool, Arc<StyledLine>)>,
+    palette: &'a Palette,
+    style: &'a StyleOptions,
+    decor: &'a DecorOptions,
+    /// F8: the actions to highlight matches of.
+    matcher: Option<&'a ActionMatcher>,
+    world: &'a str,
+    /// This client's display id (whose ▶ a line carries).
+    me: u64,
+}
+
+impl Styler<'_> {
+    fn line(&mut self, line: &Line) -> Arc<StyledLine> {
+        let is_new = self.me != 0 && line.display_id == Some(self.me);
+        if let Some((was_new, styled)) = self.styled.get(&line.id) {
+            if *was_new == is_new {
+                return styled.clone();
+            }
+        }
+        let facts = LineFacts {
+            text: &line.text,
+            ts: line.ts,
+            from_server: line.from_server,
+            from_archive: line.from_archive,
+            archive_sourced: line.archive_sourced,
+            is_new,
+            highlight: line.highlight.as_deref(),
+            action_match: self.matcher.is_some_and(|m| m.matches(&line.text, self.world)),
+        };
+        let styled = Arc::new(decorate(&facts, self.palette, self.style, self.decor));
+        self.styled.insert(line.id, (is_new, styled.clone()));
+        styled
+    }
 }
 
 pub struct ClayView {
@@ -151,6 +191,8 @@ pub struct ClayView {
     media_gate: Option<(usize, bool)>,
     /// The settings' Transparency, as applied to this window.
     opacity: opacity::Opacity,
+    /// The title bar's dark or light, as set for this window (Windows).
+    titlebar: titlebar::TitleBar,
 }
 
 impl ClayView {
@@ -174,6 +216,9 @@ impl ClayView {
             this.after(rest, cx);
         })
         .detach();
+        // The system's light/dark changed: GPUI has just put the title bar back to the
+        // system's choice, so draw again to put the theme's back (titlebar.rs).
+        cx.observe_window_appearance(window, |_, _window, cx| cx.notify()).detach();
         let mut session = session;
         let _ = session.core.set_visible(window.is_visible(), Instant::now());
         let theme = ThemeColors::dark_default();
@@ -225,6 +270,7 @@ impl ClayView {
             kokoro_warmed: None,
             media_gate: None,
             opacity: Default::default(),
+            titlebar: Default::default(),
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -373,10 +419,33 @@ impl ClayView {
             self.scroll.borrow_mut().follow_bottom();
             return;
         }
-        let threshold = self.scroll.borrow().view_rows.saturating_sub(2);
+        // More-mode counts rows, as the output will wrap the lines: they're measured
+        // before they're laid out, since a held line never is.
+        let (threshold, cols) = {
+            let s = self.scroll.borrow();
+            let cols = if self.wrap_columns > 0 { s.view_cols.min(self.wrap_columns) } else { s.view_cols };
+            (s.view_rows.saturating_sub(2), cols)
+        };
+        let (indent, show_tags) = (self.wrapspace, self.show_tags);
         let enabled = self.more_mode_enabled();
         if let Some(world) = self.session.core.current_world() {
-            if self.more.arrivals(world, enabled, threshold) {
+            let mut styler = Styler {
+                styled: &mut self.styled,
+                palette: &self.palette,
+                style: &self.style,
+                decor: &self.decor,
+                matcher: self.action_highlight.then_some(&self.matcher),
+                world: &world.name,
+                me: self.session.core.display_id,
+            };
+            let mut rows = |line: &Line| {
+                if (line.gagged && !show_tags) || hidden_line(&line.text) {
+                    return 0;
+                }
+                let styled = styler.line(line);
+                rows_in_columns(&styled.text, &styled.breaks, cols, indent)
+            };
+            if self.more.arrivals(world, enabled, threshold, &mut rows) {
                 self.scroll.borrow_mut().follow_bottom();
             }
         }
@@ -728,13 +797,25 @@ impl ClayView {
             self.note_visible(lines.iter().map(|(id, _)| *id).collect());
             return lines;
         };
-        let me = self.session.core.display_id;
         let mut out = Vec::with_capacity(world.lines.len());
         let mut seqs = Vec::with_capacity(world.lines.len());
         let filter = self.find.filtering().map(str::to_string);
         let cut = self.find.search_cut();
+        let mut styler = Styler {
+            styled: &mut self.styled,
+            palette: &self.palette,
+            style: &self.style,
+            decor: &self.decor,
+            matcher: self.action_highlight.then_some(&self.matcher),
+            world: &world.name,
+            me: self.session.core.display_id,
+        };
+        // Nothing below a line more-mode holds back is drawn (more.rs): released lines
+        // come out at the bottom, never in above something already shown.
+        let mut holding = false;
         for line in &world.lines {
-            if (line.gagged && !self.show_tags) || hidden_line(&line.text) || self.more.is_held(line.id) {
+            holding |= self.more.is_held(line.id);
+            if holding || (line.gagged && !self.show_tags) || hidden_line(&line.text) {
                 if Some(line.id) == cut {
                     break;
                 }
@@ -749,29 +830,7 @@ impl ClayView {
                 continue;
             }
             seqs.push(line.seq.filter(|_| !line.from_archive));
-            let is_new = me != 0 && line.display_id == Some(me);
-            if let Some((was_new, styled)) = self.styled.get(&line.id) {
-                if *was_new == is_new {
-                    out.push((line.id, styled.clone()));
-                    if Some(line.id) == cut {
-                        break;
-                    }
-                    continue;
-                }
-            }
-            let facts = LineFacts {
-                text: &line.text,
-                ts: line.ts,
-                from_server: line.from_server,
-                from_archive: line.from_archive,
-                archive_sourced: line.archive_sourced,
-                is_new,
-                highlight: line.highlight.as_deref(),
-                action_match: self.action_highlight && self.matcher.matches(&line.text, &world.name),
-            };
-            let styled = Arc::new(decorate(&facts, &self.palette, &self.style, &self.decor));
-            self.styled.insert(line.id, (is_new, styled.clone()));
-            out.push((line.id, styled));
+            out.push((line.id, styler.line(line)));
             if Some(line.id) == cut {
                 // F5: the output ends at the match.
                 break;
@@ -929,6 +988,7 @@ impl Render for ClayView {
         // A `/window` takes its main window's, which a Transparency being previewed is on.
         let alpha = self.link.leader.as_ref().and_then(|l| l.upgrade()).map_or_else(|| self.transparency(), |l| l.read(cx).transparency());
         self.opacity.apply(window, alpha);
+        self.titlebar.apply(window, !self.chrome.tokens.light);
         let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
         if need_login && !self.login_focused {
             // The cursor goes where typing starts: the name in multiuser mode, else the password.
@@ -969,14 +1029,24 @@ impl Render for ClayView {
                     selection: self.selection_ranges(),
                     selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],
                     hover_link: self.select.hover_link.clone(),
-                    scrollbar: self.mode.grep.is_some(),
+                    bar_thumb: self.chrome.tokens.muted,
+                    bar_thumb_hot: self.chrome.tokens.fg2,
+                    bar_hot: self.select.bar_hot(),
                     shell_cursor,
                 };
                 let link = self.select.hover_link.is_some();
+                let bar = self.select.bar_hot();
                 div()
                     .id("output")
                     .size_full()
-                    .map(|d| if link { d.cursor_pointer() } else { d.cursor_text() })
+                    .map(|d| if bar { d.cursor_default() } else if link { d.cursor_pointer() } else { d.cursor_text() })
+                    // Off the output (the bar is on its edge): the bar is no longer lit.
+                    .on_hover(cx.listener(|this, hovered: &bool, _w, cx| {
+                        if !*hovered && this.select.bar_hover {
+                            this.select.bar_hover = false;
+                            cx.notify();
+                        }
+                    }))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.output_mouse_down(ev, cx)))
                     .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.output_mouse_down(ev, cx)))
                     .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| this.output_mouse_move(ev, cx)))
@@ -1028,7 +1098,7 @@ impl Render for ClayView {
                     let rows = (this.more.wheel_px / this.font_size).floor() as usize;
                     if rows > 0 {
                         this.more.wheel_px -= rows as f32 * this.font_size;
-                        this.release_lines(rows, cx);
+                        this.release_rows(rows, cx);
                     }
                 } else {
                     this.more.wheel_px = 0.0;
@@ -1039,8 +1109,10 @@ impl Render for ClayView {
                 }
                 cx.notify();
             }))
-            // Dragging the font slider or the input's top edge, and the end of a press.
+            // Dragging the font slider, the input's top edge or the scroll bar's thumb, and
+            // the end of a press.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                this.bar_drag(ev, cx);
                 if this.chrome.slider_drag {
                     if ev.pressed_button == Some(MouseButton::Left) {
                         this.slide_to(ev.position.x, cx);
@@ -1062,6 +1134,7 @@ impl Render for ClayView {
                     this.chrome.slider_drag = false;
                     this.chrome.closed_by_press = None;
                     this.input_resize_end(cx);
+                    this.bar_release(cx);
                 }),
             )
             .children(icon_bar)

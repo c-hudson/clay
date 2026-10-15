@@ -100,6 +100,7 @@ mod tests {
                 display_id: None,
                 archive_sourced: false,
                 from_archive: false,
+                scrollback: false,
             })
             .collect();
         w

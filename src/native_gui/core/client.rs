@@ -156,6 +156,11 @@ pub struct Line {
     pub display_id: Option<u64>,
     pub archive_sourced: bool,
     pub from_archive: bool,
+    /// Came in a scrollback reply (a gap fill, the server's resume replay, a backfill):
+    /// history this client is catching up on, never a live arrival for more-mode. A cold
+    /// start's catch-up after the disk cache is appended at the tail like live output,
+    /// so the position alone can't tell them apart.
+    pub scrollback: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1370,6 +1375,7 @@ impl ClientCore {
             display_id: None,
             archive_sourced: false,
             from_archive: false,
+            scrollback: false,
         }
     }
 
@@ -1631,7 +1637,14 @@ impl ClientCore {
             _ if pending => RequestKind::GapFill,
             _ => RequestKind::Backfill,
         };
-        let new_lines: Vec<Line> = lines.iter().map(|t| self.line_from_ts(t)).collect();
+        let new_lines: Vec<Line> = lines
+            .iter()
+            .map(|t| {
+                let mut l = self.line_from_ts(t);
+                l.scrollback = true;
+                l
+            })
+            .collect();
         match kind {
             RequestKind::GapFill => {
                 let w = &mut self.worlds[world_index];

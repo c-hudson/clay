@@ -34,7 +34,7 @@ const FAILURES_FOR_RETRY: u32 = 5;
 pub struct Surfaces {
     pub stack: dialogs::Stack,
     /// What opens or closes on the next frame, where there's a window to do it with.
-    later: Vec<Later>,
+    pub(super) later: Vec<Later>,
     seen: Option<Seen>,
     pub conn_log: ConnLog,
     /// A command Connection Lost holds, with the name of the world it was for: sent
@@ -103,19 +103,24 @@ impl ClayView {
         }
     }
 
-    /// Close a dialog from outside it (the keyboard goes back where it belongs).
+    /// Close a dialog from outside it (the keyboard goes back where it belongs). Queued
+    /// even when it isn't open yet: an opening queued for the same frame runs first, and
+    /// this then closes it. Asking `is_open` here instead skipped the close whenever the
+    /// opening was still waiting for its frame - a reconnect that went from connecting
+    /// to online between two frames (a few milliseconds on a LAN) left "Connecting to
+    /// Clay Server" up over a working connection for good.
     fn close_dialog(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        if self.surf.stack.is_open(&kind) {
-            self.later(
-                move |v, window, cx| {
+        self.later(
+            move |v, window, cx| {
+                if v.surf.stack.is_open(&kind) {
                     v.surf.stack.close(&kind);
                     if !v.surf.stack.any() {
                         window.focus(&v.focus, cx);
                     }
-                },
-                cx,
-            );
-        }
+                }
+            },
+            cx,
+        );
     }
 
     /// A window or dialog by the web client's name for it: the menu's and icon bar's
@@ -753,11 +758,15 @@ impl ClayView {
             Status::Reconnecting { attempt, .. } => Seen::Failed(*attempt),
             Status::Stopped(_) => Seen::Stopped,
         };
+        self.observe(now, cx);
+        self.resend_held(cx);
+    }
+
+    fn observe(&mut self, now: Seen, cx: &mut Context<Self>) {
         if self.surf.seen != Some(now) {
             self.surf.seen = Some(now);
             self.status_changed(now, cx);
         }
-        self.resend_held(cx);
     }
 
     fn status_changed(&mut self, now: Seen, cx: &mut Context<Self>) {
@@ -817,7 +826,11 @@ impl ClayView {
         }
         self.later(
             |v, window, cx| {
-                if v.surf.stack.is_open(&Kind::ConnectionLog) {
+                // Not if the connection got through before this frame (it's online, or
+                // past the attempt to the login): the close for that is queued too, but
+                // there's no reason to show the log for an instant.
+                let wanted = matches!(v.surf.seen, Some(Seen::Connecting(_) | Seen::Failed(_) | Seen::Stopped));
+                if !wanted || v.surf.stack.is_open(&Kind::ConnectionLog) {
                     return;
                 }
                 let main = cx.entity().downgrade();
@@ -879,6 +892,17 @@ impl ClayView {
                 "insecure" => {
                     let d = cx.new(|cx| ImportInsecure::new(main, "192.168.1.20:9000".into(), cx));
                     dialogs::open(self, Kind::ImportInsecure, d, window, cx);
+                }
+                // A reconnect that gets through between two frames: connecting, then
+                // online, with no frame between (a real window draws on its next frame;
+                // this harness draws whenever it settles, so it never shows the race).
+                "connect-race" => {
+                    self.observe(Seen::Connecting(99), cx);
+                    if self.session.target.is_loopback() {
+                        // The log shows for a remote server only.
+                        self.show_conn_log(cx);
+                    }
+                    self.observe(Seen::Online, cx);
                 }
                 "connlog" => {
                     let url = self.session.url();

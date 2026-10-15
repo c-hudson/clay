@@ -1,0 +1,10 @@
+/def ld_greet = /echo hello
+(trig) '* waves' ld_wave
+ld_hidden
+ld_greet
+(trig) '* waves' ld_wave
+[-s ld_*] same=1 empty=0
+[-s -i ld_*] same=1 empty=0
+[ld_*] same=1 empty=0
+[-s no_such_macro_*] same=1 empty=1
+nothing_listed_returns=0

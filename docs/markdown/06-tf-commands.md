@@ -337,6 +337,15 @@ List defined macros.
 /list heal*           List matching pattern
 ```
 
+### /listdef
+The same as `/list`, with the same options and patterns: TinyFugue's standard
+library defines it as `/list %*`, and Clay has it built in.
+
+```
+/listdef              List all
+/listdef -s heal*     Short listing of the macros named heal*
+```
+
 ### /purge
 Remove macros matching a filter (same option grammar as `/list`); silent on
 success.

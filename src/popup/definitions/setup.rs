@@ -40,6 +40,9 @@ pub const SETUP_FIELD_TTS_VOICE: FieldId = FieldId(27);
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
 pub const SETUP_BTN_CANCEL: ButtonId = ButtonId(2);
+/// Import Settings (`/import`): the master console's only, on the left before the "?",
+/// as the GUIs' Settings have it (it left their menu). See [`add_import_button`].
+pub const SETUP_BTN_IMPORT: ButtonId = ButtonId(3);
 
 /// World switching mode options
 pub fn world_switching_options() -> Vec<SelectOption> {
@@ -270,6 +273,15 @@ pub fn create_setup_popup(
     def
 }
 
+/// The Import Settings button, for the master console (a remote console has no
+/// `/import`, as its `/menu` has no Import Settings).
+pub fn add_import_button(def: &mut PopupDefinition) {
+    // Left-aligned buttons draw in the order they're defined: first is before the "?".
+    def.buttons.insert(0, Button::new(SETUP_BTN_IMPORT, "Import Settings").left_align().with_shortcut('I'));
+    // Room for both groups with a gap between: at 40 "[ ? ]" touched "[Cancel]".
+    def.layout.min_width = def.layout.min_width.max(44);
+}
+
 /// Update visibility of the Log Input field based on the current Archive Input/Output
 /// (SETUP_FIELD_SCROLLBACK) toggle state - it's only shown once that's checked (see
 /// SETUP_FIELD_LOG_INPUT's doc comment). Mirrors update_web_visibility in web.rs.
@@ -295,6 +307,10 @@ fn update_setup_visibility_def(def: &mut PopupDefinition) {
 fn setup_help_text() -> Vec<String> {
     vec![
         "Setup - Global Settings",
+        "",
+        "Import Settings (button): copy settings, theme and",
+        "  keybindings from another Clay (/import). Setup",
+        "  closes first; the import replaces what it shows.",
         "",
         "More Mode: Pauses output when a full screen of text",
         "  arrives. Press Tab to release one page, Esc+J to",
@@ -403,6 +419,21 @@ mod tests {
         assert_eq!(state.definition.title, "Setup");
         assert_eq!(state.definition.fields.len(), 23);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
+    }
+
+    #[test]
+    fn the_master_consoles_import_button_comes_before_the_help_button() {
+        let mut def = create_setup_popup(
+            true, true, false, "unseen_first",
+            false, 3, "dark", false, "", "left", false, false, true,
+            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet",
+        );
+        add_import_button(&mut def);
+        let left: Vec<&str> = def.buttons.iter().filter(|b| b.left_align).map(|b| b.label.as_str()).collect();
+        assert_eq!(left, ["Import Settings", "?"], "left-aligned buttons draw in this order");
+        let right: Vec<&str> = def.buttons.iter().filter(|b| !b.left_align).map(|b| b.label.as_str()).collect();
+        assert_eq!(right, ["Cancel", "Save"]);
+        assert!(def.layout.min_width >= 44, "room for both groups with a gap");
     }
 
     #[test]

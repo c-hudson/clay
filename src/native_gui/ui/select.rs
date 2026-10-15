@@ -56,8 +56,17 @@ pub struct SelectState {
     copied_at: Option<Instant>,
     /// The mouse while dragging, for scrolling when it's past the top or bottom.
     pub drag_at: Option<Point<Pixels>>,
-    /// Dragging a grep window's scrollbar: where on the thumb it was taken.
+    /// Dragging the scroll bar: where on the thumb it was taken.
     bar_grab: Option<f32>,
+    /// The mouse is on the scroll bar.
+    pub bar_hover: bool,
+}
+
+impl SelectState {
+    /// The scroll bar's thumb is drawn lit: the mouse is on the bar, or dragging it.
+    pub fn bar_hot(&self) -> bool {
+        self.bar_hover || self.bar_grab.is_some()
+    }
 }
 
 /// The word around `byte` (Unicode word boundaries; a run of spaces is its own word).
@@ -200,13 +209,13 @@ impl ClayView {
             return;
         }
         self.select.menu = None;
-        // A grep window's scrollbar: take the thumb where it was pressed, or, pressed
-        // beside it, by its middle (the view jumps there).
+        // The scroll bar: take the thumb where it was pressed, or, pressed beside it, by
+        // its middle (the view jumps there, as GTK's scroll bars do).
         let bar = self.scroll.borrow().bar_at(x, y);
         if let Some(b) = bar {
             let grab = if y >= b.thumb_top && y < b.thumb_top + b.thumb_h { y - b.thumb_top } else { b.thumb_h / 2.0 };
             self.select.bar_grab = Some(grab);
-            self.scroll.borrow_mut().drag_thumb_to(y - grab);
+            self.drag_thumb(y - grab);
             cx.notify();
             return;
         }
@@ -237,13 +246,10 @@ impl ClayView {
 
     pub(super) fn output_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
         let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
-        if let Some(grab) = self.select.bar_grab {
-            if ev.pressed_button == Some(MouseButton::Left) {
-                self.scroll.borrow_mut().drag_thumb_to(y - grab);
-                cx.notify();
-                return;
-            }
-            self.select.bar_grab = None;
+        if self.select.bar_grab.is_some() {
+            // The window's own handler moves the thumb (`bar_drag`): it hears the mouse
+            // off the output too.
+            return;
         }
         let dragging = self.select.sel.is_some_and(|s| s.dragging);
         if dragging && ev.pressed_button == Some(MouseButton::Left) {
@@ -254,6 +260,11 @@ impl ClayView {
         }
         if let Some(sel) = self.select.sel.as_mut() {
             sel.dragging = false;
+        }
+        let on_bar = self.scroll.borrow().bar_at(x, y).is_some();
+        if on_bar != self.select.bar_hover {
+            self.select.bar_hover = on_bar;
+            cx.notify();
         }
         let on = self.scroll.borrow().byte_at(x, y);
         let link = on.and_then(|p| self.styled_text(p.id).and_then(|s| link_at(&s, p.byte)).map(|r| (p.id, r)));
@@ -284,8 +295,31 @@ impl ClayView {
         self.select.sel = Some(sel);
     }
 
+    /// The mouse moving anywhere in the window while the scroll bar's thumb is held: the
+    /// thumb follows it up and down; a move with the button up lets go.
+    pub(super) fn bar_drag(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(grab) = self.select.bar_grab else { return };
+        if ev.pressed_button == Some(MouseButton::Left) {
+            self.drag_thumb(f32::from(ev.position.y) - grab);
+        } else {
+            self.select.bar_grab = None;
+        }
+        cx.notify();
+    }
+
+    /// The button let go anywhere in the window: the thumb, if held, is let go.
+    pub(super) fn bar_release(&mut self, cx: &mut Context<Self>) {
+        if self.select.bar_grab.take().is_some() {
+            cx.notify();
+        }
+    }
+
     pub(super) fn output_mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
         if self.select.bar_grab.take().is_some() {
+            // Let go: lit while the mouse is still on the bar.
+            let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            self.select.bar_hover = self.scroll.borrow().bar_at(x, y).is_some();
+            cx.notify();
             return;
         }
         let Some(mut sel) = self.select.sel else { return };

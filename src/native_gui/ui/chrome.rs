@@ -169,16 +169,13 @@ const MAIN_MENU: &[Option<(&str, &str, &str)>] = &[
     Some(("help", "Help", "F1")),
     Some(("world-selector", "World Selector", "/worlds")),
     Some(("actions", "Actions", "/actions")),
-    None,
     Some(("setup", "Settings", "/setup")),
-    Some(("import", "Import Settings", "/import")),
     None,
     Some(("toggle-tags", "Toggle Tags", "F2")),
     Some(("filter", "Find", "F4")),
     Some(("search", "Search History", "F5")),
     None,
     Some(("change-password", "Change Password", "")),
-    Some(("reload", "Reload", "Ctrl+R")),
     Some(("new-window", "New Window", "")),
     Some(("resync", "Resync", "")),
     None,
@@ -760,5 +757,33 @@ impl ClayView {
             self.after(fx, cx);
         }
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAIN_MENU;
+
+    /// The hamburger menu is index.html's `#menu-dropdown`, item for item and separator
+    /// for separator (the web hides some per platform; this menu hides some per mode).
+    #[test]
+    fn the_main_menu_is_the_web_menu() {
+        let html = include_str!("../../web/index.html");
+        let start = html.find("<div id=\"menu-dropdown\"").expect("the web menu");
+        let block = &html[start..start + html[start..].find("\n        </div>").expect("its end")];
+        let web: Vec<String> = block
+            .lines()
+            .filter_map(|l| {
+                if l.contains("class=\"menu-sep") {
+                    Some("---".to_string())
+                } else {
+                    let at = l.find("data-action=\"")? + "data-action=\"".len();
+                    Some(l[at..at + l[at..].find('"')?].to_string())
+                }
+            })
+            .collect();
+        let native: Vec<String> = MAIN_MENU.iter().map(|e| e.map_or("---".to_string(), |(action, _, _)| action.to_string())).collect();
+        assert_eq!(native, web);
+        assert!(!native.iter().any(|a| a == "reload" || a == "import"), "Reload and Import Settings left the menu");
     }
 }

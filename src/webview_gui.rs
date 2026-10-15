@@ -954,8 +954,7 @@ fn build_html(params: &WebViewParams) -> String {
     // Inject WebView-specific CSS and JS overrides
     let webview_overrides = r#"<style>
 /* WebView overrides - native app, not mobile browser */
-#output-container { padding: 2px 4px; -webkit-user-select: text; user-select: text; cursor: text; scrollbar-width: none; }
-.clay-scrollbar { position: fixed; right: 1px; width: 5px; background: rgba(255,255,255,0.25); border-radius: 3px; z-index: 50; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+#output-container { padding: 2px 4px; -webkit-user-select: text; user-select: text; cursor: text; }
 #input-container { padding: 2px 4px; }
 #output { -webkit-user-select: text; user-select: text; }
 #output * { -webkit-user-select: text; user-select: text; }
@@ -977,29 +976,7 @@ fn build_html(params: &WebViewParams) -> String {
 window.WEBVIEW_MODE = true;
 window.WEBVIEW_DEVICE_OVERRIDE = 'desktop';
 document.addEventListener('DOMContentLoaded', function() {
-    /* Custom scroll indicator — appended to body (not output-container) to avoid layout interference */
-    var scrollThumb = document.createElement('div');
-    scrollThumb.className = 'clay-scrollbar';
-    var scrollTimer = null;
-    function initScrollbar() {
-        var oc = document.getElementById('output-container');
-        if (!oc) return;
-        document.body.appendChild(scrollThumb);
-        oc.addEventListener('scroll', function() {
-            var sh = oc.scrollHeight - oc.clientHeight;
-            if (sh <= 0) { scrollThumb.style.opacity = '0'; return; }
-            var ratio = oc.scrollTop / sh;
-            var thumbH = Math.max(20, (oc.clientHeight / oc.scrollHeight) * oc.clientHeight);
-            var ocRect = oc.getBoundingClientRect();
-            var thumbTop = ocRect.top + ratio * (oc.clientHeight - thumbH);
-            scrollThumb.style.height = thumbH + 'px';
-            scrollThumb.style.top = thumbTop + 'px';
-            scrollThumb.style.opacity = '1';
-            if (scrollTimer) clearTimeout(scrollTimer);
-            scrollTimer = setTimeout(function() { scrollThumb.style.opacity = '0'; }, 1500);
-        });
-    }
-    setTimeout(initScrollbar, 100);
+    /* The output's scroll bar is style.css's (body.device-desktop #output-container). */
 
     /* Selection highlight overlays */
     var overlays = [];

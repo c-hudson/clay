@@ -33,7 +33,7 @@ pub fn is_tf_command_name(cmd: &str) -> bool {
         "echo" | "beep" | "quote" | "substitute" | "escape" | "hilite" | "nohilite" | "partial" | "export" |
         "expr" | "test" | "eval" |
         "if" | "elseif" | "else" | "endif" | "while" | "for" | "done" | "break" |
-        "def" | "undef" | "undefn" | "undeft" | "list" | "purge" |
+        "def" | "undef" | "undefn" | "undeft" | "list" | "listdef" | "purge" |
         "bind" | "unbind" | "hook" | "unhook" |
         "load" | "save" | "require" | "loaded" | "lcd" | "cd" | "pwd" | "log" |
         "sh" | "time" | "runtime" | "recall" | "repeat" | "ps" | "kill" |
@@ -380,7 +380,8 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "undef" => cmd_undef(engine, args),
         "undefn" => cmd_undefn(engine, args),
         "undeft" => cmd_undeft(engine, args),
-        "list" => cmd_list(engine, args),
+        // stdlib.tf: `/def -i listdef = /list %*` - the same command under another name.
+        "list" | "listdef" => cmd_list(engine, args),
         "purge" => cmd_purge(engine, args),
 
         // Expression commands
@@ -2439,7 +2440,7 @@ Expressions & Control Flow:
   /if  /elseif  /else  /endif  /while  /for  /done  /break
   /true  /false  /:  /then  /do
 Macros & Triggers:
-  /def  /undef  /undefn  /undeft  /list  /purge  /edit
+  /def  /undef  /undefn  /undeft  /list  /listdef  /purge  /edit
   /trig  /trigp  /trigc  /trigpc  /untrig
   /bind  /unbind  /hook  /unhook  /dokey  /ismacro  /isvar
 Output:
@@ -3028,6 +3029,9 @@ Examples:
                                      of underline/reverse/hilite
   /list -s -i ~alias_*            - short-format listing incl. invisible"##.to_string()
             )),
+            "listdef" => TfCommandResult::Success(Some(
+                "/listdef [<macro-options>] [<name>] [= <body>]\n\nThe same as /list with the same arguments (TinyFugue's standard library\ndefines it as `/list %*`). See /help list for the options.\n\nExamples:\n  /listdef            - every non-invisible macro\n  /listdef -s foo*    - short listing of the macros named foo*".to_string()
+            )),
             "purge" => TfCommandResult::Success(Some(
 r##"/purge [<macro-options>] [<name>] [= <body>]
 
@@ -3501,8 +3505,9 @@ const TF_BUILTIN_COMMANDS: &[&str] = &[
 
 fn cmd_def(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.trim().is_empty() {
-        // No args: list all macros
-        return TfCommandResult::Success(Some(macros::list_macros(engine, None, false)));
+        // No args: list all macros (silent when there are none, as in TF)
+        let text = macros::list_macros(engine, None, false);
+        return TfCommandResult::Success((!text.is_empty()).then_some(text));
     }
 
     // -m defaults to %matching (`/help def`)
@@ -3881,7 +3886,8 @@ fn cmd_list(engine: &mut TfEngine, args: &str) -> TfCommandResult {
                 .unwrap_or(0);
             let text = macros::list_macros_with_filter(engine, &filter);
             engine.set_global("?", TfValue::Integer(last as i64));
-            TfCommandResult::Success(Some(text))
+            // Nothing matched: no output at all, as real tf (tests/tf/cases/listdef.tf).
+            TfCommandResult::Success((!text.is_empty()).then_some(text))
         }
         Err(e) => TfCommandResult::Error(e),
     }
@@ -4623,7 +4629,7 @@ mod tests {
             "else", "elseif", "endif", "endpaste", "escape", "eval", "exit", "export", "expr", "false",
             "features", "fg", "finger", "first", "for", "gag", "getfile", "gpri", "grab", "help",
             "hilite", "histsize", "hook", "hpri", "if", "input", "insert", "isize", "ismacro", "isvar",
-            "kecho", "kill", "l", "last", "lcd", "let", "limit", "list", "listsockets", "liststreams",
+            "kecho", "kill", "l", "last", "lcd", "let", "limit", "list", "listdef", "listsockets", "liststreams",
             "listvar", "listworlds", "load", "loaded", "loadworld", "localecho", "log", "login", "lp", "lpquote",
             "man", "mecho", "more", "nogag", "nohilite", "nologin", "noquiet", "not", "nth", "partial",
             "paste", "prompt", "ps", "ptime", "purge", "purgeworld", "putfile", "pwd", "qecho", "quiet", "quit",
@@ -4636,7 +4642,7 @@ mod tests {
             "unworld", "ver", "version", "visual", "watchdog", "watchname", "while", "world", "wrap", "wrapspace",
             "xtitle",
         ];
-        assert_eq!(DISPATCH_COMMANDS.len(), 169, "unexpected count - is_tf_command_name's own list changed size?");
+        assert_eq!(DISPATCH_COMMANDS.len(), 170, "unexpected count - is_tf_command_name's own list changed size?");
         for name in DISPATCH_COMMANDS {
             assert!(is_tf_command_name(name),
                 "{name:?} is pinned in DISPATCH_COMMANDS but is_tf_command_name doesn't \
@@ -5639,10 +5645,9 @@ mod tests {
         let mut engine = TfEngine::new();
         engine.add_macro(macros::parse_def("x = /echo visible-x").unwrap());
         match cmd_list(&mut engine, "-s -I -mglob x") {
-            TfCommandResult::Success(Some(msg)) => {
-                assert_eq!(msg, "No macros defined.", "a visible macro must not satisfy -I: {msg}");
-            }
-            other => panic!("expected success: {other:?}"),
+            // Nothing listed: silent, as in real tf.
+            TfCommandResult::Success(None) => {}
+            other => panic!("a visible macro must not satisfy -I (expected an empty listing): {other:?}"),
         }
 
         engine.macros.clear();

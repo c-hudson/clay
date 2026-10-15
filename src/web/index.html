@@ -212,16 +212,13 @@
             <div class="menu-item" data-action="help">Help<span class="shortcut">F1</span></div>
             <div class="menu-item" data-action="world-selector">World Selector<span class="shortcut">/worlds</span></div>
             <div class="menu-item" data-action="actions">Actions<span class="shortcut">/actions</span></div>
-            <div class="menu-sep"></div>
             <div class="menu-item" data-action="setup">Settings<span class="shortcut">/setup</span></div>
-            <div class="menu-item" data-action="import">Import Settings<span class="shortcut">/import</span></div>
             <div class="menu-sep"></div>
             <div class="menu-item" data-action="toggle-tags">Toggle Tags<span class="shortcut">F2</span></div>
             <div class="menu-item" data-action="filter">Find<span class="shortcut">F4</span></div>
             <div class="menu-item" data-action="search">Search History<span class="shortcut">F5</span></div>
             <div class="menu-sep"></div>
             <div class="menu-item menu-change-password" data-action="change-password" style="display: none;">Change Password</div>
-            <div class="menu-item menu-reload" data-action="reload" style="display: none;">Reload<span class="shortcut">Ctrl+R</span></div>
             <div class="menu-item" data-action="new-window">New Window</div>
             <div class="menu-item menu-resync" data-action="resync">Resync</div>
             <div class="menu-sep menu-logout-divider" style="display: none;"></div>
@@ -1337,6 +1334,9 @@
                         </div>
                         <!-- Shared footer -->
                         <div class="popup-footer">
+                            <!-- General only (switchSettingsTab): Import Settings, which the
+                                 menu used to have. -->
+                            <button id="settings-import-btn" class="btn">Import Settings</button>
                             <button id="settings-help-btn" class="btn btn-help">?</button>
                             <span class="footer-spacer"></span>
                             <button id="settings-cancel-btn" class="btn">Cancel</button>

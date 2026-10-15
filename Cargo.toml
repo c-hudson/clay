@@ -170,7 +170,8 @@ tao = { version = "0.34", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # The native GUI's spell checking on Windows (ISpellChecker; the windows version GPUI uses).
-windows = { version = "0.62", optional = true, features = ["Win32_Globalization", "Win32_System_Com"] }
+# Also its title bars' dark mode (ui/titlebar.rs: DwmSetWindowAttribute, SetWindowPos).
+windows = { version = "0.62", optional = true, features = ["Win32_Globalization", "Win32_System_Com", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
 # Audio playback (uses WASAPI on Windows automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav", "mp3", "vorbis", "flac"] }
 # WebView GUI (native WebView window using system browser engine)

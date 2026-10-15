@@ -157,9 +157,50 @@ pub fn wrap_rows(
     rows
 }
 
+/// How many rows `text` wraps to in a grid `cols` columns wide, continuation rows
+/// pushed right by `indent` columns: [`wrap_rows`] with every character as wide as a
+/// terminal draws it (a tab to the next eight-column stop). The output's font is
+/// monospaced, so this is the layout's count, give or take a wide glyph, for a line it
+/// hasn't laid out yet (more-mode's budget for lines it holds back).
+pub fn rows_in_columns(text: &str, breaks: &[usize], cols: usize, indent: usize) -> usize {
+    // No character but a tab is more columns wide than it has bytes, so a line that
+    // fits in bytes fits (most do): the scroll bar asks this of every line in the buffer.
+    if text.len() <= cols && !text.contains('\t') {
+        return 1;
+    }
+    let mut x = vec![0.0f32; text.len() + 1];
+    let mut at = 0.0f32;
+    for (i, c) in text.char_indices() {
+        x[i..i + c.len_utf8()].fill(at);
+        at += if c == '\t' { 8.0 - at % 8.0 } else { unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as f32 };
+    }
+    x[text.len()] = at;
+    let cols = cols.max(1) as f32;
+    if at <= cols {
+        return 1;
+    }
+    wrap_rows(text, breaks, cols, indent as f32, &|i| x[i]).len().max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_in_columns_counts_the_wrap() {
+        assert_eq!(rows_in_columns("", &[], 10, 0), 1);
+        assert_eq!(rows_in_columns("hello world", &[], 11, 0), 1);
+        // Broken at the space, as wrap_rows does: "hello " / "world".
+        assert_eq!(rows_in_columns("hello world", &[], 8, 0), 2);
+        // Continuation rows are narrower by the indent.
+        assert_eq!(rows_in_columns("aa bb cc dd", &[], 6, 3), 3);
+        // Wide characters take two columns, a tab runs to the next stop.
+        assert_eq!(rows_in_columns("日本語日本語", &[], 6, 0), 2);
+        assert_eq!(rows_in_columns("a\tb", &[], 9, 0), 1);
+        assert_eq!(rows_in_columns("a\tb", &[], 8, 0), 2);
+        // A line no longer in bytes than the row is one row, wide characters and all.
+        assert_eq!(rows_in_columns("日本語日本語", &[], 18, 0), 1);
+    }
 
     /// Every char one unit wide.
     fn mono(text: &str) -> impl Fn(usize) -> f32 + '_ {

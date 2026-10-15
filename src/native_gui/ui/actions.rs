@@ -48,7 +48,7 @@ impl ClayView {
                 let n = self.take_kbnum();
                 if self.scroll.borrow().at_bottom() && self.pending_total() > 0 {
                     let rows = ((view_rows - 2) / 2).max(1) as usize * n.max(1) as usize;
-                    self.release_lines(rows, cx);
+                    self.release_rows(rows, cx);
                 } else {
                     self.user_scroll((view_rows / 2).max(1) * n);
                 }
@@ -294,10 +294,21 @@ impl ClayView {
     /// A scroll the user asked for: moving up leaves the bottom (and pauses output, as
     /// app.js does when more-mode is on).
     pub(super) fn user_scroll(&mut self, rows: isize) {
+        self.note_user_scroll(rows);
+        self.scroll.borrow_mut().by(rows);
+    }
+
+    /// The scroll bar's thumb taken to window y (its top): the view goes with it, and
+    /// leaving the bottom that way pauses output as any other scroll up does.
+    pub(super) fn drag_thumb(&mut self, thumb_top: f32) {
+        let rows = self.scroll.borrow_mut().drag_thumb_to(thumb_top);
+        self.note_user_scroll(rows);
+    }
+
+    fn note_user_scroll(&mut self, rows: isize) {
         if rows < 0 && self.more_mode_enabled() && !self.more.paused {
             self.more.pause();
         }
-        self.scroll.borrow_mut().by(rows);
     }
 
     /// Local held lines plus the server's.
@@ -305,21 +316,26 @@ impl ClayView {
         self.more.held() + self.session.core.current_world().map_or(0, |w| w.pending_count)
     }
 
-    pub(super) fn release_lines(&mut self, n: usize, cx: &mut Context<Self>) {
-        self.more.release(n);
+    /// Show `rows` rows of held output: this window's own held lines first (they're
+    /// older than anything the server still holds), then, once those are all out, the
+    /// server's for what's left (`ReleasePending`'s count is a row budget too). Asking
+    /// the server while lines are still held here released both at once - and the
+    /// server's `PendingReleased` then released as many again here.
+    pub(super) fn release_rows(&mut self, rows: usize, cx: &mut Context<Self>) {
+        let used = self.more.release_rows(rows);
         self.more.caught_up();
+        let left = rows.saturating_sub(used);
         let world = self.session.core.current;
-        if self.session.core.current_world().is_some_and(|w| w.pending_count > 0) {
-            let fx = self.session.core.release_pending(world, n);
-            let rest = self.session.apply(fx);
-            self.after(rest, cx);
+        if self.more.held() == 0 && left > 0 && self.session.core.current_world().is_some_and(|w| w.pending_count > 0) {
+            let fx = self.session.core.release_pending(world, left);
+            self.after(fx, cx);
         }
         cx.notify();
     }
 
     pub(super) fn release_screenful(&mut self, cx: &mut Context<Self>) {
         let rows = self.scroll.borrow().view_rows.saturating_sub(2).max(1);
-        self.release_lines(rows, cx);
+        self.release_rows(rows, cx);
     }
 
     pub(super) fn release_all(&mut self, cx: &mut Context<Self>) {

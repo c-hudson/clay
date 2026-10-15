@@ -84,14 +84,20 @@ Click the hamburger icon for:
 
 | Option | Description |
 |--------|-------------|
-| Worlds List | Show connected worlds |
-| World Selector | Open world selector popup |
-| Actions | Open actions editor |
-| Settings | (Android) Open server settings |
+| Help | Keyboard shortcuts and commands (F1) |
+| World Selector | Open the world selector (`/worlds`) |
+| Actions | Open the actions editor (`/actions`) |
+| Settings | Open Settings (`/setup`) |
 | Toggle Tags | Show/hide MUD tags (F2) |
-| Toggle Highlight | Show action pattern matches (F8) |
+| Find | Show only matching lines (F4) |
+| Search History | Find text in the output (F5) |
+| Change Password | (multiuser) Change your password |
+| New Window | Another window on the same connection (not on Android) |
 | Resync | Request full state refresh |
-| Clay Server | (Android) Disconnect and reconfigure |
+| Logout | (multiuser) Log out |
+
+Import Settings is a button on Settings' General tab (before the `?`), and `/import`
+opens it too. Reload is `Ctrl+R` or `/reload`.
 
 ### World Selector
 
@@ -129,6 +135,11 @@ the right. On a phone the dialog fills the screen and the sidebar becomes a stri
 icons along the top. The Worlds and Actions dialogs use the same cards, and every
 colour comes from the theme chosen in Settings (the Interface chapter lists them).
 
+The General tab's footer has **Import Settings** before the `?`: it closes Settings (an
+import replaces what it shows, so a Save afterwards would put the old values back) and
+opens the Import dialog, the same one as `/import`. The console's `/setup` has the same
+button.
+
 ### Status Panel
 
 A collapsible panel below the output area shows the current world's GMCP `Char.*`/MSDP
@@ -156,7 +167,7 @@ and the Android app since all three run the same interface code.
 | `Up/Down` | Move the cursor within a multi-line input |
 | `Esc-{` / `Esc-}` | Switch between active worlds |
 | `Esc-Left` / `Esc-Right` | Switch between connected worlds |
-| `PageUp/PageDown` | Scroll output |
+| `PageUp/PageDown` | Scroll output (or drag the scroll bar on the output's right edge; see the Interface chapter) |
 | `Tab` | Release screenful when paused; scroll down otherwise |
 | `Escape+j` | Jump to end |
 | `Ctrl+P/N` | Command history |

@@ -35,7 +35,7 @@ use super::emoji::{self, Look};
 use super::fonts::{FontClass, Fonts, bundled_index, class_of};
 use super::ink;
 use crate::native_gui::core::style::{Cell, DiscordEmoji, Rgb, Run, StyledLine};
-use crate::native_gui::core::wrap::wrap_rows;
+use crate::native_gui::core::wrap::{rows_in_columns, wrap_rows};
 
 /// The GUI's `#output-container { padding: 2px 4px }` (webview_gui.rs's override of
 /// style.css's 4px).
@@ -73,9 +73,11 @@ pub struct OutputSnapshot {
     pub selection_bg: Rgb,
     /// The link under the mouse: (line, bytes), drawn brighter (`.output-link:hover`).
     pub hover_link: Option<(u64, Range<usize>)>,
-    /// A scrollbar that stays, with its track, rather than the thumb that shows for a
-    /// moment after a scroll: a grep window's, which has nothing else on screen.
-    pub scrollbar: bool,
+    /// The scroll bar's thumb (the theme's fg-muted), and its colour while the mouse is
+    /// on the bar or dragging it (fg-secondary): style.css `#output-container`'s.
+    pub bar_thumb: Hsla,
+    pub bar_thumb_hot: Hsla,
+    pub bar_hot: bool,
     /// A shell world's cursor, drawn in the grid (src/shell). `None` for an ordinary world
     /// or a hidden cursor.
     pub shell_cursor: Option<ShellCursor>,
@@ -91,7 +93,7 @@ pub struct ShellCursor {
     pub color: Rgb,
 }
 
-/// A grep window's scrollbar, as last laid out (window coordinates).
+/// The scroll bar, as last laid out (window coordinates).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Bar {
     pub left: f32,
@@ -100,12 +102,16 @@ pub struct Bar {
     pub thumb_top: f32,
     pub thumb_h: f32,
     /// Rows in all, when they're more than the view holds (else nothing to drag).
-    total: usize,
+    pub total: usize,
 }
 
-/// The scrollbar's width, and the gap between it and the window's edge.
+/// The scroll bar's width, and the gap between it and the window's edge. The strip is
+/// kept clear of text whether or not there's anything to scroll, so the output doesn't
+/// rewrap the moment it first outgrows the view (style.css `scrollbar-gutter: stable`).
 const BAR_W: f32 = 8.0;
 const BAR_GAP: f32 = 1.0;
+/// The thumb is never shorter than this.
+const THUMB_MIN: f32 = 20.0;
 
 /// One painted row, for finding what's under the mouse.
 #[derive(Clone, Debug, Default)]
@@ -147,21 +153,19 @@ pub struct Scroll {
     /// view costs a layout only once per line.
     rows_cache: (u32, u32, u64),
     rows: HashMap<u64, usize>,
+    /// For the lines not laid out yet, the rows they'll wrap to, counted in columns
+    /// (`rows_in_columns`), for the scroll bar's sense of the whole: counting each as one
+    /// row put the thumb of a world of wrapped prose far from where the view was, and
+    /// moved it as the drag laid lines out.
+    estimates: HashMap<u64, usize>,
     /// After the last layout: the rows painted, top to bottom, and their height.
     pub hits: Vec<HitRow>,
     pub row_h: f32,
-    /// Where the view was (top, rows below, rows in all), and when that last changed:
-    /// the scroll thumb shows for a moment after any move.
-    pos_key: Option<PosKey>,
-    moved_at: Option<Instant>,
-    /// A grep window's scrollbar, as last laid out.
+    /// The scroll bar, as last laid out.
     pub bar: Option<Bar>,
 }
 
 pub type ScrollHandle = Rc<RefCell<Scroll>>;
-
-/// Where the view is: the top row (`None` on the bottom), rows below, rows in all.
-type PosKey = (Option<(u64, usize)>, usize, usize);
 
 impl Default for Scroll {
     fn default() -> Self {
@@ -174,10 +178,9 @@ impl Default for Scroll {
             view_cols: 80,
             rows_cache: (0, 0, 0),
             rows: HashMap::new(),
+            estimates: HashMap::new(),
             hits: Vec::new(),
             row_h: 16.0,
-            pos_key: None,
-            moved_at: None,
             bar: None,
         }
     }
@@ -200,23 +203,27 @@ impl Scroll {
         self.follow || self.rows_below == 0
     }
 
-    /// The scrollbar, if (x, y) is on it.
+    /// The scroll bar, if (x, y) is on it.
     pub fn bar_at(&self, x: f32, y: f32) -> Option<Bar> {
         self.bar.filter(|b| x >= b.left - 2.0 && y >= b.top && y < b.top + b.height)
     }
 
-    /// Put the thumb's top at window y, as far as it goes: the view follows.
-    pub fn drag_thumb_to(&mut self, thumb_top: f32) {
-        let Some(b) = self.bar else { return };
+    /// Put the thumb's top at window y, as far as it goes: the view follows. Returns the
+    /// rows the view will move (negative is up). The move replaces any not yet laid out,
+    /// since where the thumb is is absolute: two moves of the mouse between frames each
+    /// measured from the same last layout, and adding them went twice as far.
+    pub fn drag_thumb_to(&mut self, thumb_top: f32) -> isize {
+        let Some(b) = self.bar else { return 0 };
         if b.total <= self.view_rows {
-            return;
+            return 0;
         }
         let travel = (b.height - b.thumb_h).max(1.0);
         let ratio = ((thumb_top - b.top) / travel).clamp(0.0, 1.0);
         let scrollable = b.total - self.view_rows;
         let above_now = scrollable.saturating_sub(self.rows_below) as isize;
         let above = (ratio * scrollable as f32).round() as isize;
-        self.by(above - above_now);
+        self.pending = above - above_now;
+        self.pending
     }
 
     /// What's under window point (x, y), as of the last frame: the nearest character
@@ -288,14 +295,9 @@ pub struct Prepared {
     /// The bundled faces' font ids, by [`bundled_index`]: glyphs whose outlines `ink` can
     /// read.
     bundled: [FontId; 4],
-    /// The scroll thumb: top, height and opacity.
-    thumb: Option<(f32, f32, f32)>,
+    /// The scroll bar's thumb: top and height, when there's anything to scroll.
+    thumb: Option<(f32, f32)>,
 }
-
-/// The GUI's scroll thumb (webview_gui.rs `.clay-scrollbar`): shown on any scroll, then
-/// faded out over 0.3 s once 1.5 s have passed.
-const THUMB_SHOWN: f32 = 1.5;
-const THUMB_FADE: f32 = 0.3;
 
 pub fn output_view(snapshot: OutputSnapshot) -> impl IntoElement {
     canvas(move |bounds, window, cx| prepare(snapshot, bounds, window, cx), paint).size_full()
@@ -588,8 +590,7 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         ch: ts.ch_advance(primary, font_size).map(f32::from).unwrap_or(snapshot.font_size * 0.6),
     };
 
-    // A scrollbar that stays keeps its strip clear of text.
-    let bar_w = if snapshot.scrollbar { BAR_W + BAR_GAP } else { 0.0 };
+    let bar_w = BAR_W + BAR_GAP;
     let content = Bounds::new(
         point(bounds.origin.x + px(PAD_X), bounds.origin.y + px(PAD_Y)),
         size(bounds.size.width - px(2.0 * PAD_X + bar_w), bounds.size.height - px(2.0 * PAD_Y)),
@@ -605,6 +606,7 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     if st.rows_cache != key {
         st.rows_cache = key;
         st.rows.clear();
+        st.estimates.clear();
     }
 
     // Lines are laid out only as far as the view (and the scroll) needs.
@@ -648,39 +650,32 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     }
     st.view_rows = view_rows;
     st.view_cols = view_cols;
-    // Rows in all (lines not laid out yet count one each), for the thumb.
-    let total: usize = snapshot.lines.iter().map(|(id, _)| st.rows.get(id).copied().unwrap_or(1)).sum();
-    let key = (st.top, below, total);
-    let now = Instant::now();
-    if st.pos_key.is_some_and(|k| k != key) {
-        st.moved_at = Some(now);
-    }
-    st.pos_key = Some(key);
-    let h = f32::from(bounds.size.height);
-    let place = |above: usize, opacity: f32| {
-        let thumb_h = (view_rows as f32 / total as f32 * h).max(20.0);
-        let ratio = above as f32 / (total - view_rows) as f32;
-        (f32::from(bounds.origin.y) + ratio.clamp(0.0, 1.0) * (h - thumb_h), thumb_h, opacity)
+    // Rows in all, for the scroll bar: a line laid out by its rows, one that isn't by
+    // its count in columns at the wrap the layout uses.
+    let cols = if snapshot.wrap_columns > 0 { view_cols.min(snapshot.wrap_columns) } else { view_cols };
+    let total: usize = {
+        let Scroll { rows, estimates, .. } = &mut *st;
+        snapshot
+            .lines
+            .iter()
+            .map(|(id, line)| match rows.get(id) {
+                Some(&r) => r,
+                None => *estimates.entry(*id).or_insert_with(|| rows_in_columns(&line.text, &line.breaks, cols, snapshot.wrapspace)),
+            })
+            .sum()
     };
-    st.bar = None;
-    let thumb = if snapshot.scrollbar {
-        let left = f32::from(bounds.origin.x + bounds.size.width) - BAR_W - BAR_GAP;
-        let top = f32::from(bounds.origin.y);
-        let thumb = (total > view_rows).then(|| place(total.saturating_sub(below + view_rows), 1.0));
-        let (thumb_top, thumb_h) = thumb.map_or((top, h), |(t, th, _)| (t, th));
-        st.bar = Some(Bar { left, top, height: h, thumb_top, thumb_h, total });
-        thumb
-    } else { st.moved_at.and_then(|at| {
-        let t = now.saturating_duration_since(at).as_secs_f32();
-        let opacity = if t < THUMB_SHOWN { 1.0 } else { 1.0 - (t - THUMB_SHOWN) / THUMB_FADE };
-        if opacity <= 0.0 || total <= view_rows {
-            return None;
-        }
-        // Wake for the fade.
-        let next = if t < THUMB_SHOWN { at + std::time::Duration::from_secs_f32(THUMB_SHOWN) } else { now + std::time::Duration::from_millis(16) };
-        emoji::wake_at(next);
-        Some(place(total.saturating_sub(below + view_rows), opacity))
-    }) };
+    // The scroll bar runs the output's height at its right edge; the thumb is the view's
+    // share of the rows and sits where the view is among them.
+    let (bar_top, bar_h) = (f32::from(bounds.origin.y), f32::from(bounds.size.height));
+    let thumb = (total > view_rows).then(|| {
+        let thumb_h = (view_rows as f32 / total as f32 * bar_h).max(THUMB_MIN).min(bar_h);
+        let above = total.saturating_sub(below + view_rows);
+        let ratio = (above as f32 / (total - view_rows) as f32).clamp(0.0, 1.0);
+        (bar_top + ratio * (bar_h - thumb_h), thumb_h)
+    });
+    let (thumb_top, thumb_h) = thumb.unwrap_or((bar_top, bar_h));
+    let left = f32::from(bounds.origin.x + bounds.size.width) - BAR_W - BAR_GAP;
+    st.bar = Some(Bar { left, top: bar_top, height: bar_h, thumb_top, thumb_h, total });
     drop(st);
 
     // The visible rows, top to bottom.
@@ -1039,19 +1034,12 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
             emoji::wake_at(t);
         }
 
-        if p.snapshot.scrollbar {
-            // A grep window's scrollbar: a faint track, and the thumb on it.
+        // The scroll bar: its thumb on no track (style.css `#output-container`).
+        if let Some((top, h)) = p.thumb {
             let left = bounds.origin.x + bounds.size.width - px(BAR_W + BAR_GAP);
-            let track = Bounds::new(point(left, bounds.origin.y), size(px(BAR_W), bounds.size.height));
-            window.paint_quad(fill(track, hsla_alpha([255, 255, 255], 0.06)).corner_radii(px(4.0)));
-            if let Some((top, h, _)) = p.thumb {
-                let b = Bounds::new(point(left, px(top)), size(px(BAR_W), px(h)));
-                window.paint_quad(fill(b, hsla_alpha([255, 255, 255], 0.35)).corner_radii(px(4.0)));
-            }
-        } else if let Some((top, h, opacity)) = p.thumb {
-            // The scroll thumb: 5px wide, 1px from the right edge, translucent white.
-            let b = Bounds::new(point(bounds.origin.x + bounds.size.width - px(6.0), px(top)), size(px(5.0), px(h)));
-            window.paint_quad(fill(b, hsla_alpha([255, 255, 255], 0.25 * opacity)).corner_radii(px(3.0)));
+            let b = Bounds::new(point(left, px(top)), size(px(BAR_W), px(h)));
+            let color = if p.snapshot.bar_hot { p.snapshot.bar_thumb_hot } else { p.snapshot.bar_thumb };
+            window.paint_quad(fill(b, color).corner_radii(px(BAR_W / 2.0)));
         }
     });
 }
@@ -1273,5 +1261,53 @@ mod tests {
     #[test]
     fn less_than_a_screenful_is_always_at_the_bottom() {
         assert_eq!(plan_view(2, &mut |_| 1, false, Some((0, 0)), -3, 10), ViewPlan { top: None, below: 0 });
+    }
+
+    /// 100 rows in a 20-row view, on the bottom: a bar 400px tall from y=50 with an 80px
+    /// thumb, so the thumb travels 320px over the 80 rows above the view.
+    fn on_the_bottom() -> Scroll {
+        let mut s = Scroll { view_rows: 20, rows_below: 0, ..Scroll::default() };
+        s.bar = Some(Bar { left: 500.0, top: 50.0, height: 400.0, thumb_top: 370.0, thumb_h: 80.0, total: 100 });
+        s
+    }
+
+    #[test]
+    fn the_thumb_takes_the_view_where_it_is_dragged() {
+        let mut s = on_the_bottom();
+        assert_eq!(s.drag_thumb_to(50.0), -80, "the top: all 80 rows up");
+        assert_eq!(s.drag_thumb_to(210.0), -40, "halfway");
+        assert_eq!(s.drag_thumb_to(-500.0), -80, "past the top stops there");
+        assert_eq!(s.drag_thumb_to(900.0), 0, "past the bottom stops there");
+        // Scrolled 30 rows up (50 above the view): the thumb's place is still absolute.
+        s.rows_below = 30;
+        assert_eq!(s.drag_thumb_to(50.0), -50);
+        assert_eq!(s.drag_thumb_to(370.0), 30);
+    }
+
+    #[test]
+    fn moves_between_frames_go_where_the_last_one_was() {
+        // The mouse moves twice before the view is laid out again: each is measured from
+        // the same last layout, so the second replaces the first rather than adding to it.
+        let mut s = on_the_bottom();
+        s.drag_thumb_to(290.0);
+        s.drag_thumb_to(210.0);
+        assert_eq!(s.pending, -40);
+    }
+
+    #[test]
+    fn nothing_to_drag_when_it_all_fits() {
+        let mut s = on_the_bottom();
+        s.bar = Some(Bar { total: 20, ..s.bar.unwrap() });
+        assert_eq!(s.drag_thumb_to(50.0), 0);
+        assert_eq!(Scroll::default().drag_thumb_to(50.0), 0, "no bar laid out yet");
+    }
+
+    #[test]
+    fn the_bar_is_the_strip_at_the_edge_and_a_little_beside_it() {
+        let s = on_the_bottom();
+        assert!(s.bar_at(504.0, 60.0).is_some());
+        assert!(s.bar_at(498.5, 60.0).is_some(), "2px of grace to its left");
+        assert!(s.bar_at(490.0, 60.0).is_none());
+        assert!(s.bar_at(504.0, 40.0).is_none() && s.bar_at(504.0, 450.0).is_none(), "not above or below it");
     }
 }

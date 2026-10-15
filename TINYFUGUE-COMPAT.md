@@ -111,7 +111,11 @@ described flags the implementation never had).
 Missing TF builtins/stdlib one-liners implemented natively (no shipped stdlib, so they
 survive hot reload with no three-UI plumbing): `/result /features /limit /unlimit
 /relimit /then /do /restrict /core /complete /ismacro /first /rest /last /nth /isvar
-/more /wrap /sys /runtime /ver /cd /pwd /man /nogag /true /false /:`. Optional-library
+/more /wrap /sys /runtime /ver /cd /pwd /man /nogag /true /false /: /listdef`
+(`/listdef` is stdlib's `/list %*`; added 2026-10-15, fixture `listdef.tf`). The
+rest of stdlib's list/purge shortcuts (`/listgag /listtrig /listhilite /listbind
+/listhook /listfullhilite /listpartial /purgedef /purgegag /purgetrig ...`) are not
+built in yet; `/list`/`/purge` take the options they expand to. Optional-library
 commands (alias, at, lisp, stack-q, textencode, textutil, map, speedwalk, tick, tools,
 quoter, watch, spell, psh, color) come from the real library itself once `/require`
 can find it — see "Loading TinyFugue's own library" below.

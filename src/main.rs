@@ -6635,14 +6635,14 @@ impl App {
 
     /// Open the new setup popup for global settings
     fn open_setup_popup_new(&mut self) {
-        use popup::definitions::setup::{create_setup_popup, SETUP_FIELD_MORE_MODE};
+        use popup::definitions::setup::{add_import_button, create_setup_popup, SETUP_FIELD_MORE_MODE};
 
         let world_switching = match self.settings.world_switch_mode {
             WorldSwitchMode::UnseenFirst => "unseen_first",
             WorldSwitchMode::Alphabetical => "alphabetical",
         };
 
-        let def = create_setup_popup(
+        let mut def = create_setup_popup(
             self.settings.more_mode_enabled,
             self.settings.spell_check_enabled,
             self.settings.temp_convert_enabled,
@@ -6667,6 +6667,9 @@ impl App {
             self.settings.tabs.name(),
             self.settings.icon_bar.name(),
         );
+        if self.is_master {
+            add_import_button(&mut def);
+        }
         self.popup_manager.open(def);
 
         // Select first field
@@ -18159,7 +18162,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE, SETUP_FIELD_TTS_VOICE,
         SETUP_FIELD_SCROLLBACK, SETUP_FIELD_LOG_INPUT, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
         SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR,
-        SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
+        SETUP_BTN_SAVE, SETUP_BTN_CANCEL, SETUP_BTN_IMPORT,
         update_setup_visibility,
     };
     use popup::definitions::web::{
@@ -18585,6 +18588,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             return NewPopupAction::SetupSaved(settings);
                         } else if state.is_button_focused(SETUP_BTN_CANCEL) {
                             app.popup_manager.close();
+                        } else if state.is_button_focused(SETUP_BTN_IMPORT) {
+                            app.popup_manager.close();
+                            return NewPopupAction::Command("/import".to_string());
                         }
                     } else {
                         // Toggle current field or start editing text field
@@ -18606,6 +18612,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             return NewPopupAction::SetupSaved(settings);
                         } else if state.is_button_focused(SETUP_BTN_CANCEL) {
                             app.popup_manager.close();
+                        } else if state.is_button_focused(SETUP_BTN_IMPORT) {
+                            app.popup_manager.close();
+                            return NewPopupAction::Command("/import".to_string());
                         }
                     } else {
                         // Toggle current field
@@ -18687,6 +18696,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             return NewPopupAction::SetupSaved(settings);
                         } else if btn_id == SETUP_BTN_CANCEL {
                             app.popup_manager.close();
+                        } else if btn_id == SETUP_BTN_IMPORT {
+                            app.popup_manager.close();
+                            return NewPopupAction::Command("/import".to_string());
                         }
                     }
                 }

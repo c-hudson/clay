@@ -1944,8 +1944,10 @@ pub fn list_macros_with_filter(engine: &TfEngine, filter: &MacroFilter) -> Strin
         matched.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
+    // Nothing matched: nothing printed, as in real TinyFugue (`/list` and a bare `/def`
+    // are silent then; %? = 0 says so). Callers turn the empty text into no output.
     if matched.is_empty() {
-        return "No macros defined.".to_string();
+        return String::new();
     }
 
     let mut output = String::new();

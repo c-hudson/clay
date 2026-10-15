@@ -109,6 +109,14 @@ Use PageUp/PageDown to scroll through output history:
 
 When scrolled back, the separator shows `Hist: XXXX` indicating lines from bottom.
 
+In the GUIs (`--gui` and `--web-gui`) and in a desktop browser, the output also has a
+scroll bar along its right edge. Drag its thumb to move through the scrollback, or click
+the bar beside the thumb to jump there (in Firefox a click there moves one page instead).
+Dragging up pauses output just as PageUp does, and dragging back to the bottom follows new
+output again. The thumb takes the theme's muted text colour and brightens under the mouse.
+The bar covers what the GUI holds, which on a GUI attached to another Clay is the **Remote
+Lines** setting's worth. Phones and tablets keep the platform's own scroll bar.
+
 ## Themes
 
 Clay supports light and dark themes for both console and GUI:

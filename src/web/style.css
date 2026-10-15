@@ -127,7 +127,7 @@ body {
     position: relative;
     z-index: 1;
     scrollbar-width: thin;
-    scrollbar-color: rgba(255,255,255,0.2) transparent;
+    scrollbar-color: var(--theme-fg-muted, #52525b) transparent;
 }
 
 #output {
@@ -1362,6 +1362,44 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 #output-container {
     -ms-overflow-style: none;  /* IE/Edge */
+}
+
+/* The output's scroll bar on a desktop (a desktop browser and the WebView GUI): a real
+   one to click and drag, the native GUI's (src/native_gui/ui/output.rs) - an 8px thumb
+   1px from the edge in the theme's fg-muted, fg-secondary under the mouse, on no track.
+   Its strip is kept whether or not there is anything to scroll, so the text doesn't
+   rewrap the moment it first overflows. Every engine that has these pseudo-elements
+   (WebKitGTK, WKWebView, Safari, Chromium, WebView2) draws the bar from them - but only
+   while the standard scrollbar-width/-color are unset, which win where both are known:
+   with them set, WebKitGTK drew GTK's own 21px trough and pale thumb. Firefox, which has
+   only the standard ones, keeps them (a thin bar in fg-muted). The hide above would
+   otherwise remove the pseudo-element bar. Phones and tablets keep the platform's own
+   overlay bar. */
+body.device-desktop #output-container {
+    scrollbar-gutter: stable;
+}
+@supports selector(::-webkit-scrollbar) {
+    body.device-desktop #output-container {
+        scrollbar-width: auto;
+        scrollbar-color: auto;
+    }
+}
+body.device-desktop #output-container::-webkit-scrollbar {
+    display: block;
+    width: 9px;
+}
+body.device-desktop #output-container::-webkit-scrollbar-track {
+    background: transparent;
+}
+body.device-desktop #output-container::-webkit-scrollbar-thumb {
+    background-color: var(--theme-fg-muted, #52525b);
+    border-right: 1px solid transparent;
+    background-clip: padding-box;
+    border-radius: 4px;
+}
+body.device-desktop #output-container::-webkit-scrollbar-thumb:hover,
+body.device-desktop #output-container::-webkit-scrollbar-thumb:active {
+    background-color: var(--theme-fg-secondary, #a1a1aa);
 }
 
 /* ─── Modal ─── */
