@@ -575,6 +575,7 @@ fn handle_http_routes(
         }
         "/theme-editor" => {
             let html = WEB_THEME_EDITOR_HTML
+                .replace("{{THEME_CSS_VARS}}", theme_css_vars)
                 .replace("{{WEB_PATH}}", web_path)
                 .replace("{{WS_HOST}}", &sanitized_host)
                 .replace("{{WS_PORT}}", "0")
@@ -583,6 +584,7 @@ fn handle_http_routes(
         }
         "/keybind-editor" => {
             let html = WEB_KEYBIND_EDITOR_HTML
+                .replace("{{THEME_CSS_VARS}}", theme_css_vars)
                 .replace("{{WEB_PATH}}", web_path)
                 .replace("{{WS_HOST}}", &sanitized_host)
                 .replace("{{WS_PORT}}", "0")
@@ -591,6 +593,7 @@ fn handle_http_routes(
         }
         "/action-editor" => {
             let html = WEB_ACTION_EDITOR_HTML
+                .replace("{{THEME_CSS_VARS}}", theme_css_vars)
                 .replace("{{INTERNAL_COMMANDS_JSON}}", &serde_json::to_string(internal_command_names()).unwrap_or_else(|_| "[]".into()))
                 .replace("{{WEB_PATH}}", web_path)
                 .replace("{{WS_HOST}}", &sanitized_host)

@@ -125,6 +125,14 @@ Clay supports light and dark themes for both console and GUI:
 
 Each is a `[theme:name]` section in `~/.clay/theme.dat` (`dark`, `light`, `dark-new`, `light-new`) and can be edited in the theme editor.
 
+The desktop GUI, the web page and the Android app draw the same chrome from whichever
+theme is chosen: settings grouped in rounded cards, a sidebar of icon-and-label tiles
+(icons only on a phone), the accent colour on the primary buttons and switches, world
+tabs sitting on the ribbon with the current one raised, and the input bar on the surface
+colour under a thin line. Whether a theme counts as light is decided from its background
+colour, not its name, so a custom light theme gets the light treatment too. The theme,
+keybind and action editor pages follow the theme as well.
+
 ## Colored Square Emoji
 
 Clay renders colored square emoji (🟥🟧🟨🟩🟦🟪🟫⬛⬜) with proper colors:

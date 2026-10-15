@@ -20,6 +20,7 @@ cat > "$WORK/home/.clay/settings.dat" <<EOF
 http_enabled=true
 http_port=$WEB
 more_mode=false
+${REVIEW_THEME:+gui_theme=$REVIEW_THEME}
 
 [world:Corpus]
 world_type=mud

@@ -1689,13 +1689,32 @@
     // Theme Application
     // ============================================================================
 
-    // Apply theme to the document body: the light themes ("light", "light-new") get the
-    // light-theme rules (style.css `body.theme-light`).
-    function applyTheme(theme) {
-        if (theme === 'light' || theme === 'light-new') {
-            document.body.classList.add('theme-light');
-        } else {
-            document.body.classList.remove('theme-light');
+    // Is the theme in force a light one? The same rule as the server's
+    // ThemeColors::is_light (theme.rs): the WCAG relative luminance of the background
+    // colour is above 0.4. Decided from the colours, never from the theme's name, so a
+    // custom light theme gets the light rules too. null when no colour can be read.
+    function themeBgIsLight() {
+        const v = getComputedStyle(document.documentElement).getPropertyValue('--theme-bg').trim();
+        const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(v);
+        if (!m) return null;
+        let h = m[1];
+        if (h.length === 3) h = h.replace(/./g, c => c + c);
+        const n = parseInt(h, 16);
+        const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+        const lum = 0.2126 * lin((n >> 16) & 255) + 0.7152 * lin((n >> 8) & 255) + 0.0722 * lin(n & 255);
+        return lum > 0.4;
+    }
+
+    // Apply the theme's lightness to the page (style.css `body.theme-light`) and, in the
+    // Android app, to the system bars around it. Call it after the theme variables have
+    // been written (applyThemeColors, ThemeCssVarsUpdated), since it reads them back.
+    function applyThemeAppearance() {
+        const light = themeBgIsLight();
+        if (light === null) return;
+        document.body.classList.toggle('theme-light', light);
+        if (window.Android && typeof window.Android.setThemeAppearance === 'function') {
+            const bg = getComputedStyle(document.documentElement).getPropertyValue('--theme-bg').trim();
+            try { window.Android.setThemeAppearance(bg, light); } catch (e) { /* older app */ }
         }
     }
 
@@ -2319,6 +2338,18 @@
         const device = detectDeviceType();
         setFontSize(device.fontSize);
         setupToolbars(device.mode);
+
+        // The theme the page came with (the server-filled variables, or the Android
+        // app's cached ones): its lightness, before the first InitialState. The Android
+        // app writes its cached variables into the element only after the page has
+        // loaded, so the element is also watched: whoever rewrites it, the lightness
+        // follows.
+        applyThemeAppearance();
+        const themeVarsEl = document.getElementById('theme-vars');
+        if (themeVarsEl && window.MutationObserver) {
+            new MutationObserver(function() { applyThemeAppearance(); })
+                .observe(themeVarsEl, { childList: true, characterData: true, subtree: true });
+        }
 
         // Create custom dropdowns on mobile
         if (device.mode === 'phone' || device.mode === 'tablet') {
@@ -3892,7 +3923,6 @@
                     }
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
-                        applyTheme(guiTheme);
                     }
                     if (msg.settings.theme_colors_json) {
                         applyThemeColors(msg.settings.theme_colors_json);
@@ -3901,6 +3931,8 @@
                             if (el) window.Android.saveThemeCss(el.textContent);
                         }
                     }
+                    // After the colours: the lightness is read back from them.
+                    applyThemeAppearance();
                     if (msg.settings.color_offset_percent !== undefined) {
                         colorOffsetPercent = msg.settings.color_offset_percent;
                     }
@@ -4663,6 +4695,8 @@
                     if (themeVarsEl) {
                         themeVarsEl.textContent = ':root { ' + msg.css_vars + ' }';
                     }
+                    // The editor may have moved the theme across the light/dark line.
+                    applyThemeAppearance();
                     // themeAnsiPalette/colorNameToRgb are declared inside parseAnsi()
                     // itself (let, re-initialized to null on every call), so each call
                     // already re-reads the CSS vars fresh - no cache to reset here.
@@ -4794,7 +4828,6 @@
                     }
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
-                        applyTheme(guiTheme);
                     }
                     if (msg.settings.theme_colors_json) {
                         applyThemeColors(msg.settings.theme_colors_json);
@@ -4803,6 +4836,8 @@
                             if (el) window.Android.saveThemeCss(el.textContent);
                         }
                     }
+                    // After the colours: the lightness is read back from them.
+                    applyThemeAppearance();
                     if (msg.settings.color_offset_percent !== undefined) {
                         const oldOffset = colorOffsetPercent;
                         colorOffsetPercent = msg.settings.color_offset_percent;
@@ -11245,6 +11280,14 @@
         }
     }
 
+    // The Clay Server tab's remote-only groups: hidden while the app runs Clay itself.
+    // They are two groups (one per card) so "Run on This Phone" leaves no empty card.
+    function setClayServerRemoteFields(local) {
+        document.querySelectorAll('.cs-remote-only').forEach(function(el) {
+            el.style.display = local ? 'none' : '';
+        });
+    }
+
     // Update UI based on Android app detection
     function updateAndroidUI() {
         const isAndroid = typeof Android !== 'undefined' && Android.openServerSettings;
@@ -11318,11 +11361,10 @@
                 modeEl.value = window.Android.getConnectionMode() || 'auto';
             }
             var runModeEl = document.getElementById('cs-run-mode');
-            var remoteFields = document.getElementById('cs-remote-fields');
             if (runModeEl && typeof window.Android.getRunMode === 'function') {
                 var runMode = window.Android.getRunMode() || 'remote';
                 runModeEl.value = runMode;
-                if (remoteFields) remoteFields.style.display = (runMode === 'local') ? 'none' : '';
+                setClayServerRemoteFields(runMode === 'local');
             }
             var sshEnabledEl = document.getElementById('cs-ssh-enabled');
             var sshFields = document.getElementById('cs-ssh-fields');
@@ -11475,8 +11517,7 @@
 
         if (actions.length === 0) {
             const div = document.createElement('div');
-            div.style.padding = '8px';
-            div.style.color = '#888';
+            div.className = 'actions-list-empty';
             div.textContent = 'No actions defined.';
             elements.actionsList.appendChild(div);
             return;
@@ -11484,8 +11525,7 @@
 
         if (filteredIndices.length === 0) {
             const div = document.createElement('div');
-            div.style.padding = '8px';
-            div.style.color = '#888';
+            div.className = 'actions-list-empty';
             div.textContent = 'No matching actions.';
             elements.actionsList.appendChild(div);
             return;
@@ -11892,26 +11932,24 @@
         container.innerHTML = '';
         if (patterns.length === 0) {
             const hint = document.createElement('div');
-            hint.style.cssText = 'font-size:11px;color:#888;font-style:italic;padding:2px 0;';
+            hint.className = 'action-patterns-empty';
             hint.textContent = 'No patterns — action runs only via /name';
             container.appendChild(hint);
         }
         patterns.forEach(function(pat, idx) {
             const row = document.createElement('div');
-            row.style.cssText = 'display:flex;gap:4px;align-items:center;';
+            row.className = 'action-pattern-row';
 
             const inp = document.createElement('input');
             inp.type = 'text';
             inp.className = 'form-input';
-            inp.style.flex = '1';
             inp.value = pat;
             inp.placeholder = '^pattern$';
             inp.autocomplete = 'off';
             inp.addEventListener('input', function() { patterns[idx] = inp.value; });
 
             const del = document.createElement('button');
-            del.className = 'btn btn-danger';
-            del.style.cssText = 'padding:2px 6px;font-size:12px;flex-shrink:0;';
+            del.className = 'btn btn-danger btn-sm action-pattern-remove';
             del.textContent = '✕';
             del.addEventListener('click', function() {
                 patterns.splice(idx, 1);
@@ -12523,7 +12561,8 @@
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
         wrapspace = setupWrapspace;
-        applyTheme(guiTheme);
+        // The new theme's colours (and so its lightness) arrive with the server's
+        // GlobalSettingsUpdated; nothing to apply from the name alone.
         setInputHeight(setupInputHeightValue);
         applyTransparency(setupTransparency);
         applyWrapspace(wrapspace);
@@ -12960,8 +12999,7 @@
             const td = document.createElement('td');
             td.colSpan = 5;
             td.textContent = 'No worlds connected.';
-            td.style.textAlign = 'center';
-            td.style.color = '#888';
+            td.className = 'table-empty';
             tr.appendChild(td);
             elements.worldsTableBody.appendChild(tr);
             return;
@@ -17396,8 +17434,7 @@
         var csRunModeEl = document.getElementById('cs-run-mode');
         if (csRunModeEl) {
             csRunModeEl.onchange = function() {
-                var remoteFields = document.getElementById('cs-remote-fields');
-                if (remoteFields) remoteFields.style.display = (this.value === 'local') ? 'none' : '';
+                setClayServerRemoteFields(this.value === 'local');
             };
         }
 
@@ -17751,7 +17788,7 @@
         if (!warning) {
             warning = document.createElement('div');
             warning.id = 'cert-warning';
-            warning.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);background:#c00;color:#fff;padding:15px 20px;border-radius:8px;z-index:2000;text-align:center;max-width:90%;';
+            warning.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);background:var(--error-color);color:#fff;padding:15px 20px;border-radius:8px;z-index:2000;text-align:center;max-width:90%;';
             const host = window.location.hostname;
             const certPort = window.location.port || '443';
             const certUrl = `https://${host}:${certPort}/`;
@@ -17789,14 +17826,14 @@
         const safeOld = escapeHtml(String(oldFingerprint));
         const safeNew = escapeHtml(String(newFingerprint));
         dlg.innerHTML = sanitizeHtml(`
-            <div style="background:#1a1a1a;color:#eee;border:2px solid #c00;border-radius:8px;padding:20px;max-width:500px;width:90%;">
-                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;color:#f55;">TLS Certificate Changed</div>
+            <div class="modal-content js-dialog js-dialog-danger" style="max-width:500px;width:90%;">
+                <div class="js-dialog-title danger">TLS Certificate Changed</div>
                 <div style="margin-bottom:10px;">The certificate for <b>${safeHost}</b> no longer matches the one pinned on first connect. This could mean the server was reinstalled, or that someone is intercepting your connection.</div>
                 <div style="font-family:monospace;font-size:0.85em;word-break:break-all;margin-bottom:6px;">Old: ${safeOld}</div>
                 <div style="font-family:monospace;font-size:0.85em;word-break:break-all;margin-bottom:16px;">New: ${safeNew}</div>
                 <div style="display:flex;gap:10px;justify-content:flex-end;">
-                    <button id="cert-mismatch-cancel" style="padding:8px 16px;">Cancel</button>
-                    <button id="cert-mismatch-trust" style="padding:8px 16px;background:#c00;color:#fff;border:none;border-radius:4px;">Trust new certificate</button>
+                    <button id="cert-mismatch-cancel" class="btn">Cancel</button>
+                    <button id="cert-mismatch-trust" class="btn btn-danger">Trust new certificate</button>
                 </div>
             </div>
         `);
@@ -17856,14 +17893,14 @@
         const keyText = serverAuthKey || '';
         const safeKey = escapeHtml(keyText || '(none)');
         dlg.innerHTML = sanitizeHtml(`
-            <div style="background:#1a1a1a;color:#eee;border:2px solid #555;border-radius:8px;padding:20px;max-width:480px;width:90%;">
-                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;">Modify Auth Key</div>
+            <div class="modal-content js-dialog" style="max-width:480px;width:90%;">
+                <div class="js-dialog-title">Modify Auth Key</div>
                 <div style="font-family:monospace;font-size:0.85em;word-break:break-all;margin-bottom:16px;opacity:0.9;">${safeKey}</div>
                 <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
-                    <button id="modify-key-close" style="padding:8px 16px;">Close</button>
-                    <button id="modify-key-delete" style="padding:8px 16px;background:#c00;color:#fff;border:none;border-radius:4px;">Delete</button>
-                    <button id="modify-key-regen" style="padding:8px 16px;">Regen</button>
-                    <button id="modify-key-copy" style="padding:8px 16px;">Copy</button>
+                    <button id="modify-key-close" class="btn">Close</button>
+                    <button id="modify-key-delete" class="btn btn-danger">Delete</button>
+                    <button id="modify-key-regen" class="btn">Regen</button>
+                    <button id="modify-key-copy" class="btn">Copy</button>
                 </div>
             </div>
         `);
@@ -17973,8 +18010,8 @@
         const isWin = !!(info && info.is_windows);
         const pmEnabled = !!(info && info.port_map_enabled);
         dlg.innerHTML = sanitizeHtml(`
-            <div style="background:#1a1a1a;color:#eee;border:2px solid #555;border-radius:8px;padding:20px;max-width:640px;width:94%;max-height:90vh;overflow:auto;">
-                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;">Remote Access</div>
+            <div class="modal-content js-dialog" style="max-width:640px;width:94%;max-height:90vh;overflow:auto;">
+                <div class="js-dialog-title">Remote Access</div>
                 <div style="opacity:0.85;margin-bottom:10px;">How other devices reach this Clay. Same as typing /reach.</div>
                 <div class="reach-report">${rows.join('')}</div>
                 <div style="font-weight:bold;margin:12px 0 6px;">Connect from another device</div>
@@ -17985,10 +18022,10 @@
                 </label>
                 <div id="remote-access-status" style="min-height:1.2em;opacity:0.85;margin-bottom:10px;"></div>
                 <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
-                    <button id="remote-access-close" style="padding:8px 16px;">Close</button>
-                    <button id="remote-access-refresh" style="padding:8px 16px;">Refresh</button>
-                    <button id="remote-access-lookup" style="padding:8px 16px;">Look Up Public IP</button>
-                    <button id="remote-access-firewall" style="padding:8px 16px;">Add Firewall Rule</button>
+                    <button id="remote-access-close" class="btn">Close</button>
+                    <button id="remote-access-refresh" class="btn">Refresh</button>
+                    <button id="remote-access-lookup" class="btn">Look Up Public IP</button>
+                    <button id="remote-access-firewall" class="btn">Add Firewall Rule</button>
                 </div>
             </div>
         `);
@@ -18056,8 +18093,8 @@
         }
         const safeAddr = escapeHtml(String(prefillAddr || ''));
         dlg.innerHTML = sanitizeHtml(`
-            <div style="background:#1a1a1a;color:#eee;border:2px solid #555;border-radius:8px;padding:20px;max-width:420px;width:90%;">
-                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;">Import Settings</div>
+            <div class="modal-content js-dialog" style="max-width:420px;width:90%;">
+                <div class="js-dialog-title">Import Settings</div>
                 <div style="margin-bottom:12px;opacity:0.85;">Pull worlds, theme, and keybindings from another Clay instance. Remote values win on conflicts; everything else you have locally is kept.</div>
                 <label style="display:block;margin-bottom:8px;">Host[:port]<br>
                     <input id="import-addr" type="text" value="${safeAddr}" style="width:100%;box-sizing:border-box;padding:6px;margin-top:4px;" autocomplete="off">
@@ -18069,8 +18106,8 @@
                     <input id="import-authkey" type="password" style="width:100%;box-sizing:border-box;padding:6px;margin-top:4px;" autocomplete="off">
                 </label>
                 <div style="display:flex;gap:10px;justify-content:flex-end;">
-                    <button id="import-cancel" style="padding:8px 16px;">Cancel</button>
-                    <button id="import-go" style="padding:8px 16px;background:#06c;color:#fff;border:none;border-radius:4px;">Import</button>
+                    <button id="import-cancel" class="btn">Cancel</button>
+                    <button id="import-go" class="btn btn-primary">Import</button>
                 </div>
             </div>
         `);
@@ -18119,12 +18156,12 @@
         }
         const safeAddr = escapeHtml(String(addr));
         dlg.innerHTML = sanitizeHtml(`
-            <div style="background:#1a1a1a;color:#eee;border:2px solid #c00;border-radius:8px;padding:20px;max-width:460px;width:90%;">
-                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;color:#f55;">No Secure Connection</div>
+            <div class="modal-content js-dialog js-dialog-danger" style="max-width:460px;width:90%;">
+                <div class="js-dialog-title danger">No Secure Connection</div>
                 <div style="margin-bottom:16px;">${safeAddr} did not accept a TLS connection. Continuing will send your password/auth-key to it <b>unencrypted</b>. Only do this on a network you trust.</div>
                 <div style="display:flex;gap:10px;justify-content:flex-end;">
-                    <button id="import-insecure-cancel" style="padding:8px 16px;">Cancel</button>
-                    <button id="import-insecure-go" style="padding:8px 16px;background:#c00;color:#fff;border:none;border-radius:4px;">Send unencrypted</button>
+                    <button id="import-insecure-cancel" class="btn">Cancel</button>
+                    <button id="import-insecure-go" class="btn btn-danger">Send unencrypted</button>
                 </div>
             </div>
         `);

@@ -35,6 +35,45 @@
     --radius-sm: 4px;
     --radius-md: 8px;
     --transition: 180ms ease;
+    /* The chrome tokens shared with the native GUI (src/native_gui/ui/kit.rs): a dialog
+       panel, a card inside it, a few translucent lifts and the hover tints. The hover
+       tints are an HSL lightness step in the native code; the color-mix forms below are
+       the nearest the older engines can do, and the @supports block after this picks the
+       exact relative-colour form where it exists. */
+    --panel-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    --card-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+    --fg-7: color-mix(in srgb, var(--text-color) 7%, transparent);
+    --fg-8: color-mix(in srgb, var(--text-color) 8%, transparent);
+    --accent-12: color-mix(in srgb, var(--accent-color) 12%, transparent);
+    --accent-14: color-mix(in srgb, var(--accent-color) 14%, transparent);
+    --accent-hover: color-mix(in srgb, var(--accent-color) 84%, white);
+    --hover-lift: color-mix(in srgb, var(--theme-bg-hover, #2c2535) 88%, white);
+}
+
+@supports (color: hsl(from red h s calc(l + 8))) {
+    :root {
+        --accent-hover: hsl(from var(--accent-color) h s calc(l + 8));
+        --hover-lift: hsl(from var(--theme-bg-hover, #2c2535) h s calc(l + 6));
+    }
+}
+
+/* Engines without color-mix (WebKitGTK before 2.38, Safari before 16.2): flat tints. */
+@supports not (color: color-mix(in srgb, red 50%, white)) {
+    :root {
+        --fg-7: rgba(255, 255, 255, 0.07);
+        --fg-8: rgba(255, 255, 255, 0.08);
+        --accent-12: var(--theme-bg-hover, #2c2535);
+        --accent-14: var(--theme-bg-hover, #2c2535);
+        --accent-hover: var(--accent-color);
+        --hover-lift: var(--theme-bg-hover, #2c2535);
+    }
+    body.theme-light {
+        --fg-7: rgba(0, 0, 0, 0.07);
+        --fg-8: rgba(0, 0, 0, 0.08);
+    }
+    .btn-primary:hover {
+        filter: brightness(1.1);
+    }
 }
 
 *, *::before, *::after {
@@ -479,11 +518,12 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
 /* ─── World-Tabs Ribbon (Tabs setting: none/top/bottom) ─── */
 .tabs-ribbon {
     display: none;   /* shown via JS (applyTabsMode) only when mode != 'none' */
-    align-items: center;
+    /* Tabs sit on the ribbon's top edge, so there is no line above them: the
+       26px box is the 25px tab row plus the 1px line below (native bars.rs). */
+    align-items: flex-start;
     height: var(--status-height);
     padding: 0 4px;
     background: var(--theme-status-bar-bg, var(--theme-bg-surface, #1c1722));
-    border-top: 1px solid var(--border-color);
     border-bottom: 1px solid var(--theme-border-subtle, #221c2b);
     flex-shrink: 0;
     gap: 4px;
@@ -516,7 +556,8 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
 
 .tabs-ribbon-tabs {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
+    height: 100%;
     gap: 4px;
     flex: 1;
     overflow-x: auto;
@@ -533,19 +574,23 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
     display: flex;
     align-items: center;
     flex-shrink: 0;
-    padding: 4px 12px;
+    padding: 4px 12px 3px;
+    line-height: 1.364;
     /* Rounded top corners only, flat bottom — the classic "attached" tab
        silhouette, kept the same regardless of whether the ribbon itself sits
        at the top or bottom of the window (one consistent, recognizable
-       shape rather than flipping per position). */
+       shape rather than flipping per position). An inactive tab keeps the
+       shape in a faint lift of the text colour with a muted top edge, so it
+       reads as a tab but not as the current one (native bars.rs). */
     border-radius: 6px 6px 0 0;
     font-family: var(--sans);
     font-size: 11.5px;
     color: var(--theme-fg-secondary, #a89fb4);
+    background: var(--fg-7);
     white-space: nowrap;
     cursor: pointer;
     position: relative;
-    border-top: 2px solid transparent;
+    border-top: 2px solid var(--border-color);
 }
 
 .tabs-ribbon-tab:hover {
@@ -554,9 +599,7 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
 }
 
 .tabs-ribbon-tab.active {
-    /* Elevated surface + accent top bar, matching the settings sidebar's own
-       active-tab language (.settings-tab-btn.active) rather than a solid
-       filled badge/pill. */
+    /* Elevated surface + accent top bar rather than a solid filled badge/pill. */
     background: var(--theme-bg-elevated, #231d2a);
     border-top-color: var(--accent-color);
     color: var(--text-color);
@@ -635,7 +678,7 @@ body.theme-light .icon-bar {
 
 .icon-tile-label {
     font-family: var(--sans);
-    font-size: 8.5px;
+    font-size: 9.5px;
     font-weight: 700;
     line-height: 1.1;
     text-align: center;
@@ -1082,9 +1125,11 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
     /* The prompt sits on the input's FIRST row: centred, it was level with the second
        of a multi-row input (and a little low on one row). */
     align-items: flex-start;
-    padding: 4px;
-    background-color: var(--bg-color);
-    border-top: none;
+    /* On the surface colour with a line above it, as the native input bar
+       (input_view.rs); the resize handle straddles that line. */
+    padding: 2px 4px;
+    background-color: var(--theme-bg-surface, #1c1722);
+    border-top: 1px solid var(--border-color);
     overflow: hidden;
     max-width: 100%;
     box-sizing: border-box;
@@ -1126,7 +1171,7 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
     line-height: 1.0;
     padding: 2px;
     outline: none;
-    caret-color: #ffffff;
+    caret-color: var(--text-color);
     resize: none;
     overflow-y: auto;
     min-height: 3.6em;
@@ -1343,9 +1388,12 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 .modal-content {
+    /* The native dialog panel (kit.rs panel): elevated, framed, rounded, shadowed. */
     background-color: var(--theme-bg-elevated, #111);
     padding: 20px;
     border: 1px solid var(--separator-color);
+    border-radius: 8px;
+    box-shadow: var(--panel-shadow);
     min-width: 280px;
     text-align: center;
 }
@@ -1384,7 +1432,7 @@ body.device-phone #output-container { padding: 6px 10px; }
    with `width: 100%` plus a `margin-top` it never asked for. That is exactly
    what flattened the emoji picker's tab strip into one full-width "All" tab
    with the rest scrolled off behind a hidden scrollbar. */
-.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell):not(.we-nav-btn) {
+.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell):not(.we-nav-btn):not(.side-tile):not(.modal-buttons *) {
     width: 100%;
     padding: 8px;
     margin-top: 6px;
@@ -1396,8 +1444,125 @@ body.device-phone #output-container { padding: 6px 10px; }
     font-size: inherit;
 }
 
-.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell):not(.we-nav-btn):hover {
+.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell):not(.we-nav-btn):not(.side-tile):not(.modal-buttons *):hover {
     background-color: var(--theme-bg-hover, #444);
+}
+
+/* ─── Cards, sidebars and tiles (the native GUI's kit.rs, in CSS) ───
+   A card groups rows inside a dialog: the surface colour on the dialog's elevated
+   ground, framed, rounded and softly shadowed. `.card-frame` is the same box without
+   padding, for a list or table that fills it; `.card` never clips, because on a phone
+   the custom dropdown menus open inside it. A sidebar is a column of icon+label
+   tiles; on a phone it is a horizontal strip of icons only (user ruling). */
+.card,
+.card-frame {
+    background: var(--theme-bg-surface, #1c1722);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: var(--card-shadow);
+}
+
+.card {
+    padding: 10px 12px;
+}
+
+.card-frame {
+    overflow: hidden;
+}
+
+.card-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.sidebar {
+    width: 74px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding-top: 8px;
+    background: var(--theme-bg-surface, #1c1722);
+    border-right: 1px solid var(--border-color);
+}
+
+.sidebar-divider {
+    width: 44px;
+    height: 1px;
+    margin: 6px 0;
+    background: var(--border-color);
+    flex-shrink: 0;
+}
+
+.side-tile {
+    width: 64px;
+    padding: 6px 0 5px;
+    margin: 0;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    color: var(--theme-fg-secondary, #a89fb4);
+    font-family: var(--sans);
+    cursor: pointer;
+    transition: background var(--transition), color var(--transition);
+}
+
+.side-tile svg {
+    width: 20px;
+    height: 20px;
+    display: block;
+    flex-shrink: 0;
+}
+
+.side-tile-label {
+    font-size: 9.5px;
+    font-weight: 700;
+    line-height: 1.1;
+    white-space: nowrap;
+}
+
+.side-tile:hover {
+    background: var(--fg-8);
+}
+
+.side-tile.active,
+.side-tile.active:hover {
+    background: var(--accent-14);
+    color: var(--accent-color);
+}
+
+body.device-phone .sidebar {
+    width: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 2px;
+    padding: 6px 8px;
+    border-right: none;
+    border-bottom: 1px solid var(--border-color);
+    overflow-x: auto;
+    scrollbar-width: none;
+}
+
+body.device-phone .sidebar-divider {
+    width: 1px;
+    height: 20px;
+    margin: 0 6px;
+}
+
+body.device-phone .side-tile {
+    width: auto;
+    min-width: 40px;
+    padding: 6px 8px;
+}
+
+body.device-phone .side-tile-label {
+    display: none;
 }
 
 .modal-content .error {
@@ -1559,8 +1724,11 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 .actions-list {
-    border: 1px solid var(--separator-color);
-    background-color: var(--theme-bg, #000);
+    /* A card frame (native actions.rs): the list fills it and scrolls inside. */
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background-color: var(--theme-bg-surface, #1c1722);
+    box-shadow: var(--card-shadow);
     overflow-y: auto;
     margin-bottom: 10px;
 }
@@ -1580,7 +1748,7 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 .actions-list-item.selected {
     background-color: var(--accent-color);
-    color: #000;
+    color: var(--theme-bg, #121212);
 }
 
 .actions-list-item .action-name {
@@ -1614,7 +1782,7 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 .actions-list-item.selected .action-world,
 .actions-list-item.selected .action-pattern {
-    color: #000;
+    color: var(--theme-bg, #121212);
 }
 
 .actions-list-header {
@@ -1702,7 +1870,7 @@ body.device-phone #output-container { padding: 6px 10px; }
 .emoji-tab-btn.active {
     color: var(--accent-color);
     border-bottom-color: var(--accent-color);
-    background: rgba(8, 145, 178, 0.09);
+    background: var(--accent-12);
 }
 
 /* R13: the tab strip's normal .active marker (above) just says "this is the
@@ -1712,7 +1880,7 @@ body.device-phone #output-container { padding: 6px 10px; }
    selection (below), only applied while data-zone="tabs" on the modal. */
 #emoji-modal[data-zone="tabs"] .emoji-tab-btn.active {
     background: var(--accent-color);
-    color: #000;
+    color: var(--theme-bg, #121212);
     border-bottom-color: var(--accent-color);
 }
 
@@ -1794,7 +1962,7 @@ body.device-phone #output-container { padding: 6px 10px; }
    the rest of the time). */
 #emoji-modal[data-zone="grid"] .emoji-grid button.emoji-cell.selected {
     background: var(--accent-color);
-    color: #000;
+    color: var(--theme-bg, #121212);
 }
 
 /* R13: the console distinguishes a focused grid (bright button_selected_bg())
@@ -1941,9 +2109,11 @@ body.device-phone #output-container { padding: 6px 10px; }
     cursor: pointer;
     -webkit-appearance: none;
     appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-image: linear-gradient(45deg, transparent 50%, var(--theme-fg-muted, #71717a) 50%),
+                      linear-gradient(135deg, var(--theme-fg-muted, #71717a) 50%, transparent 50%);
+    background-position: calc(100% - 13px) calc(50% - 2px), calc(100% - 8px) calc(50% - 2px);
+    background-size: 5px 5px, 5px 5px;
     background-repeat: no-repeat;
-    background-position: right 6px center;
 }
 
 .action-field input:focus,
@@ -1973,43 +2143,80 @@ body.device-phone #output-container { padding: 6px 10px; }
     margin-top: 4px;
 }
 
+/* ─── Buttons (the native GUI's kit.rs button(), in CSS) ───
+   One family for every dialog: `.btn` is the plain button, `.btn-primary` the
+   accent one (text in the theme's background colour, never a hardcoded cyan),
+   `.btn-danger` the destructive one. The `.modal-buttons button.x` twins exist
+   because `.modal-buttons button` outranks a bare class. */
+.btn,
 .modal-buttons button {
     padding: 6px 16px;
-    background-color: var(--theme-bg-hover, #333);
+    border-radius: 5px;
+    border: 1px solid var(--border-color);
+    background: var(--theme-bg-hover, #333);
     color: var(--text-color);
-    border: 1px solid var(--separator-color);
-    cursor: pointer;
     font-family: inherit;
-    font-size: inherit;
+    font-size: 13px;
+    font-weight: 400;
+    line-height: 1.364;
+    cursor: pointer;
+    margin: 0;
+    transition: background var(--transition), border-color var(--transition);
 }
 
+.btn:hover,
 .modal-buttons button:hover {
-    background-color: var(--theme-bg-hover, #444);
+    background: var(--hover-lift);
+    border-color: var(--hover-lift);
 }
 
+.btn-primary,
 .modal-buttons button.btn-primary {
-    background: #0891b2;
-    border-color: #0891b2;
-    color: #08080a;
+    background: var(--accent-color);
+    border-color: var(--accent-color);
+    color: var(--theme-bg, #121212);
+    font-weight: 600;
 }
 
+.btn-primary:hover,
 .modal-buttons button.btn-primary:hover {
-    background: #22d3ee;
-    border-color: #22d3ee;
-    color: #08080a;
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+    color: var(--theme-bg, #121212);
 }
 
+.btn-danger,
 .modal-buttons button.btn-danger {
-    background: var(--theme-error, #dc2626);
-    border-color: var(--theme-error, #dc2626);
+    background: var(--error-color);
+    border-color: var(--error-color);
     color: #ffffff;
-    margin-right: auto;
+    font-weight: 600;
 }
 
+.btn-danger:hover,
 .modal-buttons button.btn-danger:hover {
     background: #ef4444;
     border-color: #ef4444;
     color: #ffffff;
+}
+
+/* Only a footer's Delete sits apart on the left. */
+.modal-buttons .btn-danger,
+.popup-footer .btn-danger {
+    margin-right: auto;
+}
+
+.btn:disabled,
+.btn[disabled],
+.modal-buttons button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.btn-sm,
+.modal-buttons button.btn-sm {
+    padding: 2px 8px;
+    font-size: 12px;
 }
 
 /* Popup help overlay (above other modals) */
@@ -2029,22 +2236,27 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 /* Help button (?) in popup footers */
-.btn-help {
-    min-width: 28px !important;
-    width: 28px !important;
-    padding: 4px 0 !important;
-    font-weight: bold;
+.btn-help,
+.modal-buttons button.btn-help {
+    width: 26px;
+    height: 26px;
+    min-width: 26px;
+    padding: 0;
+    font-weight: 700;
     font-size: 14px;
+    line-height: 1;
     border-radius: 50%;
     background: transparent;
-    border: 1px solid var(--theme-border, #555) !important;
-    color: var(--theme-fg, #ccc);
+    border: 1px solid var(--border-color);
+    color: var(--text-color);
     cursor: pointer;
     opacity: 0.7;
 }
-.btn-help:hover {
+.btn-help:hover,
+.modal-buttons button.btn-help:hover {
     opacity: 1;
-    background: var(--theme-input-bg, #333) !important;
+    background: var(--theme-bg-hover, #333);
+    border-color: var(--border-color);
 }
 .footer-spacer {
     flex: 1;
@@ -2053,6 +2265,99 @@ body.device-phone #output-container { padding: 6px 10px; }
     color: var(--error-color);
     font-size: 12px;
     min-height: 14px;
+}
+
+/* The action editor's pattern list (built by app.js renderActionPatternRows). */
+.action-patterns-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 350px;
+    max-width: 100%;
+}
+
+.action-pattern-row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.form-input {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 8px;
+    background: var(--theme-bg, #08080a);
+    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
+    border-radius: 3px;
+    color: var(--text-color);
+    font-family: inherit;
+    font-size: inherit;
+}
+
+.form-input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.action-pattern-remove,
+.modal-buttons button.action-pattern-remove {
+    padding: 2px 6px;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
+.action-add-pattern {
+    align-self: flex-start;
+    font-size: 11px;
+    margin-top: 4px;
+}
+
+.action-patterns-empty {
+    font-size: 11px;
+    color: var(--theme-fg-muted, #71717a);
+    font-style: italic;
+    padding: 2px 0;
+}
+
+.action-field-hint {
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+.actions-list-empty,
+.table-empty {
+    padding: 8px;
+    color: var(--theme-fg-muted, #71717a);
+    text-align: center;
+}
+
+.card > .action-field:last-child {
+    margin-bottom: 0;
+}
+
+.font-advanced-label {
+    color: var(--theme-fg-muted, #71717a);
+    font-size: 11px;
+}
+
+/* Dialogs app.js builds itself (certificate, Modify Key, Remote Access, Import):
+   the same panel as every other modal, left-aligned text. */
+.js-dialog {
+    text-align: left;
+    max-width: min(92vw, 560px);
+}
+
+.js-dialog-danger {
+    border-color: var(--error-color);
+}
+
+.js-dialog-title {
+    font-weight: 700;
+    margin-bottom: 10px;
+}
+
+.js-dialog-title.danger {
+    color: var(--error-color);
 }
 
 /* Password change modal (multiuser mode) */
@@ -2151,7 +2456,7 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 #worlds-table tr.selected-row {
     background-color: var(--accent-color);
-    color: #000;
+    color: var(--theme-bg, #121212);
 }
 
 #worlds-table tr.selected-row.current-world {
@@ -2284,7 +2589,7 @@ body.device-phone #output-container { padding: 6px 10px; }
     position: sticky;
     top: 0;
     z-index: 1;
-    background-color: var(--theme-bg-elevated, #111);
+    background-color: var(--theme-bg-surface, #1c1722);
 }
 
 #world-selector-table th:first-child {
@@ -2302,7 +2607,7 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 #world-selector-table tr.selected-row {
     background-color: var(--accent-color);
-    color: #000;
+    color: var(--theme-bg, #121212);
 }
 
 #world-selector-table tr.selected-row.current-world {
@@ -2384,7 +2689,8 @@ body.device-phone #output-container { padding: 6px 10px; }
     left: 0;
     right: 0;
     bottom: 0;
-    background-color: var(--theme-bg-hover, #444);
+    background-color: var(--theme-bg, #121212);
+    border: 1px solid var(--theme-border-subtle, #221c2b);
     transition: 0.2s;
     border-radius: 20px;
 }
@@ -2394,8 +2700,8 @@ body.device-phone #output-container { padding: 6px 10px; }
     content: "";
     height: 14px;
     width: 14px;
-    left: 3px;
-    bottom: 3px;
+    left: 2px;
+    bottom: 2px;
     background-color: var(--theme-fg-muted, #ccc);
     transition: 0.2s;
     border-radius: 50%;
@@ -2403,11 +2709,12 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 .toggle-switch input:checked + .toggle-slider {
     background-color: var(--accent-color);
+    border-color: var(--accent-color);
 }
 
 .toggle-switch input:checked + .toggle-slider:before {
     transform: translateX(16px);
-    background-color: #fff;
+    background-color: var(--theme-bg, #121212);
 }
 
 /* Smaller buttons for world selector */
@@ -2468,9 +2775,9 @@ body.device-phone #output-container { padding: 6px 10px; }
 .world-editor-modal-content {
     padding: 0;
     background: var(--theme-bg-elevated, #1a1a1f);
-    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
+    border: 1px solid var(--border-color);
     border-radius: 8px;
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--panel-shadow);
 }
 
 .world-editor-modal-content .popup-header {
@@ -2502,53 +2809,7 @@ body.device-phone #output-container { padding: 6px 10px; }
     background: var(--theme-bg-elevated, #1a1a1f);
 }
 
-.world-editor-modal-content .btn {
-    padding: 9px 6px;
-    width: 70px;
-    background: var(--theme-bg-hover, #222228);
-    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
-    border-radius: 4px;
-    color: var(--theme-fg-secondary, #a1a1aa);
-    font-family: inherit;
-    font-size: 10px;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    cursor: pointer;
-    transition: all 0.1s ease;
-}
-
-.world-editor-modal-content .btn:hover {
-    background: var(--theme-bg-elevated, #1a1a1f);
-    color: var(--text-color);
-    border-color: var(--theme-fg-muted, #52525b);
-}
-
-.world-editor-modal-content .btn-primary {
-    background: #0891b2;
-    border-color: #0891b2;
-    color: #08080a;
-}
-
-.world-editor-modal-content .btn-primary:hover {
-    background: #22d3ee;
-    border-color: #22d3ee;
-    color: #08080a;
-}
-
-.world-editor-modal-content .btn-danger {
-    background: var(--theme-error, #dc2626);
-    border-color: var(--theme-error, #dc2626);
-    color: #ffffff;
-    font-weight: 700;
-    margin-right: auto;
-}
-
-.world-editor-modal-content .btn-danger:hover {
-    background: #ef4444;
-    border-color: #ef4444;
-    color: #ffffff;
-}
+/* The footer's buttons are the shared .btn family (see "Buttons" above). */
 
 .world-editor-modal-content .setting-row {
     display: flex;
@@ -2567,6 +2828,7 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 .world-editor-modal-content .setting-value {
     flex: 1;
+    min-width: 0;
 }
 
 .world-editor-modal-content .editor-input {
@@ -2582,7 +2844,7 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 .world-editor-modal-content .editor-input:focus {
     outline: none;
-    border-color: #0891b2;
+    border-color: var(--accent-color);
 }
 
 .world-editor-modal-content .form-select {
@@ -2619,7 +2881,7 @@ body.device-phone #output-container { padding: 6px 10px; }
     color: var(--theme-error, #f87171);
 }
 .world-editor-modal-content .chat-status a {
-    color: #0891b2;
+    color: var(--theme-link, #8cb4e0);
     word-break: break-all;
 }
 
@@ -2686,6 +2948,13 @@ body.device-phone #output-container { padding: 6px 10px; }
     gap: 6px;
 }
 
+/* The sections live in one card (native worlds.rs: the body is a card). */
+.we-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
 .we-section {
     display: none;
     flex-direction: column;
@@ -2704,7 +2973,7 @@ body.device-phone #output-container { padding: 6px 10px; }
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    color: #0891b2;
+    color: var(--accent-color);
     padding: 6px 0 2px 0;
 }
 
@@ -2754,56 +3023,9 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 /* Icon sidebar (tablet) - modelled on .settings-sidebar/.settings-tab-btn */
-.we-side {
-    width: 72px;
-    flex-shrink: 0;
-    background: var(--theme-bg-deep, #0e0e12);
-    border-right: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.06));
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 10px 0;
-    gap: 4px;
-}
-
-.we-side .we-nav-btn {
-    width: 60px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 3px;
-    padding: 7px 2px;
-    background: transparent;
-    border: none;
-    border-radius: 7px;
-    color: var(--theme-fg-muted, #52525b);
-    font-family: inherit;
-    font-size: 10px;
-    cursor: pointer;
-    position: relative;
-}
-
-.we-side .we-nav-btn:hover {
-    background: rgba(255, 255, 255, 0.05);
-    color: var(--theme-fg-secondary, #a1a1aa);
-}
-
-.we-side .we-nav-btn.active {
-    background: rgba(8, 145, 178, 0.12);
-    color: #0891b2;
-}
-
-.we-side .we-nav-btn.active::before {
-    content: '';
-    position: absolute;
-    left: -6px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 3px;
-    height: 16px;
-    background: #0891b2;
-    border-radius: 0 2px 2px 0;
-}
+/* The tablet sidebar is the shared .sidebar of .side-tile buttons (see "Cards,
+   sidebars and tiles" above); `.we-side` stays as the hook the phone and desktop
+   layouts below use to hide it. */
 
 /* Phone: full screen, segmented control */
 @media (max-width: 600px), (max-height: 560px) {
@@ -2861,7 +3083,8 @@ body.device-phone #output-container { padding: 6px 10px; }
         display: none;
     }
 
-    .world-editor-modal-content .popup-body {
+    /* Wide: the one card holds both columns (native worlds.rs "wide" mode). */
+    .we-card {
         display: grid;
         grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
         grid-template-areas: "server options" "login options";
@@ -2889,13 +3112,13 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 .settings-modal-content {
-    width: min(92vw, 448px);
+    width: min(92vw, 520px);
     max-width: 95vw;
     padding: 0;
     background: var(--theme-bg-elevated, #1a1a1f);
-    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
-    border-radius: 10px;
-    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: var(--panel-shadow);
     box-sizing: border-box;
     overflow: hidden;
 }
@@ -2904,108 +3127,11 @@ body.device-phone #output-container { padding: 6px 10px; }
     display: flex;
 }
 
-.settings-sidebar {
-    width: 48px;
-    flex-shrink: 0;
-    background: var(--theme-bg-deep, #0e0e12);
-    border-right: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.06));
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 10px 0;
-    gap: 2px;
-}
-
-.settings-tab-btn {
-    width: 34px;
-    height: 34px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: none;
-    border-radius: 7px;
-    color: var(--theme-fg-muted, #52525b);
-    cursor: pointer;
-    transition: all 0.12s ease;
-    padding: 0;
-    position: relative;
-}
-
-.settings-tab-btn:hover {
-    background: rgba(255, 255, 255, 0.05);
-    color: var(--theme-fg-secondary, #a1a1aa);
-}
-
-.settings-tab-btn.active {
-    background: rgba(8, 145, 178, 0.12);
-    color: #0891b2;
-}
-
-.settings-tab-btn.active::before {
-    content: '';
-    position: absolute;
-    left: -6px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 3px;
-    height: 16px;
-    background: #0891b2;
-    border-radius: 0 2px 2px 0;
-}
-
-/* Divider between the real settings tabs and the external-editor links */
-.settings-tab-divider {
-    width: 24px;
-    height: 1px;
-    margin: 6px 0;
-    background: var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
-    flex-shrink: 0;
-}
-
-/* Theme/Keybind/Action Editor links: these open an external page rather than
-   switching a settings section, so they're styled distinctly from the real
-   tabs above -- a small label, a link-colored icon, and an external-link
-   arrow badge -- rather than looking like just another tab. */
-.settings-tab-btn.settings-tab-link {
-    flex-direction: column;
-    gap: 2px;
-    width: auto;
-    min-width: 40px;
-    height: auto;
-    min-height: 40px;
-    padding: 5px 2px 4px;
-    /* Reuse the app's established hyperlink color (same token as clickable
-       URLs in output, .output-link) so "this behaves like a link" reads
-       consistently across the whole UI, not just here. */
-    color: var(--theme-link, #00cdcd);
-}
-
-.settings-tab-btn.settings-tab-link:hover {
-    color: var(--theme-link, #00ffff);
-    background: rgba(0, 205, 205, 0.12);
-}
-
-.settings-tab-btn.settings-tab-link::after {
-    content: '';
-    position: absolute;
-    top: 3px;
-    right: 3px;
-    width: 6px;
-    height: 6px;
-    border-top: 1.4px solid currentColor;
-    border-right: 1.4px solid currentColor;
-    transform: rotate(45deg);
-}
-
-.settings-tab-label {
-    font-size: 8px;
-    font-weight: 600;
-    line-height: 1;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    white-space: nowrap;
-}
+/* The sidebar is the shared .sidebar of .side-tile buttons (see "Cards, sidebars
+   and tiles"): General, Web, Font, then a divider, then the Theme, Keybind and
+   Action editor tiles, which open their pages and look like tabs that are never
+   the current one (native windows/settings.rs). `.settings-sidebar` and
+   `.settings-tab-btn` stay as the hooks app.js and the phone layout use. */
 
 .settings-content {
     flex: 1;
@@ -3045,6 +3171,14 @@ body.device-phone #output-container { padding: 6px 10px; }
     padding: 8px 14px 14px;
     display: flex;
     flex-direction: column;
+    /* A stack of cards (native: two or three per section, 10px apart); the rows
+       inside a card keep their own 6px rhythm. */
+    gap: 10px;
+}
+
+.settings-modal-content .card:not(.settings-two-column) {
+    display: flex;
+    flex-direction: column;
     gap: 6px;
 }
 
@@ -3077,35 +3211,7 @@ body.device-phone .settings-layout {
     height: 100%;
 }
 
-body.device-phone .settings-sidebar {
-    width: auto;
-    height: auto;
-    flex-direction: row;
-    align-items: center;
-    border-right: none;
-    border-bottom: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.06));
-    padding: 6px 8px;
-    overflow-x: auto; /* safety net if a very narrow phone can't fit every icon */
-}
-
-body.device-phone .settings-tab-divider {
-    width: 1px;
-    height: 20px;
-    align-self: stretch;
-    margin: 0 6px;
-}
-
-body.device-phone .settings-tab-btn.active::before {
-    /* The left-edge bar reads as a vertical-sidebar convention; in a
-       horizontal strip the active indicator moves to a bottom underline. */
-    left: 50%;
-    top: auto;
-    bottom: -6px;
-    transform: translateX(-50%);
-    width: 16px;
-    height: 3px;
-    border-radius: 2px 2px 0 0;
-}
+/* The sidebar's phone strip is the shared `body.device-phone .sidebar` rule. */
 
 body.device-phone .settings-content {
     flex: 1;
@@ -3188,7 +3294,7 @@ html.popup-window .settings-content {
 }
 
 .settings-modal-content .web-input:focus {
-    border-color: #0891b2;
+    border-color: var(--accent-color);
 }
 
 /* Settings rows */
@@ -3202,11 +3308,12 @@ html.popup-window .settings-content {
 .settings-two-column {
     display: flex;
     gap: 8px;
-    margin-top: 4px;
+    margin-top: 0;
 }
 
 .settings-column {
     flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 0;
@@ -3250,8 +3357,8 @@ html.popup-window .settings-content {
 }
 
 .toggle.active {
-    background: #0891b2;
-    border-color: #0891b2;
+    background: var(--accent-color);
+    border-color: var(--accent-color);
 }
 
 .toggle::after {
@@ -3268,7 +3375,7 @@ html.popup-window .settings-content {
 
 .toggle.active::after {
     left: 16px;
-    background: #08080a;
+    background: var(--theme-bg, #121212);
 }
 
 /* Form select */
@@ -3283,9 +3390,13 @@ html.popup-window .settings-content {
     cursor: pointer;
     -webkit-appearance: none;
     appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    /* The chevron is two gradients in the theme's muted colour: a data-URI image
+       cannot read a CSS variable, and a select takes no ::after. */
+    background-image: linear-gradient(45deg, transparent 50%, var(--theme-fg-muted, #71717a) 50%),
+                      linear-gradient(135deg, var(--theme-fg-muted, #71717a) 50%, transparent 50%);
+    background-position: calc(100% - 13px) calc(50% - 2px), calc(100% - 8px) calc(50% - 2px);
+    background-size: 5px 5px, 5px 5px;
     background-repeat: no-repeat;
-    background-position: right 6px center;
 }
 
 .settings-modal-content .form-select {
@@ -3294,7 +3405,7 @@ html.popup-window .settings-content {
 
 .form-select:focus {
     outline: none;
-    border-color: #0891b2;
+    border-color: var(--accent-color);
 }
 
 /* Custom dropdown for mobile (replaces native select) */
@@ -3305,9 +3416,11 @@ html.popup-window .settings-content {
 
 .custom-dropdown-button {
     background-color: var(--theme-bg, #08080a);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-image: linear-gradient(45deg, transparent 50%, var(--theme-fg-muted, #71717a) 50%),
+                      linear-gradient(135deg, var(--theme-fg-muted, #71717a) 50%, transparent 50%);
+    background-position: calc(100% - 15px) calc(50% - 2px), calc(100% - 10px) calc(50% - 2px);
+    background-size: 5px 5px, 5px 5px;
     background-repeat: no-repeat;
-    background-position: right 8px center;
     border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
     border-radius: 4px;
     padding: 8px 28px 8px 12px;
@@ -3349,8 +3462,8 @@ html.popup-window .settings-content {
 }
 
 .custom-dropdown-item.selected {
-    background: rgba(8, 145, 178, 0.3);
-    color: #0891b2;
+    background: var(--accent-14);
+    color: var(--accent-color);
 }
 
 /* Stepper (- value +) */
@@ -3411,6 +3524,7 @@ html.popup-window .settings-content {
     background: var(--theme-bg, #121212);
     border-radius: 2px;
     outline: none;
+    cursor: pointer;
 }
 
 .slider::-webkit-slider-thumb {
@@ -3423,40 +3537,17 @@ html.popup-window .settings-content {
     cursor: pointer;
 }
 
-/* Buttons (mockup style) */
-.settings-modal-content .btn {
-    padding: 9px 6px;
-    width: 70px;
-    background: var(--theme-bg-hover, #222228);
-    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
-    border-radius: 4px;
-    color: var(--theme-fg-secondary, #a1a1aa);
-    font-family: inherit;
-    font-size: 10px;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
+.slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border: none;
+    border-radius: 50%;
+    background: var(--accent-color, #0891b2);
     cursor: pointer;
-    transition: all 0.1s ease;
 }
 
-.settings-modal-content .btn:hover {
-    background: var(--theme-bg-elevated, #1a1a1f);
-    color: var(--text-color);
-    border-color: var(--theme-fg-muted, #52525b);
-}
-
-.settings-modal-content .btn-primary {
-    background: #0891b2;
-    border-color: #0891b2;
-    color: #08080a;
-}
-
-.settings-modal-content .btn-primary:hover {
-    background: #22d3ee;
-    border-color: #22d3ee;
-    color: #08080a;
-}
+/* Buttons (mockup style) */
+/* The footer's buttons are the shared .btn family (see "Buttons" above). */
 
 /* Font modal CSS removed — merged into .settings-modal-content */
 
@@ -3470,10 +3561,10 @@ html.popup-window .settings-content {
     max-height: 200px;
     overflow-y: auto;
     background: var(--theme-bg, #08080a);
-    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
-    border-radius: 4px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
     padding: 2px;
-    margin-bottom: 8px;
+    margin-bottom: 0;
 }
 
 .font-family-item {
@@ -3490,8 +3581,8 @@ html.popup-window .settings-content {
 }
 
 .font-family-item.selected {
-    background: rgba(8, 145, 178, 0.3);
-    color: #22d3ee;
+    background: var(--accent-color);
+    color: var(--theme-bg, #121212);
 }
 
 .font-size-section .setting-label {
@@ -3528,7 +3619,7 @@ html.popup-window .settings-content {
 
 .menu-list .menu-item.selected {
     background-color: var(--accent-color);
-    color: #000;
+    color: var(--theme-bg, #121212);
     font-weight: bold;
 }
 
@@ -3734,7 +3825,7 @@ body.device-phone .help-ref-table td:first-child {
 }
 
 .help-content a:hover {
-    color: #fff;
+    color: var(--text-color);
 }
 
 /* Slider (kept for compatibility) */
@@ -3744,33 +3835,7 @@ body.device-phone .help-ref-table td:first-child {
     gap: 8px;
 }
 
-.slider {
-    width: 100px;
-    height: 4px;
-    background: var(--theme-bg, #08080a);
-    border-radius: 2px;
-    appearance: none;
-    cursor: pointer;
-}
-
-.slider::-webkit-slider-thumb {
-    appearance: none;
-    width: 14px;
-    height: 14px;
-    background: #22d3ee;
-    border-radius: 50%;
-    cursor: pointer;
-    box-shadow: 0 0 8px rgba(34, 211, 238, 0.15);
-}
-
-.slider::-moz-range-thumb {
-    width: 14px;
-    height: 14px;
-    background: #22d3ee;
-    border-radius: 50%;
-    cursor: pointer;
-    border: none;
-}
+/* .slider itself is defined once, with the steppers above. */
 
 .slider-value {
     color: var(--theme-fg-muted, #71717a);

@@ -4,23 +4,26 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Clay Keybind Editor</title>
+<style id="theme-vars">:root { {{THEME_CSS_VARS}} }</style>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* The page's palette reads Clay's theme (the --theme-* variables the server fills
+   in above, as for the main page); the old fixed colours remain as fallbacks. */
 :root {
-  --editor-bg: #0e1220;
-  --editor-bg2: #141828;
-  --editor-bg3: #1a1f33;
-  --editor-bg4: #222840;
-  --editor-fg: #d0ccd6;
-  --editor-fg2: #908a9a;
-  --editor-accent: #d4845a;
-  --editor-border: #2a2f44;
-  --editor-hover: #2a3050;
-  --editor-selected: #33395a;
-  --editor-success: #7ecf8b;
-  --editor-error: #e87070;
-  --editor-warning: #e8c46a;
+  --editor-bg: var(--theme-bg, #0e1220);
+  --editor-bg2: var(--theme-bg-surface, #141828);
+  --editor-bg3: var(--theme-bg-elevated, #1a1f33);
+  --editor-bg4: var(--theme-bg-hover, #222840);
+  --editor-fg: var(--theme-fg, #d0ccd6);
+  --editor-fg2: var(--theme-fg-secondary, #908a9a);
+  --editor-accent: var(--theme-accent, #d4845a);
+  --editor-border: var(--theme-border-medium, #2a2f44);
+  --editor-hover: var(--theme-bg-hover, #2a3050);
+  --editor-selected: var(--theme-selection-bg, #33395a);
+  --editor-success: var(--theme-success, #7ecf8b);
+  --editor-error: var(--theme-error, #e87070);
+  --editor-warning: var(--theme-highlight, #e8c46a);
 }
 
 html, body {

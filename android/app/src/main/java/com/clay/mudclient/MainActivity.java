@@ -52,6 +52,10 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
     private static final String KEY_CACHED_THEME_CSS = "cachedThemeCss";
+    // The theme's background and lightness (AndroidInterface.setThemeAppearance), so the
+    // system bars match the page from the first frame of the next start too.
+    private static final String KEY_THEME_BG = "themeBg";
+    private static final String KEY_THEME_LIGHT = "themeLight";
     private static final String KEY_SETUP_COMPLETE = "setupComplete";
     // Whether Clay runs its own server on-device ("local") or connects to one elsewhere
     // ("remote"). Unset on first launch until the user picks in the startup chooser; changeable
@@ -898,6 +902,19 @@ public class MainActivity extends AppCompatActivity {
                 .putString(KEY_CACHED_THEME_CSS, cssVars).apply();
         }
 
+        /** The theme's background colour and whether it is a light theme (app.js
+         *  applyThemeAppearance, from the page's own luminance rule): the system bars
+         *  and the connecting overlay follow it, now and at the next cold start. */
+        @JavascriptInterface
+        public void setThemeAppearance(String bgHex, boolean light) {
+            Integer color = parseHexColor(bgHex);
+            if (color == null) return;
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putInt(KEY_THEME_BG, color).putBoolean(KEY_THEME_LIGHT, light).apply();
+            final int c = color;
+            runOnUiThread(() -> applyThemeAppearance(c, light));
+        }
+
         @JavascriptInterface
         public void openExternalUrl(String url) {
             runOnUiThread(() -> {
@@ -924,6 +941,55 @@ public class MainActivity extends AppCompatActivity {
                 reloadInterfaceRespectingRunMode();
             });
         }
+    }
+
+    /** "#rgb" or "#rrggbb" as an opaque ARGB int, or null. */
+    private static Integer parseHexColor(String hex) {
+        if (hex == null) return null;
+        String h = hex.trim();
+        if (!h.startsWith("#")) return null;
+        h = h.substring(1);
+        if (h.length() == 3) {
+            h = "" + h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
+        }
+        if (h.length() != 6) return null;
+        try {
+            return 0xFF000000 | Integer.parseInt(h, 16);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** Paint the chrome around the page in the theme's colours: the status and navigation
+     *  bars and the window ground in its background, with dark bar icons on a light theme,
+     *  and the connecting overlay in the same ground with text that reads on it. Called
+     *  from onCreate with the remembered theme and from the page whenever it changes. */
+    private void applyThemeAppearance(int bg, boolean light) {
+        android.view.Window w = getWindow();
+        if (w == null) return;
+        w.setStatusBarColor(bg);
+        w.setNavigationBarColor(bg);
+        w.getDecorView().setBackgroundColor(bg);
+        android.view.View root = findViewById(android.R.id.content);
+        if (root != null) root.setBackgroundColor(bg);
+        androidx.core.view.WindowInsetsControllerCompat controller =
+            new androidx.core.view.WindowInsetsControllerCompat(w, w.getDecorView());
+        controller.setAppearanceLightStatusBars(light);
+        controller.setAppearanceLightNavigationBars(light);
+        if (connectingOverlay != null) connectingOverlay.setBackgroundColor(bg);
+        int text = light ? 0xFF1F1B17 : 0xFFD0CCD6;
+        int muted = light ? 0xFF6F655A : 0xFF908A9A;
+        if (connectingText != null) connectingText.setTextColor(text);
+        if (connectingUrl != null) connectingUrl.setTextColor(muted);
+        if (connectingCancelBtn != null) connectingCancelBtn.setTextColor(text);
+    }
+
+    /** The theme remembered from the last run (none on a fresh install: the layout's
+     *  dark defaults stay). */
+    private void applyRememberedThemeAppearance() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (!prefs.contains(KEY_THEME_BG)) return;
+        applyThemeAppearance(prefs.getInt(KEY_THEME_BG, 0xFF0E1220), prefs.getBoolean(KEY_THEME_LIGHT, false));
     }
 
     @Override
@@ -967,6 +1033,7 @@ public class MainActivity extends AppCompatActivity {
         connectingText = findViewById(R.id.connectingText);
         connectingUrl = findViewById(R.id.connectingUrl);
         connectingCancelBtn = findViewById(R.id.connectingCancelBtn);
+        applyRememberedThemeAppearance();
         connectingCancelBtn.setOnClickListener(v -> {
             connectCancelled = true;
             hideConnectingOverlay();
@@ -2000,9 +2067,17 @@ public class MainActivity extends AppCompatActivity {
             // in app.js, which engages the /clay/ws then /ws probe.
             webPathScript = webPath.isEmpty() ? "" : "window.WEB_PATH=" + jsStr(webPath) + ";";
         }
-        String theme = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS)
-                            .replace("\\", "\\\\").replace("'", "\\'")
-                            .replace("\r", "").replace("\n", " ");
+        // The page saves the whole `:root { ... }` rule it has (app.js saveThemeCss) while
+        // DEFAULT_THEME_CSS is the bare declarations; both are injected as declarations
+        // below. Wrapping a saved rule again produced `:root{:root { ... }}`, which no
+        // engine accepts, so a cached theme never applied at a cold start - the page sat
+        // on style.css's fallback greys until the server's InitialState arrived.
+        String theme = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS).trim();
+        if (theme.startsWith(":root")) {
+            theme = theme.replaceFirst("^:root\\s*\\{", "").replaceFirst("\\}\\s*$", "");
+        }
+        theme = theme.replace("\\", "\\\\").replace("'", "\\'")
+                     .replace("\r", "").replace("\n", " ");
         return "window.WS_HOST=" + localHost + ";" +
                "window.WS_LOCAL_HOST=" + localHost + ";" +
                "window.WS_REMOTE_HOST=" + remoteHost + ";" +

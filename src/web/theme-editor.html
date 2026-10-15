@@ -4,23 +4,26 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Clay Theme Editor</title>
+<style id="theme-vars">:root { {{THEME_CSS_VARS}} }</style>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* The page's palette reads Clay's theme (the --theme-* variables the server fills
+   in above, as for the main page); the old fixed colours remain as fallbacks. */
 :root {
-  --editor-bg: #0e1220;
-  --editor-bg2: #141828;
-  --editor-bg3: #1a1f33;
-  --editor-bg4: #222840;
-  --editor-fg: #d0ccd6;
-  --editor-fg2: #908a9a;
-  --editor-accent: #d4845a;
-  --editor-border: #2a2f44;
-  --editor-hover: #2a3050;
-  --editor-selected: #33395a;
-  --editor-success: #7ecf8b;
-  --editor-error: #e87070;
-  --editor-warning: #e8c46a;
+  --editor-bg: var(--theme-bg, #0e1220);
+  --editor-bg2: var(--theme-bg-surface, #141828);
+  --editor-bg3: var(--theme-bg-elevated, #1a1f33);
+  --editor-bg4: var(--theme-bg-hover, #222840);
+  --editor-fg: var(--theme-fg, #d0ccd6);
+  --editor-fg2: var(--theme-fg-secondary, #908a9a);
+  --editor-accent: var(--theme-accent, #d4845a);
+  --editor-border: var(--theme-border-medium, #2a2f44);
+  --editor-hover: var(--theme-bg-hover, #2a3050);
+  --editor-selected: var(--theme-selection-bg, #33395a);
+  --editor-success: var(--theme-success, #7ecf8b);
+  --editor-error: var(--theme-error, #e87070);
+  --editor-warning: var(--theme-highlight, #e8c46a);
 }
 
 html, body {
@@ -1037,11 +1040,11 @@ const VARIABLE_GROUPS = [
 function darkDefaults() {
   return {
     bg: '#131926', bg_deep: '#131926', bg_surface: '#1c1722',
-    bg_elevated: '#231d2a', bg_hover: '#2c2535',
+    bg_elevated: '#1f1f1f', bg_hover: '#2c2535',
     fg: '#e8e4ec', fg_secondary: '#a89fb4', fg_muted: '#6e6479', fg_dim: '#4a4255',
-    accent: '#d4845a', accent_dim: '#c27a52', highlight: '#e8c46a',
-    success: '#7ecf8b', error: '#e87070', error_dim: '#5f0000',
-    'status_bar.bg': '#284b63', 'menu_bar.bg': '#111111', 'selection.bg': '#004080', link: '#8cb4e0',
+    accent: '#2657ba', accent_dim: '#004080', highlight: '#e8c46a',
+    success: '#7ecf8b', error: '#dc2626', error_dim: '#5f0000',
+    'status_bar.bg': '#284b63', 'menu_bar.bg': '#152b3a', 'selection.bg': '#004080', link: '#8cb4e0',
     prompt: '#d4845a', border_subtle: '#221c2b', border_medium: '#2e2738',
     'button.selected_bg': '#e8e4ec', 'button.selected_fg': '#131926',
     'more_indicator.bg': '#5f0000', 'activity.bg': '#f5f0d8',
@@ -1072,6 +1075,59 @@ function lightDefaults() {
     'ansi.12': '#295fcc', 'ansi.13': '#cc58cc', 'ansi.14': '#4ccce6',
     'ansi.15': '#282828'
   };
+}
+
+// The two newer built-ins (theme.rs dark_new / light_new: the Slate and Paper looks).
+function darkNewDefaults() {
+  return Object.assign(darkDefaults(), {
+    bg: '#0f1b26', bg_deep: '#0b1520', bg_surface: '#17293a',
+    bg_elevated: '#1e3448', bg_hover: '#2f5570',
+    fg: '#eef3f7', fg_secondary: '#b8c9d6', fg_muted: '#9ab3c6', fg_dim: '#6f8aa0',
+    accent: '#e8965f', accent_dim: '#c97a46', highlight: '#f0c674',
+    success: '#7ecf8b', error: '#ff7b7b', error_dim: '#5f1f1f',
+    'status_bar.bg': '#284b63', 'menu_bar.bg': '#1b3447', 'selection.bg': '#3a6a8e', link: '#9ec5ea',
+    prompt: '#e8965f', border_subtle: '#1f3a4f', border_medium: '#3b6584',
+    'button.selected_bg': '#eef3f7', 'button.selected_fg': '#0f1b26',
+    'more_indicator.bg': '#5f1f1f', 'activity.bg': '#f5e6b8'
+  });
+}
+
+function lightNewDefaults() {
+  return Object.assign(lightDefaults(), {
+    bg: '#f6f2ea', bg_deep: '#f6f2ea', bg_surface: '#efe9de',
+    bg_elevated: '#fbf8f2', bg_hover: '#e8e0d2',
+    fg: '#1f1b17', fg_secondary: '#4f463d', fg_muted: '#6f655a', fg_dim: '#9a9086',
+    accent: '#b5552b', accent_dim: '#a04a24', highlight: '#e0a93a',
+    success: '#2e8b57', error: '#c62828', error_dim: '#5f0000',
+    'status_bar.bg': '#e4dccd', 'menu_bar.bg': '#ddd4c4', 'selection.bg': '#cfe0f5', link: '#1a5fa8',
+    prompt: '#a84a22', border_subtle: '#ddd4c4', border_medium: '#cdc3b2',
+    'button.selected_bg': '#1f1b17', 'button.selected_fg': '#f6f2ea',
+    'more_indicator.bg': '#5f0000', 'activity.bg': '#f1c85c'
+  });
+}
+
+// Every built-in, fresh (theme::BUILTIN_THEMES).
+function builtinDefaults() {
+  return { dark: darkDefaults(), light: lightDefaults(), 'dark-new': darkNewDefaults(), 'light-new': lightNewDefaults() };
+}
+
+// Is a background colour a light one? The server's ThemeColors::is_light rule: WCAG
+// relative luminance above 0.4.
+function isLightBg(hex) {
+  if (!/^#[0-9a-f]{6}$/i.test(String(hex || ''))) return null;
+  const [r, g, b] = hexToRgb(hex);
+  const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b) > 0.4;
+}
+
+// The defaults a theme's missing keys are filled from: its own built-in when it is one,
+// else by the lightness of the background it has, else by its name as a last resort.
+function defaultsFor(name, colors) {
+  const builtin = builtinDefaults();
+  if (builtin[name]) return builtin[name];
+  const light = colors && colors.bg ? isLightBg(colors.bg) : null;
+  if (light !== null) return light ? lightDefaults() : darkDefaults();
+  return /^light/.test(name) ? lightDefaults() : darkDefaults();
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -1177,7 +1233,7 @@ function handleWsMessage(msg) {
         // Convert to our format (fill in missing keys from defaults)
         themes = {};
         for (const [name, colors] of Object.entries(parsed)) {
-          const base = /^light/.test(name) ? lightDefaults() : darkDefaults();
+          const base = defaultsFor(name, colors);
           themes[name] = Object.assign({}, base, colors);
         }
       }
@@ -1314,7 +1370,7 @@ function sha256Fallback(message) {
 // ── Standalone mode ────────────────────────────────────────────────────────
 
 function initStandalone() {
-  themes = { dark: darkDefaults(), light: lightDefaults() };
+  themes = builtinDefaults();
   savedSnapshot = JSON.stringify(themes);
   currentTheme = 'dark';
   selectedVar = null;
@@ -2048,7 +2104,7 @@ function parseThemeFile(content) {
         var name = inner.slice(6).trim();
         currentName = name;
         if (!result[name]) {
-          result[name] = /^light/.test(name) ? lightDefaults() : darkDefaults();
+          result[name] = defaultsFor(name, null);
         }
       }
       continue;
@@ -2134,7 +2190,7 @@ function resetChanges() {
 
 function loadDefaults() {
   if (isModified() && !confirm('Discard current changes and load built-in defaults?')) return;
-  themes = { dark: darkDefaults(), light: lightDefaults() };
+  themes = builtinDefaults();
   currentTheme = 'dark';
   selectedVar = null;
 

@@ -19,7 +19,7 @@ Open with `/setup` command:
 | Show tags | Show MUD tags at line start | Off |
 | Input height | Input area height in lines (1-15), kept per interface: the console's here, and one each for phone, tablet and desktop clients (the GUIs and a desktop browser are desktops), each set from that interface's own Settings, `Alt-Up/Down` or a drag of the input's top edge. In `settings.dat`: `input_height` (console), `input_height_phone`, `input_height_tablet`, `input_height_desktop`; a file from before the split starts all three at the console's | 3 |
 | Console Theme | Terminal color scheme | Dark |
-| GUI Theme | Remote GUI color scheme | Dark |
+| GUI Theme | Colour scheme of the GUI, the web page and the Android app: Dark, Light, Dark - New, Light - New or a custom theme from `theme.dat` | Dark |
 | TLS Proxy | Preserve TLS connections across reload | Off |
 | ANSI Music | Enable ANSI music playback | Off |
 | TTS | Text-to-speech for incoming lines: Off; Local (espeak or espeak-ng on Linux, `say` on macOS, the Windows voices); Kokoro (an offline neural voice, installed once with `/tts install`); Edge (Microsoft's cloud voices, needs internet). Browser and Android clients always use the device's own voice. F9 mutes. | Off |

@@ -53,7 +53,7 @@ The web interface provides a complete MUD experience:
 
 - **ANSI color rendering**: Xubuntu Dark palette, 256-color and true color
 - **Shade character blending**: ░▒▓ rendered with proper color blending
-- **Clickable URLs**: Links are cyan, underlined, open in new tab
+- **Clickable URLs**: Links in the theme's link colour, underlined, open in new tab
 - **More-mode pausing**: Tab to release, same as console
 - **Command history**: Ctrl+P/N navigation
 - **Multiple worlds**: Full world switching support
@@ -118,6 +118,16 @@ Access via hamburger menu or `/actions`:
 - Full action editing capability
 - Same interface as console
 - Create, edit, delete actions
+
+### Settings
+
+Access via the hamburger menu or `/setup`. The dialog is the desktop GUI's Settings
+window drawn in the browser: a sidebar of icon-and-label tiles on the left (General,
+Web, Font, then the Theme, Keybind and Action editors, which open their own pages; the
+Android app adds Clay Server), and the section's settings grouped in rounded cards on
+the right. On a phone the dialog fills the screen and the sidebar becomes a strip of
+icons along the top. The Worlds and Actions dialogs use the same cards, and every
+colour comes from the theme chosen in Settings (the Interface chapter lists them).
 
 ### Status Panel
 

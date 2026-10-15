@@ -127,8 +127,15 @@ elsewhere (the input box, popups) the platform's normal context menu still appli
 ## Themes
 
 Configure GUI theme in `/setup` (`GUI Theme` setting):
-- **Dark**: Dark background, light text (default)
-- **Light**: Light background, dark text
+- **Dark**: the original dark interface (default)
+- **Light**: the original light interface
+- **Dark - New**: slate blues with a warm orange accent and higher-contrast text
+- **Light - New**: a warm off-white interface with charcoal text and a terracotta accent
+- any custom `[theme:name]` from `~/.clay/theme.dat`, made in the theme editor
+
+The WebView draws the same chrome as the native GUI and the browser page (cards,
+sidebar tiles, accent buttons; see the Interface chapter), and treats a theme as light
+when its background colour is light, whatever its name.
 
 ## Synchronization
 
