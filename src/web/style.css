@@ -1298,10 +1298,11 @@ body.device-phone .nav-btn {
 body.device-phone .nav-btn svg { width: 15px; height: 15px; }
 /* Dark - New on a phone: the nav bar's buttons and font slider keep the original Dark
    theme's colours (theme.rs `dark_default`; a user ruling, 2026-10-16), on Dark - New's
-   own bar - its ground and top border are not touched. Tablets are not affected. The
-   aliases (--text-color, --border-color, --accent-color) are resolved at :root, so they
-   are restated here, not only the --theme-* values behind them. app.js `markGuiTheme`
-   sets the attribute. */
+   own bar - its ground and top border are not touched - and so do the input area's
+   ground and the line above it (Dark's bg_surface, border_medium). Tablets are not
+   affected. The aliases (--text-color, --border-color, --accent-color) are resolved at
+   :root, so they are restated here, not only the --theme-* values behind them. app.js
+   `markGuiTheme` sets the attribute. */
 body.device-phone[data-gui-theme="dark-new"] #nav-bar > * {
     --theme-fg-secondary: #a89fb4;
     --theme-fg-muted: #6e6479;
@@ -1310,6 +1311,10 @@ body.device-phone[data-gui-theme="dark-new"] #nav-bar > * {
     --text-color: #e8e4ec;
     --border-color: #2e2738;
     --accent-color: #2657ba;
+}
+body.device-phone[data-gui-theme="dark-new"] #input-container {
+    background-color: #1c1722;
+    border-top-color: #2e2738;
 }
 body.device-phone #output-container { padding: 6px 10px; }
 
