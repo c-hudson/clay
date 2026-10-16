@@ -111,7 +111,10 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
         unsafe { FreeConsole() };
     }
     ui::run(session, events);
-    Ok(())
+    // The windows are closed and the quit's cleanup is done (ui::run's on_app_quit):
+    // end here, as the WebView GUI's event loop does, rather than return through
+    // main, whose runtime would first wait out any blocking call still running.
+    std::process::exit(0);
 }
 
 /// `--gui` alone: Clay itself, in this process, as `--web-gui` runs it

@@ -7,7 +7,8 @@
 //! core of its own (its own world on screen, its own more-mode and input) fed the
 //! leader's messages. What the user does there waits in its outbox for the leader to
 //! send; what the core says to keep a connection going (logins, keepalives, acks, gap
-//! fills, what this client is looking at) is the leader's to say, and is dropped.
+//! fills, what this client is looking at) is the leader's to say, and is dropped. The
+//! leader says what its followers look at too (`set_other_views`).
 
 use std::time::Instant;
 
@@ -44,6 +45,7 @@ pub fn is_upkeep(msg: &WsMessage) -> bool {
             | WsMessage::ClientTypeDeclaration { .. }
             | WsMessage::ClientVisibility { .. }
             | WsMessage::MarkWorldSeen { .. }
+            | WsMessage::OtherViews { .. }
             | WsMessage::Ping
             | WsMessage::Pong
             | WsMessage::PongCheck { .. }
@@ -205,6 +207,12 @@ impl Session {
 
     pub fn send(&mut self, msg: WsMessage) -> Vec<Effect> {
         let e = self.core.send_message(msg);
+        self.apply(e)
+    }
+
+    /// The worlds the windows following this one show (`ClientCore::set_other_views`).
+    pub fn set_other_views(&mut self, worlds: Vec<usize>) -> Vec<Effect> {
+        let e = self.core.set_other_views(worlds);
         self.apply(e)
     }
 

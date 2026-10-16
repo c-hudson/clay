@@ -600,6 +600,7 @@ impl ClayView {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fx = self.session.tick();
         self.after(fx, cx);
+        self.report_other_views(cx);
         if let Some(m) = self.media.as_mut() {
             m.poll();
         }
@@ -1200,11 +1201,11 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         let Some((main, main_window)) = open_view_window(cx, fonts, session, Some(events), viewmode::ViewMode::default(), how) else {
             panic!("open the main window");
         };
-        // Running Clay itself: hand the router its port back on the way out, as the
-        // WebView GUI does.
+        // Running Clay itself: what /quit does before the process ends (the archive
+        // flushed, the TLS proxies ended, the router's port back), as the WebView GUI does.
         if crate::native_gui::runs_clay() {
             cx.on_app_quit(|_| {
-                crate::portmap::unmap_active_blocking();
+                crate::quit_in_process_clay();
                 async {}
             })
             .detach();

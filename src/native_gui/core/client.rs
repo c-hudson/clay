@@ -290,6 +290,11 @@ pub struct ClientCore {
     view: Option<(usize, usize)>,
     /// World name -> index, for the worlds listed in this connection's `resume`.
     resume_sent: HashMap<String, usize>,
+    /// The worlds this connection's other windows show (`set_other_views`).
+    other_views: Vec<usize>,
+    /// The server takes `OtherViews` (its `InitialState` says so); an older one would
+    /// close the connection on it.
+    server_takes_other_views: bool,
     requests: HashMap<u64, (RequestKind, usize, Instant)>,
     next_request_id: u64,
     backfill_at: Option<Instant>,
@@ -341,6 +346,8 @@ impl ClientCore {
             visible: true,
             view: None,
             resume_sent: HashMap::new(),
+            other_views: Vec::new(),
+            server_takes_other_views: false,
             requests: HashMap::new(),
             next_request_id: 1,
             backfill_at: None,
@@ -637,6 +644,23 @@ impl ClientCore {
         if let Some((rows, cols)) = self.view {
             self.send(WsMessage::UpdateViewState { world_index: self.current, visible_lines: rows, visible_columns: Some(cols) });
         }
+    }
+
+    /// The worlds this connection's other windows (`/window`) show, for the server
+    /// (`WsMessage::OtherViews`): they send nothing of their own, so without it a world
+    /// on screen in one of them was unseen to the server, and Unseen First sent that
+    /// window back to it from everywhere. Sent when the set changes, and again at each
+    /// login (a new connection is a new client to the server).
+    pub fn set_other_views(&mut self, mut worlds: Vec<usize>) -> Vec<Effect> {
+        worlds.sort_unstable();
+        worlds.dedup();
+        if worlds != self.other_views {
+            self.other_views = worlds;
+            if self.is_online() && self.server_takes_other_views {
+                self.send(WsMessage::OtherViews { worlds: self.other_views.clone() });
+            }
+        }
+        self.take()
     }
 
     /// Show another world (the client keeps its own current world, as app.js does).
@@ -994,7 +1018,8 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, .. } => {
+                self.server_takes_other_views = other_views;
                 self.initial_states += 1;
                 self.actions = actions;
                 self.splash_lines = splash_lines;
@@ -1502,6 +1527,9 @@ impl ClientCore {
         self.resume_sent.clear();
         if !self.worlds.is_empty() {
             self.send_view_state();
+            if !self.other_views.is_empty() && self.server_takes_other_views {
+                self.send(WsMessage::OtherViews { worlds: self.other_views.clone() });
+            }
             if self.visible {
                 self.send(WsMessage::MarkWorldSeen { world_index: self.current, previous_world_index: None });
             } else {

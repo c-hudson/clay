@@ -124,6 +124,7 @@ impl H {
             android_app_version: String::new(),
             your_display_id: 7,
             scrollback_push: false,
+            other_views: true,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -1038,6 +1039,67 @@ fn a_switch_the_server_worked_out_tells_the_server_what_is_seen() {
         assert!(sent.iter().any(|m| matches!(m, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) })), "{sent:?}");
         assert!(sent.iter().any(|m| matches!(m, WsMessage::RequestWorldState { world_index: 1 })), "{sent:?}");
     }
+}
+
+/// The worlds the other windows on this connection (`/window`) show go to the server as
+/// `OtherViews`: once per change, never while offline, and again after the next login
+/// (a new connection is a new client there). Without it a world on screen only in a
+/// second window stayed unseen, and Unseen First kept sending that window back to it.
+#[test]
+fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_login() {
+    let other_views = |sent: &[WsMessage]| -> Vec<Vec<usize>> {
+        sent.iter().filter_map(|m| if let WsMessage::OtherViews { worlds } = m { Some(worlds.clone()) } else { None }).collect()
+    };
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..2, 9), world_msg(2, "C", 0..2, 9)]);
+    h.effects.clear();
+    let e = h.core.set_other_views(vec![2, 1, 2]);
+    h.keep(e);
+    assert_eq!(other_views(&h.sent()), vec![vec![1, 2]], "sorted, once each");
+    let e = h.core.set_other_views(vec![1, 2]);
+    h.keep(e);
+    assert!(other_views(&h.sent()).is_empty(), "unchanged: nothing sent");
+    // Offline: remembered, said at the next login.
+    h.input(Input::Closed("network".into()));
+    h.drain();
+    let e = h.core.set_other_views(vec![2]);
+    h.keep(e);
+    assert!(other_views(&h.sent()).is_empty(), "nothing goes out while offline");
+    h.advance(Duration::from_secs(3));
+    h.input(Input::Opened);
+    h.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: "c2".into() });
+    h.msg(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false });
+    h.drain();
+    h.initial(vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..2, 9), world_msg(2, "C", 0..2, 9)]);
+    assert_eq!(other_views(&h.sent()), vec![vec![2]], "the new connection is told");
+    // The last window closed: an empty list says so.
+    let e = h.core.set_other_views(Vec::new());
+    h.keep(e);
+    assert_eq!(other_views(&h.sent()), vec![Vec::<usize>::new()]);
+
+    // A server that doesn't say it takes OtherViews never gets one: an older server
+    // closes the connection on a message it can't parse.
+    let mut old = H::password();
+    old.connect_and_login();
+    old.msg(WsMessage::InitialState {
+        worlds: vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..2, 9)],
+        settings: settings(),
+        current_world_index: 0,
+        actions: Vec::new(),
+        splash_lines: Vec::new(),
+        server_version: "1.7.8".into(),
+        android_app_version: String::new(),
+        your_display_id: 7,
+        scrollback_push: false,
+        other_views: false,
+        emoji_json: String::new(),
+        emoji_categories_json: String::new(),
+        tf_status: Vec::new(),
+    });
+    old.effects.clear();
+    let e = old.core.set_other_views(vec![1]);
+    old.keep(e);
+    assert!(other_views(&old.sent()).is_empty(), "not to a server that doesn't take it");
 }
 
 // ---- the telnet echo mask ----

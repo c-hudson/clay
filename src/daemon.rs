@@ -1686,6 +1686,9 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::MarkWorldSeen { world_index, previous_world_index } => {
             app.handle_mark_world_seen(client_id, world_index, previous_world_index);
         }
+        WsMessage::OtherViews { worlds } => {
+            app.handle_other_views(client_id, worlds);
+        }
         WsMessage::ReleasePending { world_index, count } => {
             app.release_pending_lines(client_id, world_index, count);
         }
@@ -3110,6 +3113,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         // `false` keeps multiuser clients on `RequestScrollback`, which does work here, in
         // preference to advertising the capability and then refusing every request.
         scrollback_push: false,
+        // Multiuser doesn't act on OtherViews (its view state is per user's own worlds).
+        other_views: false,
         emoji_json: crate::emoji::emoji_json(),
         emoji_categories_json: crate::emoji::emoji_categories_json(),
         // Multiuser shows Clay's own status bar.

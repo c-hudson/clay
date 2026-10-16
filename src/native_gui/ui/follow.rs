@@ -9,6 +9,10 @@
 //! been asked since and for a little while after. Anything else reaches every window,
 //! except what serves the main window's own windows (the editors, a new window, an MCP
 //! edit, a MUD's changed certificate).
+//!
+//! For the same reason the server knows of one world on screen, the main window's: it
+//! tells it which worlds its followers show (`report_other_views`, `OtherViews`), so a
+//! world up in a follower is seen there, not left unseen for Unseen First to return to.
 
 use std::time::{Duration, Instant};
 
@@ -39,6 +43,11 @@ impl Link {
     #[cfg(feature = "native-gui-snapshot")]
     pub fn follower_window(&self, n: usize) -> Option<AnyWindowHandle> {
         self.followers.iter().filter(|(f, _)| f.upgrade().is_some()).nth(n).map(|(_, h)| *h)
+    }
+
+    #[cfg(feature = "native-gui-snapshot")]
+    pub fn follower_views(&self) -> Vec<WeakEntity<ClayView>> {
+        self.followers.iter().filter(|(f, _)| f.upgrade().is_some()).map(|(f, _)| f.clone()).collect()
     }
 }
 
@@ -158,6 +167,33 @@ impl ClayView {
             self.after(fx, cx);
         }
         self.link.reply_to = Some((from, self.session.requests_sent, Instant::now()));
+        // A follower that switched worlds says so with its RequestWorldState: what's on
+        // screen in the windows changed.
+        self.report_other_views(cx);
+    }
+
+    /// The main window's: tell the server which worlds the windows following it show
+    /// (`Session::set_other_views`; sent only when that changes). They say nothing for
+    /// themselves, so without it a world shown in one was unseen to the server for good.
+    /// Also from the clock, for a window opened or closed.
+    pub(super) fn report_other_views(&mut self, cx: &mut Context<Self>) {
+        if self.is_follower() {
+            return;
+        }
+        self.link.followers.retain(|(f, _)| f.upgrade().is_some());
+        let worlds: Vec<usize> = self
+            .link
+            .followers
+            .iter()
+            .filter_map(|(f, _)| f.upgrade())
+            .map(|f| &f.read(cx).session.core)
+            .filter(|core| !core.worlds.is_empty())
+            .map(|core| core.current)
+            .collect();
+        let fx = self.session.set_other_views(worlds);
+        if !fx.is_empty() {
+            self.after(fx, cx);
+        }
     }
 
     /// Open a window on this connection (the main window's, whichever window asks).

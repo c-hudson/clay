@@ -402,6 +402,12 @@ pub enum WsMessage {
         /// catch-all and wait forever for a batch that never comes.
         #[serde(default)]
         scrollback_push: bool,
+        /// `true` = this server takes `OtherViews` (the native GUI's `/window`s). Sent only
+        /// to a server that says so: an older one closes the connection on a message it
+        /// can't parse, and a client that sent it again after each login would never stay
+        /// connected. `serde(default)` = false.
+        #[serde(default)]
+        other_views: bool,
         /// The emoji picker's curated table, in the compact wire form
         /// `[[ch, name, "kw1 kw2", category_index], ...]` from `emoji::emoji_json()`. The
         /// table is static, so it is sent once per connection here rather than on every
@@ -607,6 +613,13 @@ pub enum WsMessage {
     /// for wire compat with older clients that don't send it (falls back to the
     /// `ws_client_worlds` lookup).
     MarkWorldSeen { world_index: usize, #[serde(default)] previous_world_index: Option<usize> },
+    /// The worlds this client also shows, in other windows on this one connection (the
+    /// native GUI's `/window`s, which send nothing of their own): each counts as on screen
+    /// (`App::ws_client_viewing`), and one newly listed is marked seen, as `MarkWorldSeen`
+    /// would - without moving this client's own world. The whole list each time. Only to a
+    /// server whose `InitialState.other_views` says it takes it: an older one logs
+    /// `WS-BAD-MESSAGE` and closes the connection.
+    OtherViews { worlds: Vec<usize> },
     /// Update client's view state (world index and visible lines for more-mode calculation)
     UpdateViewState { world_index: usize, visible_lines: usize, #[serde(default)] visible_columns: Option<usize> },
     /// Update client's output dimensions (for NAWS - report smallest across all instances)

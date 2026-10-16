@@ -1730,6 +1730,14 @@ feature = "wire MarkWorldSeen"
 note = "sent by the web client"
 
 [[item]]
+id = "wire:OtherViews"
+section = "wire"
+phase = 0
+status = "done"
+feature = "wire OtherViews"
+note = "native only: the main window reports its /window followers' worlds; the web's windows are clients of their own"
+
+[[item]]
 id = "wire:UpdateViewState"
 section = "wire"
 phase = 1

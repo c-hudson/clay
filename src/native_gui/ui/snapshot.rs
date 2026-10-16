@@ -301,6 +301,27 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     });
                     Vec::new()
                 }
+                // The world each window shows (the main one, then each `/window`), and
+                // each world's unseen count as that window knows it.
+                "worlds" => {
+                    cx.run_until_parked();
+                    cx.update(|app| {
+                        let describe = |v: &ClayView| {
+                            let core = &v.session.core;
+                            let unseen: Vec<String> = core.worlds.iter().filter(|w| w.unseen > 0).map(|w| format!("{}={}", w.name, w.unseen)).collect();
+                            format!("{} (unseen: {})", core.current_world().map_or("-", |w| w.name.as_str()), unseen.join(" "))
+                        };
+                        let main = view.read(app);
+                        let mut line = format!("snapshot-worlds: {arg} main={}", describe(main));
+                        for (i, f) in main.link.follower_views().iter().enumerate() {
+                            if let Some(f) = f.upgrade() {
+                                line.push_str(&format!(" view{i}={}", describe(f.read(app))));
+                            }
+                        }
+                        println!("{line}");
+                    });
+                    Vec::new()
+                }
                 // A capture of the main window now, as well as the one at the end.
                 "shot" => {
                     cx.run_until_parked();

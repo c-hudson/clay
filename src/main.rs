@@ -96,6 +96,30 @@ pub static GUI_HTTP_READY: AtomicBool = AtomicBool::new(false);
 /// Why the GUI's in-process server didn't start (a bind or certificate failure), for the
 /// GUIs' start-up waits: they say so at once rather than waiting out their timeout.
 pub static GUI_HTTP_FAILED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// A Clay is running in this process (`run_app_headless`, for a GUI or `--local-server`)
+/// and answers `quit_in_process_clay`.
+static IN_PROCESS_CLAY: AtomicBool = AtomicBool::new(false);
+/// `quit_in_process_clay`'s request, and the in-process Clay's answer that it's done.
+static GUI_QUIT: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static GUI_QUIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// A GUI is closing (the native GUI's quit, the WebView's main window or Quit): have the
+/// Clay running in this process do what `/quit` does (`App::quit_cleanup`) and wait for
+/// it, a few seconds at most. Neither GUI did: the archive's last lines were lost, and
+/// each TLS proxy (a `clay.exe` of its own on Windows) took the GUI's going for a hot
+/// reload and lived on for a minute, its MUD connection still open. A GUI attached to a
+/// Clay elsewhere has none in-process; only a UPnP mapping (never held then) is looked at.
+pub fn quit_in_process_clay() {
+    if IN_PROCESS_CLAY.load(Ordering::SeqCst) {
+        GUI_QUIT.notify_one();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !GUI_QUIT_DONE.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Whatever the in-process Clay didn't get to.
+    portmap::unmap_active_blocking();
+}
 /// Set by `--local-server` before startup. General "local-server mode is active" signal, used
 /// wherever headless-server behavior needs to differ from other headless modes (-D, --multiuser)
 /// or from interactive modes:
@@ -5450,6 +5474,10 @@ pub struct App {
     /// Cache of each WS client's view state (for activity indicator and more-mode)
     /// Maps client_id -> ClientViewState (world_index + visible_lines)
     pub ws_client_worlds: std::collections::HashMap<u64, ClientViewState>,
+    /// Client id -> the worlds it also shows in other windows on the same connection
+    /// (`WsMessage::OtherViews`, the native GUI's `/window`s). They count as on screen
+    /// while the client itself does (`ws_client_viewing`); reaped with its view state.
+    pub ws_client_other_views: std::collections::HashMap<u64, Vec<usize>>,
     /// Connection id -> stable ▶ ownership id, seeded from `AuthRequest.client_uid`. See
     /// `App::display_owner_id`. Entries are dropped when the client's `ClientViewState` is
     /// reaped, so this stays bounded by the live client count.
@@ -5747,6 +5775,7 @@ impl App {
             https_server: None,
             popup_was_visible: false,
             ws_client_worlds: std::collections::HashMap::new(),
+            ws_client_other_views: std::collections::HashMap::new(),
             ws_client_owner_ids: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
             deferred_tf: std::collections::VecDeque::new(),
@@ -9040,6 +9069,36 @@ impl App {
         }
     }
 
+    /// `WsMessage::OtherViews` handling — shared by master-WS and daemon single-user: the
+    /// worlds `client_id` also shows in other windows of its own (the native GUI's
+    /// `/window`s, which share its connection and say nothing for themselves). They count
+    /// as on screen from now on (`ws_client_viewing`), and one that wasn't listed before
+    /// has been seen: its unseen output and activity are cleared, as `MarkWorldSeen` does,
+    /// but this client's own world, history and ▶ markers stay where they are. Without
+    /// it, a world brought up in a second window kept its unseen output, so Unseen First
+    /// sent that window back to it from every other world.
+    pub(crate) fn handle_other_views(&mut self, client_id: u64, worlds: Vec<usize>) {
+        let mut worlds: Vec<usize> = worlds.into_iter().filter(|&w| w < self.worlds.len()).collect();
+        worlds.sort_unstable();
+        worlds.dedup();
+        let before = self.ws_client_other_views.get(&client_id).cloned().unwrap_or_default();
+        let arrived: Vec<usize> = worlds.iter().copied().filter(|w| !before.contains(w)).collect();
+        if worlds.is_empty() {
+            self.ws_client_other_views.remove(&client_id);
+        } else {
+            self.ws_client_other_views.insert(client_id, worlds);
+        }
+        if arrived.is_empty() {
+            return;
+        }
+        for &w in &arrived {
+            self.worlds[w].mark_seen();
+            self.ws_broadcast(WsMessage::UnseenCleared { world_index: w });
+        }
+        self.broadcast_activity();
+        self.needs_output_redraw = true;
+    }
+
     /// `WsMessage::UpdateActions` handling — shared by master-WS and daemon (T40).
     ///
     /// **Was entirely absent from daemon.rs** (not in the regular handler, not in the
@@ -9803,6 +9862,12 @@ impl App {
             self.current_world_index = self.worlds.len().saturating_sub(1);
         } else if self.current_world_index > world_index {
             self.current_world_index -= 1;
+        }
+        for views in self.ws_client_other_views.values_mut() {
+            views.retain(|&w| w != world_index);
+            for w in views.iter_mut().filter(|w| **w > world_index) {
+                *w -= 1;
+            }
         }
     }
 
@@ -11811,8 +11876,11 @@ impl App {
     }
 
     pub(crate) fn ws_client_viewing(&self, world_index: usize) -> bool {
-        self.ws_client_worlds.values().any(|v| v.world_index == world_index && !v.paused && v.visible
-            && v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true))
+        self.ws_client_worlds.iter().any(|(id, v)| {
+            let shown = v.world_index == world_index
+                || self.ws_client_other_views.get(id).is_some_and(|o| o.contains(&world_index));
+            shown && !v.paused && v.visible && v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true)
+        })
     }
 
     /// `viewer_id` is now displaying `world_idx`: claim every still-unviewed line there for
@@ -11922,6 +11990,7 @@ impl App {
             // notify: None — the socket is long gone, there is nobody to tell.
             self.release_world_for(world_idx, owner, None);
             self.ws_client_worlds.remove(&client_id);
+            self.ws_client_other_views.remove(&client_id);
             self.ws_client_owner_ids.remove(&client_id);
         }
     }
@@ -14748,6 +14817,32 @@ impl App {
         }
     }
 
+    /// What quitting does before the process ends - `/quit` in the console, and a GUI
+    /// closing with Clay in its own process (`quit_in_process_clay`): the archive's last
+    /// lines to disk, the router's port back, and the TLS proxies ended. A proxy left
+    /// running takes its client's going for a hot reload and waits a minute for it to
+    /// come back, holding the MUD connection open.
+    pub async fn quit_cleanup(&mut self) {
+        // Drain the archive writer before tearing anything down, so the last
+        // batch of output reaches disk rather than dying with the process.
+        self.flush_scrollback();
+        // Give the router its port back (no-op unless a UPnP mapping is held).
+        self.unmap_on_quit().await;
+        for world in &self.worlds {
+            #[cfg(unix)]
+            if let Some(proxy_pid) = world.proxy_pid {
+                unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+            }
+            #[cfg(windows)]
+            if let Some(proxy_pid) = world.proxy_pid {
+                kill_proxy_process(proxy_pid);
+            }
+            if let Some(ref socket_path) = world.proxy_socket_path {
+                let _ = std::fs::remove_file(socket_path);
+            }
+        }
+    }
+
     /// Flip the UPnP port-mapping toggle: immediate effect, persisted (with the
     /// requesting UI as the audit source), broadcast to every client. Deliberately
     /// not part of `UpdateGlobalSettings`, so an older client that doesn't know the
@@ -16062,6 +16157,9 @@ impl App {
             WsMessage::MarkWorldSeen { world_index, previous_world_index } => {
                 self.handle_mark_world_seen(client_id, world_index, previous_world_index);
             }
+            WsMessage::OtherViews { worlds } => {
+                self.handle_other_views(client_id, worlds);
+            }
             WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
                 // A remote client is reporting its view state (for more-mode threshold calculation)
                 if world_index < self.worlds.len() {
@@ -16898,6 +16996,7 @@ impl App {
             // can answer it would strand a new client waiting on a batch that never comes,
             // so every intermediate build honestly reports "use the legacy path".
             scrollback_push: false,
+            other_views: true,
             emoji_json: crate::emoji::emoji_json(),
             emoji_categories_json: crate::emoji::emoji_categories_json(),
             tf_status: self.tf_status.iter()
@@ -21601,6 +21700,7 @@ pub async fn run_app_headless(
     tfstartup::run_tf_startup_daemon(&mut app, &event_tx, true, !local_server).await;
 
     debug_log(is_debug_enabled(), "HEADLESS: Entering main event loop");
+    IN_PROCESS_CLAY.store(true, Ordering::SeqCst);
 
     // Main event loop
     loop {
@@ -21608,6 +21708,15 @@ pub async fn run_app_headless(
         reap_zombie_children();
 
         tokio::select! {
+            // The GUI this Clay runs in is closing (quit_in_process_clay): /quit's
+            // cleanup, then nothing more - the process ends with the GUI.
+            _ = GUI_QUIT.notified() => {
+                debug_log(is_debug_enabled(), "HEADLESS: GUI quitting, running /quit's cleanup");
+                app.quit_cleanup().await;
+                GUI_QUIT_DONE.store(true, Ordering::SeqCst);
+                return Ok(());
+            }
+
             // App events (server data, disconnects, WS client messages)
             Some(event) = event_rx.recv() => {
                 // Slack/Discord events and connection-close notices: handled once, for every

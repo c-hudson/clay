@@ -11762,6 +11762,69 @@ third
         assert_eq!(app.worlds[1].output_lines.last().unwrap().display_id, None);
     }
 
+    /// A world on screen in another window of a client (`OtherViews`, the native GUI's
+    /// `/window`s, which share its connection and send nothing themselves) is seen when it
+    /// arrives there and counts as watched while it stays, and the client's own world does
+    /// not move. Before, such a world kept its unseen output: Unseen First sent the second
+    /// window back to it from every other world, so it bounced between two worlds.
+    #[test]
+    fn test_a_world_shown_in_another_window_of_a_client_is_seen_and_watched() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["A", "B", "C"] {
+            app.worlds.push(World::new(name));
+        }
+        app.current_world_index = 9999; // the console watches none of them
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        });
+        push_server_line(&mut app, 2, "missed on C");
+        app.worlds[2].unseen_lines = 1;
+        app.worlds[2].first_unseen_at = Some(std::time::Instant::now());
+        assert!(!app.ws_client_viewing(2), "precondition: nobody watches C");
+
+        // A second window of this client brings up C.
+        app.handle_other_views(client_id, vec![2, 2, 7]);
+        assert_eq!(app.worlds[2].unseen_lines, 0, "C was seen there");
+        assert_eq!(app.worlds[2].first_unseen_at, None);
+        assert!(app.ws_client_viewing(2), "C is on screen");
+        assert_eq!(app.ws_client_worlds[&client_id].world_index, 0, "the client's own world stays");
+        assert_eq!(app.ws_client_other_views[&client_id], vec![2], "deduplicated, out-of-range dropped");
+        push_server_line(&mut app, 2, "while shown");
+        assert!(app.worlds[2].output_lines.last().unwrap().viewed, "text there is born viewed");
+        // Unseen First from C now looks past it.
+        app.worlds[1].unseen_lines = 3;
+        app.worlds[1].first_unseen_at = Some(std::time::Instant::now());
+        app.worlds[0].connected = true;
+        app.worlds[1].connected = true;
+        app.worlds[2].connected = true;
+        app.settings.world_switch_mode = WorldSwitchMode::UnseenFirst;
+        assert_eq!(app.calculate_next_world_from(0), Some(1), "B, the world with unseen output");
+
+        // A hidden client watches nothing, in any window.
+        app.ws_client_worlds.get_mut(&client_id).unwrap().visible = false;
+        assert!(!app.ws_client_viewing(2));
+        app.ws_client_worlds.get_mut(&client_id).unwrap().visible = true;
+
+        // Deleting a world before C keeps the list on C.
+        app.delete_world(0);
+        assert_eq!(app.ws_client_other_views[&client_id], vec![1]);
+
+        // The window closed: C is no longer watched.
+        app.handle_other_views(client_id, Vec::new());
+        assert!(!app.ws_client_other_views.contains_key(&client_id));
+        assert!(!app.ws_client_viewing(1));
+
+        // Reaped with the client's view state.
+        app.handle_other_views(client_id, vec![1]);
+        app.ws_client_worlds.get_mut(&client_id).unwrap().disconnected_at =
+            Some(std::time::Instant::now() - WS_VIEWER_GRACE - std::time::Duration::from_secs(1));
+        app.reap_stale_ws_client_worlds();
+        assert!(!app.ws_client_other_views.contains_key(&client_id));
+    }
+
     /// A backgrounded client stops counting as a viewer and drops its markers; coming back
     /// claims whatever arrived meanwhile. A brief transport drop is the opposite case and is
     /// covered by WS_VIEWER_GRACE.
@@ -19812,4 +19875,24 @@ fn a_custom_certificate_that_cannot_serve_is_named_and_clays_own_serves_instead(
     assert!(own_cert.ends_with("cert.pem") && own_key.ends_with("key.pem"), "{own_cert} {own_key}");
     assert_eq!(custom_cert_problem(&own_cert, &own_key), None);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What quitting does is one `App::quit_cleanup`, shared by the console's /quit and a
+/// GUI closing over Clay in its own process: a TLS proxy is ended and its socket file
+/// removed. Before, a closing GUI left the proxies to wait a minute for a reload.
+#[cfg(unix)]
+#[tokio::test]
+async fn quitting_ends_the_tls_proxies() {
+    let mut proxy = std::process::Command::new("sleep").arg("30").spawn().expect("a stand-in proxy");
+    let socket = std::env::temp_dir().join(format!("clay-quit-proxy-{}.sock", std::process::id()));
+    std::fs::write(&socket, "").unwrap();
+    let mut app = App::new();
+    let mut world = World::new("proxied");
+    world.proxy_pid = Some(proxy.id());
+    world.proxy_socket_path = Some(socket.clone());
+    app.worlds.push(world);
+    app.quit_cleanup().await;
+    let status = proxy.wait().unwrap();
+    assert!(!status.success(), "the proxy was ended, not left to finish: {status}");
+    assert!(!socket.exists(), "its socket file is gone");
 }

@@ -843,25 +843,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output("Font settings are available in the web and GUI interfaces.");
         }
         Command::Quit => {
-            // Drain the archive writer before tearing anything down, so the last
-            // batch of output reaches disk rather than dying with the process.
-            app.flush_scrollback();
-            // Give the router its port back (no-op unless a UPnP mapping is held).
-            app.unmap_on_quit().await;
-            // Kill all TLS proxy processes before quitting
-            for world in &app.worlds {
-                #[cfg(unix)]
-                if let Some(proxy_pid) = world.proxy_pid {
-                    unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
-                }
-                #[cfg(windows)]
-                if let Some(proxy_pid) = world.proxy_pid {
-                    kill_proxy_process(proxy_pid);
-                }
-                if let Some(ref socket_path) = world.proxy_socket_path {
-                    let _ = std::fs::remove_file(socket_path);
-                }
-            }
+            app.quit_cleanup().await;
             return true; // Signal to quit
         }
         Command::Setup => {

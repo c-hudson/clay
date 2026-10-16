@@ -1581,19 +1581,20 @@ fn create_webview_window(
                 webviews.remove(&window_id);
                 forget_popup_window(&mut popup_windows, window_id, &webviews);
                 if window_id == main_window_id {
-                    // Same as WvEvent::Quit: hand back any UPnP mapping, then exit, which
-                    // drops every remaining window with the event loop.
-                    crate::portmap::unmap_active_blocking();
+                    // Same as WvEvent::Quit: /quit's cleanup in the Clay this GUI runs,
+                    // then exit, which drops every remaining window with the event loop.
+                    crate::quit_in_process_clay();
                     *control_flow = ControlFlow::Exit;
                 } else if windows.is_empty() {
                     *control_flow = ControlFlow::Exit;
                 }
             }
             Event::UserEvent(WvEvent::Quit) => {
-                // Give the router its port back before the process ends (no-op unless a
-                // UPnP mapping is held; the master GUI's App lives on the runtime thread,
-                // so this goes through portmap's process-wide record).
-                crate::portmap::unmap_active_blocking();
+                // What /quit does, before the process ends: the master GUI's App (on the
+                // runtime thread) flushes its archive, ends its TLS proxies and gives the
+                // router its port back. Attached to another Clay, only a UPnP mapping
+                // (none) is looked at.
+                crate::quit_in_process_clay();
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(WvEvent::SetOpacity(opacity)) => {
