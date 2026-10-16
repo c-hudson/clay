@@ -65,7 +65,7 @@ pub(crate) const VERSION: &str = "1.7.9";
 /// font sliders' `min` in the web client (app.js / index.html).
 pub(crate) const MIN_WEB_FONT_SIZE: f32 = 7.0;
 
-pub(crate) const ANDROID_APP_VERSION: &str = "1.7.8";
+pub(crate) const ANDROID_APP_VERSION: &str = "1.7.9";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
