@@ -1706,6 +1706,18 @@
         return lum > 0.4;
     }
 
+    // The GUI theme's name on the page (`body[data-gui-theme]`), for the few rules that
+    // belong to one theme rather than to its colours - Dark - New's phone nav bar keeps
+    // the original Dark buttons (style.css). Remembered, so an Android cold start, which
+    // paints from its cached colours before the server says which theme they are, starts
+    // with it too.
+    const GUI_THEME_KEY = 'clay-gui-theme';
+    function markGuiTheme(name) {
+        if (!name) return;
+        document.body.dataset.guiTheme = name;
+        try { localStorage.setItem(GUI_THEME_KEY, name); } catch (e) {}
+    }
+
     // Apply the theme's lightness to the page (style.css `body.theme-light`) and, in the
     // Android app, to the system bars around it. Call it after the theme variables have
     // been written (applyThemeColors, ThemeCssVarsUpdated), since it reads them back.
@@ -2345,6 +2357,10 @@
         // app writes its cached variables into the element only after the page has
         // loaded, so the element is also watched: whoever rewrites it, the lightness
         // follows.
+        try {
+            const cachedTheme = localStorage.getItem(GUI_THEME_KEY);
+            if (cachedTheme) document.body.dataset.guiTheme = cachedTheme;
+        } catch (e) {}
         applyThemeAppearance();
         const themeVarsEl = document.getElementById('theme-vars');
         if (themeVarsEl && window.MutationObserver) {
@@ -3924,6 +3940,7 @@
                     }
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
+                        markGuiTheme(guiTheme);
                     }
                     if (msg.settings.theme_colors_json) {
                         applyThemeColors(msg.settings.theme_colors_json);
@@ -4829,6 +4846,7 @@
                     }
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
+                        markGuiTheme(guiTheme);
                     }
                     if (msg.settings.theme_colors_json) {
                         applyThemeColors(msg.settings.theme_colors_json);

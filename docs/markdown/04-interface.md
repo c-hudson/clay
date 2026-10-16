@@ -128,7 +128,7 @@ Clay supports light and dark themes for both console and GUI:
 **GUI themes** (set in `/setup`; the web and GUI share them):
 - Dark (default): the original dark interface
 - Light: the original light interface
-- Dark - New: slate blues built from the separator bar's colour, with a warm orange accent and higher-contrast text
+- Dark - New: slate blues built from the separator bar's colour, with a warm orange accent and higher-contrast text. On a phone (the web page's phone layout and the Android app), the buttons and font slider in the row under the separator bar keep the original Dark theme's colours.
 - Light - New: a warm off-white interface with charcoal text and a terracotta accent
 
 Each is a `[theme:name]` section in `~/.clay/theme.dat` (`dark`, `light`, `dark-new`, `light-new`) and can be edited in the theme editor.
