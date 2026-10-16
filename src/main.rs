@@ -93,6 +93,9 @@ static STARTUP_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub static GUI_RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Flag set by HTTP server after successful bind — checked by GUI readiness wait
 pub static GUI_HTTP_READY: AtomicBool = AtomicBool::new(false);
+/// Why the GUI's in-process server didn't start (a bind or certificate failure), for the
+/// GUIs' start-up waits: they say so at once rather than waiting out their timeout.
+pub static GUI_HTTP_FAILED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Set by `--local-server` before startup. General "local-server mode is active" signal, used
 /// wherever headless-server behavior needs to differ from other headless modes (-D, --multiuser)
 /// or from interactive modes:
@@ -1441,12 +1444,40 @@ fn resolve_web_cert_files_multiuser(app: &mut App) -> Option<(String, String)> {
     resolve_web_cert_files_inner(app, false)
 }
 
+/// Why the user's own certificate and key can't serve (missing, unreadable, or - with
+/// rustls - not a certificate and key it can load), or `None` when they can.
+fn custom_cert_problem(cert: &str, key: &str) -> Option<String> {
+    for (what, path) in [("certificate", cert), ("key", key)] {
+        if let Err(e) = std::fs::metadata(path) {
+            return Some(match e.kind() {
+                std::io::ErrorKind::NotFound => format!("the {what} file {path} does not exist"),
+                _ => format!("the {what} file {path} can't be read: {e}"),
+            });
+        }
+    }
+    #[cfg(feature = "rustls-backend")]
+    if let Err(e) = crate::websocket::load_pem_cert_and_key(cert, key) {
+        return Some(e);
+    }
+    None
+}
+
 fn resolve_web_cert_files_inner(app: &mut App, persist: bool) -> Option<(String, String)> {
     let report = |app: &mut App, msg: &str| {
         if persist { app.add_output(msg) } else { println!("{}", msg) }
     };
     if !app.settings.websocket_cert_file.is_empty() && !app.settings.websocket_key_file.is_empty() {
-        return Some((app.settings.websocket_cert_file.clone(), app.settings.websocket_key_file.clone()));
+        let (cert, key) = (app.settings.websocket_cert_file.clone(), app.settings.websocket_key_file.clone());
+        match custom_cert_problem(&cert, &key) {
+            None => return Some((cert, key)),
+            // A custom certificate that's gone (or unreadable) used to stop the web
+            // server altogether: the console carried on without one, and the GUIs, which
+            // log in through it, never started ("did not come up ... within 10 seconds").
+            // Serve with Clay's own certificate instead, and say so.
+            Some(why) => report(app, &format!(
+                "Custom TLS certificate not used ({why}); using Clay's own certificate instead. Fix the files in /web, or set Custom Cert File to No."
+            )),
+        }
     }
 
     let cert_path = clay_config_path("cert.pem");
@@ -21479,11 +21510,13 @@ pub async fn run_app_headless(
                     }
                     Err(e) => {
                         app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
+                        *GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
                     }
                 }
             }
         } else {
             app.add_output("Warning: No TLS certificate available — web server not started.");
+            *GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = Some("no TLS certificate available for its web server".to_string());
         }
     }
 

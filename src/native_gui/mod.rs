@@ -126,12 +126,18 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
     };
     // Another Clay already there? (Not on a reload: the old process may hold the port
     // a moment longer, and the server's bind retries.)
+    // Both the loopback this window connects to and every interface, where the server
+    // listens: Windows lets a loopback bind succeed beside another program listening on
+    // all interfaces, so checking the loopback alone let a Clay already running through,
+    // to a server that couldn't bind and a ten-second wait for nothing.
     if !std::env::args().any(|a| a == "--reload") {
-        if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                fail(format!("Clay is already running (port {port} is in use). Only one Clay runs at a time; to attach to it: clay --gui=127.0.0.1:{port}"));
+        for host in ["127.0.0.1", "0.0.0.0"] {
+            if let Err(e) = std::net::TcpListener::bind((host, port)) {
+                if e.kind() == std::io::ErrorKind::AddrInUse {
+                    fail(crate::platform::port_in_use_message(port, &format!("clay --gui=127.0.0.1:{port}")));
+                }
+                fail(format!("Clay failed to start: could not bind port {port}: {e}"));
             }
-            fail(format!("Clay failed to start: could not bind port {port}: {e}"));
         }
     }
     let mut random = [0u8; 32];
@@ -144,15 +150,20 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
     let (to_app, from_gui) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
     std::mem::forget((from_app, to_app));
     crate::GUI_HTTP_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+    *crate::GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let session_password = password.clone();
     runtime.spawn(async move {
         let _ = crate::run_app_headless(to_gui, from_gui, Some(session_password), None, None).await;
     });
-    // Wait for the server to have its port (it sets GUI_HTTP_READY once bound).
+    // Wait for the server to have its port (it sets GUI_HTTP_READY once bound), or to
+    // say why it can't (GUI_HTTP_FAILED: the port taken after all, no certificate).
     let ready = tokio::task::block_in_place(|| {
         for _ in 0..100 {
             if crate::GUI_HTTP_READY.load(std::sync::atomic::Ordering::SeqCst) {
                 return true;
+            }
+            if let Some(why) = crate::GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                fail(format!("Clay failed to start: {why}"));
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

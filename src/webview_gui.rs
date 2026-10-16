@@ -464,20 +464,22 @@ pub fn run_master_webgui() -> io::Result<()> {
     // always-TLS-capable start_https_server — see SECURITY-ROADMAP.md D8); the
     // --reload flag is set on every reload exec regardless of platform, so use that.
     let is_reload = std::env::args().any(|a| a == "--reload");
+    // Both the loopback the WebView connects to and every interface, where the server
+    // listens: Windows lets a loopback bind succeed beside another program listening on
+    // all interfaces, so the loopback alone missed a Clay already running there.
     if !is_reload {
-        if let Err(e) = std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
-            let msg = if e.kind() == io::ErrorKind::AddrInUse {
-                format!(
-                    "Clay is already running (port {} is in use).\n\nOnly one instance of Clay can run at a time.",
-                    port
-                )
-            } else {
-                format!("Clay failed to start: could not bind port {}.\n\n{}", port, e)
-            };
-            show_error_dialog("Clay", &msg);
-            return Err(e);
+        for host in ["127.0.0.1", "0.0.0.0"] {
+            if let Err(e) = std::net::TcpListener::bind((host, port)) {
+                let msg = if e.kind() == io::ErrorKind::AddrInUse {
+                    crate::platform::port_in_use_message(port, &format!("clay --web-gui=127.0.0.1:{port}"))
+                } else {
+                    format!("Clay failed to start: could not bind port {}.\n\n{}", port, e)
+                };
+                show_error_dialog("Clay", &msg);
+                return Err(e);
+            }
         }
-        // Drop the test listener immediately — the real bind happens inside run_app_headless.
+        // Drop the test listeners immediately — the real bind happens inside run_app_headless.
     }
 
     // Random session password from the OS CSPRNG (the server listens on all
@@ -499,7 +501,8 @@ pub fn run_master_webgui() -> io::Result<()> {
     let (app_to_gui_tx, _app_to_gui_rx) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
     let (gui_to_app_tx, gui_to_app_rx) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
 
-    // Spawn the headless App with WS override
+    // Spawn the headless App with WS override (a failure to start it is reported fresh)
+    *crate::GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let ws_password = password.clone();
     handle.spawn(async move {
         if let Err(_e) = crate::run_app_headless(
@@ -519,6 +522,12 @@ pub fn run_master_webgui() -> io::Result<()> {
     let ws_ready = {
         let mut ready = false;
         for _ in 0..100 {
+            if let Some(why) = crate::GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let msg = format!("Clay failed to start: {why}");
+                show_error_dialog("Clay", &msg);
+                runtime.shutdown_background();
+                return Err(io::Error::other(msg));
+            }
             if crate::GUI_HTTP_READY.load(std::sync::atomic::Ordering::SeqCst) {
                 // Server has bound — give the accept loop a moment to start
                 std::thread::sleep(std::time::Duration::from_millis(200));

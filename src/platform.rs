@@ -532,6 +532,89 @@ pub(crate) fn not_inherited<S: std::os::windows::io::AsRawSocket>(socket: &S) {
 #[cfg(not(windows))]
 pub(crate) fn not_inherited<S>(_socket: &S) {}
 
+/// Which program is listening on TCP `port`, as "name.exe (PID n)", when Clay can tell:
+/// on Windows from `netstat -ano` and `tasklist`. Asked only after a bind failed with
+/// "address in use", so a message can name what holds the port. On Windows a loopback
+/// bind succeeds beside another program listening on all interfaces, so the GUIs' "is
+/// the port free?" check let a Clay already running through, and the only symptom was a
+/// server that never came up ("did not come up on port 9000 within 10 seconds").
+pub(crate) fn port_owner(port: u16) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let netstat = run_quietly("netstat", &["-ano", "-p", "TCP"])?;
+        let pid = listener_pid(&netstat, port)?;
+        let filter = format!("PID eq {pid}");
+        let name = run_quietly("tasklist", &["/fi", &filter, "/fo", "csv", "/nh"]).and_then(|t| tasklist_name(&t));
+        Some(match name {
+            Some(n) => format!("{n} (PID {pid})"),
+            None => format!("PID {pid}"),
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+        None
+    }
+}
+
+/// A Windows tool's output, read leniently: it prints in the console's code page, which
+/// isn't UTF-8 (German netstat says "ABHÖREN"), and it never opens a console window.
+#[cfg(windows)]
+fn run_quietly(cmd: &str, args: &[&str]) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// From `netstat -ano` output, the PID listening on `port`: a TCP row whose local address
+/// ends in `:port` and whose foreign address is the unconnected `0.0.0.0:0` / `[::]:0`
+/// (the state column is in the system's language, so it isn't read).
+#[cfg_attr(not(windows), allow(dead_code))] // Windows' port_owner, and the tests
+pub(crate) fn listener_pid(netstat: &str, port: u16) -> Option<u32> {
+    let suffix = format!(":{port}");
+    netstat.lines().find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let (proto, local, foreign) = (cols.first()?, cols.get(1)?, cols.get(2)?);
+        let unconnected = *foreign == "0.0.0.0:0" || *foreign == "[::]:0";
+        if proto.eq_ignore_ascii_case("TCP") && local.ends_with(&suffix) && unconnected {
+            cols.last()?.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// The image name from `tasklist /fo csv /nh` output: `"clay.exe","4808",...`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn tasklist_name(csv: &str) -> Option<String> {
+    let line = csv.lines().find(|l| l.starts_with('"'))?;
+    let name = line.trim_start_matches('"').split('"').next()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// What to tell someone whose Clay can't have its port: who has it, and what to do.
+/// `attach` is how this interface attaches to a Clay already running, offered only when
+/// it is (or may be) one.
+#[cfg_attr(not(any(feature = "native-gui", feature = "webview-gui")), allow(dead_code))] // the GUIs' start-up
+pub(crate) fn port_in_use_message(port: u16, attach: &str) -> String {
+    match port_owner(port) {
+        Some(owner) if owner.to_ascii_lowercase().starts_with("clay") => {
+            format!("Clay is already running: {owner} has port {port}. Only one Clay runs at a time. To attach to it: {attach}")
+        }
+        Some(owner) => format!(
+            "Clay can't have its web port {port}: {owner} is using it. Close that program, or give Clay another port (Web settings: /web in clay --console)."
+        ),
+        None => format!("Clay is already running (port {port} is in use). Only one Clay runs at a time. To attach to it: {attach}"),
+    }
+}
+
 /// Check if a process with the given PID is still alive
 #[cfg(all(unix, not(target_os = "android")))]
 pub(crate) fn is_process_alive(pid: u32) -> bool {
@@ -2075,6 +2158,23 @@ fn exec_relaunch_with_args(_args: Vec<String>, _use_gui: bool) -> io::Result<()>
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_listener_on_a_port_is_found_in_netstat_whatever_the_language() {
+        let netstat = "\r\nActive Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1032\r\n  TCP    127.0.0.1:59000        127.0.0.1:9000         ESTABLISHED     77\r\n  TCP    0.0.0.0:9000           0.0.0.0:0              LISTENING       4808\r\n";
+        assert_eq!(listener_pid(netstat, 9000), Some(4808));
+        // Not :19000, not a connection whose far end is 9000.
+        assert_eq!(listener_pid("  TCP    0.0.0.0:19000   0.0.0.0:0   LISTENING   5\n  TCP    10.0.0.2:5000   10.0.0.9:9000   ESTABLISHED   6\n", 9000), None);
+        // The state column in another language, and IPv6.
+        assert_eq!(listener_pid("  TCP    [::]:9000   [::]:0   ABH\u{fffd}REN   812\n", 9000), Some(812));
+    }
+
+    #[test]
+    fn tasklist_csv_gives_the_image_name() {
+        assert_eq!(tasklist_name("\"clay.exe\",\"4808\",\"Console\",\"1\",\"15,452 K\"\r\n").as_deref(), Some("clay.exe"));
+        assert_eq!(tasklist_name("INFO: No tasks are running which match the specified criteria.\r\n"), None);
+    }
+
     use super::*;
     use serde_json::json;
 

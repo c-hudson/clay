@@ -19786,3 +19786,30 @@ third
             Ok((tx, None, false, None, None)));
         assert!(rx.try_recv().is_err(), "no login with -l");
     }
+
+#[test]
+fn a_custom_certificate_that_cannot_serve_is_named_and_clays_own_serves_instead() {
+    let dir = std::env::temp_dir().join(format!("clay-custom-cert-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = |name: &str| dir.join(name).to_string_lossy().to_string();
+    let (cert, key) = (path("c.pem"), path("k.pem"));
+    // Gone (settings from an old install pointed at ~/clay.cert.pem, long deleted).
+    let why = custom_cert_problem(&cert, &key).expect("a missing file is a problem");
+    assert!(why.contains("c.pem") && why.contains("does not exist"), "the message names the file: {why}");
+    // There, but not a certificate and key.
+    std::fs::write(&cert, "not a certificate").unwrap();
+    std::fs::write(&key, "not a key").unwrap();
+    assert!(custom_cert_problem(&cert, &key).is_some());
+    // A real pair serves.
+    generate_self_signed_cert(std::path::Path::new(&cert), std::path::Path::new(&key)).unwrap();
+    assert_eq!(custom_cert_problem(&cert, &key), None);
+    // A pair that's gone: Clay's own certificate instead, rather than no web server.
+    let mut app = App::new();
+    app.settings.websocket_cert_file = path("gone.pem");
+    app.settings.websocket_key_file = path("gone-key.pem");
+    let (own_cert, own_key) = resolve_web_cert_files_multiuser(&mut app).expect("Clay's own certificate");
+    assert!(own_cert.ends_with("cert.pem") && own_key.ends_with("key.pem"), "{own_cert} {own_key}");
+    assert_eq!(custom_cert_problem(&own_cert, &own_key), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

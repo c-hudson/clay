@@ -1224,7 +1224,7 @@ pub async fn start_https_server(
         }
         match bound {
             Some(l) => l,
-            None => return Err(format!("Failed to bind HTTPS to port {}: {}", server.port, last_err.unwrap()).into()),
+            None => return Err(bind_failure("HTTPS", server.port, last_err.as_ref()).into()),
         }
     };
 
@@ -1391,7 +1391,7 @@ pub async fn start_https_server(
         }
         match bound {
             Some(l) => l,
-            None => return Err(format!("Failed to bind HTTPS to port {}: {}", server.port, last_err.unwrap()).into()),
+            None => return Err(bind_failure("HTTPS", server.port, last_err.as_ref()).into()),
         }
     };
 
@@ -1696,6 +1696,21 @@ impl HttpServer {
 
 /// Host to bind the HTTP+WS listener to. Loopback-only when running as `--local-server`
 /// (`LOCAL_SERVER_LOOPBACK_ONLY`), otherwise all interfaces as before.
+/// Why the server couldn't have its port. When another program holds it, say which
+/// (`platform::port_owner`): Windows lets a loopback bind succeed beside a program
+/// listening on all interfaces, so the GUIs' own check can miss it, and this message -
+/// in the console's output, or the GUI's "Clay failed to start" - is where it shows.
+pub(crate) fn bind_failure(what: &str, port: u16, err: Option<&std::io::Error>) -> String {
+    match err {
+        Some(e) if e.kind() == std::io::ErrorKind::AddrInUse => match crate::platform::port_owner(port) {
+            Some(owner) => format!("Failed to bind {what} to port {port}: it is in use by {owner}"),
+            None => format!("Failed to bind {what} to port {port}: it is in use by another program ({e})"),
+        },
+        Some(e) => format!("Failed to bind {what} to port {port}: {e}"),
+        None => format!("Failed to bind {what} to port {port}"),
+    }
+}
+
 fn http_bind_host() -> &'static str {
     if crate::LOCAL_SERVER_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
         "127.0.0.1"
@@ -1745,7 +1760,7 @@ pub async fn start_http_server(
         }
         match bound {
             Some(l) => l,
-            None => return Err(format!("Failed to bind HTTP to port {}: {}", server.port, last_err.unwrap()).into()),
+            None => return Err(bind_failure("HTTP", server.port, last_err.as_ref()).into()),
         }
     };
 
