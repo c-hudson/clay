@@ -54,7 +54,7 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-pub(crate) const VERSION: &str = "1.7.9";
+pub(crate) const VERSION: &str = "1.7.10";
 /// The minimum Android app version this server considers fully compatible: the last
 /// release in which the Android app itself changed (the bundled web client in `src/web/`,
 /// or the native app in `android/app/`). `/release` sets it to the new `VERSION` exactly
@@ -66,7 +66,7 @@ pub(crate) const VERSION: &str = "1.7.9";
 /// font sliders' `min` in the web client (app.js / index.html).
 pub(crate) const MIN_WEB_FONT_SIZE: f32 = 7.0;
 
-pub(crate) const ANDROID_APP_VERSION: &str = "1.7.9";
+pub(crate) const ANDROID_APP_VERSION: &str = "1.7.10";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
