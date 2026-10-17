@@ -295,6 +295,10 @@ pub struct ClientCore {
     /// The server takes `OtherViews` (its `InitialState` says so); an older one would
     /// close the connection on it.
     server_takes_other_views: bool,
+    /// The server takes `ExpandLine` (`InitialState.expand_line`).
+    pub server_expands_line: bool,
+    /// The server takes `PictureUpload` (`InitialState.picture_upload`): Import Picture.
+    pub server_picture_upload: bool,
     requests: HashMap<u64, (RequestKind, usize, Instant)>,
     next_request_id: u64,
     backfill_at: Option<Instant>,
@@ -348,6 +352,8 @@ impl ClientCore {
             resume_sent: HashMap::new(),
             other_views: Vec::new(),
             server_takes_other_views: false,
+            server_expands_line: false,
+            server_picture_upload: false,
             requests: HashMap::new(),
             next_request_id: 1,
             backfill_at: None,
@@ -1018,8 +1024,10 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, .. } => {
                 self.server_takes_other_views = other_views;
+                self.server_expands_line = expand_line;
+                self.server_picture_upload = picture_upload;
                 self.initial_states += 1;
                 self.actions = actions;
                 self.splash_lines = splash_lines;
@@ -2025,6 +2033,8 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         keyboard_always_visible: s.keyboard_always_visible,
         tabs: s.tabs.clone(),
         icon_bar: s.icon_bar.clone(),
+        // Empty: a server from before Import Picture sent none.
+        picture_host: (!s.picture_host.is_empty()).then(|| s.picture_host.clone()),
     }
 }
 

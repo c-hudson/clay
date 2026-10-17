@@ -231,6 +231,10 @@ fn is_false(v: &bool) -> bool { !v }
 fn is_true(v: &bool) -> bool { *v }
 
 /// WebSocket protocol messages for client-server communication
+// InitialState (it carries the whole GlobalSettingsMsg) is the largest by far. A message
+// is built, serialized and dropped one at a time, so its size costs nothing worth boxing
+// the settings at every construction site for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum WsMessage {
@@ -408,6 +412,15 @@ pub enum WsMessage {
         /// connected. `serde(default)` = false.
         #[serde(default)]
         other_views: bool,
+        /// `true` = this server takes `ExpandLine` (TF's expand_line key for a client: the
+        /// variables are the server's). Gated as `other_views` is. `serde(default)` = false.
+        #[serde(default)]
+        expand_line: bool,
+        /// `true` = this server takes `PictureUpload` (Import Picture: the server uploads
+        /// the picture to the Settings' picture host). Gated as `other_views` is; a
+        /// multiuser server says false. `serde(default)` = false.
+        #[serde(default)]
+        picture_upload: bool,
         /// The emoji picker's curated table, in the compact wire form
         /// `[[ch, name, "kw1 kw2", category_index], ...]` from `emoji::emoji_json()`. The
         /// table is static, so it is sent once per connection here rather than on every
@@ -589,7 +602,9 @@ pub enum WsMessage {
     /// `key_<name>` macro) and executes the result in this client's own context — output
     /// comes back like any typed command. A `key` with no such binding (stale client-side
     /// cache, race with an `/unbind`) is ignored silently, never an error.
-    RunKeyBinding { key: String, #[serde(default)] kbnum: Option<i64> },
+    /// `input`: the client's input line and cursor when the key was pressed, which the
+    /// binding's kb* functions read (TF's keyboard buffer). `None` from an older client.
+    RunKeyBinding { key: String, #[serde(default)] kbnum: Option<i64>, #[serde(default)] input: Option<InputSnapshot> },
     SwitchWorld { world_index: usize },
     ConnectWorld { world_index: usize },
     /// Server -> client: a MUD world's TLS certificate no longer matches the
@@ -833,6 +848,10 @@ pub enum WsMessage {
         tabs: String,
         #[serde(default)]
         icon_bar: String,
+        /// Import Picture's host (`picture::PictureService` value). `None` (an older client,
+        /// which doesn't know it) = unchanged: a save from it must not reset the setting.
+        #[serde(default)]
+        picture_host: Option<String>,
     },
 
     // Settings update confirmations (server -> client)
@@ -1103,6 +1122,58 @@ pub enum WsMessage {
     // interpreted, only framed back into an MCP `-set` message (see
     // mcp::McpState::build_simpleedit_set).
     McpEditSet { world_index: usize, reference: String, edit_type: String, content: String },
+
+    // `/note <file>` from a client: the file is on the main instance's machine (user ruling
+    // 2026-10-16), so the server reads it and sends it to the client that asked, which
+    // edits it in its note editor and sends it back. A client sends SaveFile only for a
+    // FileEditorState it was sent - an older server never sends one, so it never gets a
+    // SaveFile it can't parse.
+    // (server -> client)
+    FileEditorState { path: String, content: String },
+    // (client -> server)
+    SaveFile { path: String, content: String },
+    // (server -> client) the answer to SaveFile.
+    FileSaved { path: String, ok: bool, #[serde(default)] error: Option<String> },
+    // (server -> client) an `/import` that ran on the server (an action, a macro): open the
+    // Import dialog with the address filled in; the password is typed there, client-side.
+    // A message of its own rather than a bounced `/import`: an older client sends a bounced
+    // command it doesn't know back to the server, which would bounce it again.
+    OpenImport { addr: String },
+    // (client -> server) TF's expand_line key: `text` (the client's input line) with the
+    // server's TF variables substituted, answered with SetInputBuffer. Sent only to a server
+    // whose InitialState.expand_line says it takes it.
+    ExpandLine { text: String },
+    // (client -> server) Import Picture: one chunk of a picture for the server to upload to
+    // its picture host (src/picture.rs). `data` is base64 of at most picture::CHUNK_BYTES;
+    // chunks go in order from offset 0, the last one says so. Sent only to a server whose
+    // InitialState.picture_upload says it takes it.
+    PictureUpload { id: u64, name: String, size: u64, offset: u64, data: String, last: bool },
+    // (server -> client) This many bytes of upload `id` have arrived (one per chunk; the
+    // client keeps picture::ACK_WINDOW chunks unacknowledged).
+    PictureUploadAck { id: u64, received: u64 },
+    // (server -> client) Upload `id` is done: the link (shortened when the setting says),
+    // or why not.
+    PictureUploaded {
+        id: u64,
+        #[serde(default)] url: Option<String>,
+        #[serde(default)] error: Option<String>,
+    },
+    // (server -> client) What a TF command this client ran (`/input`, `/grab`, `/dokey`,
+    // the kb* functions) does to ITS input line, in order - as the console applies them to
+    // its own. They used to be queued for the console, which applied them on its next
+    // command: a web user's /grab edited the console's input line.
+    InputOps { ops: Vec<InputOp> },
+    // (server -> client) TF's /xtitle run by this client: its window's (or terminal's) title.
+    SetTitle { title: String },
+    // (server -> client) TF's /limit, /unlimit, /relimit run by this client: its own output
+    // filter (F4). `action`: "apply", "clear" or "reapply"; `style`: TF's match style name.
+    LimitOp {
+        action: String,
+        #[serde(default)] pattern: String,
+        #[serde(default)] invert: bool,
+        #[serde(default)] attrs_only: bool,
+        #[serde(default)] style: String,
+    },
 
     // Keepalive
     Ping,
@@ -1846,6 +1917,10 @@ pub struct GlobalSettingsMsg {
     /// web/GUI/Android only — see IconBarMode.
     #[serde(default)]
     pub icon_bar: String,
+    /// Import Picture's host (`picture::PictureService` value; "off" = no uploads).
+    /// Empty = a server from before Import Picture.
+    #[serde(default)]
+    pub picture_host: String,
     /// Theme colors from ~/.clay/theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
@@ -1958,6 +2033,42 @@ fn default_keyboard_always_visible() -> bool {
 }
 
 /// Type of remote client connected via WebSocket
+/// A client's input line, for the server's TF keyboard functions (`RunKeyBinding.input`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputSnapshot {
+    pub buffer: String,
+    /// The cursor, in characters.
+    pub cursor: usize,
+}
+
+impl InputSnapshot {
+    /// TF's keyboard buffer for it, its cursor a byte offset as the console's is.
+    pub fn keyboard_state(self) -> crate::tf::KeyboardBufferState {
+        let cursor_position = self.buffer.char_indices().nth(self.cursor).map_or(self.buffer.len(), |(b, _)| b);
+        crate::tf::KeyboardBufferState { buffer: self.buffer, cursor_position }
+    }
+}
+
+/// One step a TF command (`/input`, `/grab`, `/dokey`, the kb* functions) takes on the input
+/// line of the client that ran it (`WsMessage::InputOps`), as the console applies a
+/// `tf::PendingKeyboardOp` to its own. Positions and counts are in characters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum InputOp {
+    /// The cursor to this position.
+    Goto { pos: usize },
+    /// Delete `count` characters after the cursor (before it, if negative).
+    Delete { count: i32 },
+    WordLeft,
+    WordRight,
+    /// Insert `text` at the cursor; `insert` false = overwrite (TF's `%insert` off).
+    Insert { text: String, insert: bool },
+    /// A `/dokey`: run this key action (`keybindings::ACTIONS` id).
+    Action { id: String },
+    /// `/dokey NEWLINE`: send the input line, as Enter does.
+    Submit,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(Default)]
 pub enum RemoteClientType {

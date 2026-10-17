@@ -3925,3 +3925,9 @@ body.device-phone .help-ref-table td:first-child {
 .reach-good { color: var(--theme-success); }
 .reach-bad { color: var(--theme-error); }
 .reach-copy { padding: 2px 8px; font-size: 0.85em; }
+
+/* Import Picture: files dragged over the page (app.js picture-drag). */
+body.picture-drag #output-container {
+    outline: 2px dashed var(--accent-color);
+    outline-offset: -4px;
+}

@@ -28,7 +28,22 @@ pub(crate) fn save_editor_content(app: &mut App) -> KeyAction {
         // user's own edited text - untrusted server-supplied text never reaches this
         // path at all except as the starting buffer, and `reference` is echoed back
         // verbatim, never interpreted.
-        if ctx.world_index < app.worlds.len() {
+        if !app.is_master {
+            // A remote console: the MCP session is the server's, so the text goes back to
+            // it. Not sent (the connection's writer is gone): the editor stays open.
+            let msg = WsMessage::McpEditSet {
+                world_index: ctx.world_index,
+                reference: ctx.reference.clone(),
+                edit_type: ctx.edit_type.as_str().to_string(),
+                content: app.editor.buffer.clone(),
+            };
+            let sent = app.ws_client_tx.as_ref().is_some_and(|tx| tx.send(msg).is_ok());
+            if !sent {
+                app.add_output("Not connected - not sent.");
+                return KeyAction::None;
+            }
+            app.add_output("Sent.");
+        } else if ctx.world_index < app.worlds.len() {
             let content = app.editor.buffer.clone();
             match app.worlds[ctx.world_index].mcp.build_simpleedit_set(&ctx.reference, ctx.edit_type, &content) {
                 Some(lines) => {
@@ -42,6 +57,16 @@ pub(crate) fn save_editor_content(app: &mut App) -> KeyAction {
                 }
             }
         }
+    } else if let Some(path) = app.editor.server_file.clone() {
+        // A file on the main instance's machine (a remote console's `/note <file>`): it
+        // goes back to the server, and the editor closes when the server says it is saved
+        // (`FileSaved`). Not sent: the editor stays open with the edits.
+        let msg = WsMessage::SaveFile { path, content: app.editor.buffer.clone() };
+        let sent = app.ws_client_tx.as_ref().is_some_and(|tx| tx.send(msg).is_ok());
+        if !sent {
+            app.add_output("Not connected - not saved.");
+        }
+        return KeyAction::None;
     } else if let Some(ref path) = app.editor.file_path {
         // Save to file
         match std::fs::write(path, &app.editor.buffer) {
@@ -53,6 +78,20 @@ pub(crate) fn save_editor_content(app: &mut App) -> KeyAction {
                 return KeyAction::None; // Don't close on error
             }
         }
+    } else if let Some(world_idx) = app.editor.world_index.filter(|_| !app.is_master) {
+        // A remote console: the notes are the server's (App::open_notes_editor fetched
+        // them), so they go back to it. Its connection's writer gone, nothing was sent:
+        // the editor stays open with the edits.
+        let notes = app.editor.buffer.clone();
+        let sent = app.ws_client_tx.as_ref().is_some_and(|tx| tx.send(WsMessage::UpdateNote { world_index: world_idx, notes: notes.clone() }).is_ok());
+        if !sent {
+            app.add_output("Not connected - notes not saved.");
+            return KeyAction::None;
+        }
+        if let Some(world) = app.worlds.get_mut(world_idx) {
+            world.settings.notes = notes;
+        }
+        app.add_output("Notes saved.");
     } else if let Some(world_idx) = app.editor.world_index {
         // Save to world notes
         if world_idx < app.worlds.len() {
@@ -71,6 +110,90 @@ pub(crate) fn save_editor_content(app: &mut App) -> KeyAction {
     app.needs_output_redraw = true;
     app.needs_terminal_clear = true;
     KeyAction::None
+}
+
+/// The F5 Search History popup's keys, for both consoles (the remote console had none).
+pub(crate) fn handle_search_popup_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::F(5) => {
+            app.search_popup.close();
+            let w = app.current_world_mut();
+            w.search_active = false;
+            w.scroll_to_bottom();
+            app.needs_output_redraw = true;
+        }
+        KeyCode::Enter => {
+            let output_lines = app.current_world().output_lines.clone();
+            let show_tags = app.show_tags;
+            // Re-update in case lines changed
+            app.search_popup.update_search(&output_lines, show_tags);
+            if let Some(line_idx) = app.search_popup.advance() {
+                app.current_world_mut().scroll_offset = line_idx;
+                app.needs_output_redraw = true;
+            }
+        }
+        KeyCode::Backspace => {
+            if app.search_popup.cursor > 0 {
+                app.search_popup.cursor -= 1;
+                app.search_popup.search_text.remove(app.search_popup.cursor);
+                let output_lines = app.current_world().output_lines.clone();
+                let show_tags = app.show_tags;
+                app.search_popup.update_search(&output_lines, show_tags);
+                if let Some(line_idx) = app.search_popup.current_match_line() {
+                    app.current_world_mut().scroll_offset = line_idx;
+                }
+                app.needs_output_redraw = true;
+            }
+        }
+        KeyCode::Delete => {
+            if app.search_popup.cursor < app.search_popup.search_text.len() {
+                app.search_popup.search_text.remove(app.search_popup.cursor);
+                let output_lines = app.current_world().output_lines.clone();
+                let show_tags = app.show_tags;
+                app.search_popup.update_search(&output_lines, show_tags);
+                if let Some(line_idx) = app.search_popup.current_match_line() {
+                    app.current_world_mut().scroll_offset = line_idx;
+                }
+                app.needs_output_redraw = true;
+            }
+        }
+        KeyCode::Up => {
+            if let Some(line_idx) = app.search_popup.advance() {
+                app.current_world_mut().scroll_offset = line_idx;
+                app.needs_output_redraw = true;
+            }
+        }
+        KeyCode::Down => {
+            if let Some(line_idx) = app.search_popup.retreat() {
+                app.current_world_mut().scroll_offset = line_idx;
+                app.needs_output_redraw = true;
+            }
+        }
+        KeyCode::Left => {
+            if app.search_popup.cursor > 0 {
+                app.search_popup.cursor -= 1;
+            }
+        }
+        KeyCode::Right => {
+            if app.search_popup.cursor < app.search_popup.search_text.len() {
+                app.search_popup.cursor += 1;
+            }
+        }
+        KeyCode::Home => { app.search_popup.cursor = 0; }
+        KeyCode::End => { app.search_popup.cursor = app.search_popup.search_text.len(); }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.search_popup.search_text.insert(app.search_popup.cursor, c);
+            app.search_popup.cursor += 1;
+            let output_lines = app.current_world().output_lines.clone();
+            let show_tags = app.show_tags;
+            app.search_popup.update_search(&output_lines, show_tags);
+            if let Some(line_idx) = app.search_popup.current_match_line() {
+                app.current_world_mut().scroll_offset = line_idx;
+            }
+            app.needs_output_redraw = true;
+        }
+        _ => {}
+    }
 }
 
 pub(crate) enum KeyAction {
@@ -328,7 +451,158 @@ pub(crate) fn handle_popup_mouse_highlight_end(app: &mut App) {
     }
 }
 
+/// The split-screen editor's keys (`/note`, `/note <file>`, an MCP edit), for the console
+/// and the remote console alike: both ask here after a confirm dialog and before popups.
+/// `None`: not the editor's key - it isn't open, or the input line has the focus.
+pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) -> Option<KeyAction> {
+    if !app.editor.visible {
+        return None;
+    }
+    // Ctrl+Space toggles focus between editor and input
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(' ') {
+        app.editor.toggle_focus();
+        return Some(KeyAction::None);
+    }
+
+    // When editor is focused, handle editor keys
+    if app.editor.focus == EditorFocus::Editor {
+        match key.code {
+            KeyCode::Esc => {
+                // Close editor without saving
+                app.editor.close();
+                app.needs_output_redraw = true;
+                app.needs_terminal_clear = true;
+                return Some(KeyAction::None);
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Save and close
+                return Some(save_editor_content(app));
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                // Just 'S' key - check if at start of buffer (for shortcut)
+                // Actually, we want S anywhere to be a shortcut when not typing
+                // Let's make S work as a shortcut only without any modifiers
+                // But we should insert 's' when typing... let's just use Ctrl+S
+                // Insert the character
+                app.editor.insert_char('s');
+                return Some(KeyAction::None);
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                // Insert the character
+                app.editor.insert_char(if key.code == KeyCode::Char('C') { 'C' } else { 'c' });
+                return Some(KeyAction::None);
+            }
+            KeyCode::Up => {
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.cursor_up(editor_width);
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::Down => {
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.cursor_down(editor_width);
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::Left => {
+                app.editor.cursor_left();
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::Right => {
+                app.editor.cursor_right();
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::Home => {
+                app.editor.cursor_home();
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::End => {
+                app.editor.cursor_end();
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::PageUp => {
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.page_up(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::PageDown => {
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.page_down(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::Enter => {
+                app.editor.insert_char('\n');
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::Backspace => {
+                app.editor.delete_backward();
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::Delete => {
+                app.editor.delete_forward();
+                return Some(KeyAction::None);
+            }
+            KeyCode::Tab => {
+                // Insert 4 spaces for tab
+                for _ in 0..4 {
+                    app.editor.insert_char(' ');
+                }
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            KeyCode::Char(c) => {
+                // Insert character
+                let ch = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                app.editor.insert_char(ch);
+                let visible_lines = app.output_height.saturating_sub(2) as usize;
+                let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                return Some(KeyAction::None);
+            }
+            _ => {}
+        }
+        return Some(KeyAction::None);
+    }
+    // The input line has the focus: its keys are handled as usual.
+    None
+}
+
 pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
+    // Import Picture: the separate trailing space of a drop the terminal typed belongs to
+    // the drop (src/picture.rs DropSniffer) - before any popup could take it as a press.
+    let plain_space = key.code == KeyCode::Char(' ') && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if app.drop_sniffer.swallow(plain_space, std::time::Instant::now()) {
+        return KeyAction::None;
+    }
+    app.drop_sniffer.begin_key();
 
     // Handle confirm dialog first (highest priority)
     if app.confirm_dialog.visible {
@@ -357,141 +631,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     }
 
     // Handle split-screen editor (before popups, after confirm dialog)
-    if app.editor.visible {
-        // Ctrl+Space toggles focus between editor and input
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(' ') {
-            app.editor.toggle_focus();
-            return KeyAction::None;
-        }
-
-        // When editor is focused, handle editor keys
-        if app.editor.focus == EditorFocus::Editor {
-            match key.code {
-                KeyCode::Esc => {
-                    // Close editor without saving
-                    app.editor.close();
-                    app.needs_output_redraw = true;
-                    app.needs_terminal_clear = true;
-                    return KeyAction::None;
-                }
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Save and close
-                    return save_editor_content(app);
-                }
-                KeyCode::Char('s') | KeyCode::Char('S') if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
-                    // Just 'S' key - check if at start of buffer (for shortcut)
-                    // Actually, we want S anywhere to be a shortcut when not typing
-                    // Let's make S work as a shortcut only without any modifiers
-                    // But we should insert 's' when typing... let's just use Ctrl+S
-                    // Insert the character
-                    app.editor.insert_char('s');
-                    return KeyAction::None;
-                }
-                KeyCode::Char('c') | KeyCode::Char('C') if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
-                    // Insert the character
-                    app.editor.insert_char(if key.code == KeyCode::Char('C') { 'C' } else { 'c' });
-                    return KeyAction::None;
-                }
-                KeyCode::Up => {
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.cursor_up(editor_width);
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::Down => {
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.cursor_down(editor_width);
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::Left => {
-                    app.editor.cursor_left();
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::Right => {
-                    app.editor.cursor_right();
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::Home => {
-                    app.editor.cursor_home();
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::End => {
-                    app.editor.cursor_end();
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::PageUp => {
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.page_up(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::PageDown => {
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.page_down(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::Enter => {
-                    app.editor.insert_char('\n');
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::Backspace => {
-                    app.editor.delete_backward();
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::Delete => {
-                    app.editor.delete_forward();
-                    return KeyAction::None;
-                }
-                KeyCode::Tab => {
-                    // Insert 4 spaces for tab
-                    for _ in 0..4 {
-                        app.editor.insert_char(' ');
-                    }
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                KeyCode::Char(c) => {
-                    // Insert character
-                    let ch = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        c.to_ascii_uppercase()
-                    } else {
-                        c
-                    };
-                    app.editor.insert_char(ch);
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
-                    return KeyAction::None;
-                }
-                _ => {}
-            }
-            return KeyAction::None;
-        }
-        // When input is focused, fall through to normal input handling below
+    if let Some(action) = handle_editor_key(app, key) {
+        return action;
     }
 
     // Handle new unified popup system (help popup and others)
@@ -576,6 +717,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 } else if data.contains_key(popup::definitions::confirm::IMPORT_RELOAD_OFFER) {
                     // Post-import "reload now?" offer confirmed.
                     return KeyAction::Reload;
+                } else if data.contains_key(popup::definitions::confirm::PICTURE_UPLOAD) {
+                    app.picture_drop_answered(true);
                 }
             }
             NewPopupAction::ConfirmCancelled(data) => {
@@ -589,6 +732,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.add_output("Import cancelled.");
                 } else if data.contains_key(popup::definitions::confirm::IMPORT_RELOAD_OFFER) {
                     app.add_output("Settings imported and saved — run /reload later to fully apply.");
+                } else if data.contains_key(popup::definitions::confirm::PICTURE_UPLOAD) {
+                    app.picture_drop_answered(false);
                 }
             }
             NewPopupAction::WorldSelector(action) => {
@@ -636,35 +781,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
             }
-            NewPopupAction::WorldSelectorFilter => {
-                // Filter changed - update the world list
-                use popup::definitions::world_selector::SELECTOR_FIELD_FILTER;
-                if let Some(state) = app.popup_manager.current_mut() {
-                    // Use edit_buffer if currently editing, otherwise use field value
-                    let filter_text = if state.editing && state.is_field_selected(SELECTOR_FIELD_FILTER) {
-                        state.edit_buffer.clone()
-                    } else {
-                        state.get_text(SELECTOR_FIELD_FILTER).unwrap_or("").to_string()
-                    };
-                    // Build world info list
-                    let all_worlds: Vec<popup::definitions::world_selector::WorldInfo> = app.worlds
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, w)| popup::definitions::world_selector::WorldInfo {
-                            name: w.name.clone(),
-                            hostname: w.settings.hostname.clone(),
-                            port: w.settings.port.to_string(),
-                            user: w.settings.user.clone(),
-                            is_connected: w.connected,
-                            is_current: idx == app.current_world_index,
-                        })
-                        .collect();
-                    // Apply filter
-                    let filtered = popup::definitions::world_selector::filter_worlds(&all_worlds, &filter_text);
-                    // Update the list in the popup state
-                    popup::definitions::world_selector::update_world_list(state, &filtered);
-                }
-            }
+            NewPopupAction::WorldSelectorFilter => app.refilter_world_selector(),
             NewPopupAction::SetupSaved(settings) => {
                 // Apply saved settings
                 app.settings.more_mode_enabled = settings.more_mode;
@@ -698,6 +815,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.keyboard_always_visible = settings.keyboard_always_visible;
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
+                app.settings.picture_host = crate::picture::PictureService::from_name(&settings.picture_host);
                 let old_tts_mode = app.settings.tts_mode;
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.note_kokoro_selected(old_tts_mode);
@@ -1059,9 +1177,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 match action {
                     NotesListAction::Open(name) => {
                         if let Some(idx) = app.find_world(&name) {
-                            let notes = app.worlds[idx].settings.notes.clone();
-                            app.editor.open_notes(idx, &notes);
-                            app.needs_terminal_clear = true;
+                            app.open_notes_editor(idx);
                         }
                     }
                 }
@@ -1179,86 +1295,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
     // Handle search popup (F5) input
     if app.search_popup.visible {
-        match key.code {
-            KeyCode::Esc | KeyCode::F(5) => {
-                app.search_popup.close();
-                let w = app.current_world_mut();
-                w.search_active = false;
-                w.scroll_to_bottom();
-                app.needs_output_redraw = true;
-            }
-            KeyCode::Enter => {
-                let output_lines = app.current_world().output_lines.clone();
-                let show_tags = app.show_tags;
-                // Re-update in case lines changed
-                app.search_popup.update_search(&output_lines, show_tags);
-                if let Some(line_idx) = app.search_popup.advance() {
-                    app.current_world_mut().scroll_offset = line_idx;
-                    app.needs_output_redraw = true;
-                }
-            }
-            KeyCode::Backspace => {
-                if app.search_popup.cursor > 0 {
-                    app.search_popup.cursor -= 1;
-                    app.search_popup.search_text.remove(app.search_popup.cursor);
-                    let output_lines = app.current_world().output_lines.clone();
-                    let show_tags = app.show_tags;
-                    app.search_popup.update_search(&output_lines, show_tags);
-                    if let Some(line_idx) = app.search_popup.current_match_line() {
-                        app.current_world_mut().scroll_offset = line_idx;
-                    }
-                    app.needs_output_redraw = true;
-                }
-            }
-            KeyCode::Delete => {
-                if app.search_popup.cursor < app.search_popup.search_text.len() {
-                    app.search_popup.search_text.remove(app.search_popup.cursor);
-                    let output_lines = app.current_world().output_lines.clone();
-                    let show_tags = app.show_tags;
-                    app.search_popup.update_search(&output_lines, show_tags);
-                    if let Some(line_idx) = app.search_popup.current_match_line() {
-                        app.current_world_mut().scroll_offset = line_idx;
-                    }
-                    app.needs_output_redraw = true;
-                }
-            }
-            KeyCode::Up => {
-                if let Some(line_idx) = app.search_popup.advance() {
-                    app.current_world_mut().scroll_offset = line_idx;
-                    app.needs_output_redraw = true;
-                }
-            }
-            KeyCode::Down => {
-                if let Some(line_idx) = app.search_popup.retreat() {
-                    app.current_world_mut().scroll_offset = line_idx;
-                    app.needs_output_redraw = true;
-                }
-            }
-            KeyCode::Left => {
-                if app.search_popup.cursor > 0 {
-                    app.search_popup.cursor -= 1;
-                }
-            }
-            KeyCode::Right => {
-                if app.search_popup.cursor < app.search_popup.search_text.len() {
-                    app.search_popup.cursor += 1;
-                }
-            }
-            KeyCode::Home => { app.search_popup.cursor = 0; }
-            KeyCode::End => { app.search_popup.cursor = app.search_popup.search_text.len(); }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.search_popup.search_text.insert(app.search_popup.cursor, c);
-                app.search_popup.cursor += 1;
-                let output_lines = app.current_world().output_lines.clone();
-                let show_tags = app.show_tags;
-                app.search_popup.update_search(&output_lines, show_tags);
-                if let Some(line_idx) = app.search_popup.current_match_line() {
-                    app.current_world_mut().scroll_offset = line_idx;
-                }
-                app.needs_output_redraw = true;
-            }
-            _ => {}
-        }
+        handle_search_popup_key(app, key);
         return KeyAction::None;
     }
 
@@ -1389,8 +1426,14 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             if !c.is_whitespace() && !matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}') {
                 app.skip_temp_conversion = None;
             }
+            let at = app.input.cursor_position;
+            let insert_mode = app.input.insert;
             app.input.insert_char(c);
             app.last_input_was_delete = false;
+            // A drop the terminal types arrives here a character at a time (Import Picture).
+            if insert_mode && !app.settings.picture_host.is_off() {
+                app.drop_sniffer.typed(at, c);
+            }
             return KeyAction::None;
         }
     }
@@ -1449,6 +1492,19 @@ fn sanitize_paste(text: &str, keep_newlines: bool) -> String {
 /// as synthetic keystrokes (as the old `Event::Paste` arm did for popups), so a
 /// paste can't be misinterpreted as button hotkeys and doesn't lose embedded
 /// newlines.
+/// A paste into the split-screen editor, if it is open with the focus (the console's
+/// `handle_paste` and the remote console's paste both ask). False: not the editor's.
+pub(crate) fn paste_into_editor(app: &mut App, text: &str) -> bool {
+    if !(app.editor.visible && app.editor.focus == EditorFocus::Editor) {
+        return false;
+    }
+    app.editor.insert_str(&sanitize_paste(text, true));
+    let visible_lines = app.output_height.saturating_sub(2) as usize;
+    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+    true
+}
+
 pub(crate) fn handle_paste(app: &mut App, text: &str) {
     app.last_input_was_delete = false;
 
@@ -1461,11 +1517,7 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) {
     // Split-screen editor (before popups, after confirm dialog) - e.g. /note.
     // If the input side is focused instead, fall through to normal handling
     // below (including the popup/filter/search checks), same as handle_key_event.
-    if app.editor.visible && app.editor.focus == EditorFocus::Editor {
-        app.editor.insert_str(&sanitize_paste(text, true));
-        let visible_lines = app.output_height.saturating_sub(2) as usize;
-        let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
-        app.editor.ensure_cursor_visible(visible_lines, editor_width);
+    if paste_into_editor(app, text) {
         return;
     }
 
@@ -1521,6 +1573,13 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) {
             return;
         }
         app.shell_input(app.current_world_index, None, Some(text.to_string()), true);
+        return;
+    }
+
+    // A picture dropped onto the terminal arrives as its path (Import Picture): asked
+    // about, never typed.
+    if let Some(paths) = app.picture_drop(text) {
+        app.ask_picture_upload(paths);
         return;
     }
 

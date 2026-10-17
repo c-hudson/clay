@@ -122,7 +122,16 @@ impl ClayView {
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
             }
-            "bg_all_worlds" | "expand_line" | "suspend" | "bell" => {}
+            // TF's variables are the server's: it substitutes them into this input line and
+            // sends it back (SetInputBuffer). An older server can't.
+            "expand_line" => {
+                if self.session.core.server_expands_line {
+                    let text = self.editor.text.clone();
+                    let fx = self.session.send(crate::websocket::WsMessage::ExpandLine { text });
+                    self.after(fx, cx);
+                }
+            }
+            "bg_all_worlds" | "suspend" | "bell" => {}
             "completion" => {
                 self.complete_input();
                 self.input_touched(cx);

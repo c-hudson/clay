@@ -1904,7 +1904,7 @@ pub(crate) fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.settings.theme;
 
     // Get editor title with world name if editing notes
-    let world_name = app.editor.world_index.map(|idx| app.worlds[idx].name.as_str());
+    let world_name = app.editor.world_index.and_then(|idx| app.worlds.get(idx)).map(|w| w.name.as_str());
     let title = app.editor.title(world_name);
 
     // Add focus indicator to title

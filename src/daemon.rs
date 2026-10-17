@@ -12,7 +12,7 @@ use crate::{
     App, WorldSettings, UserConnection,
     ClientViewState, Command, OutputLine,
     get_multiuser_settings_path,
-    enable_tcp_keepalive, parse_command, current_timestamp_secs,
+    enable_tcp_keepalive, current_timestamp_secs,
 };
 use crate::actions::{action_commands_to_run,
     find_invocable_action, rewrite_slashless_action};
@@ -302,34 +302,15 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
-                        // Check if this is an AuthRequest (client just authenticated)
-                        if let WsMessage::AuthRequest { ref resume, ref resume_epochs, .. } = *msg {
-                            // Send initial state after successful authentication. Skips the
-                            // history for worlds the client still holds - see
-                            // App::build_initial_state_with_resume.
-                            let initial_state = app.build_initial_state_with_resume(
-                                app.display_owner_id(client_id), resume_epochs);
-                            app.log_initial_state_resume_skip(resume, resume_epochs, &initial_state);
-                            app.ws_send_initial_state_and_mark(client_id, initial_state);
-                            // Resume-driven replay (PROTOCOL-ROADMAP.md Step 2): reuse the
-                            // exact same gap-fill logic RequestScrollback{after_seq} already
-                            // uses, once per named world, instead of waiting for the client
-                            // to notice and ask for it. Mirrors main.rs's
-                            // handle_ws_auth_initial_state for the master-WS path.
-                            if !resume.is_empty() {
-                                if let Some(ref server) = app.ws_server {
-                                    server.record_acked_seq(client_id, resume);
-                                }
-                                // Mirrors the in-memory scrollback ring's cap (MAX_LINES,
-                                // main.rs) so a single replay always covers the entire ring.
-                                const RESUME_REPLAY_MAX: usize = 10_000;
-                                for &(world_index, last_seq) in resume {
-                                    // request_id: Some(0) is the reserved value marking a
-                                    // server-initiated unprompted resume replay (see
-                                    // ScrollbackLines' doc comment in websocket.rs).
-                                    app.handle_request_scrollback(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq), Some(0));
-                                }
-                            }
+                        // An AuthRequest: the client just logged in. The same post-login path
+                        // as the console master's and the GUI master's: the stable ownership
+                        // id first (▶ markers survive a reconnect), then InitialState with the
+                        // resume-aware history skip and replay, the client's view state, and
+                        // the activity count. `-D` used to build InitialState here itself and
+                        // skipped the rest.
+                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, .. } = *msg {
+                            app.set_display_owner_id(client_id, &client_uid);
+                            app.handle_ws_auth_initial_state(client_id, current_world, resume, resume_epochs);
                         } else {
                             handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
@@ -337,8 +318,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     AppEvent::WsClientConnected(_client_id) => {
                         // Client connected but not yet authenticated - nothing to do
                     }
-                    AppEvent::WsClientDisconnected(_client_id) => {
-                        // Client disconnected, nothing special to do
+                    AppEvent::WsClientDisconnected(client_id) => {
+                        // As every other loop: it stops counting as a viewer, and its NAWS
+                        // size stops counting.
+                        app.handle_ws_client_disconnected(client_id);
                     }
                     AppEvent::SystemMessage(msg) => {
                         // Print system messages (including connection rejections) to console
@@ -412,6 +395,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         }
                     }
                     AppEvent::Sigusr1Received => {
+                        // A `-D` daemon on Windows has no hot reload: say so rather than nothing.
+                        #[cfg(not(all(unix, not(target_os = "android"))))]
+                        app.add_output("Hot reload is not available on this platform.");
                         #[cfg(all(unix, not(target_os = "android")))]
                         {
                             app.ws_broadcast(WsMessage::ServerReloading);
@@ -658,8 +644,44 @@ pub async fn handle_daemon_ws_message(
     msg: WsMessage,
     event_tx: &mpsc::Sender<AppEvent>,
 ) {
-    handle_daemon_ws_message_impl(app, client_id, msg, event_tx).await;
+    // A client's command or key binding: TF's keyboard functions see the client's input line
+    // (empty once a line is sent; a binding brings its own), and what they leave goes back
+    // to that client - never to anyone's console.
+    let clients_own = matches!(msg, WsMessage::SendCommand { .. } | WsMessage::RunKeyBinding { .. });
+    let saved_keyboard = if clients_own { app.client_keyboard.replace(crate::tf::KeyboardBufferState::default()) } else { app.client_keyboard.clone() };
+    if clients_own {
+        // Left by a trigger or a timer: there is no console here to take them, and they
+        // are not this client's.
+        app.tf_engine.pending_keyboard_ops.clear();
+        app.tf_engine.pending_xtitle = None;
+        app.tf_engine.pending_limit_op = None;
+    }
+    handle_daemon_client_message(app, client_id, msg, event_tx).await;
+    if clients_own {
+        app.send_client_tf_ops(client_id);
+    }
+    app.client_keyboard = saved_keyboard;
     app.refresh_tf_bound_keys_if_changed();
+}
+
+async fn handle_daemon_client_message(
+    app: &mut App,
+    client_id: u64,
+    msg: WsMessage,
+    event_tx: &mpsc::Sender<AppEvent>,
+) {
+    // A line the client typed that TF takes first, as at the console (App::client_line_for_tf).
+    if let WsMessage::SendCommand { world_index, ref command } = msg {
+        if let Some(line) = app.client_line_for_tf(world_index, command) {
+            app.auto_resume_if_user_action(client_id, &msg);
+            app.tf_echo_line(world_index, "kecho", "kprefix", command);
+            let effects = app.run_typed_tf_in_world(world_index, &line);
+            let ctx = crate::tfrun::TfEffectCtx::for_world(world_index, true);
+            crate::tfrun::run_tf_effects_daemon(app, client_id, effects, ctx, event_tx).await;
+            return;
+        }
+    }
+    handle_daemon_ws_message_impl(app, client_id, msg, event_tx).await;
 }
 
 pub(crate) async fn handle_daemon_ws_message_impl(
@@ -685,8 +707,11 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         // `RunKeyBinding` work for GUI/headless single-user modes too, not just the
         // interactive TUI console - `run_master_webgui`/`run_app_headless` dispatch every
         // WS message through `handle_daemon_ws_message`.
-        WsMessage::RunKeyBinding { key, kbnum } => {
+        WsMessage::RunKeyBinding { key, kbnum, input } => {
             if let Some(cmd) = crate::chords::resolve_bound_command(app, &key) {
+                // The client's input line, for the binding's kb* functions; what they do to
+                // it goes back to the client (handle_daemon_ws_message: send_client_tf_ops).
+                app.client_keyboard = Some(input.map(crate::websocket::InputSnapshot::keyboard_state).unwrap_or_default());
                 let world_index = app.ws_client_worlds.get(&client_id)
                     .map(|s| s.world_index)
                     .unwrap_or(app.current_world_index);
@@ -707,6 +732,13 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             // silently, per the plan's own ruling.
         }
         WsMessage::SendCommand { world_index, command } => {
+            // A live shell world: a line of text (not a Clay command) is typed at the shell,
+            // as the console master's handler does. A "/..." command falls through to
+            // normal handling, so /dc and friends still reach it.
+            if app.shell_live(world_index) && !command.starts_with('/') {
+                app.shell_input(world_index, None, Some(format!("{command}\r")), false);
+                return;
+            }
             // TF's leading-slash forms (never at a password prompt): "//x" is "/x", "///x"
             // sends "/x" as text. ("^old^new" needs the client's own history, so the client
             // resolves it before sending.)
@@ -730,7 +762,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             let command = rewrite_slashless_action(&command, &app.settings.actions, &world_name)
                 .unwrap_or(command);
             // Use shared command parsing (same as console mode)
-            let parsed = parse_command(&command);
+            let parsed = crate::parse_typed_line(&command);
 
             // Reset more-mode counter when user sends a command
             if world_index < app.worlds.len() {
@@ -804,15 +836,22 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     // console loop does in main.rs).
                     if world_index < app.worlds.len() {
                         let suppressed = app.fire_tf_hook(Some(world_index), tf::TfHookEvent::Send, &text, true);
-                        if !suppressed && app.send_to_world(world_index, text) {
-                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                            app.worlds[world_index].clear_prompt_after_send();
+                        if !suppressed {
+                            if app.send_to_world(world_index, text) {
+                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                app.worlds[world_index].clear_prompt_after_send();
+                            } else if !app.worlds[world_index].connected {
+                                // As at the console, to the client that typed it.
+                                app.ws_tell(client_id, world_index, "Not connected. Use /worlds to connect.");
+                            }
                         }
                     }
                 }
+                // `/note <file>`: the file is on this machine (user ruling 2026-10-16).
+                Command::Edit { filename: Some(ref path) } => app.ws_open_file_for_client(client_id, world_index, path),
                 Command::Edit { .. } | Command::EditList => {
-                    // Edit command is handled locally on the client, not on daemon
-                    // Send back to client for local execution
+                    // The notes editor and list are the client's own windows: send it
+                    // back for the client to open.
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                 }
                 Command::Tag => {
@@ -854,15 +893,10 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                         "  Example: /url https://github.com/c-hudson/clay",
                     ], true);
                 }
-                Command::HelpTopic { ref topic, ref raw } => {
-                    use crate::popup::definitions::help::get_topic_help;
-                    let help_text = if let Some(lines) = get_topic_help(topic) {
-                        lines.join("\n")
-                    } else {
-                        crate::tf::parser::help_text(&app.tf_engine, raw)
-                    };
-                    app.emit_client_text(world_index, &help_text, true);
-                }
+                // What the console's typed `/help <topic>` shows, to the client that asked
+                // only (it used to go into the world's scrollback for every client).
+                Command::HelpTopic { ref raw, .. } => app.handle_ws_help_via_tf(client_id, world_index, raw),
+                Command::Help => app.handle_ws_help_via_tf(client_id, world_index, ""),
                 Command::Unknown { cmd } => {
                     // NOMACRO hook - see /help hooks and finding C.10 / plan step P1.9.
                     app.fire_tf_hook(Some(world_index), tf::TfHookEvent::Nomacro, &cmd, true);
@@ -935,70 +969,8 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     };
                     app.emit_client_text(world_index, &msg, true);
                 }
-                Command::BanList => {
-                    let bans = app.ban_list.get_ban_info();
-                    if bans.is_empty() {
-                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                            world_index,
-                            data: "No hosts are currently banned.".to_string(),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
-                        });
-                    } else {
-                        let mut output = String::new();
-                        output.push_str("\nBanned Hosts:\n");
-                        output.push_str(&"\u{2500}".repeat(70));
-                        output.push_str(&format!("\n{:<20} {:<12} {}\n", "Host", "Type", "Last URL/Reason"));
-                        output.push_str(&"\u{2500}".repeat(70));
-                        output.push('\n');
-                        for (ip, ban_type, reason) in &bans {
-                            let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
-                            output.push_str(&format!("{:<20} {:<12} {}\n", ip, ban_type, reason_display));
-                        }
-                        output.push_str(&"\u{2500}".repeat(70));
-                        output.push_str("\nUse /unban <host> to remove a ban.");
-                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                            world_index,
-                            data: output,
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
-                        });
-                    }
-                    app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
-                }
-                Command::Unban { host } => {
-                    if app.ban_list.remove_ban(&host) {
-                        let _ = persistence::save_settings(app);
-                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                            world_index,
-                            data: format!("Removed ban for: {}", host),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
-                        });
-                        app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
-                        app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
-                    } else {
-                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                            world_index,
-                            data: format!("No ban found for: {}", host),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
-                        });
-                        app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
-                    }
-                }
+                Command::BanList => app.ws_ban_list(client_id, world_index),
+                Command::Unban { host } => app.ws_unban(client_id, world_index, host),
                 Command::TestMusic => {
                     let test_notes = crate::generate_test_music_notes();
                     crate::debug_log(is_debug_enabled(), &format!("TESTMUSIC: daemon path, client_id={}, notes={}", client_id, test_notes.len()));
@@ -1028,50 +1000,8 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     });
                     app.emit_client_text(world_index, &format!("Notification sent: {}", message), true);
                 }
-                Command::Say { text } => {
-                    // Speak text via TTS (console subprocess + broadcast to web clients)
-                    app.speak_text(&text);
-                    let clean_text = strip_ansi_codes(&text);
-                    app.ws_broadcast(WsMessage::ServerSpeak {
-                        text: clean_text,
-                        world_index,
-                    });
-                    app.emit_client_text(world_index, &format!("TTS: {}", text), true);
-                }
-                Command::Dump => {
-                    // Same debug-dump content console/master-WS write (previously this
-                    // was a bare 3-column CSV missing all the actual debug state -
-                    // paused/pending/encoding/effective-dimensions - that's the whole
-                    // point of the command). daemon.rs is the one dispatch path that
-                    // already gave user-facing feedback on success/failure, so keep that.
-                    let total_lines: usize = app.worlds.iter()
-                        .map(|w| w.output_lines.len() + w.pending_lines.len())
-                        .sum();
-                    match app.write_debug_dump("daemon") {
-                        Ok(dump_path) => {
-                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                                world_index,
-                                data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path.display()),
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
-                            });
-                        }
-                        Err(e) => {
-                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                                world_index,
-                                data: format!("Failed to create dump file: {}", e),
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
-                            });
-                        }
-                    }
-                }
+                Command::Say { text } => app.ws_say(client_id, world_index, &text),
+                Command::Dump => app.ws_dump(client_id, world_index, "daemon"),
                 Command::Mssp => {
                     execute_mssp_command(app, world_index, true);
                 }
@@ -1091,37 +1021,22 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     ], true);
                 }
                 Command::Reload => {
+                    // The Android app's server can't hot reload: say so rather than nothing.
+                    #[cfg(target_os = "android")]
+                    app.ws_tell(client_id, world_index, "Hot reload is not available on this platform. Restart the app to apply changes.");
                     // Signal the event loop to perform reload
-                    crate::debug_log(is_debug_enabled(), "DAEMON: Received /reload command, sending Sigusr1Received event");
-                    let _ = event_tx.send(AppEvent::Sigusr1Received).await;
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        crate::debug_log(is_debug_enabled(), "DAEMON: Received /reload command, sending Sigusr1Received event");
+                        let _ = event_tx.send(AppEvent::Sigusr1Received).await;
+                    }
                 }
-                Command::RemoteAttach { .. } => {
-                    // A headless daemon (-D) has no local console/GUI to relaunch into —
-                    // /server only makes sense for an interactive master or client.
-                    app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
-                        world_index,
-                        data: "/server is not available in daemon mode.".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0, end_seq: None,
-                        flush: false, gagged: false, highlight_colors: Vec::new(),
-                    });
-                }
-                Command::Import { .. } => {
-                    // Same reasoning as the WS-bounced-command rejection in main.rs: the
-                    // command line can't carry a password/auth-key, so a dedicated
-                    // ImportSettings message is required (later plan step).
-                    app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
-                        world_index,
-                        data: "Use the /import dialog (not the command line) so your password/auth-key aren't sent unprotected.".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0, end_seq: None,
-                        flush: false, gagged: false, highlight_colors: Vec::new(),
-                    });
-                }
+                // The WebView GUI master's own window relaunches; a headless daemon (-D), or
+                // any other client, is refused (App::ws_remote_attach).
+                Command::RemoteAttach { addr, close, cancel } => app.ws_remote_attach(client_id, world_index, &addr, close, cancel),
+                // An `/import` that reached the server (typed ones open the dialog
+                // client-side): the client's Import dialog, where the password is typed.
+                Command::Import { addr } => app.ws_send_to_client(client_id, WsMessage::OpenImport { addr }),
                 // Commands that execute locally on the client
                 Command::Quit => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
@@ -1132,13 +1047,23 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 Command::Tts { args } => app.tts_command(&args, Some((client_id, world_index)), event_tx),
                 Command::Menu => app.ws_menu_is_console_only(client_id, world_index),
                 // UI popup commands - send back to client for local handling
-                Command::Help | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
+                Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                 }
                 Command::Window { world } => {
-                    // Send OpenWindow message to requesting client only — client opens a new browser tab
+                    // The client opens the window; a named world that isn't connected is
+                    // connected first, as the console master's handler does.
+                    let connect = app.window_world_to_connect(world.as_deref());
                     app.ws_send_to_client(client_id, WsMessage::OpenWindow { world });
+                    if let Some(idx) = connect {
+                        if !start_non_mud_world(app, idx, event_tx) {
+                            let settings = app.worlds[idx].settings.clone();
+                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+                            app.emit_client_text(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg), true);
+                            app.spawn_world_connect(idx, crate::ConnectOrigin::Client { report_failure: true }, event_tx);
+                        }
+                    }
                 }
                 Command::Version => {
                     app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
@@ -1211,13 +1136,17 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                                 flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         }
+                    } else if world_index < app.worlds.len() {
+                        // As the console says it, to the client that asked.
+                        app.ws_tell(client_id, world_index, "Already connected. Use /disconnect first.");
                     }
                 }
                 Command::WorldConnectBackground { ref name, no_login } => {
                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings()
-                            && !start_non_mud_world(app, idx, event_tx)
-                        {
+                        // The console's answers, to the client that asked.
+                        if let Some(why) = app.background_connect_refusal(idx, name) {
+                            app.ws_tell(client_id, world_index, &why);
+                        } else if !start_non_mud_world(app, idx, event_tx) {
                             // In the background - see App::spawn_world_connect. `/worlds -b` never
                             // reported a failure, so it still doesn't.
                             // `/worlds -b` logs in unless -l (handle_connection_success reads the flag).
@@ -1232,8 +1161,10 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                         app.switch_world(idx);
                         app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
-                        // Also send ExecuteLocalCommand so web clients can switch their local view
-                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
+                        // Also send ExecuteLocalCommand so web clients can switch their local
+                        // view: as `/world <name>`, the one form every client reads (TF's
+                        // flags, `/world -q foo`, made them look for a world named "-q foo").
+                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: format!("/world {}", app.worlds[idx].name) });
                         // Connect if not connected and has settings
                         if !app.worlds[idx].connected
                             && app.worlds[idx].settings.has_connection_settings()
@@ -1372,7 +1303,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar, picture_host } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1382,22 +1313,13 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                 mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                log_input_enabled, keyboard_always_visible, tabs, icon_bar,
+                log_input_enabled, keyboard_always_visible, tabs, icon_bar, picture_host,
             );
         }
-        WsMessage::ToggleWorldGmcp { world_index } => {
-            if world_index < app.worlds.len() {
-                app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
-                if !app.worlds[world_index].gmcp_user_enabled {
-                    app.stop_world_media(world_index);
-                }
-                app.needs_output_redraw = true;
-                app.ws_broadcast(WsMessage::GmcpUserToggled {
-                    world_index,
-                    enabled: app.worlds[world_index].gmcp_user_enabled,
-                });
-            }
-        }
+        WsMessage::ToggleWorldGmcp { world_index } => app.toggle_world_gmcp(world_index),
+        // Android going to the background (and back), a minimised GUI: not watching, so
+        // its ▶ markers and unseen counts work as on the console master's server.
+        WsMessage::ClientVisibility { visible } => app.handle_client_visibility(client_id, visible),
         // Plan Job 13 (Phase 4, 4.4): folded into one shared function with main.rs's
         // App::handle_ws_client_msg and this file's other copy below - see
         // commands::execute_send_gmcp/execute_send_msdp.
@@ -1562,6 +1484,14 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 let _ = persistence::save_settings(app);
                 app.ws_broadcast(WsMessage::NotesChanged { world_index, has_notes });
             }
+        }
+        // A file the client's `/note <file>` opened (`ws_open_file_for_client`).
+        WsMessage::SaveFile { path, content } => app.ws_save_file_for_client(client_id, path, content),
+        // TF's expand_line key, for a client (App::ws_expand_line).
+        WsMessage::ExpandLine { text } => app.ws_expand_line(client_id, &text),
+        // Import Picture: a chunk of a picture to upload (src/picture.rs).
+        WsMessage::PictureUpload { id, name, size, offset, data, last } => {
+            app.ws_picture_chunk(client_id, id, name, size, offset, data, last);
         }
         // MCP simpleedit reply (plan Job 15): no ownership check needed, same as the
         // note editor above (single-user daemon). `content` is untrusted user-edited
@@ -3115,6 +3045,9 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         scrollback_push: false,
         // Multiuser doesn't act on OtherViews (its view state is per user's own worlds).
         other_views: false,
+        expand_line: false,
+        // Multiuser's uploads come with its command parsing (deferred task M1).
+        picture_upload: false,
         emoji_json: crate::emoji::emoji_json(),
         emoji_categories_json: crate::emoji::emoji_categories_json(),
         // Multiuser shows Clay's own status bar.
@@ -4847,5 +4780,115 @@ mod shell_world_connect_tests {
     #[tokio::test]
     async fn connect_world_message_starts_the_shell() {
         starts_the_shell(WsMessage::ConnectWorld { world_index: 0 }).await;
+    }
+}
+
+#[cfg(test)]
+mod client_parity_tests {
+    //! A client of a server with no console of its own (handler B: the Android app's
+    //! `--local-server`, the GUI masters, `-D`) gets what the console master's clients get.
+    //! Client 0 is the embedded GUI channel (`gui_tx`), which these tests read.
+    use super::*;
+
+    fn app_with_gui() -> (App, tokio::sync::mpsc::UnboundedReceiver<WsMessage>, mpsc::Sender<AppEvent>) {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("w"));
+        let (gui_tx, gui_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.gui_tx = Some(gui_tx);
+        let (tx, _rx) = mpsc::channel::<AppEvent>(100);
+        app.event_tx = Some(tx.clone());
+        app.tf_event_tx = Some(tx.clone());
+        (app, gui_rx, tx)
+    }
+
+    fn sent(rx: &mut tokio::sync::mpsc::UnboundedReceiver<WsMessage>) -> Vec<WsMessage> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    async fn typed(app: &mut App, tx: &mpsc::Sender<AppEvent>, line: &str) {
+        handle_daemon_ws_message(app, 0, WsMessage::SendCommand { world_index: 0, command: line.into() }, tx).await;
+    }
+
+    /// TF's /input, /xtitle and /limit run by a client act on that client's input line,
+    /// title and filter (InputOps, SetTitle, LimitOp) - never on a console's.
+    #[tokio::test]
+    async fn a_clients_tf_input_title_and_limit_are_its_own() {
+        let (mut app, mut rx, tx) = app_with_gui();
+        typed(&mut app, &tx, "/input hello").await;
+        let msgs = sent(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::InputOps { ops }
+            if matches!(ops.as_slice(), [crate::websocket::InputOp::Insert { text, .. }] if text == "hello"))), "{msgs:?}");
+        assert!(app.input.buffer.is_empty(), "the console's own input is untouched");
+        assert!(app.tf_engine.pending_keyboard_ops.is_empty(), "nothing left for a console");
+
+        typed(&mut app, &tx, "/xtitle My Title").await;
+        assert!(sent(&mut rx).iter().any(|m| matches!(m, WsMessage::SetTitle { title } if title == "My Title")));
+
+        typed(&mut app, &tx, "/limit orc").await;
+        assert!(sent(&mut rx).iter().any(|m| matches!(m, WsMessage::LimitOp { action, pattern, .. } if action == "apply" && pattern == "orc")));
+        typed(&mut app, &tx, "/unlimit").await;
+        assert!(sent(&mut rx).iter().any(|m| matches!(m, WsMessage::LimitOp { action, .. } if action == "clear")));
+    }
+
+    /// A key binding's kb* functions read the input line the client sent with it.
+    #[tokio::test]
+    async fn a_key_binding_reads_the_clients_input_line() {
+        let (mut app, mut rx, tx) = app_with_gui();
+        typed(&mut app, &tx, "/bind ^X = /test kbhead()").await;
+        let _ = sent(&mut rx);
+        assert!(app.client_keyboard.is_none(), "restored after the command");
+        let input = Some(crate::websocket::InputSnapshot { buffer: "abcdef".into(), cursor: 3 });
+        handle_daemon_ws_message(&mut app, 0, WsMessage::RunKeyBinding { key: "^X".into(), kbnum: None, input }, &tx).await;
+        assert_eq!(app.tf_engine.keyboard_state.buffer, "abcdef");
+        assert_eq!(app.tf_engine.keyboard_state.cursor_position, 3);
+        assert!(app.client_keyboard.is_none());
+    }
+
+    /// A user macro named like a Clay command runs for a client, as at the console (TF
+    /// first); `/help <topic>` goes to the client that asked, not into the world.
+    #[tokio::test]
+    async fn typed_lines_go_through_tf_as_at_the_console() {
+        let (mut app, mut rx, tx) = app_with_gui();
+        typed(&mut app, &tx, "/def flush = /echo the macro ran").await;
+        typed(&mut app, &tx, "/flush").await;
+        assert!(app.worlds[0].output_lines.iter().any(|l| l.text.contains("the macro ran")), "the macro, not Clay's /flush");
+        let _ = sent(&mut rx);
+
+        let before = app.worlds[0].output_lines.len();
+        typed(&mut app, &tx, "/help send").await;
+        assert_eq!(app.worlds[0].output_lines.len(), before, "help is not stored in the world");
+        assert!(sent(&mut rx).iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if !data.is_empty())), "help to the asker");
+    }
+
+    /// Backgrounding (Android) reaches this handler: the client stops counting as a viewer.
+    #[tokio::test]
+    async fn client_visibility_reaches_this_handler() {
+        let (mut app, _rx, tx) = app_with_gui();
+        app.ws_client_worlds.insert(5, crate::ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 0, visible_columns: 0,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        });
+        handle_daemon_ws_message(&mut app, 5, WsMessage::ClientVisibility { visible: false }, &tx).await;
+        assert!(!app.ws_client_worlds[&5].visible);
+    }
+
+    /// An MCP edit on a server with no console reaches the clients each time; no invisible
+    /// console editor is left to refuse the next one.
+    #[tokio::test]
+    async fn every_mcp_edit_reaches_the_clients() {
+        let (mut app, mut rx, _tx) = app_with_gui();
+        for content in ["one", "two"] {
+            app.handle_mcp_event(0, crate::mcp::McpEvent::SimpleEditContent {
+                reference: "#1".into(), name: "R".into(), edit_type: crate::mcp::SimpleEditType::Str, content: content.into(),
+            });
+        }
+        let opens = sent(&mut rx).into_iter().filter(|m| matches!(m, WsMessage::McpEditOpen { .. })).count();
+        assert_eq!(opens, 2);
+        assert!(!app.editor.visible);
     }
 }

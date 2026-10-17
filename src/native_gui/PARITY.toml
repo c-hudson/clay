@@ -2513,7 +2513,7 @@ section = "status"
 phase = 2
 status = "done"
 feature = "hamburger menu (dropdown upward); items open their features as those land"
-note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab)"
+note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings, Recent Worlds, Notes, Notes List, Emoji Picker, Import Picture (when the server uploads pictures) | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab)"
 
 [[item]]
 id = "ui:status.world"
@@ -3066,3 +3066,155 @@ phase = 3
 status = "done"
 feature = "handle ShellScreen"
 note = "a shell world's grid: core::client applies the frame, ui draws rows + cursor (src/shell)"
+
+[[item]]
+id = "msg:FileEditorState"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "handle FileEditorState"
+note = "/note <file>: the main instance's file in the note editor over the main window (Purpose::File); one at a time"
+
+[[item]]
+id = "msg:FileSaved"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "handle FileSaved"
+note = "closes the file editor when saved, shows the error when not"
+
+[[item]]
+id = "msg:InputOps"
+section = "input"
+phase = 4
+status = "done"
+feature = "handle InputOps"
+note = "TF's /input, /grab, /dokey, kb* on this window's input (Editor::apply_input_op; actions and Submit run here)"
+
+[[item]]
+id = "msg:LimitOp"
+section = "input"
+phase = 4
+status = "done"
+feature = "handle LimitOp"
+note = "TF's /limit family: this window's Find filter (apply_limit)"
+
+[[item]]
+id = "msg:OpenImport"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "handle OpenImport"
+note = "a server-run /import: the Import dialog with the address filled in"
+
+[[item]]
+id = "msg:SetTitle"
+section = "windows"
+phase = 4
+status = "done"
+feature = "handle SetTitle"
+note = "TF's /xtitle: this window's title"
+
+[[item]]
+id = "wire:ExpandLine"
+section = "wire"
+phase = 4
+status = "done"
+feature = "wire ExpandLine"
+note = "the expand_line key, when InitialState.expand_line says the server takes it"
+
+[[item]]
+id = "wire:FileEditorState"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire FileEditorState"
+note = "handled: see msg:FileEditorState"
+
+[[item]]
+id = "wire:FileSaved"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire FileSaved"
+note = "handled: see msg:FileSaved"
+
+[[item]]
+id = "wire:InputOps"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire InputOps"
+note = "handled: see msg:InputOps"
+
+[[item]]
+id = "wire:LimitOp"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire LimitOp"
+note = "handled: see msg:LimitOp"
+
+[[item]]
+id = "wire:OpenImport"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire OpenImport"
+note = "handled: see msg:OpenImport"
+
+[[item]]
+id = "wire:SaveFile"
+section = "wire"
+phase = 4
+status = "done"
+feature = "wire SaveFile"
+note = "the file editor's Save"
+
+[[item]]
+id = "wire:SetTitle"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire SetTitle"
+note = "handled: see msg:SetTitle"
+
+[[item]]
+id = "msg:PictureUploadAck"
+section = "input"
+phase = 4
+status = "done"
+feature = "handle PictureUploadAck"
+note = "Import Picture: the ack window opens (picture::ClientUploads, ui/picture.rs); every window sees it, only the uploader acts"
+
+[[item]]
+id = "msg:PictureUploaded"
+section = "input"
+phase = 4
+status = "done"
+feature = "handle PictureUploaded"
+note = "Import Picture: the link into the input line at the cursor (Editor::insert_link), or why not as a line"
+
+[[item]]
+id = "wire:PictureUpload"
+section = "wire"
+phase = 4
+status = "done"
+feature = "wire PictureUpload"
+note = "Import Picture's chunks (menu file dialog, a drop on the window), when InitialState.picture_upload says the server takes them"
+
+[[item]]
+id = "wire:PictureUploadAck"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire PictureUploadAck"
+note = "handled: see msg:PictureUploadAck"
+
+[[item]]
+id = "wire:PictureUploaded"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire PictureUploaded"
+note = "handled: see msg:PictureUploaded"

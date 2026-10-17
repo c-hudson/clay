@@ -195,9 +195,15 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         ],
         "note" | "notes" => vec![
             "/note [file]               Open split-screen editor",
+            "/note -l                   List the worlds' notes",
             "",
             "Opens a notes editor. With no args, opens per-world",
             "notes. With a filename, opens that file for editing.",
+            "Ctrl+S saves and closes, Esc closes without saving,",
+            "Ctrl+Space moves between the editor and the input.",
+            "Every interface has all three. A file is always on",
+            "the main instance's machine: a remote console, the",
+            "web page, the GUI and the app edit the server's.",
         ],
         "help" => vec![
             "/help [topic]              Show help",

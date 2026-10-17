@@ -33,13 +33,13 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    /// The items, in order. The notes editor, its list and Import are the master
-    /// console's own (the remote console has none of them).
+    /// The items, in order. Import is the master console's own; the remote console edits
+    /// notes too (the server's, fetched and saved over the connection - App::run_note_command).
     pub fn all(is_master: bool) -> Vec<MenuItem> {
         use MenuItem::*;
         [Help, Setup, WebSettings, Actions, WorldSelector, RecentWorlds, Notes, NotesList, ImportSettings, EmojiPicker, FilterOutput, SearchOutput]
             .into_iter()
-            .filter(|i| is_master || !matches!(i, Notes | NotesList | ImportSettings))
+            .filter(|i| is_master || !matches!(i, ImportSettings))
             .collect()
     }
 
@@ -165,9 +165,10 @@ mod tests {
         assert_eq!(MenuItem::all(true).len(), 12);
         assert_eq!(MenuItem::Help.label(), "Help");
         assert_eq!(MenuItem::Help.command(), "/help");
-        // The remote console has no notes editor or Import.
+        // The remote console has the notes editor and its list, but not Import.
         let remote = MenuItem::all(false);
-        assert!(!remote.contains(&MenuItem::Notes) && !remote.contains(&MenuItem::ImportSettings));
+        assert!(remote.contains(&MenuItem::Notes) && remote.contains(&MenuItem::NotesList));
+        assert!(!remote.contains(&MenuItem::ImportSettings));
         assert_eq!(menu_action(MenuItem::EmojiPicker.command()), Some("emoji_picker"));
         assert_eq!(menu_action("/help"), None);
     }

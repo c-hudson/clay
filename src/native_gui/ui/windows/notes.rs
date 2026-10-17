@@ -1,7 +1,8 @@
 //! A world's notes (app.js `openNoteEditor`, `enterNoteMode`): an OS window of its own
-//! with a text area, Save and Cancel. And the MCP simpleedit editor (`enterMcpEditMode`):
-//! the same editor over the main window, for text the MUD sends to be edited and sent
-//! back.
+//! with a text area, Save and Cancel; Save saves and closes it, as in every interface.
+//! And the MCP simpleedit editor (`enterMcpEditMode`): the same editor over the main
+//! window, for text the MUD sends to be edited and sent back; and `/note <file>`
+//! (`enterFileEditMode`): a file on the main instance's machine, which the server sent.
 
 use std::time::{Duration, Instant};
 
@@ -17,14 +18,16 @@ use crate::native_gui::ui::kit::Kit;
 use crate::native_gui::ui::output::hsla;
 use crate::websocket::WsMessage;
 
-/// How long "Saved" or "Sent" shows.
+/// How long "Not connected - not saved/sent" shows.
 const STATUS_FOR: Duration = Duration::from_millis(1500);
 
-/// What the editor is for: a world's notes, or a MUD's simpleedit session.
+/// What the editor is for: a world's notes, a MUD's simpleedit session, or a file on the
+/// main instance's machine (`/note <file>`).
 #[derive(Clone, Debug)]
 pub enum Purpose {
     Notes { world_index: usize },
     Mcp { world_index: usize, reference: String, edit_type: String, name: String },
+    File { path: String },
 }
 
 pub struct NoteView {
@@ -33,8 +36,12 @@ pub struct NoteView {
     title: String,
     text: Entity<TextareaState>,
     status_at: Option<Instant>,
+    /// The last Save found no connection: nothing was sent, and the window stays open.
+    not_sent: bool,
     /// Another simpleedit arrived while this one was open (and was refused).
     ignored: bool,
+    /// A file's save under way, or why it failed: (text, is an error).
+    file_status: Option<(String, bool)>,
 }
 
 impl NoteView {
@@ -43,7 +50,7 @@ impl NoteView {
         let text = cx.new(|cx| TextareaState::new(window, cx));
         let _ = main.update(cx, |v, cx| v.send_message(WsMessage::RequestNoteEditorState { world_index }, cx));
         window.set_window_title(&format!("Clay - Notes: {name}"));
-        Self { main, purpose: Purpose::Notes { world_index }, title: "Notes".into(), text, status_at: None, ignored: false }
+        Self { main, purpose: Purpose::Notes { world_index }, title: "Notes".into(), text, status_at: None, not_sent: false, ignored: false, file_status: None }
     }
 
     /// A simpleedit session, with the MUD's text.
@@ -51,9 +58,10 @@ impl NoteView {
         let text = cx.new(|cx| TextareaState::new(window, cx).default_value(content));
         let title = match &purpose {
             Purpose::Mcp { name, .. } => format!("Edit: {name}"),
+            Purpose::File { path } => format!("Edit: {}", std::path::Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned())),
             Purpose::Notes { .. } => "Notes".into(),
         };
-        Self { main, purpose, title, text, status_at: None, ignored: false }
+        Self { main, purpose, title, text, status_at: None, not_sent: false, ignored: false, file_status: None }
     }
 
     /// The notes arrived (`NoteEditorState`).
@@ -63,6 +71,24 @@ impl NoteView {
         let notes = notes.to_string();
         self.text.update(cx, |t, cx| t.set_value(notes, window, cx));
         cx.notify();
+    }
+
+    /// The server's answer to a file's Save (`FileSaved`): saved, it closes.
+    pub fn file_saved(&mut self, ok: bool, error: Option<&str>, cx: &mut Context<Self>) {
+        if ok {
+            cx.emit(DialogEvent::Close);
+        } else {
+            self.file_status = Some((format!("Failed to save: {}", error.unwrap_or("")), true));
+            cx.notify();
+        }
+    }
+
+    /// The file this editor is for, if it is one.
+    pub fn file_path(&self) -> Option<&str> {
+        match &self.purpose {
+            Purpose::File { path } => Some(path),
+            _ => None,
+        }
     }
 
     /// A second simpleedit was refused while this one is open.
@@ -78,16 +104,26 @@ impl NoteView {
             Purpose::Mcp { world_index, reference, edit_type, .. } => {
                 WsMessage::McpEditSet { world_index: *world_index, reference: reference.clone(), edit_type: edit_type.clone(), content }
             }
+            Purpose::File { path } => WsMessage::SaveFile { path: path.clone(), content },
         };
+        // The text goes through the main window's connection, which outlives this window:
+        // sent, it can close at once (notes and an MCP edit alike, as the console's Ctrl+S
+        // does). Offline, nothing would be sent, so it stays open with the edits.
+        let online = self.main.upgrade().is_some_and(|m| m.read(cx).session.core.is_online());
+        if !online {
+            self.not_sent = true;
+            self.status_at = Some(Instant::now());
+            cx.notify();
+            return;
+        }
         let _ = self.main.update(cx, |v, cx| v.send_message(msg, cx));
-        self.status_at = Some(Instant::now());
-        cx.notify();
-        // Fade the status out again.
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(STATUS_FOR).await;
-            let _ = this.update(cx, |_, cx| cx.notify());
-        })
-        .detach();
+        if matches!(self.purpose, Purpose::File { .. }) {
+            // The server writes it: closed when it says it is saved (`file_saved`).
+            self.file_status = Some(("Saving...".into(), false));
+            cx.notify();
+        } else {
+            cx.emit(DialogEvent::Close);
+        }
     }
 }
 
@@ -108,7 +144,14 @@ impl Render for NoteView {
         };
         let t = k.t.clone();
         let mcp = matches!(self.purpose, Purpose::Mcp { .. });
-        let status = self.status_at.filter(|at| at.elapsed() < STATUS_FOR).map(|_| if mcp { "Sent" } else { "Saved" });
+        // A save that went out closes the window, so the only status left is "not sent".
+        let not_sent = self.status_at.filter(|at| self.not_sent && at.elapsed() < STATUS_FOR).map(|_| {
+            (if mcp { "Not connected - not sent" } else { "Not connected - not saved" }.to_string(), true)
+        });
+        let (status, is_error) = match not_sent.or_else(|| self.file_status.clone()) {
+            Some((text, error)) => (Some(text), error),
+            None => (None, false),
+        };
         let title = if self.ignored { format!("{} (another edit request was ignored)", self.title) } else { self.title.clone() };
         let (accent, hover) = (t.accent, t.hover);
         div()
@@ -130,7 +173,7 @@ impl Render for NoteView {
                     .border_b_1()
                     .border_color(t.border)
                     .child(div().font_weight(FontWeight::BOLD).text_color(t.fg).whitespace_nowrap().overflow_hidden().text_ellipsis().child(title))
-                    .child(div().text_size(px(11.0)).text_color(t.success).children(status))
+                    .child(div().text_size(px(11.0)).text_color(if is_error { t.error } else { t.success }).children(status))
                     .child(div().flex_1())
                     .child(
                         div()

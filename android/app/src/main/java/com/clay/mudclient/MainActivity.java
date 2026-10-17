@@ -113,6 +113,10 @@ public class MainActivity extends AppCompatActivity {
     private static final String CHANNEL_ID_SERVICE = "clay_service";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1001;
     private static final int BATTERY_OPTIMIZATION_REQUEST = 1002;
+    // Import Picture: the page's <input type="file"> (Menu > Import Picture) opens a
+    // picture/media app; what it picks goes back to the page through this callback.
+    private static final int PICTURE_CHOOSER_REQUEST = 1003;
+    private android.webkit.ValueCallback<Uri[]> pictureChooserCallback;
     private static final int KEEPALIVE_INTERVAL_MS = 60000; // 60 seconds (reduced from 30s for power savings)
     private static final long BACKGROUND_SHUTDOWN_MS = 60 * 60 * 1000; // 1 hour - auto-disconnect when in background
 
@@ -174,6 +178,14 @@ public class MainActivity extends AppCompatActivity {
             lifecycleEvents.addLast(event + "\t" + detail);
         }
     }
+
+    /** A second window (WindowActivity): it uses the session, never starts or ends it. */
+    protected boolean isWindowActivity() { return false; }
+
+    /** /say and spoken output (app.js ServerSpeak): the WebView has no speechSynthesis. */
+    private android.speech.tts.TextToSpeech tts;
+    private boolean ttsReady = false;
+    private final java.util.ArrayList<String> ttsPending = new java.util.ArrayList<>();
 
     private LocalServerManager localServerManager() { return ClaySession.localServer(); }
     private SshProxyManager sshProxyManager() { return ClaySession.sshProxy(); }
@@ -257,6 +269,69 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> loadInterface());
         }
 
+        /**
+         * /window, /window --grep, and the menu's New Window: a second window
+         * (WindowActivity) showing the page with `query` (the browser's `?world=` /
+         * `?grep=`), as its own task - beside this one in split screen when there is room.
+         */
+        @JavascriptInterface
+        public void openWindow(String query) {
+            runOnUiThread(() -> {
+                Intent intent = new Intent(MainActivity.this, WindowActivity.class);
+                intent.putExtra(WindowActivity.EXTRA_QUERY, query == null ? "" : query);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT | Intent.FLAG_ACTIVITY_MULTIPLE_TASK
+                    | Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT);
+                startActivity(intent);
+            });
+        }
+
+        /**
+         * /quit (user ruling 2026-10-16): a window closes; the main window ends the app - its
+         * other windows, the on-device server or SSH tunnel it started, and the foreground
+         * service. Attached to a remote server, that server keeps running.
+         */
+        @JavascriptInterface
+        public void quitApp() {
+            runOnUiThread(() -> {
+                if (isWindowActivity()) {
+                    finishAndRemoveTask();
+                    return;
+                }
+                WindowActivity.finishAll();
+                isConnected = false;
+                stopKeepalive();
+                stopHeartbeat();
+                cancelBackgroundShutdownTimer();
+                stopService(new Intent(MainActivity.this, ClayForegroundService.class));
+                ClaySession.shutdown();
+                finishAndRemoveTask();
+            });
+        }
+
+        /** Speak `text` with the system's text-to-speech (app.js ServerSpeak, /say). */
+        @JavascriptInterface
+        public void speak(String text) {
+            if (text == null || text.trim().isEmpty()) return;
+            runOnUiThread(() -> {
+                if (tts == null) {
+                    tts = new android.speech.tts.TextToSpeech(getApplicationContext(), status -> {
+                        ttsReady = status == android.speech.tts.TextToSpeech.SUCCESS;
+                        if (ttsReady) {
+                            for (String pending : ttsPending) {
+                                tts.speak(pending, android.speech.tts.TextToSpeech.QUEUE_ADD, null, null);
+                            }
+                        }
+                        ttsPending.clear();
+                    });
+                }
+                if (ttsReady) {
+                    tts.speak(text, android.speech.tts.TextToSpeech.QUEUE_ADD, null, null);
+                } else {
+                    ttsPending.add(text);
+                }
+            });
+        }
+
         @JavascriptInterface
         public void showNotification(String title, String message) {
             runOnUiThread(() -> {
@@ -287,6 +362,16 @@ public class MainActivity extends AppCompatActivity {
 
         @JavascriptInterface
         public void startBackgroundService() {
+            if (isWindowActivity()) {
+                // The main window's service already keeps the process alive; a window only
+                // keeps its own connection checked.
+                runOnUiThread(() -> {
+                    isConnected = true;
+                    startKeepalive();
+                    startHeartbeat();
+                });
+                return;
+            }
             runOnUiThread(() -> {
                 // Request battery optimization exemption here, lazily, the first time a
                 // persistent background connection actually starts - not unconditionally at
@@ -310,6 +395,8 @@ public class MainActivity extends AppCompatActivity {
 
         @JavascriptInterface
         public void stopBackgroundService() {
+            // The session is the main window's: a window never ends it.
+            if (isWindowActivity()) return;
             runOnUiThread(() -> {
                 isConnected = false;
                 stopKeepalive();
@@ -935,6 +1022,11 @@ public class MainActivity extends AppCompatActivity {
                 nativeWebSockets.clear();
                 // Clear cache for a true hard refresh
                 webView.clearCache(true);
+                // A window reloads its own page; the session is the main window's.
+                if (isWindowActivity()) {
+                    loadWindowInterface();
+                    return;
+                }
                 // Reload — restarts the local server first if the run mode just changed (see
                 // saveSettingsAll()'s 'clay-server' tab in app.js, which calls this after saving),
                 // otherwise just a normal reload/resync.
@@ -1051,6 +1143,13 @@ public class MainActivity extends AppCompatActivity {
 
         setupWebView();
 
+        // A second window: the session is already up (the main window started it) - just
+        // the page, in window mode.
+        if (isWindowActivity()) {
+            loadWindowInterface();
+            return;
+        }
+
         // Start permission flow - will call proceedAfterPermissions when done
         isInitialLoadPending = true;
         startPermissionFlow();
@@ -1164,6 +1263,37 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICTURE_CHOOSER_REQUEST) {
+            // Every picked picture (several come as ClipData, which
+            // FileChooserParams.parseResult ignores). A cancel must still answer, or the
+            // page's file input never opens again.
+            final android.webkit.ValueCallback<Uri[]> callback = pictureChooserCallback;
+            pictureChooserCallback = null;
+            if (callback == null) return;
+            final java.util.List<Uri> picked = new java.util.ArrayList<>();
+            if (resultCode == RESULT_OK && data != null) {
+                if (data.getClipData() != null) {
+                    android.content.ClipData clip = data.getClipData();
+                    for (int i = 0; i < clip.getItemCount(); i++) {
+                        picked.add(clip.getItemAt(i).getUri());
+                    }
+                } else if (data.getData() != null) {
+                    picked.add(data.getData());
+                }
+            }
+            if (picked.isEmpty()) {
+                callback.onReceiveValue(null);
+                return;
+            }
+            // The page reads a picture in slices, and WebView can't slice a File backed by
+            // the photo picker's content:// link ("NotReadableError"): hand it a copy in
+            // this app's cache instead, off the UI thread (a photo can be megabytes).
+            new Thread(() -> {
+                final Uri[] copies = copyPickedPictures(picked);
+                runOnUiThread(() -> callback.onReceiveValue(copies));
+            }).start();
+            return;
+        }
         if (requestCode == BATTERY_OPTIMIZATION_REQUEST) {
             batteryOptimizationDone = true;
             Runnable callback = pendingBatteryOptCallback;
@@ -1172,6 +1302,48 @@ public class MainActivity extends AppCompatActivity {
                 callback.run();
             }
         }
+    }
+
+    /** Import Picture: the picked pictures copied into cache/picked/ (the last pick's
+     *  copies are removed first), under their own names, as file:// links. */
+    private Uri[] copyPickedPictures(java.util.List<Uri> sources) {
+        java.io.File dir = new java.io.File(getCacheDir(), "picked");
+        deleteTree(dir);
+        java.util.List<Uri> out = new java.util.ArrayList<>();
+        int n = 0;
+        for (Uri uri : sources) {
+            n++;
+            String name = null;
+            try (android.database.Cursor c = getContentResolver().query(uri,
+                    new String[] { android.provider.OpenableColumns.DISPLAY_NAME }, null, null, null)) {
+                if (c != null && c.moveToFirst()) name = c.getString(0);
+            } catch (Exception ignored) { }
+            if (name == null || name.isEmpty()) name = "picture";
+            name = name.replace('/', '_');
+            // A folder per picture keeps each one's own name (two picks may share one).
+            java.io.File sub = new java.io.File(dir, String.valueOf(n));
+            sub.mkdirs();
+            java.io.File copy = new java.io.File(sub, name);
+            try (java.io.InputStream in = getContentResolver().openInputStream(uri);
+                 java.io.OutputStream os = new java.io.FileOutputStream(copy)) {
+                if (in == null) continue;
+                byte[] buf = new byte[64 * 1024];
+                int r;
+                while ((r = in.read(buf)) > 0) os.write(buf, 0, r);
+                out.add(Uri.fromFile(copy));
+            } catch (Exception e) {
+                android.util.Log.w("Clay", "Import Picture: couldn't copy " + uri + ": " + e);
+            }
+        }
+        return out.isEmpty() ? null : out.toArray(new Uri[0]);
+    }
+
+    private static void deleteTree(java.io.File f) {
+        java.io.File[] children = f.listFiles();
+        if (children != null) {
+            for (java.io.File c : children) deleteTree(c);
+        }
+        f.delete();
     }
 
     // Guards against proceedAfterPermissions() running twice: onResume()/onNewIntent() can fire
@@ -1995,10 +2167,46 @@ public class MainActivity extends AppCompatActivity {
                     cm.message() + " @ " + cm.sourceId() + ":" + cm.lineNumber());
                 return true;
             }
+
+            // Import Picture: the page's file input. A WebView opens nothing for it unless
+            // the app does - here a chooser of the apps that give pictures (a gallery,
+            // photos, files).
+            @Override
+            public boolean onShowFileChooser(WebView view, android.webkit.ValueCallback<Uri[]> callback,
+                                             FileChooserParams params) {
+                if (pictureChooserCallback != null) {
+                    pictureChooserCallback.onReceiveValue(null);
+                }
+                pictureChooserCallback = callback;
+                Intent pick = new Intent(Intent.ACTION_GET_CONTENT);
+                pick.addCategory(Intent.CATEGORY_OPENABLE);
+                pick.setType("image/*");
+                pick.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,
+                    params != null && params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
+                try {
+                    startActivityForResult(Intent.createChooser(pick, "Import Picture"), PICTURE_CHOOSER_REQUEST);
+                } catch (android.content.ActivityNotFoundException e) {
+                    pictureChooserCallback = null;
+                    callback.onReceiveValue(null);
+                    Toast.makeText(MainActivity.this, "No app to pick a picture with", Toast.LENGTH_SHORT).show();
+                    return false;
+                }
+                return true;
+            }
         });
     }
 
     /** Load the web interface from bundled APK assets. Template vars injected via JS in onPageFinished. */
+    /** A window's page: the main page with the browser's window-mode query (WindowActivity). */
+    private void loadWindowInterface() {
+        connectionFailed = false;
+        String query = getIntent().getStringExtra(WindowActivity.EXTRA_QUERY);
+        String url = "file:///android_asset/web/index.html" + (query == null ? "" : query);
+        webView.loadUrl(url);
+        interfaceLoaded = true;
+        loadedInterfaceUrl = url;
+    }
+
     private void loadInterface() {
         connectionFailed = false;
         runOnUiThread(() -> {
@@ -2247,6 +2455,22 @@ public class MainActivity extends AppCompatActivity {
             + " localServerRunning=" + ClaySession.isLocalServerRunning()
             + " sshProxyRunning=" + ClaySession.isSshProxyRunning());
 
+        // A window: back on screen, counted as a viewer again, its connection checked. The
+        // session (the tunnel, the network watch, the shutdown timer) is the main window's.
+        if (isWindowActivity()) {
+            notifyVisibility(true);
+            if (webView != null) {
+                webView.onResume();
+            }
+            if (!interfaceLoaded) {
+                loadWindowInterface();
+            } else if (webView != null) {
+                webView.evaluateJavascript(
+                    "if (typeof checkConnectionOnResume === 'function') checkConnectionOnResume();", null);
+            }
+            return;
+        }
+
         // Cancel background shutdown timer since user is back
         cancelBackgroundShutdownTimer();
 
@@ -2337,6 +2561,8 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onStop() {
         super.onStop();
+        // A window never ends the session (it is the main window's to time out).
+        if (isWindowActivity()) return;
         // WebView continues running if connected (foreground service keeps process alive)
         // Start background shutdown timer to save power after 1 hour
         startBackgroundShutdownTimer();
@@ -2384,6 +2610,10 @@ public class MainActivity extends AppCompatActivity {
         stopHeartbeat();
         cancelBackgroundShutdownTimer();
         unregisterSshNetworkCallback(); // normally already done in onPause(); safe/idempotent
+        if (tts != null) {
+            tts.shutdown();
+            tts = null;
+        }
         // Deliberately does NOT stop the local server or the SSH tunnel. Android destroys and
         // recreates Activities routinely - Back, a notification tap, or an OEM reclaiming a
         // backgrounded Activity - and tearing the session down here meant every one of those
@@ -2399,6 +2629,11 @@ public class MainActivity extends AppCompatActivity {
     public void onBackPressed() {
         if (webView != null && webView.canGoBack()) {
             webView.goBack();
+            return;
+        }
+        // A window: Back closes it (the session stays, with the main window).
+        if (isWindowActivity()) {
+            finishAndRemoveTask();
             return;
         }
         // Background the task rather than finishing the Activity. super.onBackPressed() would

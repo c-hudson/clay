@@ -159,6 +159,31 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     left_down = false;
                     vec![gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button: gpui::MouseButton::Left, position: at(), modifiers: mods, click_count: 1 })]
                 }
+                // Files dropped onto the window as the platform delivers them:
+                // `drop:x,y|/path/one|/path/two` (Import Picture).
+                "drop" => {
+                    let mut parts = arg.split('|');
+                    let xy: Vec<f32> = parts.next().unwrap_or("").split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                    let position = gpui::point(px(xy.first().copied().unwrap_or(0.0)), px(xy.get(1).copied().unwrap_or(0.0)));
+                    let paths = gpui::ExternalPaths(parts.map(std::path::PathBuf::from).collect());
+                    vec![
+                        gpui::PlatformInput::FileDrop(gpui::FileDropEvent::Entered { position, paths }),
+                        gpui::PlatformInput::FileDrop(gpui::FileDropEvent::Pending { position }),
+                        gpui::PlatformInput::FileDrop(gpui::FileDropEvent::Submit { position }),
+                    ]
+                }
+                // The main window's input line and cursor, as text.
+                "inputline" => {
+                    cx.run_until_parked();
+                    cx.update(|app| {
+                        let v = view.read(app);
+                        let last: Vec<String> = v.session.core.current_world().map_or(Vec::new(), |w| {
+                            w.lines.iter().rev().take(3).map(|l| super::find::plain(&l.text)).collect()
+                        });
+                        println!("snapshot-input: {arg} text={:?} cursor={} last_lines={:?} picture_upload={}", v.editor.text, v.editor.cursor, last, v.session.core.server_picture_upload);
+                    });
+                    Vec::new()
+                }
                 "key" => match gpui::Keystroke::parse(arg) {
                     Ok(keystroke) => vec![gpui::PlatformInput::KeyDown(gpui::KeyDownEvent { keystroke, is_held: false, prefer_character_input: false })],
                     Err(e) => fail(&format!("bad key {arg}: {e}")),
@@ -207,7 +232,13 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                         cx.update(|app| view.read(app).link.follower_window(0)).unwrap_or_else(|| fail("no /window is open"))
                     } else {
                         let kind = window_kind(arg);
-                        cx.update(|app| view.read(app).windows.handle(kind)).unwrap_or_else(|| fail("that window isn't open (add an open: step)"))
+                        let handle = cx.update(|app| view.read(app).windows.handle(kind)).unwrap_or_else(|| fail("that window isn't open (add an open: step)"));
+                        // The list keeps a window's handle after it closes (its own Close,
+                        // Save in the notes window): a closed one can't be updated.
+                        if cx.update_window(handle, |_, _, _| ()).is_err() {
+                            fail("that window has closed");
+                        }
+                        handle
                     };
                     Vec::new()
                 }

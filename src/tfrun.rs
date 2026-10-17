@@ -433,13 +433,20 @@ impl App {
                 self.emit_recall(&opts, world_idx, ctx.daemon_mode);
             }
             TfEffect::StartProcess(process) => {
-                if ctx.typed_at_console {
+                // Typed (at the console, or by a client - whose command is running while
+                // `client_keyboard` is set): TF says it started, to whoever typed it.
+                if ctx.typed_at_console || self.client_keyboard.is_some() {
                     let id = process.id;
                     let interval = crate::format_duration_short(process.interval);
                     let count_str = process.count.map_or("infinite".to_string(), |c| c.to_string());
                     let cmd = process.command.clone();
                     self.register_repeat_process(process);
-                    self.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
+                    let notice = format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str);
+                    if ctx.typed_at_console {
+                        self.add_tf_output(&notice);
+                    } else {
+                        self.client_notices.push(notice);
+                    }
                 } else {
                     self.register_repeat_process(process);
                 }

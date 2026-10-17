@@ -61,6 +61,9 @@ The remote console provides the identical interface to the main console:
 - World switching
 - Command history
 - Spell checking (if enabled on master)
+- Importing a picture by dragging it onto the terminal: the file is read on this console's
+  machine and sent to the server, which uploads it (see **Importing a Picture** in the
+  Interface chapter)
 
 ## Key Differences from Main Console
 
@@ -138,9 +141,37 @@ more from you. Pick one with the arrow keys and Enter.
 | Filter Output | Show only matching lines (`F4`) |
 | Search Output | Find text in the output |
 
-Notes, Notes List and Import Settings are the local console's own, so a remote
-console's menu leaves them out. `/menu` is console-only: the web and GUI
-interfaces have their menu button (☰) instead.
+Import Settings is the main instance's own (it brings another Clay's settings into
+the main instance), so a remote console's menu leaves it out and `/import` says so.
+Notes and Notes List work as on the local console: the notes are the server's,
+fetched when the editor opens and saved back with Ctrl+S (Esc cancels).
+`/note <file>` edits a file on the main instance's machine, as it does from every
+interface: the server reads it, and Ctrl+S sends it back; the editor closes once the
+server has written it. `/menu` is the console's: the web and GUI interfaces have
+their menu button (☰) instead; an action or macro that runs `/menu` opens this
+console's menu.
+
+## Commands run by the server
+
+An action or a TF macro that runs a command whose window is the console's (`/quit`,
+`/worlds -e`, `/world <name>`, `/note`, `/menu`, `/help`) runs it here as if you had
+typed it. When a MUD sends text to edit (MCP simpleedit), it opens in the same
+editor the notes use; Ctrl+S sends it back to the MUD. TF commands that act on the
+input line (`/input`, `/grab`, `/dokey`, the `kb*` functions), the window title
+(`/xtitle`) and the filter (`/limit`, `/unlimit`, `/relimit`) act on this console's,
+not the main console's. Sound and speech the server sends - a world's MUD media,
+ANSI music, `/say` and spoken output - play on this console's machine. A MUD whose
+certificate changed shows the same trust dialog as the main console.
+
+## When the server restarts or the connection drops
+
+A `/reload` (or `/update`) of the main instance, or a dropped connection, doesn't end
+the console: it says it's reconnecting and logs in again on its own, with the password
+you typed when it started (it keeps only the password's hash). The input line, its
+history and an open editor stay; a line you send while it's away is reported as not
+sent. Over `--ssh` it opens a new channel on the same SSH login. If the login is
+refused (the password changed) or the server's certificate changed, it stops trying
+and says so - start the console again to log in or to check the certificate.
 
 ## Popups
 

@@ -491,6 +491,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
+    writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
 
     // Save each world's settings.
     //
@@ -1372,6 +1373,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "icon_bar" => {
                         app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
+                    "picture_host" => {
+                        app.settings.picture_host = crate::picture::PictureService::from_name(value);
+                    }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
@@ -2223,6 +2227,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
+    writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
 
     // Save watchdog state
     writeln!(file, "watchdog_enabled={}", app.tf_engine.watchdog_enabled)?;
@@ -3270,6 +3275,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "icon_bar" => {
                         app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
+                    "picture_host" => {
+                        app.settings.picture_host = crate::picture::PictureService::from_name(value);
+                    }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
@@ -3846,6 +3854,7 @@ mod tests {
             keyboard_always_visible: false,    // default: true
             tabs: TabsMode::Top,               // default: None
             icon_bar: IconBarMode::All,        // default: AppTablet
+            picture_host: crate::picture::PictureService::from_name("x0+short"), // default: catbox
         }
     }
 
@@ -3956,6 +3965,7 @@ mod tests {
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
         assert_eq!(a.tabs, b.tabs, "{context}: tabs");
         assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
+        assert_eq!(a.picture_host, b.picture_host, "{context}: picture_host");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -5230,6 +5240,7 @@ pattern=foo
         assert_ne!(non_default.keyboard_always_visible, default.keyboard_always_visible, "keyboard_always_visible should differ");
         assert_ne!(non_default.tabs, default.tabs, "tabs should differ");
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");
+        assert_ne!(non_default.picture_host, default.picture_host, "picture_host should differ");
     }
 
     #[test]

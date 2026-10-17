@@ -98,6 +98,7 @@ ansi_music_enabled=false
 tts_mode=off                        # off, local, kokoro or edge
 tts_speak_mode=all                  # all or limit
 tts_voice=af_heart                  # the Kokoro voice (/tts voices)
+picture_host=catbox                 # catbox, sxcu or x0, each also +short; or off
 websocket_enabled=false
 websocket_password_hash=<sha256>
 websocket_use_tls=false

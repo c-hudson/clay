@@ -25,6 +25,7 @@ Open with `/setup` command:
 | TTS | Text-to-speech for incoming lines: Off; Local (espeak or espeak-ng on Linux, `say` on macOS, the Windows voices); Kokoro (an offline neural voice, installed once with `/tts install`); Edge (Microsoft's cloud voices, needs internet). Browser and Android clients always use the device's own voice. F9 mutes. | Off |
 | Speak Mode | All: every line. Limit: only lines like `Name says, "..."` and later lines from the same speakers | All |
 | Kokoro Voice | Which of Kokoro's 54 voices speaks, e.g. `af_heart`, `am_michael`, `bf_emma`; `/tts voices` lists them by language. In `settings.dat`: `tts_voice` | af_heart |
+| Picture Host | Where Import Picture uploads a picture (see **Importing a Picture**): catbox.moe, sxcu.net or x0.at, each also "+ URL shortening" (the link goes through `/url`'s shortening), or Off. In `settings.dat`: `picture_host` (`catbox`, `catbox+short`, ..., `off`) | catbox.moe |
 
 ### World Switching Modes
 

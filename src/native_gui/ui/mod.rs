@@ -17,6 +17,7 @@ mod native_spell;
 mod opacity;
 mod more;
 pub mod output;
+mod picture;
 mod select;
 mod surfaces;
 mod textdiv;
@@ -193,6 +194,8 @@ pub struct ClayView {
     opacity: opacity::Opacity,
     /// The title bar's dark or light, as set for this window (Windows).
     titlebar: titlebar::TitleBar,
+    /// Import Picture: this window's pictures going to the server (ui/picture.rs).
+    pictures: crate::picture::ClientUploads,
 }
 
 impl ClayView {
@@ -271,6 +274,7 @@ impl ClayView {
             media_gate: None,
             opacity: Default::default(),
             titlebar: Default::default(),
+            pictures: Default::default(),
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -333,6 +337,39 @@ impl ClayView {
                     }
                     // The web client passes these to Android's notifications only.
                     crate::websocket::WsMessage::Notification { .. } => {}
+                    // What a TF command this window ran does to its input line (/input, /grab,
+                    // /dokey, kb*), in order.
+                    crate::websocket::WsMessage::InputOps { ops } => {
+                        for op in &ops {
+                            if !self.editor.apply_input_op(op) {
+                                match op {
+                                    crate::websocket::InputOp::Action { id } => self.later(
+                                        {
+                                            let id = id.clone();
+                                            move |v, window, cx| v.run_action(&id, window, cx)
+                                        },
+                                        cx,
+                                    ),
+                                    crate::websocket::InputOp::Submit => self.later(|v, window, cx| v.send_line(window, cx), cx),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        changed = true;
+                    }
+                    // Import Picture: the server's progress and answers (this window's own
+                    // uploads only).
+                    m @ (crate::websocket::WsMessage::PictureUploadAck { .. } | crate::websocket::WsMessage::PictureUploaded { .. }) => {
+                        self.picture_message(m, cx);
+                    }
+                    // TF's /xtitle run here: this window's title.
+                    crate::websocket::WsMessage::SetTitle { title } => {
+                        self.later(move |_, window, _| window.set_window_title(&title), cx);
+                    }
+                    // TF's /limit family run here: this window's filter (F4).
+                    crate::websocket::WsMessage::LimitOp { action, pattern, .. } => {
+                        self.later(move |v, window, cx| v.apply_limit(&action, &pattern, window, cx), cx);
+                    }
                     // The server puts text in the input (TF's /input and the like).
                     crate::websocket::WsMessage::SetInputBuffer { text, cursor_start } => {
                         self.editor.clear();
@@ -556,7 +593,8 @@ impl ClayView {
             Resolved::Server(key) => {
                 let kbnum = self.kbnum.take();
                 self.kbnum_sign = 1;
-                let fx = self.session.send(crate::websocket::WsMessage::RunKeyBinding { key, kbnum });
+                let input = Some(self.input_snapshot());
+                let fx = self.session.send(crate::websocket::WsMessage::RunKeyBinding { key, kbnum, input });
                 self.after(fx, cx);
                 true
             }
@@ -600,6 +638,11 @@ impl ClayView {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fx = self.session.tick();
         self.after(fx, cx);
+        // Import Picture: resend after a lost ack; the connection gone, the uploads too.
+        if self.pictures.is_busy() && !self.session.core.is_online() {
+            self.pictures_connection_lost(cx);
+        }
+        self.picture_tick(cx);
         self.report_other_views(cx);
         if let Some(m) = self.media.as_mut() {
             m.poll();
@@ -608,7 +651,8 @@ impl ClayView {
         match self.keys.tick(Instant::now()) {
             Some(Resolved::Action { action, .. }) => self.run_action(&action, window, cx),
             Some(Resolved::Server(key)) => {
-                let fx = self.session.send(crate::websocket::WsMessage::RunKeyBinding { key, kbnum: self.kbnum.take() });
+                let input = Some(self.input_snapshot());
+                let fx = self.session.send(crate::websocket::WsMessage::RunKeyBinding { key, kbnum: self.kbnum.take(), input });
                 self.after(fx, cx);
             }
             _ => {}
@@ -1059,6 +1103,11 @@ impl Render for ClayView {
         // A grep window shows its matches and nothing else (app.js GREP_MODE).
         let grep = self.mode.grep.is_some();
         let icon_bar = if grep { None } else { self.icon_bar(cx) };
+        let drop_tint = {
+            let mut tint = self.chrome.tokens.accent;
+            tint.a = 0.12;
+            tint
+        };
         let tabs_top = self.tabs_mode() == "top";
         let mut tabs = if grep { None } else { self.tabs_ribbon(cx) };
         let stats = if grep { None } else { self.stats_panel(cx) };
@@ -1138,6 +1187,15 @@ impl Render for ClayView {
                     this.bar_release(cx);
                 }),
             )
+            // Import Picture: pictures dropped onto the window (a tint while they're over it).
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(drop_tint))
+            .on_drop(cx.listener(move |this, paths: &gpui::ExternalPaths, _window, cx| {
+                // A --grep window has no input line to put the link in.
+                if !grep {
+                    this.import_pictures(paths.paths().to_vec(), cx);
+                }
+            }))
+            .child(picture::drop_after_typing_fix())
             .children(icon_bar)
             .when(tabs_top, |d| d.children(tabs.take()))
             .child(div().flex_1().min_h_0().child(body))

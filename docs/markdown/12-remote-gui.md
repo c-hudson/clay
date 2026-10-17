@@ -87,6 +87,10 @@ different about running it as a native window instead of a browser tab:
 - No browser autoplay restrictions on ANSI music/audio.
 - Right-click in the output area opens a **Debug Selection** context menu item (see
   below) that the plain browser client doesn't have.
+- Menu > Import Picture opens a file dialog, and a picture dragged onto the window is
+  uploaded too (see **Importing a Picture** in the Interface chapter). The native GUI does
+  the same; on Linux its file dialog needs xdg-desktop-portal, and without it a drag
+  still works.
 
 ## Keyboard Shortcuts
 

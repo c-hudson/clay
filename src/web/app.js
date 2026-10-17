@@ -492,6 +492,10 @@
         recentWorldsModal: document.getElementById('recent-worlds-modal'),
         recentWorldsContent: document.getElementById('recent-worlds-content'),
         recentWorldsList: document.getElementById('recent-worlds-list'),
+        notesListModal: document.getElementById('notes-list-modal'),
+        pictureFileInput: document.getElementById('picture-file-input'),
+        notesListContent: document.getElementById('notes-list-content'),
+        notesListList: document.getElementById('notes-list-list'),
         // Password change modal (multiuser mode)
         passwordModal: document.getElementById('password-modal'),
         passwordOld: document.getElementById('password-old'),
@@ -683,6 +687,7 @@
         setupTtsVoiceInput: document.getElementById('setup-tts-voice-input'),
         setupTabsSelect: document.getElementById('setup-tabs-select'),
         setupIconBarSelect: document.getElementById('setup-iconbar-select'),
+        setupPictureHostSelect: document.getElementById('setup-picture-host-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupKeyboardVisibleToggle: document.getElementById('setup-keyboard-visible-toggle'),
@@ -877,6 +882,10 @@
     // whenever a McpEditOpen push arrives (see enterMcpEditMode), reusing the exact
     // same #note-editor-view DOM/CSS. { world_index, reference, edit_type }.
     var mcpEditState = null;
+    // The server takes ExpandLine (InitialState.expand_line): the expand_line key asks it.
+    var serverExpandsLine = false;
+    // The server takes PictureUpload (InitialState.picture_upload): Import Picture works.
+    var serverPictureUpload = false;
     let pendingReconnectCommand = null;  // Command to resend after reconnect
     // T1.12/D3: the world to resend to is remembered by NAME, not index. Indices
     // shift across a reconnect exactly like the InitialState focus resolution below
@@ -1420,6 +1429,7 @@
     let setupTtsMode = 'Off';
     let setupTabsMode = 'none';
     let setupIconBarMode = 'app_tablet';
+    let setupPictureHost = 'catbox';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
     let setupKeyboardAlwaysVisible = true;
@@ -1586,6 +1596,9 @@
     let tabsMode = 'none';
     // Icon bar visibility mode, synced from server settings ('none', 'app_tablet', 'all')
     let iconBarMode = 'app_tablet';
+    // Import Picture's host (Settings > General; src/picture.rs). '' = a server from before
+    // Import Picture, which sends none and can't upload.
+    let pictureHost = '';
     // World-switch dropdown (opened by clicking the world name on the status bar)
     let worldMenuOpen = false;
 
@@ -2270,6 +2283,77 @@
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) switchWorldLocal(index);
     }
 
+    // Notes List (`/note -l`, as the console's): the worlds with notes and each one's first
+    // line; Open edits it. The notes are the server's, so each world with notes is asked
+    // for (RequestNoteEditorState) and the list opens when all have answered, or after 3 s.
+    let notesListModalOpen = false;
+    let notesListSelected = 0;
+    let notesListEntries = [];
+    let notesListPending = null;  // { owed: Set of world indices, notes: {index: text}, timer }
+
+    function openNotesList() {
+        const owed = [];
+        worlds.forEach((w, i) => { if (w && w.settings && w.settings.has_notes) owed.push(i); });
+        if (!owed.length) {
+            appendClientLine('No worlds have notes. Use /note to create notes for the current world.', currentWorldIndex, 'system');
+            return;
+        }
+        if (notesListPending) clearTimeout(notesListPending.timer);
+        notesListPending = { owed: new Set(owed), notes: {}, timer: setTimeout(finishNotesList, 3000) };
+        owed.forEach(i => send({ type: 'RequestNoteEditorState', world_index: i }));
+    }
+
+    function finishNotesList() {
+        if (!notesListPending) return;
+        clearTimeout(notesListPending.timer);
+        const notes = notesListPending.notes;
+        notesListPending = null;
+        notesListEntries = Object.keys(notes).map(Number).sort((a, b) => a - b)
+            .filter(i => worlds[i] && notes[i].trim() !== '')
+            .map(i => {
+                const first = notes[i].split('\n')[0];
+                const chars = Array.from(first);
+                return { i, preview: chars.length > 50 ? chars.slice(0, 47).join('') + '...' : first };
+            });
+        if (!notesListEntries.length) {
+            appendClientLine('No worlds have notes. Use /note to create notes for the current world.', currentWorldIndex, 'system');
+            return;
+        }
+        notesListSelected = Math.max(0, notesListEntries.findIndex(e => e.i === currentWorldIndex));
+        notesListModalOpen = true;
+        renderNotesList();
+        elements.notesListModal.classList.add('visible');
+        elements.notesListContent.focus();
+    }
+
+    function renderNotesList() {
+        const list = elements.notesListList;
+        list.innerHTML = '';
+        notesListEntries.forEach((e, n) => {
+            const item = document.createElement('div');
+            item.className = 'menu-item' + (n === notesListSelected ? ' selected' : '');
+            item.dataset.world = String(e.i);
+            const name = document.createElement('span');
+            name.textContent = worlds[e.i] ? worlds[e.i].name : ('World ' + (e.i + 1));
+            const preview = document.createElement('span');
+            preview.className = 'recent-ago';
+            preview.textContent = e.preview;
+            item.append(name, preview);
+            list.appendChild(item);
+        });
+    }
+
+    function hideNotesListModal() {
+        notesListModalOpen = false;
+        elements.notesListModal.classList.remove('visible');
+        elements.input.focus();
+    }
+
+    function chooseNotesListEntry(index) {
+        hideNotesListModal();
+        if (worlds[index]) openNoteEditor(index);
+    }
+
     // Device mode modal
     let deviceModeModalOpen = false;
 
@@ -2788,8 +2872,20 @@
     }
 
     // Called when the winner socket closes (session disconnect after auth).
+    // `/quit` in a browser: disconnected for good (no reconnect), and the tab is the
+    // user's to close (a page may close only a tab a script opened).
+    var pageQuit = false;  // var: connect() may run before this line has
+    function quitPage() {
+        pageQuit = true;
+        try { if (ws) ws.close(); } catch (e) { /* already closed */ }
+        appendClientLine('Disconnected. You can close this tab.', currentWorldIndex, 'system');
+        try { window.close(); } catch (e) { /* not a script-opened tab */ }
+    }
+
     function handleSessionDisconnect(code, reason) {
         debugLog('Session disconnect: ' + code + ' ' + reason);
+        pictureConnectionLost();
+        if (pageQuit) return;
         if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
         // T1.11: forceReconnect() (below) already resets this mutex; without it here too,
         // a stale socket closing inside the wake-check window leaves wakeStateCleared stuck
@@ -3164,6 +3260,7 @@
     }
 
     function connect() {
+        if (pageQuit) return;  // /quit in a browser: no reconnect
         if (connectInProgress) {
             debugLog('connect(): already in progress, skipping duplicate call');
             return;
@@ -3431,6 +3528,11 @@
                 // Our ▶ ownership id for this session. Captured before the world hydration
                 // below so lineIsNew() is already correct for the first render.
                 myDisplayId = (typeof msg.your_display_id === 'number') ? msg.your_display_id : 0;
+                // The server substitutes TF variables for the expand_line key (ExpandLine).
+                serverExpandsLine = !!msg.expand_line;
+                // The server uploads pictures (Import Picture; InitialState.picture_upload).
+                serverPictureUpload = !!msg.picture_upload;
+                updateImportPictureMenu();
                 // TF's status area, per world, once a script has it (see 'TfStatus').
                 tfStatusViews = {};
                 (msg.tf_status || []).forEach(function(e) { tfStatusViews[e.world_index] = e.view; });
@@ -3851,6 +3953,7 @@
                     if (msg.settings.tts_voice) ttsVoice = msg.settings.tts_voice;
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
+                    if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
                     }
@@ -4757,6 +4860,7 @@
                     if (msg.settings.tts_voice) ttsVoice = msg.settings.tts_voice;
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
+                    if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
                     if (msg.settings.new_line_indicator !== undefined) {
                         const oldNli = newLineIndicator;
                         newLineIndicator = msg.settings.new_line_indicator;
@@ -5023,6 +5127,13 @@
                 break;
 
             case 'NoteEditorState':
+                // An answer for the Notes List (openNotesList) is the list's.
+                if (notesListPending && notesListPending.owed.has(msg.world_index)) {
+                    notesListPending.notes[msg.world_index] = msg.notes || '';
+                    notesListPending.owed.delete(msg.world_index);
+                    if (!notesListPending.owed.size) finishNotesList();
+                    break;
+                }
                 // Reply to RequestNoteEditorState (see noteMode handling above) —
                 // populate the note-editor window/tab with this world's current notes.
                 if (elements.noteEditorTextarea) {
@@ -5032,6 +5143,58 @@
                     elements.noteEditorTitle.textContent = 'Notes: ' + msg.world_name;
                 }
                 document.title = 'Clay - Notes: ' + msg.world_name;
+                break;
+
+            case 'InputOps':
+                applyInputOps(msg.ops);
+                break;
+
+            case 'PictureUploadAck':
+                // Import Picture: the server has this much of the picture going up.
+                pictureAck(msg.id, msg.received);
+                break;
+
+            case 'PictureUploaded':
+                // Import Picture: the picture is up (its link) or isn't (why).
+                pictureUploaded(msg.id, msg.url, msg.error);
+                break;
+
+            case 'SetTitle':
+                // TF's /xtitle, run here: this window's (tab's) title.
+                if (typeof msg.title === 'string') document.title = msg.title;
+                break;
+
+            case 'LimitOp':
+                applyLimitOp(msg);
+                break;
+
+            case 'OpenImport':
+                // An /import an action or macro ran on the server: the dialog, where the
+                // password is typed here.
+                showImportDialog(msg.addr || '');
+                break;
+
+            case 'FileEditorState':
+                // `/note <file>`: the file on the main instance's machine (user ruling
+                // 2026-10-16), edited in place like an MCP edit - it arrives from a
+                // message, not a click, so a new window/tab risks a popup blocker.
+                if (noteMode || mcpEditState || fileEditState) {
+                    appendClientLine('Editor is already open. Close it first.', currentWorldIndex, 'system');
+                    break;
+                }
+                enterFileEditMode(msg.path, msg.content || '');
+                break;
+
+            case 'FileSaved':
+                if (fileEditState && msg.path === fileEditState.path) {
+                    if (msg.ok) {
+                        exitFileEditMode();
+                        appendClientLine('Saved: ' + msg.path, currentWorldIndex, 'system');
+                    } else if (elements.noteEditorStatus) {
+                        elements.noteEditorStatus.textContent = 'Failed to save: ' + (msg.error || '');
+                        elements.noteEditorStatus.classList.add('visible');
+                    }
+                }
                 break;
 
             case 'McpEditOpen':
@@ -5044,7 +5207,7 @@
                 // either way it's an unprompted push blowing away whatever the
                 // user is actually looking at, unsaved notes included. Refuse
                 // rather than clobber.
-                if (noteMode) {
+                if (noteMode || fileEditState) {
                     debugLog('McpEditOpen ignored: a NOTE_MODE window is already showing');
                     recordClientEvent('mcpEditIgnoredNoteWindow', (msg && msg.name) || '');
                     break;
@@ -5132,6 +5295,10 @@
                 if (msg.world_index !== undefined && worlds[msg.world_index] && worlds[msg.world_index].settings) {
                     worlds[msg.world_index].settings.has_notes = !!msg.has_notes;
                     updateStatusBar();
+                }
+                // This note window's Save has been stored: it can close now.
+                if (noteSaveClose && msg.world_index === noteSaveClose.world_index) {
+                    closeNoteEditor();
                 }
                 break;
 
@@ -5228,8 +5395,11 @@
 
             case 'OpenWindow':
                 // In WebView mode, use IPC to spawn a new native WebView window
-                // (window.open doesn't produce a usable new window there).
-                if (window.WEBVIEW_MODE) {
+                // (window.open doesn't produce a usable new window there). The Android app
+                // opens a window of its own (WindowActivity) with the same query a tab gets.
+                if (window.Android && typeof window.Android.openWindow === 'function') {
+                    window.Android.openWindow(msg.world ? '?world=' + encodeURIComponent(msg.world) : '');
+                } else if (window.WEBVIEW_MODE) {
                     sendIpc('new-window:' + JSON.stringify({ world: msg.world || null, auth: inheritableAuth() }));
                 } else {
                     var worldParam = msg.world ? '?world=' + encodeURIComponent(msg.world) : '';
@@ -5362,8 +5532,11 @@
                 break;
 
             case 'ServerSpeak':
-                // Text-to-speech via Web Speech API
-                if (window.speechSynthesis && msg.text) {
+                // Text-to-speech: the Android app's (its WebView has no speechSynthesis),
+                // else the Web Speech API.
+                if (window.Android && typeof window.Android.speak === 'function' && msg.text) {
+                    window.Android.speak(msg.text);
+                } else if (window.speechSynthesis && msg.text) {
                     var utterance = new SpeechSynthesisUtterance(msg.text);
                     window.speechSynthesis.speak(utterance);
                 }
@@ -6764,7 +6937,11 @@
                 var grepWorld = grepWorldMatch ? grepWorldMatch[1] : null;
                 var grepRegexp = winArgs.includes('--regexp');
 
-                if (window.WEBVIEW_MODE) {
+                if (window.Android && typeof window.Android.openWindow === 'function') {
+                    window.Android.openWindow('?grep=' + encodeURIComponent(grepPattern)
+                        + (grepWorld ? '&world=' + encodeURIComponent(grepWorld) : '')
+                        + (grepRegexp ? '&regexp=1' : ''));
+                } else if (window.WEBVIEW_MODE) {
                     sendIpc('grep-window:' + JSON.stringify({
                         pattern: grepPattern,
                         world: grepWorld,
@@ -7357,7 +7534,11 @@
                 } else {
                     // /worlds <name> - server already connected if needed, switch local view.
                     // Same as -l above: the not-found case is handled server-side, not here.
-                    const name = args.join(' ');
+                    // TF's flags (`/world -q foo`, `-nf`) come back from an older server as
+                    // typed; they aren't part of the name.
+                    let rest = args.slice();
+                    while (rest.length > 1 && /^-[a-z]+$/i.test(rest[0])) rest.shift();
+                    const name = rest.join(' ');
                     const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
                     if (idx >= 0) switchWorldLocal(idx);
                 }
@@ -7379,19 +7560,30 @@
                 break;
 
             case '/note':
+                if (args.length === 1 && args[0] === '-l') {
+                    openNotesList();
+                    break;
+                }
                 if (args.length > 0) {
-                    appendClientLine("This form of /note is console-only. Plain /note opens the current world's notes.", currentWorldIndex, 'system');
+                    // `/note <file>` is the server's (the file is on its machine: it
+                    // answers with FileEditorState). Only a server from before that
+                    // sends it back here.
+                    appendClientLine('This server is too old to open its files with /note <file>; update it.', currentWorldIndex, 'system');
                     break;
                 }
                 openNoteEditor();
                 break;
 
             case '/quit':
-                // Close the window — use IPC for WebView GUI, window.close() for browser
+                // The desktop GUI closes; the Android app exits (its on-device server with
+                // it); a browser page can't close its own tab, so it disconnects and says
+                // so (user ruling 2026-10-16). The server keeps running for the others.
                 if (window.WEBVIEW_MODE) {
                     sendIpc('quit');
+                } else if (window.Android && window.Android.quitApp) {
+                    window.Android.quitApp();
                 } else {
-                    window.close();
+                    quitPage();
                 }
                 break;
 
@@ -7619,6 +7811,92 @@
         renderOutput();
     }
 
+    // TF's /limit, /unlimit and /relimit run by this client (LimitOp): its own filter (F4),
+    // as the console's /limit drives its own. This filter matches text (with * and ?): a
+    // pattern is shown as typed whatever its TF match style.
+    function applyLimitOp(msg) {
+        const showFilter = function(text) {
+            filterPopupOpen = true;
+            filterText = text;
+            lastFilterText = text;
+            elements.filterPopup.style.display = 'block';
+            elements.filterInput.value = text;
+            renderOutput();
+        };
+        if (msg.action === 'clear') {
+            if (filterPopupOpen) closeFilterPopup();
+        } else if (msg.action === 'reapply') {
+            if (lastFilterText) showFilter(lastFilterText);
+            else appendClientLine('No previous /limit to repeat.', currentWorldIndex, 'system');
+        } else {
+            showFilter(msg.pattern || '');
+        }
+    }
+
+    // This client's input line, sent with a key binding (RunKeyBinding.input) for its kb*
+    // functions, which read TF's keyboard buffer. The cursor is in characters.
+    function inputSnapshot() {
+        const v = elements.input.value;
+        return { buffer: v, cursor: Array.from(v.slice(0, elements.input.selectionStart)).length };
+    }
+
+    // What a TF command this client ran (/input, /grab, /dokey, the kb* functions) does to
+    // its input line (InputOps), in order - as the console applies its own
+    // (App::process_pending_keyboard_ops). Positions and counts are in characters.
+    function applyInputOps(ops) {
+        const el = elements.input;
+        const isWordChar = function(c) { return /[\p{L}\p{N}]/u.test(c); };
+        (ops || []).forEach(function(op) {
+            const chars = Array.from(el.value);
+            let pos = Math.min(Array.from(el.value.slice(0, el.selectionStart)).length, chars.length);
+            const put = function(cursor) {
+                el.value = chars.join('');
+                const offset = chars.slice(0, cursor).join('').length;
+                el.selectionStart = el.selectionEnd = offset;
+            };
+            switch (op.op) {
+                case 'Goto':
+                    put(Math.min(op.pos, chars.length));
+                    break;
+                case 'Delete':
+                    if (op.count > 0) {
+                        chars.splice(pos, op.count);
+                        put(pos);
+                    } else if (op.count < 0) {
+                        const start = Math.max(0, pos + op.count);
+                        chars.splice(start, pos - start);
+                        put(start);
+                    }
+                    break;
+                case 'WordLeft':
+                    while (pos > 0 && !isWordChar(chars[pos - 1])) pos--;
+                    while (pos > 0 && isWordChar(chars[pos - 1])) pos--;
+                    put(pos);
+                    break;
+                case 'WordRight':
+                    while (pos < chars.length && isWordChar(chars[pos])) pos++;
+                    while (pos < chars.length && !isWordChar(chars[pos])) pos++;
+                    put(pos);
+                    break;
+                case 'Insert': {
+                    const text = Array.from(op.text || '');
+                    // %insert off overwrites what follows the cursor instead.
+                    const replaced = op.insert ? 0 : Math.min(text.length, chars.length - pos);
+                    chars.splice.apply(chars, [pos, replaced].concat(text));
+                    put(pos + text.length);
+                    break;
+                }
+                case 'Action':
+                    dispatchAction(op.id);
+                    break;
+                case 'Submit':
+                    sendCommand();
+                    break;
+            }
+        });
+        el.dispatchEvent(new Event('input'));
+    }
+
     // Search popup functions (F5)
     function openSearchPopup() {
         searchPopupOpen = true;
@@ -7824,6 +8102,28 @@
         send({ type: 'RequestNoteEditorState', world_index: worldIndex });
     }
 
+    // A note Save waiting for the server's NotesChanged before its window closes:
+    // { world_index, timer } (the timer closes it anyway after 3 s).
+    let noteSaveClose = null;
+
+    // Leave the note editor (Save once saved, or Cancel). Android never actually
+    // opened a separate window (see enterNoteMode()), so it switches the current page
+    // back to the normal chat view; desktop/plain-web really did spawn one, so they
+    // close it (same IPC-vs-window.close() split as /quit).
+    function closeNoteEditor() {
+        if (noteSaveClose) {
+            clearTimeout(noteSaveClose.timer);
+            noteSaveClose = null;
+        }
+        if (window.Android) {
+            exitNoteMode();
+        } else if (window.WEBVIEW_MODE) {
+            sendIpc('close-window');
+        } else {
+            window.close();
+        }
+    }
+
     // Reverses enterNoteMode(): restore the normal chat view. Mirrors the
     // hide/restore pattern showAuthModal(false) already uses for the same set
     // of containers.
@@ -7873,6 +8173,37 @@
     // its own comment for why.
     function exitMcpEditMode() {
         mcpEditState = null;
+        leaveInPlaceEditor();
+    }
+
+    // `/note <file>` (FileEditorState): the file on the main instance's machine, in the
+    // same in-place editor as an MCP edit. Save sends SaveFile; the server's FileSaved
+    // closes it.
+    var fileEditState = null;  // { path }
+
+    function enterFileEditMode(path, content) {
+        fileEditState = { path: path };
+        const name = path.split(/[\\/]/).pop() || path;
+        if (elements.statusBar) elements.statusBar.style.display = 'none';
+        if (elements.inputContainer) elements.inputContainer.style.display = 'none';
+        if (elements.navBar) elements.navBar.style.display = 'none';
+        if (elements.outputContainer) elements.outputContainer.style.display = 'none';
+        if (elements.tabsRibbon) elements.tabsRibbon.style.display = 'none';
+        if (elements.iconBar) elements.iconBar.style.display = 'none';
+        if (elements.noteEditorView) elements.noteEditorView.style.display = 'flex';
+        if (elements.noteEditorTextarea) elements.noteEditorTextarea.value = content;
+        if (elements.noteEditorTitle) elements.noteEditorTitle.textContent = 'Edit: ' + name;
+        if (elements.noteEditorStatus) elements.noteEditorStatus.classList.remove('visible');
+        document.title = 'Clay - Edit: ' + name;
+    }
+
+    function exitFileEditMode() {
+        fileEditState = null;
+        leaveInPlaceEditor();
+    }
+
+    // Back from an in-place editor (MCP edit, `/note <file>`) to the normal view.
+    function leaveInPlaceEditor() {
         if (elements.noteEditorView) elements.noteEditorView.style.display = 'none';
         if (elements.statusBar) elements.statusBar.style.display = '';
         if (elements.inputContainer) elements.inputContainer.style.display = '';
@@ -7891,8 +8222,7 @@
     // switches the current page into note mode in place (see enterNoteMode()
     // for why: its WebView has no multi-window support). Shared by the /note
     // command and the status-bar note icon (both should behave identically).
-    // Only the no-args "current world" form is supported here; `/note -l` and
-    // `/note <file>` remain console-only (see plan doc for why).
+    // `/note -l` is openNotesList(); `/note <file>` is the server's (FileEditorState).
     // The credential a spawned window may inherit (see seedInheritedAuth).
     // Null in master GUI mode: every window there already gets AUTO_PASSWORD.
     function inheritableAuth() {
@@ -7993,15 +8323,16 @@
         }
     };
 
-    function openNoteEditor() {
-        if (!worlds[currentWorldIndex]) return;
+    function openNoteEditor(worldIndex) {
+        if (worldIndex === undefined) worldIndex = currentWorldIndex;
+        if (!worlds[worldIndex]) return;
         if (window.Android) {
-            enterNoteMode(currentWorldIndex);
+            enterNoteMode(worldIndex);
         } else if (window.WEBVIEW_MODE) {
-            var notePayload = { world_index: currentWorldIndex, world_name: worlds[currentWorldIndex].name, auth: inheritableAuth() };
+            var notePayload = { world_index: worldIndex, world_name: worlds[worldIndex].name, auth: inheritableAuth() };
             sendIpc('note-window:' + JSON.stringify(notePayload));
         } else {
-            var noteUrl = window.location.origin + basePath() + '/?note=' + currentWorldIndex;
+            var noteUrl = window.location.origin + basePath() + '/?note=' + worldIndex;
             window.open(noteUrl, '_blank');
         }
     }
@@ -8164,6 +8495,12 @@
             'ZWJ Sequence: For terminals that support combined',
             '  emoji (ZWJ). If unsupported, shows two separate',
             '  emoji instead of one combined one.', '',
+            'Picture Host: Where Import Picture uploads a picture',
+            '  (dragged onto the window or terminal, or chosen with',
+            '  Import Picture in the menu); its link goes into the',
+            '  input line. "+ URL shortening" runs the link through',
+            '  /url\'s shortening. Uploads are public. "Off" turns',
+            '  picture uploads off.', '',
             'Import Settings: copy settings, theme and keybindings',
             '  from another Clay (/import). Settings closes first;',
             '  the import replaces what it shows.'
@@ -11396,8 +11733,9 @@
             dlBtn.style.display = isAndroid ? '' : 'none';
             if (isAndroid) { dlBtn.disabled = true; dlBtn.style.opacity = '0.4'; }
         }
-        // Hide New Window on Android (can't open browser tabs from the app)
-        if (isAndroid) {
+        // Hide New Window in an Android app from before it could open windows (it can't open
+        // browser tabs).
+        if (isAndroid && !(window.Android && typeof window.Android.openWindow === 'function')) {
             document.querySelectorAll('[data-action="new-window"]').forEach(el => {
                 el.style.display = 'none';
             });
@@ -12013,6 +12351,236 @@
         input.selectionStart = input.selectionEnd = newPos;
     }
 
+    // ---- Import Picture (src/picture.rs) ----
+    // The server uploads a picture to its Settings' picture host and answers with the link,
+    // which goes into the input line at the caret. The page sends the file in chunks
+    // (PictureUpload; the server caps a frame at 256 KiB), at most PICTURE_WINDOW of them
+    // unacknowledged (PictureUploadAck) - Android's native socket refuses more than 16 MiB
+    // queued - and resends from the last ack when one is lost. One drop or one pick is a
+    // batch: its pictures go up one at a time and their links go in together.
+    const PICTURE_CHUNK = 96 * 1024;
+    const PICTURE_WINDOW = 8;
+    const PICTURE_MAX = 32 * 1024 * 1024;
+    const PICTURE_RESEND_MS = 10000;
+    const PICTURE_GIVE_UP_MS = 180000;
+    const PICTURE_OFF_MESSAGE = 'Picture uploads are off - choose a Picture Host in Settings (General).';
+    var pictureNextId = 1;
+    var pictureBatches = [];
+    var pictureCurrent = null;
+    var pictureTimer = null;
+
+    // Why pictures can't be uploaded right now, or null.
+    function picturesUnavailable() {
+        if (!serverPictureUpload) return "This server can't upload pictures - update it.";
+        if (pictureHost === 'off') return PICTURE_OFF_MESSAGE;
+        return null;
+    }
+
+    function updateImportPictureMenu() {
+        document.querySelectorAll('[data-action="import-picture"]').forEach(function(item) {
+            item.style.display = serverPictureUpload ? '' : 'none';
+        });
+    }
+
+    function pictureSizeLabel(bytes) {
+        if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        if (bytes >= 1024) return Math.ceil(bytes / 1024) + ' KB';
+        return bytes + ' bytes';
+    }
+
+    // Menu > Import Picture: the browser's (or the Android app's) picture picker.
+    function openPicturePicker() {
+        const why = picturesUnavailable();
+        if (why) { appendClientLine(why); return; }
+        const input = elements.pictureFileInput;
+        if (!input) return;
+        input.value = '';
+        input.click();
+    }
+
+    // Pictures from a drop or the picker: one batch.
+    function importPictures(fileList) {
+        const files = Array.prototype.slice.call(fileList || []);
+        if (!files.length) return;
+        const why = picturesUnavailable();
+        if (why) { appendClientLine(why); return; }
+        const pictures = [];
+        files.forEach(function(f) {
+            const name = f.name || 'picture';
+            const looksLikePicture = (f.type && f.type.indexOf('image/') === 0) ||
+                /\.(png|jpe?g|gif|webp|bmp|tiff?|avif|heic|heif)$/i.test(name);
+            if (!looksLikePicture) {
+                appendClientLine(name + " isn't a picture.");
+            } else if (f.size > PICTURE_MAX) {
+                appendClientLine(name + ' is ' + pictureSizeLabel(f.size) + '; pictures over ' + pictureSizeLabel(PICTURE_MAX) + " can't be uploaded.");
+            } else {
+                pictures.push(f);
+            }
+        });
+        if (!pictures.length) return;
+        pictureBatches.push({ files: pictures, links: [] });
+        if (!pictureCurrent) pictureStartNext();
+    }
+
+    function pictureStartNext() {
+        while (pictureBatches.length) {
+            const batch = pictureBatches[0];
+            if (batch.files.length) {
+                const file = batch.files.shift();
+                pictureCurrent = { id: pictureNextId++, file: file, name: file.name || 'picture', size: file.size,
+                                   sent: 0, acked: 0, lastProgress: Date.now(), reading: false };
+                if (!pictureTimer) pictureTimer = setInterval(guard('pictureTick', pictureTick), 1000);
+                pictureSendDue();
+                return;
+            }
+            pictureBatches.shift();
+            if (batch.links.length) insertPictureLinks(batch.links.join(' '));
+        }
+        if (pictureTimer) { clearInterval(pictureTimer); pictureTimer = null; }
+    }
+
+    function bytesToBase64(bytes) {
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(bin);
+    }
+
+    // Send the chunks the ack window allows, one read at a time so they go in order.
+    function pictureSendDue() {
+        const cur = pictureCurrent;
+        if (!cur || cur.reading) return;
+        if (cur.sent >= cur.size || cur.sent - cur.acked >= PICTURE_WINDOW * PICTURE_CHUNK) return;
+        const start = cur.sent;
+        const end = Math.min(start + PICTURE_CHUNK, cur.size);
+        cur.reading = true;
+        cur.file.slice(start, end).arrayBuffer().then(function(buf) {
+            cur.reading = false;
+            if (pictureCurrent !== cur) return;
+            if (cur.sent !== start) { pictureSendDue(); return; }  // a resend moved it back
+            const ok = send({ type: 'PictureUpload', id: cur.id, name: cur.name, size: cur.size, offset: start,
+                              data: bytesToBase64(new Uint8Array(buf)), last: end === cur.size });
+            if (!ok) { pictureFailed(cur, 'not connected'); return; }
+            cur.sent = end;
+            pictureSendDue();
+        }, function(err) {
+            cur.reading = false;
+            pictureFailed(cur, "couldn't read it (" + err + ')');
+        });
+    }
+
+    function pictureFailed(cur, why) {
+        if (pictureCurrent !== cur) return;
+        pictureCurrent = null;
+        appendClientLine("Couldn't upload " + cur.name + ': ' + why);
+        pictureStartNext();
+    }
+
+    function pictureAck(id, received) {
+        const cur = pictureCurrent;
+        if (!cur || cur.id !== id) return;
+        received = Math.min(received || 0, cur.size);
+        if (received > cur.acked) { cur.acked = received; cur.lastProgress = Date.now(); }
+        if (received > cur.sent) cur.sent = received;
+        pictureSendDue();
+    }
+
+    function pictureUploaded(id, url, error) {
+        const cur = pictureCurrent;
+        if (!cur || cur.id !== id) return;
+        pictureCurrent = null;
+        if (url) {
+            if (pictureBatches.length) pictureBatches[0].links.push(url);
+        } else {
+            appendClientLine("Couldn't upload " + cur.name + ': ' + (error || 'the server gave no reason'));
+        }
+        pictureStartNext();
+    }
+
+    // Resend after a lost ack; give up when the server never answers.
+    function pictureTick() {
+        const cur = pictureCurrent;
+        if (!cur) return;
+        const now = Date.now();
+        if (now - cur.lastProgress >= PICTURE_GIVE_UP_MS) {
+            pictureFailed(cur, "the server didn't answer.");
+        } else if (cur.sent > cur.acked && now - cur.lastProgress >= PICTURE_RESEND_MS) {
+            cur.sent = cur.acked;
+            cur.lastProgress = now;
+            pictureSendDue();
+        }
+    }
+
+    function pictureConnectionLost() {
+        if (!pictureCurrent && !pictureBatches.length) return;
+        pictureCurrent = null;
+        pictureBatches = [];
+        if (pictureTimer) { clearInterval(pictureTimer); pictureTimer = null; }
+        appendClientLine('Picture upload interrupted (connection lost).');
+    }
+
+    // A batch's links at the caret, without touching the text around them (a space where a
+    // neighbour isn't one); the caret ends at the first link's start. Selected text stays:
+    // the links go in at the selection's end. In a live shell world they go to the shell.
+    function insertPictureLinks(links) {
+        const world = worlds[currentWorldIndex];
+        if (world && world.shell && world.shell.live) {
+            send({ type: 'ShellInput', world_index: currentWorldIndex, text: links, paste: true });
+            return;
+        }
+        const input = elements.input;
+        const value = input.value;
+        const pos = input.selectionEnd == null ? value.length : input.selectionEnd;
+        const before = pos > 0 ? value.charAt(pos - 1) : '';
+        const after = pos < value.length ? value.charAt(pos) : '';
+        const pre = before !== '' && !/\s/.test(before);
+        const post = after !== '' && !/\s/.test(after);
+        input.value = value.slice(0, pos) + (pre ? ' ' : '') + links + (post ? ' ' : '') + value.slice(pos);
+        const start = pos + (pre ? 1 : 0);
+        input.selectionStart = input.selectionEnd = start;
+        input.dispatchEvent(new Event('input'));
+        input.selectionStart = input.selectionEnd = start;
+    }
+
+    // Files dragged over the page: a picture dropped anywhere is imported, and the browser
+    // (or WebView) never navigates away to the file.
+    function dragCarriesFiles(e) {
+        const types = e.dataTransfer && e.dataTransfer.types;
+        return !!types && Array.prototype.indexOf.call(types, 'Files') !== -1;
+    }
+    var pictureDragDepth = 0;
+    window.addEventListener('dragenter', function(e) {
+        if (!dragCarriesFiles(e)) return;
+        e.preventDefault();
+        pictureDragDepth++;
+        document.body.classList.add('picture-drag');
+    });
+    window.addEventListener('dragover', function(e) {
+        if (!dragCarriesFiles(e)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+    });
+    window.addEventListener('dragleave', function(e) {
+        if (!dragCarriesFiles(e)) return;
+        pictureDragDepth = Math.max(0, pictureDragDepth - 1);
+        if (!pictureDragDepth) document.body.classList.remove('picture-drag');
+    });
+    window.addEventListener('drop', guard('pictureDrop', function(e) {
+        if (!dragCarriesFiles(e)) return;
+        e.preventDefault();
+        pictureDragDepth = 0;
+        document.body.classList.remove('picture-drag');
+        // Only a window with an input line imports (not a /window --grep or a popup window).
+        if (grepMode || popupWindowMode) return;
+        importPictures(e.dataTransfer.files);
+    }));
+    if (elements.pictureFileInput) {
+        elements.pictureFileInput.addEventListener('change', guard('pictureFileInput', function() {
+            importPictures(this.files);
+        }));
+    }
+
     // Build the pattern rows in the inline action editor (patterns is a simple string array)
     function renderActionPatternRows(patterns) {
         const container = elements.actionPatternsContainer;
@@ -12308,6 +12876,7 @@
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'kokoro' ? 'Kokoro' : ttsMode === 'edge' ? 'Edge' : 'Off';
         setupTabsMode = tabsMode;
         setupIconBarMode = iconBarMode;
+        setupPictureHost = pictureHost || 'catbox';
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupKeyboardAlwaysVisible = keyboardAlwaysVisible;
@@ -12421,6 +12990,10 @@
             elements.setupIconBarSelect.value = setupIconBarMode;
             updateCustomDropdown(elements.setupIconBarSelect);
         }
+        if (elements.setupPictureHostSelect) {
+            elements.setupPictureHostSelect.value = setupPictureHost;
+            updateCustomDropdown(elements.setupPictureHostSelect);
+        }
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
         } else {
@@ -12529,6 +13102,8 @@
             tts_voice: ttsVoice,
             tabs: tabsMode,
             icon_bar: iconBarMode,
+            // null = unchanged (a server from before Import Picture sent none).
+            picture_host: pictureHost || null,
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
@@ -12655,6 +13230,7 @@
         }
         applyTabsMode(setupTabsMode);
         applyIconBarMode(setupIconBarMode);
+        if (pictureHost) pictureHost = setupPictureHost;
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         keyboardAlwaysVisible = setupKeyboardAlwaysVisible;
@@ -13978,7 +14554,7 @@
 
     // Check if any popup is open
     function isAnyPopupOpen() {
-        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || settingsPopupOpen || recentWorldsModalOpen;
+        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || settingsPopupOpen || recentWorldsModalOpen || notesListModalOpen;
     }
 
     // Check if a world should be included in cycling (connected OR has activity)
@@ -15072,6 +15648,9 @@
             // half-typed) line to the MUD - actively harmful, not just unhelpful. No-op
             // here rather than either of those; see this job's own report for detail.
             case 'expand_line':
+                // TF's variables are the server's: it substitutes them into this input line
+                // and sends it back (SetInputBuffer). An older server can't.
+                if (serverExpandsLine) send({ type: 'ExpandLine', text: elements.input.value });
                 return true;
             case 'tab_key': {
                 noteUserScrollIntent();
@@ -15575,6 +16154,21 @@
             case 'setup':
                 openSettingsPopup('general');
                 break;
+            case 'recent_worlds':
+                showRecentWorldsModal();
+                break;
+            case 'notes':
+                openNoteEditor();
+                break;
+            case 'notes-list':
+                openNotesList();
+                break;
+            case 'emoji_picker':
+                if (!emojiPopupOpen) openEmojiPopup();
+                break;
+            case 'import-picture':
+                openPicturePicker();
+                break;
             case 'import':
                 showImportDialog('');
                 break;
@@ -15615,7 +16209,12 @@
                 break;
             case 'new-window':
                 // The desktop GUI opens another GUI window (as /window and OpenWindow do);
-                // window.open there would hand the URL to the system browser.
+                // window.open there would hand the URL to the system browser. The Android app
+                // opens a window of its own.
+                if (window.Android && typeof window.Android.openWindow === 'function') {
+                    window.Android.openWindow('');
+                    break;
+                }
                 if (window.WEBVIEW_MODE) {
                     sendIpc('new-window:' + JSON.stringify({ world: null, auth: inheritableAuth() }));
                     break;
@@ -16564,7 +17163,7 @@
                     const kb = kbnum; clearKbnum();
                     e.preventDefault();
                     e.stopPropagation();
-                    send({ type: 'RunKeyBinding', key: keyName, kbnum: kb });
+                    send({ type: 'RunKeyBinding', key: keyName, kbnum: kb, input: inputSnapshot() });
                     return;
                 }
                 const action = lookupBinding(keyName);
@@ -16892,6 +17491,25 @@
                 return;
             }
 
+            // Notes List
+            if (notesListModalOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    hideNotesListModal();
+                } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    if (notesListEntries.length) {
+                        notesListSelected = (notesListSelected + (e.key === 'ArrowUp' ? -1 : 1) + notesListEntries.length) % notesListEntries.length;
+                        renderNotesList();
+                    }
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (notesListEntries[notesListSelected]) chooseNotesListEntry(notesListEntries[notesListSelected].i);
+                    else hideNotesListModal();
+                }
+                return;
+            }
+
             // Handle world selector popup
             if (worldSelectorPopupOpen) {
                 if (e.key === 'Escape') {
@@ -16933,7 +17551,7 @@
                         const kb = kbnum; clearKbnum();
                         e.preventDefault();
                         e.stopPropagation();
-                        send({ type: 'RunKeyBinding', key: name, kbnum: kb });
+                        send({ type: 'RunKeyBinding', key: name, kbnum: kb, input: inputSnapshot() });
                         // R13: don't steal focus back if the bound key just opened
                         // the emoji popup - openEmojiPopup() already put DOM focus
                         // on elements.emojiSearch, and the popup owns the keyboard
@@ -17033,7 +17651,7 @@
                 const kb = kbnum; clearKbnum();
                 e.preventDefault();
                 e.stopPropagation();
-                send({ type: 'RunKeyBinding', key: keyName, kbnum: kb });
+                send({ type: 'RunKeyBinding', key: keyName, kbnum: kb, input: inputSnapshot() });
                 return;
             }
 
@@ -17388,6 +18006,11 @@
                 setupIconBarMode = this.value;
             };
         }
+        if (elements.setupPictureHostSelect) {
+            elements.setupPictureHostSelect.onchange = function() {
+                setupPictureHost = this.value;
+            };
+        }
         elements.setupTlsProxyToggle.onclick = function() {
             setupTlsProxy = !setupTlsProxy;
             updateSetupPopupUI();
@@ -17465,9 +18088,13 @@
         elements.settingsSaveBtn.onclick = saveSettingsAll;
         elements.settingsCancelBtn.onclick = closeSettingsPopup;
 
-        // Note editor (NOTE_MODE only): save current world's notes and show a
-        // brief confirmation. Save itself never closes the window — Cancel
-        // (below) is the deliberate way to back out, whether or not you saved.
+        // Note editor (NOTE_MODE only): Save saves the world's notes and closes the
+        // editor, in every interface (user ruling 2026-10-16; it used to stay open
+        // with a "Saved" flash). A separate window/tab closes once the server says the
+        // notes are saved (NotesChanged), so the window can't take an unsent message
+        // with it; Android's editor is the main page, whose connection stays, so it
+        // closes at once. Not connected: nothing was sent, so the editor stays open
+        // with the edits. MCP simpleedit's Save closes it the same way once sent.
         if (elements.noteEditorSaveBtn) {
             elements.noteEditorSaveBtn.onclick = function() {
                 // MCP simpleedit (plan Job 15) is checked first. This used to claim
@@ -17479,43 +18106,65 @@
                 // MCP edit session is already open, leaving both set. This branch
                 // ordering is what makes MCP simpleedit win if that happens.
                 if (mcpEditState) {
-                    send({
+                    // Sent, the editor closes, as the console's Ctrl+S does; not connected,
+                    // nothing was sent and it stays open with the edits.
+                    const mcpSent = send({
                         type: 'McpEditSet',
                         world_index: mcpEditState.world_index,
                         reference: mcpEditState.reference,
                         edit_type: mcpEditState.edit_type,
                         content: elements.noteEditorTextarea.value
                     });
-                    if (elements.noteEditorStatus) {
-                        elements.noteEditorStatus.textContent = 'Sent';
+                    if (mcpSent) {
+                        exitMcpEditMode();
+                    } else if (elements.noteEditorStatus) {
+                        elements.noteEditorStatus.textContent = 'Not connected - not sent';
                         elements.noteEditorStatus.classList.add('visible');
                         setTimeout(function() {
                             elements.noteEditorStatus.classList.remove('visible');
-                        }, 1500);
+                        }, 3000);
+                    }
+                    return;
+                }
+                if (fileEditState) {
+                    const fileSent = send({ type: 'SaveFile', path: fileEditState.path, content: elements.noteEditorTextarea.value });
+                    if (elements.noteEditorStatus) {
+                        elements.noteEditorStatus.textContent = fileSent ? 'Saving...' : 'Not connected - not saved';
+                        elements.noteEditorStatus.classList.add('visible');
                     }
                     return;
                 }
                 if (!noteMode) return;
-                send({
+                const worldIndex = noteMode.world_index;
+                const sent = send({
                     type: 'UpdateNote',
-                    world_index: noteMode.world_index,
+                    world_index: worldIndex,
                     notes: elements.noteEditorTextarea.value
                 });
-                if (elements.noteEditorStatus) {
-                    elements.noteEditorStatus.textContent = 'Saved';
-                    elements.noteEditorStatus.classList.add('visible');
-                    setTimeout(function() {
-                        elements.noteEditorStatus.classList.remove('visible');
-                    }, 1500);
+                if (!sent) {
+                    if (elements.noteEditorStatus) {
+                        elements.noteEditorStatus.textContent = 'Not connected - not saved';
+                        elements.noteEditorStatus.classList.add('visible');
+                        setTimeout(function() {
+                            elements.noteEditorStatus.classList.remove('visible');
+                        }, 3000);
+                    }
+                    return;
                 }
+                if (window.Android) {
+                    closeNoteEditor();
+                    return;
+                }
+                if (elements.noteEditorStatus) {
+                    elements.noteEditorStatus.textContent = 'Saving...';
+                    elements.noteEditorStatus.classList.add('visible');
+                }
+                if (noteSaveClose) clearTimeout(noteSaveClose.timer);
+                noteSaveClose = { world_index: worldIndex, timer: setTimeout(closeNoteEditor, 3000) };
             };
         }
 
-        // Cancel: discard any unsaved edits and leave note mode. Android
-        // never actually opened a separate window (see enterNoteMode()), so
-        // it just switches the current page back to the normal chat view;
-        // desktop/plain-web really did spawn one, so they close it (same
-        // IPC-vs-window.close() split as /quit).
+        // Cancel: discard any unsaved edits and leave note mode (closeNoteEditor).
         if (elements.noteEditorCancelBtn) {
             elements.noteEditorCancelBtn.onclick = function() {
                 // MCP simpleedit is always the in-place overlay, regardless of
@@ -17523,12 +18172,10 @@
                 // opens a real window/tab to begin with.
                 if (mcpEditState) {
                     exitMcpEditMode();
-                } else if (window.Android) {
-                    exitNoteMode();
-                } else if (window.WEBVIEW_MODE) {
-                    sendIpc('close-window');
+                } else if (fileEditState) {
+                    exitFileEditMode();
                 } else {
-                    window.close();
+                    closeNoteEditor();
                 }
             };
         }
@@ -17795,6 +18442,18 @@
         if (elements.recentWorldsModal) {
             elements.recentWorldsModal.onclick = function(e) {
                 if (e.target === elements.recentWorldsModal) hideRecentWorldsModal();
+            };
+        }
+        // Notes List: click a world to edit its notes, click outside to close
+        if (elements.notesListList) {
+            elements.notesListList.onclick = function(e) {
+                const item = e.target.closest('.menu-item');
+                if (item && item.dataset.world !== undefined) chooseNotesListEntry(parseInt(item.dataset.world, 10));
+            };
+        }
+        if (elements.notesListModal) {
+            elements.notesListModal.onclick = function(e) {
+                if (e.target === elements.notesListModal) hideNotesListModal();
             };
         }
 

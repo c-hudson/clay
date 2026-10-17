@@ -119,6 +119,22 @@ impl Editor {
         self.completion = None;
     }
 
+    /// Import Picture's links: in at the cursor without touching the text around them
+    /// (`picture::link_insertion`; selected text stays, the links go in at its end), the
+    /// cursor left at the first link's start.
+    pub fn insert_link(&mut self, link: &str) {
+        if let Some(sel) = self.selection() {
+            self.cursor = sel.end;
+        }
+        self.anchor = None;
+        let before = self.text[..self.cursor].chars().next_back();
+        let after = self.text[self.cursor..].chars().next();
+        let (text, at) = crate::picture::link_insertion(before, after, link);
+        let start = self.cursor + at;
+        self.insert(&text);
+        self.cursor = start;
+    }
+
     /// A typed character with %insert off: replaces the character under the cursor.
     pub fn overwrite(&mut self, s: &str) {
         let end = if self.selection().is_some() { None } else { Some(self.next_boundary(self.cursor)) };
@@ -128,6 +144,37 @@ impl Editor {
         }
         self.last_was_delete = false;
         self.completion = None;
+    }
+
+    /// One step of the `InputOps` a TF command this client ran sends (`/input`, `/grab`, the
+    /// kb* functions), on this line, as the console applies its own. Positions and counts
+    /// are in characters. False for a step that isn't text (an action, Submit): the
+    /// window runs those.
+    pub fn apply_input_op(&mut self, op: &crate::websocket::InputOp) -> bool {
+        use crate::websocket::InputOp;
+        let byte_at = |text: &str, chars: usize| text.char_indices().nth(chars).map_or(text.len(), |(b, _)| b);
+        let here = self.text[..self.cursor.min(self.text.len())].chars().count();
+        match op {
+            InputOp::Goto { pos } => self.set_cursor(byte_at(&self.text, *pos), false),
+            InputOp::Delete { count } if *count > 0 => {
+                let end = byte_at(&self.text, here + *count as usize);
+                self.splice(self.cursor..end, "");
+            }
+            InputOp::Delete { count } => {
+                let start = byte_at(&self.text, here.saturating_sub(count.unsigned_abs() as usize));
+                self.splice(start..self.cursor, "");
+            }
+            InputOp::WordLeft => self.word_left(1),
+            InputOp::WordRight => self.word_right(1),
+            InputOp::Insert { text, insert: true } => self.splice(self.cursor..self.cursor, text),
+            // %insert off: what follows the cursor is overwritten.
+            InputOp::Insert { text, insert: false } => {
+                let end = byte_at(&self.text, here + text.chars().count());
+                self.splice(self.cursor..end, text);
+            }
+            InputOp::Action { .. } | InputOp::Submit => return false,
+        }
+        true
     }
 
     pub fn clear(&mut self) {

@@ -9817,7 +9817,7 @@ third
             String::new(), String::new(), ws_password.to_string(),
             false, String::new(), true, true, false,
             "off".to_string(), "off".to_string(), String::new(), false, false, true,
-            "none".to_string(), "app_tablet".to_string(),
+            "none".to_string(), "app_tablet".to_string(), None,
         );
     }
 
@@ -16151,7 +16151,7 @@ third
         let parsed = serde_json::from_str::<WsMessage>(r#"{"type":"RunKeyBinding","key":"^X"}"#);
         assert!(parsed.is_ok(), "kbnum must default to None when the peer omits it: {parsed:?}");
         match parsed.unwrap() {
-            WsMessage::RunKeyBinding { key, kbnum } => {
+            WsMessage::RunKeyBinding { key, kbnum, .. } => {
                 assert_eq!(key, "^X");
                 assert_eq!(kbnum, None);
             }
@@ -16202,6 +16202,7 @@ third
         let action = app.handle_ws_client_msg(client_id, WsMessage::RunKeyBinding {
             key: "Esc-x".to_string(),
             kbnum: Some(7),
+            input: None,
         }, &event_tx);
         assert!(matches!(action, WsAsyncAction::Done));
 
@@ -16220,6 +16221,7 @@ third
         let action2 = app.handle_ws_client_msg(client_id, WsMessage::RunKeyBinding {
             key: "Esc-y".to_string(),
             kbnum: Some(9),
+            input: None,
         }, &event_tx);
         assert!(matches!(action2, WsAsyncAction::Done));
         assert_eq!(app.tf_engine.get_var("kbnum_seen").map(|v| v.to_string_value()), Some("9".to_string()),
@@ -16238,6 +16240,7 @@ third
         let action = app.handle_ws_client_msg(99, WsMessage::RunKeyBinding {
             key: "Esc-x".to_string(),
             kbnum: None,
+            input: None,
         }, &event_tx);
 
         assert!(matches!(action, WsAsyncAction::Done));
@@ -19895,4 +19898,411 @@ async fn quitting_ends_the_tls_proxies() {
     let status = proxy.wait().unwrap();
     assert!(!status.success(), "the proxy was ended, not left to finish: {status}");
     assert!(!socket.exists(), "its socket file is gone");
+}
+
+/// A server with no console (a GUI master, the Android app's `--local-server`, `-D`) never
+/// opens the console's editor for an MCP edit: it used to, invisibly, and then refused every
+/// later edit as "already open". Each edit is still sent to the clients.
+#[test]
+fn a_server_without_a_console_passes_every_mcp_edit_on() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("moo"));
+    assert!(!app.console_tui);
+    for content in ["first", "second"] {
+        app.handle_mcp_event(0, mcp::McpEvent::SimpleEditContent {
+            reference: "#1.desc".into(),
+            name: "Room".into(),
+            edit_type: mcp::SimpleEditType::StringList,
+            content: content.into(),
+        });
+    }
+    assert!(!app.editor.visible, "no console, no console editor");
+    assert!(
+        !app.worlds[0].output_lines.iter().any(|l| l.text.contains("already open")),
+        "the second edit was not refused"
+    );
+    // The console master still opens its own editor.
+    let mut console = App::new();
+    console.worlds.clear();
+    console.worlds.push(World::new("moo"));
+    console.console_tui = true;
+    console.handle_mcp_event(0, mcp::McpEvent::SimpleEditContent {
+        reference: "#1.desc".into(),
+        name: "Room".into(),
+        edit_type: mcp::SimpleEditType::Str,
+        content: "x".into(),
+    });
+    assert!(console.editor.visible);
+}
+
+/// A client's `/note <file>` (either server handler): the file on this machine goes to that
+/// client, its SaveFile writes it, and `/restrict file` refuses both.
+#[test]
+fn a_clients_note_file_is_read_and_written_on_the_server() {
+    let path = std::env::temp_dir().join(format!("clay-ws-note-{}.txt", std::process::id()));
+    std::fs::write(&path, "on the server").unwrap();
+    let path_s = path.to_string_lossy().to_string();
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("w"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.gui_tx = Some(tx);
+    app.ws_open_file_for_client(0, 0, &path_s);
+    match rx.try_recv() {
+        Ok(WsMessage::FileEditorState { path, content }) => {
+            assert_eq!(path, path_s);
+            assert_eq!(content, "on the server");
+        }
+        other => panic!("expected FileEditorState, got {other:?}"),
+    }
+    app.ws_save_file_for_client(0, path_s.clone(), "edited".into());
+    assert!(matches!(rx.try_recv(), Ok(WsMessage::FileSaved { ok: true, .. })));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+    app.tf_engine.restrict_level = tf::RestrictLevel::File;
+    app.ws_save_file_for_client(0, path_s.clone(), "nope".into());
+    assert!(matches!(rx.try_recv(), Ok(WsMessage::FileSaved { ok: false, .. })));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The console master's own handler (A): a client's TF /input acts on that client's input
+/// line (InputOps), never the console's, and a user macro named like a Clay command runs
+/// for a client as it would at the console.
+#[test]
+fn a_clients_commands_on_the_console_master_are_its_own() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("w"));
+    let (gui_tx, mut gui_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.gui_tx = Some(gui_tx);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+    app.input.buffer = "console text".into();
+    app.input.cursor_position = app.input.buffer.len();
+    let _ = app.handle_ws_client_msg(0, WsMessage::SendCommand { world_index: 0, command: "/input hi".into() }, &event_tx);
+    let mut got = Vec::new();
+    while let Ok(m) = gui_rx.try_recv() {
+        got.push(m);
+    }
+    assert!(got.iter().any(|m| matches!(m, WsMessage::InputOps { ops }
+        if matches!(ops.as_slice(), [websocket::InputOp::Insert { text, .. }] if text == "hi"))), "{got:?}");
+    assert_eq!(app.input.buffer, "console text", "the console's input is not the client's");
+    assert!(app.tf_engine.pending_keyboard_ops.is_empty());
+
+    let _ = app.handle_ws_client_msg(0, WsMessage::SendCommand { world_index: 0, command: "/def dump = /echo my dump macro".into() }, &event_tx);
+    let _ = app.handle_ws_client_msg(0, WsMessage::SendCommand { world_index: 0, command: "/dump".into() }, &event_tx);
+    assert!(app.worlds[0].output_lines.iter().any(|l| l.text.contains("my dump macro")));
+}
+
+/// Which typed client lines TF takes first (App::client_line_for_tf), as at the console.
+#[test]
+fn client_lines_for_tf_are_the_consoles() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("w"));
+    assert_eq!(app.client_line_for_tf(0, "/10 *orc*").as_deref(), Some("/recall /10 *orc*"));
+    assert_eq!(app.client_line_for_tf(0, "/l -s").as_deref(), Some("/l -s"));
+    assert_eq!(app.client_line_for_tf(0, "/l"), None, "bare /l is the client's own list");
+    assert_eq!(app.client_line_for_tf(0, "/flush"), None, "no macro: Clay's");
+    app.tf_engine.macros.push(tf::TfMacro { name: "flush".into(), ..Default::default() });
+    assert_eq!(app.client_line_for_tf(0, "/flush").as_deref(), Some("/flush"), "a macro of that name: TF's");
+    assert_eq!(app.client_line_for_tf(0, "//flush"), None, "the // form is left alone");
+    assert_eq!(app.client_line_for_tf(0, "look"), None, "plain text is never routed here");
+    app.worlds[0].protocol.echo_masked = true;
+    assert_eq!(app.client_line_for_tf(0, "/flush"), None, "never at a password prompt");
+}
+
+/// A picture file for Import Picture tests, in this process's temp dir.
+fn picture_file(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("clay-import-picture-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, crate::picture::test_png()).unwrap();
+    path
+}
+
+/// The next `AppEvent::PictureUploaded`, from the upload's own task.
+async fn next_picture_event(rx: &mut tokio::sync::mpsc::Receiver<AppEvent>) -> AppEvent {
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the upload finished")
+            .expect("the channel is open");
+        if matches!(event, AppEvent::PictureUploaded { .. }) {
+            return event;
+        }
+    }
+}
+
+/// Import Picture in handler A (the console master) and handler B (GUI masters, Android,
+/// `-D`): a client's chunks are acknowledged one by one, the server says it's uploading,
+/// and the link comes back to that client - never into the console's input line.
+#[tokio::test]
+async fn a_clients_picture_is_uploaded_and_its_link_sent_back_in_both_handlers() {
+    use base64::Engine;
+    crate::picture::test_host();
+    let chunk = crate::picture::CHUNK_BYTES;
+    let mut bytes = crate::picture::test_png();
+    bytes.resize(chunk + 10, 3);
+    let len = bytes.len();
+    for handler_b in [false, true] {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("w"));
+        let (gui_tx, mut gui_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.gui_tx = Some(gui_tx);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        app.event_tx = Some(event_tx.clone());
+        for (start, end, last) in [(0, chunk, false), (chunk, len, true)] {
+            let msg = WsMessage::PictureUpload {
+                id: 5,
+                name: "cat.png".into(),
+                size: len as u64,
+                offset: start as u64,
+                data: base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]),
+                last,
+            };
+            if handler_b {
+                crate::daemon::handle_daemon_ws_message(&mut app, 0, msg, &event_tx).await;
+            } else {
+                let _ = app.handle_ws_client_msg(0, msg, &event_tx);
+            }
+        }
+        let mut got = Vec::new();
+        while let Ok(m) = gui_rx.try_recv() {
+            got.push(m);
+        }
+        assert!(got.iter().any(|m| matches!(m, WsMessage::PictureUploadAck { id: 5, received } if *received == chunk as u64)), "{got:?}");
+        assert!(got.iter().any(|m| matches!(m, WsMessage::PictureUploadAck { id: 5, received } if *received == len as u64)), "{got:?}");
+        assert!(got.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.starts_with("Uploading cat.png (") && data.ends_with("to catbox.moe..."))), "{got:?}");
+        let event = next_picture_event(&mut event_rx).await;
+        assert!(app.preprocess_event(event).is_none());
+        match gui_rx.try_recv() {
+            Ok(WsMessage::PictureUploaded { id: 5, url: Some(url), error: None }) => {
+                assert!(url.starts_with("https://pics.example/") && url.ends_with(".png"), "{url}");
+            }
+            other => panic!("expected the link, got {other:?}"),
+        }
+        assert!(app.input.buffer.is_empty(), "never the console's input line");
+    }
+}
+
+/// A client's message to handler A (the console master) or B (GUI masters, Android, `-D`).
+async fn send_to_handler(app: &mut App, handler_b: bool, msg: WsMessage, event_tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+    if handler_b {
+        crate::daemon::handle_daemon_ws_message(app, 0, msg, event_tx).await;
+    } else {
+        let _ = app.handle_ws_client_msg(0, msg, event_tx);
+    }
+}
+
+/// Import Picture: what isn't a picture, or a server with uploads Off, is refused with the
+/// reason, in both handlers.
+#[tokio::test]
+async fn a_clients_picture_is_refused_when_off_or_not_a_picture() {
+    use base64::Engine;
+    for handler_b in [false, true] {
+        let mut app = App::new();
+        let (gui_tx, mut gui_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.gui_tx = Some(gui_tx);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let text = b"hello, not a picture";
+        let msg = |id| WsMessage::PictureUpload {
+            id,
+            name: "notes.png".into(),
+            size: text.len() as u64,
+            offset: 0,
+            data: base64::engine::general_purpose::STANDARD.encode(text),
+            last: true,
+        };
+        send_to_handler(&mut app, handler_b, msg(1), &event_tx).await;
+        let mut got = Vec::new();
+        while let Ok(m) = gui_rx.try_recv() {
+            got.push(m);
+        }
+        assert!(got.iter().any(|m| matches!(m, WsMessage::PictureUploaded { id: 1, url: None, error: Some(e) } if e == "notes.png isn't a picture.")), "{got:?}");
+        app.settings.picture_host = crate::picture::PictureService::OFF;
+        send_to_handler(&mut app, handler_b, msg(2), &event_tx).await;
+        match gui_rx.try_recv() {
+            Ok(WsMessage::PictureUploaded { id: 2, url: None, error: Some(e) }) => assert_eq!(e, crate::picture::OFF_MESSAGE),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+/// Import Picture in the master console: a picture's path pasted (a terminal drop) is
+/// asked about and never typed; Yes uploads it, and the link goes in at the cursor without
+/// touching the text around it, the cursor at the link's start.
+#[tokio::test]
+async fn the_consoles_dropped_picture_is_asked_about_then_its_link_goes_in_at_the_cursor() {
+    crate::picture::test_host();
+    let pic = picture_file("pasted cat.png");
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("w"));
+    app.console_tui = true;
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+    app.event_tx = Some(event_tx);
+    app.input.buffer = "look at this please".into();
+    app.input.cursor_position = "look at this".len();
+
+    crate::input_handler::handle_paste(&mut app, &format!("'{}' ", pic.display()));
+    assert_eq!(app.input.buffer, "look at this please", "the path is never typed");
+    assert_eq!(app.pending_picture_drop.as_deref(), Some(&[pic.clone()][..]));
+    assert!(app.popup_manager.current().is_some_and(|s| s.definition.id == popup::PopupId("picture_upload")));
+
+    // Yes (its shortcut).
+    let _ = crate::input_handler::handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &mut app);
+    assert!(app.pending_picture_drop.is_none());
+    assert!(!app.has_new_popup());
+    let event = next_picture_event(&mut event_rx).await;
+    assert!(app.preprocess_event(event).is_none());
+    let start = "look at this ".len();
+    let link = &app.input.buffer[start..app.input.buffer.len() - " please".len()];
+    assert!(link.starts_with("https://pics.example/") && link.ends_with(".png"), "{}", app.input.buffer);
+    assert!(app.input.buffer.starts_with("look at this https://"));
+    assert!(app.input.buffer.ends_with(".png please"));
+    assert_eq!(app.input.cursor_position, start, "the cursor is at the link's start");
+    let output: Vec<String> = app.current_world().output_lines.iter().map(|l| l.text.clone()).collect();
+    assert!(output.iter().any(|l| l.contains("Uploading pasted cat.png")), "{output:?}");
+
+    // No: nothing is uploaded and nothing typed. Off: the path is ordinary text.
+    app.input.buffer.clear();
+    app.input.cursor_position = 0;
+    crate::input_handler::handle_paste(&mut app, &format!("'{}'", pic.display()));
+    let _ = crate::input_handler::handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &mut app);
+    assert!(app.pending_picture_drop.is_none() && app.input.buffer.is_empty() && !app.has_new_popup());
+    app.settings.picture_host = crate::picture::PictureService::OFF;
+    crate::input_handler::handle_paste(&mut app, &format!("'{}'", pic.display()));
+    assert_eq!(app.input.buffer, format!("'{}'", pic.display()));
+    assert!(!app.has_new_popup());
+}
+
+/// Import Picture: xfce4-terminal *types* a drop (the quoted path, then a separate space).
+/// A burst of characters is taken back out of the input line and asked about, the trailing
+/// space swallowed; the same text typed a character at a time is just text.
+#[test]
+fn a_drop_the_terminal_types_is_taken_back_out_and_asked_about() {
+    let pic = picture_file("typed cat.png");
+    let quoted = format!("'{}'", pic.display());
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("w"));
+    app.input.buffer = "hi ".into();
+    app.input.cursor_position = 3;
+    let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+
+    // Every character with more input already waiting: one run.
+    for c in quoted.chars() {
+        let _ = crate::input_handler::handle_key_event(key(c), &mut app);
+        app.drop_sniffer.end_key();
+    }
+    assert_eq!(app.input.buffer, format!("hi {quoted}"));
+    app.finish_typed_burst();
+    assert_eq!(app.input.buffer, "hi ");
+    assert_eq!(app.input.cursor_position, 3);
+    assert_eq!(app.pending_picture_drop.as_deref(), Some(&[pic.clone()][..]));
+    // The drop's separate trailing space doesn't reach the question (or the line).
+    let _ = crate::input_handler::handle_key_event(key(' '), &mut app);
+    assert!(app.has_new_popup(), "the space didn't answer the question");
+    assert_eq!(app.input.buffer, "hi ");
+    let _ = crate::input_handler::handle_key_event(key('n'), &mut app);
+    assert!(!app.has_new_popup() && app.pending_picture_drop.is_none());
+
+    // Typed: each character's run ends on its own (nothing waiting) - it's text.
+    for c in quoted.chars() {
+        let _ = crate::input_handler::handle_key_event(key(c), &mut app);
+        app.drop_sniffer.end_key();
+        app.finish_typed_burst();
+    }
+    assert_eq!(app.input.buffer, format!("hi {quoted}"));
+    assert!(!app.has_new_popup());
+}
+
+/// Import Picture in the remote console: the confirmed pictures go to the server in chunks;
+/// its acks open the window, and its answer puts the link into the console's own line.
+#[test]
+fn the_remote_consoles_picture_goes_to_the_server_and_its_link_comes_back() {
+    let pic = picture_file("remote cat.png");
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("w"));
+    app.is_master = false;
+    app.server_picture_upload = true;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.ws_client_tx = Some(tx.clone());
+    app.input.buffer = "see".into();
+    app.input.cursor_position = 3;
+
+    crate::input_handler::handle_paste(&mut app, &format!("'{}'", pic.display()));
+    assert!(app.pending_picture_drop.is_some());
+    // Yes, in the remote console's own key handler.
+    crate::remote_client::handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+    assert!(!app.has_new_popup());
+    let (id, size) = match rx.try_recv() {
+        Ok(WsMessage::PictureUpload { id, name, size, offset: 0, last: true, .. }) => {
+            assert_eq!(name, "remote cat.png");
+            (id, size)
+        }
+        other => panic!("expected the picture, got {other:?}"),
+    };
+    app.handle_remote_ws_message(WsMessage::PictureUploadAck { id, received: size });
+    app.handle_remote_ws_message(WsMessage::PictureUploaded { id, url: Some("https://pics.example/r.png".into()), error: None });
+    assert_eq!(app.input.buffer, "see https://pics.example/r.png");
+    assert_eq!(app.input.cursor_position, 4);
+
+    // A server from before Import Picture: a drop is ordinary text.
+    app.server_picture_upload = false;
+    app.input.buffer.clear();
+    app.input.cursor_position = 0;
+    crate::input_handler::handle_paste(&mut app, &format!("'{}'", pic.display()));
+    assert_eq!(app.input.buffer, format!("'{}'", pic.display()));
+}
+
+/// The web settings' Picture Host choices are the ones every other interface lists.
+#[test]
+fn the_web_picture_host_options_are_picture_service_options() {
+    let html = include_str!("web/index.html");
+    let start = html.find("id=\"setup-picture-host-select\"").expect("the select");
+    let end = start + html[start..].find("</select>").unwrap();
+    let options: Vec<(String, String)> = html[start..end]
+        .split("<option value=\"")
+        .skip(1)
+        .map(|o| {
+            let (value, rest) = o.split_once("\">").unwrap();
+            (value.to_string(), rest.split("</option>").next().unwrap().to_string())
+        })
+        .collect();
+    let expected: Vec<(String, String)> = crate::picture::PictureService::OPTIONS
+        .iter()
+        .map(|(v, l)| (v.to_string(), l.to_string()))
+        .collect();
+    assert_eq!(options, expected);
+}
+
+/// A client's typed line reaches the MUD as typed, its spaces kept, in both handlers - as
+/// the console sends it (both used to trim it: "say hi " went as "say hi"). A line
+/// starting with "/" is still a command.
+#[tokio::test]
+async fn a_clients_typed_line_keeps_its_spaces_in_both_handlers() {
+    for handler_b in [false, true] {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].connected = true;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteCommand>(8);
+        app.worlds[0].command_tx = Some(tx);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        for line in ["say look at this ", "  indented", "   "] {
+            send_to_handler(&mut app, handler_b, WsMessage::SendCommand { world_index: 0, command: line.into() }, &event_tx).await;
+            match rx.try_recv() {
+                Ok(WriteCommand::Text(t)) => assert_eq!(t, line, "handler_b={handler_b}"),
+                other => panic!("handler_b={handler_b}: {line:?} didn't reach the MUD: {other:?}"),
+            }
+        }
+        send_to_handler(&mut app, handler_b, WsMessage::SendCommand { world_index: 0, command: "/set kept_space_probe=1".into() }, &event_tx).await;
+        assert!(rx.try_recv().is_err(), "handler_b={handler_b}: a command went to the MUD");
+        assert_eq!(app.tf_engine.get_var("kept_space_probe").map(|v| v.to_string_value()), Some("1".to_string()), "handler_b={handler_b}");
+    }
 }

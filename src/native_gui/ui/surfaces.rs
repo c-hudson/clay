@@ -56,6 +56,8 @@ pub struct Surfaces {
     pub preview: Option<crate::websocket::GlobalSettingsMsg>,
     /// Saved: the preview goes once the settings move past this revision.
     preview_until: Option<u64>,
+    /// `/note -l` waiting for the worlds' notes: the worlds still to answer, and what came.
+    notes_list: Option<(std::collections::HashSet<usize>, std::collections::BTreeMap<usize, String>)>,
 }
 
 impl Host for ClayView {
@@ -153,6 +155,7 @@ impl ClayView {
             "world-selector" => self.open_worlds(super::windows::worlds::Show::Selector, cx),
             "setup" | "web" | "font" => self.open_settings(super::windows::settings::Tab::from_name(name), cx),
             "notes" => self.open_notes(cx),
+            "notes-list" => self.open_notes_list(cx),
             "new-window" => self.open_world_window(None, cx),
             "help" => self.open_window(super::windows::Kind::Help, |main, _w, cx| cx.new(|cx| super::windows::help::HelpView::new(main, cx)), |_, _, _| {}, cx),
             "theme-editor" => {
@@ -225,7 +228,10 @@ impl ClayView {
                     None => self.send_message(WsMessage::CreateWorld { name }, cx),
                 }
             }
-            ["-l", name @ ..] | name @ [..] => {
+            name @ [..] => {
+                // `-l` and TF's other flags (`/world -q foo`, `-nf`) come back from an older
+                // server as typed; they aren't part of the name.
+                let name: Vec<&str> = name.iter().copied().skip_while(|a| a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| c.is_ascii_alphabetic())).collect();
                 if let Some(i) = find(self, &name.join(" ")) {
                     self.switch_to(i, cx);
                 }
@@ -583,7 +589,19 @@ impl ClayView {
                 let (ok, e) = (*success, error.clone());
                 self.in_window::<super::windows::keybind_editor::KeybindEditor>(super::windows::Kind::KeybindEditor, move |v, _w, cx| v.saved(ok, e.as_deref(), cx), cx);
             }
-            // A world's notes, for its notes window.
+            // A world's notes, for `/note -l`'s list or for its notes window.
+            WsMessage::NoteEditorState { world_index, notes, .. }
+                if self.surf.notes_list.as_ref().is_some_and(|(owed, _)| owed.contains(world_index)) =>
+            {
+                let done = self.surf.notes_list.as_mut().is_some_and(|(owed, got)| {
+                    owed.remove(world_index);
+                    got.insert(*world_index, notes.clone());
+                    owed.is_empty()
+                });
+                if done {
+                    self.finish_notes_list(cx);
+                }
+            }
             WsMessage::NoteEditorState { world_index, world_name, notes } => {
                 let kind = super::windows::Kind::Notes(*world_index);
                 if let (Some(frame), Some(handle)) = (self.windows.frame(kind), self.windows.handle_of(kind)) {
@@ -592,6 +610,41 @@ impl ClayView {
                         cx.defer(move |cx| {
                             let _ = handle.update(cx, |_, window, cx| view.update(cx, |v, cx| v.set_notes(&name, &notes, window, cx)));
                         });
+                    }
+                }
+            }
+            // An /import an action or macro ran on the server: the Import dialog, where the
+            // password is typed here.
+            WsMessage::OpenImport { addr } => {
+                let addr = addr.clone();
+                self.later(move |v, window, cx| v.open_import(&addr, window, cx), cx);
+            }
+            // `/note <file>`: a file on the main instance's machine, over the main window
+            // like an MCP edit (it comes from the server, not from a click here).
+            WsMessage::FileEditorState { path, content } => {
+                if self.surf.stack.is_open(&Kind::FileEdit) || self.surf.stack.is_open(&Kind::McpEdit) {
+                    self.client_line("Editor is already open. Close it first.", cx);
+                } else {
+                    let purpose = super::windows::notes::Purpose::File { path: path.clone() };
+                    let content = content.clone();
+                    self.later(
+                        move |v, window, cx| {
+                            let main = cx.entity().downgrade();
+                            let d = cx.new(|cx| super::windows::notes::NoteView::mcp(main, purpose, content, window, cx));
+                            dialogs::open(v, Kind::FileEdit, d, window, cx);
+                        },
+                        cx,
+                    );
+                }
+            }
+            WsMessage::FileSaved { path, ok, error } => {
+                if *ok {
+                    self.client_line(&format!("Saved: {path}"), cx);
+                }
+                if let Some(open) = self.surf.stack.get::<super::windows::notes::NoteView>(&Kind::FileEdit) {
+                    if open.read(cx).file_path() == Some(path.as_str()) {
+                        let (ok, error) = (*ok, error.clone());
+                        open.update(cx, |v, cx| v.file_saved(ok, error.as_deref(), cx));
                     }
                 }
             }
@@ -687,12 +740,81 @@ impl ClayView {
         }
     }
 
+    /// This window's input line, sent with a key binding (`RunKeyBinding.input`) for its kb*
+    /// functions, which read TF's keyboard buffer. The cursor is in characters.
+    pub(super) fn input_snapshot(&self) -> crate::websocket::InputSnapshot {
+        let text = &self.editor.text;
+        let cursor = text[..self.editor.cursor.min(text.len())].chars().count();
+        crate::websocket::InputSnapshot { buffer: text.clone(), cursor }
+    }
+
     /// The current world's notes, in a window of their own (`/note`, the note icon).
     pub(super) fn open_notes(&mut self, cx: &mut Context<Self>) {
+        self.open_notes_for(self.session.core.current, cx);
+    }
+
+    /// World `index`'s notes, in a window of their own (`/note`, Notes List's Open).
+    pub(super) fn open_notes_for(&mut self, index: usize, cx: &mut Context<Self>) {
         use super::windows::{Kind as Win, notes::NoteView};
-        let index = self.session.core.current;
         let Some(name) = self.session.core.worlds.get(index).map(|w| w.name.clone()) else { return };
         self.open_window(Win::Notes(index), move |main, window, cx| cx.new(|cx| NoteView::notes(main, index, &name, window, cx)), |_, _, _| {}, cx);
+    }
+
+    /// `/note -l` (app.js `openNotesList`): the worlds with notes, each one's first line. The
+    /// notes are the server's: each world with notes is asked for, and the list opens when
+    /// all have answered, or after three seconds with what came. The main window asks
+    /// (the answers come to it).
+    pub(super) fn open_notes_list(&mut self, cx: &mut Context<Self>) {
+        if let Some(leader) = self.link.leader.clone() {
+            cx.defer(move |cx| {
+                let _ = leader.update(cx, |v, cx| v.open_notes_list(cx));
+            });
+            return;
+        }
+        let owed: std::collections::HashSet<usize> = self.session.core.worlds.iter().enumerate()
+            .filter(|(_, w)| w.settings.as_ref().is_some_and(|s| s.has_notes))
+            .map(|(i, _)| i)
+            .collect();
+        if owed.is_empty() {
+            self.client_line("No worlds have notes. Use /note to create notes for the current world.", cx);
+            return;
+        }
+        for &world_index in &owed {
+            self.send_message(WsMessage::RequestNoteEditorState { world_index }, cx);
+        }
+        self.surf.notes_list = Some((owed, Default::default()));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
+            let _ = this.update(cx, |v, cx| v.finish_notes_list(cx));
+        })
+        .detach();
+    }
+
+    /// `/note -l`'s answers are in (or it has waited long enough): the list.
+    fn finish_notes_list(&mut self, cx: &mut Context<Self>) {
+        let Some((_, got)) = self.surf.notes_list.take() else { return };
+        let entries: Vec<(usize, String, String)> = got.into_iter()
+            .filter(|(_, notes)| !notes.trim().is_empty())
+            .filter_map(|(i, notes)| {
+                let name = crate::util::strip_ansi_codes(&self.session.core.worlds.get(i)?.name).trim().to_string();
+                let first = notes.lines().next().unwrap_or("");
+                let preview = if first.chars().count() > 50 { format!("{}...", first.chars().take(47).collect::<String>()) } else { first.to_string() };
+                Some((i, name, preview))
+            })
+            .collect();
+        if entries.is_empty() {
+            self.client_line("No worlds have notes. Use /note to create notes for the current world.", cx);
+            return;
+        }
+        let current = self.session.core.current;
+        self.later(
+            move |v, window, cx| {
+                let main = cx.entity().downgrade();
+                let d = cx.new(|cx| super::dialogs::small::NotesList::new(main, entries, current, cx));
+                dialogs::open(v, Kind::NotesList, d, window, cx);
+            },
+            cx,
+        );
     }
 
     /// `/window [world]` (the server's OpenWindow, which has connected the world) and the

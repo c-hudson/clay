@@ -33,6 +33,10 @@ pub enum Kind {
     RemoteAccess,
     /// The MUD's simpleedit text, over the whole window.
     McpEdit,
+    /// A file on the main instance's machine (`/note <file>`), over the whole window.
+    FileEdit,
+    /// `/note -l`: the worlds with notes.
+    NotesList,
     AddTheme,
     RecentWorlds,
 }

@@ -747,6 +747,95 @@ impl Render for RecentWorlds {
     }
 }
 
+// ---- Notes List ---------------------------------------------------------------------
+
+/// `/note -l` (the console's notes list, app.js `openNotesList`): the worlds with notes and
+/// each one's first line; Enter or a click opens that world's notes.
+pub struct NotesList {
+    main: WeakEntity<ClayView>,
+    focus: FocusHandle,
+    /// (world index, name, first line)
+    entries: Vec<(usize, String, String)>,
+    selected: usize,
+}
+
+impl NotesList {
+    pub fn new(main: WeakEntity<ClayView>, entries: Vec<(usize, String, String)>, current: usize, cx: &mut Context<Self>) -> Self {
+        let selected = entries.iter().position(|e| e.0 == current).unwrap_or(0);
+        Self { main, focus: cx.focus_handle(), entries, selected }
+    }
+
+    fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(m) = self.main.upgrade() {
+            m.update(cx, |m, cx| m.open_notes_for(index, cx));
+        }
+        cx.emit(DialogEvent::Close);
+    }
+}
+
+impl EventEmitter<DialogEvent> for NotesList {}
+impl Focusable for NotesList {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for NotesList {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(k) = kit(&self.main, cx) else { return div().into_any_element() };
+        let t = k.t.clone();
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        let rows: Vec<gpui::AnyElement> = self.entries
+            .iter()
+            .enumerate()
+            .map(|(n, (i, name, preview))| {
+                let i = *i;
+                let hover = t.hover;
+                let row = div()
+                    .id(("notes-list", n))
+                    .flex()
+                    .justify_between()
+                    .gap(px(24.0))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .child(div().flex_shrink_0().child(SharedString::from(name.clone())))
+                    .child(div().min_w_0().overflow_hidden().whitespace_nowrap().opacity(0.7).child(SharedString::from(preview.clone())))
+                    .on_click(cx.listener(move |this, _, _w, cx| this.choose(i, cx)));
+                if n == self.selected { row.bg(t.accent).text_color(gpui::black()) } else { row.hover(move |s| s.bg(hover)) }.into_any_element()
+            })
+            .collect();
+        let indices: Vec<usize> = self.entries.iter().map(|e| e.0).collect();
+        k.panel("notes-list")
+            .track_focus(&self.focus)
+            .min_w(px(340.0))
+            .max_w(px(560.0))
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _w, cx| {
+                match ev.keystroke.key.as_str() {
+                    "escape" => cx.emit(DialogEvent::Close),
+                    "up" | "down" => {
+                        let by = if ev.keystroke.key == "up" { -1 } else { 1 };
+                        if let Some(at) = crate::native_gui::ui::kit::list_step(Some(this.selected), indices.len(), by) {
+                            this.selected = at;
+                        }
+                        cx.notify();
+                    }
+                    "enter" => match indices.get(this.selected) {
+                        Some(&i) => this.choose(i, cx),
+                        None => cx.emit(DialogEvent::Close),
+                    },
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
+            .child(k.header("notes-list-close", "World Notes", cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Close))))
+            .child(div().flex().flex_col().gap(px(2.0)).py(px(4.0)).children(rows))
+            .child(k.note("↑↓ select, Enter open, Esc close"))
+            .into_any_element()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

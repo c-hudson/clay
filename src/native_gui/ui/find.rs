@@ -187,6 +187,33 @@ impl ClayView {
         cx.notify();
     }
 
+    /// TF's /limit, /unlimit, /relimit run by this window (`LimitOp`): its Find filter, as
+    /// the console's /limit drives its own. This filter matches text (with * and ?): the
+    /// pattern is shown as typed, whatever its TF match style.
+    pub(super) fn apply_limit(&mut self, action: &str, pattern: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = match action {
+            "clear" => {
+                if self.find.filter_open {
+                    self.close_filter(window, cx);
+                }
+                return;
+            }
+            "reapply" if self.find.last_filter.is_empty() => {
+                self.client_line("No previous /limit to repeat.", cx);
+                return;
+            }
+            "reapply" => self.find.last_filter.clone(),
+            _ => pattern.to_string(),
+        };
+        self.find.filter_open = true;
+        self.find.filter_text = text.clone();
+        self.find.last_filter = text.clone();
+        let input = self.find.filter_input.clone();
+        input.update(cx, |s, cx| s.set_value(text, window, cx));
+        self.scroll.borrow_mut().follow_bottom();
+        cx.notify();
+    }
+
     /// Esc-L: close Find, or bring it back with its last text.
     pub(super) fn toggle_limit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find.filter_open {

@@ -45,6 +45,17 @@
             </intent-filter>
         </activity>
 
+        <!-- A second Clay window (/window, the menu's New Window): its own task, opened with
+             FLAG_ACTIVITY_NEW_DOCUMENT | MULTIPLE_TASK, so it can sit beside the main window
+             in split screen. See WindowActivity. -->
+        <activity
+            android:name=".WindowActivity"
+            android:label="@string/app_name"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize" />
+
         <!-- Grants temporary read access to the diagnostic logs so they can be shared out of
              the app (MainActivity.shareLogs). They sit in app-private internal storage, which
              nothing else can read and which cannot legally be handed over as a file:// URI on

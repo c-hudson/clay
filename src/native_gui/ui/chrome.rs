@@ -170,6 +170,11 @@ const MAIN_MENU: &[Option<(&str, &str, &str)>] = &[
     Some(("world-selector", "World Selector", "/worlds")),
     Some(("actions", "Actions", "/actions")),
     Some(("setup", "Settings", "/setup")),
+    Some(("recent_worlds", "Recent Worlds", "")),
+    Some(("notes", "Notes", "/note")),
+    Some(("notes-list", "Notes List", "/note -l")),
+    Some(("emoji_picker", "Emoji Picker", "")),
+    Some(("import-picture", "Import Picture", "")),
     None,
     Some(("toggle-tags", "Toggle Tags", "F2")),
     Some(("filter", "Find", "F4")),
@@ -584,6 +589,10 @@ impl ClayView {
                     if matches!(*action, "change-password" | "logout") && !multiuser {
                         continue;
                     }
+                    // Import Picture needs a server that uploads pictures (as app.js hides it).
+                    if *action == "import-picture" && !self.session.core.server_picture_upload {
+                        continue;
+                    }
                     let action: &'static str = action;
                     items.push(
                         self.menu_item(format!("menu-{action}").into(), None, label.to_string(), shortcut.to_string(), false)
@@ -630,6 +639,7 @@ impl ClayView {
             "reload" | "resync" => self.restart_connection(cx),
             "filter" => self.toggle_filter(window, cx),
             "search" => self.toggle_search(window, cx),
+            "import-picture" => self.import_picture_menu(window, cx),
             "logout" => {
                 let fx = self.session.core.logout();
                 let rest = self.session.apply(fx);

@@ -790,9 +790,8 @@ impl ClayView {
         let local = match first {
             // A remote GUI's /reload restarts the GUI, not the server.
             "/reload" => Some(None),
-            "/window" if trimmed.contains("--grep") => Some(Some("% Grep windows aren't in the native GUI yet.")),
-            "/server" => Some(Some("% /server isn't in the native GUI yet.")),
-            "/import" => Some(Some("% /import isn't in the native GUI yet.")),
+            // A grep window with no pattern (parse_grep_window found none above).
+            "/window" if trimmed.contains("--grep") => Some(Some("Usage: /window --grep <pattern> [-w <world>] [--regexp]")),
             _ => None,
         };
         if let Some(note) = local {
@@ -827,13 +826,13 @@ impl ClayView {
             // /menu went console-only still sends it here: answer it, don't return it.
             "/menu" => self.client_line("/menu is the console's menu; here, use the menu button (\u{2630}).", cx),
             "/help" => self.later(|v, window, cx| v.open_surface("help", window, cx), cx),
-            "/note" => {
-                if command.split_whitespace().nth(1).is_some() {
-                    self.client_line("This form of /note is console-only. Plain /note opens the current world's notes.", cx);
-                } else {
-                    self.open_notes(cx);
-                }
-            }
+            "/note" => match command.split_whitespace().nth(1) {
+                None => self.open_notes(cx),
+                Some("-l") => self.open_notes_list(cx),
+                // `/note <file>` is the server's (the file is on its machine: it answers
+                // with FileEditorState). Only a server from before that sends it back here.
+                Some(_) => self.client_line("This server is too old to open its files with /note <file>; update it.", cx),
+            },
             "/setup" | "/web" | "/font" => self.open_settings(super::windows::settings::Tab::from_name(&first[1..]), cx),
             "/worlds" | "/world" => {
                 let args: Vec<&str> = command.split_whitespace().skip(1).collect();

@@ -517,6 +517,19 @@ impl InputArea {
         self.history_index = None;
     }
 
+    /// Import Picture's links go in at the cursor without touching the text around them
+    /// (`picture::link_insertion`: a space where a neighbour isn't one), and the cursor is
+    /// left at the link's first character.
+    pub fn insert_link(&mut self, link: &str) {
+        let before = self.buffer[..self.cursor_position].chars().next_back();
+        let after = self.buffer[self.cursor_position..].chars().next();
+        let (text, at) = crate::picture::link_insertion(before, after, link);
+        let start = self.cursor_position + at;
+        self.insert_str(&text);
+        self.cursor_position = start;
+        self.adjust_viewport();
+    }
+
     /// Start a negative numeric-prefix entry (TF `Esc--`: `/set kbnum=-`). Overwrites any
     /// prefix already pending, matching TF's own `/set` semantics - `Esc--` always begins a
     /// fresh entry. No digits have arrived yet, so `kbnum` itself stays `None` until the

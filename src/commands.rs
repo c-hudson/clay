@@ -2,7 +2,6 @@
 //! Includes: handle_command (main command router), API lookups, chat connections,
 //! transliteration, and deferred command processing.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 #[allow(unused_imports)]
 use std::time::{Duration, UNIX_EPOCH};
@@ -1619,37 +1618,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 Err(e) => app.add_output(&e),
             }
         }
-        Command::EditList => {
-            app.open_notes_list_popup();
-        }
-        Command::Edit { filename } => {
-            // Open split-screen editor
-            if app.editor.visible {
-                app.add_output("Editor is already open. Close it first.");
-            } else if let Some(ref path_str) = filename {
-                // Edit a file
-                let path = PathBuf::from(path_str);
-                let content = if path.exists() {
-                    match std::fs::read_to_string(&path) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            app.add_output(&format!("Failed to read file: {}", e));
-                            return false;
-                        }
-                    }
-                } else {
-                    // New file - start with empty content
-                    String::new()
-                };
-                app.editor.open_file(path, &content);
-                app.needs_terminal_clear = true;
-            } else {
-                // Edit current world's notes
-                let world_idx = app.current_world_index;
-                let notes = app.worlds[world_idx].settings.notes.clone();
-                app.editor.open_notes(world_idx, &notes);
-                app.needs_terminal_clear = true;
-            }
+        Command::EditList | Command::Edit { .. } => {
+            // The split-screen editor (App::run_note_command, shared with the remote console).
+            app.run_note_command(&parsed);
         }
         Command::Window { .. } => {
             app.add_output("Use /window from a web or GUI client to open a new window.");

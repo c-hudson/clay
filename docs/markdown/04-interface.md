@@ -141,6 +141,29 @@ colour under a thin line. Whether a theme counts as light is decided from its ba
 colour, not its name, so a custom light theme gets the light treatment too. The theme,
 keybind and action editor pages follow the theme as well.
 
+## Importing a Picture
+
+A picture can go into what you type as a link: Clay uploads it to a free picture host and
+puts the link into the input line at the cursor. Text already in the line stays as it is
+(a space is added where the link would touch a word), and the cursor is left at the start
+of the link.
+
+- **Console and remote console**: drag the picture onto the terminal. The terminal hands
+  Clay the file's path, so Clay asks first: "Upload cat.png (2.1 MB) to catbox.moe?" (a
+  pasted path to a picture looks the same as a dropped one, and uploads are public). No
+  is the default. Anything that isn't a picture types its path as before.
+- **Web page**: drag the picture onto the page, or Menu > Import Picture.
+- **Android app**: Menu > Import Picture, then choose a gallery, photos or files app.
+- **GUIs**: Menu > Import Picture (a file dialog), or drag the picture onto the window.
+
+Several pictures at once go up one after another, and their links go in together. The
+upload always runs on the Clay server (the main instance), whose **Picture Host** setting
+(Settings > General) chooses the host: catbox.moe (the default; kept until nobody has
+viewed it for two years), sxcu.net (pictures only, three uploads a minute) or x0.at (kept
+3 to 100 days, shorter for big files). Each has a "+ URL shortening" choice that runs the link through `/url`'s shortening. Off turns uploads off.
+Pictures over 32 MB aren't uploaded. Anyone with a link can see the picture, and these
+hosts don't let you delete it.
+
 ## Colored Square Emoji
 
 Clay renders colored square emoji (🟥🟧🟨🟩🟦🟪🟫⬛⬜) with proper colors:

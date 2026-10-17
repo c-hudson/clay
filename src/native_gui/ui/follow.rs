@@ -81,6 +81,9 @@ fn is_leaders(msg: &WsMessage) -> bool {
         msg,
         WsMessage::OpenWindow { .. }
             | WsMessage::McpEditOpen { .. }
+            | WsMessage::FileEditorState { .. }
+            | WsMessage::FileSaved { .. }
+            | WsMessage::OpenImport { .. }
             | WsMessage::CertMismatch { .. }
             | WsMessage::ThemeEditorState { .. }
             | WsMessage::ThemeFileSaved { .. }

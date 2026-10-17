@@ -97,6 +97,7 @@ pub struct SettingsView {
     speak: Pick,
     tabs: Pick,
     icon_bar: Pick,
+    picture_host: Pick,
     port_mode: Pick,
     custom_cert: Pick,
     transparency: Entity<SliderState>,
@@ -187,6 +188,7 @@ impl SettingsView {
             speak: Pick::new(&[("all", "All"), ("limit", "Limit")], &edit.tts_speak_mode, window, cx),
             tabs: Pick::new(&[("none", "None"), ("top", "Show Top Ribbon"), ("bottom", "Show Bottom Ribbon")], &edit.tabs, window, cx),
             icon_bar: Pick::new(&[("none", "None"), ("app_tablet", "App/Tablet"), ("all", "All")], &edit.icon_bar, window, cx),
+            picture_host: Pick::new(crate::picture::PictureService::OPTIONS, &edit.picture_host, window, cx),
             port_mode: Pick::new(&[("disabled", "Disabled"), ("9000", "9000"), ("custom", "Custom")], port_mode, window, cx),
             custom_cert: Pick::new(&[("no", "No"), ("yes", "Yes")], if edit.tls_configured { "yes" } else { "no" }, window, cx),
             main,
@@ -267,6 +269,7 @@ impl SettingsView {
         s.tts_voice = crate::kokoro::normalize_voice(&self.text(&self.fields.voice, cx));
         s.tabs = self.tabs.value(cx);
         s.icon_bar = self.icon_bar.value(cx);
+        s.picture_host = self.picture_host.value(cx);
         let rows = super::super::input_view::input_height_of(&s).clamp(1, 15);
         super::super::input_view::set_input_height(&mut s, rows);
         s.color_offset_percent = s.color_offset_percent.min(100);
@@ -411,7 +414,8 @@ impl SettingsView {
             .child(row(k, "Speak Mode", self.speak.view()))
             .child(row(k, "Kokoro Voice", k.input(&self.fields.voice).font_family(k.fonts.ui.clone()).text_size(px(12.0)).into_any_element()))
             .child(row(k, "Tabs", self.tabs.view()))
-            .child(row(k, "Icon Bar", self.icon_bar.view()));
+            .child(row(k, "Icon Bar", self.icon_bar.view()))
+            .child(row(k, "Picture Host", self.picture_host.view()));
         // Two cards: the values, then the switches and the remaining choices.
         div()
             .flex()

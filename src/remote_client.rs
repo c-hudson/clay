@@ -685,11 +685,321 @@ pub(crate) async fn run_import_client(
 type BoxedWsWrite = Box<dyn futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send>;
 type BoxedWsRead = Box<dyn futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send>;
 
-pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::Result<()> {
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
-    use futures::SinkExt;
+/// Where this console connects. Kept after the first connect, so a reconnect (the server
+/// reloaded, or the connection dropped) can open the same WebSocket again without asking.
+#[derive(Clone)]
+enum ConnectTarget {
+    Direct {
+        ws_url: String,
+        /// Plain `ws://`, tried when `wss://` fails - only ever for this machine.
+        fallback_url: Option<String>,
+        remote: crate::util::RemoteAddr,
+    },
+    #[cfg(feature = "ssh-transport")]
+    Ssh {
+        target: crate::ssh::SshTarget,
+        session: crate::ssh::SshSession,
+    },
+}
 
-    let (mut ws_write, mut ws_read): (BoxedWsWrite, BoxedWsRead) = if let Some(target) = ssh {
+/// Why opening a connection, or logging in on a reconnect, failed.
+enum ConnectError {
+    /// The server's certificate isn't the pinned one: never trusted without asking.
+    CertChanged(platform::danger::CertMismatch),
+    /// The server refused the login.
+    Refused(String),
+    /// Anything else (refused connection, timeout, closed early): worth trying again.
+    Failed(String),
+}
+
+/// What a reconnect logs in with: the password's hash, never the password itself (the
+/// challenge answer needs only the hash), and on a multiuser server the user name.
+#[derive(Clone)]
+struct SavedLogin {
+    username: Option<String>,
+    password_hash: String,
+}
+
+impl ConnectTarget {
+    /// The WebSocket, over TLS (or plain `ws://` to this machine) or the SSH tunnel.
+    /// `first`: the console's first connect, which may print progress (the TUI isn't up).
+    async fn open(&mut self, first: bool) -> Result<(BoxedWsWrite, BoxedWsRead), ConnectError> {
+        use tokio_tungstenite::connect_async;
+        match self {
+            ConnectTarget::Direct { ws_url, fallback_url, remote } => {
+                #[cfg(feature = "rustls-backend")]
+                let result = if ws_url.starts_with("wss://") {
+                    connect_wss(ws_url, &remote.host_port).await
+                } else {
+                    connect_async(ws_url.as_str()).await
+                };
+                #[cfg(not(feature = "rustls-backend"))]
+                let result = connect_async(ws_url.as_str()).await;
+                match result {
+                    Ok((stream, _)) => {
+                        let (w, r) = stream.split();
+                        Ok((Box::new(w), Box::new(r)))
+                    }
+                    Err(e) => {
+                        // A changed certificate, as opposed to an ordinary network error, is
+                        // never quietly worked around with plaintext ws:// (that would mask a
+                        // possible MITM).
+                        if let Some(mismatch) = platform::danger::take_cert_mismatch() {
+                            return Err(ConnectError::CertChanged(mismatch));
+                        }
+                        let Some(fallback) = fallback_url else {
+                            return Err(ConnectError::Failed(format!("Failed to connect to {}: {}{}", ws_url, e, remote.path_hint(&e))));
+                        };
+                        if first {
+                            eprintln!("Secure connection failed, trying {}...", fallback);
+                        }
+                        match connect_async(fallback.as_str()).await {
+                            Ok((stream, _)) => {
+                                let (w, r) = stream.split();
+                                Ok((Box::new(w), Box::new(r)))
+                            }
+                            Err(e2) => Err(ConnectError::Failed(format!("Failed to connect to {}: {}{}", fallback, e2, remote.path_hint(&e2)))),
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "ssh-transport")]
+            ConnectTarget::Ssh { target, session } => {
+                // A new channel on the same SSH login. If the SSH connection itself is gone
+                // (a reconnect after a network drop), log in again without prompting: the
+                // agent or a key file, never a typed password.
+                let tunnel = match session.open_tunnel(target.clay_port).await {
+                    Ok(t) => t,
+                    Err(_) if !first => {
+                        let creds = crate::ssh::SshCredentials::desktop_default();
+                        *session = crate::ssh::establish_session(target, &creds, crate::ssh::AuthContext::NonInteractive)
+                            .await
+                            .map_err(|e| ConnectError::Failed(crate::ssh::render_ssh_error(&e)))?;
+                        session.open_tunnel(target.clay_port).await.map_err(|e| ConnectError::Failed(crate::ssh::render_ssh_error(&e)))?
+                    }
+                    Err(e) => return Err(ConnectError::Failed(crate::ssh::render_ssh_error(&e))),
+                };
+                // Plaintext ws:// inside the tunnel: SSH already encrypts everything, and
+                // the daemon's loopback listener (which is where this direct-tcpip channel
+                // lands) never presents a TLS cert - see src/ssh.rs's doc comment.
+                let ws_url = format!("ws://127.0.0.1:{}/", target.clay_port);
+                if first {
+                    println!("Connecting to {} (via SSH tunnel)...", ws_url);
+                }
+                match tokio_tungstenite::client_async(ws_url.as_str(), tunnel).await {
+                    Ok((stream, _)) => {
+                        let (w, r) = stream.split();
+                        Ok((Box::new(w), Box::new(r)))
+                    }
+                    Err(e) => Err(ConnectError::Failed(format!("WebSocket handshake over SSH tunnel failed: {e}"))),
+                }
+            }
+        }
+    }
+}
+
+/// `wss://` with Clay's trust-on-first-use pinning (`~/.clay/known_hosts.dat`, see
+/// platform::danger_rustls) rather than CA verification: Clay's own server is self-signed.
+#[cfg(feature = "rustls-backend")]
+async fn connect_wss(ws_url: &str, host_port_key: &str) -> Result<
+    (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+     tokio_tungstenite::tungstenite::handshake::client::Response),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.to_string())))
+        .with_no_client_auth();
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+    tokio_tungstenite::connect_async_tls_with_config(ws_url, None, false, Some(connector)).await
+}
+
+/// The task that writes this connection's messages to its socket, and the sender for it
+/// (what `App::ws_client_tx` holds while connected).
+fn spawn_ws_writer(mut ws_write: BoxedWsWrite) -> (mpsc::UnboundedSender<WsMessage>, tokio::task::JoinHandle<()>) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let handle = tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if ws_write.send(Message::Text(json)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (ws_tx, handle)
+}
+
+/// How long a reconnect waits for each step of the server's answer.
+const RECONNECT_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Seconds before each reconnect attempt, by attempt (the last repeats). The first is
+/// quick: a server's hot reload is back within a second or two.
+const RECONNECT_BACKOFF: [u64; 7] = [1, 2, 2, 5, 10, 20, 30];
+
+/// One reconnect: the transport, the server's hello, the saved login and the server's
+/// state (its `InitialState`). Never prompts: a changed certificate or a refused login
+/// ends the retries. Returns the target too, since an SSH one may have logged in again.
+async fn reconnect_once(
+    mut target: ConnectTarget,
+    login: SavedLogin,
+) -> (ConnectTarget, Result<(BoxedWsWrite, BoxedWsRead, Box<WsMessage>), ConnectError>) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let result = async {
+        let (mut write, mut read) = target.open(false).await?;
+        let failed = |what: &str| ConnectError::Failed(what.to_string());
+        let (multiuser, challenge) = tokio::time::timeout(RECONNECT_STEP_TIMEOUT, async {
+            loop {
+                match read.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(WsMessage::ServerHello { multiuser_mode, challenge }) = serde_json::from_str::<WsMessage>(&text) {
+                            return Ok((multiuser_mode, challenge));
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return Err(failed("the connection closed before the login")),
+                    Some(Err(e)) => return Err(ConnectError::Failed(e.to_string())),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| failed("no answer from the server"))??;
+        if multiuser && login.username.is_none() {
+            return Err(ConnectError::Refused("the server now asks for a user name".to_string()));
+        }
+        let auth = WsMessage::AuthRequest {
+            password_hash: hash_with_challenge(&login.password_hash, &challenge),
+            username: login.username.clone(),
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+            challenge_response: true,
+            resume: Vec::new(),
+            resume_epochs: Vec::new(),
+            client_version: String::new(),
+            client_uid: String::new(),
+        };
+        let json = serde_json::to_string(&auth).map_err(|e| ConnectError::Failed(e.to_string()))?;
+        write.send(Message::Text(json)).await.map_err(|e| ConnectError::Failed(e.to_string()))?;
+        let initial = tokio::time::timeout(RECONNECT_STEP_TIMEOUT, async {
+            loop {
+                match read.next().await {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsMessage>(&text) {
+                        Ok(WsMessage::AuthResponse { success: false, error, .. }) => {
+                            return Err(ConnectError::Refused(error.filter(|e| !e.is_empty()).unwrap_or_else(|| "login refused".to_string())));
+                        }
+                        Ok(msg @ WsMessage::InitialState { .. }) => return Ok(Box::new(msg)),
+                        _ => {}
+                    },
+                    Some(Ok(Message::Close(_))) | None => return Err(failed("the connection closed during the login")),
+                    Some(Err(e)) => return Err(ConnectError::Failed(e.to_string())),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| failed("no answer from the server"))??;
+        Ok((write, read, initial))
+    }
+    .await;
+    (target, result)
+}
+
+/// The server's `InitialState`, at the first connect and after every reconnect: this
+/// console's worlds, settings and view become the server's again. What belongs to the
+/// console - the input line, its history, an open editor - stays.
+fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSender<WsMessage>, version_mismatch_shown: &mut bool) {
+    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, tf_status, expand_line, picture_upload, .. } = msg else {
+        return;
+    };
+    app.server_expands_line = expand_line;
+    app.server_picture_upload = picture_upload;
+    // An open editor is kept by its world's name: the world list is the server's again.
+    let notes_world = app.editor.world_index.and_then(|i| app.worlds.get(i)).map(|w| w.name.clone());
+    let mcp_world = app.editor.mcp_edit.as_ref().and_then(|c| app.worlds.get(c.world_index)).map(|w| w.name.clone());
+    // Requests made on the old connection get no answer on this one.
+    app.pending_scrollback_requests.clear();
+    app.pending_note_open = None;
+    app.pending_note_list = None;
+    // Save world totals for backfill before consuming worlds vec
+    let world_totals: Vec<(usize, usize)> = worlds.iter()
+        .map(|w| (w.index, w.total_output_lines))
+        .collect();
+    // Initialize app state from server
+    app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
+    app.tf_status = tf_status.into_iter().map(|e| (e.world_index, e.view)).collect();
+    let find = |app: &App, name: &str| app.worlds.iter().position(|w| w.name == name);
+    if let Some(name) = notes_world {
+        match find(app, &name) {
+            Some(i) => app.editor.world_index = Some(i),
+            None => {
+                app.editor.close();
+                app.needs_terminal_clear = true;
+                app.add_output("The world whose notes were open is gone; the editor is closed.");
+            }
+        }
+    }
+    if let Some(name) = mcp_world {
+        match find(app, &name) {
+            Some(i) => {
+                if let Some(ctx) = app.editor.mcp_edit.as_mut() {
+                    ctx.world_index = i;
+                }
+            }
+            None => {
+                app.editor.close();
+                app.needs_terminal_clear = true;
+                app.add_output("The world being edited is gone; the editor is closed.");
+            }
+        }
+    }
+    // Warn once per session if our version differs from the server's. An empty
+    // server_version means an old server that predates this field (#[serde(default)]) -
+    // stay silent, not a mismatch.
+    if !*version_mismatch_shown && !server_version.is_empty() && server_version != crate::VERSION {
+        app.add_output(&format!(
+            "Version mismatch: {} (local) ≠ {} (remote).",
+            crate::VERSION, server_version
+        ));
+        *version_mismatch_shown = true;
+    }
+    // Initialize backfill queue: a one-time guaranteed screenful per world
+    // (max(75, visible rows)) so switching to any world shows content immediately.
+    // That's the only auto-fetch this client ever does - it does NOT deep-fill further
+    // toward "Remote Lines" (that setting only bounds the app/gui/web clients'
+    // download); anything older than the initial screenful is fetched exclusively on
+    // demand, via scroll_page_up. See init_backfill.
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
+    app.init_backfill(&world_totals, visible_lines.max(75));
+    // Declare client type to server (RemoteConsole for TUI clients)
+    let _ = ws_tx.send(WsMessage::ClientTypeDeclaration {
+        client_type: websocket::RemoteClientType::RemoteConsole,
+    });
+    // Send initial view state for more-mode sync
+    let _ = ws_tx.send(WsMessage::UpdateViewState {
+        world_index: current_world_index,
+        visible_lines,
+        visible_columns: Some(width as usize),
+    });
+    // Mark the world we're displaying as seen. Only a world *switch* ever sends
+    // MarkWorldSeen otherwise, so the world on screen at connect would keep its
+    // server-side unseen_lines and a stale first_unseen_at - which Unseen First cycling
+    // later mistakes for the oldest activity and bounces back to. Same fix as app.js's
+    // InitialState handler.
+    let _ = ws_tx.send(WsMessage::MarkWorldSeen {
+        world_index: current_world_index,
+        previous_world_index: None,
+    });
+    app.needs_output_redraw = true;
+}
+
+pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::Result<()> {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut target = if let Some(target) = ssh {
         // --ssh: tunnel through an embedded SSH client instead of connecting
         // directly. Must happen before any TUI setup (this whole branch runs in
         // the same plain-stdio region as the println!/prompt calls below it) so
@@ -699,25 +1009,10 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
         {
             println!("Establishing SSH tunnel to {}@{}:{}...", target.user, target.host, target.ssh_port);
             let creds = crate::ssh::SshCredentials::desktop_default();
-            let tunnel = match crate::ssh::establish_tunnel(&target, &creds, crate::ssh::AuthContext::InteractiveTerminal).await {
-                Ok(t) => t,
+            match crate::ssh::establish_session(&target, &creds, crate::ssh::AuthContext::InteractiveTerminal).await {
+                Ok(session) => ConnectTarget::Ssh { target, session },
                 Err(e) => {
                     eprintln!("{}", crate::ssh::render_ssh_error(&e));
-                    return Ok(());
-                }
-            };
-            // Plaintext ws:// inside the tunnel: SSH already encrypts everything,
-            // and the daemon's loopback listener (which is where this direct-tcpip
-            // channel lands) never presents a TLS cert - see src/ssh.rs's doc comment.
-            let ws_url = format!("ws://127.0.0.1:{}/", target.clay_port);
-            println!("Connecting to {} (via SSH tunnel)...", ws_url);
-            match tokio_tungstenite::client_async(ws_url.as_str(), tunnel).await {
-                Ok((ws_stream, _)) => {
-                    let (w, r) = ws_stream.split();
-                    (Box::new(w), Box::new(r))
-                }
-                Err(e) => {
-                    eprintln!("WebSocket handshake over SSH tunnel failed: {e}");
                     return Ok(());
                 }
             }
@@ -726,6 +1021,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
         {
             // Unreachable in practice: main.rs already refuses --ssh when this
             // feature isn't compiled in, before it ever reaches here.
+            let _ = target;
             eprintln!("clay: --ssh requires the 'ssh-transport' feature.");
             return Ok(());
         }
@@ -743,109 +1039,44 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             eprintln!("Refusing unencrypted ws:// to a remote host (the login would be sent in the clear). Use wss:// or --ssh.");
             return Ok(());
         }
-        let try_fallback = try_fallback && plaintext_ok;
+        let fallback_url = (try_fallback && plaintext_ok).then(|| remote.url("ws"));
 
         println!("Connecting to {}...", ws_url);
 
-        let host_port_key = remote.host_port.clone();
         // Relaunched by /update while the server reloads: give it time to come back.
         wait_for_server_if_relaunched(&remote.host_port).await;
-
-        // Connect to WebSocket server - for wss:// we need to configure TLS to accept self-signed
-        // certs (trust-on-first-use pinned via ~/.clay/known_hosts.dat, see platform::danger_rustls).
-        #[cfg(feature = "rustls-backend")]
-        async fn try_wss(ws_url: &str, host_port_key: &str) -> Result<
-            (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-             tokio_tungstenite::tungstenite::handshake::client::Response),
-            tokio_tungstenite::tungstenite::Error,
-        > {
-            let tls_config = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.to_string())))
-                .with_no_client_auth();
-            let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
-            tokio_tungstenite::connect_async_tls_with_config(
-                ws_url,
-                None,
-                false,
-                Some(connector),
-            ).await
-        }
-
-        #[cfg(feature = "rustls-backend")]
-        let connect_result = if ws_url.starts_with("wss://") {
-            match try_wss(&ws_url, &host_port_key).await {
-                Ok(result) => Ok(result),
-                Err(e) => {
-                    // If this failed because the pinned certificate changed (as opposed to an
-                    // ordinary network error), prompt interactively rather than silently
-                    // falling back to plaintext ws:// (which would mask a possible MITM).
-                    if let Some(mismatch) = platform::danger::take_cert_mismatch() {
-                        eprintln!();
-                        eprintln!("*** TLS CERTIFICATE FOR {} HAS CHANGED ***", mismatch.host);
-                        eprintln!("  old fingerprint: {}", mismatch.old_fingerprint);
-                        eprintln!("  new fingerprint: {}", mismatch.new_fingerprint);
-                        eprintln!("This could mean the server was reinstalled, or that someone is intercepting your connection.");
-                        eprint!("Trust the new certificate and reconnect? [y/N] ");
-                        let _ = io::stdout().flush();
-                        let mut answer = String::new();
-                        let _ = io::stdin().read_line(&mut answer);
-                        if answer.trim().eq_ignore_ascii_case("y") {
-                            persistence::replace_pin(&mismatch.host, &mismatch.new_fingerprint);
-                            try_wss(&ws_url, &host_port_key).await
-                        } else {
-                            eprintln!("Not trusting new certificate; aborting connection.");
-                            Err(e)
-                        }
-                    } else {
-                        Err(e)
-                    }
-                }
-            }
-        } else {
-            connect_async(&ws_url).await
-        };
-
-        #[cfg(not(feature = "rustls-backend"))]
-        let connect_result = connect_async(&ws_url).await;
-
-        let (ws_stream, _) = match connect_result {
-            Ok(result) => result,
-            Err(_) if try_fallback => {
-                // wss:// failed, try ws:// fallback
-                let fallback_url = remote.url("ws");
-                eprintln!("Secure connection failed, trying {}...", fallback_url);
-                match connect_async(&fallback_url).await {
-                    Ok(result) => result,
-                    Err(e2) => {
-                        eprintln!("Failed to connect to {}: {}{}", fallback_url, e2, remote.path_hint(&e2));
-                        return Ok(());
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to connect to {}: {}{}", ws_url, e, remote.path_hint(&e));
-                return Ok(());
-            }
-        };
-
-        let (w, r) = ws_stream.split();
-        (Box::new(w), Box::new(r))
+        ConnectTarget::Direct { ws_url, fallback_url, remote }
     };
 
-    // Create a channel for sending messages to the WebSocket
-    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsMessage>();
-
-    // Spawn task to forward messages to WebSocket
-    let ws_write_handle = tokio::spawn(async move {
-        while let Some(msg) = ws_rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_write.send(Message::Text(json)).await.is_err() {
-                    break;
+    let (ws_write, mut ws_read) = loop {
+        match target.open(true).await {
+            Ok(pair) => break pair,
+            Err(ConnectError::CertChanged(mismatch)) => {
+                // Prompt interactively: the TUI isn't up yet.
+                eprintln!();
+                eprintln!("*** TLS CERTIFICATE FOR {} HAS CHANGED ***", mismatch.host);
+                eprintln!("  old fingerprint: {}", mismatch.old_fingerprint);
+                eprintln!("  new fingerprint: {}", mismatch.new_fingerprint);
+                eprintln!("This could mean the server was reinstalled, or that someone is intercepting your connection.");
+                eprint!("Trust the new certificate and reconnect? [y/N] ");
+                let _ = io::stdout().flush();
+                let mut answer = String::new();
+                let _ = io::stdin().read_line(&mut answer);
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("Not trusting new certificate; aborting connection.");
+                    return Ok(());
                 }
+                persistence::replace_pin(&mismatch.host, &mismatch.new_fingerprint);
+            }
+            Err(ConnectError::Failed(msg) | ConnectError::Refused(msg)) => {
+                eprintln!("{msg}");
+                return Ok(());
             }
         }
-    });
+    };
+
+    // Messages to the server go through this channel to the writer task.
+    let (mut ws_tx, mut ws_write_handle) = spawn_ws_writer(ws_write);
 
     // Wait for ServerHello to know if we're in multiuser mode and get challenge
     let (multiuser_mode, server_challenge) = loop {
@@ -910,6 +1141,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 
     // Read password with raw mode for character-by-character input
     let mut password = String::new();
+    // Kept for reconnecting (the hash only).
+    let mut saved_login: Option<SavedLogin> = None;
     enable_raw_mode()?;
     let mut event_stream = EventStream::new();
     loop {
@@ -923,17 +1156,16 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             println!(); // Move to next line after password
                             // Send authentication with challenge-response
                             let password_hash = hash_password(&password);
+                            password.clear();
                             let challenge_hash = hash_with_challenge(&password_hash, &server_challenge);
-                            // `resume` is empty here: `App` (and every `World`'s max_received_seq)
-                            // isn't created until after auth succeeds (see `App::new()` below), and
-                            // this whole function is a single connection attempt with no in-process
-                            // reconnect loop - a dropped connection ends the process rather than
-                            // looping back to resend AuthRequest, so there is never prior per-world
-                            // state available to resume from at this call site. Live gap recovery
+                            saved_login = Some(SavedLogin { username: username.clone(), password_hash });
+                            // `resume` is empty: a reconnect gets the server's whole state
+                            // again (apply_initial_state replaces the mirrored worlds), so
+                            // there is no per-world state to resume from. Live gap recovery
                             // for a connection that stays up is handled separately via
-                            // `ResyncRequired` in `App::handle_remote_ws_message` (PROTOCOL-ROADMAP.md
-                            // Step 6).
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username, current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new() });
+                            // `ResyncRequired` in `App::handle_remote_ws_message`
+                            // (PROTOCOL-ROADMAP.md Step 6).
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username: username.clone(), current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new() });
                             break;
                         }
                         KeyCode::Char(c) => {
@@ -986,6 +1218,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             }
         }
     }
+    let saved_login = saved_login.unwrap_or(SavedLogin { username, password_hash: String::new() });
 
     // Create App struct and set it up for remote client mode
     let mut app = App::new();
@@ -993,9 +1226,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     app.is_master = false;
 
     // Warn at most once per session (not on every reconnect) if this console's own
-    // version drifts from the server's. Declared here, outside the "wait for
-    // InitialState" loop below, so it survives any future in-process reconnect within
-    // this same --console invocation rather than resetting per attempt.
+    // version drifts from the server's.
     let mut version_mismatch_shown = false;
 
     // Now set up the terminal for the main UI
@@ -1017,80 +1248,17 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
         match ws_read.next().await {
             Some(Ok(Message::Text(text))) => {
                 match serde_json::from_str::<WsMessage>(&text) {
-                    Ok(ws_msg) => {
-                    match ws_msg {
-                        WsMessage::AuthResponse { success, error, .. } => {
-                            if !success {
-                                disable_raw_mode()?;
-                                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                                eprintln!("Authentication failed: {}", error.unwrap_or_default());
-                                return Ok(());
-                            }
-                            // Auth success - continue waiting for InitialState
-                        }
-                        WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, tf_status, .. } => {
-                            // Save world totals for backfill before consuming worlds vec
-                            let world_totals: Vec<(usize, usize)> = worlds.iter()
-                                .map(|w| (w.index, w.total_output_lines))
-                                .collect();
-                            // Initialize app state from server
-                            app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
-                            app.tf_status = tf_status.into_iter().map(|e| (e.world_index, e.view)).collect();
-                            // Warn once per session if our version differs from the server's.
-                            // An empty server_version means an old server that predates this
-                            // field (#[serde(default)]) - stay silent, not a mismatch.
-                            if !version_mismatch_shown && !server_version.is_empty() && server_version != crate::VERSION {
-                                app.add_output(&format!(
-                                    "Version mismatch: {} (local) ≠ {} (remote).",
-                                    crate::VERSION, server_version
-                                ));
-                                // This is the only InitialState this loop currently ever
-                                // receives (a dropped connection ends the process rather
-                                // than looping back here - see the comment on
-                                // `version_mismatch_shown`'s declaration above), so this
-                                // write is never read again today. Kept (and the lint
-                                // silenced) so the guard is already correct if an
-                                // in-process reconnect loop is ever added here.
-                                #[allow(unused_assignments)]
-                                {
-                                    version_mismatch_shown = true;
-                                }
-                            }
-                            // Initialize backfill queue: a one-time guaranteed screenful per
-                            // world (max(75, visible rows)) so switching to any world shows
-                            // content immediately. That's the only auto-fetch this client
-                            // ever does - it does NOT deep-fill further toward "Remote Lines"
-                            // (that setting only bounds the app/gui/web clients' download);
-                            // anything older than the initial screenful is fetched exclusively
-                            // on demand, via scroll_page_up. See init_backfill.
-                            let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-                            let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
-                            app.init_backfill(&world_totals, visible_lines.max(75));
-                            // Declare client type to server (RemoteConsole for TUI clients)
-                            let _ = ws_tx.send(WsMessage::ClientTypeDeclaration {
-                                client_type: websocket::RemoteClientType::RemoteConsole,
-                            });
-                            // Send initial view state for more-mode sync
-                            let _ = ws_tx.send(WsMessage::UpdateViewState {
-                                world_index: current_world_index,
-                                visible_lines,
-                                visible_columns: Some(width as usize),
-                            });
-                            // Mark the world we're displaying as seen. Only a world
-                            // *switch* ever sends MarkWorldSeen otherwise, so the world on
-                            // screen at connect would keep its server-side unseen_lines
-                            // and a stale first_unseen_at - which Unseen First cycling
-                            // later mistakes for the oldest activity and bounces back to.
-                            // Same fix as app.js's InitialState handler.
-                            let _ = ws_tx.send(WsMessage::MarkWorldSeen {
-                                world_index: current_world_index,
-                                previous_world_index: None,
-                            });
-                            break;
-                        }
-                        _ => {}
+                    Ok(WsMessage::AuthResponse { success: false, error, .. }) => {
+                        disable_raw_mode()?;
+                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                        eprintln!("Authentication failed: {}", error.unwrap_or_default());
+                        return Ok(());
                     }
+                    Ok(msg @ WsMessage::InitialState { .. }) => {
+                        apply_initial_state(&mut app, msg, &ws_tx, &mut version_mismatch_shown);
+                        break;
                     }
+                    Ok(_) => {}
                     Err(e) => {
                         // Invalid JSON / undeserializable message while waiting for
                         // InitialState - log and keep waiting rather than vanishing it
@@ -1152,9 +1320,28 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     let mut ws_closed = false;
     let mut update_timeout = std::pin::pin!(tokio::time::sleep(crate::selfupdate::SERVER_ANSWER_TIMEOUT));
     let mut update_timeout_armed = false;
+    // /note -l (App::open_notes_list): when it stops waiting for the worlds' notes.
+    let mut notes_list_timeout = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_secs(3)));
+    // Import Picture: a lost ack is resent, a server that never answers given up on.
+    let mut picture_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut notes_list_armed = false;
 
     // The output area's size as last reported to the server (UpdateViewState).
     let mut reported_view: Option<(u16, u16)> = None;
+
+    // Reconnecting (the server reloaded, or the connection dropped): the attempt count,
+    // the timer for the next attempt, and the attempt's answer. While disconnected,
+    // `ws_tx` is `offline_tx`, whose messages are caught so a line typed meanwhile is
+    // reported rather than silently lost.
+    let mut server_reloading = false;
+    let mut reconnect_attempt: Option<usize> = None;
+    let mut reconnect_timer = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_secs(1)));
+    let mut reconnect_armed = false;
+    let (reconnect_tx, mut reconnect_rx) =
+        mpsc::channel::<(ConnectTarget, Result<(BoxedWsWrite, BoxedWsRead, Box<WsMessage>), ConnectError>)>(1);
+    let (offline_tx, mut offline_rx) = mpsc::unbounded_channel::<WsMessage>();
+    // Set by an arm below when the connection has just gone.
+    let mut connection_lost = false;
 
     loop {
         // Draw if needed
@@ -1236,6 +1423,14 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             }
             Some(_) => {}
             None => update_timeout_armed = false,
+        }
+        match app.pending_note_list {
+            Some((_, until)) if !notes_list_armed => {
+                notes_list_timeout.as_mut().reset(tokio::time::Instant::from_std(until));
+                notes_list_armed = true;
+            }
+            Some(_) => {}
+            None => notes_list_armed = false,
         }
 
         tokio::select! {
@@ -1334,7 +1529,14 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             }
                             needs_redraw = true;
                         }
+                        // The notes editor (/note) has the focus: the paste is its text.
+                        Event::Paste(text) if app.editor.visible && app.editor.focus == crate::EditorFocus::Editor => {
+                            app.drop_sniffer.reset();
+                            crate::input_handler::paste_into_editor(&mut app, &text);
+                            needs_redraw = true;
+                        }
                         Event::Paste(text) if app.shell_live(app.current_world_index) => {
+                            app.drop_sniffer.reset();
                             // A live shell world: the paste goes to the PTY over the wire.
                             if let Some(msg) = crate::input_handler::oversized_paste_message(&text) {
                                 app.add_output(&msg);
@@ -1355,7 +1557,15 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             // the buffer from the start, so an N-character paste cost
                             // O(N^2) - minutes of hang for the 700KB paste that
                             // prompted this, versus milliseconds now.
-                            if let Some(msg) = crate::input_handler::oversized_paste_message(&text) {
+                            app.drop_sniffer.reset();
+                            if app.has_new_popup() {
+                                // A popup's text field takes the paste, as locally.
+                                crate::input_handler::handle_paste(&mut app, &text);
+                            } else if let Some(paths) = app.picture_drop(&text) {
+                                // A picture dropped onto the terminal (Import Picture): asked
+                                // about, never typed.
+                                app.ask_picture_upload(paths);
+                            } else if let Some(msg) = crate::input_handler::oversized_paste_message(&text) {
                                 app.add_output(&msg);
                             } else {
                                 let clean: String = text
@@ -1396,6 +1606,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             if handle_remote_client_key(&mut app, key, &ws_tx) {
                                 break; // Quit requested
                             }
+                            // Misspelled words underlined as they're typed, as locally.
+                            app.check_word_ended();
                             // Check if a /reload was requested (re-exec local binary)
                             if app.pending_reload {
                                 app.pending_reload = false;
@@ -1421,6 +1633,17 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 own_update_running = start_own_update(&mut app, &update_tx, force);
                             }
                             needs_redraw = true;
+                            // Import Picture: a drop the terminal types is a burst with more
+                            // input already waiting - no draw while it lasts; when the input
+                            // runs dry, see whether it was one (src/picture.rs).
+                            app.drop_sniffer.end_key();
+                            if app.drop_sniffer.is_active() {
+                                if crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                                    needs_redraw = false;
+                                } else {
+                                    app.finish_typed_burst();
+                                }
+                            }
                         }
                         Event::Resize(_, _) => {
                             // The redraw lays the output area out again and reports its
@@ -1436,7 +1659,16 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<WsMessage>(&text) {
                         Ok(ws_msg) => {
+                            // The server is about to reload: the close that follows is
+                            // that, and the reconnect can start quickly.
+                            if matches!(ws_msg, WsMessage::ServerReloading) {
+                                server_reloading = true;
+                            }
                             app.handle_remote_ws_message(ws_msg);
+                            // The server ran /quit for this console (an action, a macro).
+                            if app.pending_quit {
+                                break;
+                            }
                             // After processing ScrollbackLines, backfill_next may be set
                             if let Some((world_idx, before_seq, count, request_id)) = app.backfill_next.take() {
                                 let _ = ws_tx.send(WsMessage::RequestScrollback {
@@ -1470,29 +1702,77 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                     Some(Ok(Message::Ping(_))) => {
                         // Respond to ping - handled by tungstenite automatically
                     }
-                    Some(Ok(Message::Close(_))) | None => {
-                        // The server reloading under a /update takes the connection with
-                        // it; this console restarts itself (attached again) once its own
-                        // update is done, so keep going without the socket until then.
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        ws_closed = true;
                         if own_update_running || app.pending_update.is_some() || app.update_flow.is_some() {
-                            ws_closed = true;
+                            // The server reloading under a /update takes the connection
+                            // with it; this console restarts itself (attached again) once
+                            // its own update is done, so keep going without the socket
+                            // until then.
                             app.update_server_reloading = true;
                         } else {
-                            break;
+                            connection_lost = true;
                         }
                     }
                     _ => {}
                 }
+            }
+            // The next reconnect attempt is due: it runs on its own task, so the keys
+            // keep working while it waits for the server.
+            () = &mut reconnect_timer, if reconnect_armed => {
+                reconnect_armed = false;
+                let (tx, target, login) = (reconnect_tx.clone(), target.clone(), saved_login.clone());
+                tokio::spawn(async move {
+                    let _ = tx.send(reconnect_once(target, login).await).await;
+                });
+            }
+            Some((new_target, result)) = reconnect_rx.recv() => {
+                target = new_target;
+                match result {
+                    Ok((write, read, initial)) => {
+                        let (tx, handle) = spawn_ws_writer(write);
+                        ws_tx = tx;
+                        ws_write_handle = handle;
+                        ws_read = read;
+                        ws_closed = false;
+                        server_reloading = false;
+                        reconnect_attempt = None;
+                        app.ws_client_tx = Some(ws_tx.clone());
+                        apply_initial_state(&mut app, *initial, &ws_tx, &mut version_mismatch_shown);
+                        app.add_output("Reconnected.");
+                        // Report the view again, and fetch each world's first screenful.
+                        reported_view = None;
+                        backfill_timer.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_millis(500));
+                        backfill_timer_active = app.backfill_needed();
+                    }
+                    Err(ConnectError::Refused(why)) => {
+                        reconnect_attempt = None;
+                        app.add_output(&format!("Reconnecting stopped: the server refused the login ({why}). Start this console again to log in."));
+                    }
+                    Err(ConnectError::CertChanged(_)) => {
+                        reconnect_attempt = None;
+                        app.add_output("Reconnecting stopped: the server's certificate has changed. Start this console again to check and trust it.");
+                    }
+                    Err(ConnectError::Failed(why)) => {
+                        let attempt = reconnect_attempt.map_or(1, |a| a + 1);
+                        reconnect_attempt = Some(attempt);
+                        let secs = RECONNECT_BACKOFF[attempt.min(RECONNECT_BACKOFF.len() - 1)];
+                        app.add_output(&format!("Reconnect failed ({why}); trying again in {secs}s."));
+                        reconnect_timer.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+                        reconnect_armed = true;
+                    }
+                }
+                needs_redraw = true;
             }
             // This console's own /update is over (src/selfupdate.rs).
             result = update_rx.recv() => {
                 if let Some(result) = result {
                     own_update_running = false;
                     finish_own_update(&mut app, result);
-                    if ws_closed {
-                        // The server is gone and the relaunch didn't happen (or failed).
-                        app.add_output("Connection closed by the server's reload; start this console again.");
-                        break;
+                    if ws_closed && reconnect_attempt.is_none() {
+                        // The server reloaded and the relaunch didn't happen (or failed):
+                        // connect to it again.
+                        connection_lost = true;
                     }
                     needs_redraw = true;
                 }
@@ -1505,6 +1785,22 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                     own_update_running = start_own_update(&mut app, &update_tx, force);
                     needs_redraw = true;
                 }
+            }
+            // Import Picture: resend after a lost ack, give up on no answer.
+            _ = picture_tick.tick(), if app.picture_client.is_busy() => {
+                let (msgs, notes) = app.picture_client.tick(std::time::Instant::now());
+                app.send_picture_messages(msgs);
+                if !notes.is_empty() {
+                    app.apply_picture_notes(notes);
+                    needs_redraw = true;
+                }
+            }
+            // /note -l: not every world's notes came (a multiuser server never answers
+            // for another user's world) - list what did.
+            () = &mut notes_list_timeout, if notes_list_armed => {
+                notes_list_armed = false;
+                app.expire_notes_list_wait();
+                needs_redraw = true;
             }
             // Backfill timer: start requesting scrollback history after initial delay
             () = &mut backfill_timer, if backfill_timer_active => {
@@ -1520,6 +1816,39 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                         request_id: Some(request_id),
                     });
                 }
+            }
+        }
+
+        // /suspend or Ctrl+Z: stop this console, as the local console stops itself.
+        if !app.pending_terminal_ops.is_empty() {
+            crate::run_terminal_ops(&mut app, &mut terminal)?;
+            app.needs_terminal_clear = true;
+            needs_redraw = true;
+        }
+
+        // The connection has just gone: keep the console up and connect again, as the
+        // web and GUI clients do. The input line, its history and an open editor stay.
+        if std::mem::take(&mut connection_lost) {
+            ws_write_handle.abort();
+            ws_tx = offline_tx.clone();
+            app.ws_client_tx = None;
+            let notes = app.picture_client.connection_lost();
+            app.apply_picture_notes(notes);
+            app.add_output(if server_reloading {
+                "The server is reloading; reconnecting..."
+            } else {
+                "The connection to the server was lost; reconnecting..."
+            });
+            reconnect_attempt = Some(0);
+            reconnect_timer.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(RECONNECT_BACKOFF[0]));
+            reconnect_armed = true;
+            needs_redraw = true;
+        }
+        // Whatever was sent while disconnected never left: a typed line says so.
+        while let Ok(msg) = offline_rx.try_recv() {
+            if let WsMessage::SendCommand { command, .. } = msg {
+                app.add_output(&format!("Not connected - not sent: {command}"));
+                needs_redraw = true;
             }
         }
     }
@@ -1673,6 +2002,20 @@ pub(crate) fn handle_remote_client_key(
 ) -> bool {
     use KeyCode::*;
 
+    // Import Picture: the separate trailing space of a drop the terminal typed belongs to
+    // the drop (src/picture.rs DropSniffer) - before any popup could take it as a press.
+    let plain_space = key.code == Char(' ') && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if app.drop_sniffer.swallow(plain_space, std::time::Instant::now()) {
+        return false;
+    }
+    app.drop_sniffer.begin_key();
+
+    // The notes editor (/note), as on the console: before popups, so that while it has
+    // the focus Ctrl+S saves (here, to the server) rather than pausing output.
+    if crate::input_handler::handle_editor_key(app, key).is_some() {
+        return false;
+    }
+
     // New unified popup system - handles help popup and others
     if app.has_new_popup() {
         match handle_new_popup_key(app, key) {
@@ -1681,74 +2024,9 @@ pub(crate) fn handle_remote_client_key(
                 if let Some(action) = popup::definitions::menu::menu_action(&cmd) {
                     return dispatch_remote_action(action, app, ws_tx);
                 }
-                // Menu command selected - parse and execute locally
-                let parsed = parse_command(&cmd);
-                match parsed {
-                    Command::Help => {
-                        app.open_help_popup_new();
-                    }
-                    Command::HelpTopic { ref topic, .. } => {
-                        use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
-                        if let Some(lines) = get_topic_help(topic) {
-                            app.popup_manager.open(create_topic_help_popup(lines));
-                            if let Some(state) = app.popup_manager.current_mut() {
-                                state.select_field(HELP_FIELD_CONTENT);
-                            }
-                        } else {
-                            // TinyFugue's help lives on the server, which answers just us.
-                            let _ = ws_tx.send(WsMessage::SendCommand {
-                                world_index: app.current_world_index,
-                                command: cmd.clone(),
-                            });
-                        }
-                    }
-                    Command::Version => {
-                        app.add_output(&get_version_string());
-                    }
-                    Command::Menu => {
-                        app.open_menu_popup_new();
-                    }
-                    Command::Font => {
-                        app.add_output("Font settings are available in the web and GUI interfaces.");
-                    }
-                    Command::Setup => {
-                        app.open_setup_popup_new();
-                    }
-                    Command::Web => {
-                        app.open_web_popup_new();
-                    }
-                    Command::WorldSelector => {
-                        app.open_world_selector_new();
-                    }
-                    Command::WorldsList => {
-                        let _ = ws_tx.send(WsMessage::RequestConnectionsList);
-                    }
-                    Command::Actions { world } => {
-                        if let Some(world_name) = world {
-                            app.open_actions_list_popup_with_filter(&world_name);
-                        } else {
-                            app.open_actions_list_popup();
-                        }
-                    }
-                    _ => {
-                        // Web-only editors: show URL hint in console
-                        if cmd == "/theme-editor" || cmd == "/keybind-editor" {
-                            let page = cmd.trim_start_matches('/');
-                            // Localhost is always served plain (see http::route_connection).
-                            let proto = "http";
-                            if app.settings.http_enabled {
-                                app.add_output(&format!("Open in browser: {}://localhost:{}/{}", proto, app.settings.http_port, page));
-                            } else {
-                                app.add_output(&format!("Enable HTTP in /web settings, then open /{} in a browser.", page));
-                            }
-                        } else {
-                            // Other commands - send to server
-                            let _ = ws_tx.send(WsMessage::SendCommand {
-                                world_index: app.current_world_index,
-                                command: cmd,
-                            });
-                        }
-                    }
+                // Menu command selected: the same dispatcher as a typed line.
+                if run_remote_command(app, &cmd, ws_tx, false) {
+                    return true;
                 }
             }
             NewPopupAction::Confirm(data) => {
@@ -1771,6 +2049,20 @@ pub(crate) fn handle_remote_client_key(
                     // Allow list wildcard warning confirmed — apply settings
                     let settings = web_settings_from_custom_data(&data);
                     apply_remote_web_settings(app, &settings, ws_tx);
+                } else if let (Some(world_index), Some(host), Some(new_fp)) = (
+                    data.get(popup::definitions::confirm::CERT_MISMATCH_WORLD_INDEX).and_then(|i| i.parse::<usize>().ok()),
+                    data.get(popup::definitions::confirm::CERT_MISMATCH_HOST),
+                    data.get(popup::definitions::confirm::CERT_MISMATCH_NEW_FP),
+                ) {
+                    // A MUD's changed certificate, trusted: the server re-pins it and
+                    // connects (the pin is the server's, as the connection is).
+                    let _ = ws_tx.send(WsMessage::TrustCertificate { world_index, host: host.clone(), new_fingerprint: new_fp.clone() });
+                } else if let Some(world_index) = data.get("world_index").and_then(|i| i.parse::<usize>().ok()) {
+                    // A world's deletion, confirmed: the server removes it and tells every
+                    // client (WorldRemoved), this one's mirror included.
+                    let _ = ws_tx.send(WsMessage::DeleteWorld { world_index });
+                } else if data.contains_key(popup::definitions::confirm::PICTURE_UPLOAD) {
+                    app.picture_drop_answered(true);
                 }
             }
             NewPopupAction::ConfirmCancelled(data) => {
@@ -1779,17 +2071,54 @@ pub(crate) fn handle_remote_client_key(
                     app.open_world_selector_new();
                 } else if data.contains_key("action_index") {
                     app.open_actions_list_popup();
+                } else if data.contains_key(popup::definitions::confirm::PICTURE_UPLOAD) {
+                    app.picture_drop_answered(false);
                 }
             }
-            NewPopupAction::WorldSelector(_action) => {
-                // World selector action - remote client doesn't handle locally
-            }
-            NewPopupAction::WorldSelectorFilter => {
-                // Filter changed - remote client doesn't handle locally
-            }
+            // The World Selector's buttons, as the local console's - the worlds are the
+            // server's, so connecting, deleting and adding are its to do.
+            NewPopupAction::WorldSelector(action) => match action {
+                crate::WorldSelectorAction::Connect(name) => {
+                    if let Some(idx) = app.find_world(&name) {
+                        let previous_idx = app.current_world_index;
+                        app.current_world_index = idx;
+                        let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
+                        if !app.worlds[idx].connected {
+                            if app.worlds[idx].settings.has_connection_settings() {
+                                let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
+                            } else {
+                                app.add_output(&format!("World '{}' has no connection settings.", name));
+                            }
+                        }
+                        app.needs_output_redraw = true;
+                    }
+                }
+                crate::WorldSelectorAction::Edit(name) => {
+                    if let Some(idx) = app.find_world(&name) {
+                        app.open_world_editor_popup_new(idx, false);
+                    }
+                }
+                crate::WorldSelectorAction::Delete(name) => {
+                    if let Some(idx) = app.find_world(&name) {
+                        if app.worlds.len() > 1 {
+                            app.open_delete_world_confirm(&name, idx);
+                        } else {
+                            app.add_output("Cannot delete the last world.");
+                        }
+                    }
+                }
+                // The server creates it; its editor opens on the server's WorldCreated.
+                crate::WorldSelectorAction::Add => {
+                    let _ = ws_tx.send(WsMessage::CreateWorld { name: format!("World {}", app.worlds.len() + 1) });
+                }
+            },
+            NewPopupAction::WorldSelectorFilter => app.refilter_world_selector(),
             NewPopupAction::SetupSaved(settings) => {
                 // Send settings update to master daemon
                 // Update local app settings first
+                // Debug, as the local console's Setup sets it (it was never sent from here).
+                app.settings.debug_enabled = settings.debug;
+                crate::DEBUG_ENABLED.store(settings.debug, std::sync::atomic::Ordering::Relaxed);
                 app.settings.more_mode_enabled = settings.more_mode;
                 app.settings.spell_check_enabled = settings.spell_check;
                 app.settings.temp_convert_enabled = settings.temp_convert;
@@ -1816,6 +2145,7 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.keyboard_always_visible = settings.keyboard_always_visible;
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
+                app.settings.picture_host = crate::picture::PictureService::from_name(&settings.picture_host);
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
                 app.settings.tts_voice = crate::kokoro::normalize_voice(&settings.tts_voice);
@@ -1881,6 +2211,7 @@ pub(crate) fn handle_remote_client_key(
                     keyboard_always_visible: app.settings.keyboard_always_visible,
                     tabs: app.settings.tabs.name().to_string(),
                     icon_bar: app.settings.icon_bar.name().to_string(),
+                    picture_host: Some(app.settings.picture_host.name()),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -2176,8 +2507,14 @@ pub(crate) fn handle_remote_client_key(
                 }
             }
             NewPopupAction::WorldEditorDelete(idx) => {
-                // Send delete request to daemon
-                let _ = ws_tx.send(WsMessage::DeleteWorld { world_index: idx });
+                // Asked first, as on the local console; the confirm sends DeleteWorld.
+                if let Some(name) = app.worlds.get(idx).map(|w| w.name.clone()) {
+                    if app.worlds.len() > 1 {
+                        app.open_delete_world_confirm(&name, idx);
+                    } else {
+                        app.add_output("Cannot delete the last world.");
+                    }
+                }
             }
             NewPopupAction::WorldEditorChatLookup { world_index, world_type, token, app_token, server, request_id } => {
                 // Fetch runs on the server (it holds the stored tokens when the editor
@@ -2188,8 +2525,11 @@ pub(crate) fn handle_remote_client_key(
                 // Send connect request to daemon
                 let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
             }
-            NewPopupAction::NotesList(_action) => {
-                // Notes list not used in remote client
+            // The notes list's Open (/note -l): that world's notes, fresh from the server.
+            NewPopupAction::NotesList(crate::NotesListAction::Open(name)) => {
+                if let Some(idx) = app.find_world(&name) {
+                    app.open_notes_editor(idx);
+                }
             }
             NewPopupAction::RecentWorlds(action) => {
                 match action {
@@ -2225,6 +2565,10 @@ pub(crate) fn handle_remote_client_key(
             }
             NewPopupAction::None => {}
         }
+        return false;
+    }
+    if app.search_popup.visible {
+        crate::input_handler::handle_search_popup_key(app, key);
         return false;
     }
     if app.filter_popup.visible {
@@ -2317,7 +2661,10 @@ pub(crate) fn handle_remote_client_key(
             // decide what an absent prefix means, exactly like a locally-bound key would.
             let kbnum = app.input.kbnum;
             app.input.clear_kbnum();
-            let _ = ws_tx.send(WsMessage::RunKeyBinding { key: name.clone(), kbnum });
+            // The input line goes with it, for the binding's kb* functions (TF's keyboard
+            // buffer); what they do comes back as InputOps.
+            let input = Some(websocket::InputSnapshot { buffer: app.input.buffer.clone(), cursor: app.input.buffer[..app.input.cursor_position.min(app.input.buffer.len())].chars().count() });
+            let _ = ws_tx.send(WsMessage::RunKeyBinding { key: name.clone(), kbnum, input });
             return false;
         }
     }
@@ -2360,185 +2707,8 @@ pub(crate) fn handle_remote_client_key(
                     world_index: app.current_world_index,
                     command: cmd,
                 });
-            } else {
-                // Parse command to handle local commands
-                let parsed = parse_command(&cmd);
-                match parsed {
-                    Command::Quit => return true,
-                    Command::Help => {
-                        app.open_help_popup_new();
-                    }
-                    Command::HelpTopic { ref topic, .. } => {
-                        use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
-                        if let Some(lines) = get_topic_help(topic) {
-                            app.popup_manager.open(create_topic_help_popup(lines));
-                            if let Some(state) = app.popup_manager.current_mut() {
-                                state.select_field(HELP_FIELD_CONTENT);
-                            }
-                        } else {
-                            // TinyFugue's help lives on the server, which answers just us.
-                            let _ = ws_tx.send(WsMessage::SendCommand {
-                                world_index: app.current_world_index,
-                                command: cmd.clone(),
-                            });
-                        }
-                    }
-                    Command::Version => {
-                        app.add_output(&get_version_string());
-                    }
-                    Command::Menu => {
-                        app.open_menu_popup_new();
-                    }
-                    Command::Font => {
-                        app.add_output("Font settings are available in the web and GUI interfaces.");
-                    }
-                    Command::Setup => {
-                        app.open_setup_popup_new();
-                    }
-                    Command::Web => {
-                        app.open_web_popup_new();
-                    }
-                    Command::WorldSelector => {
-                        app.open_world_selector_new();
-                    }
-                    Command::WorldsList => {
-                        // Request connections list from server (includes timing info)
-                        let _ = ws_tx.send(WsMessage::RequestConnectionsList);
-                    }
-                    Command::WorldSwitch { ref name } => {
-                        // /worlds <name> - switch to world if it exists
-                        if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                            let previous_idx = app.current_world_index;
-                            app.current_world_index = idx;
-                            let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
-                            // If not connected, request connection
-                            if !app.worlds[idx].connected {
-                                let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
-                            }
-                        } else {
-                            // World doesn't exist - could create it, but for now just show message
-                            let ci = app.current_world_index;
-                            let seq = app.worlds[ci].next_seq;
-                            app.worlds[ci].next_seq += 1;
-                            app.worlds[ci].output_lines.push(
-                                OutputLine::new_client(format!("World '{}' not found.", name), seq)
-                            );
-                        }
-                    }
-                    Command::WorldConnectNoLogin { ref name } => {
-                        // /worlds -l <name> - send to server as SendCommand so skip_auto_login is set
-                        if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                            let previous_idx = app.current_world_index;
-                            app.current_world_index = idx;
-                            let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
-                            if !app.worlds[idx].connected {
-                                // Send as command so server parses -l flag and sets skip_auto_login
-                                let _ = ws_tx.send(WsMessage::SendCommand {
-                                    world_index: idx,
-                                    command: format!("/worlds -l {}", name),
-                                });
-                            }
-                        } else {
-                            let ci = app.current_world_index;
-                            let seq = app.worlds[ci].next_seq;
-                            app.worlds[ci].next_seq += 1;
-                            app.worlds[ci].output_lines.push(
-                                OutputLine::new_client(format!("World '{}' not found.", name), seq)
-                            );
-                        }
-                    }
-                    Command::WorldEdit { ref name } => {
-                        // /worlds -e [name] - open world editor using new popup. Creates the
-                        // world if it doesn't exist yet (mirrors commands.rs's local-TUI
-                        // find_or_create_world behavior) instead of silently falling back to
-                        // editing the current world. Only marked "created" when it didn't
-                        // already exist, so Cancel can roll back a fresh creation without
-                        // ever touching a pre-existing world.
-                        let (idx, created) = if let Some(ref n) = name {
-                            match app.find_world(n) {
-                                Some(existing_idx) => (existing_idx, false),
-                                None => (app.find_or_create_world(n), true),
-                            }
-                        } else {
-                            (app.current_world_index, false)
-                        };
-                        if idx < app.worlds.len() {
-                            app.open_world_editor_popup_new(idx, created);
-                        }
-                    }
-                    Command::Actions { world } => {
-                        if let Some(world_name) = world {
-                            app.open_actions_list_popup_with_filter(&world_name);
-                        } else {
-                            app.open_actions_list_popup();
-                        }
-                    }
-                    Command::Update { force } => {
-                        // /update updates what can be updated (src/selfupdate.rs): the
-                        // server first, then - once it has answered (and come back, if it
-                        // reloaded) - this console's own binary. The answer arrives as
-                        // UpdateOutcome (App::handle_remote_ws_message).
-                        if app.update_flow.is_some() || app.pending_update.is_some() {
-                            app.add_output("An update is already in progress.");
-                        } else {
-                            app.update_flow = Some(crate::selfupdate::ClientFlow::WaitingServer { force, since: std::time::Instant::now() });
-                            let _ = ws_tx.send(WsMessage::SendCommand {
-                                world_index: app.current_world_index,
-                                command: (if force { "/update -f" } else { "/update" }).to_string(),
-                            });
-                        }
-                    }
-                    Command::Reload => {
-                        // Reload the local remote client binary
-                        app.pending_reload = true;
-                    }
-                    Command::Connect { .. } => {
-                        let _ = ws_tx.send(WsMessage::ConnectWorld {
-                            world_index: app.current_world_index,
-                        });
-                    }
-                    Command::Disconnect { world } => {
-                        // Route through the normal command pipeline (like WorldConnectNoLogin
-                        // above) so the server can resolve -ALL/a named world - the dedicated
-                        // WsMessage::DisconnectWorld only ever targets the caller's own current
-                        // world and knows nothing about either.
-                        let command = match world {
-                            Some(w) => format!("/disconnect {}", w),
-                            None => "/disconnect".to_string(),
-                        };
-                        let _ = ws_tx.send(WsMessage::SendCommand {
-                            world_index: app.current_world_index,
-                            command,
-                        });
-                    }
-                    Command::RemoteAttach { addr, close, cancel } => {
-                        // A remote client owns no server/worlds of its own, so switching or
-                        // detaching relaunches immediately — no confirmation needed.
-                        if cancel {
-                            app.add_output("No pending /server to cancel.");
-                        } else if close {
-                            app.pending_remote_detach = true;
-                        } else if addr.is_empty() {
-                            app.add_output("Usage: /server host:port  (or)  /server host port  (or)  /server --close");
-                        } else {
-                            app.pending_remote_switch = Some(addr);
-                        }
-                    }
-                    Command::NotACommand { text } => {
-                        // Regular text - send to server
-                        let _ = ws_tx.send(WsMessage::SendCommand {
-                            world_index: app.current_world_index,
-                            command: text,
-                        });
-                    }
-                    _ => {
-                        // Other commands - send to server for processing
-                        let _ = ws_tx.send(WsMessage::SendCommand {
-                            world_index: app.current_world_index,
-                            command: cmd,
-                        });
-                    }
-                }
+            } else if run_remote_command(app, &cmd, ws_tx, false) {
+                return true;
             }
             // Reset lines_since_pause for more-mode
             app.current_world_mut().lines_since_pause = 0;
@@ -2555,13 +2725,163 @@ pub(crate) fn handle_remote_client_key(
     // Fall through to character input (unbound keys)
     if let Char(c) = key.code {
         if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            let at = app.input.cursor_position;
+            let insert_mode = app.input.insert;
             app.input.insert_char(c);
             app.last_input_was_delete = false;
+            // A drop the terminal types arrives a character at a time (Import Picture).
+            if insert_mode && !app.settings.picture_host.is_off() {
+                app.drop_sniffer.typed(at, c);
+            }
             app.check_temp_conversion();
         }
     }
     false
 }
+/// A command line in the remote console, wherever it came from: typed (Enter), the menu,
+/// or the server (`ExecuteLocalCommand`: an action or a macro ran a command whose window is
+/// this console's). One dispatcher, as `App::run_note_command` is for `/note`: three copies
+/// is how commands went missing on one path. `from_server`: never send it back (the server
+/// has already passed on it; sending it again would bounce for ever). Returns true to quit.
+pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::UnboundedSender<WsMessage>, from_server: bool) -> bool {
+    let to_server = |app: &App, command: String| {
+        let _ = ws_tx.send(WsMessage::SendCommand { world_index: app.current_world_index, command });
+    };
+    let has_args = cmd.split_whitespace().nth(1).is_some();
+    // TF's /suspend stops this console, as Ctrl+Z does (user ruling 2026-10-16: the remote
+    // console suspends itself).
+    if cmd.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/suspend")) && !has_args {
+        app.pending_terminal_ops.push_back(crate::TerminalOp::Suspend);
+        return false;
+    }
+    let parsed = parse_command(cmd);
+    match parsed {
+        Command::Quit => return true,
+        // What the console's typed `/help` shows (TF's help text) is the server's to answer,
+        // to this console alone. A server from before that bounces it back: the popup.
+        Command::Help | Command::HelpTopic { .. } if !from_server => to_server(app, cmd.to_string()),
+        Command::Help => app.open_help_popup_new(),
+        Command::HelpTopic { ref topic, .. } => {
+            use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
+            if let Some(lines) = get_topic_help(topic) {
+                app.popup_manager.open(create_topic_help_popup(lines));
+                if let Some(state) = app.popup_manager.current_mut() {
+                    state.select_field(HELP_FIELD_CONTENT);
+                }
+            }
+        }
+        Command::Version => app.add_output(&get_version_string()),
+        Command::Menu => app.open_menu_popup_new(),
+        Command::Font => app.add_output("Font settings are available in the web and GUI interfaces."),
+        Command::Setup => app.open_setup_popup_new(),
+        Command::Web => app.open_web_popup_new(),
+        Command::WorldSelector => app.open_world_selector_new(),
+        // `/l -s` and the like: TF's listing (the server's); bare `/l`, this console's.
+        Command::WorldsList if has_args && !from_server => to_server(app, cmd.to_string()),
+        Command::WorldsList => {
+            let _ = ws_tx.send(WsMessage::RequestConnectionsList);
+        }
+        Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+            let no_login = matches!(parsed, Command::WorldConnectNoLogin { .. });
+            if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                let previous_idx = app.current_world_index;
+                app.current_world_index = idx;
+                let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
+                // From the server, it has connected the world already if it could.
+                if !from_server && !app.worlds[idx].connected {
+                    if no_login {
+                        // As a command, so the server sets skip_auto_login.
+                        let _ = ws_tx.send(WsMessage::SendCommand { world_index: idx, command: format!("/worlds -l {}", name) });
+                    } else {
+                        let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
+                    }
+                }
+            } else {
+                app.add_output(&format!("World '{}' not found.", name));
+            }
+        }
+        Command::WorldEdit { ref name } => match name {
+            None => {
+                let idx = app.current_world_index;
+                app.open_world_editor_popup_new(idx, false);
+            }
+            Some(n) => match app.find_world(n) {
+                Some(idx) => app.open_world_editor_popup_new(idx, false),
+                // A new world is the server's to create; its editor opens on the
+                // server's WorldCreated (as the web and GUI do).
+                None => {
+                    let _ = ws_tx.send(WsMessage::CreateWorld { name: n.clone() });
+                }
+            },
+        },
+        Command::Actions { world } => match world {
+            Some(world_name) => app.open_actions_list_popup_with_filter(&world_name),
+            None => app.open_actions_list_popup(),
+        },
+        // Only a server from before `/note <file>` went to the server bounces it back;
+        // sending it to it again would just bounce again.
+        Command::Edit { filename: Some(_) } if from_server => {
+            app.add_output("This server is too old to open its files with /note <file>; update it.");
+        }
+        // /note, /note -l, /note <file>: the editor here, the notes and files the server's.
+        Command::Edit { .. } | Command::EditList => app.run_note_command(&parsed),
+        Command::Update { force } if !from_server => {
+            // /update updates what can be updated (src/selfupdate.rs): the server first,
+            // then - once it has answered (and come back, if it reloaded) - this console's
+            // own binary. The answer arrives as UpdateOutcome (App::handle_remote_ws_message).
+            if app.update_flow.is_some() || app.pending_update.is_some() {
+                app.add_output("An update is already in progress.");
+            } else {
+                app.update_flow = Some(crate::selfupdate::ClientFlow::WaitingServer { force, since: std::time::Instant::now() });
+                to_server(app, (if force { "/update -f" } else { "/update" }).to_string());
+            }
+        }
+        // This console's own binary (the server's /reload is the server's).
+        Command::Reload if !from_server => app.pending_reload = true,
+        Command::Connect { .. } if !from_server => {
+            let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: app.current_world_index });
+        }
+        Command::RemoteAttach { addr, close, cancel } if !from_server => {
+            // A remote client owns no server/worlds of its own, so switching or detaching
+            // relaunches immediately - no confirmation needed.
+            if cancel {
+                app.add_output("No pending /server to cancel.");
+            } else if close {
+                app.pending_remote_detach = true;
+            } else if addr.is_empty() {
+                app.add_output("Usage: /server host:port  (or)  /server host port  (or)  /server --close");
+            } else {
+                app.pending_remote_switch = Some(addr);
+            }
+        }
+        // Import Settings stays the main instance's own (user ruling 2026-10-16).
+        Command::Import { .. } => app.add_output(crate::REMOTE_IMPORT_IS_MAIN_ONLY),
+        // As the console says it: windows are a web or GUI client's.
+        Command::Window { .. } => app.add_output("Use /window from a web or GUI client to open a new window."),
+        _ if from_server => {
+            let first = cmd.split_whitespace().next().unwrap_or(cmd);
+            app.add_output(&format!("% {} isn't available in this console.", first));
+        }
+        _ => {
+            // Web-only editors: show URL hint in console
+            if cmd == "/theme-editor" || cmd == "/keybind-editor" {
+                let page = cmd.trim_start_matches('/');
+                // Localhost is always served plain (see http::route_connection).
+                if app.settings.http_enabled {
+                    app.add_output(&format!("Open in browser: http://localhost:{}/{}", app.settings.http_port, page));
+                } else {
+                    app.add_output(&format!("Enable HTTP in /web settings, then open /{} in a browser.", page));
+                }
+            } else {
+                // Everything else (text for the MUD, TF commands, Clay commands the
+                // server runs): the server's.
+                to_server(app, cmd.to_string());
+            }
+        }
+    }
+    false
+}
+
 /// Compute the target world index for TF SOCKETB/SOCKETF (`world_socket_prev/next`,
 /// TF-parity plan Job 22a, finding 38) - same connected-only, list-order cycling as the
 /// master console's own `App::cycle_connected_world`, but read-only: this client has no
@@ -2714,10 +3034,15 @@ pub(crate) fn dispatch_remote_action(
         // TF-parity plan Job 19 (P2.3).
         "kill_to_start" => { app.input.kill_to_start(); app.last_input_was_delete = true; }
         "expand_line" => {
+            // TF's variables are the server's: it substitutes them and sends the line back
+            // (SetInputBuffer). An older server can't; this console's own engine does then.
             let text = app.input.buffer.clone();
-            let expanded = crate::tf::variables::substitute_commands(&mut app.tf_engine, &text);
-            app.input.buffer = expanded;
-            app.input.cursor_position = app.input.buffer.len();
+            let asked = app.server_expands_line && ws_tx.send(WsMessage::ExpandLine { text: text.clone() }).is_ok();
+            if !asked {
+                let expanded = crate::tf::variables::substitute_commands(&mut app.tf_engine, &text);
+                app.input.buffer = expanded;
+                app.input.cursor_position = app.input.buffer.len();
+            }
         }
         "completion" => { perform_completion(app); }
 
@@ -2747,18 +3072,21 @@ pub(crate) fn dispatch_remote_action(
         "recall_begin" => { let n = app.input.take_kbnum(); app.input.history_begin_n(n); }
         "recall_end" => { let n = app.input.take_kbnum(); app.input.history_end_n(n); }
 
-        // Scrollback - deliberately left kbnum-unaware for this client (Job 20/P2.4 scope
-        // decision): `scroll_page_up`'s backfill request sizing and `scroll_half_page`'s
-        // pending-release-vs-viewport-move branch both need to stay in lockstep with the
-        // request/count they send the server, which isn't worth the risk of touching here;
-        // the master console's equivalent actions (`input_handler::dispatch_action_impl`)
-        // are the fully kbnum-aware ones.
+        // Scrollback, kbnum-aware as the master console's (`input_handler::dispatch_action`):
+        // N pages, a negative N the other way. A page up that reaches the top asks the server
+        // for as many rows as it moved.
         "scroll_page_up" => {
+            let n = app.input.take_kbnum();
+            let page = (app.output_height as usize).saturating_sub(2).max(1);
+            let rows = page.saturating_mul(n.unsigned_abs() as usize).max(1);
+            if n < 0 {
+                app.move_viewport_down(rows);
+                return false;
+            }
             // Row-exact, measured the way render_output_crossterm actually wraps (this client
             // shares that renderer). The old logical-index subtraction ignored wrapping
             // entirely, so a single wrapped paragraph could swallow a whole page.
-            let scroll_amount = (app.output_height as usize).saturating_sub(2).max(1);
-            app.move_viewport_up(scroll_amount);
+            app.move_viewport_up(rows);
             if app.viewport_at_top() {
                 let before_seq = app.current_world().output_lines.first().map(|l| l.seq);
                 // Registered as Backfill (PROTOCOL-ROADMAP.md's seq-drift fix, Step 12b): a
@@ -2768,7 +3096,7 @@ pub(crate) fn dispatch_remote_action(
                 let request_id = app.register_scrollback_request(app.current_world_index, crate::ScrollbackRequestKind::Backfill);
                 let _ = ws_tx.send(WsMessage::RequestScrollback {
                     world_index: app.current_world_index,
-                    count: scroll_amount,
+                    count: rows,
                     before_seq,
                     after_seq: None,
                     request_id: Some(request_id),
@@ -2777,8 +3105,13 @@ pub(crate) fn dispatch_remote_action(
             app.needs_output_redraw = true;
         }
         "scroll_page_down" => {
-            let scroll_amount = (app.output_height as usize).saturating_sub(2).max(1);
-            app.move_viewport_down(scroll_amount);
+            let n = app.input.take_kbnum();
+            if n < 0 {
+                app.input.kbnum = Some(-n);
+                return dispatch_remote_action("scroll_page_up", app, ws_tx);
+            }
+            let page = (app.output_height as usize).saturating_sub(2).max(1);
+            app.move_viewport_down(page.saturating_mul(n as usize).max(1));
         }
         // TF PAGEBACK: real alias of scroll_page_up, including its backfill request -
         // recurses into this same function rather than duplicating that body.
@@ -2837,6 +3170,9 @@ pub(crate) fn dispatch_remote_action(
                 let max_offset = app.current_world().output_lines.len().saturating_sub(1);
                 app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
                 app.needs_output_redraw = true;
+            } else if app.input.buffer.starts_with('/') {
+                // Nothing to page: a command is completed, as by the local console's Tab.
+                perform_completion(app);
             }
         }
 
@@ -2922,10 +3258,19 @@ pub(crate) fn dispatch_remote_action(
             app.last_ctrl_c = Some(std::time::Instant::now());
             app.add_output("Press again within 15 seconds to quit.");
         }
-        "suspend" => { /* Not supported in remote console */ }
+        // Stop this console, as the local console stops itself (the loop does it: it has
+        // the terminal).
+        "suspend" => app.pending_terminal_ops.push_back(crate::TerminalOp::Suspend),
         "bell" => { print!("\x07"); }
-        "spell_check" => {
-            // Spell check not easily supported in remote mode
+        // This console's own dictionary, as the local console's.
+        "spell_check" => app.handle_spell_check(),
+        "search_popup" => {
+            app.search_popup.open();
+            app.current_world_mut().search_active = true;
+            let output_lines = app.current_world().output_lines.clone();
+            let show_tags = app.show_tags;
+            app.search_popup.update_search(&output_lines, show_tags);
+            app.needs_output_redraw = true;
         }
 
         // Clay Extensions
@@ -2947,11 +3292,13 @@ pub(crate) fn dispatch_remote_action(
         // through the TF engine this client doesn't run), so "toggle" here just means
         // show/hide the popup rather than reapplying a remembered pattern.
         "toggle_limit" => {
-            if app.filter_popup.visible {
-                app.filter_popup.visible = false;
+            // As the local console: off, or the last limit again.
+            let op = if app.filter_popup.visible {
+                crate::tf::PendingLimitOp::Clear
             } else {
-                app.filter_popup.open();
-            }
+                crate::tf::PendingLimitOp::Reapply
+            };
+            crate::commands::apply_limit_op(app, op);
         }
         // TF-parity plan Job 22a (`^X^V`): same text as a typed `/version`.
         "show_version" => {
@@ -2962,16 +3309,12 @@ pub(crate) fn dispatch_remote_action(
             app.needs_output_redraw = true;
         }
         "toggle_gmcp_media" => {
-            let idx = app.current_world_index;
-            app.worlds[idx].gmcp_user_enabled = !app.worlds[idx].gmcp_user_enabled;
-            app.ws_broadcast(WsMessage::GmcpUserToggled {
-                world_index: idx,
-                enabled: app.worlds[idx].gmcp_user_enabled,
-            });
-            if app.worlds[idx].gmcp_user_enabled {
-                app.restart_world_media(idx);
-            } else {
-                app.stop_world_media(idx);
+            // The world's media are the server's: it toggles them (and tells every client,
+            // GmcpUserToggled). This console's own speech mutes with it, as local F9's does.
+            let _ = ws_tx.send(WsMessage::ToggleWorldGmcp { world_index: app.current_world_index });
+            app.settings.tts_muted = !app.settings.tts_muted;
+            if app.settings.tts_muted {
+                crate::tts::stop(&app.tts_backend);
             }
             app.needs_output_redraw = true;
         }
@@ -3077,6 +3420,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         keyboard_always_visible: app.settings.keyboard_always_visible,
         tabs: app.settings.tabs.name().to_string(),  // unchanged — this function only touches web settings
         icon_bar: app.settings.icon_bar.name().to_string(),  // unchanged — this function only touches web settings
+        picture_host: None,
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
@@ -3211,7 +3555,7 @@ mod tests {
         let quit = handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL), &tx);
         assert!(!quit);
         match try_recv(&mut rx) {
-            Some(WsMessage::RunKeyBinding { key, kbnum }) => {
+            Some(WsMessage::RunKeyBinding { key, kbnum, .. }) => {
                 assert_eq!(key, "^T");
                 assert_eq!(kbnum, None, "no kbnum was set, so None should be forwarded as-is");
             }
@@ -3346,5 +3690,294 @@ mod tests {
         app.handle_remote_ws_message(WsMessage::GlobalSettingsUpdated { settings, input_height: 3 });
 
         assert!(app.tf_bound_keys.is_empty());
+    }
+
+    // ---- /note in the remote console (App::run_note_command) ----
+
+    /// A remote console's App: not the master, its messages on `tx`.
+    fn remote_note_app(worlds: usize) -> (App, mpsc::UnboundedSender<WsMessage>, mpsc::UnboundedReceiver<WsMessage>) {
+        let mut app = make_test_app_with_worlds(&vec![true; worlds]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.is_master = false;
+        app.ws_client_tx = Some(tx.clone());
+        app.output_width = 80;
+        app.output_height = 24;
+        (app, tx, rx)
+    }
+
+    fn type_line(app: &mut App, tx: &mpsc::UnboundedSender<WsMessage>, line: &str) {
+        for c in line.chars() {
+            handle_remote_client_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), tx);
+        }
+        handle_remote_client_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx);
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<WsMessage>) -> Vec<WsMessage> {
+        std::iter::from_fn(|| try_recv(rx)).collect()
+    }
+
+    fn notes_reply(world_index: usize, notes: &str) -> WsMessage {
+        WsMessage::NoteEditorState { world_index, world_name: format!("w{world_index}"), notes: notes.to_string() }
+    }
+
+    /// `/note` asks the server for the current world's notes (it used to go to the server
+    /// as a command and come back as an ExecuteLocalCommand nobody handled); the answer
+    /// opens the editor, keys type into it, and Ctrl+S sends the text back and closes.
+    #[test]
+    fn note_opens_the_servers_notes_and_ctrl_s_saves_them_back() {
+        let (mut app, tx, mut rx) = remote_note_app(2);
+        app.current_world_index = 1;
+        type_line(&mut app, &tx, "/note");
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [WsMessage::RequestNoteEditorState { world_index: 1 }]), "{sent:?}");
+        assert!(!app.editor.visible, "nothing to show until the notes come");
+
+        app.handle_remote_ws_message(notes_reply(1, "old"));
+        assert!(app.editor.visible);
+        assert_eq!((app.editor.world_index, app.editor.buffer.as_str()), (Some(1), "old"));
+
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT), &tx);
+        assert_eq!(app.editor.buffer, "oldX", "keys go to the editor");
+        assert!(app.input.buffer.is_empty(), "not to the input line");
+
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &tx);
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [WsMessage::UpdateNote { world_index: 1, notes }] if notes == "oldX"), "{sent:?}");
+        assert!(!app.editor.visible, "Ctrl+S saves and closes");
+        assert_eq!(app.worlds[1].settings.notes, "oldX", "the mirror keeps the saved text");
+    }
+
+    #[test]
+    fn note_esc_closes_without_sending_and_a_lost_connection_keeps_the_edits() {
+        let (mut app, tx, mut rx) = remote_note_app(1);
+        app.run_note_command(&Command::Edit { filename: None });
+        app.handle_remote_ws_message(notes_reply(0, "text"));
+        drain(&mut rx);
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(!app.editor.visible);
+        assert!(drain(&mut rx).is_empty(), "Esc sends nothing");
+
+        app.run_note_command(&Command::Edit { filename: None });
+        app.handle_remote_ws_message(notes_reply(0, "text"));
+        drop(rx); // the connection's writer is gone
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &tx);
+        assert!(app.editor.visible, "nothing was sent: the edits stay");
+        assert_eq!(app.editor.buffer, "text");
+    }
+
+    /// `/note -l` collects every world's notes, then lists the worlds that have some; Open
+    /// fetches that world's notes afresh and edits them.
+    #[test]
+    fn note_list_waits_for_the_worlds_then_open_edits_one() {
+        let (mut app, tx, mut rx) = remote_note_app(3);
+        type_line(&mut app, &tx, "/note -l");
+        let mut asked: Vec<usize> = drain(&mut rx).into_iter().filter_map(|m| match m {
+            WsMessage::RequestNoteEditorState { world_index } => Some(world_index),
+            _ => None,
+        }).collect();
+        asked.sort();
+        assert_eq!(asked, vec![0, 1, 2]);
+        app.handle_remote_ws_message(notes_reply(0, "zero's notes"));
+        app.handle_remote_ws_message(notes_reply(1, ""));
+        assert!(!app.has_new_popup(), "not until every world has answered");
+        app.handle_remote_ws_message(notes_reply(2, "two"));
+        assert!(app.has_new_popup(), "the list opens");
+        // Enter on the list opens the selected world (the current one, w0).
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [WsMessage::RequestNoteEditorState { world_index: 0 }]), "{sent:?}");
+        app.handle_remote_ws_message(notes_reply(0, "zero's notes"));
+        assert!(app.editor.visible && app.editor.world_index == Some(0));
+    }
+
+    #[test]
+    fn note_list_opens_with_what_came_when_the_wait_is_over() {
+        let (mut app, tx, mut rx) = remote_note_app(2);
+        type_line(&mut app, &tx, "/note -l");
+        drain(&mut rx);
+        app.handle_remote_ws_message(notes_reply(0, "only this one answered"));
+        assert!(!app.has_new_popup());
+        if let Some((_, until)) = app.pending_note_list.as_mut() {
+            *until = std::time::Instant::now();
+        }
+        app.expire_notes_list_wait();
+        assert!(app.has_new_popup() && app.pending_note_list.is_none());
+    }
+
+    /// `/note <file>`: the file is on the main instance's machine (user ruling 2026-10-16).
+    /// The server reads it (FileEditorState), Ctrl+S sends it back (SaveFile), and the
+    /// editor closes when the server says it is saved (FileSaved); a failed save keeps it.
+    #[test]
+    fn note_with_a_file_edits_it_on_the_servers_machine() {
+        let (mut app, tx, mut rx) = remote_note_app(1);
+        type_line(&mut app, &tx, "/note /srv/notes.txt");
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [WsMessage::SendCommand { command, .. }] if command == "/note /srv/notes.txt"), "{sent:?}");
+        assert!(!app.editor.visible, "it opens on the server's answer");
+        app.handle_remote_ws_message(WsMessage::FileEditorState { path: "/srv/notes.txt".into(), content: "file text".into() });
+        assert!(app.editor.visible);
+        assert_eq!(app.editor.buffer, "file text");
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE), &tx);
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &tx);
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [WsMessage::SaveFile { path, content }] if path == "/srv/notes.txt" && content == "file text!"), "{sent:?}");
+        assert!(app.editor.visible, "open until the server says it is saved");
+        app.handle_remote_ws_message(WsMessage::FileSaved { path: "/srv/notes.txt".into(), ok: false, error: Some("Permission denied".into()) });
+        assert!(app.editor.visible, "a failed save keeps the edits");
+        app.handle_remote_ws_message(WsMessage::FileSaved { path: "/srv/notes.txt".into(), ok: true, error: None });
+        assert!(!app.editor.visible);
+        // An older server bounces `/note <file>` back: said, not sent again.
+        app.handle_remote_ws_message(WsMessage::ExecuteLocalCommand { command: "/note /srv/notes.txt".into() });
+        assert!(drain(&mut rx).is_empty(), "no ping-pong with an older server");
+    }
+
+    /// MCP simpleedit in the remote console: the server's McpEditOpen opens the same editor
+    /// the master console opens, Ctrl+S sends McpEditSet back and closes it, and with the
+    /// connection gone nothing is sent and the editor keeps the text.
+    #[test]
+    fn an_mcp_edit_opens_the_editor_and_ctrl_s_sends_it_to_the_server() {
+        let (mut app, tx, mut rx) = remote_note_app(2);
+        app.handle_remote_ws_message(WsMessage::McpEditOpen {
+            world_index: 1, reference: "#12.desc".into(), name: "My Room".into(), edit_type: "string-list".into(), content: "A room.".into(),
+        });
+        assert!(app.editor.visible);
+        assert_eq!(app.editor.buffer, "A room.");
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE), &tx);
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &tx);
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [WsMessage::McpEditSet { world_index: 1, reference, edit_type, content }]
+            if reference == "#12.desc" && edit_type == "string-list" && content == "A room.!"), "{sent:?}");
+        assert!(!app.editor.visible, "Save closes it, as on the master console");
+
+        // A second edit while one is open is refused, not swapped in.
+        app.handle_remote_ws_message(WsMessage::McpEditOpen {
+            world_index: 0, reference: "a".into(), name: "A".into(), edit_type: "string".into(), content: "first".into(),
+        });
+        app.handle_remote_ws_message(WsMessage::McpEditOpen {
+            world_index: 0, reference: "b".into(), name: "B".into(), edit_type: "string".into(), content: "second".into(),
+        });
+        assert_eq!(app.editor.buffer, "first");
+
+        // Not connected: nothing sent, the editor stays with the text.
+        app.ws_client_tx = None;
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &tx);
+        assert!(app.editor.visible);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// A world removed before the MCP edit's world moves its index (McpEditSet is by index);
+    /// removing that world closes the editor.
+    #[test]
+    fn the_mcp_edits_world_moves_with_the_worlds() {
+        let (mut app, _tx, _rx) = remote_note_app(3);
+        app.handle_remote_ws_message(WsMessage::McpEditOpen {
+            world_index: 2, reference: "r".into(), name: "N".into(), edit_type: "string".into(), content: "x".into(),
+        });
+        app.handle_remote_ws_message(WsMessage::WorldRemoved { world_index: 0 });
+        assert_eq!(app.editor.mcp_edit.as_ref().map(|c| c.world_index), Some(1));
+        app.handle_remote_ws_message(WsMessage::WorldRemoved { world_index: 1 });
+        assert!(!app.editor.visible);
+    }
+
+    /// Commands the server runs for this console (an action, a macro) go through the same
+    /// dispatcher as typed ones, and never back to the server: /quit ends the console, a
+    /// /world switches the view (the server has connected it), /menu opens the menu, an
+    /// unknown one is said rather than bounced back.
+    #[test]
+    fn commands_the_server_runs_here_are_this_consoles() {
+        let (mut app, _tx, mut rx) = remote_note_app(2);
+        app.handle_remote_ws_message(WsMessage::ExecuteLocalCommand { command: "/world w1".into() });
+        assert_eq!(app.current_world_index, 1);
+        let sent = drain(&mut rx);
+        assert!(!sent.iter().any(|m| matches!(m, WsMessage::ConnectWorld { .. } | WsMessage::SendCommand { .. })), "{sent:?}");
+        app.handle_remote_ws_message(WsMessage::ExecuteLocalCommand { command: "/menu".into() });
+        assert!(app.has_new_popup());
+        app.popup_manager.close();
+        app.handle_remote_ws_message(WsMessage::ExecuteLocalCommand { command: "/nonesuch".into() });
+        assert!(drain(&mut rx).is_empty(), "never sent back");
+        assert!(!app.pending_quit);
+        app.handle_remote_ws_message(WsMessage::ExecuteLocalCommand { command: "/quit".into() });
+        assert!(app.pending_quit);
+    }
+
+    /// The World Selector's Add asks the server for the world; the server's WorldCreated
+    /// opens its editor. `/worlds -e <new>` does the same.
+    #[test]
+    fn new_worlds_are_the_servers_to_create() {
+        let (mut app, tx, mut rx) = remote_note_app(1);
+        type_line(&mut app, &tx, "/worlds -e brand new");
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [WsMessage::CreateWorld { name }] if name == "brand new"), "{sent:?}");
+        assert_eq!(app.worlds.len(), 1, "not created in this console's mirror");
+        app.worlds.push(crate::World::new("brand new"));
+        app.handle_remote_ws_message(WsMessage::WorldCreated { world_index: 1 });
+        assert!(app.has_new_popup(), "the editor opens on the server's answer");
+    }
+
+    /// TF's /input, /dokey and /limit run by this console come back as steps on its own
+    /// input line and filter.
+    #[test]
+    fn input_ops_and_limits_from_the_server_act_here() {
+        let (mut app, _tx, _rx) = remote_note_app(1);
+        use crate::websocket::InputOp;
+        app.handle_remote_ws_message(WsMessage::InputOps { ops: vec![
+            InputOp::Insert { text: "abc".into(), insert: true },
+            InputOp::Goto { pos: 1 },
+            InputOp::Delete { count: 1 },
+        ] });
+        assert_eq!(app.input.buffer, "ac");
+        app.handle_remote_ws_message(WsMessage::LimitOp { action: "apply".into(), pattern: "orc".into(), invert: false, attrs_only: false, style: "glob".into() });
+        assert!(app.filter_popup.visible);
+        assert_eq!(app.filter_popup.filter_text, "orc");
+        app.handle_remote_ws_message(WsMessage::LimitOp { action: "clear".into(), pattern: String::new(), invert: false, attrs_only: false, style: String::new() });
+        assert!(!app.filter_popup.visible);
+    }
+
+    /// The expand_line key asks a server that takes ExpandLine; an older one's line is
+    /// expanded here, as before.
+    #[test]
+    fn expand_line_asks_the_server() {
+        let (mut app, tx, mut rx) = remote_note_app(1);
+        app.input.buffer = "say %{x}".into();
+        app.server_expands_line = true;
+        dispatch_remote_action("expand_line", &mut app, &tx);
+        assert!(matches!(drain(&mut rx).as_slice(), [WsMessage::ExpandLine { text }] if text == "say %{x}"));
+    }
+
+    /// The other ways in - the menu's Notes, and /note bounced back by the server (an
+    /// action ran it) - open the editor too.
+    #[test]
+    fn note_from_the_menu_and_from_the_server_opens_the_editor() {
+        let (mut app, tx, mut rx) = remote_note_app(2);
+        let menu = popup::definitions::menu::MenuItem::all(false);
+        assert!(menu.contains(&popup::definitions::menu::MenuItem::Notes));
+        app.handle_remote_ws_message(WsMessage::ExecuteLocalCommand { command: "/note".into() });
+        assert!(matches!(drain(&mut rx).as_slice(), [WsMessage::RequestNoteEditorState { world_index: 0 }]));
+        app.open_menu_popup_new();
+        // Down to Notes (Help, Settings, Web, Actions, World Selector, Recent Worlds, Notes).
+        for _ in 0..6 {
+            handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        }
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [WsMessage::RequestNoteEditorState { world_index: 0 }]), "{sent:?}");
+    }
+
+    /// The editor's world is an index, and `UpdateNote` goes by index: removing a world
+    /// before it moves it down, removing its own world closes it, and a world inserted
+    /// before it moves it up.
+    #[test]
+    fn the_editors_world_moves_with_the_worlds() {
+        let (mut app, _tx, _rx) = remote_note_app(4);
+        app.run_note_command(&Command::Edit { filename: None });
+        app.pending_note_open = Some(2);
+        app.handle_remote_ws_message(notes_reply(2, "w2's"));
+        assert_eq!(app.editor.world_index, Some(2));
+        app.handle_remote_ws_message(WsMessage::WorldRemoved { world_index: 0 });
+        assert_eq!(app.editor.world_index, Some(1), "w2 is index 1 now");
+        app.shift_note_indices_after_insert(0);
+        assert_eq!(app.editor.world_index, Some(2), "a world inserted before it");
+        app.handle_remote_ws_message(WsMessage::WorldRemoved { world_index: 2 });
+        assert!(!app.editor.visible, "its world is gone: the editor closes");
     }
 }

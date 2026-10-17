@@ -71,7 +71,7 @@ flate2 = "1"
 # pulls in "__rustls-ring" - the ring-based crypto provider variant. This unifies
 # with our direct rustls/tokio-rustls deps above on the same ring-backed rustls
 # 0.23, keeping aws-lc-rs out of the build (see the comment on tokio-rustls above).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 
 # UUID for Edge TTS request IDs
 uuid = { version = "1", features = ["v4"] }

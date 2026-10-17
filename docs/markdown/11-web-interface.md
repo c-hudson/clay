@@ -88,6 +88,11 @@ Click the hamburger icon for:
 | World Selector | Open the world selector (`/worlds`) |
 | Actions | Open the actions editor (`/actions`) |
 | Settings | Open Settings (`/setup`) |
+| Recent Worlds | The worlds you used last |
+| Notes | This world's notes (`/note`) |
+| Notes List | Every world's notes (`/note -l`) |
+| Emoji Picker | Insert an emoji |
+| Import Picture | Upload a picture and put its link in the input line (on Android, choose a picture app) |
 | Toggle Tags | Show/hide MUD tags (F2) |
 | Find | Show only matching lines (F4) |
 | Search History | Find text in the output (F5) |
@@ -97,7 +102,8 @@ Click the hamburger icon for:
 | Logout | (multiuser) Log out |
 
 Import Settings is a button on Settings' General tab (before the `?`), and `/import`
-opens it too. Reload is `Ctrl+R` or `/reload`.
+opens it too. Reload is `Ctrl+R` or `/reload`. A picture dragged onto the page is
+uploaded as Import Picture's are (see **Importing a Picture** in the Interface chapter).
 
 ### World Selector
 

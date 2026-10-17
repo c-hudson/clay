@@ -36,6 +36,8 @@ pub const SETUP_FIELD_ICON_BAR: FieldId = FieldId(25);
 pub const SETUP_FIELD_LOG_INPUT: FieldId = FieldId(26);
 /// The Kokoro voice name (src/kokoro.rs; `/tts voices` lists them).
 pub const SETUP_FIELD_TTS_VOICE: FieldId = FieldId(27);
+/// Import Picture's host (src/picture.rs, `PictureService::OPTIONS`).
+pub const SETUP_FIELD_PICTURE_HOST: FieldId = FieldId(28);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -96,6 +98,11 @@ pub fn icon_bar_options() -> Vec<SelectOption> {
     ]
 }
 
+/// Picture host options (the one list every UI shows, `PictureService::OPTIONS`)
+pub fn picture_host_options() -> Vec<SelectOption> {
+    crate::picture::PictureService::OPTIONS.iter().map(|(v, l)| SelectOption::new(*v, *l)).collect()
+}
+
 /// Create the setup popup definition with current values
 #[allow(clippy::too_many_arguments)]
 pub fn create_setup_popup(
@@ -122,6 +129,7 @@ pub fn create_setup_popup(
     keyboard_always_visible: bool,
     tabs: &str,
     icon_bar: &str,
+    picture_host: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = crate::theme::BUILTIN_THEMES.iter().position(|(name, _)| *name == gui_theme).unwrap_or(0);
@@ -130,6 +138,7 @@ pub fn create_setup_popup(
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
     let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
     let icon_bar_idx = icon_bar_options().iter().position(|o| o.value == icon_bar).unwrap_or(1);
+    let picture_host_idx = picture_host_options().iter().position(|o| o.value == picture_host).unwrap_or(0);
 
     let mut def = PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -246,6 +255,11 @@ pub fn create_setup_popup(
             SETUP_FIELD_ICON_BAR,
             "Icon Bar",
             FieldKind::select(icon_bar_options(), icon_bar_idx),
+        ))
+        .with_field(Field::new(
+            SETUP_FIELD_PICTURE_HOST,
+            "Picture Host",
+            FieldKind::select(picture_host_options(), picture_host_idx),
         ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
@@ -398,6 +412,13 @@ fn setup_help_text() -> Vec<String> {
         "  the console). 'None' hides it; 'App/Tablet' (default)",
         "  shows it in the desktop GUI app and on tablet-width web",
         "  clients; 'All' also shows it on phone.",
+        "",
+        "Picture Host: Where Import Picture uploads a picture",
+        "  (dragged onto the terminal or window, or chosen from",
+        "  the menu in the web/GUI/Android UI); its link goes",
+        "  into the input line. '+ URL shortening' runs the link",
+        "  through /url's shortening. Uploads are public. 'Off'",
+        "  turns picture uploads off.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -411,13 +432,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet",
+            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox",
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 23);
+        assert_eq!(state.definition.fields.len(), 24);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -426,7 +447,7 @@ mod tests {
         let mut def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet",
+            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox",
         );
         add_import_button(&mut def);
         let left: Vec<&str> = def.buttons.iter().filter(|b| b.left_align).map(|b| b.label.as_str()).collect();
@@ -441,7 +462,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all",
+            false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short",
         );
         let state = PopupState::new(def);
 
@@ -461,5 +482,6 @@ mod tests {
         assert_eq!(state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE), Some(false));
         assert_eq!(state.get_selected(SETUP_FIELD_TABS), Some("top"));
         assert_eq!(state.get_selected(SETUP_FIELD_ICON_BAR), Some("all"));
+        assert_eq!(state.get_selected(SETUP_FIELD_PICTURE_HOST), Some("sxcu+short"));
     }
 }
