@@ -174,18 +174,25 @@ Update Clay to the latest GitHub release.
 
 Typed in the console (or in a GUI that runs Clay itself), it checks GitHub, downloads
 this platform's build, installs it over the running binary and hot-reloads, keeping your
-connections. `-f` installs the latest release even when it is not newer.
+connections. `-f` installs the latest release even when it is not newer. An update that
+works says two lines:
+
+```
+Updating Clay to v1.7.10 from v1.7.9
+Reload successful
+```
+
+Already up to date, or a failed download, is one line saying so.
 
 Typed in a remote client - the desktop GUI attached with `--gui=host`, the SSH console,
 the web page, the Android app - it updates what can be updated: first the Clay you are
 attached to (it hot-reloads; the client reconnects), then the client's own binary, which
-restarts attached to the same server. Every line says which program it is about:
+restarts attached to the same server. The client's lines say which program they are about:
 
 ```
-Server (Clay v1.7.4, linux/x86_64): checking for updates...
-Server: updated to Clay v1.7.5 — hot reloading, connections kept.
-This GUI (Clay v1.7.4, linux/x86_64): checking for updates...
-This GUI: updated to Clay v1.7.5 — restarting, still attached to mini:9000.
+Server: updating Clay to v1.7.10 from v1.7.9
+Reload successful
+This GUI: updating Clay to v1.7.10 from v1.7.9
 ```
 
 The two steps never run at the same time. When the client and the server are the same

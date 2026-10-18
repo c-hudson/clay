@@ -159,8 +159,11 @@ of the link.
 Several pictures at once go up one after another, and their links go in together. The
 upload always runs on the Clay server (the main instance), whose **Picture Host** setting
 (Settings > General) chooses the host: catbox.moe (the default; kept until nobody has
-viewed it for two years), sxcu.net (pictures only, three uploads a minute) or x0.at (kept
-3 to 100 days, shorter for big files). Each has a "+ URL shortening" choice that runs the link through `/url`'s shortening. Off turns uploads off.
+viewed it for two years), sxcu.net (pictures only, three uploads a minute), x0.at (kept
+3 to 100 days, shorter for big files) or tmpfiles.org (deleted after two days; its link
+opens tmpfiles' page with the picture and a Download button, not the picture alone). Each
+has a "+ URL shortening" choice that runs the link through `/url`'s shortening. Off turns
+uploads off.
 Pictures over 32 MB aren't uploaded. Anyone with a link can see the picture, and these
 hosts don't let you delete it.
 

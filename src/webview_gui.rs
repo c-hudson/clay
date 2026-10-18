@@ -1133,6 +1133,12 @@ document.addEventListener('DOMContentLoaded', function() {
     document.addEventListener('keydown', function() { closeCtxMenu(); });
 });
 </script>"#;
+    // The OS for the fonts this GUI keeps on it (src/font_profile.rs): the page can't tell
+    // from its user agent (Termux's WebKitGTK says Linux).
+    let webview_overrides = webview_overrides.replace(
+        "window.WEBVIEW_MODE = true;",
+        &format!("window.WEBVIEW_MODE = true;\nwindow.CLAY_GUI_OS = '{}';", crate::font_profile::this_os()),
+    );
     html = html.replace("</head>", &format!("{}\n</head>", webview_overrides));
 
     html
@@ -1162,7 +1168,6 @@ fn self_update_thread(force: bool, proxy: EventLoopProxy<WvEvent>) {
     }
     #[cfg(not(target_os = "android"))]
     {
-        say(crate::selfupdate::checking(LABEL, force));
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
@@ -1170,14 +1175,18 @@ fn self_update_thread(force: bool, proxy: EventLoopProxy<WvEvent>) {
                 return;
             }
         };
-        let outcome: Result<String, String> = match rt.block_on(crate::platform::check_and_download_update(force)) {
+        let found = |version: String| {
+            say(crate::selfupdate::updating(Some(LABEL), &version));
+            std::future::ready(())
+        };
+        let outcome: Result<String, String> = match rt.block_on(crate::platform::check_and_download_update(force, found)) {
             Ok(success) => crate::platform::install_update(&success.temp_path).map(|()| success.version),
             Err(e) => Err(e),
         };
-        say(crate::selfupdate::client_result(LABEL, &outcome, &attached));
+        if let Some(line) = crate::selfupdate::failed(Some(LABEL), &outcome) {
+            say(line);
+        }
         if outcome.is_ok() {
-            // Let the line reach the page before the process is replaced.
-            std::thread::sleep(std::time::Duration::from_millis(500));
             let _ = proxy.send_event(WvEvent::Reload);
         }
     }

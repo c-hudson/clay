@@ -78,6 +78,15 @@ Settings → Font sets the font, its size per device type and its weight. Under
 at 1.0, so ANSI and box-drawing art joins up), **Letter** and **Word** add spacing to the
 output and the input. The desktop GUI's Settings window has the same controls.
 
+Each program keeps its own fonts on each operating system: the native GUI, the WebView
+GUI, a web browser and the Android app, on Windows, macOS, Linux, Android and iOS. A font
+that suits the GUI on Windows can differ from the one it uses on Linux, and a browser on
+the same machine keeps its own again. Settings → Font says whose fonts you are editing.
+Until you change a font, size or spacing in one of them (the slider counts), it uses the
+fonts every interface shared before; from then on it has its own. The phone, tablet and
+desktop sizes are kept inside each one as before. A Clay server from before this change
+keeps one set for everything, as it always did.
+
 ### Hamburger Menu
 
 Click the hamburger icon for:
@@ -88,10 +97,7 @@ Click the hamburger icon for:
 | World Selector | Open the world selector (`/worlds`) |
 | Actions | Open the actions editor (`/actions`) |
 | Settings | Open Settings (`/setup`) |
-| Recent Worlds | The worlds you used last |
-| Notes | This world's notes (`/note`) |
-| Notes List | Every world's notes (`/note -l`) |
-| Emoji Picker | Insert an emoji |
+| Emoji Picker | Insert an emoji (not on a phone or tablet, whose keyboard has its own; `Esc-e` still opens it) |
 | Import Picture | Upload a picture and put its link in the input line (on Android, choose a picture app) |
 | Toggle Tags | Show/hide MUD tags (F2) |
 | Find | Show only matching lines (F4) |
@@ -101,9 +107,12 @@ Click the hamburger icon for:
 | Resync | Request full state refresh |
 | Logout | (multiuser) Log out |
 
-Import Settings is a button on Settings' General tab (before the `?`), and `/import`
-opens it too. Reload is `Ctrl+R` or `/reload`. A picture dragged onto the page is
-uploaded as Import Picture's are (see **Importing a Picture** in the Interface chapter).
+A world's notes are `/note`, or the note icon on the status bar once it has some, and
+`/note -l` lists every world's. Recent Worlds is the `recent_worlds` key action, which has
+no default key (bind one in the keybind editor). Import Settings is the **Import** button
+on Settings' General tab (before the `?`), and `/import` opens it too. Reload is `Ctrl+R`
+or `/reload`. A picture dragged onto the page is uploaded as Import Picture's are (see
+**Importing a Picture** in the Interface chapter).
 
 ### World Selector
 
@@ -141,7 +150,7 @@ the right. On a phone the dialog fills the screen and the sidebar becomes a stri
 icons along the top. The Worlds and Actions dialogs use the same cards, and every
 colour comes from the theme chosen in Settings (the Interface chapter lists them).
 
-The General tab's footer has **Import Settings** before the `?`: it closes Settings (an
+The General tab's footer has **Import** before the `?`: it closes Settings (an
 import replaces what it shows, so a Save afterwards would put the old values back) and
 opens the Import dialog, the same one as `/import`. The console's `/setup` has the same
 button.

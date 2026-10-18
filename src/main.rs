@@ -35,6 +35,7 @@ pub mod audio;
 pub mod platform;
 pub mod commands;
 pub mod picture;
+pub mod font_profile;
 pub mod remote_client;
 pub mod ssh;
 pub mod tts;
@@ -1886,6 +1887,9 @@ pub struct Settings {
     web_font_line_height: f32,     // The INPUT line's line height multiplier (default 1.2); output rows stay 1.0
     web_font_letter_spacing: f32,  // Letter spacing in px (default 0)
     web_font_word_spacing: f32,    // Word spacing in px (default 0)
+    // The fonts of one program on one OS where it has its own (src/font_profile.rs); the
+    // font fields above are the shared ones every other program/OS uses.
+    pub font_profiles: font_profile::FontProfiles,
     // Web server settings (consolidated)
     // The server is always TLS-capable now: localhost is served plain (no cert prompt,
     // see http::route_connection's loopback branch), remote clients always get TLS —
@@ -2006,6 +2010,7 @@ impl Default for Settings {
             web_font_line_height: 1.2,
             web_font_letter_spacing: 0.0,
             web_font_word_spacing: 0.0,
+            font_profiles: Default::default(),
             web_secure: false,         // Default to non-secure
             http_enabled: false,
             http_port: 9000,
@@ -6128,6 +6133,7 @@ impl App {
             web_font_line_height: self.settings.web_font_line_height,
             web_font_letter_spacing: self.settings.web_font_letter_spacing,
             web_font_word_spacing: self.settings.web_font_word_spacing,
+            font_profiles: Some(self.settings.font_profiles.clone()),
             ws_allow_list: self.settings.websocket_allow_list.clone(),
             web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
@@ -6214,6 +6220,9 @@ impl App {
         self.settings.web_font_line_height = settings.web_font_line_height;
         self.settings.web_font_letter_spacing = settings.web_font_letter_spacing;
         self.settings.web_font_word_spacing = settings.web_font_word_spacing;
+        if let Some(profiles) = &settings.font_profiles {
+            self.settings.font_profiles = profiles.clone();
+        }
         self.settings.websocket_allow_list = settings.ws_allow_list.clone();
         self.settings.web_secure = settings.web_secure;
         self.settings.http_enabled = settings.http_enabled;
@@ -10779,6 +10788,7 @@ impl App {
         tabs: String,
         icon_bar: String,
         picture_host: Option<String>,
+        font_profile: Option<font_profile::FontProfileUpdate>,
     ) {
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
@@ -10824,6 +10834,10 @@ impl App {
         self.settings.web_font_line_height = web_font_line_height.clamp(0.5, 3.0);
         self.settings.web_font_letter_spacing = web_font_letter_spacing.clamp(-5.0, 10.0);
         self.settings.web_font_word_spacing = web_font_word_spacing.clamp(-5.0, 20.0);
+        // One client's own fonts (its program on its OS); None = unchanged.
+        if let Some(update) = font_profile {
+            self.settings.set_font_profile(update);
+        }
         self.settings.websocket_allow_list = ws_allow_list.clone();
         // Update the running WebSocket server's allow list
         if let Some(ref server) = self.ws_server {
@@ -13801,6 +13815,10 @@ impl App {
                 self.apply_picture_upload(client_id, id, name, result);
                 None
             }
+            AppEvent::UpdateLine { line, reply_to } => {
+                self.reply_update_line(reply_to, &line);
+                None
+            }
             AppEvent::TtsLine { line, done, reply_to } => {
                 self.reply_update_line(reply_to, &line);
                 if done {
@@ -15213,10 +15231,15 @@ impl App {
         }
         #[cfg(not(target_os = "android"))]
         {
-            self.reply_update_line(reply_to, &selfupdate::checking(selfupdate::SERVER, force));
             let event_tx = event_tx.clone();
+            let label = Self::update_label(reply_to);
             tokio::spawn(async move {
-                let result = check_and_download_update(force).await;
+                let line_tx = event_tx.clone();
+                let result = check_and_download_update(force, move |version| async move {
+                    let line = selfupdate::updating(label, &version);
+                    let _ = line_tx.send(AppEvent::UpdateLine { line, reply_to }).await;
+                })
+                .await;
                 let _ = event_tx.send(AppEvent::UpdateResult { result, reply_to }).await;
             });
         }
@@ -15237,7 +15260,9 @@ impl App {
             )),
             Err(e) => Err(e),
         };
-        self.reply_update_line(reply_to, &selfupdate::server_result(&outcome));
+        if let Some(line) = selfupdate::failed(Self::update_label(reply_to), &outcome) {
+            self.reply_update_line(reply_to, &line);
+        }
         match outcome {
             Ok(version) => {
                 self.send_update_outcome(reply_to, true, true, &version);
@@ -15255,6 +15280,12 @@ impl App {
                 false
             }
         }
+    }
+
+    /// The console's own `/update` lines need no label; a client's say they are the
+    /// server's (its own half's lines are in the same output).
+    fn update_label(reply_to: Option<(u64, usize)>) -> Option<&'static str> {
+        reply_to.map(|_| selfupdate::SERVER)
     }
 
     fn send_update_outcome(&mut self, reply_to: Option<(u64, usize)>, ok: bool, reloading: bool, version: &str) {
@@ -16856,7 +16887,7 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar, picture_host } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar, picture_host, font_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -16866,7 +16897,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                     mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                    log_input_enabled, keyboard_always_visible, tabs, icon_bar, picture_host,
+                    log_input_enabled, keyboard_always_visible, tabs, icon_bar, picture_host, font_profile,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -18499,6 +18530,9 @@ pub enum AppEvent {
     // is who asked: None = the console, Some((client_id, world_index)) = a remote client
     // (which also gets a WsMessage::UpdateOutcome so it can go on with its own update).
     UpdateResult { result: Result<UpdateSuccess, String>, reply_to: Option<(u64, usize)> },
+    /// The server's /update found a newer release and is downloading it: its "Updating
+    /// Clay to ..." line, for whoever asked. Handled in `App::preprocess_event`.
+    UpdateLine { line: String, reply_to: Option<(u64, usize)> },
     /// A line from `/tts install` (src/kokoro.rs), for the console or the client that
     /// asked; `done` on the last one. Handled in `App::preprocess_event` for every loop.
     TtsLine { line: String, done: bool, reply_to: Option<(u64, usize)> },
@@ -22203,7 +22237,7 @@ pub async fn run_app_headless(
         let reload_msg = if is_crash {
             "Crash recovery complete."
         } else {
-            "Hot reload complete."
+            selfupdate::RELOADED
         };
         app.add_output(reload_msg);
     }
@@ -22653,6 +22687,7 @@ pub async fn run_app_headless(
                     }
                     // Consumed by App::preprocess_event above; never reaches here.
                     AppEvent::TtsLine { .. } => {}
+                    AppEvent::UpdateLine { .. } => {}
                     AppEvent::PictureUploaded { .. } => {}
                     AppEvent::ImportResult(client_id, addr, result) => {
                         app.handle_import_result(client_id, addr, result);
@@ -23582,7 +23617,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         let reload_msg = if is_crash {
             "Crash recovery complete."
         } else {
-            "Hot reload complete."
+            selfupdate::RELOADED
         };
         app.add_output(reload_msg);
     }
@@ -23940,8 +23975,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.drop_sniffer.reset();
                     handle_paste(&mut app, text);
                     // Fall through to the draw at the end of the loop
+                } else if matches!(event, Event::Key(key) if key.kind != KeyEventKind::Press) {
+                    // A release (Windows reports one after every press): nothing, unless it
+                    // ends a typed burst - then fall through to the draw at the end of the loop.
+                    if !app.release_ends_typed_burst() { continue; }
                 } else if let Event::Key(key) = event {
-                    if key.kind != KeyEventKind::Press { continue; }
                     match handle_key_event(key, &mut app) {
                         KeyAction::Quit => {
                             app.unmap_on_quit().await;
@@ -24517,6 +24555,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     // Consumed by App::preprocess_event above; never reaches here.
                     AppEvent::TtsLine { .. } => {}
+                    AppEvent::UpdateLine { .. } => {}
                     AppEvent::PictureUploaded { .. } => {}
                     AppEvent::ImportResult(client_id, addr, result) => {
                         app.handle_import_result(client_id, addr, result);
@@ -24998,6 +25037,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 // Consumed by App::preprocess_event above; never reaches here.
                 AppEvent::TtsLine { .. } => {}
+                AppEvent::UpdateLine { .. } => {}
                 AppEvent::PictureUploaded { .. } => {}
                 AppEvent::ImportResult(client_id, addr, result) => {
                     app.handle_import_result(client_id, addr, result);

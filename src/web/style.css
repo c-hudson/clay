@@ -1252,6 +1252,13 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
     font-weight: 400;
 }
 
+/* A phone's or tablet's keyboard has its own emoji picker (user ruling 2026-10-17);
+   Esc-e still opens Clay's. */
+body.device-phone #menu-dropdown .menu-item[data-action="emoji_picker"],
+body.device-tablet #menu-dropdown .menu-item[data-action="emoji_picker"] {
+    display: none;
+}
+
 .menu-sep {
     height: 1px;
     background: var(--border-color);
@@ -3613,6 +3620,12 @@ html.popup-window .settings-content {
     color: var(--theme-fg-secondary, #a1a1aa);
     font-size: 12px;
     padding-bottom: 4px;
+}
+
+.font-owner-note {
+    color: var(--theme-fg-secondary, #a1a1aa);
+    font-size: 12px;
+    padding: 0 2px;
 }
 
 .font-family-list {

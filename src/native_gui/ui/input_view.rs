@@ -450,7 +450,7 @@ impl ClayView {
     /// The input's line height (Settings > Font > Input Ht, web_font_line_height); the
     /// output's rows stay at 1.0.
     pub(super) fn input_row_h(&self) -> f32 {
-        let line_height = self.session.core.settings.as_ref().map_or(1.2, |s| s.web_font_line_height).clamp(0.5, 3.0);
+        let line_height = self.session.core.settings.as_ref().map_or(1.2, |s| s.font_for(crate::font_profile::native_key()).line_height).clamp(0.5, 3.0);
         line_height * self.font_size
     }
 

@@ -2473,7 +2473,7 @@ section = "output"
 phase = 2
 status = "done"
 feature = "font_name, size 7-20, weight, letter/word spacing applied to output"
-note = "font_name (installed fonts, monospace), web_font_weight, letter and word spacing (letter spacing on all text: B16)"
+note = "this GUI's fonts on this OS (GlobalSettingsMsg::font_for(native_key), else the shared font_name/web_font_*): name (installed fonts, monospace), weight, letter and word spacing (letter spacing on all text: B16)"
 
 [[item]]
 id = "ui:output.wrap"
@@ -2513,7 +2513,7 @@ section = "status"
 phase = 2
 status = "done"
 feature = "hamburger menu (dropdown upward); items open their features as those land"
-note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings, Recent Worlds, Notes, Notes List, Emoji Picker, Import Picture (when the server uploads pictures) | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab)"
+note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings, Emoji Picker (not on a phone or tablet), Import Picture (when the server uploads pictures) | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab; Notes, Notes List and Recent Worlds left it 2026-10-17: /note, the status bar's note icon, /note -l, and the recent_worlds key action)"
 
 [[item]]
 id = "ui:status.world"
@@ -2568,8 +2568,8 @@ id = "ui:status.font-slider"
 section = "status"
 phase = 2
 status = "done"
-feature = "A / slider / value: font size 7-20, saved to web_font_size_desktop"
-note = "UpdateGlobalSettings echoes every field back (settings_update, round-trip tested against App)"
+feature = "A / slider / value: font size 7-20, saved as this GUI's own desktop size on this OS (font profile native-<os>, src/font_profile.rs)"
+note = "UpdateGlobalSettings echoes every field back, the shared fonts too, plus font_profile (settings_update, round-trip tested against App)"
 
 [[item]]
 id = "ui:status.scrollback"
@@ -2808,7 +2808,7 @@ id = "ui:dialog.import"
 section = "dialogs"
 phase = 4
 status = "done"
-feature = "/import and Settings' Import Settings button (General, before the ?; Settings closes first): host, password, auth key; a plaintext confirm before resending without TLS"
+feature = "/import and Settings' Import button (General, before the ?; Settings closes first): host, password, auth key; a plaintext confirm before resending without TLS"
 note = "app.js showImportDialog"
 
 [[item]]

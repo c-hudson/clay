@@ -5,8 +5,13 @@
 //! console, a browser page - it first asks the server to update itself, and once the
 //! server has answered (and come back, if it reloaded), updates the client's own
 //! binary and restarts it attached to the same server. Two programs can be updating in
-//! one go, so every line says which one it is about: `Server: ...` for the Clay being
-//! attached to, `This GUI: ...`/`This console: ...` for the program the user typed in.
+//! one go, so a client's lines say which one they are about: `Server: ...` for the Clay
+//! being attached to, `This GUI: ...`/`This console: ...` for the program the user typed
+//! in. The console's own lines need no label - it is the only program.
+//!
+//! A successful update says two lines (user ruling 2026-10-17): "Updating Clay to v1.7.10
+//! from v1.7.9" once the new release is found, before the download, and the reloaded
+//! Clay's "Reload successful". Nothing says "checking" or "installed".
 //!
 //! The two steps run one after the other, never at the same time: the client's own
 //! download starts only once the server's attempt has finished. That matters when both
@@ -50,25 +55,25 @@ impl ClientFlow {
     }
 }
 
-/// `{label} (Clay v1.7.4, linux/x86_64): checking for updates...`
-pub fn checking(label: &str, force: bool) -> String {
-    let what = if force { "fetching the latest release (forced)" } else { "checking for updates" };
-    format!("{label} (Clay v{}, {}/{}): {what}...", crate::VERSION, crate::platform_tag(), std::env::consts::ARCH)
-}
+/// What the reloaded Clay says (the console's `/reload` and `/update` alike).
+pub const RELOADED: &str = "Reload successful";
 
-/// The server's attempt is over: what it says, by outcome.
-pub fn server_result(result: &Result<String, String>) -> String {
-    match result {
-        Ok(version) => format!("{SERVER}: updated to Clay v{version} \u{2014} hot reloading, connections kept."),
-        Err(e) => format!("{SERVER}: {e}"),
+/// A newer release was found and is being downloaded: `Updating Clay to v1.7.10 from
+/// v1.7.9`, or `{label}: updating Clay to ...` among a client's lines.
+pub fn updating(label: Option<&str>, version: &str) -> String {
+    match label {
+        None => format!("Updating Clay to v{version} from v{}", crate::VERSION),
+        Some(label) => format!("{label}: updating Clay to v{version} from v{}", crate::VERSION),
     }
 }
 
-/// A client's own attempt is over. `attached_to` names the server it restarts against.
-pub fn client_result(label: &str, result: &Result<String, String>, attached_to: &str) -> String {
-    match result {
-        Ok(version) => format!("{label}: updated to Clay v{version} \u{2014} restarting, still attached to {attached_to}."),
-        Err(e) => format!("{label}: {e}"),
+/// An attempt is over: nothing more to say when it worked (the reload or the restart
+/// follows), else why not.
+pub fn failed(label: Option<&str>, result: &Result<String, String>) -> Option<String> {
+    match (result, label) {
+        (Ok(_), _) => None,
+        (Err(e), None) => Some(e.clone()),
+        (Err(e), Some(label)) => Some(format!("{label}: {e}")),
     }
 }
 
@@ -215,19 +220,14 @@ mod tests {
     }
 
     #[test]
-    fn every_line_names_its_program() {
-        assert!(checking("This GUI", false).starts_with("This GUI (Clay v"));
-        assert!(checking("Server", true).contains("forced"));
-        assert_eq!(
-            server_result(&Ok("1.7.5".into())),
-            "Server: updated to Clay v1.7.5 \u{2014} hot reloading, connections kept."
-        );
-        assert_eq!(server_result(&Err("Already up to date (current: v1.7.5, latest: v1.7.5)".into())),
+    fn every_client_line_names_its_program() {
+        assert_eq!(updating(None, "9.9.9"), format!("Updating Clay to v9.9.9 from v{}", crate::VERSION));
+        assert_eq!(updating(Some("This GUI"), "9.9.9"), format!("This GUI: updating Clay to v9.9.9 from v{}", crate::VERSION));
+        assert_eq!(failed(None, &Ok("1.7.5".into())), None, "a success says nothing more");
+        assert_eq!(failed(Some(SERVER), &Ok("1.7.5".into())), None);
+        assert_eq!(failed(Some(SERVER), &Err("Already up to date (current: v1.7.5, latest: v1.7.5)".into())).unwrap(),
             "Server: Already up to date (current: v1.7.5, latest: v1.7.5)");
-        assert_eq!(
-            client_result("This console", &Ok("1.7.5".into()), "mini:9000"),
-            "This console: updated to Clay v1.7.5 \u{2014} restarting, still attached to mini:9000."
-        );
+        assert_eq!(failed(None, &Err("Download failed: HTTP 404".into())).unwrap(), "Download failed: HTTP 404");
         assert!(replaced_on_disk("This GUI", "mini:9000").starts_with("This GUI: its binary was replaced"));
         assert!(server_too_old().starts_with("Server: "));
         assert!(multiuser_refused().starts_with("Server: "));

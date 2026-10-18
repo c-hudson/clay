@@ -213,9 +213,6 @@
             <div class="menu-item" data-action="world-selector">World Selector<span class="shortcut">/worlds</span></div>
             <div class="menu-item" data-action="actions">Actions<span class="shortcut">/actions</span></div>
             <div class="menu-item" data-action="setup">Settings<span class="shortcut">/setup</span></div>
-            <div class="menu-item" data-action="recent_worlds">Recent Worlds</div>
-            <div class="menu-item" data-action="notes">Notes<span class="shortcut">/note</span></div>
-            <div class="menu-item" data-action="notes-list">Notes List<span class="shortcut">/note -l</span></div>
             <div class="menu-item" data-action="emoji_picker">Emoji Picker</div>
             <div class="menu-item" data-action="import-picture" style="display: none;">Import Picture</div>
             <div class="menu-sep"></div>
@@ -1037,6 +1034,8 @@
                                                     <option value="sxcu+short">sxcu.net + URL shortening</option>
                                                     <option value="x0">x0.at</option>
                                                     <option value="x0+short">x0.at + URL shortening</option>
+                                                    <option value="tmpfiles">tmpfiles.org (2 days)</option>
+                                                    <option value="tmpfiles+short">tmpfiles.org (2 days) + URL shortening</option>
                                                     <option value="off">Off</option>
                                                 </select>
                                             </div>
@@ -1134,6 +1133,8 @@
                         <!-- Font section -->
                         <div class="settings-section" id="settings-font">
                             <div class="popup-body card-stack">
+                                <!-- Whose fonts these are: each program keeps its own on each OS (app.js fontProfileKey) -->
+                                <div class="font-owner-note" id="font-owner-note"></div>
                                 <div class="card">
                                 <div class="font-family-label">Font family</div>
                                 <div class="font-family-list" id="font-family-list"></div>
@@ -1353,9 +1354,9 @@
                         </div>
                         <!-- Shared footer -->
                         <div class="popup-footer">
-                            <!-- General only (switchSettingsTab): Import Settings, which the
+                            <!-- General only (switchSettingsTab): Import (Import Settings), which the
                                  menu used to have. -->
-                            <button id="settings-import-btn" class="btn">Import Settings</button>
+                            <button id="settings-import-btn" class="btn">Import</button>
                             <button id="settings-help-btn" class="btn btn-help">?</button>
                             <span class="footer-spacer"></span>
                             <button id="settings-cancel-btn" class="btn">Cancel</button>

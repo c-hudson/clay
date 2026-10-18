@@ -441,6 +441,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "web_font_line_height={}", app.settings.web_font_line_height)?;
     writeln!(file, "web_font_letter_spacing={}", app.settings.web_font_letter_spacing)?;
     writeln!(file, "web_font_word_spacing={}", app.settings.web_font_word_spacing)?;
+    crate::font_profile::write_lines(&app.settings.font_profiles, &mut *file)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -1199,6 +1200,10 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         if let Ok(v) = value.parse::<f32>() {
                             app.settings.web_font_word_spacing = v.clamp(-5.0, 20.0);
                         }
+                    }
+                    // One program/OS's own fonts (src/font_profile.rs).
+                    k if k.starts_with("font.") => {
+                        app.settings.read_font_profile_line(k, value);
                     }
                     "gui_transparency" => {
                         if let Ok(t) = value.parse::<f32>() {
@@ -2182,6 +2187,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "web_font_line_height={}", app.settings.web_font_line_height)?;
     writeln!(file, "web_font_letter_spacing={}", app.settings.web_font_letter_spacing)?;
     writeln!(file, "web_font_word_spacing={}", app.settings.web_font_word_spacing)?;
+    crate::font_profile::write_lines(&app.settings.font_profiles, &mut *file)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -3113,6 +3119,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             app.settings.web_font_word_spacing = v.clamp(-5.0, 20.0);
                         }
                     }
+                    // One program/OS's own fonts (src/font_profile.rs).
+                    k if k.starts_with("font.") => {
+                        app.settings.read_font_profile_line(k, value);
+                    }
                     "gui_transparency" => {
                         if let Ok(t) = value.parse::<f32>() {
                             app.settings.gui_transparency = t.clamp(0.3, 1.0);
@@ -3855,6 +3865,21 @@ mod tests {
             tabs: TabsMode::Top,               // default: None
             icon_bar: IconBarMode::All,        // default: AppTablet
             picture_host: crate::picture::PictureService::from_name("x0+short"), // default: catbox
+            font_profiles: [(
+                "native-windows".to_string(),
+                crate::font_profile::FontProfile {
+                    name: "Cascadia Mono".to_string(),
+                    size_phone: 10.0,
+                    size_tablet: 12.0,
+                    size_desktop: 15.5,
+                    weight: 350,
+                    line_height: 1.3,
+                    letter_spacing: 0.5,
+                    word_spacing: 1.0,
+                },
+            )]
+            .into_iter()
+            .collect(), // default: none
         }
     }
 
@@ -3966,6 +3991,7 @@ mod tests {
         assert_eq!(a.tabs, b.tabs, "{context}: tabs");
         assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
         assert_eq!(a.picture_host, b.picture_host, "{context}: picture_host");
+        assert_eq!(a.font_profiles, b.font_profiles, "{context}: font_profiles");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -5241,6 +5267,7 @@ pattern=foo
         assert_ne!(non_default.tabs, default.tabs, "tabs should differ");
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");
         assert_ne!(non_default.picture_host, default.picture_host, "picture_host should differ");
+        assert_ne!(non_default.font_profiles, default.font_profiles, "font_profiles should differ");
     }
 
     #[test]

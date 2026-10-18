@@ -89,8 +89,16 @@ pub struct SettingsView {
     main: WeakEntity<ClayView>,
     focus: FocusHandle,
     tab: Tab,
-    /// The settings as edited (the font ones also previewed on the main window).
+    /// The settings as edited (the font ones also previewed on the main window). Its
+    /// shared font fields hold this GUI's own fonts on this OS while the window is open
+    /// (src/font_profile.rs); Save puts them back as its profile.
     edit: GlobalSettingsMsg,
+    /// The shared fonts as the server sent them, to send back unchanged.
+    shared_font: crate::font_profile::FontProfile,
+    /// The fonts the Font tab opened with, and whether they were this GUI's own: an
+    /// unchanged Font tab doesn't give it a profile.
+    shown_font: crate::font_profile::FontProfile,
+    had_own_font: bool,
     world_switch: Pick,
     theme: Pick,
     tts: Pick,
@@ -112,6 +120,12 @@ pub struct SettingsView {
 
 impl SettingsView {
     pub fn new(main: WeakEntity<ClayView>, edit: GlobalSettingsMsg, tab: Tab, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut edit = edit;
+        let key = crate::font_profile::native_key();
+        let shared_font = edit.shared_font();
+        let had_own_font = edit.has_own_font(key);
+        let shown_font = edit.font_for(key);
+        edit.put_shared_font(&shown_font);
         let text = |v: String, ph: &str, window: &mut Window, cx: &mut Context<Self>| {
             let ph = ph.to_string();
             cx.new(|cx| InputState::new(window, cx).default_value(v).placeholder(ph))
@@ -195,6 +209,9 @@ impl SettingsView {
             focus: cx.focus_handle(),
             tab,
             edit,
+            shared_font,
+            shown_font,
+            had_own_font,
             transparency,
             fields,
             fonts,
@@ -248,7 +265,9 @@ impl SettingsView {
 
     /// Show the font and Transparency as edited.
     fn preview(&self, cx: &mut Context<Self>) {
-        let edit = self.edit.clone();
+        let mut edit = self.edit.clone();
+        let font = edit.shared_font();
+        edit.set_font_for(crate::font_profile::native_key(), font);
         let _ = self.main.update(cx, |v, cx| v.preview_settings(Some(edit), cx));
     }
 
@@ -262,6 +281,12 @@ impl SettingsView {
             return;
         }
         let mut s = self.edit.clone();
+        // The Font tab's values are this GUI's own fonts; the shared ones go back as sent.
+        let edited = s.shared_font();
+        s.put_shared_font(&self.shared_font);
+        if self.had_own_font || edited != self.shown_font {
+            s.set_font_for(crate::font_profile::native_key(), edited);
+        }
         s.world_switch_mode = self.world_switch.value(cx);
         s.gui_theme = self.theme.value(cx);
         s.tts_mode = self.tts.value(cx);
@@ -513,11 +538,12 @@ impl SettingsView {
         });
         let num = |v: f32| format!("{v:.1}");
         let advanced = self.advanced;
-        // Three cards: the family, the sizes, the advanced spacing.
+        // Whose fonts these are, then three cards: the family, the sizes, the advanced spacing.
         div()
             .flex()
             .flex_col()
             .gap(px(10.0))
+            .child(k.note(format!("Fonts for {} (each program keeps its own on each OS).", crate::font_profile::label(crate::font_profile::native_key()))).text_size(px(12.0)))
             .child(
                 k.card()
                     .flex()
@@ -665,7 +691,7 @@ impl Render for SettingsView {
                             .pt(px(8.0))
                             .pb(px(10.0))
                             .when(self.tab == Tab::General, |d| {
-                                d.child(k.button("settings-import", "Import Settings", Btn::Plain, Some(Box::new(cx.listener(|this, _, _, cx| this.import(cx))))))
+                                d.child(k.button("settings-import", "Import", Btn::Plain, Some(Box::new(cx.listener(|this, _, _, cx| this.import(cx))))))
                             })
                             .child(k.help_button("settings-help", cx.listener(|this, _, w, cx| this.help(w, cx))))
                             .child(div().flex_1())

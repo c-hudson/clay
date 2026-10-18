@@ -36,6 +36,8 @@ pub const GIVE_UP_AFTER: Duration = Duration::from_secs(180);
 pub const IDLE_DROP_AFTER: Duration = Duration::from_secs(60);
 /// The host's whole request, upload and reply.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// tmpfiles.org deletes a file after this long: two days, the most it allows.
+const TMPFILES_EXPIRE_SECS: u32 = 48 * 60 * 60;
 
 // ---------------------------------------------------------------------------------------
 // Hosts and the setting
@@ -46,6 +48,7 @@ pub enum PictureHost {
     Catbox,
     Sxcu,
     X0,
+    Tmpfiles,
 }
 
 impl PictureHost {
@@ -54,6 +57,7 @@ impl PictureHost {
             PictureHost::Catbox => "catbox",
             PictureHost::Sxcu => "sxcu",
             PictureHost::X0 => "x0",
+            PictureHost::Tmpfiles => "tmpfiles",
         }
     }
 
@@ -63,6 +67,7 @@ impl PictureHost {
             PictureHost::Catbox => "catbox.moe",
             PictureHost::Sxcu => "sxcu.net",
             PictureHost::X0 => "x0.at",
+            PictureHost::Tmpfiles => "tmpfiles.org",
         }
     }
 
@@ -71,10 +76,11 @@ impl PictureHost {
             PictureHost::Catbox => "https://catbox.moe/user/api.php",
             PictureHost::Sxcu => "https://sxcu.net/api/files/create",
             PictureHost::X0 => "https://x0.at/",
+            PictureHost::Tmpfiles => "https://tmpfiles.org/api/v1/upload",
         }
     }
 
-    const ALL: [PictureHost; 3] = [PictureHost::Catbox, PictureHost::Sxcu, PictureHost::X0];
+    const ALL: [PictureHost; 4] = [PictureHost::Catbox, PictureHost::Sxcu, PictureHost::X0, PictureHost::Tmpfiles];
 }
 
 /// The Settings > General "Picture Host" choice: a host, optionally with the link run
@@ -103,6 +109,8 @@ impl PictureService {
         ("sxcu+short", "sxcu.net + URL shortening"),
         ("x0", "x0.at"),
         ("x0+short", "x0.at + URL shortening"),
+        ("tmpfiles", "tmpfiles.org (2 days)"),
+        ("tmpfiles+short", "tmpfiles.org (2 days) + URL shortening"),
         ("off", "Off"),
     ];
 
@@ -309,6 +317,10 @@ async fn upload_at(
         PictureHost::Sxcu => reqwest::multipart::Form::new()
             .text("noembed", "")
             .part("file", part),
+        // Deleted after two days, its longest (`expire` is in seconds).
+        PictureHost::Tmpfiles => reqwest::multipart::Form::new()
+            .text("expire", TMPFILES_EXPIRE_SECS.to_string())
+            .part("file", part),
     };
 
     let response = client
@@ -365,6 +377,22 @@ fn parse_reply(host: PictureHost, status: u16, body: &str) -> Result<String, Str
                 Some(url) if (200..300).contains(&status) => url,
                 _ => {
                     return Err(field("error").unwrap_or_else(|| reply_error(status, body)));
+                }
+            }
+        }
+        // `{"status":"success","data":{"url":...}}`. The link is the file's page (the
+        // picture and a Download button): the picture's own link is signed per page view
+        // and lapses in minutes, so it can't be shared.
+        PictureHost::Tmpfiles => {
+            let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+            let url = json.as_ref().and_then(|j| j.pointer("/data/url")).and_then(|v| v.as_str());
+            match url {
+                Some(url) if (200..300).contains(&status) => url.to_string(),
+                _ => {
+                    let said = json.as_ref().and_then(|j| {
+                        ["message", "error"].iter().find_map(|k| j.get(*k).and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    });
+                    return Err(said.unwrap_or_else(|| reply_error(status, body)));
                 }
             }
         }
@@ -928,6 +956,18 @@ impl crate::App {
         parse_dropped_paths(text)
     }
 
+    /// A key's release (or repeat), which Windows' console reports after every press: the
+    /// burst check after the press saw it waiting and skipped the draw, so once the input
+    /// has run dry the burst ends here. True when it did and the console must draw - before
+    /// this, Windows drew each key only when the next one came.
+    pub(crate) fn release_ends_typed_burst(&mut self) -> bool {
+        if !self.drop_sniffer.is_active() || crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+            return false;
+        }
+        self.finish_typed_burst();
+        true
+    }
+
     /// A typed burst is over (no more terminal input waiting): if it was a drop of
     /// pictures, it comes back out of the input line and the y/n question goes up.
     pub(crate) fn finish_typed_burst(&mut self) {
@@ -1374,6 +1414,16 @@ mod tests {
         assert_eq!(parse_reply(PictureHost::Catbox, 200, "File too large."), Err("catbox.moe refused it: File too large.".to_string()));
         assert_eq!(parse_reply(PictureHost::X0, 200, "http://insecure/x.png"), Err("x0.at refused it: http://insecure/x.png".to_string()));
         assert!(parse_reply(PictureHost::X0, 200, "  ").unwrap_err().contains("empty"));
+        assert_eq!(
+            parse_reply(PictureHost::Tmpfiles, 200, r#"{"status":"success","data":{"url":"https://tmpfiles.org/wUAkcoywiOwN/picture.png"}}"#),
+            Ok("https://tmpfiles.org/wUAkcoywiOwN/picture.png".to_string())
+        );
+        assert_eq!(parse_reply(PictureHost::Tmpfiles, 413, r#"{"status":"error","message":"File too large"}"#), Err("File too large".to_string()));
+        assert_eq!(parse_reply(PictureHost::Tmpfiles, 502, "<html>bad gateway</html>"), Err("HTTP 502".to_string()));
+        assert_eq!(
+            parse_reply(PictureHost::Tmpfiles, 200, r#"{"status":"success","data":{"url":"http://tmpfiles.org/a/picture.png"}}"#),
+            Err("tmpfiles.org refused it: http://tmpfiles.org/a/picture.png".to_string())
+        );
     }
 
     fn chunks_of(bytes: &[u8]) -> Vec<(u64, String, bool)> {
@@ -1490,9 +1540,9 @@ mod tests {
         assert!(!c.is_busy());
     }
 
-    /// The upload's request, against a local fake host.
-    #[tokio::test]
-    async fn an_upload_posts_the_picture_and_returns_the_link() {
+    /// One upload against a local fake host that answers `reply`: what came back, and the
+    /// request the host saw.
+    async fn upload_to_fake(service: PictureService, reply: &'static str) -> (Result<Uploaded, String>, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let port = crate::testserver::free_port();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -1520,19 +1570,34 @@ mod tests {
                 assert!(n > 0, "closed early");
                 req.extend_from_slice(&buf[..n]);
             }
-            let body = "https://files.example/abc.png\n";
-            let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-            sock.write_all(reply.as_bytes()).await.unwrap();
+            let out = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply);
+            sock.write_all(out.as_bytes()).await.unwrap();
             String::from_utf8_lossy(&req).to_string()
         });
         let endpoint = format!("http://127.0.0.1:{}/", port);
-        let got = upload_at(&endpoint, PictureService::default(), png(), sniff(&png()).unwrap(), Vec::new()).await;
+        let got = upload_at(&endpoint, service, png(), sniff(&png()).unwrap(), Vec::new()).await;
+        (got, server.await.unwrap())
+    }
+
+    /// The upload's request, against a local fake host.
+    #[tokio::test]
+    async fn an_upload_posts_the_picture_and_returns_the_link() {
+        let (got, req) = upload_to_fake(PictureService::default(), "https://files.example/abc.png\n").await;
         assert_eq!(got, Ok(Uploaded { url: "https://files.example/abc.png".to_string(), note: None }));
-        let req = server.await.unwrap();
         assert!(req.contains("name=\"reqtype\""), "{}", req);
         assert!(req.contains("fileupload"));
         assert!(req.contains("name=\"fileToUpload\"; filename=\"picture.png\""));
         assert!(req.contains("image/png"));
         assert!(req.contains("Clay/"));
+    }
+
+    /// tmpfiles.org: the file under "file", kept two days, the page link out of the JSON.
+    #[tokio::test]
+    async fn a_tmpfiles_upload_asks_for_two_days() {
+        let service = PictureService::from_name("tmpfiles");
+        let (got, req) = upload_to_fake(service, r#"{"status":"success","data":{"url":"https://tmpfiles.org/Ab12/picture.png"}}"#).await;
+        assert_eq!(got, Ok(Uploaded { url: "https://tmpfiles.org/Ab12/picture.png".to_string(), note: None }));
+        assert!(req.contains("name=\"file\"; filename=\"picture.png\""), "{}", req);
+        assert!(req.contains("name=\"expire\"\r\n\r\n172800\r\n"), "{}", req);
     }
 }

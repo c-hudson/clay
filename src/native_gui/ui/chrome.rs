@@ -170,9 +170,6 @@ const MAIN_MENU: &[Option<(&str, &str, &str)>] = &[
     Some(("world-selector", "World Selector", "/worlds")),
     Some(("actions", "Actions", "/actions")),
     Some(("setup", "Settings", "/setup")),
-    Some(("recent_worlds", "Recent Worlds", "")),
-    Some(("notes", "Notes", "/note")),
-    Some(("notes-list", "Notes List", "/note -l")),
     Some(("emoji_picker", "Emoji Picker", "")),
     Some(("import-picture", "Import Picture", "")),
     None,
@@ -748,8 +745,8 @@ impl ClayView {
         self.set_font_size(size, cx);
     }
 
-    /// A new output font size: shown at once, and saved to the server (it's the
-    /// `web_font_size_desktop` setting every desktop client shares).
+    /// A new output font size: shown at once, and saved to the server as this GUI's own
+    /// desktop size on this OS (src/font_profile.rs).
     pub(super) fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
         let size = size.round().clamp(FONT_MIN, FONT_MAX);
         if size == self.font_size {
@@ -761,7 +758,10 @@ impl ClayView {
             self.scroll.borrow_mut().follow_bottom();
         }
         if let Some(s) = self.session.core.settings.as_mut() {
-            s.web_font_size_desktop = size;
+            let key = crate::font_profile::native_key();
+            let mut font = s.font_for(key);
+            font.size_desktop = size;
+            s.set_font_for(key, font);
             let msg = crate::native_gui::core::client::settings_update(s);
             let fx = self.session.send(msg);
             self.after(fx, cx);

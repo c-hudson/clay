@@ -287,11 +287,11 @@ pub fn create_setup_popup(
     def
 }
 
-/// The Import Settings button, for the master console (a remote console has no
+/// The Import button (Import Settings), for the master console (a remote console has no
 /// `/import`, as its `/menu` has no Import Settings).
 pub fn add_import_button(def: &mut PopupDefinition) {
     // Left-aligned buttons draw in the order they're defined: first is before the "?".
-    def.buttons.insert(0, Button::new(SETUP_BTN_IMPORT, "Import Settings").left_align().with_shortcut('I'));
+    def.buttons.insert(0, Button::new(SETUP_BTN_IMPORT, "Import").left_align().with_shortcut('I'));
     // Room for both groups with a gap between: at 40 "[ ? ]" touched "[Cancel]".
     def.layout.min_width = def.layout.min_width.max(44);
 }
@@ -322,7 +322,7 @@ fn setup_help_text() -> Vec<String> {
     vec![
         "Setup - Global Settings",
         "",
-        "Import Settings (button): copy settings, theme and",
+        "Import (button): copy settings, theme and",
         "  keybindings from another Clay (/import). Setup",
         "  closes first; the import replaces what it shows.",
         "",
@@ -451,7 +451,7 @@ mod tests {
         );
         add_import_button(&mut def);
         let left: Vec<&str> = def.buttons.iter().filter(|b| b.left_align).map(|b| b.label.as_str()).collect();
-        assert_eq!(left, ["Import Settings", "?"], "left-aligned buttons draw in this order");
+        assert_eq!(left, ["Import", "?"], "left-aligned buttons draw in this order");
         let right: Vec<&str> = def.buttons.iter().filter(|b| !b.left_align).map(|b| b.label.as_str()).collect();
         assert_eq!(right, ["Cancel", "Save"]);
         assert!(def.layout.min_width >= 44, "room for both groups with a gap");

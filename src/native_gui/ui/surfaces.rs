@@ -309,12 +309,20 @@ impl ClayView {
                 self.client_line(&format!("{LABEL}: no runtime to download with."), cx);
                 return;
             };
-            self.client_line(&crate::selfupdate::checking(LABEL, force), cx);
+            let (found_tx, found_rx) = futures::channel::oneshot::channel::<String>();
             let (tx, rx) = futures::channel::oneshot::channel();
             runtime.spawn(async move {
-                let _ = tx.send(crate::platform::check_and_download_update(force).await);
+                let found = move |version: String| {
+                    let _ = found_tx.send(version);
+                    std::future::ready(())
+                };
+                let _ = tx.send(crate::platform::check_and_download_update(force, found).await);
             });
             cx.spawn(async move |this, cx| {
+                // A newer release, downloading (dropped unsent when there is none).
+                if let Ok(version) = found_rx.await {
+                    let _ = this.update(cx, |v, cx| v.client_line(&crate::selfupdate::updating(Some(LABEL), &version), cx));
+                }
                 if let Ok(result) = rx.await {
                     let _ = this.update(cx, |v, cx| v.self_update_done(result, cx));
                 }
@@ -330,8 +338,9 @@ impl ClayView {
             Ok(success) => crate::platform::install_update(&success.temp_path).map(|()| success.version),
             Err(e) => Err(e),
         };
-        let attached = self.session.target.key();
-        self.client_line(&crate::selfupdate::client_result("This GUI", &outcome, &attached), cx);
+        if let Some(line) = crate::selfupdate::failed(Some("This GUI"), &outcome) {
+            self.client_line(&line, cx);
+        }
         if outcome.is_ok() {
             self.restart_now(cx);
         }

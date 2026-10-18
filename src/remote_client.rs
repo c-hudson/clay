@@ -1313,7 +1313,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     let mut backfill_timer_active = app.backfill_needed();
 
     // Channel for local /update results
-    let (update_tx, mut update_rx) = mpsc::channel::<Result<UpdateSuccess, String>>(1);
+    let (update_tx, mut update_rx) = mpsc::channel::<OwnUpdate>(4);
     // /update (src/selfupdate.rs): this console's own download is running; the socket
     // closed under it (the server reloaded); the wait for the server's answer.
     let mut own_update_running = false;
@@ -1344,6 +1344,11 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     let mut connection_lost = false;
 
     loop {
+        // /reload or /update on Windows: the new console starts once this loop is over.
+        #[cfg(windows)]
+        if RELAUNCH_ON_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         // Draw if needed
         if needs_redraw || app.needs_output_redraw {
             // Check current popup visibility
@@ -1650,6 +1655,13 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             // new size (see reported_view above).
                             needs_redraw = true;
                         }
+                        // A release (Windows reports one after every press): nothing, unless
+                        // it ends a typed burst.
+                        Event::Key(_) => {
+                            if app.release_ends_typed_burst() {
+                                needs_redraw = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1764,9 +1776,13 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                 }
                 needs_redraw = true;
             }
-            // This console's own /update is over (src/selfupdate.rs).
-            result = update_rx.recv() => {
-                if let Some(result) = result {
+            // This console's own /update found a release, or is over (src/selfupdate.rs).
+            step = update_rx.recv() => {
+                if let Some(OwnUpdate::Found(version)) = &step {
+                    app.add_output(&crate::selfupdate::updating(Some(OWN_LABEL), version));
+                    needs_redraw = true;
+                }
+                if let Some(OwnUpdate::Done(result)) = step {
                     own_update_running = false;
                     finish_own_update(&mut app, result);
                     if ws_closed && reconnect_attempt.is_none() {
@@ -1859,6 +1875,13 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     let _ = execute!(terminal.backend_mut(), crossterm::event::DisableBracketedPaste);
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    #[cfg(windows)]
+    if RELAUNCH_ON_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+        // This console's key reader must be gone first: crossterm's wake thread reads
+        // console input itself, and the window's input is the new console's from now on.
+        drop(event_stream);
+        relaunch_and_wait();
+    }
     Ok(())
 }
 /// Handle key events for remote console client mode
@@ -1874,7 +1897,8 @@ fn attached_to() -> String {
 }
 
 /// This console starts again as it was started: `/reload`, and the end of `/update`.
-/// Returns only if the exec failed (the terminal is then back as it was).
+/// Returns only if the exec failed (the terminal is then back as it was) - or, on
+/// Windows, at once: the loop ends at its next pass and `relaunch_and_wait` follows.
 fn relaunch_console(app: &mut App) {
     #[cfg(all(unix, not(target_os = "android")))]
     {
@@ -1903,9 +1927,47 @@ fn relaunch_console(app: &mut App) {
             app.add_output("Reload failed: cannot find executable path");
         }
     }
-    #[cfg(not(all(unix, not(target_os = "android"))))]
+    // Windows can't replace a running process: the console's loop ends, and the new one
+    // is started in the same window (relaunch_and_wait).
+    #[cfg(windows)]
+    {
+        let _ = app;
+        RELAUNCH_ON_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
     {
         app.add_output("Reload is not available on this platform.");
+    }
+}
+
+/// Set by `relaunch_console` on Windows: end the console's loop, then start it again.
+#[cfg(windows)]
+static RELAUNCH_ON_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The Windows half of `relaunch_console`, once the TUI is torn down: the new console
+/// runs in this window with the same arguments, and this one waits for it and exits with
+/// its code, so the shell's prompt never comes back in between (as the Windows console's
+/// own `/reload` does, platform::exec_reload). Returns only if it could not start.
+#[cfg(windows)]
+fn relaunch_and_wait() {
+    // Give crossterm's wake thread, woken by the EventStream's drop, time to end.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let exe = match get_executable_path() {
+        Ok((exe, _)) => exe,
+        Err(e) => {
+            eprintln!("Clay could not start again ({e}); start it again by hand.");
+            return;
+        }
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The new console may start while the server is still coming back from its own
+    // reload: let it wait for the port (run_console_client).
+    match std::process::Command::new(&exe).args(&args).env(CONNECT_RETRY_ENV, "1").spawn() {
+        Ok(mut child) => {
+            let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(0);
+            std::process::exit(code);
+        }
+        Err(e) => eprintln!("Clay could not start again ({e}, {}); start it again by hand.", exe.display()),
     }
 }
 
@@ -1935,12 +1997,21 @@ async fn wait_for_server_if_relaunched(host_port: &str) {
     }
 }
 
+/// What this console's own update download reports to its loop (none on Android, which
+/// can't update itself).
+#[cfg_attr(target_os = "android", allow(dead_code))]
+enum OwnUpdate {
+    /// A newer release, being downloaded: its version.
+    Found(String),
+    Done(Result<UpdateSuccess, String>),
+}
+
 /// This console's own half of `/update` (src/selfupdate.rs), once the server's is
 /// over. Returns true when a download is running (its result comes through
 /// `update_tx`); false when there was nothing to download - the server's install
 /// already replaced this binary (same machine, same file), so the console restarts
 /// at once - or when this platform can't self-update.
-fn start_own_update(app: &mut App, update_tx: &mpsc::Sender<Result<UpdateSuccess, String>>, force: bool) -> bool {
+fn start_own_update(app: &mut App, update_tx: &mpsc::Sender<OwnUpdate>, force: bool) -> bool {
     if crate::selfupdate::exe_replaced() {
         app.add_output(&crate::selfupdate::replaced_on_disk(OWN_LABEL, &attached_to()));
         relaunch_console(app);
@@ -1948,11 +2019,14 @@ fn start_own_update(app: &mut App, update_tx: &mpsc::Sender<Result<UpdateSuccess
     }
     #[cfg(not(target_os = "android"))]
     {
-        app.add_output(&crate::selfupdate::checking(OWN_LABEL, force));
         let update_tx = update_tx.clone();
         tokio::spawn(async move {
-            let result = check_and_download_update(force).await;
-            let _ = update_tx.send(result).await;
+            let found_tx = update_tx.clone();
+            let result = check_and_download_update(force, move |version| async move {
+                let _ = found_tx.send(OwnUpdate::Found(version)).await;
+            })
+            .await;
+            let _ = update_tx.send(OwnUpdate::Done(result)).await;
         });
         true
     }
@@ -1981,7 +2055,9 @@ fn finish_own_update(app: &mut App, result: Result<UpdateSuccess, String>) {
         )),
         Err(e) => Err(e),
     };
-    app.add_output(&crate::selfupdate::client_result(OWN_LABEL, &outcome, &attached_to()));
+    if let Some(line) = crate::selfupdate::failed(Some(OWN_LABEL), &outcome) {
+        app.add_output(&line);
+    }
     if outcome.is_ok() || app.update_server_reloading {
         relaunch_console(app);
     }
@@ -2212,6 +2288,7 @@ pub(crate) fn handle_remote_client_key(
                     tabs: app.settings.tabs.name().to_string(),
                     icon_bar: app.settings.icon_bar.name().to_string(),
                     picture_host: Some(app.settings.picture_host.name()),
+                    font_profile: None,
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -3421,6 +3498,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         tabs: app.settings.tabs.name().to_string(),  // unchanged — this function only touches web settings
         icon_bar: app.settings.icon_bar.name().to_string(),  // unchanged — this function only touches web settings
         picture_host: None,
+        font_profile: None,
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {

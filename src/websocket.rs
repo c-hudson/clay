@@ -852,6 +852,10 @@ pub enum WsMessage {
         /// which doesn't know it) = unchanged: a save from it must not reset the setting.
         #[serde(default)]
         picture_host: Option<String>,
+        /// This client's own fonts: its program on its OS (src/font_profile.rs). `None` (an
+        /// older client, or one that never changed a font) = unchanged.
+        #[serde(default)]
+        font_profile: Option<crate::font_profile::FontProfileUpdate>,
     },
 
     // Settings update confirmations (server -> client)
@@ -1868,6 +1872,10 @@ pub struct GlobalSettingsMsg {
     pub web_font_letter_spacing: f32,
     #[serde(default)]
     pub web_font_word_spacing: f32,
+    /// Every program/OS's own fonts (src/font_profile.rs). `None` = a server from before
+    /// the split: its clients show and edit the shared font fields above, as before.
+    #[serde(default)]
+    pub font_profiles: Option<crate::font_profile::FontProfiles>,
     pub ws_allow_list: String,
     pub web_secure: bool,
     pub http_enabled: bool,

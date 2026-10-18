@@ -1406,6 +1406,34 @@ fn old_exe_path(exe_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Every name the previous executable may have been moved aside to: `old_exe_path`, then
+/// `<exe>.old.1` and on (see `free_old_exe_path`).
+#[cfg(not(target_os = "android"))]
+fn old_exe_paths(exe_path: &Path) -> impl Iterator<Item = PathBuf> {
+    let base = old_exe_path(exe_path);
+    std::iter::once(base.clone()).chain((1..=20).map(move |n| {
+        let mut name = base.clone().into_os_string();
+        name.push(format!(".{n}"));
+        PathBuf::from(name)
+    }))
+}
+
+/// Where `install_update_at` moves the running Windows exe aside: the first of
+/// `old_exe_paths` that is free, or can be made free. A Windows console that restarted
+/// itself waits on its successor (`exec_reload`, remote_client.rs `relaunch_and_wait`)
+/// still running from `.old`, and Windows will neither remove nor replace a running exe,
+/// so the next `/update` in that window failed at "rename to .old".
+#[cfg(not(target_os = "android"))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn free_old_exe_path(exe_path: &Path) -> PathBuf {
+    old_exe_paths(exe_path)
+        .find(|p| {
+            let _ = std::fs::remove_file(p);
+            !p.exists()
+        })
+        .unwrap_or_else(|| old_exe_path(exe_path))
+}
+
 /// Clean up any leftover `.old` file from a previous self-replace.
 /// Called once at startup; silently ignored if the file doesn't exist. Matters
 /// most on Windows (where the old binary can't be removed while still running,
@@ -1414,8 +1442,9 @@ fn old_exe_path(exe_path: &Path) -> PathBuf {
 #[cfg(not(target_os = "android"))]
 pub fn cleanup_old_exe() {
     if let Ok((exe_path, _)) = get_executable_path() {
-        let old_path = old_exe_path(&exe_path);
-        let _ = std::fs::remove_file(&old_path);
+        for old_path in old_exe_paths(&exe_path) {
+            let _ = std::fs::remove_file(&old_path);
+        }
     }
 }
 
@@ -1470,9 +1499,14 @@ pub(crate) fn is_newer_version(remote: &str, current: &str) -> bool {
     false
 }
 
-/// Check GitHub for latest release and download the binary if newer
+/// Check GitHub for latest release and download the binary if newer. `found` is told the
+/// new release's version before the download starts (`selfupdate::updating`'s line).
 #[cfg(not(target_os = "android"))]
-pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, String> {
+pub async fn check_and_download_update<F, Fut>(force: bool, found: F) -> Result<UpdateSuccess, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let client = reqwest::Client::builder()
         .user_agent("clay-mud-client")
         .build()
@@ -1568,6 +1602,8 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
             ));
         }
     }
+
+    found(remote_version.to_string()).await;
 
     let response = client
         .get(download_url)
@@ -1717,10 +1753,9 @@ fn install_update_at(temp_path: &Path, exe_path: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn install_update_at(temp_path: &Path, exe_path: &Path) -> Result<(), String> {
-    let old_path = old_exe_path(exe_path);
-    // Clean up any stale .old from a previous failed/partial install before we
-    // reuse the name.
-    let _ = std::fs::remove_file(&old_path);
+    // A stale .old from a previous install is removed first; one an older Clay still
+    // runs from is left, and the next name is used.
+    let old_path = free_old_exe_path(exe_path);
 
     std::fs::rename(exe_path, &old_path)
         .map_err(|e| format!("Failed to prepare update (rename to .old): {}", e))?;
@@ -2381,6 +2416,35 @@ mod tests {
 
         let windows_style = PathBuf::from(r"C:\Users\adrick\clay\clay.exe");
         assert_eq!(old_exe_path(&windows_style), PathBuf::from(r"C:\Users\adrick\clay\clay.exe.old"));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_running_old_exe_is_stepped_over_not_replaced() {
+        // Windows can't remove an exe something still runs from; a directory in its
+        // place can't be removed either, which stands in for it here.
+        let dir = install_test_dir("old-in-use");
+        let exe = dir.join("clay.exe");
+        let old = old_exe_path(&exe);
+        // A leftover nobody runs from is cleared and reused.
+        std::fs::write(&old, b"stale").unwrap();
+        assert_eq!(free_old_exe_path(&exe), old);
+        assert!(!old.exists());
+        // One in use: the next name, clearing a stale one there too.
+        std::fs::create_dir(&old).unwrap();
+        let first = dir.join("clay.exe.old.1");
+        std::fs::write(&first, b"stale").unwrap();
+        assert_eq!(free_old_exe_path(&exe), first);
+        assert!(!first.exists());
+        std::fs::create_dir(&first).unwrap();
+        assert_eq!(free_old_exe_path(&exe), dir.join("clay.exe.old.2"));
+        // Start-up cleanup sweeps every name it may have used.
+        std::fs::write(dir.join("clay.exe.old.3"), b"x").unwrap();
+        for p in old_exe_paths(&exe) {
+            let _ = std::fs::remove_file(&p);
+        }
+        assert!(!dir.join("clay.exe.old.3").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

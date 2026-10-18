@@ -1481,7 +1481,7 @@
 
     // Font popup state (/font)
     // fontPopupOpen removed — merged into settingsPopupOpen
-    let fontName = '';  // Shared font family name (synced from server)
+    let fontName = '';  // The font family in use: this page's own, or the shared one (fontProfileKey)
     let guiFontSize = 14.0;  // GUI font size (not used by web, but preserved for server)
     let fontEditName = '';
     let fontEditSizePhone = 10;
@@ -1498,6 +1498,88 @@
     // The saved font settings while the Settings popup is open (null otherwise, and
     // after Save), so closing without saving can undo previewFontEdit's live preview.
     let fontPreviewSaved = null;
+
+    // Fonts by program and OS (src/font_profile.rs, user ruling 2026-10-17): this page keeps
+    // its own fonts as `fontProfileKey` - a browser, the WebView GUI or the Android app, on
+    // this OS. The font variables above hold the fonts in use (its own, or the shared ones);
+    // `sharedFont` is the shared set the server sent, echoed back unchanged; `fontProfiles`
+    // is every program's own (null = a server from before the split, which keeps only the
+    // shared set - this page then edits that, as before).
+    let sharedFont = null;
+    let fontProfiles = null;
+    function detectFontOs() {
+        if (window.CLAY_GUI_OS) return window.CLAY_GUI_OS;  // the WebView GUI: Clay says
+        const ua = navigator.userAgent || '';
+        if (/Android/i.test(ua)) return 'android';
+        if (/iPhone|iPad|iPod/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return 'ios';
+        if (/CrOS/.test(ua)) return 'chromeos';
+        if (/Windows/i.test(ua)) return 'windows';
+        if (/Macintosh|Mac OS X/.test(ua)) return 'macos';
+        if (/Linux|X11/.test(ua)) return 'linux';
+        return 'other';
+    }
+    const fontProfileKey = window.Android ? 'app-android'
+        : (window.WEBVIEW_MODE ? 'webview-' : 'browser-') + detectFontOs();
+    // As font_profile::label: "a web browser on Linux", "the Android app".
+    function fontProfileLabel(key) {
+        if (key === 'app-android') return 'the Android app';
+        const programs = { native: 'the native GUI', webview: 'the WebView GUI', browser: 'a web browser', app: 'the Android app' };
+        const oses = { windows: 'Windows', macos: 'macOS', linux: 'Linux', android: 'Android', ios: 'iOS', chromeos: 'ChromeOS', other: 'another OS' };
+        const at = key.indexOf('-');
+        const program = key.slice(0, at), os = key.slice(at + 1);
+        return (programs[program] || program) + ' on ' + (oses[os] || os);
+    }
+    function fontsInUse() {
+        return {
+            name: fontName, size_phone: webFontSizePhone, size_tablet: webFontSizeTablet,
+            size_desktop: webFontSizeDesktop, weight: webFontWeight, line_height: webFontLineHeight,
+            letter_spacing: webFontLetterSpacing, word_spacing: webFontWordSpacing
+        };
+    }
+    function sameFonts(a, b) {
+        return ['name', 'size_phone', 'size_tablet', 'size_desktop', 'weight', 'line_height',
+                'letter_spacing', 'word_spacing'].every(function(k) { return a[k] === b[k]; });
+    }
+    // The server's font settings: this page's own fonts, or the shared ones, put in use.
+    function receiveFontSettings(s) {
+        const dflt = function(v, d) { return v === undefined || v === null ? d : v; };
+        sharedFont = {
+            name: dflt(s.font_name, fontName), size_phone: dflt(s.web_font_size_phone, webFontSizePhone),
+            size_tablet: dflt(s.web_font_size_tablet, webFontSizeTablet),
+            size_desktop: dflt(s.web_font_size_desktop, webFontSizeDesktop),
+            weight: dflt(s.web_font_weight, webFontWeight), line_height: dflt(s.web_font_line_height, webFontLineHeight),
+            letter_spacing: dflt(s.web_font_letter_spacing, webFontLetterSpacing),
+            word_spacing: dflt(s.web_font_word_spacing, webFontWordSpacing)
+        };
+        fontProfiles = (s.font_profiles && typeof s.font_profiles === 'object') ? s.font_profiles : null;
+        const f = (fontProfiles && fontProfiles[fontProfileKey]) || sharedFont;
+        applyFontFamily(f.name);
+        webFontSizePhone = f.size_phone;
+        webFontSizeTablet = f.size_tablet;
+        webFontSizeDesktop = f.size_desktop;
+        const fontPx = deviceType === 'phone' ? webFontSizePhone :
+                       deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
+        setFontSize(clampFontSize(fontPx), false);  // Don't send back to server
+        webFontWeight = f.weight;
+        applyFontWeight(webFontWeight);
+        webFontLineHeight = f.line_height;
+        webFontLetterSpacing = f.letter_spacing;
+        webFontWordSpacing = f.word_spacing;
+        applyAdvancedFontSettings();
+    }
+    // This page's own fonts for UpdateGlobalSettings: null for a server that keeps none,
+    // and while they are still the shared ones it never changed.
+    function ownFontUpdate() {
+        if (fontProfiles === null || sharedFont === null) return null;
+        const mine = fontsInUse();
+        if (!fontProfiles[fontProfileKey] && sameFonts(mine, sharedFont)) return null;
+        return { key: fontProfileKey, profile: mine };
+    }
+    // The shared font fields to send: as the server sent them, unless it keeps no
+    // profiles - then this page's fonts are the shared ones.
+    function sharedFontToSend() {
+        return (fontProfiles === null || sharedFont === null) ? fontsInUse() : sharedFont;
+    }
     // The Transparency the settings popup opened with: its slider previews live, and a
     // close without Save puts this back (null when nothing is being previewed).
     let transparencyPreviewSaved = null;
@@ -4072,36 +4154,11 @@
                     if (msg.settings.gui_transparency !== undefined) {
                         applyTransparency(msg.settings.gui_transparency);
                     }
-                    // Load font name and GUI font size
-                    if (msg.settings.font_name !== undefined) {
-                        applyFontFamily(msg.settings.font_name);
-                    }
                     if (msg.settings.font_size !== undefined) {
                         guiFontSize = msg.settings.font_size;
                     }
-                    // Load per-device font sizes
-                    if (msg.settings.web_font_size_phone !== undefined) {
-                        webFontSizePhone = msg.settings.web_font_size_phone;
-                    }
-                    if (msg.settings.web_font_size_tablet !== undefined) {
-                        webFontSizeTablet = msg.settings.web_font_size_tablet;
-                    }
-                    if (msg.settings.web_font_size_desktop !== undefined) {
-                        webFontSizeDesktop = msg.settings.web_font_size_desktop;
-                    }
-                    // Pick the right font size based on current device type
-                    const fontPx = deviceType === 'phone' ? webFontSizePhone :
-                                   deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
-                    setFontSize(clampFontSize(fontPx), false);  // Don't send back to server
-                    // Load font weight
-                    if (msg.settings.web_font_weight !== undefined) {
-                        webFontWeight = msg.settings.web_font_weight;
-                        applyFontWeight(webFontWeight);
-                    }
-                    if (msg.settings.web_font_line_height !== undefined) webFontLineHeight = msg.settings.web_font_line_height;
-                    if (msg.settings.web_font_letter_spacing !== undefined) webFontLetterSpacing = msg.settings.web_font_letter_spacing;
-                    if (msg.settings.web_font_word_spacing !== undefined) webFontWordSpacing = msg.settings.web_font_word_spacing;
-                    applyAdvancedFontSettings();
+                    // This page's fonts: its own on this OS, or the shared ones.
+                    receiveFontSettings(msg.settings);
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
@@ -5030,39 +5087,11 @@
                     if (msg.settings.gui_transparency !== undefined) {
                         applyTransparency(msg.settings.gui_transparency);
                     }
-                    // Font settings
-                    if (msg.settings.font_name !== undefined) {
-                        applyFontFamily(msg.settings.font_name);
-                    }
                     if (msg.settings.font_size !== undefined) {
                         guiFontSize = msg.settings.font_size;
                     }
-                    if (msg.settings.web_font_size_phone !== undefined) {
-                        webFontSizePhone = msg.settings.web_font_size_phone;
-                    }
-                    if (msg.settings.web_font_size_tablet !== undefined) {
-                        webFontSizeTablet = msg.settings.web_font_size_tablet;
-                    }
-                    if (msg.settings.web_font_size_desktop !== undefined) {
-                        webFontSizeDesktop = msg.settings.web_font_size_desktop;
-                    }
-                    // Apply the right font size for current device type
-                    if (msg.settings.web_font_size_phone !== undefined ||
-                        msg.settings.web_font_size_tablet !== undefined ||
-                        msg.settings.web_font_size_desktop !== undefined) {
-                        const fontPx = deviceType === 'phone' ? webFontSizePhone :
-                                       deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
-                        setFontSize(clampFontSize(fontPx), false);
-                    }
-                    // Apply font weight
-                    if (msg.settings.web_font_weight !== undefined) {
-                        webFontWeight = msg.settings.web_font_weight;
-                        applyFontWeight(webFontWeight);
-                    }
-                    if (msg.settings.web_font_line_height !== undefined) webFontLineHeight = msg.settings.web_font_line_height;
-                    if (msg.settings.web_font_letter_spacing !== undefined) webFontLetterSpacing = msg.settings.web_font_letter_spacing;
-                    if (msg.settings.web_font_word_spacing !== undefined) webFontWordSpacing = msg.settings.web_font_word_spacing;
-                    applyAdvancedFontSettings();
+                    // This page's fonts: its own on this OS, or the shared ones.
+                    receiveFontSettings(msg.settings);
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
@@ -8501,7 +8530,7 @@
             '  input line. "+ URL shortening" runs the link through',
             '  /url\'s shortening. Uploads are public. "Off" turns',
             '  picture uploads off.', '',
-            'Import Settings: copy settings, theme and keybindings',
+            'Import: copy settings, theme and keybindings',
             '  from another Clay (/import). Settings closes first;',
             '  the import replaces what it shows.'
         ],
@@ -8559,6 +8588,11 @@
         ],
         font: [
             'Font Settings', '',
+            'Each program keeps its own fonts on each OS: the',
+            '  native GUI, the WebView GUI, a web browser and the',
+            '  Android app, on Windows, macOS, Linux and so on.',
+            '  Until you change them in one, it uses the fonts it',
+            '  had before.', '',
             'Font family: the font of the output and the input.',
             '  Only fonts on this device are listed. System Default',
             '  is the JetBrains Mono that comes with Clay, then the',
@@ -12898,6 +12932,11 @@
         // live preview (previewFontEdit) the font tab applies while it's open.
         fontPreviewSaved = currentFontSettings();
         transparencyPreviewSaved = guiTransparency;
+        const fontOwner = document.getElementById('font-owner-note');
+        if (fontOwner) {
+            fontOwner.textContent = fontProfiles === null ? ''
+                : 'Fonts for ' + fontProfileLabel(fontProfileKey) + ' (each program keeps its own on each OS).';
+        }
         fontEditName = fontName;
         fontEditSizePhone = Math.round(webFontSizePhone);
         fontEditSizeTablet = Math.round(webFontSizeTablet);
@@ -13060,6 +13099,7 @@
         return msg;
     }
     function buildUpdateGlobalSettingsBase() {
+        const shared = sharedFontToSend();
         return {
             type: 'UpdateGlobalSettings',
             more_mode_enabled: moreModeEnabled,
@@ -13074,15 +13114,17 @@
             color_offset_percent: colorOffsetPercent,
             wrapspace: wrapspace,
             remote_initial_lines: remoteInitialLines,
-            font_name: fontName,
+            font_name: shared.name,
             font_size: guiFontSize,
-            web_font_size_phone: webFontSizePhone,
-            web_font_size_tablet: webFontSizeTablet,
-            web_font_size_desktop: webFontSizeDesktop,
-            web_font_weight: webFontWeight,
-            web_font_line_height: webFontLineHeight,
-            web_font_letter_spacing: webFontLetterSpacing,
-            web_font_word_spacing: webFontWordSpacing,
+            web_font_size_phone: shared.size_phone,
+            web_font_size_tablet: shared.size_tablet,
+            web_font_size_desktop: shared.size_desktop,
+            web_font_weight: shared.weight,
+            web_font_line_height: shared.line_height,
+            web_font_letter_spacing: shared.letter_spacing,
+            web_font_word_spacing: shared.word_spacing,
+            // This page's own fonts on this OS (null = unchanged).
+            font_profile: ownFontUpdate(),
             ws_allow_list: wsAllowList,
             // Always true now — the server is always TLS-capable for remote clients
             // (auto cert or user-provided); kept only for GlobalSettingsMsg wire compat.

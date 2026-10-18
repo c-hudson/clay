@@ -1980,6 +1980,7 @@ fn split_lines(s: &str) -> Vec<&str> {
 /// buffer matches the server's, and this decides at display time on every path.
 /// Save the server's global settings with whatever this client changed in `s` (the
 /// font slider): every field echoed back as the server sent it, so nothing else moves.
+/// The shared font fields too: this GUI's own fonts go as its profile.
 /// The password goes back empty, which the server reads as "unchanged".
 pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
     WsMessage::UpdateGlobalSettings {
@@ -2035,6 +2036,8 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         icon_bar: s.icon_bar.clone(),
         // Empty: a server from before Import Picture sent none.
         picture_host: (!s.picture_host.is_empty()).then(|| s.picture_host.clone()),
+        // This GUI's own fonts on this OS, once it has them (src/font_profile.rs).
+        font_profile: s.font_update_for(crate::font_profile::native_key()),
     }
 }
 

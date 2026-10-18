@@ -749,16 +749,18 @@ impl ClayView {
             self.palette = Palette::from_theme(&self.theme);
             restyle = true;
         }
-        if s.web_font_size_desktop > 0.0 {
-            self.font_size = s.web_font_size_desktop;
+        // This GUI's fonts on this OS: its own, or the shared ones (src/font_profile.rs).
+        let font = s.font_for(crate::font_profile::native_key());
+        if font.size_desktop > 0.0 {
+            self.font_size = font.size_desktop;
         }
         // Font and wrapping settings change every line's layout.
-        let layout = (s.wrapspace as usize, s.wrap_columns, s.web_font_letter_spacing, s.web_font_word_spacing);
+        let layout = (s.wrapspace as usize, s.wrap_columns, font.letter_spacing, font.word_spacing);
         if layout != (self.wrapspace, self.wrap_columns, self.letter_spacing, self.word_spacing) {
             (self.wrapspace, self.wrap_columns, self.letter_spacing, self.word_spacing) = layout;
             restyle = true;
         }
-        restyle |= self.fonts.set_user(&s.font_name, s.web_font_weight);
+        restyle |= self.fonts.set_user(&font.name, font.weight);
         let (spell_on, dict) = (s.spell_check_enabled, s.dictionary_path.clone());
         let height = input_view::input_height_of(s);
         if height != self.input_height_seen {

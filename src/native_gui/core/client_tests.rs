@@ -671,6 +671,38 @@ fn saving_the_settings_back_unchanged_changes_nothing_but_what_was_edited() {
 }
 
 #[test]
+fn this_guis_fonts_are_its_own_on_this_os_and_the_shared_ones_stay() {
+    let mut app = crate::App::new();
+    app.settings.web_font_size_desktop = 15.0;
+    app.settings.font_name = "Shared Mono".into();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let key = crate::font_profile::native_key();
+    let mut s = app.build_global_settings_msg();
+    // Nothing of its own yet: the shared fonts, and a save sends no profile.
+    assert_eq!(s.font_for(key).size_desktop, 15.0);
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { font_profile: None, .. }));
+    // The font slider (chrome.rs set_font_size).
+    let mut font = s.font_for(key);
+    font.size_desktop = 17.0;
+    s.set_font_for(key, font);
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.web_font_size_desktop, 15.0, "the shared size stays");
+    assert_eq!(app.settings.font_profiles[key].size_desktop, 17.0);
+    assert_eq!(app.settings.font_profiles[key].name, "Shared Mono", "the rest starts from the shared fonts");
+    let after = app.build_global_settings_msg();
+    assert_eq!(after.font_for(key).size_desktop, 17.0);
+    assert_eq!(after.font_for("browser-linux").size_desktop, 15.0, "other programs keep the shared fonts");
+    // A server from before the split keeps no profiles: the slider moves the shared size.
+    let mut old = after.clone();
+    old.font_profiles = None;
+    let mut font = old.font_for(key);
+    font.size_desktop = 12.0;
+    old.set_font_for(key, font);
+    assert_eq!(old.web_font_size_desktop, 12.0);
+    assert!(matches!(settings_update(&old), WsMessage::UpdateGlobalSettings { font_profile: None, web_font_size_desktop, .. } if web_font_size_desktop == 12.0));
+}
+
+#[test]
 fn the_scrollback_badge_counts_down_to_done() {
     let mut t = H::password();
     t.connect_and_login();
