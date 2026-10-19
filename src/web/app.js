@@ -1718,6 +1718,7 @@
     let textdivStr = '=====';
     let keyboardAlwaysVisible = true;  // Will be synced from server settings
     let hardwareKeyboardPresent = false;  // Set by Java via window.onHardwareKeyboardChanged
+    let hardwareMousePresent = false;     // Set by Java via window.onHardwareMouseChanged
 
     // Whether the view is following live output (pinned to the bottom). This is the one
     // answer to "was the user at the bottom?", and ONLY THE USER turns it off: a scroll
@@ -2156,8 +2157,24 @@
     // stays correct without waiting for the next settings sync.
     window.onHardwareKeyboardChanged = function(present) {
         hardwareKeyboardPresent = !!present;
-        applyKeyboardForceState();
+        setupToolbars(deviceMode);  // applies the keyboard force, and desktopInputAttached()
     };
+
+    // Called by native Android code whenever a mouse is connected or disconnected.
+    window.onHardwareMouseChanged = function(present) {
+        hardwareMousePresent = !!present;
+        setupToolbars(deviceMode);
+    };
+
+    // The Android app with a keyboard AND a mouse attached looks like the desktop GUI: the
+    // separator bar carries the menu and the font slider, the button row under it goes, the
+    // icon bar and the output's scroll bar show (style.css body.desktop-input). Only the
+    // main window's chrome changes: the font sizes, the input height and the dialogs still
+    // follow the screen (deviceType), which is what fits on it. Both flags are only ever
+    // set by the Android app.
+    function desktopInputAttached() {
+        return hardwareKeyboardPresent && hardwareMousePresent;
+    }
 
     // Custom dropdown for mobile (replaces native select with styled dropdown)
     let activeCustomDropdown = null;
@@ -2488,6 +2505,7 @@
         if (mode === 'phone' || mode === 'tablet') {
             document.body.classList.add('is-mobile');
         }
+        document.body.classList.toggle('desktop-input', desktopInputAttached());
         applyKeyboardForceState();
         // Device mode affects iconBarVisible() ('app_tablet' mode) - re-render
         // on every device-mode change (auto-detect at startup, or the manual
@@ -11748,6 +11766,11 @@
         document.querySelectorAll('.cs-remote-only').forEach(function(el) {
             el.style.display = local ? 'none' : '';
         });
+        // Run on This Phone's own setting: an app without the bridge never shows it.
+        const lanBridge = !!(window.Android && typeof window.Android.getLocalServerLan === 'function');
+        document.querySelectorAll('.cs-local-only').forEach(function(el) {
+            el.style.display = (local && lanBridge) ? '' : 'none';
+        });
     }
 
     // Update UI based on Android app detection
@@ -11798,6 +11821,116 @@
             : 'Save auth key to device';
     }
 
+    // Run on This Phone's "Allow Other Devices" (Android getLocalServerLan/saveLocalServerLan,
+    // LocalServerManager.KEY_LAN_*): the server on this phone listens on the network with a
+    // password and port the user chose. Off by default; turning it on asks first.
+    let clayServerLanInfo = null;
+
+    function fillClayServerLan() {
+        clayServerLanInfo = null;
+        if (!window.Android || typeof window.Android.getLocalServerLan !== 'function') return;
+        try { clayServerLanInfo = JSON.parse(window.Android.getLocalServerLan()) || {}; } catch (e) { clayServerLanInfo = {}; }
+        const info = clayServerLanInfo;
+        const enabledEl = document.getElementById('cs-lan-enabled');
+        const passEl = document.getElementById('cs-lan-password');
+        const portEl = document.getElementById('cs-lan-port');
+        if (enabledEl) enabledEl.value = info.enabled ? 'yes' : 'no';
+        if (passEl) passEl.value = info.password || '';
+        if (portEl) portEl.value = info.port || 9000;
+        showClayServerLanFields(!!info.enabled);
+        showClayServerLanError(null);
+    }
+
+    function showClayServerLanFields(on) {
+        const fields = document.getElementById('cs-lan-fields');
+        if (fields) fields.style.display = on ? '' : 'none';
+        updateClayServerLanNote();
+    }
+
+    // Where other devices connect, from this phone's addresses and the port typed.
+    function updateClayServerLanNote() {
+        const note = document.getElementById('cs-lan-note');
+        if (!note) return;
+        const addrs = (clayServerLanInfo && clayServerLanInfo.addresses) || [];
+        const port = (((document.getElementById('cs-lan-port') || {}).value) || '').trim() || '9000';
+        const path = webPath ? '/' + webPath + '/' : '/';
+        let text;
+        if (addrs.length) {
+            text = 'Other devices connect to ' + addrs.join(' or ') + ', port ' + port + ', with this password: '
+                + 'clay --gui=' + addrs[0] + ':' + port + ', the Android app (Host ' + addrs[0] + ', Port ' + port
+                + '), or a browser at https://' + addrs[0] + ':' + port + path + '.';
+        } else {
+            text = 'This phone has no network address right now. Connect it to Wi-Fi.';
+        }
+        note.textContent = text + ' Saving a change restarts Clay on this phone, which disconnects your worlds.';
+    }
+
+    function showClayServerLanError(message, focusId) {
+        const el = document.getElementById('cs-lan-error');
+        if (el) {
+            el.textContent = message || '';
+            el.style.display = message ? '' : 'none';
+        }
+        if (message && focusId) {
+            const f = document.getElementById(focusId);
+            if (f) f.focus();
+        }
+    }
+
+    // Saves Allow Other Devices for the Save in Run on This Phone. False (with the reason on
+    // screen) when it is on but its password or port can't be used.
+    function saveClayServerLan() {
+        if (!window.Android || typeof window.Android.saveLocalServerLan !== 'function') return true;
+        const enabled = ((document.getElementById('cs-lan-enabled') || {}).value === 'yes');
+        const password = (document.getElementById('cs-lan-password') || {}).value || '';
+        const portText = (((document.getElementById('cs-lan-port') || {}).value) || '').trim() || '9000';
+        const port = /^[0-9]+$/.test(portText) ? parseInt(portText, 10) : NaN;
+        const minLength = (clayServerLanInfo && clayServerLanInfo.minPasswordLength) || 8;
+        if (enabled) {
+            if (password.length < minLength) {
+                showClayServerLanError('The password needs at least ' + minLength + ' characters.', 'cs-lan-password');
+                return false;
+            }
+            if (!(port >= 1024 && port <= 65535)) {
+                showClayServerLanError('The port must be a number from 1024 to 65535.', 'cs-lan-port');
+                return false;
+            }
+        }
+        showClayServerLanError(null);
+        window.Android.saveLocalServerLan(enabled, password, Number.isFinite(port) ? port : 0);
+        return true;
+    }
+
+    // The "are you sure" before Allow Other Devices goes on. onAllow runs only on Allow.
+    function showAllowOtherDevicesConfirm(onAllow) {
+        let dlg = document.getElementById('allow-other-devices-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'allow-other-devices-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            document.body.appendChild(dlg);
+        }
+        dlg.innerHTML = sanitizeHtml(`
+            <div class="modal-content js-dialog js-dialog-danger" style="max-width:460px;width:90%;">
+                <div class="js-dialog-title danger">Allow Other Devices?</div>
+                <div style="margin-bottom:10px;">Anyone on the same network who has the password can use this Clay: read your worlds, send commands to them, and change your settings.</div>
+                <div style="margin-bottom:16px;">Only turn this on with a strong password, on a network you trust.</div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;">
+                    <button id="allow-other-devices-cancel" class="btn">Cancel</button>
+                    <button id="allow-other-devices-go" class="btn btn-danger">Allow</button>
+                </div>
+            </div>
+        `);
+        dlg.style.display = 'flex';
+        document.getElementById('allow-other-devices-cancel').onclick = function() {
+            dlg.style.display = 'none';
+        };
+        document.getElementById('allow-other-devices-go').onclick = function() {
+            dlg.style.display = 'none';
+            onAllow();
+        };
+    }
+
     // Populate the Clay Server settings tab fields from Android SharedPreferences
     function populateClayServerTab() {
         if (!window.Android || typeof window.Android.getConnectionInfo !== 'function') return;
@@ -11825,6 +11958,7 @@
                 runModeEl.value = runMode;
                 setClayServerRemoteFields(runMode === 'local');
             }
+            fillClayServerLan();
             var sshEnabledEl = document.getElementById('cs-ssh-enabled');
             var sshFields = document.getElementById('cs-ssh-fields');
             if (sshEnabledEl && typeof window.Android.getSshEnabled === 'function') {
@@ -13176,7 +13310,9 @@
             var runMode = ((document.getElementById('cs-run-mode') || {}).value || 'remote');
             if (typeof window.Android.setRunMode === 'function') window.Android.setRunMode(runMode);
             if (runMode === 'local') {
-                // No remote fields to validate/save — the local server needs no configuration.
+                // No remote fields - only Allow Other Devices; a change to it restarts the local
+                // server (Android reloadInterfaceRespectingRunMode).
+                if (!saveClayServerLan()) return;
                 if (typeof window.Android.reloadPage === 'function') window.Android.reloadPage();
                 return;
             }
@@ -15951,8 +16087,10 @@
         if (iconBarMode === 'none') return false;
         if (iconBarMode === 'all') return true;
         // 'app_tablet': the desktop WebView GUI app, or a tablet-width
-        // layout - NOT a plain desktop browser tab, NOT phone.
-        return deviceMode === 'tablet' || (deviceMode === 'desktop' && window.WEBVIEW_MODE);
+        // layout - NOT a plain desktop browser tab, NOT phone - unless the Android
+        // app has a keyboard and mouse, when it looks like the desktop GUI.
+        return deviceMode === 'tablet' || (deviceMode === 'desktop' && window.WEBVIEW_MODE)
+            || desktopInputAttached();
     }
 
     // Apply an Icon Bar setting change and re-render.
@@ -18240,6 +18378,27 @@
             };
         }
 
+        // Clay Server tab, Run on This Phone: Allow Other Devices stays No until the user says
+        // yes to the warning.
+        var csLanEnabledEl = document.getElementById('cs-lan-enabled');
+        if (csLanEnabledEl) {
+            csLanEnabledEl.onchange = function() {
+                const sel = this;
+                if (sel.value === 'yes') {
+                    sel.value = 'no';
+                    showAllowOtherDevicesConfirm(function() {
+                        sel.value = 'yes';
+                        showClayServerLanFields(true);
+                    });
+                } else {
+                    showClayServerLanFields(false);
+                    showClayServerLanError(null);
+                }
+            };
+        }
+        var csLanPortEl = document.getElementById('cs-lan-port');
+        if (csLanPortEl) csLanPortEl.oninput = updateClayServerLanNote;
+
         // Web settings popup (use edit state, not global state)
         elements.webPortSelect.onchange = function() {
             editPortMode = this.value;
@@ -18786,7 +18945,10 @@
             const path = info.web_path ? '/' + info.web_path + '/' : '/';
             row('Web server', info.http_enabled ? ('on, port ' + info.port + ', path ' + path) : 'OFF (enable it in Web Settings)',
                 info.http_enabled ? '' : 'reach-bad');
-            row('LAN', (info.lan_urls && info.lan_urls.length) ? info.lan_urls.join('\n') : 'no non-loopback IPv4 address found');
+            // local_only: the Android app's own server with Allow Other Devices off (reach.rs
+            // LOCAL_ONLY_TEXT). Its hints are empty then, and so is the section below.
+            row('LAN', info.local_only ? 'off - only this device can connect (Settings > Clay Server > Allow Other Devices)'
+                : (info.lan_urls && info.lan_urls.length) ? info.lan_urls.join('\n') : 'no non-loopback IPv4 address found');
             if (info.vpn_addrs && info.vpn_addrs.length) {
                 row('VPN', info.vpn_addrs.join(', ') + '  (Tailscale or similar; reachable from that VPN without port forwarding)');
             }
@@ -18820,7 +18982,7 @@
                 <div class="js-dialog-title">Remote Access</div>
                 <div style="opacity:0.85;margin-bottom:10px;">How other devices reach this Clay. Same as typing /reach.</div>
                 <div class="reach-report">${rows.join('')}</div>
-                <div style="font-weight:bold;margin:12px 0 6px;">Connect from another device</div>
+                ${hints.length ? '<div style="font-weight:bold;margin:12px 0 6px;">Connect from another device</div>' : ''}
                 <div class="reach-report">${hintRows}</div>
                 <label style="display:flex;align-items:center;gap:8px;margin:14px 0 10px;">
                     <input type="checkbox" id="remote-access-portmap">

@@ -58,20 +58,23 @@ The web interface provides a complete MUD experience:
 - **Command history**: Ctrl+P/N navigation
 - **Multiple worlds**: Full world switching support
 
-### Toolbar
+### Separator Bar and Button Row
 
-The toolbar at the top provides quick access:
+On a desktop, the separator bar above the input carries the hamburger menu (☰) and the
+font slider.
 
-**Left side:**
-- Hamburger menu (☰)
-- PgUp button
-- PgDn button
+On a phone or tablet, a row of buttons sits under the separator bar:
 
-**Right side:**
-- ▲ Previous world
-- ▼ Next world
+- **PgUp** / **PgDn**: scroll the output
+- **▲** next world, **▼** previous world (as Ctrl+Up and Ctrl+Down)
+- On a phone, the hamburger menu (☰) and the font slider move into this row too
 
-**Font slider**: Adjust text size
+**The Android app with a keyboard and a mouse** looks like the desktop GUI: the button
+row goes, the separator bar carries the menu and the font slider, the icon bar (with
+Icon Bar set to App/Tablet) and the output's scroll bar appear, and the menu offers the
+Emoji Picker again. Unplug either one and the phone or tablet layout comes back. Your
+phone or tablet font size and input height stay as they were, and dialogs keep the
+layout that fits the screen.
 
 Settings → Font sets the font, its size per device type and its weight. Under
 **Advanced**: **Input Ht** is the line height of the input line (the output's rows stay
@@ -97,7 +100,7 @@ Click the hamburger icon for:
 | World Selector | Open the world selector (`/worlds`) |
 | Actions | Open the actions editor (`/actions`) |
 | Settings | Open Settings (`/setup`) |
-| Emoji Picker | Insert an emoji (not on a phone or tablet, whose keyboard has its own; `Esc-e` still opens it) |
+| Emoji Picker | Insert an emoji (not on a phone or tablet, whose keyboard has its own, unless the Android app has a keyboard and mouse; `Esc-e` still opens it) |
 | Import Picture | Upload a picture and put its link in the input line (on Android, choose a picture app) |
 | Toggle Tags | Show/hide MUD tags (F2) |
 | Find | Show only matching lines (F4) |
@@ -154,6 +157,21 @@ The General tab's footer has **Import** before the `?`: it closes Settings (an
 import replaces what it shows, so a Save afterwards would put the old values back) and
 opens the Import dialog, the same one as `/import`. The console's `/setup` has the same
 button.
+
+**Android: Allow Other Devices.** With Clay Server's Run Mode set to **Run on This
+Phone**, the Clay on the phone accepts only the phone itself (the app, and other apps such
+as Termux at `127.0.0.1`). **Allow Other Devices** lets computers and phones on the same
+network connect to it too. It is off by default, and turning it on asks you to confirm
+first: anyone on the network with the password can read your worlds, send commands and
+change settings. Set a password of at least 8 characters and a port (9000 unless you
+change it); the tab then shows the phone's address to use, for example
+`clay --gui=192.168.1.20:9000`, the Android app's Host and Port, or
+`https://192.168.1.20:9000/clay/` in a browser. Other devices get the same protection as
+from any Clay server: an encrypted connection, the password, the allow list and bans.
+Saving a change restarts Clay on the phone, which disconnects your worlds. If another app
+already uses the port, Clay says so and doesn't start; choose another port. This works on
+Wi-Fi; mobile data networks usually block incoming connections. While it is off, the
+Remote Access panel says that only this device can connect.
 
 ### Status Panel
 

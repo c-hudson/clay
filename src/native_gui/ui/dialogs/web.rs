@@ -142,7 +142,17 @@ pub fn report(info: Option<&ReachabilityInfo>) -> Vec<(&'static str, String, Opt
         if info.http_enabled { format!("on, port {}, path {path}", info.port) } else { "OFF (enable it in Web Settings)".into() },
         (!info.http_enabled).then_some(false),
     ));
-    rows.push(("LAN", if info.lan_urls.is_empty() { "no non-loopback IPv4 address found".into() } else { info.lan_urls.join("\n") }, None));
+    rows.push((
+        "LAN",
+        if info.local_only {
+            crate::reach::LOCAL_ONLY_TEXT.into()
+        } else if info.lan_urls.is_empty() {
+            "no non-loopback IPv4 address found".into()
+        } else {
+            info.lan_urls.join("\n")
+        },
+        None,
+    ));
     if !info.vpn_addrs.is_empty() {
         rows.push(("VPN", format!("{}  (Tailscale or similar; reachable from that VPN without port forwarding)", info.vpn_addrs.join(", ")), None));
     }
@@ -241,7 +251,7 @@ impl Render for RemoteAccess {
                     .gap(px(6.0))
                     .line_height(relative(1.4))
                     .child(div().flex().flex_col().children(rows))
-                    .child(div().font_weight(FontWeight::BOLD).mt(px(6.0)).child("Connect from another device"))
+                    .when(!hints.is_empty(), |d| d.child(div().font_weight(FontWeight::BOLD).mt(px(6.0)).child("Connect from another device")))
                     .child(div().flex().flex_col().children(hints))
                     .child(
                         div()

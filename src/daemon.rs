@@ -43,8 +43,14 @@ pub async fn run_local_server(port_override: Option<u16>) -> io::Result<()> {
         }
     };
 
-    println!("clay: starting local server (loopback only)...");
+    let lan = std::env::var("CLAY_LOCAL_SERVER_LAN").map(|v| v == "1").unwrap_or(false);
+    if lan {
+        println!("clay: starting local server (other devices allowed)...");
+    } else {
+        println!("clay: starting local server (loopback only)...");
+    }
     crate::LOCAL_SERVER_LOOPBACK_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::LOCAL_SERVER_LAN.store(lan, std::sync::atomic::Ordering::SeqCst);
 
     // These channels satisfy run_app_headless's GUI-bridge API; nothing reads/writes them here
     // since the embedding client talks to the App over the WebSocket server, not this channel.

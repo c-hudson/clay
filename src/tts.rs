@@ -160,6 +160,13 @@ fn detect_tts_command() -> Option<String> {
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
+        // Skipped for --local-server (see LOCAL_SERVER_LOOPBACK_ONLY): the Android app speaks
+        // with the phone's own voice, and starting a subprocess from the app's bundled server
+        // hangs it at random - this `which` stalled App::new in about half of the emulator's
+        // cold starts, so the server never listened and the app opened on a blank screen.
+        if crate::LOCAL_SERVER_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
         for cmd in &["espeak-ng", "espeak", "festival"] {
             if Command::new("which")
                 .arg(cmd)

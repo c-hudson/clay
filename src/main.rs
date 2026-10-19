@@ -137,6 +137,13 @@ pub fn quit_in_process_clay() {
 ///   — better to simply not do work this mode never needed).
 pub static LOCAL_SERVER_LOOPBACK_ONLY: AtomicBool = AtomicBool::new(false);
 
+/// Set by `--local-server` when `CLAY_LOCAL_SERVER_LAN=1`: the Android app's "Allow Other
+/// Devices" (off by default). The listener then binds every interface, as any Clay server does:
+/// other devices get TLS and the usual gates (password, allow list, bans), and the app itself
+/// still connects over loopback. The rest of `LOCAL_SERVER_LOOPBACK_ONLY`'s local-server
+/// behaviour stays. See `http::http_bind_host` and `App::build_reachability_info`.
+pub static LOCAL_SERVER_LAN: AtomicBool = AtomicBool::new(false);
+
 /// Check if debug logging is enabled
 pub fn is_debug_enabled() -> bool {
     DEBUG_ENABLED.load(Ordering::Relaxed)
@@ -1381,6 +1388,18 @@ fn get_local_ip_addresses() -> Vec<String> {
 
 /// Generate a self-signed TLS certificate and key, saving to the given paths.
 /// Uses rcgen for pure-Rust X.509 cert generation (no external tools needed).
+/// This machine's hostname for the self-signed cert's names - the same answer for making a
+/// cert and for checking one (`cert_needs_regeneration`), or every start would remake it. None
+/// for `--local-server`: the Android app's bundled server must not start a subprocess (see
+/// `tts::detect_tts_command`), and Android's hostname is "localhost", already listed.
+fn cert_hostname() -> Option<String> {
+    if LOCAL_SERVER_LOOPBACK_ONLY.load(Ordering::SeqCst) {
+        return None;
+    }
+    let name = util::run_command_with_timeout("hostname", &[], 2)?.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 fn generate_self_signed_cert(cert_path: &std::path::Path, key_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use rcgen::{CertificateParams, KeyPair};
     use std::io::Write;
@@ -1392,9 +1411,8 @@ fn generate_self_signed_cert(cert_path: &std::path::Path, key_path: &std::path::
     ];
 
     // Add all local IP addresses so the cert works across the LAN
-    if let Some(name) = util::run_command_with_timeout("hostname", &[], 2) {
-        let name = name.trim().to_string();
-        if !name.is_empty() && !san_names.contains(&name) {
+    if let Some(name) = cert_hostname() {
+        if !san_names.contains(&name) {
             san_names.push(name);
         }
     }
@@ -1450,9 +1468,8 @@ fn cert_needs_regeneration(cert_path: &std::path::Path) -> bool {
         "127.0.0.1".to_string(),
         "::1".to_string(),
     ];
-    if let Ok(hostname) = std::process::Command::new("hostname").output() {
-        let name = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
-        if !name.is_empty() && !current_ips.contains(&name) {
+    if let Some(name) = cert_hostname() {
+        if !current_ips.contains(&name) {
             current_ips.push(name);
         }
     }
@@ -15011,6 +15028,8 @@ impl App {
             port_map: self.port_map_status.clone(),
             port_map_text: reach::port_map_text(&self.port_map_status, self.settings.port_map_enabled),
             client_hints: Vec::new(),
+            local_only: LOCAL_SERVER_LOOPBACK_ONLY.load(Ordering::SeqCst)
+                && !LOCAL_SERVER_LAN.load(Ordering::SeqCst),
         };
         info.client_hints = reach::build_client_hints(&info);
         info

@@ -1241,6 +1241,37 @@
                                         </select>
                                     </div>
                                 </div>
+                                <!-- Run on This Phone: whether other devices may connect to the server
+                                     on this phone (Android LocalServerManager.KEY_LAN_*). Off by
+                                     default; turning it on asks first (app.js
+                                     showAllowOtherDevicesConfirm). -->
+                                <div class="cs-local-only" style="display:none;">
+                                <div class="setting-row" title="Let other computers and phones on your network connect to the Clay running on this phone">
+                                    <span class="setting-label">Allow Other Devices</span>
+                                    <div class="setting-value">
+                                        <select id="cs-lan-enabled" class="web-input">
+                                            <option value="no">No</option>
+                                            <option value="yes">Yes</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div id="cs-lan-fields" style="display:none;">
+                                <div class="setting-row" title="What other devices log in with (at least 8 characters)">
+                                    <span class="setting-label">Password</span>
+                                    <div class="setting-value">
+                                        <input type="password" id="cs-lan-password" autocomplete="new-password" class="web-input">
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">Port</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="cs-lan-port" autocomplete="off" inputmode="numeric" class="web-input" placeholder="9000">
+                                    </div>
+                                </div>
+                                <div id="cs-lan-note" class="cs-lan-note"></div>
+                                </div>
+                                <div id="cs-lan-error" class="cs-lan-error" style="display:none;"></div>
+                                </div>
                                 <div id="cs-remote-fields" class="cs-remote-only">
                                 <div class="setting-row">
                                     <span class="setting-label">Host</span>

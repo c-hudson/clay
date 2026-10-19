@@ -247,6 +247,19 @@ public class MainActivity extends AppCompatActivity {
     private boolean keyboardForceActive = true;
     private boolean hardwareKeyboardAttached = false;
 
+    // Whether a mouse is connected. The Configuration says when a keyboard comes or goes, but
+    // nothing there says "mouse", so the input devices are scanned and InputManager reports the
+    // changes. With a keyboard AND a mouse the page draws the desktop GUI's chrome (app.js
+    // desktopInputAttached).
+    private boolean mouseAttached = false;
+    private android.hardware.input.InputManager inputManager;
+    private final android.hardware.input.InputManager.InputDeviceListener inputDeviceListener =
+        new android.hardware.input.InputManager.InputDeviceListener() {
+            @Override public void onInputDeviceAdded(int deviceId) { refreshMouseAttached(); }
+            @Override public void onInputDeviceRemoved(int deviceId) { refreshMouseAttached(); }
+            @Override public void onInputDeviceChanged(int deviceId) { refreshMouseAttached(); }
+        };
+
     // JavaScript interface for communication between web and Android
     public class AndroidInterface {
         @JavascriptInterface
@@ -635,6 +648,40 @@ public class MainActivity extends AppCompatActivity {
             String sanitized = RUN_MODE_LOCAL.equals(mode) ? RUN_MODE_LOCAL : RUN_MODE_REMOTE;
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString(KEY_RUN_MODE, sanitized).apply();
+        }
+
+        // Run on This Phone's "Allow Other Devices" (LocalServerManager.KEY_LAN_*), for the Clay
+        // Server tab: the saved values, and this phone's network addresses to tell other devices.
+        @JavascriptInterface
+        public String getLocalServerLan() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            try {
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("enabled", prefs.getBoolean(LocalServerManager.KEY_LAN_ENABLED, false));
+                o.put("password", prefs.getString(LocalServerManager.KEY_LAN_PASSWORD, ""));
+                o.put("port", prefs.getInt(LocalServerManager.KEY_LAN_PORT, LocalServerManager.PREFERRED_PORT));
+                o.put("minPasswordLength", LocalServerManager.MIN_LAN_PASSWORD_LENGTH);
+                o.put("addresses", new org.json.JSONArray(localNetworkAddresses()));
+                return o.toString();
+            } catch (org.json.JSONException e) {
+                return "{}";
+            }
+        }
+
+        // Saved as given only when usable (app.js checks first and says why); anything else
+        // saves it off, never on with a weak password or a port the server can't have. Applied
+        // by the reloadPage() that follows: a change restarts the local server.
+        @JavascriptInterface
+        public void saveLocalServerLan(boolean enabled, String password, int port) {
+            String pw = password != null ? password : "";
+            boolean usable = LocalServerManager.validLanPassword(pw) && LocalServerManager.validLanPort(port);
+            SharedPreferences.Editor editor = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit();
+            editor.putBoolean(LocalServerManager.KEY_LAN_ENABLED, enabled && usable);
+            editor.putString(LocalServerManager.KEY_LAN_PASSWORD, pw);
+            if (LocalServerManager.validLanPort(port)) {
+                editor.putInt(LocalServerManager.KEY_LAN_PORT, port);
+            }
+            editor.apply();
         }
 
         // Pushed by app.js's applyKeyboardForceState() whenever the resolved
@@ -1140,6 +1187,11 @@ public class MainActivity extends AppCompatActivity {
         hardwareKeyboardAttached = isHardwareKeyboardAttached(getResources().getConfiguration());
         keyboardForceActive = migratePrefs.getBoolean(KEY_KEYBOARD_ALWAYS_VISIBLE, true) && !hardwareKeyboardAttached;
         applyKeyboardForce(keyboardForceActive);
+        mouseAttached = isMouseAttached();
+        inputManager = (android.hardware.input.InputManager) getSystemService(Context.INPUT_SERVICE);
+        if (inputManager != null) {
+            inputManager.registerInputDeviceListener(inputDeviceListener, new Handler(Looper.getMainLooper()));
+        }
 
         setupWebView();
 
@@ -1155,12 +1207,70 @@ public class MainActivity extends AppCompatActivity {
         startPermissionFlow();
     }
 
+    /** This phone's IPv4 addresses on its networks (Wi-Fi, Ethernet, a hotspot): not loopback,
+     *  not link-local. What another device types to reach Allow Other Devices. */
+    private static java.util.List<String> localNetworkAddresses() {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> ifs = java.net.NetworkInterface.getNetworkInterfaces();
+            if (ifs == null) return out;
+            for (java.net.NetworkInterface nif : java.util.Collections.list(ifs)) {
+                if (!nif.isUp() || nif.isLoopback()) continue;
+                for (java.net.InetAddress a : java.util.Collections.list(nif.getInetAddresses())) {
+                    if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress() && !a.isLinkLocalAddress()) {
+                        String host = a.getHostAddress();
+                        if (host != null && !out.contains(host)) out.add(host);
+                    }
+                }
+            }
+        } catch (java.net.SocketException e) {
+            android.util.Log.w("Clay", "Listing network addresses failed: " + e.getMessage());
+        }
+        return out;
+    }
+
+    /** In Run on This Phone, the local server isn't running (its last start failed, e.g. its
+     *  port was taken) or runs with another Allow Other Devices setting than the saved one, so
+     *  it must (re)start to follow the saved settings. */
+    private boolean localServerNeedsRestart(SharedPreferences prefs) {
+        if (!RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))) return false;
+        LocalServerManager m = localServerManager();
+        return m == null || !m.isRunning()
+            || !LocalServerManager.configSnapshot(prefs).equals(m.startedConfig());
+    }
+
     /** newConfig.keyboard != KEYBOARD_NOKEYS alone isn't enough — some devices report a
      *  QWERTY "keyboard" type even with none physically attached; hardKeyboardHidden is the
      *  actual "is it physically available right now" signal (NO = available/slid-out). */
     private static boolean isHardwareKeyboardAttached(android.content.res.Configuration cfg) {
         return cfg.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
             && cfg.hardKeyboardHidden == android.content.res.Configuration.HARDKEYBOARDHIDDEN_NO;
+    }
+
+    /** A real (not virtual) input device that drives a mouse pointer: a USB or Bluetooth mouse,
+     *  or a keyboard cover's trackpad. SOURCE_MOUSE shares its class bits with the touchscreen,
+     *  so the whole value is compared, not any overlap. */
+    private static boolean isMouseAttached() {
+        for (int id : android.view.InputDevice.getDeviceIds()) {
+            android.view.InputDevice dev = android.view.InputDevice.getDevice(id);
+            if (dev == null || dev.isVirtual()) continue;
+            int mouse = android.view.InputDevice.SOURCE_MOUSE;
+            if ((dev.getSources() & mouse) == mouse) return true;
+        }
+        return false;
+    }
+
+    /** Re-scan after InputManager reports a device added, removed or changed; tell the page
+     *  only when the answer changed. */
+    private void refreshMouseAttached() {
+        boolean attached = isMouseAttached();
+        if (attached == mouseAttached) return;
+        mouseAttached = attached;
+        if (webView != null) {
+            webView.evaluateJavascript(
+                "if (typeof window.onHardwareMouseChanged === 'function') window.onHardwareMouseChanged("
+                    + attached + ");", null);
+        }
     }
 
     /** Apply (or release) the forced-visible soft keyboard state. Must run on the UI thread.
@@ -1791,7 +1901,11 @@ public class MainActivity extends AppCompatActivity {
             boolean ready = manager.start();
             android.util.Log.i("Clay", "Local server " + (ready ? "ready" : "FAILED to start")
                 + " on port " + manager.getPort());
-            runOnUiThread(this::loadInterface);
+            String error = ready ? null : manager.lastError();
+            runOnUiThread(() -> {
+                if (error != null) Toast.makeText(this, error, Toast.LENGTH_LONG).show();
+                loadInterface();
+            });
         }, "ClayLocalServerStart").start();
     }
 
@@ -2126,6 +2240,9 @@ public class MainActivity extends AppCompatActivity {
                     view.evaluateJavascript(
                         "if (typeof window.onHardwareKeyboardChanged === 'function') window.onHardwareKeyboardChanged("
                             + hardwareKeyboardAttached + ");", null);
+                    view.evaluateJavascript(
+                        "if (typeof window.onHardwareMouseChanged === 'function') window.onHardwareMouseChanged("
+                            + mouseAttached + ");", null);
                     // connect() AFTER vars are injected so buildCandidates() sees them
                     view.postDelayed(() -> view.evaluateJavascript(
                         "if (typeof connect === 'function') connect();", null), 300);
@@ -2374,7 +2491,8 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * True when the saved run mode / SSH configuration no longer matches what the running local
-     * server or tunnel was started with, or when SSH is enabled but its tunnel has since died.
+     * server or tunnel was started with, or when SSH is enabled but its tunnel has since died,
+     * or when the local server isn't running with the saved Allow Other Devices setting.
      * Extracted so onNewIntent can ask the question without committing to a reload; the reload
      * path itself re-derives the same answer.
      */
@@ -2383,6 +2501,9 @@ public class MainActivity extends AppCompatActivity {
         String currentMode = prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE);
         String lastMode = ClaySession.lastAppliedRunMode();
         if (lastMode != null && !currentMode.equals(lastMode)) {
+            return true;
+        }
+        if (localServerNeedsRestart(prefs)) {
             return true;
         }
         boolean sshEnabledNow = RUN_MODE_REMOTE.equals(currentMode) && prefs.getBoolean(KEY_SSH_ENABLED, false);
@@ -2421,8 +2542,10 @@ public class MainActivity extends AppCompatActivity {
             ? !lastSshSnapshot.equals(currentSshSnapshot)
             : currentSshSnapshot != null;
 
-        if (modeChanged || sshChanged) {
-            android.util.Log.i("Clay", "Run mode or SSH config changed, reloading");
+        boolean localChanged = localServerNeedsRestart(prefs);
+
+        if (modeChanged || sshChanged || localChanged) {
+            android.util.Log.i("Clay", "Run mode, SSH or local server config changed, reloading");
             // A genuine mode/config change makes the running server or tunnel wrong, so this
             // is one of the few places a real teardown is correct.
             ClaySession.shutdown();
@@ -2610,6 +2733,9 @@ public class MainActivity extends AppCompatActivity {
         stopHeartbeat();
         cancelBackgroundShutdownTimer();
         unregisterSshNetworkCallback(); // normally already done in onPause(); safe/idempotent
+        if (inputManager != null) {
+            inputManager.unregisterInputDeviceListener(inputDeviceListener);
+        }
         if (tts != null) {
             tts.shutdown();
             tts = null;

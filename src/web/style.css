@@ -1325,6 +1325,22 @@ body.device-phone[data-gui-theme="dark-new"] #input-container {
 }
 body.device-phone #output-container { padding: 6px 10px; }
 
+/* ─── The Android app with a keyboard and a mouse: the desktop GUI's chrome ─── */
+/* app.js desktopInputAttached(), on a phone or a tablet alike: the separator bar carries the
+   menu and the font slider, and the button row under it goes. With the on-screen keyboard
+   gone, so is its emoji picker, so the menu offers Clay's again. The icon bar (app.js
+   iconBarVisible) and the output's scroll bar (below) show as on the desktop. Dialogs keep
+   the layout of the screen's size, which is what fits on it. These follow the phone and
+   tablet rules above and match their specificity, so they win. */
+body.desktop-input #nav-bar { display: none; }
+body.desktop-input .status-menu-btn { display: flex; }
+body.desktop-input .status-font-slider { display: flex; }
+body.desktop-input #menu-dropdown .menu-item[data-action="emoji_picker"] { display: flex; }
+
+/* Settings > Clay Server, Run on This Phone: Allow Other Devices' note and error. */
+.cs-lan-note { padding: 2px 0 4px; font-size: 0.78em; opacity: 0.85; text-align: left; }
+.cs-lan-error { padding: 2px 0 4px; font-size: 0.78em; color: var(--error-color); text-align: left; }
+
 /* ─── Filter Popup (F4) ─── */
 .filter-popup {
     position: fixed;
@@ -1401,31 +1417,38 @@ body.device-phone #output-container { padding: 6px 10px; }
    with them set, WebKitGTK drew GTK's own 21px trough and pale thumb. Firefox, which has
    only the standard ones, keeps them (a thin bar in fg-muted). The hide above would
    otherwise remove the pseudo-element bar. Phones and tablets keep the platform's own
-   overlay bar. */
-body.device-desktop #output-container {
+   overlay bar, unless the Android app has a keyboard and a mouse (body.desktop-input). */
+body.device-desktop #output-container,
+body.desktop-input #output-container {
     scrollbar-gutter: stable;
 }
 @supports selector(::-webkit-scrollbar) {
-    body.device-desktop #output-container {
+    body.device-desktop #output-container,
+    body.desktop-input #output-container {
         scrollbar-width: auto;
         scrollbar-color: auto;
     }
 }
-body.device-desktop #output-container::-webkit-scrollbar {
+body.device-desktop #output-container::-webkit-scrollbar,
+body.desktop-input #output-container::-webkit-scrollbar {
     display: block;
     width: 9px;
 }
-body.device-desktop #output-container::-webkit-scrollbar-track {
+body.device-desktop #output-container::-webkit-scrollbar-track,
+body.desktop-input #output-container::-webkit-scrollbar-track {
     background: transparent;
 }
-body.device-desktop #output-container::-webkit-scrollbar-thumb {
+body.device-desktop #output-container::-webkit-scrollbar-thumb,
+body.desktop-input #output-container::-webkit-scrollbar-thumb {
     background-color: var(--theme-fg-muted, #52525b);
     border-right: 1px solid transparent;
     background-clip: padding-box;
     border-radius: 4px;
 }
 body.device-desktop #output-container::-webkit-scrollbar-thumb:hover,
-body.device-desktop #output-container::-webkit-scrollbar-thumb:active {
+body.desktop-input #output-container::-webkit-scrollbar-thumb:hover,
+body.device-desktop #output-container::-webkit-scrollbar-thumb:active,
+body.desktop-input #output-container::-webkit-scrollbar-thumb:active {
     background-color: var(--theme-fg-secondary, #a1a1aa);
 }
 

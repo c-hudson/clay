@@ -116,7 +116,15 @@ pub struct ReachabilityInfo {
     pub port_map: PortMapStatus,
     pub port_map_text: String,
     pub client_hints: Vec<ClientHint>,
+    /// The Android app's own server with "Allow Other Devices" off: it listens on loopback
+    /// only, so no address here reaches it and there are no hints. False from older servers.
+    #[serde(default)]
+    pub local_only: bool,
 }
+
+/// What the LAN line says while `local_only` is set.
+pub const LOCAL_ONLY_TEXT: &str =
+    "off - only this device can connect (Settings > Clay Server > Allow Other Devices)";
 
 // ---------------------------------------------------------------------------
 // Address classification
@@ -212,6 +220,9 @@ pub fn port_map_text(status: &PortMapStatus, enabled: bool) -> String {
 /// internet-facing variants when a working mapping exists, then VPN and SSH.
 pub fn build_client_hints(info: &ReachabilityInfo) -> Vec<ClientHint> {
     let mut hints = Vec::new();
+    if info.local_only {
+        return hints;
+    }
     if let Some(ip) = info.lan_ips.first() {
         hints.push(ClientHint::new("Browser (LAN)", web_url(ip, info.port, &info.web_path)));
         hints.push(ClientHint::new("Clay GUI", format!("clay --gui={}", host_port_hint(ip, info.port))));
@@ -261,7 +272,9 @@ pub fn format_reach_lines(info: &ReachabilityInfo) -> Vec<String> {
     } else {
         lines.push("  Web server: OFF (enable it in /web)".to_string());
     }
-    if info.lan_urls.is_empty() {
+    if info.local_only {
+        lines.push(format!("  LAN:        {LOCAL_ONLY_TEXT}"));
+    } else if info.lan_urls.is_empty() {
         lines.push("  LAN:        no non-loopback IPv4 address found".to_string());
     } else {
         for (i, url) in info.lan_urls.iter().enumerate() {
@@ -287,11 +300,13 @@ pub fn format_reach_lines(info: &ReachabilityInfo) -> Vec<String> {
     lines.push(format!("  Public IP:  {public}"));
     lines.push(format!("  Firewall:   {}", info.firewall_text));
     lines.push(format!("  Router:     {}", info.port_map_text));
-    lines.push("Connect from another device:".to_string());
-    for hint in &info.client_hints {
-        lines.push(format!("  {:<22} {}", format!("{}:", hint.label), hint.value));
+    if !info.client_hints.is_empty() {
+        lines.push("Connect from another device:".to_string());
+        for hint in &info.client_hints {
+            lines.push(format!("  {:<22} {}", format!("{}:", hint.label), hint.value));
+        }
+        lines.push(format!("  {SSH_HINT_NOTE}"));
     }
-    lines.push(format!("  {SSH_HINT_NOTE}"));
     lines.push("See the Clay docs, Web Interface -> \"Reaching Clay from outside your network\".".to_string());
     lines
 }
@@ -526,6 +541,27 @@ mod tests {
         assert!(text.contains(SSH_HINT_NOTE));
         assert!(!text.contains("VPN:"));
         assert!(lines.iter().all(|l| !l.ends_with('\n')));
+    }
+
+    /// The Android app's own server with Allow Other Devices off listens on loopback only:
+    /// the report must not offer the phone's LAN address, or any way in, as if it worked.
+    #[test]
+    fn report_for_a_loopback_only_server_offers_no_way_in() {
+        let mut info = base_info();
+        info.local_only = true;
+        info.client_hints = build_client_hints(&info);
+        assert!(info.client_hints.is_empty());
+        let text = format_reach_lines(&info).join("\n");
+        assert!(text.contains(&format!("LAN:        {LOCAL_ONLY_TEXT}")));
+        assert!(!text.contains("192.168.1.20"));
+        assert!(!text.contains("Connect from another device"));
+        assert!(!text.contains(SSH_HINT_NOTE));
+        // An older server's JSON has no local_only: it reads as false.
+        let old: ReachabilityInfo = serde_json::from_str(r#"{"http_enabled":true,"port":9000,"web_path":"clay",
+            "lan_ips":[],"lan_urls":[],"vpn_addrs":[],"public_ip":null,"public_ip_source":"","public_ip_error":null,
+            "firewall":{"kind":"NotApplicable"},"firewall_text":"","is_windows":false,"port_map_enabled":false,
+            "port_map":{"kind":"Off"},"port_map_text":"","client_hints":[]}"#).unwrap();
+        assert!(!old.local_only);
     }
 
     #[test]

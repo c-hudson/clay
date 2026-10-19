@@ -1694,8 +1694,6 @@ impl HttpServer {
     }
 }
 
-/// Host to bind the HTTP+WS listener to. Loopback-only when running as `--local-server`
-/// (`LOCAL_SERVER_LOOPBACK_ONLY`), otherwise all interfaces as before.
 /// Why the server couldn't have its port. When another program holds it, say which
 /// (`platform::port_owner`): Windows lets a loopback bind succeed beside a program
 /// listening on all interfaces, so the GUIs' own check can miss it, and this message -
@@ -1711,8 +1709,12 @@ pub(crate) fn bind_failure(what: &str, port: u16, err: Option<&std::io::Error>) 
     }
 }
 
+/// Host to bind the HTTP+WS listener to. Loopback-only when running as `--local-server`
+/// (`LOCAL_SERVER_LOOPBACK_ONLY`) unless the Android app allowed other devices
+/// (`LOCAL_SERVER_LAN`), otherwise all interfaces as before.
 fn http_bind_host() -> &'static str {
-    if crate::LOCAL_SERVER_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+    use std::sync::atomic::Ordering;
+    if crate::LOCAL_SERVER_LOOPBACK_ONLY.load(Ordering::SeqCst) && !crate::LOCAL_SERVER_LAN.load(Ordering::SeqCst) {
         "127.0.0.1"
     } else {
         "0.0.0.0"
@@ -1849,6 +1851,15 @@ mod local_server_bind_tests {
 
         crate::LOCAL_SERVER_LOOPBACK_ONLY.store(false, Ordering::SeqCst);
         assert_eq!(http_bind_host(), "0.0.0.0");
+
+        // The Android app's "Allow Other Devices" (`CLAY_LOCAL_SERVER_LAN=1`) opens the
+        // local server to the network. Checked in this test rather than a second one, which
+        // could flip LOCAL_SERVER_LAN between this test's set and its assert.
+        crate::LOCAL_SERVER_LOOPBACK_ONLY.store(true, Ordering::SeqCst);
+        crate::LOCAL_SERVER_LAN.store(true, Ordering::SeqCst);
+        assert_eq!(http_bind_host(), "0.0.0.0");
+        crate::LOCAL_SERVER_LAN.store(false, Ordering::SeqCst);
+        assert_eq!(http_bind_host(), "127.0.0.1");
 
         crate::LOCAL_SERVER_LOOPBACK_ONLY.store(prev, Ordering::SeqCst);
     }

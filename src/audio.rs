@@ -174,6 +174,11 @@ fn detect_external_player() -> Option<String> {
 
     #[cfg(not(windows))]
     {
+        // The Android app's bundled server (--local-server) has neither player, and must not
+        // start a subprocess: it hangs there at random (see tts::detect_tts_command).
+        if crate::LOCAL_SERVER_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
         for cmd in &["mpv", "ffplay"] {
             if std::process::Command::new("which")
                 .arg(cmd)
