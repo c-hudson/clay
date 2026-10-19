@@ -375,6 +375,11 @@ pub enum WsMessage {
         splash_lines: Vec<String>,
         #[serde(default)]
         server_version: String,
+        /// The server's build as `/version` names it after "Clay " (`crate::version_detail`):
+        /// a client attached to it shows it as the `Remote` line of its own `/version`.
+        /// Empty from an older server - the client falls back to `server_version`.
+        #[serde(default)]
+        server_version_detail: String,
         /// The last version at which the Android app itself (bundled app.js/index.html,
         /// the `android/` native shell, or the bundled libclay server) actually changed
         /// (`crate::ANDROID_APP_VERSION`). Android nags to reinstall only when its

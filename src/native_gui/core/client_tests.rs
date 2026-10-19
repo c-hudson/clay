@@ -121,6 +121,7 @@ impl H {
             actions: Vec::new(),
             splash_lines: Vec::new(),
             server_version: String::new(),
+            server_version_detail: String::new(),
             android_app_version: String::new(),
             your_display_id: 7,
             scrollback_push: false,
@@ -1122,6 +1123,7 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
         actions: Vec::new(),
         splash_lines: Vec::new(),
         server_version: "1.7.8".into(),
+        server_version_detail: String::new(),
         android_app_version: String::new(),
         your_display_id: 7,
         scrollback_push: false,
@@ -1136,6 +1138,72 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
     let e = old.core.set_other_views(vec![1]);
     old.keep(e);
     assert!(other_views(&old.sent()).is_empty(), "not to a server that doesn't take it");
+}
+
+// ---- /version ----
+
+/// `/version` in a GUI attached to another Clay: this GUI's build, then the server's from
+/// its `InitialState`, aligned (user ruling 2026-10-19); a server from before the detail
+/// gives its version number; offline, this GUI's own line alone.
+#[test]
+fn version_names_this_gui_and_the_server() {
+    let mut h = H::password();
+    h.connect_and_login();
+    h.msg(WsMessage::InitialState {
+        worlds: vec![world_msg(0, "A", 0..2, 9)],
+        settings: settings(),
+        current_world_index: 0,
+        actions: Vec::new(),
+        splash_lines: Vec::new(),
+        server_version: "1.7.10".into(),
+        server_version_detail: "v1.7.10 (build 26/10/17 23:58-1d4a8b0a) [linux/x86_64]".into(),
+        android_app_version: String::new(),
+        your_display_id: 7,
+        scrollback_push: false,
+        other_views: true,
+        expand_line: true,
+        picture_upload: true,
+        emoji_json: String::new(),
+        emoji_categories_json: String::new(),
+        tf_status: Vec::new(),
+    });
+    let e = h.core.version_lines();
+    h.keep(e);
+    let texts = h.texts(0);
+    assert_eq!(texts[texts.len() - 2..], [
+        format!("Clay: Local  {}", crate::version_detail()),
+        "      Remote v1.7.10 (build 26/10/17 23:58-1d4a8b0a) [linux/x86_64]".to_string(),
+    ]);
+
+    let mut old = H::password();
+    old.connect_and_login();
+    old.msg(WsMessage::InitialState {
+        worlds: vec![world_msg(0, "A", 0..2, 9)],
+        settings: settings(),
+        current_world_index: 0,
+        actions: Vec::new(),
+        splash_lines: Vec::new(),
+        server_version: "1.7.8".into(),
+        server_version_detail: String::new(),
+        android_app_version: String::new(),
+        your_display_id: 7,
+        scrollback_push: false,
+        other_views: true,
+        expand_line: true,
+        picture_upload: true,
+        emoji_json: String::new(),
+        emoji_categories_json: String::new(),
+        tf_status: Vec::new(),
+    });
+    let e = old.core.version_lines();
+    old.keep(e);
+    assert_eq!(old.texts(0).last().unwrap(), "      Remote v1.7.8");
+
+    old.input(Input::Closed("network".into()));
+    let before = old.texts(0).len();
+    let e = old.core.version_lines();
+    old.keep(e);
+    assert_eq!(old.texts(0)[before..], [crate::get_version_string()], "offline: this GUI's line alone");
 }
 
 // ---- the telnet echo mask ----

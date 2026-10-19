@@ -710,6 +710,16 @@ impl ClayView {
             cx.notify();
             return;
         }
+        // `/version` attached to another Clay names this GUI's build and the server's;
+        // running Clay itself, the server's one line is this GUI's too.
+        if first.eq_ignore_ascii_case("/version") && !crate::native_gui::runs_clay() {
+            self.editor.remember(&trimmed, false);
+            self.editor.clear();
+            let fx = self.session.core.version_lines();
+            self.after(fx, cx);
+            self.input_touched(cx);
+            return;
+        }
         if !self.session.core.is_online() {
             let command = self.editor.text.clone();
             self.editor.remember(&command, false);

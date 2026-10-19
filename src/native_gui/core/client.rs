@@ -299,6 +299,8 @@ pub struct ClientCore {
     pub server_expands_line: bool,
     /// The server takes `PictureUpload` (`InitialState.picture_upload`): Import Picture.
     pub server_picture_upload: bool,
+    /// The server's build, for the `Remote` line of `/version` (`version_lines`).
+    server_version_detail: Option<String>,
     requests: HashMap<u64, (RequestKind, usize, Instant)>,
     next_request_id: u64,
     backfill_at: Option<Instant>,
@@ -354,6 +356,7 @@ impl ClientCore {
             server_takes_other_views: false,
             server_expands_line: false,
             server_picture_upload: false,
+            server_version_detail: None,
             requests: HashMap::new(),
             next_request_id: 1,
             backfill_at: None,
@@ -589,6 +592,20 @@ impl ClientCore {
             self.changed();
         }
         self.take()
+    }
+
+    /// `/version` in a GUI attached to another Clay: this GUI's build and, while it is
+    /// online, the server's (`crate::attached_version_lines`); offline, its own line alone.
+    pub fn version_lines(&mut self) -> Vec<Effect> {
+        let lines: Vec<String> = match self.server_version_detail.clone().filter(|_| self.is_online()) {
+            Some(remote) => crate::attached_version_lines(&crate::version_detail(), &remote).into(),
+            None => vec![crate::get_version_string()],
+        };
+        let mut fx = Vec::new();
+        for line in lines {
+            fx.extend(self.client_line(&line));
+        }
+        fx
     }
 
     /// A command was sent: the current world's prompt and splash go, as app.js clears
@@ -1024,7 +1041,8 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, server_version, server_version_detail, .. } => {
+                self.server_version_detail = crate::server_version_detail(&server_version_detail, &server_version);
                 self.server_takes_other_views = other_views;
                 self.server_expands_line = expand_line;
                 self.server_picture_upload = picture_upload;

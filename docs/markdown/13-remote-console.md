@@ -119,7 +119,7 @@ keybind editor.
 | Command | Description |
 |---------|-------------|
 | `/menu` | Open the menu of windows and popups |
-| `/version` | Display version information |
+| `/version` | This console's build and the server's (`Clay: Local ...` / `Remote ...`) |
 
 ## Menu Popup
 

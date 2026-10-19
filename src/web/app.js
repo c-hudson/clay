@@ -783,6 +783,7 @@
     let worlds = [];
     let currentWorldIndex = 0;
     let versionMismatchShown = false;  // Warn on client/server version drift once per session, not every reconnect
+    let serverVersionDetail = '';  // The server's build, for /version's Remote line (InitialState.server_version_detail)
 
     // Check for world lock parameter in URL or injected by WebView
     var urlParams = new URLSearchParams(window.location.search);
@@ -1061,6 +1062,44 @@
         const v = window.CLIENT_VERSION;
         if (typeof v === 'string' && v.length > 0 && v.indexOf('{{') === -1) return v;
         return '';
+    }
+
+    // /version (src/main.rs attached_version_lines, user ruling 2026-10-19). This program's
+    // own build ("v1.7.11 (build 26/10/17 23:58-1d4a8b0a) [linux/x86_64]") where it is a
+    // different program from the server it talks to: the WebView GUI attached to another
+    // Clay (CLIENT_VERSION_DETAIL, injected by webview_gui.rs) and the Android app in Run
+    // on Server (Android.getVersionDetail, the bundled Clay's own). '' in a browser (the
+    // page is the server's), the WebView running Clay itself and the app's Run on This
+    // Phone: their /version is the server's one line, as before.
+    function attachedLocalVersionDetail() {
+        try {
+            if (window.Android) {
+                if (typeof window.Android.getVersionDetail !== 'function') return '';
+                if (typeof window.Android.getRunMode === 'function' && window.Android.getRunMode() === 'local') return '';
+                return String(window.Android.getVersionDetail() || '');
+            }
+        } catch (e) { return ''; }
+        if (window.WEBVIEW_MASTER) return '';
+        const d = window.CLIENT_VERSION_DETAIL;
+        return (typeof d === 'string' && d.indexOf('{{') === -1) ? d : '';
+    }
+
+    function attachedVersionLines(local, remote) {
+        return ['Clay: Local  ' + local, '      Remote ' + remote];
+    }
+
+    // /version and ^X^V: answered here where this program has a build of its own - both
+    // builds while connected, its own line alone while not. Returns false where the
+    // server's line is the whole answer (send /version to it, as before).
+    function showVersionHere() {
+        const local = attachedLocalVersionDetail();
+        if (!local) return false;
+        if (ws && ws.readyState === WebSocket.OPEN && authenticated && serverVersionDetail) {
+            attachedVersionLines(local, serverVersionDetail).forEach(function(l) { appendClientLine(l); });
+        } else {
+            appendClientLine('Clay ' + local);
+        }
+        return true;
     }
 
     // Numeric dotted-version compare: "1.5.5" < "1.6.3" -> true. Used only for the
@@ -3632,6 +3671,10 @@
                 serverExpandsLine = !!msg.expand_line;
                 // The server uploads pictures (Import Picture; InitialState.picture_upload).
                 serverPictureUpload = !!msg.picture_upload;
+                // The server's build, for /version's Remote line; from a server before
+                // that field, its version number alone.
+                serverVersionDetail = msg.server_version_detail ||
+                    (msg.server_version && msg.server_version.indexOf('{{') === -1 ? 'v' + msg.server_version : '');
                 updateImportPictureMenu();
                 // TF's status area, per world, once a script has it (see 'TfStatus').
                 tfStatusViews = {};
@@ -7068,7 +7111,10 @@
             return;
         }
 
-        const sent = send({
+        // /version where this program has a build of its own: its build and the server's,
+        // answered here (showVersionHere); else the server's one line, as before.
+        const answeredHere = cmdTrimmed.split(/\s+/)[0].toLowerCase() === '/version' && showVersionHere();
+        const sent = answeredHere || send({
             type: 'SendCommand',
             world_index: currentWorldIndex,
             command: cmd
@@ -15917,10 +15963,12 @@
                 return true;
             }
             // TF-parity plan Job 22b/P2.7 (^X^V default): same text a typed /version
-            // prints - round-trips through SendCommand since the version banner is
-            // generated server-side.
+            // prints - this program's own build where it has one (showVersionHere), else
+            // the server's line through SendCommand.
             case 'show_version':
-                send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/version' });
+                if (!showVersionHere()) {
+                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/version' });
+                }
                 return true;
             case 'redraw':
                 if (worlds[currentWorldIndex]) {

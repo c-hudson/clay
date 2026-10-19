@@ -189,7 +189,34 @@ pub(crate) fn platform_tag() -> String {
 /// triage bug reports (e.g. distinguishing a Termux-hosted instance from the packaged
 /// Android app) without the user needing to know or say which platform they're on.
 pub fn get_version_string() -> String {
-    format!("Clay v{} (build {}-{}) [{}/{}]", VERSION, BUILD_DATE, BUILD_HASH, platform_tag(), std::env::consts::ARCH)
+    format!("Clay {}", version_detail())
+}
+
+/// This build as `/version` names it after "Clay ": `v1.7.11 (build 26/10/17 23:58-1d4a8b0a)
+/// [linux/x86_64]`. A server sends its own in `InitialState.server_version_detail`.
+pub fn version_detail() -> String {
+    format!("v{} (build {}-{}) [{}/{}]", VERSION, BUILD_DATE, BUILD_HASH, platform_tag(), std::env::consts::ARCH)
+}
+
+/// `/version` in a client attached to another Clay (user ruling 2026-10-19): this
+/// program's build, then the server's, the two aligned - the extra spaces are wanted.
+/// A Clay that isn't attached to another (the console, a GUI running Clay itself, the
+/// Android app's Run on This Phone), or a client whose connection is down, still says
+/// [`get_version_string`]'s one line. app.js `attachedVersionLines` is the same.
+pub fn attached_version_lines(local: &str, remote: &str) -> [String; 2] {
+    [format!("Clay: Local  {local}"), format!("      Remote {remote}")]
+}
+
+/// The server's build for that second line, from its `InitialState`: the whole detail,
+/// or from a server before that field, the version number alone (`v1.7.10`).
+pub fn server_version_detail(detail: &str, version: &str) -> Option<String> {
+    if !detail.is_empty() {
+        Some(detail.to_string())
+    } else if !version.is_empty() {
+        Some(format!("v{version}"))
+    } else {
+        None
+    }
 }
 
 // Re-export commonly used types from modules
@@ -5622,6 +5649,9 @@ pub struct App {
     pub server_expands_line: bool,
     /// Remote console only: the server takes `PictureUpload` (its `InitialState.picture_upload`).
     pub server_picture_upload: bool,
+    /// Remote console only: the server's build for `/version`'s `Remote` line (its
+    /// `InitialState.server_version_detail`), while connected to it.
+    pub server_version_detail: Option<String>,
     /// Import Picture (src/picture.rs). The server's pictures still arriving from clients.
     pub(crate) picture_uploads: picture::IncomingUploads,
     /// The master console's own pictures: the batches to upload and the one going up.
@@ -5925,6 +5955,7 @@ impl App {
             remote_reachability_json: String::new(),
             server_expands_line: false,
             server_picture_upload: false,
+            server_version_detail: None,
             picture_uploads: picture::IncomingUploads::default(),
             console_pictures: picture::ConsolePictures::default(),
             pending_picture_drop: None,
@@ -17674,6 +17705,7 @@ impl App {
             actions: self.settings.actions.clone(),
             splash_lines: generate_splash_strings(),
             server_version: crate::VERSION.to_string(),
+            server_version_detail: crate::version_detail(),
             android_app_version: crate::ANDROID_APP_VERSION.to_string(),
             // Stays false until the ScrollbackSyncRequest handler actually exists
             // (PROTOCOL-ROADMAP.md Phase J, step 9). Advertising the capability before we
@@ -21244,7 +21276,7 @@ async fn main() -> io::Result<()> {
         } else {
             features.join(", ")
         };
-        println!("Clay v{} (build {}-{}) [{}/{}]", VERSION, BUILD_DATE, BUILD_HASH, platform_tag(), std::env::consts::ARCH);
+        println!("{}", get_version_string());
         println!("Features: {}", features_str);
         return Ok(());
     }

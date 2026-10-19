@@ -136,6 +136,10 @@ impl ClayView {
                 self.complete_input();
                 self.input_touched(cx);
             }
+            "show_version" if !crate::native_gui::runs_clay() => {
+                let fx = self.session.core.version_lines();
+                self.after(fx, cx);
+            }
             "show_version" => {
                 let fx = self.session.send(WsMessage::SendCommand { world_index: world, command: "/version".into() });
                 self.after(fx, cx);

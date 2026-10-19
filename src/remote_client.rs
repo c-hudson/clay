@@ -911,11 +911,12 @@ async fn reconnect_once(
 /// console's worlds, settings and view become the server's again. What belongs to the
 /// console - the input line, its history, an open editor - stays.
 fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSender<WsMessage>, version_mismatch_shown: &mut bool) {
-    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, tf_status, expand_line, picture_upload, .. } = msg else {
+    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, .. } = msg else {
         return;
     };
     app.server_expands_line = expand_line;
     app.server_picture_upload = picture_upload;
+    app.server_version_detail = crate::server_version_detail(&server_version_detail, &server_version);
     // An open editor is kept by its world's name: the world list is the server's again.
     let notes_world = app.editor.world_index.and_then(|i| app.worlds.get(i)).map(|w| w.name.clone());
     let mcp_world = app.editor.mcp_edit.as_ref().and_then(|c| app.worlds.get(c.world_index)).map(|w| w.name.clone());
@@ -1848,6 +1849,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             ws_write_handle.abort();
             ws_tx = offline_tx.clone();
             app.ws_client_tx = None;
+            app.server_version_detail = None;
             let notes = app.picture_client.connection_lost();
             app.apply_picture_notes(notes);
             app.add_output(if server_reloading {
@@ -1890,6 +1892,31 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 /// right).
 /// What this console calls itself in `/update`'s lines (src/selfupdate.rs).
 const OWN_LABEL: &str = "This console";
+
+/// The current world's splash goes on the user's input.
+fn clear_splash_on_input(app: &mut App) {
+    if app.current_world().showing_splash {
+        let world = app.current_world_mut();
+        world.showing_splash = false;
+        world.needs_redraw = true;
+        world.output_lines.clear();
+        world.scroll_offset = 0;
+        app.needs_output_redraw = true;
+    }
+}
+
+/// `/version` (and `^X^V`): this console's build and, while it is connected, the
+/// server's (`crate::attached_version_lines`).
+fn version_command(app: &mut App) {
+    match app.server_version_detail.clone() {
+        Some(remote) => {
+            for line in crate::attached_version_lines(&crate::version_detail(), &remote) {
+                app.add_output(&line);
+            }
+        }
+        None => app.add_output(&get_version_string()),
+    }
+}
 
 /// The server this console restarts against, for `/update`'s lines.
 fn attached_to() -> String {
@@ -2778,6 +2805,9 @@ pub(crate) fn handle_remote_client_key(
                     crate::input::HistorySub::NotSubstitution => {}
                 }
             }
+            // The splash goes on the first user input (as for server data) - before the
+            // command runs, or what a command prints here (/version) goes with it.
+            clear_splash_on_input(app);
             if cmd.is_empty() {
                 // Send empty command to server (some MUDs use this for "look")
                 let _ = ws_tx.send(WsMessage::SendCommand {
@@ -2789,15 +2819,8 @@ pub(crate) fn handle_remote_client_key(
             }
             // Reset lines_since_pause for more-mode
             app.current_world_mut().lines_since_pause = 0;
-            // Clear splash on first user input (same as server data)
-            if app.current_world().showing_splash {
-                let world = app.current_world_mut();
-                world.showing_splash = false;
-                world.needs_redraw = true;
-                world.output_lines.clear();
-                world.scroll_offset = 0;
-                app.needs_output_redraw = true;
-            }
+            // A command that switched to a world still showing its splash.
+            clear_splash_on_input(app);
         }
     // Fall through to character input (unbound keys)
     if let Char(c) = key.code {
@@ -2847,7 +2870,7 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
                 }
             }
         }
-        Command::Version => app.add_output(&get_version_string()),
+        Command::Version => version_command(app),
         Command::Menu => app.open_menu_popup_new(),
         Command::Font => app.add_output("Font settings are available in the web and GUI interfaces."),
         Command::Setup => app.open_setup_popup_new(),
@@ -3378,9 +3401,7 @@ pub(crate) fn dispatch_remote_action(
             crate::commands::apply_limit_op(app, op);
         }
         // TF-parity plan Job 22a (`^X^V`): same text as a typed `/version`.
-        "show_version" => {
-            app.add_output(&crate::get_version_string());
-        }
+        "show_version" => version_command(app),
         "toggle_action_highlight" => {
             app.highlight_actions = !app.highlight_actions;
             app.needs_output_redraw = true;

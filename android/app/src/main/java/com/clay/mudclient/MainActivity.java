@@ -432,6 +432,13 @@ public class MainActivity extends AppCompatActivity {
         /// so a log pull can tell "the phone does not have this build yet" from "it has it and
         /// the thing being measured did not happen". The APK bundles its own web assets, so this
         /// is the version of both the app and the JS talking to the server.
+        /** This app's build for /version's Local line in Run on Server (ClayVersion: the
+         *  bundled Clay's own, "v1.7.11 (build ...) [android/aarch64]"). */
+        @JavascriptInterface
+        public String getVersionDetail() {
+            return ClayVersion.detail(MainActivity.this, 3000);
+        }
+
         @JavascriptInterface
         public String getAppVersion() {
             try {
@@ -1191,6 +1198,11 @@ public class MainActivity extends AppCompatActivity {
         inputManager = (android.hardware.input.InputManager) getSystemService(Context.INPUT_SERVICE);
         if (inputManager != null) {
             inputManager.registerInputDeviceListener(inputDeviceListener, new Handler(Looper.getMainLooper()));
+        }
+        // /version's Local line in Run on Server asks the bundled Clay for its build: ask it
+        // now, off the UI thread, so the first /version needn't wait for it.
+        if (!RUN_MODE_LOCAL.equals(getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_RUN_MODE, RUN_MODE_REMOTE))) {
+            ClayVersion.warm(this);
         }
 
         setupWebView();

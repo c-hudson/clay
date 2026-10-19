@@ -200,6 +200,31 @@ binary on the same machine, the client notices that the server's install already
 replaced its file and simply restarts. A browser page or the Android app has no binary of
 its own to update; a multiuser server is not updated by its users.
 
+### /version
+Show which build of Clay is running.
+
+```
+/version
+```
+
+In the console, or a GUI or Android app that runs Clay itself, it is one line:
+
+```
+Clay v1.7.11 (build 26/10/17 23:58-1d4a8b0a) [linux/x86_64]
+```
+
+In a client attached to another Clay - the desktop GUI with `--gui=host` or
+`--web-gui=host`, the SSH or `--console=host` console, the Android app connected to a
+server - it names both builds, this program's first:
+
+```
+Clay: Local  v1.7.12 (build 26/10/19 16:24-4049c2a4) [windows/x86_64]
+      Remote v1.7.11 (build 26/10/17 23:58-1d4a8b0a) [linux/x86_64]
+```
+
+While the client's connection is down it shows its own line alone. A web page is the
+server's own, so a browser shows the server's one line. `^X^V` shows the same.
+
 ### /say
 Speak text aloud.
 

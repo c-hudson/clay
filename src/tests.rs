@@ -10299,6 +10299,57 @@ third
         assert!(close > open + 1, "empty platform/arch tag: {:?}", s);
     }
 
+    /// `/version` in a client attached to another Clay (user ruling 2026-10-19): this
+    /// program's build, then the server's, aligned with the spaces kept; the web client's
+    /// `attachedVersionLines` says the same, and an older server's line is its version.
+    #[test]
+    fn attached_version_lines_name_both_builds() {
+        assert_eq!(get_version_string(), format!("Clay {}", crate::version_detail()));
+        let remote = "v1.7.11 (build 26/10/17 23:58-1d4a8b0a) [linux/x86_64]";
+        assert_eq!(crate::attached_version_lines(remote, remote), [
+            "Clay: Local  v1.7.11 (build 26/10/17 23:58-1d4a8b0a) [linux/x86_64]".to_string(),
+            "      Remote v1.7.11 (build 26/10/17 23:58-1d4a8b0a) [linux/x86_64]".to_string(),
+        ]);
+        let js = include_str!("web/app.js");
+        assert!(js.contains("return ['Clay: Local  ' + local, '      Remote ' + remote];"),
+            "app.js attachedVersionLines must match crate::attached_version_lines");
+        assert_eq!(crate::server_version_detail(remote, "1.7.11").as_deref(), Some(remote));
+        assert_eq!(crate::server_version_detail("", "1.7.8").as_deref(), Some("v1.7.8"));
+        assert_eq!(crate::server_version_detail("", ""), None);
+    }
+
+    /// An `InitialState` from a server before `server_version_detail` still parses.
+    #[test]
+    fn initial_state_without_version_detail_parses() {
+        let msg = crate::websocket::WsMessage::InitialState {
+            worlds: Vec::new(),
+            settings: App::new().build_global_settings_msg(),
+            current_world_index: 0,
+            actions: Vec::new(),
+            splash_lines: Vec::new(),
+            server_version: "1.7.8".into(),
+            server_version_detail: "x".into(),
+            android_app_version: String::new(),
+            your_display_id: 0,
+            scrollback_push: false,
+            other_views: false,
+            expand_line: false,
+            picture_upload: false,
+            emoji_json: String::new(),
+            emoji_categories_json: String::new(),
+            tf_status: Vec::new(),
+        };
+        let mut v = serde_json::to_value(&msg).unwrap();
+        v.as_object_mut().unwrap().remove("server_version_detail");
+        match serde_json::from_value::<crate::websocket::WsMessage>(v).unwrap() {
+            crate::websocket::WsMessage::InitialState { server_version_detail, server_version, .. } => {
+                assert_eq!(server_version_detail, "");
+                assert_eq!(server_version, "1.7.8");
+            }
+            other => panic!("not an InitialState: {other:?}"),
+        }
+    }
+
     /// Step 10 (PROTOCOL-ROADMAP.md): `ServerData.from_server` skips serialization when it
     /// equals its default (true), mirroring `flush`/`gagged`. Confirms the omission
     /// round-trips correctly: the common-case value is dropped from the JSON, and

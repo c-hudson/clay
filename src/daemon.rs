@@ -3041,6 +3041,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         actions,
         splash_lines,
         server_version: crate::VERSION.to_string(),
+        server_version_detail: crate::version_detail(),
         android_app_version: crate::ANDROID_APP_VERSION.to_string(),
         // Multiuser stays on the legacy pull download permanently (PROTOCOL-ROADMAP.md
         // Phase J). The push protocol is driven entirely by per-world sequence numbers and

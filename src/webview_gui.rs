@@ -930,6 +930,14 @@ fn build_html(params: &WebViewParams) -> String {
         .replace("{{THEME_CSS_VARS}}", &params.theme_css)
         .replace("{{CLIENT_VERSION}}", crate::VERSION);
 
+    // This GUI's own build, for /version's Local line when it is attached to another Clay
+    // (app.js attachedLocalVersionDetail; a WebView running Clay itself ignores it).
+    html = html.replace(
+        &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
+        &format!("window.WS_PROTOCOL = '{}';\n        window.CLIENT_VERSION_DETAIL = '{}';",
+            params.ws_protocol, crate::version_detail().replace('\\', "\\\\").replace('\'', "\\'")),
+    );
+
     // Inject world lock from env var (set by parent when spawning /window <world>)
     if let Ok(world_name) = std::env::var("CLAY_WINDOW_WORLD") {
         std::env::remove_var("CLAY_WINDOW_WORLD");

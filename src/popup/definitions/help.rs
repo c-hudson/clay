@@ -222,6 +222,12 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         ],
         "version" => vec![
             "/version                   Show version info",
+            "",
+            "Attached to another Clay (a GUI with --gui=host, the",
+            "--console=host or SSH console, the Android app on a",
+            "server), it shows this program's build and the server's:",
+            "  Clay: Local  v1.7.12 (build ...) [windows/x86_64]",
+            "        Remote v1.7.11 (build ...) [linux/x86_64]",
         ],
         "reach" => vec![
             "/reach                     How other devices can reach this Clay",
