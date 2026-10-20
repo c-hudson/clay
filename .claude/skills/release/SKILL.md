@@ -446,7 +446,22 @@ gh release create vX.Y.Z \
 Note: the three Termux assets are not bracketed above — all are cross-compiled locally
 (Step 5), so they're always included in a full release.
 
-### Step 9: Print Summary
+### Step 9: Clean Up /tmp
+
+`/tmp` on this machine is a RAM-backed tmpfs, so the staged binaries (about 0.5 GB) hold RAM
+until deleted. Once `gh release view vX.Y.Z --json assets` lists every uploaded asset, record
+each one's size for the summary, then delete the staged copies:
+```bash
+rm -f /tmp/clay-linux-x86_64-musl /tmp/clay-linux-x86_64-gui /tmp/clay-windows-x86_64.exe \
+      /tmp/clay-macos-universal /tmp/clay-termux-aarch64 /tmp/clay-termux-aarch64-nogui \
+      /tmp/clay-termux-armv7-32bit-nogui
+```
+Delete them only after a successful upload: if the upload failed, keep them for the retry.
+The APK is never staged in `/tmp` (it is uploaded from `android/clay-android.apk`, which is
+committed). Also stop the Gradle daemon the APK build left running, about 1.3 GB:
+`cd android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew --stop`.
+
+### Step 10: Print Summary
 
 Print a summary table showing:
 - Each build target attempted, pass/fail status, and file size
