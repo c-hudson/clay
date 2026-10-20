@@ -402,10 +402,8 @@ fn color_sgr(name: &str, bg: bool) -> Option<String> {
             return None;
         }
         16 + d[0] * 36 + d[1] * 6 + d[2]
-    } else if let Some(rest) = name.strip_prefix("gray") {
-        232 + rest.parse::<u32>().ok()?
     } else {
-        return None;
+        232 + name.strip_prefix("gray")?.parse::<u32>().ok()?
     };
     Some(format!("{};5;{}", if bg { 48 } else { 38 }, index))
 }
@@ -434,7 +432,7 @@ mod tests {
         assert_eq!(out, "\x1b[4;31ma\x1b[0m\x1b[4;32mbc\x1b[0m");
         // Non-SGR escapes (an OSC link) pass through untouched.
         let link = "\x1b]8;;http://x\x07link\x1b]8;;\x07";
-        assert_eq!(apply_to_line(link, &attrs("B"), &[]), format!("\x1b]8;;http://x\x07\x1b[1mlink\x1b]8;;\x07\x1b[0m"));
+        assert_eq!(apply_to_line(link, &attrs("B"), &[]), "\x1b]8;;http://x\x07\x1b[1mlink\x1b]8;;\x07\x1b[0m");
     }
 
     #[test]

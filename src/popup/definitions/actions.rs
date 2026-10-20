@@ -64,7 +64,7 @@ pub fn match_type_options() -> Vec<SelectOption> {
 pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) -> PopupDefinition {
     // Sort alphabetically by action name (case-insensitive)
     let mut sorted_actions: Vec<&ActionInfo> = actions.iter().collect();
-    sorted_actions.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    sorted_actions.sort_by_key(|a| a.name.to_lowercase());
 
     let items: Vec<ListItem> = sorted_actions
         .iter()

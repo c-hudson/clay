@@ -884,11 +884,11 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                                             result.push('\n');
                                         }
                                     }
-                                    'G' | 'C' | 'D' | '`' => {
-                                        // Cursor column/forward/back - add space
-                                        if !result.ends_with(' ') && !result.ends_with('\n') && !result.is_empty() {
-                                            result.push(' ');
-                                        }
+                                    // Cursor column/forward/back - add space
+                                    'G' | 'C' | 'D' | '`'
+                                        if !result.ends_with(' ') && !result.ends_with('\n') && !result.is_empty() =>
+                                    {
+                                        result.push(' ');
                                     }
                                     _ => {
                                         // Other sequences (J, K, @, etc.) - just discard

@@ -55,6 +55,9 @@ use fonts::Fonts;
 use more::MoreMode;
 use output::{OutputSnapshot, ScrollHandle, hsla, output_view};
 
+/// A shell world's screen as output rows: each row's id and its styled text.
+type ShellRows = Vec<(u64, Arc<StyledLine>)>;
+
 /// `web_font_size_desktop`'s default.
 const DEFAULT_FONT_SIZE: f32 = 18.0;
 
@@ -808,7 +811,7 @@ impl ClayView {
     /// A shell world's screen as output rows plus its cursor (src/shell). Each row's id
     /// mixes its index with a hash of its text, so a row that changes re-lays-out while the
     /// unchanged rows stay cached. `None` if the current world is not a shell world.
-    fn shell_output(&self) -> Option<(Vec<(u64, Arc<StyledLine>)>, Option<output::ShellCursor>)> {
+    fn shell_output(&self) -> Option<(ShellRows, Option<output::ShellCursor>)> {
         use std::hash::{Hash, Hasher};
         const SHELL_ID_BASE: u64 = 0xE000_0000_0000_0000;
         let screen = self.session.core.current_world()?.shell.as_ref()?;
@@ -825,7 +828,7 @@ impl ClayView {
             .collect();
         let c = &screen.cursor;
         let cursor = (c.visible && (c.row as usize) < screen.lines.len())
-            .then(|| output::ShellCursor { col: c.col, row: c.row, shape: c.shape, color: self.palette.fg });
+            .then_some(output::ShellCursor { col: c.col, row: c.row, shape: c.shape, color: self.palette.fg });
         Some((lines, cursor))
     }
 

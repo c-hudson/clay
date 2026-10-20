@@ -14722,6 +14722,7 @@ third
     /// deferred: `IAC DONT MCCP2` sent to ask the server to end its stream, the resume
     /// marker set, and the drain deadline armed - the actual `exec_reload` call must wait
     /// for `mccp2_reload_ready_to_exec` instead of firing immediately.
+    #[cfg(not(target_os = "android"))] // no hot reload on Android
     #[test]
     fn test_should_defer_reload_for_mccp2_drains_a_compressed_world() {
         use crate::telnet::{TELNET_IAC, TELNET_DONT, TELNET_OPT_MCCP2};
@@ -14745,6 +14746,7 @@ third
 
     /// Today's unchanged immediate path: with no compressed worlds at all, the reload must
     /// NOT be deferred.
+    #[cfg(not(target_os = "android"))] // no hot reload on Android
     #[test]
     fn test_should_defer_reload_for_mccp2_no_compressed_worlds_not_deferred() {
         let mut app = App::new();
@@ -14759,6 +14761,7 @@ third
     /// A world whose owner disabled MCCP2 (but which is still, for whatever reason,
     /// mid-stream) must never be waited on - it is left for `apply_mccp2_reload_bailout`'s
     /// existing disconnect instead of delaying reload on a mode nobody will resume.
+    #[cfg(not(target_os = "android"))] // no hot reload on Android
     #[test]
     fn test_should_defer_reload_for_mccp2_never_waits_on_a_disabled_world() {
         let mut app = App::new();
@@ -14777,6 +14780,7 @@ third
 
     /// A connected, compressed, MCCP2-enabled world with no live `command_tx` (nothing to
     /// send DONT on) must never be waited on either.
+    #[cfg(not(target_os = "android"))] // no hot reload on Android
     #[test]
     fn test_should_defer_reload_for_mccp2_never_waits_on_a_world_without_command_tx() {
         let mut app = App::new();
@@ -14793,6 +14797,7 @@ third
     /// Once every world the defer marked stops being `mccp2_active` (its stream ended),
     /// the "may we exec now?" poll must return true - and it is a one-shot: the pending
     /// deadline is cleared so the caller doesn't keep re-triggering on later passes.
+    #[cfg(not(target_os = "android"))] // no hot reload on Android
     #[test]
     fn test_mccp2_reload_ready_to_exec_true_once_drain_completes() {
         let mut app = App::new();
@@ -14814,6 +14819,7 @@ third
     /// The deadline is unconditional: even while a marked world is still compressed, the
     /// poll must return true once the deadline has passed, so a bug in drain detection (or
     /// a server that never finishes its stream) can never hang reload forever.
+    #[cfg(not(target_os = "android"))] // no hot reload on Android
     #[test]
     fn test_mccp2_reload_ready_to_exec_deadline_expiry_overrides_still_compressed() {
         let mut app = App::new();
@@ -14834,6 +14840,7 @@ third
 
     /// With no reload currently deferred, the poll must return false (cheap no-op) -
     /// nothing to fire.
+    #[cfg(not(target_os = "android"))] // no hot reload on Android
     #[test]
     fn test_mccp2_reload_ready_to_exec_false_when_nothing_pending() {
         let mut app = App::new();

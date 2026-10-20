@@ -19,7 +19,7 @@ use std::io;
 // no russh dependency and stay available either way so callers (`main.rs`,
 // `remote_client.rs`, `webview_gui.rs`) can parse a target and only need to guard the
 // actual `establish_tunnel` call site, mirroring how this codebase already gates
-// `try_wss` on `feature = "rustls-backend"` in `remote_client.rs`.
+// `connect_wss` on `feature = "rustls-backend"` in `remote_client.rs`.
 #[cfg(feature = "ssh-transport")]
 use std::path::PathBuf;
 #[cfg(feature = "ssh-transport")]

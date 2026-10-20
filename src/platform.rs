@@ -1006,7 +1006,7 @@ pub(crate) fn get_proxy_socket_path(world_name: &str) -> PathBuf {
 pub(crate) fn get_proxy_config_path(pipe_path: &Path) -> PathBuf {
     let pipe_file = pipe_path
         .components()
-        .last()
+        .next_back()
         .and_then(|c: std::path::Component| c.as_os_str().to_str())
         .unwrap_or("clay-tls-proxy");
     let temp_dir = std::env::var("TEMP")
@@ -1113,7 +1113,7 @@ pub(crate) fn spawn_tls_proxy(
 /// then accepts Named Pipe clients (one at a time) and relays data.
 /// Survives hot reload because it is a separate process.
 #[cfg(windows)]
-pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &PathBuf) {
+pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path) {
     use tokio::net::windows::named_pipe::{ServerOptions, PipeMode};
 
     debug_log(is_debug_enabled(), &format!("TLS-PROXY: starting for {}:{} pipe={}", host, port, pipe_path.display()));
@@ -1298,9 +1298,9 @@ pub(crate) async fn connect_to_proxy_pipe(
     while std::time::Instant::now() < deadline {
         let pipe_available = unsafe { WaitNamedPipeA(pipe_cstr.as_ptr(), NMPWAIT_NOWAIT) } != 0;
         if pipe_available {
-            match ClientOptions::new().open(&pipe_name) {
-                Ok(client) => return Some(client),
-                Err(_) => {} // Pipe became busy between wait and open — retry
+            // An error here means the pipe became busy between wait and open: retry.
+            if let Ok(client) = ClientOptions::new().open(&pipe_name) {
+                return Some(client);
             }
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -1922,7 +1922,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
 
 /// The native GUI sends stderr to debug.log (native_gui/quiet.rs): the process that
 /// replaces this one gets the terminal back instead of a pipe nobody reads.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 fn give_back_stderr() {
     #[cfg(feature = "native-gui")]
     crate::native_gui::quiet::release();
@@ -2041,7 +2041,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         // so it can reuse port 9000 without rebinding (avoids Windows port zombie issue).
         if let Some(ref server) = app.http_server {
             if let Some(handle) = server.listener_handle {
-                if make_inheritable(handle as u64).is_ok() {
+                if make_inheritable(handle).is_ok() {
                     std::env::set_var("CLAY_HTTP_LISTENER", handle.to_string());
                 }
             }
@@ -2189,6 +2189,58 @@ fn exec_relaunch_with_args(args: Vec<String>, _use_gui: bool) -> io::Result<()> 
 #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
 fn exec_relaunch_with_args(_args: Vec<String>, _use_gui: bool) -> io::Result<()> {
     Err(io::Error::other("Switching servers is not supported on this platform."))
+}
+
+/// While a C library call runs, the process's stderr goes to `~/.clay/debug.log`.
+/// sherpa-onnx reports with `fprintf(stderr, ...)` (a lexicon's repeated words, a file it
+/// could not read) and ALSA prints an error for every device it cannot open while cpal
+/// probes them - and in the console anything written to stderr lands in the middle of
+/// the screen (CLAUDE.md's no-stderr rule, which a C library cannot be told). Held for
+/// the call only; dropping it puts stderr back. Unix only: Windows and macOS builds have
+/// no console of their own to corrupt, and the GUI never shows stderr.
+pub(crate) struct StderrToLog {
+    #[cfg(unix)]
+    saved: Option<i32>,
+}
+
+impl StderrToLog {
+    pub(crate) fn new() -> StderrToLog {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let log = crate::clay_config_path("debug.log");
+            let file = std::fs::OpenOptions::new().append(true).create(true).open(&log)
+                .or_else(|_| std::fs::OpenOptions::new().write(true).open("/dev/null"));
+            if let Ok(file) = file {
+                // Safety: plain fd calls; `file` stays open until its dup onto 2 is made.
+                let saved = unsafe { libc::dup(2) };
+                if saved >= 0 {
+                    if unsafe { libc::dup2(file.as_raw_fd(), 2) } >= 0 {
+                        return StderrToLog { saved: Some(saved) };
+                    }
+                    unsafe { libc::close(saved) };
+                }
+            }
+            StderrToLog { saved: None }
+        }
+        #[cfg(not(unix))]
+        {
+            StderrToLog {}
+        }
+    }
+}
+
+impl Drop for StderrToLog {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(saved) = self.saved.take() {
+            // Safety: `saved` is the dup of the original fd 2 made in `new`.
+            unsafe {
+                libc::dup2(saved, 2);
+                libc::close(saved);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2654,58 +2706,5 @@ mod tests {
         assert_eq!(crate::persistence::get_pin(host_port_key), Some(fp_a), "pin must remain unchanged");
 
         crate::persistence::remove_pin(host_port_key);
-    }
-}
-
-
-/// While a C library call runs, the process's stderr goes to `~/.clay/debug.log`.
-/// sherpa-onnx reports with `fprintf(stderr, ...)` (a lexicon's repeated words, a file it
-/// could not read) and ALSA prints an error for every device it cannot open while cpal
-/// probes them - and in the console anything written to stderr lands in the middle of
-/// the screen (CLAUDE.md's no-stderr rule, which a C library cannot be told). Held for
-/// the call only; dropping it puts stderr back. Unix only: Windows and macOS builds have
-/// no console of their own to corrupt, and the GUI never shows stderr.
-pub(crate) struct StderrToLog {
-    #[cfg(unix)]
-    saved: Option<i32>,
-}
-
-impl StderrToLog {
-    pub(crate) fn new() -> StderrToLog {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let log = crate::clay_config_path("debug.log");
-            let file = std::fs::OpenOptions::new().append(true).create(true).open(&log)
-                .or_else(|_| std::fs::OpenOptions::new().write(true).open("/dev/null"));
-            if let Ok(file) = file {
-                // Safety: plain fd calls; `file` stays open until its dup onto 2 is made.
-                let saved = unsafe { libc::dup(2) };
-                if saved >= 0 {
-                    if unsafe { libc::dup2(file.as_raw_fd(), 2) } >= 0 {
-                        return StderrToLog { saved: Some(saved) };
-                    }
-                    unsafe { libc::close(saved) };
-                }
-            }
-            StderrToLog { saved: None }
-        }
-        #[cfg(not(unix))]
-        {
-            StderrToLog {}
-        }
-    }
-}
-
-impl Drop for StderrToLog {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(saved) = self.saved.take() {
-            // Safety: `saved` is the dup of the original fd 2 made in `new`.
-            unsafe {
-                libc::dup2(saved, 2);
-                libc::close(saved);
-            }
-        }
     }
 }

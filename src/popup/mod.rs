@@ -1238,10 +1238,8 @@ impl PopupState {
                     FieldKind::Toggle { value } => {
                         *value = !*value;
                     }
-                    FieldKind::Select { options, selected_index } => {
-                        if !options.is_empty() {
-                            *selected_index = (*selected_index + 1) % options.len();
-                        }
+                    FieldKind::Select { options, selected_index } if !options.is_empty() => {
+                        *selected_index = (*selected_index + 1) % options.len();
                     }
                     _ => {}
                 }
@@ -1264,10 +1262,8 @@ impl PopupState {
                             *value += 1;
                         }
                     }
-                    FieldKind::Select { options, selected_index } => {
-                        if !options.is_empty() {
-                            *selected_index = (*selected_index + 1) % options.len();
-                        }
+                    FieldKind::Select { options, selected_index } if !options.is_empty() => {
+                        *selected_index = (*selected_index + 1) % options.len();
                     }
                     _ => {}
                 }
@@ -1290,13 +1286,11 @@ impl PopupState {
                             *value -= 1;
                         }
                     }
-                    FieldKind::Select { options, selected_index } => {
-                        if !options.is_empty() {
-                            if *selected_index == 0 {
-                                *selected_index = options.len() - 1;
-                            } else {
-                                *selected_index -= 1;
-                            }
+                    FieldKind::Select { options, selected_index } if !options.is_empty() => {
+                        if *selected_index == 0 {
+                            *selected_index = options.len() - 1;
+                        } else {
+                            *selected_index -= 1;
                         }
                     }
                     _ => {}

@@ -361,14 +361,15 @@ pub fn local_time_from_epoch(epoch_secs: i64) -> LocalTime {
     // FILETIME is in 100-nanosecond intervals
     let filetime_val = (epoch_secs + UNIX_TO_FILETIME_OFFSET) * 10_000_000;
 
+    // Win32's FILETIME and SYSTEMTIME.
     #[repr(C)]
-    struct FILETIME {
+    struct FileTime {
         dw_low_date_time: u32,
         dw_high_date_time: u32,
     }
 
     #[repr(C)]
-    struct SYSTEMTIME {
+    struct SystemTime {
         w_year: u16,
         w_month: u16,
         w_day_of_week: u16,
@@ -380,21 +381,21 @@ pub fn local_time_from_epoch(epoch_secs: i64) -> LocalTime {
     }
 
     extern "system" {
-        fn FileTimeToSystemTime(ft: *const FILETIME, st: *mut SYSTEMTIME) -> i32;
+        fn FileTimeToSystemTime(ft: *const FileTime, st: *mut SystemTime) -> i32;
         fn SystemTimeToTzSpecificLocalTime(
             tz: *const std::ffi::c_void,
-            utc: *const SYSTEMTIME,
-            local: *mut SYSTEMTIME,
+            utc: *const SystemTime,
+            local: *mut SystemTime,
         ) -> i32;
     }
 
-    let ft = FILETIME {
+    let ft = FileTime {
         dw_low_date_time: filetime_val as u32,
         dw_high_date_time: (filetime_val >> 32) as u32,
     };
 
-    let mut utc_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    let mut local_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    let mut utc_st: SystemTime = unsafe { std::mem::zeroed() };
+    let mut local_st: SystemTime = unsafe { std::mem::zeroed() };
 
     unsafe {
         if FileTimeToSystemTime(&ft, &mut utc_st) == 0 {
@@ -457,7 +458,7 @@ pub fn epoch_from_local_time(year: i64, month: i64, day: i64, hour: i64, minute:
 pub fn epoch_from_local_time(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64; // [0, 399]
+    let yoe = y - era * 400; // [0, 399]
     let mp = (month + 9) % 12; // [0, 11]
     let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]

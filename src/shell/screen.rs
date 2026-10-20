@@ -424,9 +424,7 @@ impl ShellScreen {
         // reject a delta and re-request.
         if std::mem::take(&mut self.fresh) {
             self.changed = false;
-            for d in &mut self.dirty {
-                *d = false;
-            }
+            self.dirty.fill(false);
             return self.full_msg(world_index);
         }
         let base = self.frame;
@@ -438,9 +436,7 @@ impl ShellScreen {
             .filter(|(_, &d)| d)
             .map(|(i, _)| (i as u16, self.lines.get(i).cloned().unwrap_or_default()))
             .collect();
-        for d in &mut self.dirty {
-            *d = false;
-        }
+        self.dirty.fill(false);
         self.changed = false;
         self.msg(world_index, Some(base), lines)
     }

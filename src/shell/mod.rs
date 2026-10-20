@@ -362,15 +362,20 @@ where
         std::thread::Builder::new().name(format!("clay-shell-{world}")).spawn(move || {
             let joined = loop_thread.join();
             live.store(false, Ordering::Release);
-            let mut code = exit_code.lock().unwrap_or_else(|e| e.into_inner()).take();
-            if let Ok((event_loop, _state)) = joined {
-                #[cfg(unix)]
-                if let Some(pid) = pid {
-                    code = code.or(end_child(pid));
+            let code = exit_code.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let code = match joined {
+                Ok((event_loop, _state)) => {
+                    #[cfg(unix)]
+                    let code = match pid {
+                        Some(pid) => code.or(end_child(pid)),
+                        None => code,
+                    };
+                    // The pty's Drop: SIGHUP and a wait, on a child that is already gone.
+                    drop(event_loop);
+                    code
                 }
-                // The pty's Drop: SIGHUP and a wait, on a child that is already gone.
-                drop(event_loop);
-            }
+                Err(_) => code,
+            };
             let _ = events.blocking_send(crate::AppEvent::Shell(world, conn_id, ShellEvent::Exited(code)));
         })
     };

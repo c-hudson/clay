@@ -1814,7 +1814,7 @@ fn cmd_connections(engine: &TfEngine, args: &str) -> TfCommandResult {
         "host" => worlds.sort_by(|a, b| a.host.cmp(&b.host)),
         "port" => worlds.sort_by(|a, b| a.port.cmp(&b.port)),
         "character" => worlds.sort_by(|a, b| a.user.cmp(&b.user)),
-        "lines" => worlds.sort_by(|a, b| a.buffer_size.cmp(&b.buffer_size)),
+        "lines" => worlds.sort_by_key(|w| w.buffer_size),
         "idle" => worlds.sort_by(|a, b| {
             a.last_receive_secs_ago.unwrap_or(i64::MAX).cmp(&b.last_receive_secs_ago.unwrap_or(i64::MAX))
         }),

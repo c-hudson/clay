@@ -6513,7 +6513,7 @@ impl App {
     /// handles `handle_key_event`'s result (see the call site in `run_app`, inside the
     /// `KeyAction::SendCommand` arm's `/dokey` sub-branch).
     fn process_pending_keyboard_ops(&mut self) -> Vec<KeyAction> {
-        let ops: Vec<tf::PendingKeyboardOp> = self.tf_engine.pending_keyboard_ops.drain(..).collect();
+        let ops: Vec<tf::PendingKeyboardOp> = std::mem::take(&mut self.tf_engine.pending_keyboard_ops);
         let mut actions = Vec::new();
         for op in ops {
             match op {
@@ -12380,11 +12380,10 @@ impl App {
     /// Updates both WsClientInfo (in ws_server) and ClientViewState (in ws_client_worlds).
     /// Returns (new_paused, ip_address) if the client was found.
     fn ws_toggle_client_paused(&mut self, client_id: u64) -> Option<(bool, String)> {
-        let (was_paused, ip, current_world) = if let Some(ref server) = self.ws_server {
+        let (was_paused, ip, current_world) = {
+            let server = self.ws_server.as_ref()?;
             let g = server.clients.read().unwrap();
             g.get(&client_id).map(|c| (c.paused, c.ip_address.clone(), c.current_world))?
-        } else {
-            return None;
         };
         let new_paused = !was_paused;
         if let Some(ref server) = self.ws_server {
@@ -22078,8 +22077,7 @@ pub async fn run_app_headless(
         // Second pass: reconstruct plain TCP connections
         for world_idx in 0..app.worlds.len() {
             let world = &app.worlds[world_idx];
-            if world.connected && world.socket_fd.is_some() && !world.is_tls {
-                let fd = world.socket_fd.unwrap();
+            if let Some(fd) = world.socket_fd.filter(|_| world.connected && !world.is_tls) {
                 debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: Reconstructing plain TCP for '{}' fd={}", world.name, fd));
                 #[cfg(unix)]
                 let tcp_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
@@ -22206,8 +22204,7 @@ pub async fn run_app_headless(
             #[cfg(windows)]
             {
                 let world = &app.worlds[world_idx];
-                if world.connected && world.is_tls && world.proxy_pid.is_some() {
-                    let proxy_pid = world.proxy_pid.unwrap();
+                if let Some(proxy_pid) = world.proxy_pid.filter(|_| world.connected && world.is_tls) {
                     let pipe_path = world.proxy_socket_path.clone();
 
                     let alive = crate::platform::is_process_alive(proxy_pid);
@@ -23322,8 +23319,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         // Second pass: reconstruct plain TCP connections
         for world_idx in 0..app.worlds.len() {
             let world = &app.worlds[world_idx];
-            if world.connected && world.socket_fd.is_some() && !world.is_tls {
-                let fd = world.socket_fd.unwrap();
+            if let Some(fd) = world.socket_fd.filter(|_| world.connected && !world.is_tls) {
 
                 // Reconstruct TcpStream from the raw fd/handle
                 #[cfg(unix)]
@@ -23398,8 +23394,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         #[cfg(all(unix, not(target_os = "android")))]
         for world_idx in 0..app.worlds.len() {
             let world = &app.worlds[world_idx];
-            if world.connected && world.is_tls && world.proxy_pid.is_some() {
-                let proxy_pid = world.proxy_pid.unwrap();
+            if let Some(proxy_pid) = world.proxy_pid.filter(|_| world.connected && world.is_tls) {
                 let socket_path = world.proxy_socket_path.clone();
 
                 // Check if proxy is still alive
@@ -23519,8 +23514,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         #[cfg(windows)]
         for world_idx in 0..app.worlds.len() {
             let world = &app.worlds[world_idx];
-            if world.connected && world.is_tls && world.proxy_pid.is_some() {
-                let proxy_pid = world.proxy_pid.unwrap();
+            if let Some(proxy_pid) = world.proxy_pid.filter(|_| world.connected && world.is_tls) {
                 let pipe_path = world.proxy_socket_path.clone();
 
                 let alive = is_process_alive(proxy_pid);
@@ -24010,10 +24004,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     continue;
                                 }
                             }
-                            MouseEventKind::Up(MouseButton::Left) => {
-                                if app.input_resize_end() {
-                                    app.persist_input_height();
-                                }
+                            MouseEventKind::Up(MouseButton::Left) if app.input_resize_end() => {
+                                app.persist_input_height();
                             }
                             _ => {}
                         }

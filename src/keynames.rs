@@ -621,7 +621,7 @@ fn raw_sequence_table() -> Vec<(&'static str, KeyToken)> {
         ("[23~", Named(F(11))),
         ("[24~", Named(F(12))),
     ];
-    table.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    table.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
     table
 }
 

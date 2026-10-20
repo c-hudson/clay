@@ -194,7 +194,7 @@ mod rendered {
 
 /// A real PTY: start a short-lived shell, see its output and its exit code, with Clay's
 /// own child reaper running on the side (the regression that spun the event loop).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))] // Clay's reaper, as on the desktop
 #[test]
 fn real_pty_runs_and_exits() {
     use crate::shell::{ShellSession, Size};

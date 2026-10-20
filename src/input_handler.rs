@@ -917,7 +917,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                     .collect();
                                 // Apply filter and sort alphabetically
                                 let mut filtered = filter_actions(&all_actions, &filter_text);
-                                filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                                filtered.sort_by_key(|a| a.name.to_lowercase());
                                 // Update the list in the popup state
                                 if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
                                     if let popup::FieldKind::List { items, .. } = &mut field.kind {
@@ -981,7 +981,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         .collect();
                     // Apply filter and sort alphabetically
                     let mut filtered = filter_actions(&all_actions, &filter_text);
-                    filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    filtered.sort_by_key(|a| a.name.to_lowercase());
                     // Update the list in the popup state
                     if let Some(field) = state.field_mut(popup::definitions::actions::ACTIONS_FIELD_LIST) {
                         if let popup::FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {

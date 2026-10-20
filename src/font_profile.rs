@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(label("native-windows"), "the native GUI on Windows");
         assert_eq!(label("browser-linux"), "a web browser on Linux");
         assert_eq!(label("app-android"), "the Android app");
-        assert!(valid_key(&native_key()));
+        assert!(valid_key(native_key()));
     }
 
     #[test]
@@ -315,9 +315,11 @@ mod tests {
 
     #[test]
     fn a_partial_profile_starts_from_the_shared_fonts() {
-        let mut settings = crate::Settings::default();
-        settings.font_name = "Consolas".into();
-        settings.web_font_size_desktop = 16.0;
+        let mut settings = crate::Settings {
+            font_name: "Consolas".into(),
+            web_font_size_desktop: 16.0,
+            ..Default::default()
+        };
         assert!(settings.read_font_profile_line("font.native-windows.size_desktop", "12"));
         let p = &settings.font_profiles["native-windows"];
         assert_eq!((p.name.as_str(), p.size_desktop), ("Consolas", 12.0));

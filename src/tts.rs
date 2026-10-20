@@ -150,12 +150,12 @@ pub fn init_tts() -> TtsBackend {
 fn detect_tts_command() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        return Some("say".to_string());
+        Some("say".to_string())
     }
 
     #[cfg(target_os = "windows")]
     {
-        return Some("powershell".to_string());
+        Some("powershell".to_string())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -351,7 +351,7 @@ async fn edge_tts_speak(text: &str) -> Result<(), Box<dyn std::error::Error + Se
     // Build the WebSocket URL with required parameters
     let ws_url = format!(
         "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId={}&Sec-MS-GEC={}&Sec-MS-GEC-Version={}",
-        &request_id, &sec_ms_gec, sec_ms_gec_version
+        request_id, sec_ms_gec, sec_ms_gec_version
     );
 
     // Build request with required headers

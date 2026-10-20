@@ -203,6 +203,7 @@ mod tests {
         assert_eq!(attached_target(args(&["clay"])), None);
     }
 
+    #[cfg(not(target_os = "android"))] // no self-update on Android
     #[test]
     fn a_stamp_changes_when_the_file_is_replaced_and_not_otherwise() {
         let dir = std::env::temp_dir().join(format!("clay-exe-stamp-{}", std::process::id()));

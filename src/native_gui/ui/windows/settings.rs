@@ -704,6 +704,12 @@ impl Render for SettingsView {
     }
 }
 
+/// The Input height stepper: this GUI's height (`input_view::input_height_of`), 1-15.
+fn step_input_height(s: &mut crate::websocket::GlobalSettingsMsg, by: i32) {
+    let rows = (i32::from(super::super::input_view::input_height_of(s)) + by).clamp(1, 15) as u16;
+    super::super::input_view::set_input_height(s, rows);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,10 +728,3 @@ mod tests {
         assert_eq!(step(-5.0, -0.5, (-5.0, 10.0)), -5.0);
     }
 }
-
-/// The Input height stepper: this GUI's height (`input_view::input_height_of`), 1-15.
-fn step_input_height(s: &mut crate::websocket::GlobalSettingsMsg, by: i32) {
-    let rows = (i32::from(super::super::input_view::input_height_of(s)) + by).clamp(1, 15) as u16;
-    super::super::input_view::set_input_height(s, rows);
-}
-

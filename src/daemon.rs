@@ -4625,11 +4625,11 @@ mod telnet_reader_migration_tests {
     async fn connect_tcp_reports_each_address() {
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(8);
         // Port 1 (tcpmux) has no listener, and only root could bind one.
-        let failure = connect_tcp("w", "127.0.0.1", None, "1", &event_tx).await.err().expect("nothing listens on port 1");
+        let failure = connect_tcp("w", "127.0.0.1", None, "1", &event_tx).await.expect_err("nothing listens on port 1");
         assert_eq!(failure.attempts, vec![AddrFailure::new("127.0.0.1", "1", "Connection refused")]);
         assert_eq!(failure.last().tf_text(), "127.0.0.1 1: Connection refused");
 
-        let failure = connect_tcp("w", "nonexistent.invalid", None, "23", &event_tx).await.err().expect(".invalid never resolves");
+        let failure = connect_tcp("w", "nonexistent.invalid", None, "23", &event_tx).await.expect_err(".invalid never resolves");
         assert_eq!(failure.last().addr, "nonexistent.invalid");
         assert!(!failure.last().reason.starts_with("failed to lookup"), "{:?}", failure);
 
@@ -4730,7 +4730,7 @@ mod telnet_reader_migration_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // the shell is a Unix command here
 mod shell_world_connect_tests {
     //! A client connecting a shell world through this handler - `/worlds <name>` (what
     //! TF's `/connect` becomes), `/worlds -b <name>` and the `ConnectWorld` message - must
@@ -4767,25 +4767,21 @@ mod shell_world_connect_tests {
         app.worlds[0].shell = None;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn worlds_name_starts_the_shell() {
         starts_the_shell(WsMessage::SendCommand { world_index: 0, command: "/worlds Sh".to_string() }).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn worlds_background_starts_the_shell() {
         starts_the_shell(WsMessage::SendCommand { world_index: 0, command: "/worlds -b Sh".to_string() }).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn connect_command_starts_the_shell() {
         starts_the_shell(WsMessage::SendCommand { world_index: 0, command: "/connect".to_string() }).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn connect_world_message_starts_the_shell() {
         starts_the_shell(WsMessage::ConnectWorld { world_index: 0 }).await;

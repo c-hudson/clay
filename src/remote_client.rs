@@ -508,23 +508,9 @@ pub(crate) async fn run_import_client(
     let host_port_key = addr_with_port.clone();
     let ws_url = remote.url("wss");
 
-    #[cfg(feature = "rustls-backend")]
-    async fn try_wss(ws_url: &str, host_port_key: &str) -> Result<
-        (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-         tokio_tungstenite::tungstenite::handshake::client::Response),
-        tokio_tungstenite::tungstenite::Error,
-    > {
-        let tls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.to_string())))
-            .with_no_client_auth();
-        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
-        tokio_tungstenite::connect_async_tls_with_config(ws_url, None, false, Some(connector)).await
-    }
-
     let ws_stream = {
         #[cfg(feature = "rustls-backend")]
-        let attempt = tokio::time::timeout(IMPORT_NET_TIMEOUT, try_wss(&ws_url, &host_port_key)).await;
+        let attempt = tokio::time::timeout(IMPORT_NET_TIMEOUT, connect_wss(&ws_url, &host_port_key)).await;
         #[cfg(not(feature = "rustls-backend"))]
         let attempt = tokio::time::timeout(IMPORT_NET_TIMEOUT, connect_async(&ws_url)).await;
 
@@ -731,7 +717,7 @@ impl ConnectTarget {
                 let result = if ws_url.starts_with("wss://") {
                     connect_wss(ws_url, &remote.host_port).await
                 } else {
-                    connect_async(ws_url.as_str()).await
+                    connect_async(ws_url.as_str()).await.map_err(Box::new)
                 };
                 #[cfg(not(feature = "rustls-backend"))]
                 let result = connect_async(ws_url.as_str()).await;
@@ -800,18 +786,19 @@ impl ConnectTarget {
 
 /// `wss://` with Clay's trust-on-first-use pinning (`~/.clay/known_hosts.dat`, see
 /// platform::danger_rustls) rather than CA verification: Clay's own server is self-signed.
+/// The error is boxed: tungstenite's is large, and these results are passed around.
 #[cfg(feature = "rustls-backend")]
 async fn connect_wss(ws_url: &str, host_port_key: &str) -> Result<
     (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
      tokio_tungstenite::tungstenite::handshake::client::Response),
-    tokio_tungstenite::tungstenite::Error,
+    Box<tokio_tungstenite::tungstenite::Error>,
 > {
     let tls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.to_string())))
         .with_no_client_auth();
     let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
-    tokio_tungstenite::connect_async_tls_with_config(ws_url, None, false, Some(connector)).await
+    tokio_tungstenite::connect_async_tls_with_config(ws_url, None, false, Some(connector)).await.map_err(Box::new)
 }
 
 /// The task that writes this connection's messages to its socket, and the sender for it
@@ -1457,10 +1444,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 MouseEventKind::Drag(MouseButton::Left) => {
                                     app.input_resize_drag_to(mouse.row);
                                 }
-                                MouseEventKind::Up(MouseButton::Left) => {
-                                    if app.input_resize_end() {
-                                        send_global_settings(&mut app, String::new(), &ws_tx);
-                                    }
+                                MouseEventKind::Up(MouseButton::Left) if app.input_resize_end() => {
+                                    send_global_settings(&mut app, String::new(), &ws_tx);
                                 }
                                 _ => {}
                             }
@@ -1658,10 +1643,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                         }
                         // A release (Windows reports one after every press): nothing, unless
                         // it ends a typed burst.
-                        Event::Key(_) => {
-                            if app.release_ends_typed_burst() {
-                                needs_redraw = true;
-                            }
+                        Event::Key(_) if app.release_ends_typed_burst() => {
+                            needs_redraw = true;
                         }
                         _ => {}
                     }
@@ -2385,7 +2368,7 @@ pub(crate) fn handle_remote_client_key(
                                     })
                                     .collect();
                                 let mut filtered = filter_actions(&all_actions, &filter_text);
-                                filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                                filtered.sort_by_key(|a| a.name.to_lowercase());
                                 if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
                                     if let popup::FieldKind::List { items, .. } = &mut field.kind {
                                         *items = filtered.iter().map(|info| {
@@ -2444,7 +2427,7 @@ pub(crate) fn handle_remote_client_key(
                         })
                         .collect();
                     let mut filtered = filter_actions(&all_actions, &filter_text);
-                    filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    filtered.sort_by_key(|a| a.name.to_lowercase());
                     if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
                         if let popup::FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {
                             let old_len = items.len();

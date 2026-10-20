@@ -170,7 +170,7 @@ fn detect_external_player() -> Option<String> {
     // Spawning processes to search PATH can be very slow if large apps
     // (e.g. LibreOffice) add many directories to PATH.
     #[cfg(windows)]
-    { return None; }
+    { None }
 
     #[cfg(not(windows))]
     {

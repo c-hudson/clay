@@ -4573,8 +4573,10 @@ mod tests {
         assert_eq!(s.slack_channels, "C0123ABCD");
 
         // A world already on the new model is never touched.
-        let mut s = WorldSettings::default();
-        s.discord_channel = "#general".to_string();
+        let mut s = WorldSettings {
+            discord_channel: "#general".to_string(),
+            ..Default::default()
+        };
         migrate_chat_settings(&mut s);
         assert!(s.discord_channels.is_empty());
     }

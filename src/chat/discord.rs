@@ -485,12 +485,12 @@ impl Session {
                                     }
                                 }
                                 "MESSAGE_CREATE" => self.on_message(d, false).await,
-                                "MESSAGE_UPDATE" => {
-                                    // Embeds unfurling fire an UPDATE with no new content;
-                                    // only a real edit carries content + edited_timestamp.
-                                    if d["content"].is_string() && d["edited_timestamp"].is_string() && d["author"].is_object() {
-                                        self.on_message(d, true).await;
-                                    }
+                                // Embeds unfurling fire an UPDATE with no new content;
+                                // only a real edit carries content + edited_timestamp.
+                                "MESSAGE_UPDATE"
+                                    if d["content"].is_string() && d["edited_timestamp"].is_string() && d["author"].is_object() =>
+                                {
+                                    self.on_message(d, true).await;
                                 }
                                 _ => {}
                             }
