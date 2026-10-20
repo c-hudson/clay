@@ -12844,6 +12844,151 @@ third
              claim. Got: {msgs:#?}");
     }
 
+    /// Another connection on the test server `phase_c_register_client` made.
+    fn add_ws_connection(app: &mut App, client_id: u64) -> tokio::sync::mpsc::Receiver<crate::websocket::Outbound> {
+        use crate::websocket::{RemoteClientType, WsClientInfo};
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::websocket::Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let server = app.ws_server.as_ref().expect("phase_c_register_client first");
+        server.clients.write().unwrap().insert(client_id, WsClientInfo {
+            authenticated: true,
+            tx,
+            current_world: None,
+            username: None,
+            received_initial_state: true,
+            client_type: RemoteClientType::Web,
+            viewport_height: 24,
+            ip_address: "127.0.0.1".to_string(),
+            connected_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            paused: false,
+            acked_seq: std::collections::HashMap::new(),
+            audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
+            needs_resync: std::collections::HashSet::new(),
+        });
+        rx
+    }
+
+    fn owners(app: &App, world_idx: usize) -> Vec<Option<u64>> {
+        app.worlds[world_idx].output_lines.iter().map(|l| l.display_id).collect()
+    }
+
+    /// The reported bug ("lines stay flagged ▶ however often I switch away and back"), the
+    /// Android app's resume path. A reconnect is a new connection under the same owner id,
+    /// and the old connection's view entry lingers until the reaper; reaping it released the
+    /// owner's markers - the ones the new connection holds - and told nobody. The app kept
+    /// drawing them, and leaving the world could never clear them: a release clears only
+    /// what the server still holds.
+    #[test]
+    fn test_reaping_an_old_connection_keeps_the_markers_its_reconnect_holds() {
+        let mut app = App::new();
+        world_with_unviewed_backlog(&mut app, 3, 0);
+        let (old, _old_rx) = phase_c_register_client(&mut app);
+        app.set_display_owner_id(old, "phone");
+        app.handle_mark_world_seen(old, 0, None);
+        let owner = app.display_owner_id(old);
+        assert_eq!(owners(&app, 0), vec![Some(owner); 3], "precondition: claimed");
+
+        // The socket drops; the app comes back on a new connection, same client_uid.
+        app.handle_ws_client_disconnected(old);
+        let new = 2;
+        let mut new_rx = add_ws_connection(&mut app, new);
+        app.set_display_owner_id(new, "phone");
+        app.handle_mark_world_seen(new, 0, None);
+        let _ = drain_ws_messages(&mut new_rx);
+
+        // The old connection's grace runs out and the reaper gets to it.
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(16 * 60))
+            .expect("test host must have > 16 minutes of monotonic clock uptime");
+        app.ws_client_worlds.get_mut(&old).unwrap().disconnected_at = Some(long_ago);
+        app.reap_stale_ws_client_worlds();
+
+        assert!(!app.ws_client_worlds.contains_key(&old), "the old entry is reaped");
+        assert_eq!(owners(&app, 0), vec![Some(owner); 3],
+            "the reconnected app still shows these markers, so the server must keep them");
+        // ...and leaving the world clears them on the app, as it should.
+        app.handle_mark_world_seen(new, 1, Some(0));
+        let msgs = drain_ws_messages(&mut new_rx);
+        assert!(msgs.iter().any(|m| matches!(m, crate::websocket::WsMessage::ReleasedNew { world_index: 0 })),
+            "leaving releases them: {msgs:#?}");
+    }
+
+    /// A client that never came back still has its markers released when its grace runs
+    /// out - only a returned owner keeps them.
+    #[test]
+    fn test_reaping_a_departed_owner_still_releases_its_markers() {
+        let mut app = App::new();
+        world_with_unviewed_backlog(&mut app, 2, 0);
+        let (old, _rx) = phase_c_register_client(&mut app);
+        app.set_display_owner_id(old, "phone");
+        app.handle_mark_world_seen(old, 0, None);
+        app.handle_ws_client_disconnected(old);
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(16 * 60))
+            .expect("test host must have > 16 minutes of monotonic clock uptime");
+        app.ws_client_worlds.get_mut(&old).unwrap().disconnected_at = Some(long_ago);
+        app.reap_stale_ws_client_worlds();
+        assert_eq!(owners(&app, 0), vec![None, None]);
+    }
+
+    /// A client keeps its own copy of the lines across a reconnect (and in a disk cache), ▶
+    /// markers and all, and the server skips sending lines it holds. So InitialState names
+    /// every line the client owns, sent or not: a marker released while it was away, or
+    /// cached before a release, is then dropped instead of drawn for good.
+    #[test]
+    fn test_initial_state_names_every_line_the_client_owns() {
+        use crate::websocket::WsMessage;
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        for seq in 0..6u64 {
+            let mut l = OutputLine::new(format!("line {seq}"), seq);
+            l.display_id = match seq { 1 | 4 => Some(7), 2 => Some(8), _ => None };
+            w.output_lines.push(l);
+        }
+        w.next_seq = 6;
+        let epoch = w.seq_epoch;
+        app.worlds.push(w);
+
+        // The client holds this world: no history lines, but still the markers.
+        let WsMessage::InitialState { worlds, .. } = app.build_initial_state_with_resume(7, &[(0, epoch)]) else {
+            panic!("InitialState")
+        };
+        assert!(worlds[0].output_lines_ts.is_empty(), "precondition: the history is skipped");
+        assert_eq!(worlds[0].own_new_seqs, Some(vec![1, 4]), "only this client's, not another's");
+
+        let WsMessage::InitialState { worlds, .. } = app.build_initial_state(9) else { panic!("InitialState") };
+        assert_eq!(worlds[0].own_new_seqs, Some(Vec::new()), "owning nothing is said too");
+    }
+
+    /// Two connections can share one owner id (an Android /window, a second browser tab: both
+    /// read the same client_uid). A release must reach both, or the one that didn't ask keeps
+    /// drawing markers the server no longer has.
+    #[test]
+    fn test_a_release_reaches_every_connection_of_the_owner() {
+        use crate::websocket::WsMessage;
+        let mut app = App::new();
+        world_with_unviewed_backlog(&mut app, 2, 0);
+        let (main, mut main_rx) = phase_c_register_client(&mut app);
+        let window = 2;
+        let mut window_rx = add_ws_connection(&mut app, window);
+        app.set_display_owner_id(main, "phone");
+        app.set_display_owner_id(window, "phone");
+        app.handle_mark_world_seen(window, 0, None);
+        app.handle_mark_world_seen(main, 0, None);
+        let _ = drain_ws_messages(&mut main_rx);
+        let _ = drain_ws_messages(&mut window_rx);
+
+        app.handle_mark_world_seen(main, 1, Some(0));
+
+        let released = |msgs: &[WsMessage]| msgs.iter().any(|m| matches!(m, WsMessage::ReleasedNew { world_index: 0 }));
+        assert!(released(&drain_ws_messages(&mut main_rx)), "the connection that left is told");
+        assert!(released(&drain_ws_messages(&mut window_rx)), "and so is the other connection of the same owner");
+    }
+
     /// The reported bug: 100 lines arrive on a world nobody is watching, a remote client
     /// switches to it (head gets ▶ correctly), then hits Tab - and the released backlog came
     /// out with no ▶ at all, while the console TUI marked the same lines correctly.

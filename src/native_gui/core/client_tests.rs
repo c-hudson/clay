@@ -993,6 +993,37 @@ fn cached_lines_are_never_guessed_new() {
 }
 
 #[test]
+fn initial_state_says_which_kept_markers_are_still_ours() {
+    // A reconnect keeps this client's own lines, ▶ and all, and the server may have released
+    // some while it was away. Its list is what counts: a stale marker would never clear,
+    // since leaving a world releases only what the server holds.
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..4, 3)]);
+    for l in &mut h.core.worlds[1].lines {
+        l.display_id = Some(7);
+    }
+    let mut b = world_msg(1, "B", 0..4, 3);
+    b.output_lines_ts.clear(); // the server skips a buffer the client holds
+    b.own_new_seqs = Some(vec![2]);
+    h.initial(vec![world_msg(0, "A", 0..2, 9), b]);
+    assert_eq!(h.texts(1).len(), 4, "the kept buffer stands");
+    assert_eq!(mine(&h, 1), vec![2]);
+}
+
+#[test]
+fn an_older_server_leaves_kept_markers_alone() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..4, 3)]);
+    for l in &mut h.core.worlds[1].lines {
+        l.display_id = Some(7);
+    }
+    let mut b = world_msg(1, "B", 0..4, 3);
+    b.own_new_seqs = None;
+    h.initial(vec![world_msg(0, "A", 0..2, 9), b]);
+    assert_eq!(mine(&h, 1), vec![0, 1, 2, 3]);
+}
+
+#[test]
 fn a_second_claim_keeps_the_first_guess_until_it_is_answered() {
     let mut h = H::password();
     let mut b = world_msg(1, "B", 0..4, 3);

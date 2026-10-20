@@ -3008,6 +3008,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 // Multiuser refuses shell worlds (a shell runs as the server user), so a
                 // multiuser world never has a screen.
                 shell: None,
+                // Multiuser hands out no ▶ ownership (your_display_id is 0).
+                own_new_seqs: None,
             }
         }).collect();
 

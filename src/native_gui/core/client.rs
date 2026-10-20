@@ -1523,6 +1523,11 @@ impl ClientCore {
                     w.lines = dedup_by_seq(p.lines);
                     w.seen = p.seen;
                     rebuild_seen(&mut w, None);
+                    // ▶ on the kept lines is the server's to say: ours can be stale (see
+                    // `WorldStateMsg::own_new_seqs`).
+                    if let Some(own) = &m.own_new_seqs {
+                        set_own_markers(&mut w.lines, own, self.display_id);
+                    }
                     w.revision = p.revision + 1;
                     w.hydrated = true;
                     w.resumed = self.resume_sent.get(&m.name) == Some(&index);
@@ -2098,6 +2103,19 @@ fn insert_by_seq(w: &mut World, mut add: Vec<Line>) {
         let s = line.seq.unwrap_or(u64::MAX);
         let at = w.lines.iter().rposition(|l| l.seq.is_some_and(|x| x < s)).map_or(0, |p| p + 1);
         w.lines.insert(at, line);
+    }
+}
+
+/// This client's ▶ markers on `lines` are exactly `own` (`InitialState.own_new_seqs`).
+fn set_own_markers(lines: &mut [Line], own: &[u64], me: u64) {
+    let own: HashSet<u64> = own.iter().copied().collect();
+    for l in lines {
+        if l.seq.is_some_and(|s| own.contains(&s)) && !l.from_archive {
+            l.display_id = Some(me);
+            l.viewed = true;
+        } else if l.display_id == Some(me) {
+            l.display_id = None;
+        }
     }
 }
 

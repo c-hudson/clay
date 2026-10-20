@@ -4040,6 +4040,11 @@
                     // with whatever the previous session knew (see carriedSeenRanges above).
                     // Also (re)sets world._max_seq.
                     rebuildSeenRanges(world, carriedSeenRanges);
+                    // ▶ on the lines kept above (this reconnect's buffer, the disk cache) is
+                    // the server's to say: our copy's can be stale - released while we were
+                    // away, or cached before a release - and a stale marker never clears,
+                    // since leaving a world releases only what the server holds.
+                    if (Array.isArray(world.own_new_seqs)) setOwnMarkers(world, world.own_new_seqs);
                     // Initialize pending_count from server (for More indicator)
                     if (world.pending_count === undefined) world.pending_count = 0;
                     // Don't merge pending_lines - they stay on the server and are
@@ -9111,6 +9116,22 @@
         if (!lineObj) return false;
         if (!myDisplayId) return false; // no id yet, or an older server: never claim a marker
         return lineObj.display_id === myDisplayId;
+    }
+
+    // Our ▶ markers in `world` are exactly `seqs` (InitialState.own_new_seqs).
+    function setOwnMarkers(world, seqs) {
+        if (!myDisplayId || !Array.isArray(world.output_lines)) return;
+        const own = new Set(seqs);
+        for (const line of world.output_lines) {
+            if (!line || typeof line !== 'object') continue;
+            if (own.has(line.seq) && !line.from_archive && line._has_real_seq !== false) {
+                line.display_id = myDisplayId;
+                line.viewed = true;
+            } else if (line.display_id === myDisplayId) {
+                line.display_id = null;
+            }
+        }
+        world._optimisticClaim = null;
     }
 
     // Take ▶ ownership of this world's unviewed lines locally, ahead of the server saying so.

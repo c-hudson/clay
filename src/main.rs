@@ -10519,6 +10519,8 @@ impl App {
             stats: Vec::new(),
             // Brand-new world: not connected, so no shell screen yet.
             shell: None,
+            // Nothing in it to own yet.
+            own_new_seqs: None,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
     }
@@ -12663,7 +12665,15 @@ impl App {
         if !self.worlds[world_idx].release_claims(owner_id) {
             return;
         }
-        if let Some(client_id) = notify {
+        // Every live connection of this owner is told, not only `notify`: two can share an
+        // owner id (an Android /window, a second browser tab - both read one client_uid),
+        // and one left drawing markers the server no longer holds could never clear them.
+        let mut tell: Vec<u64> = self.ws_client_worlds.iter()
+            .filter(|(&id, v)| v.disconnected_at.is_none() && Some(id) != notify && self.display_owner_id(id) == owner_id)
+            .map(|(&id, _)| id)
+            .collect();
+        tell.extend(notify);
+        for client_id in tell {
             self.ws_send_to_client(client_id, WsMessage::ReleasedNew { world_index: world_idx });
         }
         self.needs_output_redraw = true;
@@ -12711,10 +12721,21 @@ impl App {
             .filter(|(_, v)| v.disconnected_at.map(|t| t.elapsed() >= WS_VIEWER_GRACE).unwrap_or(false))
             .map(|(&id, v)| (id, v.world_index))
             .collect();
-        for (client_id, world_idx) in expired {
+        for &(client_id, world_idx) in &expired {
             let owner = self.display_owner_id(client_id);
-            // notify: None — the socket is long gone, there is nobody to tell.
-            self.release_world_for(world_idx, owner, None);
+            // Unless the owner is back: a reconnect is a new connection under the same owner
+            // id, and the markers are the ones it holds now (kept, or claimed afresh).
+            // Releasing them told nobody, so the client went on drawing them, and leaving the
+            // world could never clear them - a release clears only what the server holds.
+            let owner_is_back = self.ws_client_worlds.keys().any(|&id| {
+                !expired.iter().any(|&(gone, _)| gone == id) && self.display_owner_id(id) == owner
+            });
+            if !owner_is_back {
+                // notify: None — the socket is long gone, there is nobody to tell.
+                self.release_world_for(world_idx, owner, None);
+            }
+        }
+        for (client_id, _) in expired {
             self.ws_client_worlds.remove(&client_id);
             self.ws_client_other_views.remove(&client_id);
             self.ws_client_owner_ids.remove(&client_id);
@@ -17692,6 +17713,12 @@ impl App {
                 // A shell world's full screen, so a (re)connecting client starts whole and
                 // then follows with deltas; None for every other world type.
                 shell: world.shell_screen.as_ref().map(|s| s.to_state_msg()),
+                // Every line this client owns, including the ones not sent above: its own
+                // copy's markers may be stale (see the field's doc comment).
+                own_new_seqs: Some(world.output_lines.iter()
+                    .filter(|l| l.display_id == Some(your_display_id))
+                    .map(|l| l.seq)
+                    .collect()),
             }
         }).collect();
 

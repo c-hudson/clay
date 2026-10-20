@@ -1655,6 +1655,15 @@ pub struct WorldStateMsg {
     /// starts from the full screen before deltas arrive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<ShellScreenMsg>,
+    /// The seqs of every line in this world whose ▶ belongs to the client this
+    /// `InitialState` is for (`OutputLine::display_id == your_display_id`), sent or not. A
+    /// client keeps its own copy of the lines across a reconnect and in its disk cache, and
+    /// that copy's markers can be stale - released while it was away, or cached before a
+    /// release. A stale marker could never be cleared (leaving a world releases only what
+    /// the server holds), so the client sets its markers from this list. `None` from a
+    /// server before the field, and where nobody owns markers (multiuser, `WorldAdded`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_new_seqs: Option<Vec<u64>>,
 }
 
 /// Chat-world settings in `UpdateWorldSettings` (see its `chat` field).
