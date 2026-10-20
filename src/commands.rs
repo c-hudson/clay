@@ -981,6 +981,13 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             if app.request_remote_attach(&addr) {
                 let use_gui = app.gui_tx.is_some();
                 if let Err(e) = crate::platform::exec_relaunch(Some(&addr), use_gui) {
+                    if !use_gui {
+                        // The terminal was handed back for the exec (mouse capture off
+                        // with it): repaint all of it, the mouse turned on again if wanted.
+                        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+                        app.mouse_capture_active = false;
+                        app.needs_terminal_clear = true;
+                    }
                     app.add_output(&format!("Connect failed: {}", e));
                 }
             }
@@ -1420,6 +1427,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                             crossterm::cursor::MoveTo(0, 0)
                         );
+                        // The screen is blank now, but ratatui takes it for its last frame.
+                        app.needs_terminal_clear = true;
                         app.add_output(&format!("Hot reload failed: {}", e));
                         app.add_output(&format!("Executable path: {}", exe_path.display()));
                     }

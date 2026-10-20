@@ -355,6 +355,17 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     app.input.set_dimensions(input_area.width, app.input_height);
     app.input.prompt_len = strip_ansi_codes(&app.current_world().prompt).chars().count();
 
+    // The frame the output area goes back to crossterm (a popup closed, the splash or the
+    // split editor went), crossterm must repaint all of it: ratatui no longer blanks it
+    // (`mark_painted_by_crossterm`), so what ratatui drew there last would otherwise stay.
+    // These are `render_output_crossterm`'s own conditions for drawing.
+    let crossterm_paints = !app.current_world().showing_splash && !app.editor.visible
+        && !app.confirm_dialog.visible && !app.has_new_popup();
+    if crossterm_paints && !app.output_painted_by_crossterm {
+        app.needs_output_redraw = true;
+    }
+    app.output_painted_by_crossterm = crossterm_paints;
+
     // Check if editor is visible - split the output area if so
     if app.editor.visible {
         // Split output area horizontally into editor and world output
@@ -1441,21 +1452,19 @@ pub(crate) fn render_output_crossterm(app: &App) {
     // (drawn moments earlier in the same `terminal.draw()` call). The reason is the
     // exact hazard this row is uniquely exposed to: it can be a row that, until
     // `World::stats_line_shown` last flipped from false to true, WAS an ordinary
-    // output row painted by this same bypass loop above. `render_output_area`'s
-    // ratatui `Clear` widget makes ratatui BELIEVE every output-area cell is already
-    // blank — this bypass is what actually puts pixels there, entirely outside
-    // ratatui's own buffer tracking — so on the very frame this row becomes the
-    // stats line, ratatui's diff sees "new blank space == remembered blank" for
-    // every inter-field gap in the new text and skips writing them, leaving
-    // whatever MUD text was physically sitting there a moment ago bleeding through
-    // the gaps — verified against the real binary in a pty (see the plan's job-4
-    // pty harness): "HEALTH963/1000" instead of "HEALTH 963/1000" on the exact
-    // frame the line appeared. Repainting unconditionally with an explicit
-    // erase-to-end-of-line here sidesteps the whole bug class rather than chasing
-    // it with a one-frame terminal-clear special case, and keeps this row correct
-    // on every subsequent update too (hp ticking every combat round included) as
-    // long as something marks `needs_output_redraw` when stats change — see
-    // `App::handle_gmcp_received`/`handle_msdp_received`.
+    // output row painted by this same bypass loop above. `render_output_area` used to
+    // make ratatui BELIEVE every output-area cell was blank (a `Clear`) — this bypass
+    // is what actually puts pixels there, entirely outside ratatui's own buffer
+    // tracking — so on the very frame this row became the stats line, ratatui's diff
+    // saw "new blank space == remembered blank" for every inter-field gap in the new
+    // text and skipped writing them, leaving whatever MUD text was physically sitting
+    // there a moment ago bleeding through the gaps — verified against the real binary
+    // in a pty (see the plan's job-4 pty harness): "HEALTH963/1000" instead of
+    // "HEALTH 963/1000" on the exact frame the line appeared. `mark_painted_by_crossterm`
+    // now fixes that at the source (for the input area too); the repaint stays because
+    // it keeps this row correct on every subsequent update (hp ticking every combat
+    // round included) as long as something marks `needs_output_redraw` when stats
+    // change — see `App::handle_gmcp_received`/`handle_msdp_received`.
     if app.current_world().stats_line_shown {
         let stats_row_y = visible_height as u16;
         let entries = app.current_world().current_stat_entries();
@@ -1815,6 +1824,22 @@ pub(crate) fn ansi_string_to_buffer(buf: &mut ratatui::buffer::Buffer, x: u16, y
     }
 }
 
+/// The output area as ratatui's buffer holds it while `render_output_crossterm` paints it:
+/// cells ratatui never writes (`skip`) and doesn't know (`UNKNOWN_CELL`). It used to hold
+/// blanks (`Clear`), which was a lie whenever crossterm had put text there - so when a row
+/// stopped being output (the input area grew, a world went back to its splash), ratatui
+/// took the new blanks there for what the screen already showed and skipped them, and the
+/// old output stayed in the input area or around the splash. Whatever ratatui draws over
+/// an unknown cell is always written.
+fn mark_painted_by_crossterm(f: &mut Frame, area: Rect) {
+    let buf = f.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buf.get_mut(x, y).set_symbol(popup::console_renderer::UNKNOWN_CELL).set_skip(true);
+        }
+    }
+}
+
 pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     let world = app.current_world();
     let visible_height = area.height as usize;
@@ -1847,9 +1872,8 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
     // If no overlay popup and no editor, raw crossterm will handle output rendering
     // (it provides better ANSI color handling than ratatui's ansi_to_tui conversion)
-    // Clear the area so ratatui doesn't show stale content - crossterm will fill it in
     if !has_overlay_popup && !app.editor.visible {
-        f.render_widget(ratatui::widgets::Clear, area);
+        mark_painted_by_crossterm(f, area);
         return;
     }
 

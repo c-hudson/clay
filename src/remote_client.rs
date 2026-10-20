@@ -1501,7 +1501,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     // Fast direct render bypassing ratatui
                                     let tc = app.settings.theme;
                                     if let Some(state) = app.popup_manager.current() {
-                                        popup::console_renderer::render_popup_content_direct(state, &tc);
+                                        popup::console_renderer::render_popup_content_direct(&mut terminal, state, &tc);
                                     }
                                     continue; // Skip full redraw
                                 }
@@ -1512,7 +1512,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     // Fast direct render bypassing ratatui
                                     let tc = app.settings.theme;
                                     if let Some(state) = app.popup_manager.current() {
-                                        popup::console_renderer::render_popup_content_direct(state, &tc);
+                                        popup::console_renderer::render_popup_content_direct(&mut terminal, state, &tc);
                                     }
                                     continue; // Skip full redraw
                                 }
@@ -1609,6 +1609,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             if app.pending_remote_detach {
                                 app.pending_remote_detach = false;
                                 if let Err(e) = crate::platform::exec_relaunch(None, false) {
+                                    // The terminal was handed back for the exec.
+                                    app.needs_terminal_clear = true;
                                     app.add_output(&format!("Detach failed: {}", e));
                                 }
                             }
@@ -1616,6 +1618,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             // different remote server)
                             if let Some(addr) = app.pending_remote_switch.take() {
                                 if let Err(e) = crate::platform::exec_relaunch(Some(&addr), false) {
+                                    // The terminal was handed back for the exec.
+                                    app.needs_terminal_clear = true;
                                     app.add_output(&format!("Connect failed: {}", e));
                                 }
                             }
@@ -1917,7 +1921,7 @@ fn relaunch_console(app: &mut App) {
             std::io::stdout(),
             crossterm::terminal::LeaveAlternateScreen
         );
-        if let Ok((exe, _)) = get_executable_path() {
+        let failure = if let Ok((exe, _)) = get_executable_path() {
             use std::os::unix::process::CommandExt;
             let args: Vec<String> = std::env::args().skip(1).collect();
             // The new process may start while the server is still coming back from
@@ -1925,17 +1929,21 @@ fn relaunch_console(app: &mut App) {
             std::env::set_var(CONNECT_RETRY_ENV, "1");
             let err = std::process::Command::new(&exe).args(&args).exec();
             std::env::remove_var(CONNECT_RETRY_ENV);
-            // If exec failed, restore terminal and show error
-            let _ = crossterm::terminal::enable_raw_mode();
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::EnterAlternateScreen,
-                crossterm::event::EnableBracketedPaste
-            );
-            app.add_output(&format!("Reload failed: {}", err));
+            format!("Reload failed: {}", err)
         } else {
-            app.add_output("Reload failed: cannot find executable path");
-        }
+            "Reload failed: cannot find executable path".to_string()
+        };
+        // The exec failed: take the terminal back, and repaint all of it - the alternate
+        // screen comes back blank, while ratatui still takes it for its last frame.
+        let _ = crossterm::terminal::enable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableBracketedPaste
+        );
+        app.needs_terminal_clear = true;
+        app.needs_output_redraw = true;
+        app.add_output(&failure);
     }
     // Windows can't replace a running process: the console's loop ends, and the new one
     // is started in the same window (relaunch_and_wait).

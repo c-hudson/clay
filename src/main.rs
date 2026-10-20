@@ -5595,6 +5595,10 @@ pub struct App {
     pub https_server: Option<HttpsServer>,
     // Track if popup was visible last frame (for terminal clear on transition)
     pub popup_was_visible: bool,
+    /// Whether the last frame left the output area to `render_output_crossterm` (no
+    /// popup, splash or split editor): `rendering::ui` asks for a repaint when it goes
+    /// back to crossterm.
+    pub output_painted_by_crossterm: bool,
     /// Cache of each WS client's view state (for activity indicator and more-mode)
     /// Maps client_id -> ClientViewState (world_index + visible_lines)
     pub ws_client_worlds: std::collections::HashMap<u64, ClientViewState>,
@@ -5935,6 +5939,7 @@ impl App {
             #[cfg(feature = "rustls-backend")]
             https_server: None,
             popup_was_visible: false,
+            output_painted_by_crossterm: false,
             ws_client_worlds: std::collections::HashMap::new(),
             ws_client_other_views: std::collections::HashMap::new(),
             ws_client_owner_ids: std::collections::HashMap::new(),
@@ -23973,7 +23978,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                                 let tc = app.settings.theme;
                                 if let Some(state) = app.popup_manager.current() {
-                                    popup::console_renderer::render_popup_content_direct(state, &tc);
+                                    popup::console_renderer::render_popup_content_direct(terminal, state, &tc);
                                 }
                                 continue;
                             }
@@ -23983,7 +23988,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                                 let tc = app.settings.theme;
                                 if let Some(state) = app.popup_manager.current() {
-                                    popup::console_renderer::render_popup_content_direct(state, &tc);
+                                    popup::console_renderer::render_popup_content_direct(terminal, state, &tc);
                                 }
                                 continue;
                             }

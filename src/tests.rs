@@ -2627,6 +2627,94 @@
         (0..width).map(|x| buffer.get(x, y).symbol().to_string()).collect()
     }
 
+    /// A row as the terminal shows it: a cell under the second column of a wide symbol is
+    /// covered by it, whatever `TestBackend` still holds there.
+    fn screen_row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        let mut row = String::new();
+        let mut covered = 0;
+        for x in 0..width {
+            let symbol = buffer.get(x, y).symbol();
+            if covered > 0 {
+                covered -= 1;
+                continue;
+            }
+            row.push_str(symbol);
+            covered = crate::display_width(symbol).saturating_sub(1);
+        }
+        row
+    }
+
+    /// What `render_output_crossterm` does between frames: fill the output area with
+    /// text, outside ratatui.
+    fn paint_output_behind_ratatui(terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, rows: u16, width: u16) {
+        use ratatui::backend::Backend;
+        let mut text = ratatui::buffer::Cell::default();
+        text.set_symbol("X");
+        let cells: Vec<(u16, u16)> = (0..rows).flat_map(|y| (0..width).map(move |x| (x, y))).collect();
+        terminal.backend_mut().draw(cells.iter().map(|&(x, y)| (x, y, &text))).unwrap();
+    }
+
+    /// Growing the input area (`/set isize 8`, dragging the separator up) takes rows from
+    /// the output area, which crossterm painted. Ratatui used to hold those rows as blank,
+    /// took the input area's blanks there for what the screen already showed, and left
+    /// the old output inside the input area.
+    #[test]
+    fn growing_the_input_area_repaints_the_rows_it_takes_from_the_output() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.current_world_index = 0;
+        app.input_height = 1;
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        paint_output_behind_ratatui(&mut terminal, app.output_height, 20);
+
+        app.input_height = 5;
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        for y in 5..10 {
+            let row = render_row_text(terminal.backend().buffer(), y, 20);
+            assert!(!row.contains('X'), "row {y} (input area) still shows old output: {row:?}");
+        }
+    }
+
+    /// Switching to a world still showing its splash: ratatui draws the splash where
+    /// crossterm painted the other world's output, and must write all of it, blanks
+    /// included. And going back, crossterm must be asked to repaint, since ratatui no
+    /// longer blanks the output area for it - but only on that frame, not every frame.
+    #[test]
+    fn the_output_area_changing_hands_is_repainted_whole() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.worlds.push(World::new_with_splash("Beta", true));
+        app.current_world_index = 0;
+        app.input_height = 1;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        paint_output_behind_ratatui(&mut terminal, app.output_height, 60);
+
+        app.current_world_index = 1;
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        for y in 0..app.output_height {
+            let row = screen_row_text(terminal.backend().buffer(), y, 60);
+            assert!(!row.contains('X'), "row {y} still shows Alpha's output around the splash: {row:?}");
+        }
+
+        app.current_world_index = 0;
+        app.needs_output_redraw = false;
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        assert!(app.needs_output_redraw, "the frame the output goes back to crossterm must ask it to repaint");
+        app.needs_output_redraw = false;
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        assert!(!app.needs_output_redraw, "and only that frame");
+    }
+
     /// Plan Job 4 (mud-status-display.md) security requirement: a hostile GMCP value
     /// carrying a C1 byte, a real ESC sequence, and an embedded newline must never
     /// reach the console status line's rendered buffer unsanitized - the exact hazard

@@ -3,11 +3,12 @@
 //! Renders PopupState to the terminal using ratatui Frame.
 
 use ratatui::{
+    backend::Backend,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
-    Frame,
+    Frame, Terminal,
 };
 
 use super::{
@@ -1977,10 +1978,31 @@ fn to_crossterm_color(c: ratatui::style::Color) -> crossterm::style::Color {
     }
 }
 
+/// What ratatui's buffer holds for a cell whose screen content it doesn't know: a symbol
+/// no frame ever holds (U+FFFF is a noncharacter), so whatever ratatui draws there next
+/// differs from it and is written.
+pub(crate) const UNKNOWN_CELL: &str = "\u{FFFF}";
+
+/// Make ratatui's next draw repaint every cell. A draw writes only the cells that differ
+/// from the frame it drew last, so once something has drawn over the screen behind its
+/// back, a cell where the next frame happens to match that last frame keeps whatever was
+/// drawn over it: closing a Help scrolled with the wheel left its text in the blanks of
+/// the Setup popup beneath. `swap_buffers` blanks the last frame and makes it the one the
+/// next draw renders into, so the buffer filled here (every cell `UNKNOWN_CELL`) is the
+/// one that draw is compared with. Unlike `Terminal::clear` the screen is not blanked
+/// first, so nothing flickers.
+fn mark_screen_stale<B: Backend>(terminal: &mut Terminal<B>) {
+    for cell in terminal.current_buffer_mut().content.iter_mut() {
+        cell.set_symbol(UNKNOWN_CELL);
+    }
+    terminal.swap_buffers();
+}
+
 /// Render just the scrollable/list content of a popup directly to stdout using crossterm.
 /// This is much faster than a full ratatui terminal.draw() cycle because it skips
-/// output area, separator bar, and input area rendering.
-pub fn render_popup_content_direct(state: &PopupState, theme: &Theme) {
+/// output area, separator bar, and input area rendering. It draws behind ratatui's back,
+/// so it marks `terminal`'s last frame stale and the next draw repaints the whole screen.
+pub fn render_popup_content_direct<B: Backend>(terminal: &mut Terminal<B>, state: &PopupState, theme: &Theme) {
     use std::io::Write;
     use crossterm::{cursor::MoveTo, style::{SetForegroundColor, SetBackgroundColor, SetAttribute, Print, Attribute}, QueueableCommand};
 
@@ -2235,6 +2257,7 @@ pub fn render_popup_content_direct(state: &PopupState, theme: &Theme) {
     }
 
     let _ = stdout.flush();
+    mark_screen_stale(terminal);
 }
 
 // ============================================================================
@@ -2293,6 +2316,23 @@ pub fn render_filter_popup_new(
 mod tests {
     use super::*;
     use crate::popup::{Button, ButtonId, Field, FieldId, PopupDefinition, PopupId};
+
+    #[test]
+    fn a_draw_after_a_direct_render_repaints_what_it_drew_over() {
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Cell;
+        let mut terminal = Terminal::new(TestBackend::new(6, 2)).unwrap();
+        let frame = |f: &mut Frame| f.render_widget(Paragraph::new("ab"), f.size());
+        terminal.draw(frame).unwrap();
+        // A wheel scroll draws over a blank cell behind ratatui's back.
+        let mut over = Cell::default();
+        over.set_symbol("x");
+        terminal.backend_mut().draw([(4, 1, &over)].into_iter()).unwrap();
+        mark_screen_stale(&mut terminal);
+        // The same frame again: without the mark, ratatui sees nothing to write.
+        terminal.draw(frame).unwrap();
+        terminal.backend().assert_buffer_lines(["ab    ", "      "]);
+    }
 
     #[test]
     fn close_button_sits_one_cell_in_from_the_top_right_corner() {
