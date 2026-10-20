@@ -7,7 +7,6 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
-import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
@@ -25,7 +24,6 @@ public class ClayForegroundService extends Service {
     public static final String ACTION_STOP_SERVICE = "com.clay.mudclient.STOP_SERVICE";
 
     private PowerManager.WakeLock wakeLock;
-    private WifiManager.WifiLock wifiLock;
 
     @Override
     public void onCreate() {
@@ -44,27 +42,14 @@ public class ClayForegroundService extends Service {
             );
             wakeLock.acquire();
         }
-
-        // Acquire wifi lock to keep wifi connection active
-        // Use WIFI_MODE_FULL instead of WIFI_MODE_FULL_HIGH_PERF to reduce power consumption
-        WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wifiManager != null) {
-            wifiLock = wifiManager.createWifiLock(
-                WifiManager.WIFI_MODE_FULL,
-                "Clay::WifiLock"
-            );
-            wifiLock.acquire();
-        }
+        // No Wi-Fi lock: WIFI_MODE_FULL does nothing since Android 10, HIGH_PERF nothing since
+        // Android 14, and LOW_LATENCY works only while the app is on screen.
     }
 
     private void releaseWakeLocks() {
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
             wakeLock = null;
-        }
-        if (wifiLock != null && wifiLock.isHeld()) {
-            wifiLock.release();
-            wifiLock = null;
         }
     }
 
@@ -79,7 +64,7 @@ public class ClayForegroundService extends Service {
             // server running with nothing left to talk to it.
             ClaySession.shutdown();
             releaseWakeLocks();
-            stopForeground(true);
+            stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -136,7 +121,7 @@ public class ClayForegroundService extends Service {
     public void onDestroy() {
         releaseWakeLocks();
         super.onDestroy();
-        stopForeground(true);
+        stopForeground(STOP_FOREGROUND_REMOVE);
     }
 
     private void createNotificationChannel() {

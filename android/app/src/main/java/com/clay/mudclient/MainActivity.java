@@ -30,6 +30,10 @@ import android.webkit.JavascriptInterface;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import androidx.activity.OnBackPressedCallback;
+import androidx.activity.result.ActivityResult;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
@@ -112,11 +116,13 @@ public class MainActivity extends AppCompatActivity {
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
     private static final String CHANNEL_ID_SERVICE = "clay_service";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1001;
-    private static final int BATTERY_OPTIMIZATION_REQUEST = 1002;
     // Import Picture: the page's <input type="file"> (Menu > Import Picture) opens a
     // picture/media app; what it picks goes back to the page through this callback.
-    private static final int PICTURE_CHOOSER_REQUEST = 1003;
     private android.webkit.ValueCallback<Uri[]> pictureChooserCallback;
+    private final ActivityResultLauncher<Intent> pictureChooser = registerForActivityResult(
+        new ActivityResultContracts.StartActivityForResult(), this::onPicturesPicked);
+    private final ActivityResultLauncher<Intent> batteryOptimizationRequest = registerForActivityResult(
+        new ActivityResultContracts.StartActivityForResult(), result -> onBatteryOptimizationAnswered());
     private static final int KEEPALIVE_INTERVAL_MS = 60000; // 60 seconds (reduced from 30s for power savings)
     private static final long BACKGROUND_SHUTDOWN_MS = 60 * 60 * 1000; // 1 hour - auto-disconnect when in background
 
@@ -139,8 +145,8 @@ public class MainActivity extends AppCompatActivity {
     // usage Google pushes back on) - it's now asked for the first time a persistent
     // background connection actually starts (see startBackgroundService() /
     // checkBatteryOptimization()), not during startPermissionFlow(). This callback carries
-    // the "proceed with starting the connection" continuation across the async
-    // startActivityForResult() round-trip.
+    // the "proceed with starting the connection" continuation across the round-trip to the
+    // system's dialog (batteryOptimizationRequest).
     private Runnable pendingBatteryOptCallback = null;
     private boolean interfaceLoaded = false;
     private String loadedInterfaceUrl = null;
@@ -1150,6 +1156,12 @@ public class MainActivity extends AppCompatActivity {
                 ? " (Activity recreated, process survived)"
                 : " (fresh process)"));
         setContentView(R.layout.activity_main);
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                onBack();
+            }
+        });
 
         // getNoBackupFilesDir() is never included in any backup (Auto Backup, ADB, OEM).
         // If this flag is absent it is a true fresh install — clear any restored prefs so
@@ -1345,14 +1357,14 @@ public class MainActivity extends AppCompatActivity {
             PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
             String packageName = getPackageName();
             if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
-                // Need to request - will return via onActivityResult
+                // Need to request - answered in onBatteryOptimizationAnswered()
                 Intent intent = new Intent();
                 intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
                 intent.setData(Uri.parse("package:" + packageName));
                 try {
                     pendingBatteryOptCallback = onDone;
-                    startActivityForResult(intent, BATTERY_OPTIMIZATION_REQUEST);
-                    return; // Wait for callback via onActivityResult
+                    batteryOptimizationRequest.launch(intent);
+                    return; // Wait for the answer
                 } catch (Exception e) {
                     // Device doesn't support this intent
                     Toast.makeText(this,
@@ -1382,47 +1394,46 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == PICTURE_CHOOSER_REQUEST) {
-            // Every picked picture (several come as ClipData, which
-            // FileChooserParams.parseResult ignores). A cancel must still answer, or the
-            // page's file input never opens again.
-            final android.webkit.ValueCallback<Uri[]> callback = pictureChooserCallback;
-            pictureChooserCallback = null;
-            if (callback == null) return;
-            final java.util.List<Uri> picked = new java.util.ArrayList<>();
-            if (resultCode == RESULT_OK && data != null) {
-                if (data.getClipData() != null) {
-                    android.content.ClipData clip = data.getClipData();
-                    for (int i = 0; i < clip.getItemCount(); i++) {
-                        picked.add(clip.getItemAt(i).getUri());
-                    }
-                } else if (data.getData() != null) {
-                    picked.add(data.getData());
+    /** Import Picture: the chooser's answer. */
+    private void onPicturesPicked(ActivityResult result) {
+        // Every picked picture (several come as ClipData, which
+        // FileChooserParams.parseResult ignores). A cancel must still answer, or the
+        // page's file input never opens again.
+        final android.webkit.ValueCallback<Uri[]> callback = pictureChooserCallback;
+        pictureChooserCallback = null;
+        if (callback == null) return;
+        final java.util.List<Uri> picked = new java.util.ArrayList<>();
+        Intent data = result.getData();
+        if (result.getResultCode() == RESULT_OK && data != null) {
+            if (data.getClipData() != null) {
+                android.content.ClipData clip = data.getClipData();
+                for (int i = 0; i < clip.getItemCount(); i++) {
+                    picked.add(clip.getItemAt(i).getUri());
                 }
+            } else if (data.getData() != null) {
+                picked.add(data.getData());
             }
-            if (picked.isEmpty()) {
-                callback.onReceiveValue(null);
-                return;
-            }
-            // The page reads a picture in slices, and WebView can't slice a File backed by
-            // the photo picker's content:// link ("NotReadableError"): hand it a copy in
-            // this app's cache instead, off the UI thread (a photo can be megabytes).
-            new Thread(() -> {
-                final Uri[] copies = copyPickedPictures(picked);
-                runOnUiThread(() -> callback.onReceiveValue(copies));
-            }).start();
+        }
+        if (picked.isEmpty()) {
+            callback.onReceiveValue(null);
             return;
         }
-        if (requestCode == BATTERY_OPTIMIZATION_REQUEST) {
-            batteryOptimizationDone = true;
-            Runnable callback = pendingBatteryOptCallback;
-            pendingBatteryOptCallback = null;
-            if (callback != null) {
-                callback.run();
-            }
+        // The page reads a picture in slices, and WebView can't slice a File backed by
+        // the photo picker's content:// link ("NotReadableError"): hand it a copy in
+        // this app's cache instead, off the UI thread (a photo can be megabytes).
+        new Thread(() -> {
+            final Uri[] copies = copyPickedPictures(picked);
+            runOnUiThread(() -> callback.onReceiveValue(copies));
+        }).start();
+    }
+
+    /** The battery optimization dialog was answered, either way. */
+    private void onBatteryOptimizationAnswered() {
+        batteryOptimizationDone = true;
+        Runnable callback = pendingBatteryOptCallback;
+        pendingBatteryOptCallback = null;
+        if (callback != null) {
+            callback.run();
         }
     }
 
@@ -2313,7 +2324,7 @@ public class MainActivity extends AppCompatActivity {
                 pick.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,
                     params != null && params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
                 try {
-                    startActivityForResult(Intent.createChooser(pick, "Import Picture"), PICTURE_CHOOSER_REQUEST);
+                    pictureChooser.launch(Intent.createChooser(pick, "Import Picture"));
                 } catch (android.content.ActivityNotFoundException e) {
                     pictureChooserCallback = null;
                     callback.onReceiveValue(null);
@@ -2763,8 +2774,8 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
     }
 
-    @Override
-    public void onBackPressed() {
+    /** Back, from the callback onCreate() registers. */
+    private void onBack() {
         if (webView != null && webView.canGoBack()) {
             webView.goBack();
             return;
@@ -2774,7 +2785,7 @@ public class MainActivity extends AppCompatActivity {
             finishAndRemoveTask();
             return;
         }
-        // Background the task rather than finishing the Activity. super.onBackPressed() would
+        // Background the task rather than finishing the Activity. Back's default would
         // finish it, and Clay is a session app kept alive by a foreground service - Back means
         // "put it away", not "end my session". Finishing also ran onDestroy(), which used to
         // take the local server and SSH tunnel with it. Matches what Home already does, so both
