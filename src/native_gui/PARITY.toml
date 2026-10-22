@@ -2560,7 +2560,7 @@ id = "ui:status.notes"
 section = "status"
 phase = 2
 status = "done"
-feature = "notes icon when the world has notes"
+feature = "notes icon (📝, as on the console's separator bar) when the world has notes"
 note = "the icon shows; the note editor it opens arrives in phase 4"
 
 [[item]]

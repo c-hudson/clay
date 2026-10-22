@@ -110,12 +110,13 @@ Click the hamburger icon for:
 | Resync | Request full state refresh |
 | Logout | (multiuser) Log out |
 
-A world's notes are `/note`, or the note icon on the status bar once it has some, and
-`/note -l` lists every world's. Recent Worlds is the `recent_worlds` key action, which has
-no default key (bind one in the keybind editor). Import Settings is the **Import** button
-on Settings' General tab (before the `?`), and `/import` opens it too. Reload is `Ctrl+R`
-or `/reload`. A picture dragged onto the page is uploaded as Import Picture's are (see
-**Importing a Picture** in the Interface chapter).
+A world's notes are `/note`, or the 📝 on the status bar once it has some (the console
+shows the same 📝 on its separator bar), and `/note -l` lists every world's. Recent
+Worlds is the `recent_worlds` key action, which has no default key (bind one in the
+keybind editor). Import Settings is the **Import** button on Settings' General tab (before
+the `?`), and `/import` opens it too. Reload is `Ctrl+R` or `/reload`. A picture dragged
+onto the page is uploaded as Import Picture's are (see **Importing a Picture** in the
+Interface chapter).
 
 ### World Selector
 

@@ -434,7 +434,7 @@ impl ClayView {
 
         // The notes icon, when this world has notes.
         if world.and_then(|w| w.settings.as_ref()).is_some_and(|s| s.has_notes) {
-            row = row.child(self.icon_button("status-note", "note", "Notes", cx).on_click(cx.listener(|this, _, w, cx| this.open_surface("notes", w, cx))));
+            row = row.child(self.emoji_button("status-note", "📝", "Notes").on_click(cx.listener(|this, _, w, cx| this.open_surface("notes", w, cx))));
         }
 
         row = row.child(self.font_slider(cx));
@@ -481,7 +481,18 @@ impl ClayView {
     /// A `.status-btn`: a 15px icon that lights up in the accent colour on hover.
     fn icon_button(&self, id: &'static str, name: &str, title: &'static str, _cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let t = &self.chrome.tokens;
-        let (accent, muted, hover) = (t.accent, t.muted, t.hover);
+        let (accent, muted) = (t.accent, t.muted);
+        self.status_btn(id, title).child(svg().path(icon(name)).size(px(15.0)).text_color(muted).group_hover(id, move |s| s.text_color(accent)))
+    }
+
+    /// A `.status-btn` around a colour emoji (the notes button's 📝, as the console's bar shows it).
+    fn emoji_button(&self, id: &'static str, emoji: &'static str, title: &'static str) -> gpui::Stateful<gpui::Div> {
+        self.status_btn(id, title).child(div().font_family(self.fonts.emoji.clone()).text_size(px(14.0)).line_height(px(15.0)).child(emoji))
+    }
+
+    /// `.status-btn`'s frame: padding, rounded corners, the hover background and a tooltip.
+    fn status_btn(&self, id: &'static str, title: &'static str) -> gpui::Stateful<gpui::Div> {
+        let hover = self.chrome.tokens.hover;
         div()
             .id(id)
             .group(id)
@@ -493,7 +504,6 @@ impl ClayView {
             .rounded(px(4.0))
             .cursor_pointer()
             .hover(move |s| s.bg(hover))
-            .child(svg().path(icon(name)).size(px(15.0)).text_color(muted).group_hover(id, move |s| s.text_color(accent)))
             .tooltip(move |w, cx| Tooltip::new(title).build(w, cx))
     }
 

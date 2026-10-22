@@ -994,6 +994,13 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
     height: 15px;
 }
 
+/* The notes button is 📝, the same symbol the console's separator bar shows. */
+.status-note-emoji {
+    font-family: 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', 'Twemoji Mozilla', 'EmojiOne Color', sans-serif;
+    font-size: 14px;
+    line-height: 15px;
+}
+
 /* ─── Font Slider (range input) ─── */
 .font-slider-group {
     display: flex;

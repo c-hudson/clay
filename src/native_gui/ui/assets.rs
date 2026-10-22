@@ -14,7 +14,7 @@ macro_rules! icons {
 
 const ICONS: &[(&str, &[u8])] =
     icons![
-        "worlds", "actions", "settings", "find", "tags", "arrow-left", "arrow-right", "menu", "note", "star",
+        "worlds", "actions", "settings", "find", "tags", "arrow-left", "arrow-right", "menu", "star",
         // The help window's quick-start cards (app.js buildHelpQuickStartCards) and its disclosure chevron.
         "help-connect", "help-switch", "help-send", "help-catchup", "help-actions", "help-yours", "help-remote", "help-notes", "help-chevron",
         // The world editor's section bar.
