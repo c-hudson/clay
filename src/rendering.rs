@@ -2389,6 +2389,13 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // Time on the right (no space before it, underscores fill to it)
     let time_display = time_str.clone();
 
+    // The current world has notes (`/note`): "🗒️ " just before the time, as the web/GUI
+    // status bar shows its note icon. The emoji is a VS16 sequence, two columns wide -
+    // ratatui measures the grapheme (unicode-width's emoji presentation rule), so it
+    // reserves both cells; the count here must say the same.
+    let note_indicator = if world.has_notes(app.is_master) { "🗒️ " } else { "" };
+    let note_width = if note_indicator.is_empty() { 0 } else { 3 };
+
     // Create styled spans
     let mut spans = Vec::new();
 
@@ -2495,7 +2502,7 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         ACTIVITY_POSITION.max(current_pos) + activity_str.len()
     };
     // Subtract 2 for the fixed gap before time
-    let fill_count = width.saturating_sub(used_len + time_display.len() + 2);
+    let fill_count = width.saturating_sub(used_len + note_width + time_display.len() + 2);
 
     spans.push(Span::styled(
         fill_str(fill_count),
@@ -2504,6 +2511,10 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Separator before time (2 chars for extra spacing)
     spans.push(Span::styled(fill_str(2), Style::default().fg(theme.fg_dim())));
+
+    if !note_indicator.is_empty() {
+        spans.push(Span::styled(note_indicator, Style::default().fg(theme.fg())));
+    }
 
     // Time on the right (no spaces around it)
     spans.push(Span::styled(time_display, Style::default().fg(theme.fg())));

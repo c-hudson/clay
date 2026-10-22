@@ -9370,7 +9370,7 @@ third
             keep_alive_cmd: String::new(),
             gmcp_packages: String::new(),
             auto_reconnect_secs: "0".to_string(),
-            has_notes: false,
+            has_notes: true,
             msp_enabled: true,
             mcp_enabled: true,
             mccp2_enabled: true,
@@ -9416,6 +9416,7 @@ third
         assert_eq!(app.worlds[0].settings.discord_guild, "guild1");
         assert_eq!(app.worlds[0].settings.discord_channel, "chan1");
         assert_eq!(app.worlds[0].settings.discord_dm_user, "user1");
+        assert!(app.worlds[0].has_notes(false), "has_notes drives the separator bar's 🗒️");
     }
 
     /// Old-peer compat: `WorldSettingsMsg::mccp2_enabled` must default to `true` (compression
@@ -9626,20 +9627,65 @@ third
             "a type change away from MudTimedPrompt must clear the parked promotion timer");
     }
 
-    /// `NotesChanged`/`PausedState` are explicit no-ops for this mirror (T1.13): it holds no
-    /// notes text and the console draws no PAUSED badge. They must not panic or otherwise
-    /// disturb the world.
+    /// `PausedState` is an explicit no-op for this mirror (T1.13): the console draws no
+    /// PAUSED badge. `NotesChanged` sets only the world's `has_notes` (the separator bar's
+    /// 🗒️), never its notes text, and ignores an index that isn't there.
     #[test]
-    fn test_console_mirror_notes_changed_and_paused_state_are_explicit_no_ops() {
+    fn test_console_mirror_notes_changed_sets_has_notes_and_paused_state_is_a_no_op() {
         let mut app = App::new();
+        app.is_master = false;
         app.worlds = vec![World::new("alpha")];
         app.current_world_index = 0;
         let before = app.worlds[0].name.clone();
 
         app.handle_remote_ws_message(WsMessage::NotesChanged { world_index: 0, has_notes: true });
         app.handle_remote_ws_message(WsMessage::PausedState { paused: true });
+        app.handle_remote_ws_message(WsMessage::NotesChanged { world_index: 7, has_notes: true });
 
-        assert_eq!(app.worlds[0].name, before, "must be true no-ops");
+        assert_eq!(app.worlds[0].name, before);
+        assert!(app.worlds[0].has_notes(app.is_master));
+        assert!(app.worlds[0].settings.notes.is_empty(), "the text is fetched by /note, never carried");
+
+        app.handle_remote_ws_message(WsMessage::NotesChanged { world_index: 0, has_notes: false });
+        assert!(!app.worlds[0].has_notes(app.is_master));
+    }
+
+    /// The separator bar shows "🗒️ " just before the clock while the current world has
+    /// notes - the master's own, or on the SSH remote console what the server said, even
+    /// when that mirror still holds text `/note` fetched before another interface cleared
+    /// them. The fill gives up the emoji's two cells and the space, so the clock stays
+    /// whole at the right edge.
+    #[test]
+    fn test_separator_bar_shows_note_emoji_before_the_time() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+        const WIDTH: u16 = 40;
+        // The bar's last 8 cells. A wide symbol's second cell is the one after it.
+        let tail = |app: &App| -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(WIDTH, 1)).unwrap();
+            terminal.draw(|f| rendering::render_separator_bar(f, app, Rect::new(0, 0, WIDTH, 1))).unwrap();
+            let buffer = terminal.backend().buffer();
+            (WIDTH - 8..WIDTH).map(|x| buffer.get(x, 0).symbol().to_string()).collect()
+        };
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.current_world_index = 0;
+        app.settings.clock_format = "NOW".to_string();
+        let fill = app.settings.separator_style.fill_char().to_string();
+        let f = fill.as_str();
+        let without = [f, f, f, f, f, "N", "O", "W"];
+        let with = [f, f, "🗒\u{FE0F}", " ", " ", "N", "O", "W"];
+
+        assert_eq!(tail(&app), without, "no notes, no emoji");
+
+        app.worlds[0].settings.notes = "remember the key".to_string();
+        assert_eq!(tail(&app), with, "the emoji (two cells), a space, then the time");
+
+        // The SSH remote console's mirror: the server's word, not stale fetched text.
+        app.is_master = false;
+        assert_eq!(tail(&app), without, "a mirror goes by has_notes, not settings.notes");
+        app.worlds[0].mirrored_has_notes = true;
+        assert_eq!(tail(&app), with);
     }
 
     // --- App::start_quote ---

@@ -4119,6 +4119,12 @@ pub struct World {
     /// `WsMessage::WorldDisconnected` (that handler's own comment explains why it
     /// can't wait for `clear_connection_state`, which never runs on this mirror).
     pub mirrored_stats: Vec<stats::StatEntry>,
+    /// The server's word on whether this world has notes (`WorldSettingsMsg::has_notes`,
+    /// `WsMessage::NotesChanged`), for the SSH remote console's mirrored `World`: its
+    /// `settings.notes` holds text only once `/note` has fetched it, and goes stale when
+    /// another interface edits them. Unused on the master, whose notes are its own. Read
+    /// it through `World::has_notes`.
+    pub mirrored_has_notes: bool,
     /// Plan Job 4 / D3: has the console status line ever been shown for the CURRENT
     /// connection on this world? A one-way latch, not a live "has data right now"
     /// check — set the first time `current_stat_entries()` is seen non-empty
@@ -4328,6 +4334,7 @@ impl World {
             reader_name: None,
             world_id: String::new(),
             mirrored_stats: Vec::new(),
+            mirrored_has_notes: false,
             stats_line_shown: false,
             active_media: std::collections::HashMap::new(),
             gmcp_user_enabled: false,
@@ -4417,6 +4424,13 @@ impl World {
         } else {
             self.mirrored_stats.clone()
         }
+    }
+
+    /// Whether this world has notes (the console separator bar's 🗒️). The master's notes
+    /// are its own; an SSH remote console's mirror goes by what the server said
+    /// (`mirrored_has_notes`). Same test as the wire's `has_notes`: any text at all.
+    pub fn has_notes(&self, is_master: bool) -> bool {
+        if is_master { !self.settings.notes.is_empty() } else { self.mirrored_has_notes }
     }
 
     /// Clear connection state when disconnecting
@@ -8262,6 +8276,7 @@ impl App {
                 // `world_from_state_msg` — this message always carries an empty one.
                 if let Some(w) = self.worlds.get_mut(world_index) {
                     w.name = name;
+                    w.mirrored_has_notes = settings.has_notes;
                     w.settings.hostname = settings.hostname;
                     w.settings.port = settings.port;
                     w.settings.user = settings.user;
@@ -8301,11 +8316,14 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
-            // No-op (T1.13): this mirrored World holds no notes text — the console's own
-            // `/note` editor fetches/saves notes via a dedicated NoteEditorState
-            // request/response, never from this broadcast — so there is nothing here to
-            // update; `has_notes` alone would have nowhere to go.
-            WsMessage::NotesChanged { .. } => {}
+            // A world's notes came or went (any interface's save, this console's own
+            // included): the separator bar's 🗒️. The text itself is still fetched by
+            // `/note` (NoteEditorState), never carried here.
+            WsMessage::NotesChanged { world_index, has_notes } => {
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.mirrored_has_notes = has_notes;
+                }
+            }
             // The MUD sent text to edit (MCP simpleedit): the same editor the master console
             // opens, saved back with McpEditSet (input_handler::save_editor_content).
             // Import Settings stays the main instance's own (user ruling 2026-10-16).
@@ -8591,6 +8609,8 @@ impl App {
         // shared by both the master and this mirror) sets `stats_line_shown` from
         // this on the very next paint - no need to set it here too.
         world.mirrored_stats = w.stats;
+        // The separator bar's 🗒️ (World::has_notes); the notes themselves stay the server's.
+        world.mirrored_has_notes = w.settings.has_notes;
         // auto_reconnect_secs/on_web: without this, World::is_reconnecting() (and the
         // amber separator dot it drives) could never fire on the SSH remote console mirror
         // - auto_reconnect_secs would silently sit at WorldSettings::default()'s 0 until the
