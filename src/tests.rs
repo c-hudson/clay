@@ -9416,7 +9416,7 @@ third
         assert_eq!(app.worlds[0].settings.discord_guild, "guild1");
         assert_eq!(app.worlds[0].settings.discord_channel, "chan1");
         assert_eq!(app.worlds[0].settings.discord_dm_user, "user1");
-        assert!(app.worlds[0].has_notes(false), "has_notes drives the separator bar's 🗒️");
+        assert!(app.worlds[0].has_notes(false), "has_notes drives the separator bar's 📝");
     }
 
     /// Old-peer compat: `WorldSettingsMsg::mccp2_enabled` must default to `true` (compression
@@ -9629,7 +9629,7 @@ third
 
     /// `PausedState` is an explicit no-op for this mirror (T1.13): the console draws no
     /// PAUSED badge. `NotesChanged` sets only the world's `has_notes` (the separator bar's
-    /// 🗒️), never its notes text, and ignores an index that isn't there.
+    /// 📝), never its notes text, and ignores an index that isn't there.
     #[test]
     fn test_console_mirror_notes_changed_sets_has_notes_and_paused_state_is_a_no_op() {
         let mut app = App::new();
@@ -9650,7 +9650,7 @@ third
         assert!(!app.worlds[0].has_notes(app.is_master));
     }
 
-    /// The separator bar shows "🗒️ " just before the clock while the current world has
+    /// The separator bar shows "📝 " just before the clock while the current world has
     /// notes - the master's own, or on the SSH remote console what the server said, even
     /// when that mirror still holds text `/note` fetched before another interface cleared
     /// them. The fill gives up the emoji's two cells and the space, so the clock stays
@@ -9674,7 +9674,7 @@ third
         let fill = app.settings.separator_style.fill_char().to_string();
         let f = fill.as_str();
         let without = [f, f, f, f, f, "N", "O", "W"];
-        let with = [f, f, "🗒\u{FE0F}", " ", " ", "N", "O", "W"];
+        let with = [f, f, "📝", " ", " ", "N", "O", "W"];
 
         assert_eq!(tail(&app), without, "no notes, no emoji");
 

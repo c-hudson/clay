@@ -4426,7 +4426,7 @@ impl World {
         }
     }
 
-    /// Whether this world has notes (the console separator bar's 🗒️). The master's notes
+    /// Whether this world has notes (the console separator bar's 📝). The master's notes
     /// are its own; an SSH remote console's mirror goes by what the server said
     /// (`mirrored_has_notes`). Same test as the wire's `has_notes`: any text at all.
     pub fn has_notes(&self, is_master: bool) -> bool {
@@ -8317,7 +8317,7 @@ impl App {
                 }
             }
             // A world's notes came or went (any interface's save, this console's own
-            // included): the separator bar's 🗒️. The text itself is still fetched by
+            // included): the separator bar's 📝. The text itself is still fetched by
             // `/note` (NoteEditorState), never carried here.
             WsMessage::NotesChanged { world_index, has_notes } => {
                 if let Some(w) = self.worlds.get_mut(world_index) {
@@ -8609,7 +8609,7 @@ impl App {
         // shared by both the master and this mirror) sets `stats_line_shown` from
         // this on the very next paint - no need to set it here too.
         world.mirrored_stats = w.stats;
-        // The separator bar's 🗒️ (World::has_notes); the notes themselves stay the server's.
+        // The separator bar's 📝 (World::has_notes); the notes themselves stay the server's.
         world.mirrored_has_notes = w.settings.has_notes;
         // auto_reconnect_secs/on_web: without this, World::is_reconnecting() (and the
         // amber separator dot it drives) could never fire on the SSH remote console mirror

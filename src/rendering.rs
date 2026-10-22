@@ -2389,11 +2389,12 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // Time on the right (no space before it, underscores fill to it)
     let time_display = time_str.clone();
 
-    // The current world has notes (`/note`): "🗒️ " just before the time, as the web/GUI
-    // status bar shows its note icon. The emoji is a VS16 sequence, two columns wide -
-    // ratatui measures the grapheme (unicode-width's emoji presentation rule), so it
-    // reserves both cells; the count here must say the same.
-    let note_indicator = if world.has_notes(app.is_master) { "🗒️ " } else { "" };
+    // The current world has notes (`/note`): "📝 " just before the time, the same symbol
+    // the web/GUI status bar shows. 📝 is East Asian Wide, two columns in every width
+    // table, so ratatui, the terminal and any multiplexer between them agree. Never a VS16
+    // sequence such as 🗒️: ratatui reserves two cells for it, VTE (xfce4-terminal), tmux
+    // and screen draw one, and the cells after it - the clock - came out garbled.
+    let note_indicator = if world.has_notes(app.is_master) { "📝 " } else { "" };
     let note_width = if note_indicator.is_empty() { 0 } else { 3 };
 
     // Create styled spans
