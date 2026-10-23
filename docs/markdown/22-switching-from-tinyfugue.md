@@ -71,6 +71,7 @@ every interface - and Clay's settings show through them:
 | `%wrapspace` | the indent of wrapped lines |
 | `%isize` | the height of the input area |
 | `%insert` | insert/overstrike |
+| `%cleardone` | Clear Input on Send: off (the default, as in TF) keeps the lines you send in the input area |
 
 They are not saved as TF variables; Clay saves the settings themselves.
 

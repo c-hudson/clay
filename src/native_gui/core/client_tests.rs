@@ -703,6 +703,21 @@ fn this_guis_fonts_are_its_own_on_this_os_and_the_shared_ones_stay() {
     assert!(matches!(settings_update(&old), WsMessage::UpdateGlobalSettings { font_profile: None, web_font_size_desktop, .. } if web_font_size_desktop == 12.0));
 }
 
+/// Clear Input on Send (TF's %cleardone) round-trips through this GUI's Settings save, as
+/// a value the server applies - never left out, which would mean "unchanged".
+#[test]
+fn clear_input_on_send_saves_from_the_native_settings() {
+    let mut app = crate::App::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let mut s = app.build_global_settings_msg();
+    assert!(!s.clear_input_on_send, "sent lines are kept by default, as in TF");
+    s.clear_input_on_send = true;
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { clear_input_on_send: Some(true), .. }));
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert!(app.settings.clear_input_on_send);
+    assert!(app.build_global_settings_msg().clear_input_on_send);
+}
+
 #[test]
 fn the_scrollback_badge_counts_down_to_done() {
     let mut t = H::password();

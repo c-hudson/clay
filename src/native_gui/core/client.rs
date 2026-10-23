@@ -2054,6 +2054,7 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         tts_voice: s.tts_voice.clone(),
         scrollback_enabled: s.scrollback_enabled,
         log_input_enabled: s.log_input_enabled,
+        clear_input_on_send: Some(s.clear_input_on_send),
         keyboard_always_visible: s.keyboard_always_visible,
         tabs: s.tabs.clone(),
         icon_bar: s.icon_bar.clone(),

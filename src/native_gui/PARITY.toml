@@ -2676,6 +2676,14 @@ feature = "input line under the status bar: prompt beside the text, input_height
 note = "core/input.rs + ui/input_view.rs"
 
 [[item]]
+id = "ui:input.sent_lines"
+section = "input"
+phase = 3
+status = "done"
+feature = "lines sent stay in the input area above the next one until they scroll off the top (TF's %cleardone off, Settings::clear_input_on_send), each with its prompt, a masked one with only its prompt; redraw clears them"
+note = "ui/input_view.rs fit_sent/paint_sent; app.js keepSentLine/layoutInputArea; console InputArea::sent"
+
+[[item]]
 id = "ui:input.editing"
 section = "input"
 phase = 3

@@ -351,9 +351,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let separator_area = chunks[2];
     let input_area = chunks[3];
 
-    // Update input dimensions and prompt length for viewport calculation
-    app.input.set_dimensions(input_area.width, app.input_height);
-    app.input.prompt_len = strip_ansi_codes(&app.current_world().prompt).chars().count();
+    fit_input_area(app, input_area.width);
 
     // The frame the output area goes back to crossterm (a popup closed, the splash or the
     // split editor went), crossterm must repaint all of it: ratatui no longer blanks it
@@ -1570,8 +1568,9 @@ fn queue_input_cursor(app: &App, stdout: &mut std::io::Stdout) {
     let stats_line_height: u16 = if app.current_world().stats_line_shown { 1 } else { 0 };
     let input_area_y = app.output_height + stats_line_height + app.separator_rows();
     let input_area_width = term_width.max(1);
+    let (sent_rows, live_height) = input_rows_split(app);
 
-    if viewport_line < app.input_height as usize {
+    if viewport_line < live_height {
         // Calculate cursor column accounting for newlines in the buffer
         let masked = app.current_world().protocol.echo_masked;
         let first_line_capacity = input_area_width.saturating_sub(prompt_len);
@@ -1607,7 +1606,7 @@ fn queue_input_cursor(app: &App, stdout: &mut std::io::Stdout) {
 
         let cursor_x = cursor_col as u16;
         // Calculate visual line within viewport
-        let cursor_y = input_area_y + viewport_line as u16;
+        let cursor_y = input_area_y + (sent_rows + viewport_line) as u16;
         let max_y = input_area_y + app.input_height - 1;
         let _ = stdout.queue(cursor::MoveTo(cursor_x, cursor_y.min(max_y)));
     }
@@ -2577,11 +2576,12 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Set cursor position (offset by prompt length on first line)
+    // Set cursor position (offset by prompt length on first line), below any sent lines
     let cursor_line = app.input.cursor_line();
     let viewport_line = cursor_line.saturating_sub(app.input.viewport_start_line);
+    let (sent_rows, live_height) = input_rows_split(app);
 
-    if viewport_line < app.input_height as usize {
+    if viewport_line < live_height {
         let masked = app.current_world().protocol.echo_masked;
         let inner_width = area.width.max(1) as usize;
         let first_line_capacity = inner_width.saturating_sub(prompt_len);
@@ -2617,7 +2617,7 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
 
         let cursor_x = area.x + cursor_col as u16;
         // Calculate visual line within viewport
-        let cursor_y = area.y + viewport_line as u16;
+        let cursor_y = area.y + (sent_rows + viewport_line) as u16;
         f.set_cursor(cursor_x, cursor_y.min(area.y + area.height - 1));
     }
 }
@@ -2681,34 +2681,14 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    // The rows left for the line being typed, below the lines already sent.
+    let (sent_rows, live_height) = input_rows_split(app);
+
     // If we're at the start, render the prompt first
     if app.input.viewport_start_line == 0 && !prompt.is_empty() {
-        // Check if prompt has ANSI codes
-        let has_ansi = prompt.contains("\x1b[");
-
-        if has_ansi {
-            // Parse ANSI codes and render with proper styling
-            match ansi_to_tui::IntoText::into_text(&prompt) {
-                Ok(text) => {
-                    // Collect all spans from all lines into a single line
-                    let mut all_spans: Vec<Span<'static>> = Vec::new();
-                    for line in text.lines {
-                        for span in line.spans {
-                            all_spans.push(span);
-                        }
-                    }
-                    if !all_spans.is_empty() {
-                        lines.push(Line::from(all_spans));
-                    }
-                }
-                Err(_) => {
-                    // Fallback: render as plain text without adding color
-                    lines.push(Line::from(Span::raw(prompt.to_string())));
-                }
-            }
-        } else {
-            // No ANSI codes — render as-is without adding color
-            lines.push(Line::from(Span::raw(prompt.to_string())));
+        let spans = prompt_spans(prompt);
+        if !spans.is_empty() {
+            lines.push(Line::from(spans));
         }
     }
 
@@ -2769,7 +2749,7 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
             if first_line_has_nl && char_pos < chars.len() && chars[char_pos] == '\n' {
                 char_pos += 1;
             }
-            while char_pos < chars.len() && lines.len() < app.input_height as usize {
+            while char_pos < chars.len() && lines.len() < live_height {
                 let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
                 let line_end = char_pos + chars_on_line;
                 let mut spans: Vec<Span<'static>> = Vec::new();
@@ -2821,7 +2801,7 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
         } else if remaining_width == 0 {
             // Prompt fills the line exactly, user input starts on next line
             let mut char_pos = 0;
-            while char_pos < chars.len() && lines.len() < app.input_height as usize {
+            while char_pos < chars.len() && lines.len() < live_height {
                 let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
                 let line_end = char_pos + chars_on_line;
                 let text: String = chars[char_pos..line_end].iter().collect();
@@ -2835,7 +2815,7 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
     } else if app.input.viewport_start_line == 0 && prompt.is_empty() {
         // No prompt, just render user input
         let mut char_pos = 0;
-        while char_pos < chars.len() && lines.len() < app.input_height as usize {
+        while char_pos < chars.len() && lines.len() < live_height {
             let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
             let line_end = char_pos + chars_on_line;
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -2893,7 +2873,7 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
         // holding many blank lines the text drawn here came from a completely different
         // part of the buffer than the one the cursor was placed in.
         let mut char_pos = 0usize;
-        while char_pos < chars.len() && lines.len() < app.input_height as usize {
+        while char_pos < chars.len() && lines.len() < live_height {
             let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
             let line_end = char_pos + chars_on_line;
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -2944,11 +2924,77 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
     }
 
     // Pad remaining lines
-    while lines.len() < app.input_height as usize {
+    while lines.len() < live_height {
         lines.push(Line::from(""));
     }
 
+    if sent_rows > 0 {
+        let mut all = sent_lines(&app.input, width, sent_rows);
+        all.extend(lines);
+        lines = all;
+    }
     Text::from(lines)
+}
+
+/// Size the input area for this frame, `width` columns: its prompt, and the split between
+/// lines already sent (TF's %cleardone off), which take its top rows, and the line being
+/// typed, which gets the rest - its viewport scrolls in those alone.
+pub(crate) fn fit_input_area(app: &mut App, width: u16) {
+    app.input.prompt_len = strip_ansi_codes(&app.current_world().prompt).chars().count();
+    app.input.set_dimensions(width, app.input_height);
+    if app.settings.clear_input_on_send {
+        app.input.clear_sent();
+    }
+    let sent_rows = app.input.fit_sent(app.input_height as usize) as u16;
+    if sent_rows > 0 {
+        app.input.set_dimensions(width, app.input_height - sent_rows);
+    }
+}
+
+/// The input area's rows as (lines sent, still shown above - TF's %cleardone off; rows
+/// for the line being typed). `ui()` fits `InputArea::sent_rows` to the area each frame;
+/// this only keeps a caller that skipped it from drawing past the area.
+pub(crate) fn input_rows_split(app: &App) -> (usize, usize) {
+    let height = (app.input_height as usize).max(1);
+    let sent = app.input.sent_rows.min(height - 1);
+    (sent, height - sent)
+}
+
+/// A prompt as spans: its ANSI colours, or as-is when it has none.
+fn prompt_spans(prompt: &str) -> Vec<Span<'static>> {
+    if !prompt.contains("\x1b[") {
+        return vec![Span::raw(prompt.to_string())];
+    }
+    match ansi_to_tui::IntoText::into_text(&prompt) {
+        // Every line's spans on one line: a prompt is drawn on a single row.
+        Ok(text) => text.lines.into_iter().flat_map(|line| line.spans).collect(),
+        Err(_) => vec![Span::raw(prompt.to_string())],
+    }
+}
+
+/// The last `count` rows of the lines sent from the input area (TF's %cleardone off), each
+/// with the prompt it was typed after, wrapped at `width` as `SentEntry::rows` wraps them.
+fn sent_lines(input: &crate::input::InputArea, width: usize, count: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Newest first, so only the entries that can show are wrapped.
+    for entry in input.sent.iter().rev() {
+        if lines.len() >= count {
+            break;
+        }
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        for (k, text) in entry.rows(width).into_iter().enumerate() {
+            let mut spans = if k == 0 && !entry.prompt.is_empty() { prompt_spans(&entry.prompt) } else { Vec::new() };
+            if !text.is_empty() {
+                spans.push(Span::raw(text));
+            }
+            rows.push(Line::from(spans));
+        }
+        rows.extend(lines);
+        lines = rows;
+    }
+    let skip = lines.len().saturating_sub(count);
+    lines.drain(..skip);
+    lines
 }
 
 pub(crate) fn render_confirm_dialog(f: &mut Frame, app: &App) {

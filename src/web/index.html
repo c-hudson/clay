@@ -202,6 +202,9 @@
             <!-- The input's top edge: drag it up or down to resize the input (app.js
                  startInputResize); the row count is saved as the Input height setting. -->
             <div id="input-resize-handle" title="Drag to resize the input"></div>
+            <!-- The lines already sent, still on screen above the one being typed (TF's
+                 %cleardone off; app.js keepSentLine/layoutInputArea). Never on a phone. -->
+            <div id="input-sent" aria-hidden="true"></div>
             <span id="prompt"></span>
             <textarea id="input" autocomplete="off" autocapitalize="off" spellcheck="true" inputmode="text" autofocus rows="1"></textarea>
             <button id="send-btn">Send</button>
@@ -938,6 +941,12 @@
                                             <span class="setting-label">New Indicator</span>
                                             <div class="setting-value">
                                                 <div id="setup-new-line-indicator-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row" title="Off (TinyFugue's default): lines you send stay in the input area above the next one until they scroll off. On: Enter clears the input. Phones always clear.">
+                                            <span class="setting-label">Clear Input on Send</span>
+                                            <div class="setting-value">
+                                                <div id="setup-clear-input-toggle" class="toggle"></div>
                                             </div>
                                         </div>
                                         <div class="setting-row" title="Keep the on-screen keyboard visible on phones/tablets. Ignored (soft keyboard hidden) whenever a hardware keyboard is attached.">

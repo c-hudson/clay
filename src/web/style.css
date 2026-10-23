@@ -1129,6 +1129,8 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
 /* ─── Input Area ─── */
 #input-container {
     display: flex;
+    /* #input-sent takes a whole line of its own above the prompt and textarea. */
+    flex-wrap: wrap;
     /* The prompt sits on the input's FIRST row: centred, it was level with the second
        of a multi-row input (and a little low on one row). */
     align-items: flex-start;
@@ -1157,6 +1159,31 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
     cursor: ns-resize;
     touch-action: none;
     z-index: 3;
+}
+
+/* The lines already sent, still on screen above the one being typed (TF's %cleardone
+   off): app.js layoutInputArea gives it whole rows of the input's height, scrolled to its
+   bottom, and the textarea the rest - so the input area never changes height on Enter.
+   Same font, size, line height and colour as the textarea. */
+#input-sent {
+    flex: 0 0 100%;
+    height: 0;
+    overflow: hidden;
+    color: var(--text-color);
+    font-family: var(--mono);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.0;
+    font-variant-ligatures: none;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+/* The text after a prompt starts where the textarea's would: past its 2px padding. */
+#input-sent .sent-text {
+    padding-left: 2px;
+}
+body.device-phone #input-sent {
+    display: none;
 }
 
 #prompt {

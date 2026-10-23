@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use unicode_width::UnicodeWidthChar;
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -334,6 +335,68 @@ pub enum HistorySub {
     NoMatch,
 }
 
+/// A line sent from the input area, as TinyFugue leaves it on screen when `%cleardone` is
+/// off (`Settings::clear_input_on_send`): the prompt it was typed after, and its text - none
+/// for a line typed while the world masked echo, which TF leaves as just its prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentEntry {
+    pub prompt: String,
+    pub text: String,
+}
+
+impl SentEntry {
+    /// The most of a sent line's text kept: more rows than the tallest input area (15)
+    /// shows at any terminal or window width, so a huge paste, wrapped again on every
+    /// frame, costs no more than this.
+    pub const MAX_TEXT: usize = 8192;
+
+    /// The line `text`, typed after `prompt`; of a huge one only its end, all that shows.
+    pub fn new(prompt: String, text: String) -> Self {
+        let text = match text.len().checked_sub(Self::MAX_TEXT) {
+            Some(mut cut) if cut > 0 => {
+                while !text.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                text[cut..].to_string()
+            }
+            _ => text,
+        };
+        SentEntry { prompt, text }
+    }
+
+    /// The text on each row the entry fills at `width`, wrapped as the input itself wraps
+    /// (`InputArea::walk_line_starts`): the first row starts after the prompt, a line break
+    /// ends a row, and control characters are their drawn stand-ins.
+    pub fn rows(&self, width: usize) -> Vec<String> {
+        let width = width.max(1);
+        let prompt_len = crate::util::strip_ansi_codes(&self.prompt).chars().count();
+        // As render_input: a prompt that exactly fills its row leaves the text the next one.
+        let first = match prompt_len % width {
+            0 if prompt_len > 0 => 0,
+            used => width - used,
+        };
+        let mut rows = vec![String::new()];
+        let mut col = 0usize;
+        for c in self.text.chars() {
+            if c == '\n' {
+                rows.push(String::new());
+                col = 0;
+                continue;
+            }
+            let c = display_control_char(c);
+            let cw = input_char_width(c);
+            let capacity = if rows.len() == 1 { first } else { width };
+            if col + cw > capacity && (col > 0 || capacity == 0) {
+                rows.push(String::new());
+                col = 0;
+            }
+            rows.last_mut().expect("never empty").push(c);
+            col += cw;
+        }
+        rows
+    }
+}
+
 pub struct InputArea {
     pub buffer: String,
     pub cursor_position: usize,
@@ -365,6 +428,12 @@ pub struct InputArea {
     /// `App::process_pending_keyboard_ops`). `insert_char` overwrites the character under
     /// the cursor when this is `false` (appending instead, at end of line).
     pub insert: bool,
+    /// The lines sent from here that are still on screen above the one being typed (TF's
+    /// `%cleardone` off), oldest first, and how many of their rows show: `fit_sent` trims
+    /// it as the typed line grows, and rows it scrolls off never come back, as in TF.
+    /// Display state of this console only - nothing else sees it.
+    pub sent: VecDeque<SentEntry>,
+    pub sent_rows: usize,
 }
 
 impl InputArea {
@@ -385,7 +454,69 @@ impl InputArea {
             kbnum: None,
             kbnum_sign: 1,
             insert: true,
+            sent: VecDeque::new(),
+            sent_rows: 0,
         }
+    }
+
+    /// Leave a sent line on screen above the next one (TF's `%cleardone` off): its rows
+    /// at the current width join those shown; `fit_sent` keeps them inside the area.
+    pub fn push_sent(&mut self, entry: SentEntry) {
+        self.sent_rows += entry.rows(self.width as usize).len();
+        self.sent.push_back(entry);
+    }
+
+    /// Forget every sent line (`/dokey redraw`, the setting turned on).
+    pub fn clear_sent(&mut self) {
+        self.sent.clear();
+        self.sent_rows = 0;
+    }
+
+    /// The display lines the typed line fills, counted to at most `max` (and at least
+    /// one): its whole length, not just up to the cursor, as TF grows the input window.
+    pub fn live_rows(&self, max: usize) -> usize {
+        let mut rows = 1usize;
+        if max > 1 {
+            self.walk_line_starts(|line, _| {
+                rows = line + 1;
+                rows < max
+            });
+        }
+        rows.min(max.max(1))
+    }
+
+    /// Fit the sent lines into an input area `height` rows tall, at the current width and
+    /// prompt: as many of their last rows as the typed line leaves room for. Trimming is
+    /// for good (TF scrolled them off), and entries wholly above what shows are dropped.
+    /// Returns the rows shown.
+    pub fn fit_sent(&mut self, height: usize) -> usize {
+        if self.sent.is_empty() {
+            self.sent_rows = 0;
+            return 0;
+        }
+        // One past the area, to tell "fills it" from "needs scrolling".
+        let live = self.live_rows(height + 1);
+        let room = height.saturating_sub(live);
+        let width = self.width as usize;
+        let mut rows = 0usize;
+        let mut keep = 0usize;
+        for entry in self.sent.iter().rev() {
+            if rows >= self.sent_rows.min(room) {
+                break;
+            }
+            rows += entry.rows(width).len();
+            keep += 1;
+        }
+        self.sent_rows = self.sent_rows.min(room).min(rows);
+        let drop = self.sent.len() - keep;
+        self.sent.drain(..drop);
+        // A typed line that fits below them is never scrolled: as it grew, a frame with
+        // the old split could scroll its first row away, and adjust_viewport alone only
+        // moves the viewport to keep the cursor in it.
+        if live <= height - self.sent_rows {
+            self.viewport_start_line = 0;
+        }
+        self.sent_rows
     }
 
     pub fn set_dimensions(&mut self, width: u16, height: u16) {

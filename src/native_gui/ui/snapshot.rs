@@ -180,7 +180,8 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                         let last: Vec<String> = v.session.core.current_world().map_or(Vec::new(), |w| {
                             w.lines.iter().rev().take(3).map(|l| super::find::plain(&l.text)).collect()
                         });
-                        println!("snapshot-input: {arg} text={:?} cursor={} last_lines={:?} picture_upload={}", v.editor.text, v.editor.cursor, last, v.session.core.server_picture_upload);
+                        let sent: Vec<String> = v.input.sent.iter().map(|e| format!("{}{}", super::find::plain(&e.prompt), e.text)).collect();
+                        println!("snapshot-input: {arg} text={:?} cursor={} last_lines={:?} picture_upload={} sent={:?} sent_rows={}", v.editor.text, v.editor.cursor, last, v.session.core.server_picture_upload, sent, v.input.sent_rows);
                     });
                     Vec::new()
                 }

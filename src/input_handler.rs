@@ -832,6 +832,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.init_scrollback();
                 }
                 app.settings.log_input_enabled = settings.log_input;
+                app.settings.clear_input_on_send = settings.clear_input_on_send;
                 // Rewrap already-visible output immediately (mirrors a terminal resize) only
                 // when wrapspace actually changed, so an unrelated setup save doesn't force
                 // a spurious redraw. No clamp beyond the popup's 0-20 field range — the
@@ -1405,7 +1406,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         // ECHO masking (plan Phase 3, step 3.4): a masked line must never enter
         // arrow-key recall history - see InputArea::take_input's doc comment.
         let record_history = !app.current_world().protocol.echo_masked;
-        let input = app.input.take_input(record_history);
+        let input = app.take_input_line(record_history);
         if !input.is_empty() || app.current_world().connected {
             // /dump is passive — don't reset more-mode state
             let is_dump = input.trim().eq_ignore_ascii_case("/dump");
@@ -2204,7 +2205,11 @@ fn dispatch_action_impl(action: &str, app: &mut App) -> Option<KeyAction> {
             app.open_help_popup_new();
             KeyAction::None
         }
-        "redraw" => KeyAction::Redraw,
+        "redraw" => {
+            // TF's redraw clears its input window too, lines left by %cleardone included.
+            app.input.clear_sent();
+            KeyAction::Redraw
+        }
         "reload" => KeyAction::Reload,
         "quit" => {
             // Double-press Ctrl+C logic
@@ -2404,7 +2409,10 @@ fn dispatch_action_impl(action: &str, app: &mut App) -> Option<KeyAction> {
         // runs `World::filter_to_server_output` there (see `KeyAction::Refresh`'s doc
         // comment).
         "refresh_line" => KeyAction::Refresh,
-        "redraw_server_only" => KeyAction::Redraw,
+        "redraw_server_only" => {
+            app.input.clear_sent();
+            KeyAction::Redraw
+        }
 
         // TF-parity plan Job 22a (P2.6/finding A ruling table, `Esc-L`): toggle the F4
         // filter popup between "no limit" and "the last limit applied" - real TF has no

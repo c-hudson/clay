@@ -847,6 +847,10 @@ pub enum WsMessage {
         /// See `Settings::log_input_enabled`'s doc comment in main.rs.
         #[serde(default)]
         log_input_enabled: bool,
+        /// `Settings::clear_input_on_send` (TF's `%cleardone`). `None` (an older client,
+        /// which doesn't know it) = unchanged: a save from it must not reset the setting.
+        #[serde(default)]
+        clear_input_on_send: Option<bool>,
         #[serde(default = "default_keyboard_always_visible")]
         keyboard_always_visible: bool,
         #[serde(default)]
@@ -1927,6 +1931,10 @@ pub struct GlobalSettingsMsg {
     /// See `Settings::log_input_enabled`'s doc comment in main.rs.
     #[serde(default)]
     pub log_input_enabled: bool,
+    /// `Settings::clear_input_on_send` (TF's `%cleardone`); false from a server before it
+    /// existed, which keeps sent lines in the input area as TF does by default.
+    #[serde(default)]
+    pub clear_input_on_send: bool,
     /// Force the on-screen keyboard visible on phone/tablet web clients (Android
     /// app included); ignored when a hardware keyboard is attached.
     #[serde(default = "default_keyboard_always_visible")]

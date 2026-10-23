@@ -2620,6 +2620,177 @@
         assert_eq!(cx, 4, "unmasked cursor column must count 中's real display width (2)");
     }
 
+    /// The input area as TF's %cleardone off leaves it (`Settings::clear_input_on_send`
+    /// false): an App with one world, an input `height` rows tall.
+    fn sent_lines_app(height: u16) -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].prompt = String::new();
+        app.input_height = height;
+        assert!(!app.settings.clear_input_on_send, "keeping sent lines is the default, as in TF");
+        app
+    }
+
+    /// Type `text` into the input, as if keyed in.
+    fn type_input(app: &mut App, text: &str) {
+        app.input.buffer = text.to_string();
+        app.input.cursor_position = app.input.buffer.len();
+    }
+
+    /// Draw the input area `width` columns wide as a frame does: (its rows, the cursor).
+    fn draw_input_area(app: &mut App, width: u16) -> (Vec<String>, (u16, u16)) {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        rendering::fit_input_area(app, width);
+        let height = app.input_height;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| { rendering::render_input_area(f, app, Rect::new(0, 0, width, height)); }).unwrap();
+        let rows = (0..height).map(|y| render_row_text(terminal.backend().buffer(), y, width).trim_end().to_string()).collect();
+        (rows, terminal.get_cursor().unwrap())
+    }
+
+    /// TF's input window with %cleardone off (checked against real tf in a pty): each sent
+    /// line stays, the next starts on the row below, and once the area is full the oldest
+    /// row scrolls off the top.
+    #[test]
+    fn test_sent_lines_stay_in_the_input_area_and_scroll_off_the_top() {
+        let mut app = sent_lines_app(3);
+        type_input(&mut app, "first line");
+        assert_eq!(app.take_input_line(true), "first line");
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["first line", "", ""]);
+        assert_eq!(cursor, (0, 1));
+        type_input(&mut app, "second line");
+        app.take_input_line(true);
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["first line", "second line", ""]);
+        assert_eq!(cursor, (0, 2));
+        type_input(&mut app, "third line");
+        app.take_input_line(true);
+        type_input(&mut app, "fourth");
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["second line", "third line", "fourth"]);
+        assert_eq!(cursor, (6, 2));
+        // An empty line takes a row too, as in TF.
+        app.input.clear();
+        app.take_input_line(true);
+        let (rows, _) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["third line", "", ""]);
+    }
+
+    /// The typed line grows downward; when it needs a sent line's row that row goes, and it
+    /// does not come back when the line shrinks again (TF's ^U leaves the gap).
+    #[test]
+    fn test_a_growing_line_scrolls_sent_lines_off_for_good() {
+        let mut app = sent_lines_app(3);
+        for line in ["one", "two"] {
+            type_input(&mut app, line);
+            app.take_input_line(true);
+        }
+        type_input(&mut app, "a long entry that wraps past the forty column edge");
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["two", "a long entry that wraps past the forty c", "olumn edge"]);
+        assert_eq!(cursor, (10, 2));
+        app.input.clear();
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["two", "", ""]);
+        assert_eq!(cursor, (0, 1));
+        // History recall replaces only the typed line.
+        app.input.history_prev();
+        let (rows, _) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["two", "two", ""]);
+    }
+
+    /// A line typed at a masked prompt leaves only its prompt, as TF does; a sent line keeps
+    /// the prompt it was typed after.
+    #[test]
+    fn test_sent_lines_keep_their_prompt_and_a_masked_line_leaves_only_it() {
+        let mut app = sent_lines_app(3);
+        app.worlds[0].prompt = "HP:10> ".to_string();
+        type_input(&mut app, "look");
+        app.take_input_line(true);
+        app.worlds[0].prompt = "Password: ".to_string();
+        app.worlds[0].protocol.echo_masked = true;
+        type_input(&mut app, "secret");
+        app.take_input_line(false);
+        app.worlds[0].protocol.echo_masked = false;
+        app.worlds[0].prompt = "HP:12> ".to_string();
+        type_input(&mut app, "n");
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["HP:10> look", "Password:", "HP:12> n"]);
+        assert_eq!(cursor, (8, 2));
+        assert!(app.input.sent.iter().all(|e| !e.text.contains("secret")), "the password is never kept");
+    }
+
+    /// Clear Input on Send (TF's %cleardone on) is Clay's old behaviour, and turning it on
+    /// drops what was kept; an input one row high never shows a sent line; the redraw
+    /// action (^L) clears them, as TF's redraw clears its input window.
+    #[test]
+    fn test_sent_lines_cleardone_height_one_and_redraw() {
+        let mut app = sent_lines_app(3);
+        type_input(&mut app, "kept");
+        app.take_input_line(true);
+        app.settings.clear_input_on_send = true;
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["", "", ""]);
+        assert_eq!(cursor, (0, 0));
+        assert!(app.input.sent.is_empty());
+        type_input(&mut app, "not kept");
+        app.take_input_line(true);
+        assert!(app.input.sent.is_empty());
+
+        app.settings.clear_input_on_send = false;
+        app.input_height = 1;
+        type_input(&mut app, "gone");
+        app.take_input_line(true);
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, [""]);
+        assert_eq!(cursor, (0, 0));
+
+        app.input_height = 3;
+        type_input(&mut app, "a");
+        app.take_input_line(true);
+        let (rows, _) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["a", "", ""]);
+        input_handler::dispatch_action("redraw", &mut app);
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["", "", ""]);
+        assert_eq!(cursor, (0, 0));
+    }
+
+    /// Of a huge sent line only the end is kept - all an input area can show - so a big
+    /// paste doesn't cost every later frame its whole length.
+    #[test]
+    fn test_a_huge_sent_line_keeps_only_its_end() {
+        let mut app = sent_lines_app(3);
+        type_input(&mut app, &format!("{}end of paste", "é".repeat(20_000)));
+        app.take_input_line(true);
+        let kept = &app.input.sent.back().unwrap().text;
+        assert!(kept.len() <= crate::input::SentEntry::MAX_TEXT && kept.ends_with("end of paste"));
+        let (rows, cursor) = draw_input_area(&mut app, 40);
+        assert!(rows[1].ends_with("end of paste"), "{rows:?}");
+        assert_eq!(cursor, (0, 2));
+    }
+
+    /// Sent lines rewrap at a new width, the way the typed line does.
+    #[test]
+    fn test_sent_lines_rewrap_when_the_width_changes() {
+        let mut app = sent_lines_app(3);
+        type_input(&mut app, "abcdefghijklmnopqrstuvwxyz");
+        app.take_input_line(true);
+        let (rows, _) = draw_input_area(&mut app, 40);
+        assert_eq!(rows, ["abcdefghijklmnopqrstuvwxyz", "", ""]);
+        let (rows, cursor) = draw_input_area(&mut app, 20);
+        assert_eq!(rows, ["uvwxyz", "", ""], "1 row was shown, so 1 row - its last - still is");
+        assert_eq!(cursor, (0, 1));
+        // A line with a newline in it keeps its rows.
+        type_input(&mut app, "x\ny");
+        app.take_input_line(true);
+        let (rows, _) = draw_input_area(&mut app, 20);
+        assert_eq!(rows, ["x", "y", ""]);
+    }
+
     /// Reads one full row of a `TestBackend` buffer back out as a plain `String`
     /// (concatenated cell symbols), for asserting on rendered content in the tests
     /// below.
@@ -9940,6 +10111,11 @@ third
     // skip entirely (T37).
 
     fn call_update_global_settings(app: &mut App, gui_transparency: f32, color_offset_percent: u8, input_height: u16, font_size: f32, ws_password: &str) {
+        call_update_global_settings_clearing(app, gui_transparency, color_offset_percent, input_height, font_size, ws_password, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_update_global_settings_clearing(app: &mut App, gui_transparency: f32, color_offset_percent: u8, input_height: u16, font_size: f32, ws_password: &str, clear_input_on_send: Option<bool>) {
         app.update_global_settings(
             0, true, true, true,
             "unseen".to_string(), false, false, true,
@@ -9950,9 +10126,23 @@ third
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), ws_password.to_string(),
             false, String::new(), true, true, false,
-            "off".to_string(), "off".to_string(), String::new(), false, false, true,
+            "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
             "none".to_string(), "app_tablet".to_string(), None, None,
         );
+    }
+
+    /// Clear Input on Send from a client that knows it is applied; a save from an older
+    /// client, which doesn't (`None`), leaves it alone.
+    #[test]
+    fn test_update_global_settings_clear_input_on_send_none_is_unchanged() {
+        let mut app = App::new();
+        call_update_global_settings_clearing(&mut app, 1.0, 0, 5, 14.0, "", Some(true));
+        assert!(app.settings.clear_input_on_send);
+        call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "");
+        assert!(app.settings.clear_input_on_send, "an older client's save must not reset it");
+        call_update_global_settings_clearing(&mut app, 1.0, 0, 5, 14.0, "", Some(false));
+        assert!(!app.settings.clear_input_on_send);
+        assert!(!app.build_global_settings_msg().clear_input_on_send);
     }
 
     #[test]
@@ -17749,8 +17939,18 @@ third
         run(&mut app, "/isize 99");
         assert_eq!(app.input_height, 15, "clamped to what Clay allows");
         assert_eq!(app.tf_engine.get_var("isize").map(|v| v.to_string_value()), Some("15".to_string()));
+        // %cleardone is Clay's Clear Input on Send: off (TF's default) keeps sent lines.
+        app.sync_tf_world_info();
+        assert_eq!(app.tf_engine.get_var("cleardone").map(|v| v.to_string_value()), Some("off".to_string()));
+        run(&mut app, "/cleardone on");
+        assert!(app.settings.clear_input_on_send);
+        run(&mut app, "/set cleardone=off");
+        assert!(!app.settings.clear_input_on_send);
+        app.settings.clear_input_on_send = true;
+        app.sync_tf_world_info();
+        assert_eq!(app.tf_engine.get_var("cleardone").map(|v| v.to_string_value()), Some("on".to_string()));
         // Mirrored values are Clay's, not TF variables: never written to [tf_globals].
-        assert!(!app.tf_engine.persistable_globals().iter().any(|(n, _)| ["more", "wrapspace", "isize"].contains(&n.as_str())));
+        assert!(!app.tf_engine.persistable_globals().iter().any(|(n, _)| ["more", "wrapspace", "isize", "cleardone"].contains(&n.as_str())));
     }
 
     // ======================================================================

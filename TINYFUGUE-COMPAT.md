@@ -191,8 +191,8 @@ against real tf 5.0b8, mostly by driving it in a pty.
   return an operand), arguments keep their spacing (`%*`, `%-N`), `%|` pipes, `/def`
   priority 1 by default, `-P` partial attributes, hook lists (`-hCONNECT|LOGIN`).
 - **Special variables** (`src/tf/special_vars.rs`): TF's table with its defaults, where
-  seeding changes nothing Clay does. `more`, `wrapspace`, `isize`, `insert` and `visual`
-  stand for Clay's own settings (`/set more=on` turns Clay's more-paging on, in every
+  seeding changes nothing Clay does. `more`, `wrapspace`, `isize`, `insert`, `cleardone`
+  and `visual` stand for Clay's own settings (`/set more=on` turns Clay's more-paging on, in every
   interface). Flag commands (`/quiet`, `/lp`, `/kecho`, ...) as stdlib.tf defines them.
 - **Worlds and login**: TF's `/connect` (Clay's remote attach is now `/server`),
   temporary `/connect host port` worlds, `/addworld` idempotent and saved (a type `-T`
@@ -341,6 +341,12 @@ From the drop-in work (user rulings, or what Clay's design allows):
   the native-tls backend, which don't expose it.
 - `/recall -a` can take a line's own attributes off only while Clay is running: after a
   hot reload the line keeps them, drawn in.
+- `%cleardone` off (the default) leaves sent lines in the input area as TF does, checked
+  against tf in a pty (rows, prompts, a masked line's bare prompt, rows scrolled off for
+  good, `^L` clearing them); `%clearfull` is not followed (Clay scrolls, TF's default).
+  The input wraps at the edge, not at word boundaries as tf's input window does. On a
+  phone (the web client's and the Android app's phone layout) the input always clears
+  (user ruling); Termux's console and GUI follow the setting like any other.
 
 ## Changed Defaults — Release Note
 

@@ -765,6 +765,10 @@ impl ClayView {
         }
         restyle |= self.fonts.set_user(&font.name, font.weight);
         let (spell_on, dict) = (s.spell_check_enabled, s.dictionary_path.clone());
+        self.input.clear_on_send = s.clear_input_on_send;
+        if s.clear_input_on_send {
+            self.input.clear_sent();
+        }
         let height = input_view::input_height_of(s);
         if height != self.input_height_seen {
             self.input_height_seen = height;

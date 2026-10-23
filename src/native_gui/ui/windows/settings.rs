@@ -432,6 +432,7 @@ impl SettingsView {
         let right_toggles: Vec<Toggle> = vec![
             ("ANSI Music", e.ansi_music_enabled, |s| s.ansi_music_enabled = !s.ansi_music_enabled),
             ("ZWJ Sequence", e.zwj_enabled, |s| s.zwj_enabled = !s.zwj_enabled),
+            ("Clear Input on Send", e.clear_input_on_send, |s| s.clear_input_on_send = !s.clear_input_on_send),
         ];
         let left = toggles(left, cx);
         let right = toggles(right_toggles, cx)

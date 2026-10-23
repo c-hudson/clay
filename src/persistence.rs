@@ -490,6 +490,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "tts_voice={}", app.settings.tts_voice)?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
+    writeln!(file, "clear_input_on_send={}", app.settings.clear_input_on_send)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
     writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
@@ -1372,6 +1373,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "log_input_enabled" => {
                         app.settings.log_input_enabled = value == "true";
                     }
+                    "clear_input_on_send" => {
+                        app.settings.clear_input_on_send = value == "true";
+                    }
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
                     }
@@ -2231,6 +2235,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "tts_voice={}", app.settings.tts_voice)?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
+    writeln!(file, "clear_input_on_send={}", app.settings.clear_input_on_send)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
     writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
@@ -3279,6 +3284,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "log_input_enabled" => {
                         app.settings.log_input_enabled = value == "true";
                     }
+                    "clear_input_on_send" => {
+                        app.settings.clear_input_on_send = value == "true";
+                    }
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
                     }
@@ -3861,6 +3869,7 @@ mod tests {
             web_font_word_spacing: 2.0,        // default: 0.0
             scrollback_enabled: true,          // default: false
             log_input_enabled: true,           // default: false
+            clear_input_on_send: true,         // default: false
             keyboard_always_visible: false,    // default: true
             tabs: TabsMode::Top,               // default: None
             icon_bar: IconBarMode::All,        // default: AppTablet
@@ -3987,6 +3996,7 @@ mod tests {
         assert_eq!(a.tts_voice, b.tts_voice, "{context}: tts_voice");
         assert_eq!(a.scrollback_enabled, b.scrollback_enabled, "{context}: scrollback_enabled");
         assert_eq!(a.log_input_enabled, b.log_input_enabled, "{context}: log_input_enabled");
+        assert_eq!(a.clear_input_on_send, b.clear_input_on_send, "{context}: clear_input_on_send");
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
         assert_eq!(a.tabs, b.tabs, "{context}: tabs");
         assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
@@ -5265,6 +5275,7 @@ pattern=foo
         assert_ne!(non_default.tts_voice, default.tts_voice, "tts_voice should differ");
         assert_ne!(non_default.scrollback_enabled, default.scrollback_enabled, "scrollback_enabled should differ");
         assert_ne!(non_default.log_input_enabled, default.log_input_enabled, "log_input_enabled should differ");
+        assert_ne!(non_default.clear_input_on_send, default.clear_input_on_send, "clear_input_on_send should differ");
         assert_ne!(non_default.keyboard_always_visible, default.keyboard_always_visible, "keyboard_always_visible should differ");
         assert_ne!(non_default.tabs, default.tabs, "tabs should differ");
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");

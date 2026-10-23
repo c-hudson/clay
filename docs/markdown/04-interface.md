@@ -54,6 +54,7 @@ The input area is where you type commands:
 
 - **Prompt display**: Server prompts (detected via telnet GA/EOR, or by timing on MUD - Timed Prompt worlds) shown in cyan
 - **Multi-line support**: Resize with `Alt+Up/Down` (1-15 lines), or drag its top edge — the separator bar in the console, the line above the input in the GUI and web — up or down with the mouse. Either way the height is kept (it is that interface's Input height setting: the console, phones, tablets and desktop clients each have their own) and comes back on the next start and after `/reload`
+- **Lines sent stay on screen**: as in TinyFugue, a line you send stays in the input area, with the prompt it was typed after, and the next one starts on the row below. Once the area is full, the oldest row scrolls off the top, and the line being typed takes the rows it needs from them. A line typed at a password prompt leaves only the prompt. `Ctrl+L` (Redraw) clears them. Turn **Clear Input on Send** on in Settings (TF's `/cleardone on`) to have Enter clear the input instead. On a phone the input always clears
 - **Cursor**: Standard text cursor with left/right movement
 - **Spell checking**: Misspelled words highlighted in red
 

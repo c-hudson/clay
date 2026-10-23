@@ -466,6 +466,7 @@
         noteEditorCancelBtn: document.getElementById('note-editor-cancel-btn'),
         noteEditorTextarea: document.getElementById('note-editor-textarea'),
         inputContainer: document.getElementById('input-container'),
+        inputSent: document.getElementById('input-sent'),
         prompt: document.getElementById('prompt'),
         input: document.getElementById('input'),
         sendBtn: document.getElementById('send-btn'),
@@ -682,6 +683,7 @@
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
+        setupClearInputToggle: document.getElementById('setup-clear-input-toggle'),
         setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
         setupTtsVoiceInput: document.getElementById('setup-tts-voice-input'),
@@ -1465,6 +1467,7 @@
     let setupColorOffset = 0;
     let setupAnsiMusic = true;
     let setupZwj = false;
+    let setupClearInput = false;
     let setupTtsMode = 'Off';
     let setupTabsMode = 'none';
     let setupIconBarMode = 'app_tablet';
@@ -1745,6 +1748,9 @@
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
     let zwjEnabled = false;  // Will be synced from server settings
+    // Clear Input on Send (TF's %cleardone, Settings::clear_input_on_send): off, as in TF,
+    // each line sent stays in the input area above the next (keepSentLine).
+    let clearInputOnSend = false;
     let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'kokoro', 'edge')
     let ttsSpeakMode = 'all';  // 'all' or 'limit'
     let ttsVoice = 'af_heart';  // The Kokoro voice (src/kokoro.rs); the server's engine uses it, not this page
@@ -1905,6 +1911,8 @@
         elements.output.style.fontFamily = monoStyle || '';
         elements.input.style.fontFamily = monoStyle || '';
         if (elements.prompt) elements.prompt.style.fontFamily = monoStyle || '';
+        if (elements.inputSent) elements.inputSent.style.fontFamily = monoStyle || '';
+        layoutInputArea();
     }
 
     function applyFontWeight(w) {
@@ -1936,11 +1944,18 @@
         output.style.lineHeight = '';
         input.style.lineHeight = webFontLineHeight;
         elements.prompt.style.lineHeight = webFontLineHeight;
-        setInputHeight(inputHeight);
         output.style.letterSpacing = webFontLetterSpacing ? webFontLetterSpacing + 'px' : '';
         input.style.letterSpacing = webFontLetterSpacing ? webFontLetterSpacing + 'px' : '';
         output.style.wordSpacing = webFontWordSpacing ? webFontWordSpacing + 'px' : '';
         input.style.wordSpacing = webFontWordSpacing ? webFontWordSpacing + 'px' : '';
+        // The lines sent above the input are drawn as it is (keepSentLine).
+        const sent = elements.inputSent;
+        if (sent) {
+            sent.style.lineHeight = webFontLineHeight;
+            sent.style.letterSpacing = input.style.letterSpacing;
+            sent.style.wordSpacing = input.style.wordSpacing;
+        }
+        setInputHeight(inputHeight);
     }
 
     // ============================================================================
@@ -2545,6 +2560,8 @@
             document.body.classList.add('is-mobile');
         }
         document.body.classList.toggle('desktop-input', desktopInputAttached());
+        // A phone keeps the input that clears on Enter.
+        if (mode === 'phone') clearSentLines();
         applyKeyboardForceState();
         // Device mode affects iconBarVisible() ('app_tablet' mode) - re-render
         // on every device-mode change (auto-detect at startup, or the manual
@@ -4096,6 +4113,12 @@
                     if (msg.settings.zwj_enabled !== undefined) {
                         zwjEnabled = msg.settings.zwj_enabled;
                     }
+                    // Here, not only in saveSettingsAll: the desktop GUI's Settings is a
+                    // window of its own, and this page hears of its saves only from this.
+                    if (msg.settings.clear_input_on_send !== undefined) {
+                        clearInputOnSend = !!msg.settings.clear_input_on_send;
+                        if (clearInputOnSend) clearSentLines();
+                    }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
                     if (msg.settings.tts_voice) ttsVoice = msg.settings.tts_voice;
@@ -4420,8 +4443,10 @@
                                 commandHistory.shift();
                             }
                         }
+                        const resent = sentLineFor(pendingReconnectCommand);
                         elements.input.value = '';
                         elements.prompt.textContent = '';
+                        keepSentLine(resent);
                     }
                     // Clear pending state
                     pendingReconnectCommand = null;
@@ -4977,6 +5002,12 @@
                     }
                     if (msg.settings.zwj_enabled !== undefined) {
                         zwjEnabled = msg.settings.zwj_enabled;
+                    }
+                    // Here, not only in saveSettingsAll: the desktop GUI's Settings is a
+                    // window of its own, and this page hears of its saves only from this.
+                    if (msg.settings.clear_input_on_send !== undefined) {
+                        clearInputOnSend = !!msg.settings.clear_input_on_send;
+                        if (clearInputOnSend) clearSentLines();
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
@@ -6968,7 +6999,19 @@
         return { noMatch: true };
     }
 
+    // Enter. The line typed stays on screen above the next one (keepSentLine) whenever
+    // sending took it out of the input - the early returns (/window --grep, /import, a
+    // failed ^old^new...) included, as TF leaves any line entered. One kept to resend
+    // after a reconnect is left when the reconnect sends it.
     function sendCommand() {
+        if (!authenticated) return;
+        const line = sentLineFor(elements.input.value);
+        const queued = pendingReconnectCommand;
+        sendCommandLine();
+        if (elements.input.value === '' && pendingReconnectCommand === queued) keepSentLine(line);
+    }
+
+    function sendCommandLine() {
         let cmd = elements.input.value;
         if (!authenticated) return;
 
@@ -8580,6 +8623,11 @@
             'Theme: Dark or Light theme for web/GUI clients.', '',
             'Color Offset: Shifts the base ANSI color palette.', '',
             'Input Height: Number of input lines visible (1-10).', '',
+            'Clear Input on Send: Off (TinyFugue\'s default), each',
+            '  line you send stays in the input area above the',
+            '  next one until it scrolls off the top; Ctrl+L',
+            '  clears them. On, Enter clears the input area.',
+            '  Phones always clear. TF\'s %cleardone.', '',
             'More Mode: Pauses output when a full screen of text',
             '  arrives. Keeps you from missing important text.', '',
             'TLS Proxy: Keeps a proxy alive during hot reload', '  so TLS connections survive.', '',
@@ -11645,7 +11693,153 @@
         const lineHeight = (webFontLineHeight || 1.2) * fontSize; // the input's own line height
         elements.input.style.height = (inputHeight * lineHeight) + 'px';
         elements.input.rows = inputHeight;
+        layoutInputArea();
     }
+
+    // ============================================================================
+    // Lines sent, left on screen (TF's %cleardone off; Settings::clear_input_on_send off)
+    // ============================================================================
+    // As in TinyFugue, a line sent stays in the input area as dead text and the next one
+    // starts on the row below; once the area is full, the oldest row scrolls off the top
+    // and never comes back, not even when the typed line shrinks again. Never on a phone,
+    // which keeps the input that clears on Enter. Display state of this page alone; the
+    // console's is InputArea::sent (src/input.rs), the native GUI's InputState::sent.
+    // #input-sent holds one .sent-line per line, its prompt then its text; `sentRows` is
+    // how many of their last rows show above the textarea.
+    let sentRows = 0;
+
+    function keepsSentLines() {
+        return !!elements.inputSent && !clearInputOnSend && deviceMode !== 'phone' && !window.GREP_MODE;
+    }
+
+    function inputRowPx() {
+        return (webFontLineHeight || 1.2) * (currentFontSize || 14);
+    }
+
+    // What is typed now, with the prompt it is typed after, to leave on screen once sent
+    // (keepSentLine). A line typed while the world masks echo keeps only its prompt, as TF
+    // leaves it - and the password is never kept.
+    function sentLineFor(text) {
+        const w = worlds[currentWorldIndex];
+        // Of a huge paste only its end, all that can show (SentEntry::MAX_TEXT).
+        const kept = text.length > 8192 ? text.slice(-8192) : text;
+        return { text: (w && w.echo_masked) ? '' : kept, prompt: elements.prompt.cloneNode(true) };
+    }
+
+    function keepSentLine(line) {
+        if (!keepsSentLines() || shellActive()) return;
+        const entry = document.createElement('div');
+        entry.className = 'sent-line';
+        const prompt = line.prompt;
+        prompt.removeAttribute('id');
+        prompt.removeAttribute('style');
+        prompt.className = 'sent-prompt';
+        entry.appendChild(prompt);
+        const text = document.createElement('span');
+        text.className = 'sent-text';
+        // An empty line takes its row too (a zero-width space gives it a line box).
+        text.textContent = line.text || (prompt.textContent ? '' : '\u200b');
+        entry.appendChild(text);
+        elements.inputSent.appendChild(entry);
+        sentRows += Math.max(1, Math.round(entry.getBoundingClientRect().height / inputRowPx()));
+        layoutInputArea();
+    }
+
+    function clearSentLines() {
+        sentRows = 0;
+        if (elements.inputSent && elements.inputSent.firstChild) {
+            elements.inputSent.textContent = '';
+            layoutInputArea();
+        }
+    }
+
+    // The rows the typed line fills (its whole text, not just up to the caret), measured
+    // with the textarea at no height, where its scrollHeight is its content's.
+    function liveInputRows(rowPx) {
+        const input = elements.input;
+        const height = input.style.height, minHeight = input.style.minHeight, top = input.scrollTop;
+        input.style.minHeight = '0px';
+        input.style.height = '0px';
+        const cs = getComputedStyle(input);
+        const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+        const rows = Math.max(1, Math.round((input.scrollHeight - pad) / rowPx));
+        input.style.height = height;
+        input.style.minHeight = minHeight;
+        input.scrollTop = top;
+        return rows;
+    }
+
+    // Share the input's height between #input-sent (the last `sentRows` rows of the lines
+    // sent, scrolled to its bottom) and the textarea (the rest). The two always add up to
+    // the textarea's own height - its rows, or its CSS min-height when that is more - so
+    // the output above never moves when a line is sent. While rows are shared, the
+    // textarea's and the prompt's 2px top and bottom padding move to the container's top,
+    // so the rows sit where they always have and each holds a whole line: the textarea's
+    // rows' height counts its padding, and a row short of a line scrolled, or made the
+    // prompt beside it the taller of the two.
+    function layoutInputArea() {
+        const input = elements.input, sent = elements.inputSent, box = elements.inputContainer;
+        if (!input || !sent || !box) return;
+        const rowPx = inputRowPx();
+        input.style.minHeight = '';
+        input.style.paddingTop = '';
+        input.style.paddingBottom = '';
+        box.style.paddingTop = '';
+        box.style.paddingBottom = '';
+        if (elements.prompt) elements.prompt.style.paddingTop = '';
+        const natural = Math.max(inputHeight * rowPx, parseFloat(getComputedStyle(input).minHeight) || 0);
+        if (!keepsSentLines() && sent.firstChild) sent.textContent = '';
+        let shown = 0;
+        if (sent.firstChild) {
+            const rows = Math.max(1, Math.floor(natural / rowPx + 0.01));
+            const room = rows - liveInputRows(rowPx);
+            const lines = Array.from(sent.children);
+            const heights = lines.map(el => Math.max(1, Math.round(el.getBoundingClientRect().height / rowPx)));
+            const total = heights.reduce((a, b) => a + b, 0);
+            sentRows = Math.max(0, Math.min(sentRows, room, total));
+            shown = sentRows;
+            // Lines wholly above the rows shown have scrolled off for good.
+            let rowsKept = 0, k = lines.length;
+            while (k > 0 && rowsKept < shown) rowsKept += heights[--k];
+            for (let i = 0; i < k; i++) lines[i].remove();
+        } else {
+            sentRows = 0;
+        }
+        if (shown > 0) {
+            const padTop = parseFloat(getComputedStyle(input).paddingTop) || 0;
+            const bs = getComputedStyle(box);
+            const boxTop = parseFloat(bs.paddingTop) || 0, boxBottom = parseFloat(bs.paddingBottom) || 0;
+            box.style.paddingTop = (boxTop + padTop) + 'px';
+            box.style.paddingBottom = Math.max(0, boxBottom - padTop) + 'px';
+            sent.style.height = (shown * rowPx) + 'px';
+            sent.scrollTop = sent.scrollHeight;
+            input.style.paddingTop = '0px';
+            input.style.paddingBottom = '0px';
+            input.style.minHeight = '0px';
+            input.style.height = (natural - shown * rowPx) + 'px';
+            if (elements.prompt) elements.prompt.style.paddingTop = '0px';
+        } else {
+            sent.style.height = '';
+            input.style.height = (inputHeight * rowPx) + 'px';
+        }
+    }
+
+    // Every change to the textarea's text can change how many rows it fills, and so how
+    // many sent rows still fit above it: a typed or pasted character fires 'input', but
+    // the code that sets it (history, /input, completion, a ^old^new, ...) does not, so
+    // those are caught here, at the one setter they all go through.
+    (function relayoutOnInputValueChange() {
+        const desc = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+        if (!elements.input || !desc || !desc.set || !desc.get) return;
+        Object.defineProperty(elements.input, 'value', {
+            configurable: true,
+            get() { return desc.get.call(this); },
+            set(v) {
+                desc.set.call(this, v);
+                if (sentRows > 0) layoutInputArea();
+            }
+        });
+    })();
 
     // The input height is split by interface: the console has input_height, and phone,
     // tablet and desktop clients (the device classes the font sizes use; the WebView
@@ -13108,6 +13302,7 @@
         setupWorldSwitchMode = worldSwitchMode;
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
+        setupClearInput = clearInputOnSend;
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'kokoro' ? 'Kokoro' : ttsMode === 'edge' ? 'Edge' : 'Off';
         setupTabsMode = tabsMode;
         setupIconBarMode = iconBarMode;
@@ -13212,6 +13407,9 @@
             elements.setupZwjToggle.classList.add('active');
         } else {
             elements.setupZwjToggle.classList.remove('active');
+        }
+        if (elements.setupClearInputToggle) {
+            elements.setupClearInputToggle.classList.toggle('active', setupClearInput);
         }
         elements.setupTtsSelect.value = setupTtsMode;
         updateCustomDropdown(elements.setupTtsSelect);
@@ -13340,6 +13538,7 @@
             ws_password: wsPassword,
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
+            clear_input_on_send: clearInputOnSend,
             tts_mode: ttsMode,
             tts_speak_mode: ttsSpeakMode,
             tts_voice: ttsVoice,
@@ -13468,6 +13667,8 @@
         worldSwitchMode = setupWorldSwitchMode;
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
+        clearInputOnSend = setupClearInput;
+        if (clearInputOnSend) clearSentLines();
         ttsMode = setupTtsMode.toLowerCase();
         if (elements.setupTtsVoiceInput) {
             var typedVoice = elements.setupTtsVoiceInput.value.trim().toLowerCase();
@@ -15992,6 +16193,8 @@
                 }
                 return true;
             case 'redraw':
+                // TF's redraw clears its input window too, the lines sent included.
+                clearSentLines();
                 if (worlds[currentWorldIndex]) {
                     const redrawWorld = worlds[currentWorldIndex];
                     redrawWorld.output_lines = redrawWorld.output_lines.filter(l => l.from_server !== false);
@@ -17149,6 +17352,8 @@
         window.addEventListener('resize', function() {
             // A move to a screen of another scale changes the device-pixel cell.
             boxDrawingRefresh();
+            // A new width rewraps the lines sent and the one typed.
+            if (sentRows > 0) layoutInputArea();
             // If we were following the bottom before resize, stay at bottom
             if (followBottom) {
                 scrollToBottom();
@@ -17981,6 +18186,7 @@
             }
             spellCycle = null; // the user's own edit ends a Ctrl+Q round
             resetCompletion();
+            if (sentRows > 0) layoutInputArea();
             // Mirrors Rust's last_input_was_delete: any deleteContent*/deleteBy*
             // inputType counts as a deletion (allows undoing a conversion);
             // anything else (typed character, paste, IME composition) does not.
@@ -18237,6 +18443,12 @@
             setupZwj = !setupZwj;
             updateSetupPopupUI();
         };
+        if (elements.setupClearInputToggle) {
+            elements.setupClearInputToggle.onclick = function() {
+                setupClearInput = !setupClearInput;
+                updateSetupPopupUI();
+            };
+        }
         elements.setupTtsSelect.onchange = function() {
             setupTtsMode = this.value;
         };

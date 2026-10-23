@@ -9,6 +9,7 @@
 //! character.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -107,6 +108,9 @@ struct Field {
     selection_bg: Rgb,
     caret: bool,
     rows_shown: usize,
+    /// The space above the first row: `PAD`, or none while sent lines sit above the field
+    /// (`input_bar`), whose rows then follow theirs with no gap.
+    top_pad: f32,
     layout: InputHandle,
     focus: FocusHandle,
     view: gpui::Entity<ClayView>,
@@ -193,11 +197,137 @@ fn row_runs(row: &str, at: usize, base: &[TextRun], f: &Field, units: &[Unit]) -
     runs
 }
 
+/// One line of the input's drawn text (no line breaks), in `fg`: its text runs, and the
+/// rows it fills at `width` (`core::wrap::wrap_rows`) - the field's wrap, which counting
+/// the typed line's rows (`field_rows`) must agree with.
+fn wrap_input_line(line: &str, fg: Rgb, font_size: f32, width: f32, fonts: &Fonts, window: &Window) -> (Vec<TextRun>, Vec<Range<usize>>) {
+    let styled = StyledLine { text: line.to_string(), runs: vec![plain_run(line.len(), fg)], ..Default::default() };
+    wrap_styled(&styled, Some(fg), font_size, width, fonts, window)
+}
+
+/// A styled line's text runs - all in `fg` when given, else each in its own run's colour
+/// (`text_runs` gives the fonts alone) - and the rows it fills at `width`.
+fn wrap_styled(line: &StyledLine, fg: Option<Rgb>, font_size: f32, width: f32, fonts: &Fonts, window: &Window) -> (Vec<TextRun>, Vec<Range<usize>>) {
+    let base = if line.text.is_empty() { Vec::new() } else { text_runs(line, fonts, window) };
+    let base: Vec<TextRun> = match fg {
+        Some(fg) => base.into_iter().map(|mut r| {
+            r.color = hsla(fg);
+            r
+        }).collect(),
+        None => {
+            let mut at = 0;
+            let mut out = Vec::new();
+            for run in &line.runs {
+                for mut piece in cut_runs(&base, at, run.len) {
+                    piece.color = hsla(run.fg);
+                    out.push(piece);
+                }
+                at += run.len;
+            }
+            out
+        }
+    };
+    let layout = window.text_system().layout_line(&line.text, px(font_size), &base, None);
+    let x = |i: usize| f32::from(layout.x_for_index(i));
+    let rows = crate::native_gui::core::wrap::wrap_rows(&line.text, &[], width.max(1.0), 0.0, &x);
+    (base, rows)
+}
+
+/// The rows the typed line fills at `width` (its whole text, not just up to the caret),
+/// counted to at most `max`: how much of the input it needs, below the lines sent.
+#[allow(clippy::too_many_arguments)]
+fn field_rows(text: &str, masked: bool, fg: Rgb, font_size: f32, width: f32, fonts: &Fonts, window: &Window, max: usize) -> usize {
+    let (shown, _) = drawn(text, masked);
+    let mut rows = 0;
+    for line in shown.split('\n') {
+        rows += wrap_input_line(line, fg, font_size, width, fonts, window).1.len();
+        if rows >= max {
+            return max;
+        }
+    }
+    rows.max(1)
+}
+
+/// The text of `runs` from byte `at`, `len` bytes long.
+fn cut_runs(runs: &[TextRun], at: usize, len: usize) -> Vec<TextRun> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for r in runs {
+        let (s, e) = (pos.max(at), (pos + r.len).min(at + len));
+        pos += r.len;
+        if s < e {
+            let mut sub = r.clone();
+            sub.len = e - s;
+            out.push(sub);
+        }
+    }
+    out
+}
+
+/// A sent line as drawn above the field, one styled line per line of it: the prompt it was
+/// typed after in its own colours, then its text (`palette.fg`), control characters as
+/// their stand-ins.
+fn sent_lines(entry: &crate::input::SentEntry, view: &ClayView) -> Vec<StyledLine> {
+    let mut first = if entry.prompt.is_empty() { StyledLine::default() } else { style_line(&entry.prompt, &view.palette, &view.style) };
+    first.breaks.clear();
+    first.line_bg = None;
+    let mut out = vec![first];
+    for (k, part) in entry.text.split('\n').enumerate() {
+        let text: String = part.chars().filter(|c| *c != '\r').map(crate::input::display_control_char).collect();
+        if k > 0 {
+            out.push(StyledLine::default());
+        }
+        if !text.is_empty() {
+            let line = out.last_mut().expect("never empty");
+            line.runs.push(plain_run(text.len(), view.palette.fg));
+            line.text.push_str(&text);
+        }
+    }
+    out
+}
+
+/// What `paint_sent` draws: the lines sent, as styled lines, and how many of their last
+/// rows show.
+struct Sent {
+    lines: Vec<StyledLine>,
+    rows: usize,
+    font_size: f32,
+    row_h: f32,
+    fonts: Fonts,
+}
+
+/// The last `rows` rows of the lines sent (TF's %cleardone off), wrapped at the input's
+/// width, one per row from the top of `bounds`.
+fn paint_sent(bounds: Bounds<Pixels>, s: Sent, window: &mut Window, cx: &mut App) {
+    let width = f32::from(bounds.size.width);
+    let top0 = bounds.origin.y + px(PAD);
+    let mut shaped: Vec<gpui::ShapedLine> = Vec::new();
+    for line in s.lines.iter().rev() {
+        if shaped.len() >= s.rows {
+            break;
+        }
+        let (base, rows) = wrap_styled(line, None, s.font_size, width, &s.fonts, window);
+        let mut these: Vec<gpui::ShapedLine> = rows
+            .iter()
+            .map(|r| window.text_system().shape_line(line.text[r.clone()].to_string().into(), px(s.font_size), &cut_runs(&base, r.start, r.len()), None))
+            .collect();
+        these.append(&mut shaped);
+        shaped = these;
+    }
+    let skip = shaped.len().saturating_sub(s.rows);
+    window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+        for (k, row) in shaped.iter().skip(skip).enumerate() {
+            let top = top0 + px(k as f32 * s.row_h);
+            let _ = row.paint(point(bounds.origin.x, top), px(s.row_h), gpui::TextAlign::Left, None, window, cx);
+        }
+    });
+}
+
 fn paint_field(bounds: Bounds<Pixels>, f: Field, window: &mut Window, cx: &mut App) {
     window.handle_input(&f.focus, ElementInputHandler::new(bounds, f.view.clone()), cx);
     let fs = px(f.font_size);
     let row_h = f.row_h;
-    let inner = Bounds::new(point(bounds.origin.x + px(PAD), bounds.origin.y + px(PAD)), size(bounds.size.width - px(2.0 * PAD), bounds.size.height - px(2.0 * PAD)));
+    let inner = Bounds::new(point(bounds.origin.x + px(PAD), bounds.origin.y + px(f.top_pad)), size(bounds.size.width - px(2.0 * PAD), bounds.size.height - px(f.top_pad + PAD)));
     let width = f32::from(inner.size.width).max(1.0);
     let left = f32::from(inner.origin.x);
     let (shown, units) = drawn(&f.text, f.masked);
@@ -211,15 +341,8 @@ fn paint_field(bounds: Bounds<Pixels>, f: Field, window: &mut Window, cx: &mut A
     let mut rows: Vec<Row> = Vec::new();
     let mut line_start = 0;
     for line in shown.split('\n') {
-        let styled = StyledLine { text: line.to_string(), runs: vec![plain_run(line.len(), f.fg)], ..Default::default() };
-        let base = if line.is_empty() { Vec::new() } else { text_runs(&styled, &f.fonts, window) };
-        let base: Vec<TextRun> = base.into_iter().map(|mut r| {
-            r.color = hsla(f.fg);
-            r
-        }).collect();
-        let layout = window.text_system().layout_line(line, fs, &base, None);
-        let x = |i: usize| f32::from(layout.x_for_index(i));
-        for r in crate::native_gui::core::wrap::wrap_rows(line, &[], width, 0.0, &x) {
+        let (base, wrapped) = wrap_input_line(line, f.fg, f.font_size, width, &f.fonts, window);
+        for r in wrapped {
             let text = &line[r.clone()];
             let runs = row_runs(text, r.start, &base, &f, &units);
             let shaped = window.text_system().shape_line(text.to_string().into(), fs, &runs, None);
@@ -232,13 +355,18 @@ fn paint_field(bounds: Bounds<Pixels>, f: Field, window: &mut Window, cx: &mut A
     let mut layout = f.layout.borrow_mut();
     let caret_shown = units.iter().find(|u| u.text.start >= f.cursor).map_or(shown.len(), |u| u.shown.start);
     let caret_row = rows.iter().rposition(|r| r.at <= caret_shown && caret_shown <= r.at + r.line.text.len()).unwrap_or(0);
-    let visible = ((f32::from(inner.size.height) / row_h).floor() as usize).max(1).min(f.rows_shown.max(1));
+    // Rounded, not floored: the field is whole rows high, but laid out to the device's pixel
+    // grid, so two rows can measure 1.99 of them.
+    let visible = ((f32::from(inner.size.height) / row_h).round() as usize).max(1).min(f.rows_shown.max(1));
     if caret_row < layout.scroll {
         layout.scroll = caret_row;
     } else if caret_row >= layout.scroll + visible {
         layout.scroll = caret_row + 1 - visible;
     }
-    layout.scroll = layout.scroll.min(rows.len().saturating_sub(1));
+    // Never rows hidden above with blank ones below: the field can lose rows to the lines
+    // sent above it and get them back (input_bar), and a frame laid out with fewer rows
+    // than the next had scrolled the first row away for good.
+    layout.scroll = layout.scroll.min(rows.len().saturating_sub(visible));
     let top0 = f32::from(inner.origin.y) - layout.scroll as f32 * row_h;
     layout.row_h = row_h;
     layout.bounds = bounds;
@@ -379,6 +507,10 @@ impl ClayView {
         let rows = self.input.rows.clamp(1, 15);
         let row_h = self.input_row_h();
         let height = rows as f32 * row_h + 2.0 * PAD;
+        // The lines sent take the top rows, the field the rest: PAD and their rows above,
+        // its rows and PAD below, adding up to the same height.
+        let sent_rows = self.fit_sent(masked, rows, window);
+        let field_h = if sent_rows > 0 { height - PAD - sent_rows as f32 * row_h } else { height };
         let field = Field {
             text: self.editor.text.clone(),
             cursor: self.editor.cursor,
@@ -392,7 +524,8 @@ impl ClayView {
             fg: self.palette.fg,
             selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],
             caret: self.caret_on() && self.focus.is_focused(window),
-            rows_shown: rows,
+            rows_shown: rows - sent_rows,
+            top_pad: if sent_rows > 0 { 0.0 } else { PAD },
             layout: self.input.layout.clone(),
             focus: self.focus.clone(),
             view: cx.entity(),
@@ -403,7 +536,7 @@ impl ClayView {
         let mut bar = div()
             .relative()
             .flex()
-            .items_start()
+            .flex_col()
             .flex_shrink_0()
             .px(px(4.0))
             .py(px(2.0))
@@ -424,27 +557,106 @@ impl ClayView {
                     cx.stop_propagation();
                 }),
             ));
+        // The lines sent (TF's %cleardone off), the whole width, above the prompt and field.
+        if sent_rows > 0 {
+            let sent = Sent {
+                lines: self.input.sent.iter().flat_map(|e| sent_lines(e, self)).collect(),
+                rows: sent_rows,
+                font_size: self.font_size,
+                row_h,
+                fonts: self.fonts.clone(),
+            };
+            let h = PAD + sent_rows as f32 * row_h;
+            bar = bar.child(div().w_full().h(px(h)).flex_shrink_0().child(canvas(|_, _, _| {}, move |bounds, _, window, cx| paint_sent(bounds, sent, window, cx)).size_full()));
+        }
+        let mut line = div().flex().items_start().w_full();
         // The prompt sits on the field's first row, at its height (the web centres it in
         // the whole input area, so a multi-row input showed it beside the second row).
         if !prompt.is_empty() {
             let styled = style_line(&prompt, &self.palette, &self.style);
-            let prompt = div().flex_shrink_0().whitespace_nowrap().mt(px(PAD)).line_height(px(row_h));
-            bar = bar.child(prompt.child(super::chrome::styled_text(&styled, &mono)));
+            let top = if sent_rows > 0 { 0.0 } else { PAD };
+            let prompt = div().flex_shrink_0().whitespace_nowrap().mt(px(top)).line_height(px(row_h));
+            line = line.child(prompt.child(super::chrome::styled_text(&styled, &mono)));
         }
-        bar.child(
+        bar.child(line.child(
             div()
                 .id("input")
                 .flex_1()
                 .min_w_0()
-                .h(px(height))
+                .h(px(field_h))
                 .cursor_text()
                 .child(canvas(|_, _, _| {}, move |bounds, _, window, cx| paint_field(bounds, field, window, cx)).size_full())
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.input_mouse_down(ev, cx)))
                 .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.input_menu_at(ev, cx)))
                 .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| this.input_mouse_move(ev, cx)))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _w, _cx| this.input.dragging = false)),
-        )
+        ))
         .into_any_element()
+    }
+
+    /// The width the lines sent wrap at: the input bar's, the window's less its padding.
+    fn sent_width(&self, window: &Window) -> f32 {
+        (f32::from(window.viewport_size().width) - 8.0).max(1.0)
+    }
+
+    /// The rows one sent line fills at `width`.
+    fn sent_entry_rows(&self, entry: &crate::input::SentEntry, width: f32, window: &Window) -> usize {
+        sent_lines(entry, self).iter().map(|l| wrap_styled(l, None, self.font_size, width, &self.fonts, window).1.len()).sum::<usize>().max(1)
+    }
+
+    /// How many rows of the lines sent show above the field this frame, in an input `rows`
+    /// high (TF's %cleardone off): as many of their last rows as the typed line leaves room
+    /// for. Trimming is for good, as TF scrolls them off, and lines wholly above what shows
+    /// are dropped. The console's `InputArea::fit_sent`, app.js `layoutInputArea`.
+    fn fit_sent(&mut self, masked: bool, rows: usize, window: &Window) -> usize {
+        if self.input.clear_on_send {
+            self.input.clear_sent();
+        }
+        if self.input.sent.is_empty() {
+            self.input.sent_rows = 0;
+            return 0;
+        }
+        let bar_w = self.sent_width(window);
+        // The field's width as last painted (the prompt beside it takes the rest).
+        let field_w = {
+            let layout = self.input.layout.borrow();
+            let w = f32::from(layout.bounds.size.width) - 2.0 * PAD;
+            if w > 1.0 { w } else { bar_w }
+        };
+        let live = field_rows(&self.editor.text, masked, self.palette.fg, self.font_size, field_w, &self.fonts, window, rows + 1);
+        let want = self.input.sent_rows.min(rows.saturating_sub(live));
+        let (mut got, mut keep) = (0, 0);
+        for entry in self.input.sent.iter().rev() {
+            if got >= want {
+                break;
+            }
+            got += self.sent_entry_rows(entry, bar_w, window);
+            keep += 1;
+        }
+        self.input.sent_rows = want.min(got);
+        let drop = self.input.sent.len() - keep;
+        self.input.sent.drain(..drop);
+        self.input.sent_rows
+    }
+
+    /// What is typed now, with the prompt it is typed after, to leave on screen once sent
+    /// (`keep_sent_line`). A line typed while the world masks echo keeps only its prompt, as
+    /// TF leaves it - and the password is never kept.
+    fn sent_entry_now(&self) -> crate::input::SentEntry {
+        let world = self.session.core.current_world();
+        let masked = world.is_some_and(|w| w.echo_masked);
+        let prompt = world.map(|w| w.prompt.clone()).unwrap_or_default();
+        crate::input::SentEntry::new(prompt, if masked { String::new() } else { self.editor.text.clone() })
+    }
+
+    /// A line left the input for good: keep it on screen above the next one (TF's
+    /// %cleardone off), unless Clear Input on Send.
+    fn keep_sent_line(&mut self, entry: crate::input::SentEntry, window: &Window) {
+        if self.input.clear_on_send || self.session.core.current_is_live_shell() {
+            return;
+        }
+        self.input.sent_rows += self.sent_entry_rows(&entry, self.sent_width(window), window);
+        self.input.sent.push_back(entry);
     }
 
     /// The input's line height (Settings > Font > Input Ht, web_font_line_height); the
@@ -668,8 +880,19 @@ impl ClayView {
 }
 
 impl ClayView {
-    /// Enter: send what's typed (app.js `sendCommand`).
+    /// Enter: send what's typed (app.js `sendCommand`). The line stays on screen above the
+    /// next one (TF's %cleardone off) whenever sending took it out of the input - the lines
+    /// this GUI answers itself included, as TF leaves any line entered.
     pub(super) fn send_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = self.sent_entry_now();
+        self.send_line_now(window, cx);
+        if self.editor.text.is_empty() {
+            self.keep_sent_line(entry, window);
+            cx.notify();
+        }
+    }
+
+    fn send_line_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // /import collects its password here, never sending it as a command line
         // (app.js sendCommand).
         let trimmed = self.editor.text.trim().to_string();
@@ -984,6 +1207,15 @@ pub struct InputState {
     native: Option<super::native_spell::Native>,
     /// The input's right-click menu: where, and the word it's for (with suggestions).
     pub menu: Option<(Point<Pixels>, Option<Suggestions>)>,
+    /// The lines sent from this window still on screen above the one being typed (TF's
+    /// `%cleardone` off, `Settings::clear_input_on_send`), oldest first, and how many of
+    /// their rows show; `input_bar` fits them in, and a row the typed line takes is gone
+    /// for good, as in TF. Each window keeps its own (app.js `#input-sent`, the console's
+    /// `InputArea::sent`).
+    pub sent: VecDeque<crate::input::SentEntry>,
+    pub sent_rows: usize,
+    /// Clear Input on Send, from the settings: then nothing is kept.
+    pub clear_on_send: bool,
 }
 
 /// A misspelled word in the input and what it might have been.
@@ -1004,7 +1236,18 @@ impl Default for InputState {
             speller_source: None,
             native: None,
             menu: None,
+            sent: VecDeque::new(),
+            sent_rows: 0,
+            clear_on_send: false,
         }
+    }
+}
+
+impl InputState {
+    /// Forget the lines sent (the redraw action, Clear Input on Send turned on).
+    pub fn clear_sent(&mut self) {
+        self.sent.clear();
+        self.sent_rows = 0;
     }
 }
 

@@ -99,6 +99,8 @@ impl ClayView {
             }
             "refresh_line" => self.scroll.borrow_mut().follow_bottom(),
             "redraw" | "redraw_server_only" => {
+                // TF's redraw clears its input window too, the lines sent included.
+                self.input.clear_sent();
                 let fx = self.session.core.redraw();
                 let rest = self.session.apply(fx);
                 self.scroll.borrow_mut().follow_bottom();

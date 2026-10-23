@@ -38,6 +38,8 @@ pub const SETUP_FIELD_LOG_INPUT: FieldId = FieldId(26);
 pub const SETUP_FIELD_TTS_VOICE: FieldId = FieldId(27);
 /// Import Picture's host (src/picture.rs, `PictureService::OPTIONS`).
 pub const SETUP_FIELD_PICTURE_HOST: FieldId = FieldId(28);
+/// TF's `%cleardone` (`Settings::clear_input_on_send`).
+pub const SETUP_FIELD_CLEAR_INPUT: FieldId = FieldId(29);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -130,6 +132,7 @@ pub fn create_setup_popup(
     tabs: &str,
     icon_bar: &str,
     picture_host: &str,
+    clear_input_on_send: bool,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = crate::theme::BUILTIN_THEMES.iter().position(|(name, _)| *name == gui_theme).unwrap_or(0);
@@ -170,6 +173,11 @@ pub fn create_setup_popup(
             SETUP_FIELD_INPUT_HEIGHT,
             "Input Height",
             FieldKind::number(input_height),
+        ))
+        .with_field(Field::new(
+            SETUP_FIELD_CLEAR_INPUT,
+            "Clear Input on Send",
+            FieldKind::toggle(clear_input_on_send),
         ))
         .with_field(Field::new(
             SETUP_FIELD_GUI_THEME,
@@ -344,6 +352,12 @@ fn setup_help_text() -> Vec<String> {
         "",
         "Input Height: Number of input lines visible (1-10).",
         "",
+        "Clear Input on Send: Off (TinyFugue's default), each",
+        "  line you send stays in the input area above the",
+        "  next one until it scrolls off the top; Ctrl+L",
+        "  clears them. On, Enter clears the input area.",
+        "  Phones always clear. TF's %cleardone.",
+        "",
         "GUI Theme: Dark or Light theme for web/GUI clients.",
         "",
         "TLS Proxy: Keeps a background proxy process alive",
@@ -432,13 +446,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox",
+            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 24);
+        assert_eq!(state.definition.fields.len(), 25);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -447,7 +461,7 @@ mod tests {
         let mut def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox",
+            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
         );
         add_import_button(&mut def);
         let left: Vec<&str> = def.buttons.iter().filter(|b| b.left_align).map(|b| b.label.as_str()).collect();
@@ -462,7 +476,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short",
+            false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
         );
         let state = PopupState::new(def);
 
@@ -483,5 +497,6 @@ mod tests {
         assert_eq!(state.get_selected(SETUP_FIELD_TABS), Some("top"));
         assert_eq!(state.get_selected(SETUP_FIELD_ICON_BAR), Some("all"));
         assert_eq!(state.get_selected(SETUP_FIELD_PICTURE_HOST), Some("sxcu+short"));
+        assert_eq!(state.get_bool(SETUP_FIELD_CLEAR_INPUT), Some(true));
     }
 }

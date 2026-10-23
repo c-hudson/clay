@@ -43,7 +43,7 @@ const fn v(name: &'static str, kind: Kind, seed: Option<&'static str>) -> Specia
 }
 
 /// TF 5.0b8's special variables. Seeds are TF's defaults wherever seeding cannot change
-/// what Clay does by default; `more`, `wrapspace`, `isize`, `insert`, `wrap`, `wrapsize`,
+/// what Clay does by default; `more`, `wrapspace`, `isize`, `insert`, `cleardone`, `wrap`, `wrapsize`,
 /// `textdiv`, `lp` and `prompt_wait` are deliberately unseeded (Clay's own settings stand
 /// for them). `visual` is seeded on and stays on: Clay's console has no non-visual mode.
 /// The status-line variables (and `clock_format`, which only TF's status line reads) are
@@ -58,7 +58,7 @@ pub static SPECIAL_VARS: &[SpecialVar] = &[
     v("bg_output", FLAG, Some("on")),
     v("binary_eol", Kind::Enum(&["LF", "CR", "CRLF"]), Some("LF")),
     v("borg", FLAG, Some("on")),
-    v("cleardone", FLAG, Some("off")),
+    v("cleardone", FLAG, None),
     v("clearfull", FLAG, Some("off")),
     v("clock_format", Kind::Str, Some("%H:%M")),
     v("connect", Kind::Enum(&["blocking", "nonblocking"]), Some("nonblocking")),
@@ -148,8 +148,9 @@ pub static SPECIAL_VARS: &[SpecialVar] = &[
 /// Special variables that stand for one of Clay's own settings: the App mirrors the
 /// setting into them (never saved as TF variables) and applies a user's assignment to it
 /// (`TfEffect::Setting`). `%more` is Clay's more-paging, `%wrapspace` its wrap indent,
-/// `%isize` the input area's height, `%insert` insert vs. overwrite typing.
-pub const BOUND: &[&str] = &["more", "wrapspace", "isize", "insert"];
+/// `%isize` the input area's height, `%insert` insert vs. overwrite typing, `%cleardone`
+/// whether Enter clears the input area (`Settings::clear_input_on_send`).
+pub const BOUND: &[&str] = &["more", "wrapspace", "isize", "insert", "cleardone"];
 
 /// Variables whose assignment the App applies too, but which keep their TF meaning rather
 /// than mirroring a Clay setting: `%wrap`/`%wrapsize` (unset, Clay wraps at the window's

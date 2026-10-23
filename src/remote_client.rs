@@ -2245,6 +2245,7 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.tts_voice = crate::kokoro::normalize_voice(&settings.tts_voice);
                 app.settings.scrollback_enabled = settings.scrollback;
                 app.settings.log_input_enabled = settings.log_input;
+                app.settings.clear_input_on_send = settings.clear_input_on_send;
                 // No local needs_output_redraw here — this is a remote console client; the
                 // master (which owns rendering for its own TUI) applies its own redraw when
                 // it processes the resulting UpdateGlobalSettings message below.
@@ -2302,6 +2303,7 @@ pub(crate) fn handle_remote_client_key(
                     tts_voice: app.settings.tts_voice.clone(),
                     scrollback_enabled: app.settings.scrollback_enabled,
                     log_input_enabled: app.settings.log_input_enabled,
+                    clear_input_on_send: Some(app.settings.clear_input_on_send),
                     keyboard_always_visible: app.settings.keyboard_always_visible,
                     tabs: app.settings.tabs.name().to_string(),
                     icon_bar: app.settings.icon_bar.name().to_string(),
@@ -2779,7 +2781,7 @@ pub(crate) fn handle_remote_client_key(
             // (World::echo_masked is mirrored here via InitialState/EchoMaskChanged; see
             // InputArea::take_input's doc comment).
             let record_history = !app.current_world().protocol.echo_masked;
-            let mut cmd = app.input.take_input(record_history);
+            let mut cmd = app.take_input_line(record_history);
             // TF's "^old^new" (see InputArea::substitute_history). This client keeps its own
             // history, so it is resolved here, before sending - never at a password prompt,
             // and not in a chat world, where "^^" is just text.
@@ -3324,6 +3326,8 @@ pub(crate) fn dispatch_remote_action(
             }
         }
         "redraw" | "redraw_server_only" => {
+            // TF's redraw clears its input window too, lines left by %cleardone included.
+            app.input.clear_sent();
             app.current_world_mut().filter_to_server_output();
             app.needs_terminal_clear = true;
             app.needs_output_redraw = true;
@@ -3506,6 +3510,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         tts_voice: app.settings.tts_voice.clone(),
         scrollback_enabled: app.settings.scrollback_enabled,
         log_input_enabled: app.settings.log_input_enabled,  // unchanged — this function only touches web settings
+        clear_input_on_send: None,
         keyboard_always_visible: app.settings.keyboard_always_visible,
         tabs: app.settings.tabs.name().to_string(),  // unchanged — this function only touches web settings
         icon_bar: app.settings.icon_bar.name().to_string(),  // unchanged — this function only touches web settings

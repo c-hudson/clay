@@ -209,6 +209,13 @@ impl App {
                 }
             }
             "insert" => self.input.insert = crate::tf::special_vars::flag_is_on(value),
+            "cleardone" => {
+                let on = crate::tf::special_vars::flag_is_on(value);
+                if self.settings.clear_input_on_send != on {
+                    self.settings.clear_input_on_send = on;
+                    changed = true;
+                }
+            }
             "wrap" | "wrapsize" => self.apply_tf_wrap(),
             "clock_format" => self.apply_tf_clock_format(Some(value.to_string_value())),
             "textdiv" | "textdiv_str" => self.apply_tf_textdiv(),
@@ -277,6 +284,7 @@ impl App {
             ("more", crate::tf::TfValue::String(if self.settings.more_mode_enabled { "on" } else { "off" }.to_string())),
             ("wrapspace", crate::tf::TfValue::Integer(self.settings.wrapspace as i64)),
             ("isize", crate::tf::TfValue::Integer(self.input_height as i64)),
+            ("cleardone", crate::tf::TfValue::String(if self.settings.clear_input_on_send { "on" } else { "off" }.to_string())),
         ];
         for (name, value) in values {
             self.tf_engine.seed_values.insert(name.to_string(), value.to_string_value());

@@ -1997,6 +1997,10 @@ pub struct Settings {
     /// `World::record_input_line`'s `log_input` parameter). Default off since it writes
     /// potentially-sensitive typed text to a plaintext file.
     pub log_input_enabled: bool,
+    /// TF's `%cleardone`: Enter clears the input area. Off (the default, as in TF), each
+    /// line sent stays in the input area above the next until it scrolls off the top
+    /// (`InputArea::sent`, and each client's own copy). Phone clients always clear.
+    pub clear_input_on_send: bool,
     // Number of visible (non-gagged) lines of scrollback sent to a remote/web/GUI
     // client per world on initial connect. Older history is backfilled on demand
     // via RequestScrollback. See build_initial_state().
@@ -2084,6 +2088,7 @@ impl Default for Settings {
             tts_muted: false,
             scrollback_enabled: false,
             log_input_enabled: false,
+            clear_input_on_send: false,
             remote_initial_lines: 100,
             keyboard_always_visible: true,
             url_shorteners: encoding::UrlShortener::default_order(),
@@ -6221,6 +6226,7 @@ impl App {
             tts_voice: self.settings.tts_voice.clone(),
             scrollback_enabled: self.settings.scrollback_enabled,
             log_input_enabled: self.settings.log_input_enabled,
+            clear_input_on_send: self.settings.clear_input_on_send,
             keyboard_always_visible: self.settings.keyboard_always_visible,
             tabs: self.settings.tabs.name().to_string(),
             icon_bar: self.settings.icon_bar.name().to_string(),
@@ -6340,6 +6346,7 @@ impl App {
         }
         self.settings.scrollback_enabled = settings.scrollback_enabled;
         self.settings.log_input_enabled = settings.log_input_enabled;
+        self.settings.clear_input_on_send = settings.clear_input_on_send;
         self.settings.keyboard_always_visible = settings.keyboard_always_visible;
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
@@ -6649,7 +6656,7 @@ impl App {
                 // ECHO masking (plan Phase 3, step 3.4): see InputArea::take_input's doc
                 // comment - a masked line must never enter arrow-key recall history.
                 let record_history = !self.current_world().protocol.echo_masked;
-                let input = self.input.take_input(record_history);
+                let input = self.take_input_line(record_history);
                 if input.is_empty() && !self.current_world().connected {
                     return None;
                 }
@@ -7289,6 +7296,7 @@ impl App {
             self.settings.tabs.name(),
             self.settings.icon_bar.name(),
             &self.settings.picture_host.name(),
+            self.settings.clear_input_on_send,
         );
         if self.is_master {
             add_import_button(&mut def);
@@ -10859,6 +10867,7 @@ impl App {
         tts_voice: String,
         scrollback_enabled: bool,
         log_input_enabled: bool,
+        clear_input_on_send: Option<bool>,
         keyboard_always_visible: bool,
         tabs: String,
         icon_bar: String,
@@ -10975,6 +10984,9 @@ impl App {
             self.init_scrollback();
         }
         self.settings.log_input_enabled = log_input_enabled;
+        if let Some(clear) = clear_input_on_send {
+            self.settings.clear_input_on_send = clear;
+        }
         self.settings.keyboard_always_visible = keyboard_always_visible;
         // Save settings to persist changes. Tag the (debug-mode-only) audit log
         // with which kind of client pushed this, so a future settings-loss report
@@ -11499,6 +11511,8 @@ impl App {
         writeln!(file, "more_mode_enabled: {}", self.settings.more_mode_enabled)?;
         writeln!(file, "show_tags: {}", self.show_tags)?;
         writeln!(file, "new_line_indicator: {}", self.settings.new_line_indicator)?;
+        writeln!(file, "clear_input_on_send: {} (sent entries kept: {}, rows shown: {})",
+            self.settings.clear_input_on_send, self.input.sent.len(), self.input.sent_rows)?;
         // Hidden setting with no UI — /dump is the only way to see the list /url is
         // actually using after a hand edit to settings.dat.
         writeln!(file, "url_shorteners: {}", encoding::UrlShortener::list_to_string(&self.settings.url_shorteners))?;
@@ -16982,7 +16996,7 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar, picture_host, font_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, font_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -16992,7 +17006,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                     mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                    log_input_enabled, keyboard_always_visible, tabs, icon_bar, picture_host, font_profile,
+                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, font_profile,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -17809,6 +17823,22 @@ impl App {
         let _ = persistence::save_settings(self);
         let settings_msg = self.build_global_settings_msg();
         self.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: self.input_height });
+    }
+
+    /// Take the typed line for Enter (the console's key, `/dokey NEWLINE`, the SSH
+    /// console's key), into history unless `record_history` is false (a masked prompt).
+    /// Unless Clear Input on Send (TF's `%cleardone`) is on, the line stays on screen above
+    /// the next one with the prompt it was typed after, as in TF; a masked one leaves only
+    /// the prompt. An empty line takes a row too.
+    pub(crate) fn take_input_line(&mut self, record_history: bool) -> String {
+        let line = self.input.take_input(record_history);
+        if !self.settings.clear_input_on_send {
+            let world = self.current_world();
+            let text = if world.protocol.echo_masked { String::new() } else { line.clone() };
+            let entry = crate::input::SentEntry::new(world.prompt.clone(), text);
+            self.input.push_sent(entry);
+        }
+        line
     }
 
     /// Is terminal row `row` (0-based) on the separator bar, the input's top edge? A
@@ -18900,6 +18930,7 @@ pub(crate) struct SetupSettings {
     pub(crate) tts_voice: String,
     pub(crate) scrollback: bool,
     pub(crate) log_input: bool,
+    pub(crate) clear_input_on_send: bool,
     pub(crate) wrapspace: i64,
     pub(crate) keyboard_always_visible: bool,
     pub(crate) tabs: String,
@@ -19067,7 +19098,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE, SETUP_FIELD_TTS_VOICE,
         SETUP_FIELD_SCROLLBACK, SETUP_FIELD_LOG_INPUT, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
-        SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR, SETUP_FIELD_PICTURE_HOST,
+        SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR, SETUP_FIELD_PICTURE_HOST, SETUP_FIELD_CLEAR_INPUT,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL, SETUP_BTN_IMPORT,
         update_setup_visibility,
     };
@@ -19466,6 +19497,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     // Input), the field's last value should still round-trip rather than
                     // silently resetting to false.
                     log_input: state.get_bool(SETUP_FIELD_LOG_INPUT).unwrap_or(false),
+                    clear_input_on_send: state.get_bool(SETUP_FIELD_CLEAR_INPUT).unwrap_or(false),
                     wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
                     keyboard_always_visible: state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE).unwrap_or(true),
                     tabs: state.get_selected(SETUP_FIELD_TABS).unwrap_or("none").to_string(),
