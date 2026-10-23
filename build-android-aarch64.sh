@@ -55,12 +55,17 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
 export CC_aarch64_linux_android="$CLANG"
 export CXX_aarch64_linux_android="${CLANG}++"
 export AR_aarch64_linux_android="$TOOLCHAIN/bin/llvm-ar"
+# Its own target dir: build-termux-aarch64.sh builds the same target and features with
+# the API 24 clang, and a different linker/CC makes every unit dirty, so sharing
+# target/aarch64-linux-android made each of the two rebuild all ~280 dependencies after
+# the other ran - twice per release.
+export CARGO_TARGET_DIR="$SCRIPT_DIR/target/android"
 
 echo "Building clay for aarch64-linux-android (API $API)..."
 cargo build --release --target aarch64-linux-android \
     --no-default-features --features rustls-backend,ssh-transport
 
-BIN="target/aarch64-linux-android/release/clay"
+BIN="$CARGO_TARGET_DIR/aarch64-linux-android/release/clay"
 OUT_DIR="android/app/src/main/jniLibs/arm64-v8a"
 OUT="$OUT_DIR/libclay.so"
 

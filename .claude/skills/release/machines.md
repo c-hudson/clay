@@ -172,7 +172,9 @@ is the `buildNativeServer` Gradle task (`android/app/build.gradle`), wired via
 `preBuild.dependsOn`, which shells out to `build-android-aarch64.sh` (repo root) using the same
 NDK already set up for the armv7 Termux build above, just targeting `aarch64-linux-android`
 instead. One-time setup: `rustup target add aarch64-linux-android` (NDK r26d is already required
-for the armv7 build; no separate download). `android.sh` asserts `lib/arm64-v8a/libclay.so` is
+for the armv7 build; no separate download). It builds in its own target dir, `target/android/`:
+the Termux aarch64 build above has the same target and features but the API 24 clang, and while
+the two shared `target/aarch64-linux-android/` each rebuilt every dependency after the other. `android.sh` asserts `lib/arm64-v8a/libclay.so` is
 present in the unsigned APK before signing — if that check fails, the NDK/rustup target is
 probably missing on this machine.
 
@@ -204,6 +206,11 @@ release); `-f` prevents the staleness from being introduced in the first place.
 - SSH port: `22`
 - Path: `C:\Users\adrick\clay`
 - SSH command: `ssh adrick@192.168.2.14`
+- Python: none is installed (`python` is only the Microsoft Store stub). For
+  `tools/prune-target.py` (SKILL.md Step 6b), python.org's embeddable Python 3.13.17 is unpacked
+  in `C:\Users\adrick\python-embed` (2026-10-23; not on PATH, no installer). Run it by full path:
+  `%USERPROFILE%\python-embed\python.exe`. To replace it, unpack another
+  `python-<ver>-embed-amd64.zip` from python.org/ftp/python into the same folder.
 - **Lifecycle:** VM is kept powered off when not in use. `/release` starts it before building and powers it off after (see SKILL.md Step 6b).
 - Start: `VBoxManage startvm clay-win11 --type headless`
 - Stop: `ssh adrick@192.168.2.14 "shutdown /s /t 0"`, then poll

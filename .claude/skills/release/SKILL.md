@@ -288,7 +288,10 @@ VirtualBox VM: finish 6a (including the stop) before starting 6b.
 4. Copy it back:
    `scp -P 2222 -o UserKnownHostsFile=$HOME/VMs/macos/known_hosts adrick@127.0.0.1:clay/clay-macos-universal /tmp/clay-macos-universal`,
    then verify it contains this release's code, like any other asset.
-5. **Always** `~/VMs/macos/macvm.sh stop` afterwards, whether the build passed or failed
+5. Prune its `target/` (see Step 9; the VM's python3 is 3.9, which the script supports):
+   `~/VMs/macos/macvm.sh ssh 'cd ~/clay && python3 tools/prune-target.py'`. The deleted space
+   goes back to the host, because the disk is attached with discard.
+6. **Always** `~/VMs/macos/macvm.sh stop` afterwards, whether the build passed or failed
    (graceful shutdown; never kill QEMU except as a last resort).
 
 If a build fails with a code issue: fix locally, commit, push, then re-sync the VM (step 2)
@@ -330,6 +333,9 @@ ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no adrick@192.
    timeout can kill mid-link.
 2. `scp` the binary back: `scp adrick@192.168.2.14:clay/target/release/clay.exe /tmp/clay-windows-x86_64.exe`
 3. **Verify** it contains this release's code (`strings /tmp/clay-windows-x86_64.exe | grep -c '<release-marker>'` must be > 0). A `0` here means the cmd.exe sync didn't take and you built stale source — re-run step 1 and re-check the printed SHA.
+4. Prune its `target\` (see Step 9). This matters most here, because C: is only 70 GB. The VM
+   has no installed Python, so use the portable one from machines.md:
+   `ssh adrick@192.168.2.14 "cd clay && %USERPROFILE%\python-embed\python.exe tools\prune-target.py"`
 
 **Shut the VM down gracefully** (always, whether the build succeeded or failed). A hard
 `controlvm poweroff` discards Windows' recent disk writes and corrupts the VM's git index,
@@ -446,7 +452,7 @@ gh release create vX.Y.Z \
 Note: the three Termux assets are not bracketed above — all are cross-compiled locally
 (Step 5), so they're always included in a full release.
 
-### Step 9: Clean Up /tmp
+### Step 9: Clean Up /tmp and target/
 
 `/tmp` on this machine is a RAM-backed tmpfs, so the staged binaries (about 0.5 GB) hold RAM
 until deleted. Once `gh release view vX.Y.Z --json assets` lists every uploaded asset, record
@@ -461,6 +467,22 @@ The APK is never staged in `/tmp` (it is uploaded from `android/clay-android.apk
 committed). Also stop the Gradle daemon the APK build left running, about 1.3 GB:
 `cd android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew --stop`.
 
+**Then prune `target/`.** cargo never deletes anything from it: every release leaves a whole
+set of Clay binaries and incremental caches behind under the previous version's hashes, next
+to every dependency version, feature set and toolchain ever built. It had reached 188 GB by
+v1.7.16. Run this only once every local build of this release has finished, the APK's
+included, because the version bump is what makes the old Clay artifacts dead:
+```bash
+python3 tools/prune-target.py
+```
+It keeps everything that a Clay build from the last 14 days uses (dependencies, build-script
+output, host proc-macros), so the next debug, test, GUI, Termux or release build recompiles
+only Clay itself, as it has to after a version bump anyway. It deletes the rest, including
+the pre-bump Clay binaries and incremental caches. It never touches final binaries such as
+`target/x86_64-unknown-linux-musl/debug/clay`, and it skips any target dir whose lock a
+running cargo holds. `--dry-run --list` shows what it would delete. The Mac and Windows VMs
+prune their own `target/` in Steps 6a and 6b. Report each `Freed N GB` line in the summary.
+
 ### Step 10: Print Summary
 
 Print a summary table showing:
@@ -468,6 +490,7 @@ Print a summary table showing:
 - Skipped targets marked as "Skipped"
 - The GitHub release URL
 - Total number of assets uploaded
+- The space `tools/prune-target.py` freed here and on each VM
 
 Example (full release, all machines reachable):
 ```
@@ -486,6 +509,7 @@ Example (full release, all machines reachable):
 
 Release: https://github.com/user/repo/releases/tag/vX.Y.Z
 Assets uploaded: 8
+Pruned target/: 41.2 GB here, 1.6 GB Mac VM, 1.9 GB Windows VM
 ```
 
 Example (full release, Windows VM unreachable, Mac VM did not come up):
