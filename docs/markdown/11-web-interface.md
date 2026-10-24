@@ -54,7 +54,7 @@ The web interface provides a complete MUD experience:
 - **ANSI color rendering**: Xubuntu Dark palette, 256-color and true color
 - **Shade character blending**: ░▒▓ rendered with proper color blending
 - **Clickable URLs**: Links in the theme's link colour, underlined, open in new tab
-- **More-mode pausing**: Tab to release, same as console
+- **More-mode pausing**: Tab to release, same as console. Every world pauses on its own, so a world you switch to with a backlog shows one screenful and holds the rest under MORE, as the console does
 - **Command history**: Ctrl+P/N navigation
 - **Multiple worlds**: Full world switching support
 
@@ -253,6 +253,8 @@ The web interface is optimized for mobile devices:
 - WebSocket password required for all connections
 - Password hashed with SHA-256 before transmission
 - Empty password disables the server
+- The desktop GUI's server uses the same password for other devices; until one is set
+  it runs with a random password of its own, so nothing else can connect
 
 ### Allow List / Whitelisting
 

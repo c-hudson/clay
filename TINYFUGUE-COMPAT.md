@@ -342,8 +342,11 @@ From the drop-in work (user rulings, or what Clay's design allows):
 - `/recall -a` can take a line's own attributes off only while Clay is running: after a
   hot reload the line keeps them, drawn in.
 - `%cleardone` off (the default) leaves sent lines in the input area as TF does, checked
-  against tf in a pty (rows, prompts, a masked line's bare prompt, rows scrolled off for
-  good, `^L` clearing them); `%clearfull` is not followed (Clay scrolls, TF's default).
+  against tf in a pty (rows, rows scrolled off for good, `^L` clearing them), except that
+  TF leaves the prompt on each done row (and a masked line's bare prompt) while Clay keeps
+  only the typed text - the prompt belongs to the line being typed, which shows the current
+  world's (user ruling 2026-10-24; a masked line is an empty row); `%clearfull` is not
+  followed (Clay scrolls, TF's default).
   The input wraps at the edge, not at word boundaries as tf's input window does. On a
   phone (the web client's and the Android app's phone layout) the input always clears
   (user ruling); Termux's console and GUI follow the setting like any other.

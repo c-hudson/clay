@@ -38,7 +38,7 @@ impl ClayView {
                     if self.pending_total() > 0 {
                         self.release_screenful(cx);
                     } else {
-                        self.more.paused = false;
+                        self.more_mut().paused = false;
                     }
                 } else {
                     self.user_scroll(page * n);
@@ -83,7 +83,7 @@ impl ClayView {
                 let fx = self.session.send(WsMessage::SelectiveFlush { world_index: world });
                 self.after(fx, cx);
             }
-            "pause_output" => self.more.pause(),
+            "pause_output" => self.more_mut().pause(),
             "filter_popup" => self.toggle_filter(window, cx),
             "search_popup" => self.toggle_search(window, cx),
             "toggle_limit" => self.toggle_limit(window, cx),
@@ -321,14 +321,14 @@ impl ClayView {
     }
 
     fn note_user_scroll(&mut self, rows: isize) {
-        if rows < 0 && self.more_mode_enabled() && !self.more.paused {
-            self.more.pause();
+        if rows < 0 && self.more_mode_enabled() && !self.more_paused() {
+            self.more_mut().pause();
         }
     }
 
     /// Local held lines plus the server's.
     pub(super) fn pending_total(&self) -> usize {
-        self.more.held() + self.session.core.current_world().map_or(0, |w| w.pending_count)
+        self.held_here() + self.session.core.current_world().map_or(0, |w| w.pending_count)
     }
 
     /// Show `rows` rows of held output: this window's own held lines first (they're
@@ -337,11 +337,11 @@ impl ClayView {
     /// the server while lines are still held here released both at once - and the
     /// server's `PendingReleased` then released as many again here.
     pub(super) fn release_rows(&mut self, rows: usize, cx: &mut Context<Self>) {
-        let used = self.more.release_rows(rows);
-        self.more.caught_up();
+        let used = self.more_mut().release_rows(rows);
+        self.more_mut().caught_up();
         let left = rows.saturating_sub(used);
         let world = self.session.core.current;
-        if self.more.held() == 0 && left > 0 && self.session.core.current_world().is_some_and(|w| w.pending_count > 0) {
+        if self.held_here() == 0 && left > 0 && self.session.core.current_world().is_some_and(|w| w.pending_count > 0) {
             let fx = self.session.core.release_pending(world, left);
             self.after(fx, cx);
         }
@@ -354,7 +354,7 @@ impl ClayView {
     }
 
     pub(super) fn release_all(&mut self, cx: &mut Context<Self>) {
-        self.more.release_all();
+        self.more_mut().release_all();
         let world = self.session.core.current;
         let fx = self.session.core.release_pending(world, 0);
         let rest = self.session.apply(fx);

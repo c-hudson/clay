@@ -181,6 +181,7 @@ This file is:
 | Compressed (MCCP2) connections | Disconnected, with a message | Lost |
 | MCP (MOO) sessions | Silently inactive until reconnect | Lost |
 | Output history | Preserved | Lost |
+| Input area (the line being typed and the lines sent above it; in the console, the native GUI and the WebView GUI) | Preserved | Lost |
 | Scroll position | Preserved | Reset |
 | Settings | Preserved | Reloaded from file |
 | Memory usage | Cleaned | Fresh start |

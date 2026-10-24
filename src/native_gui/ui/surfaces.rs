@@ -270,6 +270,7 @@ impl ClayView {
     /// `/reload`: this GUI starts again as it was started (the server's never restarted
     /// from here, app.js). `/server <addr>`: it starts again attached to `addr`.
     pub(super) fn relaunch(&mut self, target: Option<&str>, cx: &mut Context<Self>) {
+        self.stash_input_for_relaunch();
         // Running Clay itself: /reload is the server's hot reload (it keeps the MUD
         // connections, and starts this window again with it).
         if target.is_none() && crate::native_gui::runs_clay() {
@@ -466,10 +467,52 @@ impl ClayView {
     /// Start this GUI again as it was started (its binary is new now). Returns only if
     /// that failed.
     fn restart_now(&mut self, cx: &mut Context<Self>) {
+        self.stash_input_for_relaunch();
         let args: Vec<String> = std::env::args().skip(1).collect();
         if let Err(e) = crate::platform::exec_with_args(args) {
             self.client_line(&format!("% Couldn't start again: {e}"), cx);
         }
+    }
+
+    /// Keep the input area across this window's relaunch (`relaunch`, `restart_now`): the
+    /// line being typed, its caret and the lines sent above it, in the window's prefs for
+    /// the server attached, stamped - `restore_input_after_relaunch` takes them only within
+    /// `RELAUNCH_INPUT_SECS`, so a later ordinary start never shows stale input. The console
+    /// keeps its input in the reload state the same way (user ruling 2026-10-24: every
+    /// interface keeps it). Nothing to keep clears a stale stash.
+    pub(super) fn stash_input_for_relaunch(&self) {
+        let key = saved_input_key(&self.session.target.key());
+        if self.editor.text.is_empty() && self.input.sent.is_empty() {
+            crate::native_gui::core::store::set_pref(&key, "");
+            return;
+        }
+        let saved = SavedInput {
+            at: now_secs(),
+            text: self.editor.text.clone(),
+            cursor: self.editor.cursor,
+            sent: self.input.sent.iter().map(|e| e.text.clone()).collect(),
+            sent_rows: self.input.sent_rows,
+        };
+        if let Ok(json) = serde_json::to_string(&saved) {
+            crate::native_gui::core::store::set_pref(&key, &json);
+        }
+    }
+
+    /// The input area a relaunch stashed (`stash_input_for_relaunch`), once: the window
+    /// that follows takes it, if it is recent.
+    pub(super) fn restore_input_after_relaunch(&mut self) {
+        let key = saved_input_key(&self.session.target.key());
+        let Some(json) = crate::native_gui::core::store::pref(&key).filter(|s| !s.is_empty()) else { return };
+        crate::native_gui::core::store::set_pref(&key, "");
+        let Some(saved) = saved_input_from(&json, now_secs()) else { return };
+        self.editor.text = saved.text;
+        let mut cursor = saved.cursor.min(self.editor.text.len());
+        while cursor > 0 && !self.editor.text.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        self.editor.cursor = cursor;
+        self.input.sent = saved.sent.into_iter().map(crate::input::SentEntry::new).collect();
+        self.input.sent_rows = saved.sent_rows;
     }
 
     /// `/server ...` (app.js sendCommand's remote-GUI branch): attach to another Clay,
@@ -1055,6 +1098,33 @@ impl ClayView {
 /// The arguments to start again with for `/server <target>`: this run's, less its
 /// target and `--ssh` (a new target is reached directly unless asked again), plus the new
 /// one (platform::exec_relaunch's rule for the WebView GUI).
+/// The input area stashed for a relaunch (`ClayView::stash_input_for_relaunch`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedInput {
+    at: u64,
+    text: String,
+    cursor: usize,
+    sent: Vec<String>,
+    sent_rows: usize,
+}
+
+/// How long a stash is taken back: a relaunch is seconds, a later start is not.
+const RELAUNCH_INPUT_SECS: u64 = 120;
+
+fn saved_input_key(target: &str) -> String {
+    format!("input-relaunch:{target}")
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The stash in `json`, if it parses and was made within `RELAUNCH_INPUT_SECS` of `now`.
+fn saved_input_from(json: &str, now: u64) -> Option<SavedInput> {
+    let saved: SavedInput = serde_json::from_str(json).ok()?;
+    (now.saturating_sub(saved.at) <= RELAUNCH_INPUT_SECS).then_some(saved)
+}
+
 pub(super) fn relaunch_args(args: &[String], target: &str) -> Vec<String> {
     let mut out: Vec<String> = args.iter().filter(|a| *a != "--gui" && !a.starts_with("--gui=") && *a != "--ssh").cloned().collect();
     out.push(format!("--gui={target}"));
@@ -1063,7 +1133,18 @@ pub(super) fn relaunch_args(args: &[String], target: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod relaunch_tests {
-    use super::relaunch_args;
+    use super::{relaunch_args, saved_input_from, SavedInput, RELAUNCH_INPUT_SECS};
+
+    /// A relaunch's stash is taken back only while it is fresh, and round-trips as made.
+    #[test]
+    fn a_stashed_input_is_taken_back_only_while_fresh() {
+        let saved = SavedInput { at: 1000, text: "half typed".into(), cursor: 4, sent: vec!["look".into(), String::new()], sent_rows: 2 };
+        let json = serde_json::to_string(&saved).unwrap();
+        let back = saved_input_from(&json, 1000 + RELAUNCH_INPUT_SECS).expect("fresh");
+        assert_eq!((back.text.as_str(), back.cursor, back.sent.len(), back.sent_rows), ("half typed", 4, 2, 2));
+        assert!(saved_input_from(&json, 1000 + RELAUNCH_INPUT_SECS + 1).is_none(), "stale");
+        assert!(saved_input_from("not json", 1000).is_none());
+    }
 
     #[test]
     fn a_new_target_replaces_the_old_and_drops_ssh() {

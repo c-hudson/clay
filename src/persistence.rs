@@ -449,7 +449,11 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     // default "clay"; present-but-empty means legacy mode (UI served at "/").
     writeln!(file, "web_path={}", app.settings.web_path)?;
     writeln!(file, "port_map_enabled={}", app.settings.port_map_enabled)?;
-    if !app.settings.websocket_password.is_empty() {
+    // Never a GUI's or the Android app's session password (App::session_ws_password): it is
+    // for that run only, and saving it wrote over the password the user had set, so other
+    // devices were locked out at the next start. A password set later differs and is saved.
+    let session = app.session_ws_password.as_deref() == Some(app.settings.websocket_password.as_str());
+    if !app.settings.websocket_password.is_empty() && !session {
         writeln!(file, "websocket_password={}", secret(&app.settings.websocket_password))?;
     }
     if !app.settings.websocket_allow_list.is_empty() {
@@ -2199,6 +2203,8 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     // default "clay"; present-but-empty means legacy mode (UI served at "/").
     writeln!(file, "web_path={}", app.settings.web_path)?;
     writeln!(file, "port_map_enabled={}", app.settings.port_map_enabled)?;
+    // A session password too, unlike settings.dat: the successor's GUI gives its server
+    // its own anyway, and a console reload keeps its real one.
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
@@ -2259,12 +2265,17 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     // Written only when there is something to restore, so an idle reload doesn't grow
     // the state file.
     if !app.input.buffer.is_empty() {
-        let escaped = app.input.buffer
-            .replace('\\', "\\\\")
-            .replace('\n', "\\n")
-            .replace('=', "\\e");
-        writeln!(file, "input_buffer={}", escaped)?;
+        writeln!(file, "input_buffer={}", escape_state_string(&app.input.buffer))?;
         writeln!(file, "input_cursor={}", app.input.cursor_position)?;
+    }
+    // The lines sent that still show above it (TF's %cleardone off, InputArea::sent):
+    // a reload used to keep the half-typed line and lose these. Oldest first, as the
+    // loader pushes them back; a masked line is an empty entry.
+    for entry in &app.input.sent {
+        writeln!(file, "input_sent={}", escape_state_string(&entry.text))?;
+    }
+    if app.input.sent_rows > 0 {
+        writeln!(file, "input_sent_rows={}", app.input.sent_rows)?;
     }
 
     // Save input history (base64 encode each line to handle special chars)
@@ -2652,6 +2663,13 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     }
 
     Ok(())
+}
+
+/// The reload state's escaping of a text with newlines, '=' or backslashes in it
+/// (`unescape_string` undoes it): Alt-Enter puts real newlines in the input, and a bare
+/// '=' would be eaten by the key/value split.
+fn escape_state_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('=', "\\e")
 }
 
 pub fn unescape_string(s: &str) -> String {
@@ -3317,6 +3335,13 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "input_cursor" => {
                         // Clamped below, once the buffer is definitely parsed.
                         app.input.cursor_position = value.parse().unwrap_or(0);
+                    }
+                    "input_sent" => {
+                        app.input.sent.push_back(crate::input::SentEntry::new(unescape_string(value)));
+                    }
+                    "input_sent_rows" => {
+                        // Fitted to the area on the first frame (InputArea::fit_sent).
+                        app.input.sent_rows = value.parse().unwrap_or(0);
                     }
                     k if k.starts_with("history_") => {
                         app.input.history.push(unescape_string(value));
@@ -4856,6 +4881,36 @@ mod tests {
         assert_eq!(reloaded.input.cursor_position, reloaded.input.buffer.len());
     }
 
+    /// The lines sent that still show in the input area (TF's %cleardone off) survive a
+    /// hot reload with the half-typed line: a reload used to keep only that line.
+    #[test]
+    fn test_sent_input_lines_survive_a_hot_reload() {
+        let mut app = App::new();
+        for text in ["look", "", "say a=b\nand more"] {
+            app.input.push_sent(crate::input::SentEntry::new(text.to_string()));
+        }
+        app.input.buffer = "half typed".to_string();
+        app.input.cursor_position = 4;
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save");
+        let content = String::from_utf8(buf).expect("utf8");
+        assert!(content.contains("input_sent=look\ninput_sent=\ninput_sent=say a\\eb\\nand more\n"), "got:\n{content}");
+        assert!(content.contains(&format!("input_sent_rows={}", app.input.sent_rows)));
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load");
+        let texts: Vec<&str> = reloaded.input.sent.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["look", "", "say a=b\nand more"]);
+        assert_eq!(reloaded.input.sent_rows, app.input.sent_rows);
+        assert_eq!(reloaded.input.buffer, "half typed");
+
+        // Nothing sent: nothing written, nothing restored.
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&App::new(), &mut buf).expect("save");
+        assert!(!String::from_utf8(buf).unwrap().contains("input_sent"));
+    }
+
     /// A line's place in TF's history - `G` (nohistory), or recorded by /recordline -
     /// survives a hot reload, so /recall still leaves the one out and finds the other.
     #[test]
@@ -5048,6 +5103,36 @@ mod tests {
             .expect("password line present in saved file");
         let stored = stored_line.trim_start_matches("password=");
         assert_eq!(decrypt_password(stored), "testpassword");
+    }
+
+    /// A GUI's or the Android app's session password (App::session_ws_password) never
+    /// reaches settings.dat or an /import export - saving it wrote over the password the
+    /// user had set - while one the user sets afterwards does; the reload state keeps it.
+    #[test]
+    fn test_session_ws_password_is_never_saved_but_a_set_one_is() {
+        let mut app = App::new();
+        app.settings.websocket_password = "sess1on".to_string();
+        app.session_ws_password = Some("sess1on".to_string());
+        let tmp = std::env::temp_dir().join(format!("clay_test_session_pw_{}.dat", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        save_settings_to_path(&app, &tmp).expect("save_settings_to_path failed");
+        let on_disk = std::fs::read_to_string(&tmp).expect("read saved settings.dat");
+        assert!(!on_disk.contains("websocket_password="), "a session password must not be saved:\n{on_disk}");
+        assert!(!serialize_settings_for_export(&app).contains("websocket_password="), "nor exported");
+        let mut reload = Vec::new();
+        save_reload_state_to(&app, &mut reload).expect("save_reload_state_to failed");
+        let reload = String::from_utf8(reload).unwrap();
+        let line = reload.lines().find(|l| l.starts_with("websocket_password=")).expect("the reload state carries it");
+        assert_eq!(decrypt_password(line.trim_start_matches("websocket_password=")), "sess1on");
+
+        // The user sets one: it differs from the session password, so it is saved.
+        app.settings.websocket_password = "mine".to_string();
+        save_settings_to_path(&app, &tmp).expect("save_settings_to_path failed");
+        let on_disk = std::fs::read_to_string(&tmp).expect("read saved settings.dat");
+        let _ = std::fs::remove_file(&tmp);
+        let line = on_disk.lines().find(|l| l.starts_with("websocket_password=")).expect("the set password is saved");
+        assert!(line.contains("ENC:"), "encrypted at rest: {line}");
+        assert_eq!(decrypt_password(line.trim_start_matches("websocket_password=")), "mine");
     }
 
     #[test]

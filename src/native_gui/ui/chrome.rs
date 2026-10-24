@@ -359,7 +359,7 @@ impl ClayView {
             let pending = self.pending_total();
             let more = if !at_bottom {
                 Some(("History", rows_below))
-            } else if (self.more.paused && self.more.held() > 0) || world.is_some_and(|w| w.pending_count > 0) {
+            } else if (self.more_paused() && self.held_here() > 0) || world.is_some_and(|w| w.pending_count > 0) {
                 Some(("More", pending))
             } else {
                 None

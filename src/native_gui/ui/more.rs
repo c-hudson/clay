@@ -19,7 +19,11 @@
 //!   fill, appended at the tail like live output; counted, the catch-up paused after a
 //!   screenful and held the rest, and the window opened hundreds of lines back.
 //!
-//! Switching world drops the hold (the lines then show), as app.js does.
+//! One per world (`ClayView::more`), as the console pages every world on its own
+//! (`World::add_output`): a world not on screen counts and holds its arrivals too, a
+//! switch shows the world's own held state, and leaving a world counts afresh only when it
+//! holds nothing (`left`, the console's `switch_world`). app.js does the same. Before this
+//! a switch dropped the hold, so a backlog came out all at once.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -40,8 +44,9 @@ pub struct MoreMode {
 }
 
 impl MoreMode {
-    /// Start over for a world (a switch, a new InitialState): nothing held, and what's
-    /// there now counts as seen.
+    /// Start over: nothing held, and what's there now counts as seen (the tests' starting
+    /// point; a world's state is made fresh by `ClayView::more` on its first arrivals).
+    #[cfg(test)]
     pub fn reset(&mut self, world: Option<&World>) {
         self.paused = false;
         self.held.clear();
@@ -155,6 +160,16 @@ impl MoreMode {
     /// The user caught up (released output, sent a command): count afresh.
     pub fn caught_up(&mut self) {
         self.since_pause = 0;
+    }
+
+    /// The user switched away: count afresh unless lines are held, which keep their
+    /// pause for the next visit (the console's `switch_world`).
+    pub fn left(&mut self) {
+        if self.held.is_empty() {
+            self.paused = false;
+            self.since_pause = 0;
+        }
+        self.wheel_px = 0.0;
     }
 }
 
@@ -326,6 +341,31 @@ mod tests {
     }
 
     /// Lines that aren't drawn (gagged, or `rows` 0) are neither counted nor held.
+    /// A world not on screen holds its backlog too, and keeps it through a switch away and
+    /// back; leaving counts afresh only when nothing is held.
+    #[test]
+    fn leaving_keeps_a_hold_and_resets_only_an_empty_count() {
+        let mut w = World::default();
+        w.lines = vec![line(1)];
+        let mut m = MoreMode::default();
+        m.reset(Some(&w));
+        w.lines.extend((2..=4).map(line));
+        assert!(!m.arrivals(&w, true, 5, &mut one_row));
+        // Three rows shown of five: leaving with nothing held starts the count over.
+        m.left();
+        w.lines.extend((5..=10).map(line));
+        assert!(m.arrivals(&w, true, 5, &mut one_row), "six more rows: five fit, the sixth pauses");
+        assert_eq!(m.held(), 1);
+        // Held lines survive a switch away and back.
+        m.left();
+        assert!(m.paused && m.held() == 1 && m.is_held(10));
+        w.lines.extend((11..=13).map(line));
+        assert!(!m.arrivals(&w, true, 5, &mut one_row), "already paused: held, not paused anew");
+        assert_eq!(m.held(), 4);
+        m.release_all();
+        assert!(!m.paused);
+    }
+
     #[test]
     fn undrawn_lines_dont_count() {
         let mut w = World::default();

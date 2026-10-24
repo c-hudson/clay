@@ -264,14 +264,11 @@ fn cut_runs(runs: &[TextRun], at: usize, len: usize) -> Vec<TextRun> {
     out
 }
 
-/// A sent line as drawn above the field, one styled line per line of it: the prompt it was
-/// typed after in its own colours, then its text (`palette.fg`), control characters as
-/// their stand-ins.
+/// A sent line as drawn above the field, one styled line per line of it: its text
+/// (`palette.fg`, no prompt - that is the typed line's), control characters as their
+/// stand-ins.
 fn sent_lines(entry: &crate::input::SentEntry, view: &ClayView) -> Vec<StyledLine> {
-    let mut first = if entry.prompt.is_empty() { StyledLine::default() } else { style_line(&entry.prompt, &view.palette, &view.style) };
-    first.breaks.clear();
-    first.line_bg = None;
-    let mut out = vec![first];
+    let mut out = vec![StyledLine::default()];
     for (k, part) in entry.text.split('\n').enumerate() {
         let text: String = part.chars().filter(|c| *c != '\r').map(crate::input::display_control_char).collect();
         if k > 0 {
@@ -639,14 +636,12 @@ impl ClayView {
         self.input.sent_rows
     }
 
-    /// What is typed now, with the prompt it is typed after, to leave on screen once sent
-    /// (`keep_sent_line`). A line typed while the world masks echo keeps only its prompt, as
-    /// TF leaves it - and the password is never kept.
+    /// What is typed now, to leave on screen once sent (`keep_sent_line`): the text alone,
+    /// never the prompt. A line typed while the world masks echo keeps nothing - an empty
+    /// row - and the password is never kept.
     fn sent_entry_now(&self) -> crate::input::SentEntry {
-        let world = self.session.core.current_world();
-        let masked = world.is_some_and(|w| w.echo_masked);
-        let prompt = world.map(|w| w.prompt.clone()).unwrap_or_default();
-        crate::input::SentEntry::new(prompt, if masked { String::new() } else { self.editor.text.clone() })
+        let masked = self.session.core.current_world().is_some_and(|w| w.echo_masked);
+        crate::input::SentEntry::new(if masked { String::new() } else { self.editor.text.clone() })
     }
 
     /// A line left the input for good: keep it on screen above the next one (TF's
@@ -885,6 +880,14 @@ impl ClayView {
     /// this GUI answers itself included, as TF leaves any line entered.
     pub(super) fn send_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entry = self.sent_entry_now();
+        // /reload stashes the input area for the relaunch (surfaces.rs): the line goes
+        // above first, so it is there afterwards as it is on the console.
+        let lower = self.editor.text.trim().to_ascii_lowercase();
+        if lower == "/reload" || lower.starts_with("/reload ") {
+            self.keep_sent_line(entry, window);
+            self.send_line_now(window, cx);
+            return;
+        }
         self.send_line_now(window, cx);
         if self.editor.text.is_empty() {
             self.keep_sent_line(entry, window);
@@ -953,10 +956,10 @@ impl ClayView {
         // Following the output: held lines come out and more-mode counts afresh. Scrolled
         // back: the place is kept, and the reply queues below.
         if self.scroll.borrow().at_bottom() {
-            if self.more.paused {
+            if self.more_paused() {
                 self.release_all(cx);
             }
-            self.more.caught_up();
+            self.more_mut().caught_up();
         }
         let core = &self.session.core;
         let world = core.current_world();

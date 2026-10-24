@@ -2972,8 +2972,9 @@ fn prompt_spans(prompt: &str) -> Vec<Span<'static>> {
     }
 }
 
-/// The last `count` rows of the lines sent from the input area (TF's %cleardone off), each
-/// with the prompt it was typed after, wrapped at `width` as `SentEntry::rows` wraps them.
+/// The last `count` rows of the lines sent from the input area (TF's %cleardone off),
+/// their text alone (no prompt: that is the typed line's), wrapped at `width` as
+/// `SentEntry::rows` wraps them.
 fn sent_lines(input: &crate::input::InputArea, width: usize, count: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Newest first, so only the entries that can show are wrapped.
@@ -2981,14 +2982,7 @@ fn sent_lines(input: &crate::input::InputArea, width: usize, count: usize) -> Ve
         if lines.len() >= count {
             break;
         }
-        let mut rows: Vec<Line<'static>> = Vec::new();
-        for (k, text) in entry.rows(width).into_iter().enumerate() {
-            let mut spans = if k == 0 && !entry.prompt.is_empty() { prompt_spans(&entry.prompt) } else { Vec::new() };
-            if !text.is_empty() {
-                spans.push(Span::raw(text));
-            }
-            rows.push(Line::from(spans));
-        }
+        let mut rows: Vec<Line<'static>> = entry.rows(width).into_iter().map(|text| Line::from(Span::raw(text))).collect();
         rows.extend(lines);
         lines = rows;
     }

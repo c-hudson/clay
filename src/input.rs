@@ -336,11 +336,12 @@ pub enum HistorySub {
 }
 
 /// A line sent from the input area, as TinyFugue leaves it on screen when `%cleardone` is
-/// off (`Settings::clear_input_on_send`): the prompt it was typed after, and its text - none
-/// for a line typed while the world masked echo, which TF leaves as just its prompt.
+/// off (`Settings::clear_input_on_send`): its text alone. TF leaves the prompt it was typed
+/// after on the row too; Clay doesn't (user ruling 2026-10-24) - the prompt belongs to the
+/// line being typed, which shows the current world's. A line typed while the world masked
+/// echo keeps no text, so it is an empty row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentEntry {
-    pub prompt: String,
     pub text: String,
 }
 
@@ -350,8 +351,8 @@ impl SentEntry {
     /// frame, costs no more than this.
     pub const MAX_TEXT: usize = 8192;
 
-    /// The line `text`, typed after `prompt`; of a huge one only its end, all that shows.
-    pub fn new(prompt: String, text: String) -> Self {
+    /// The line `text`; of a huge one only its end, all that shows.
+    pub fn new(text: String) -> Self {
         let text = match text.len().checked_sub(Self::MAX_TEXT) {
             Some(mut cut) if cut > 0 => {
                 while !text.is_char_boundary(cut) {
@@ -361,20 +362,14 @@ impl SentEntry {
             }
             _ => text,
         };
-        SentEntry { prompt, text }
+        SentEntry { text }
     }
 
     /// The text on each row the entry fills at `width`, wrapped as the input itself wraps
-    /// (`InputArea::walk_line_starts`): the first row starts after the prompt, a line break
-    /// ends a row, and control characters are their drawn stand-ins.
+    /// (`InputArea::walk_line_starts`): a line break ends a row, and control characters
+    /// are their drawn stand-ins.
     pub fn rows(&self, width: usize) -> Vec<String> {
         let width = width.max(1);
-        let prompt_len = crate::util::strip_ansi_codes(&self.prompt).chars().count();
-        // As render_input: a prompt that exactly fills its row leaves the text the next one.
-        let first = match prompt_len % width {
-            0 if prompt_len > 0 => 0,
-            used => width - used,
-        };
         let mut rows = vec![String::new()];
         let mut col = 0usize;
         for c in self.text.chars() {
@@ -385,8 +380,7 @@ impl SentEntry {
             }
             let c = display_control_char(c);
             let cw = input_char_width(c);
-            let capacity = if rows.len() == 1 { first } else { width };
-            if col + cw > capacity && (col > 0 || capacity == 0) {
+            if col + cw > width && col > 0 {
                 rows.push(String::new());
                 col = 0;
             }

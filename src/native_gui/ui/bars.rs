@@ -173,7 +173,7 @@ impl ClayView {
                     move |this, _, _w, cx| {
                         let command = format!("/{name}");
                         let world_index = this.session.core.current;
-                        this.more.caught_up();
+                        this.more_mut().caught_up();
                         let fx = this.session.send(WsMessage::SendCommand { world_index, command });
                         this.after(fx, cx);
                     },

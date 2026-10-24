@@ -71,9 +71,11 @@ on Android regardless of GUI support.
 ## Login
 
 Master mode authenticates automatically — there is no password prompt, since the
-WebView is talking to the instance it was just launched alongside. Remote mode shows
-the same password screen as the web interface (see **Web Interface**) unless the
-connecting address is whitelisted, in which case it auto-connects.
+WebView is talking to the instance it was just launched alongside. Other devices connect
+to it with the password set in Settings › Web (see **Web Interface**); until one is set,
+the GUI protects its server with a random password made fresh at each start, so only its
+own window can log in. Remote mode shows the same password screen as the web interface
+unless the connecting address is whitelisted, in which case it auto-connects.
 
 ## Interface
 

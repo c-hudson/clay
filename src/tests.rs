@@ -2702,10 +2702,11 @@
         assert_eq!(rows, ["two", "two", ""]);
     }
 
-    /// A line typed at a masked prompt leaves only its prompt, as TF does; a sent line keeps
-    /// the prompt it was typed after.
+    /// A sent line keeps its text alone, never the prompt it was typed after (TF keeps it;
+    /// user ruling); a line typed at a masked prompt leaves an empty row. The line being
+    /// typed shows the current world's prompt.
     #[test]
-    fn test_sent_lines_keep_their_prompt_and_a_masked_line_leaves_only_it() {
+    fn test_sent_lines_drop_their_prompt_and_a_masked_line_leaves_an_empty_row() {
         let mut app = sent_lines_app(3);
         app.worlds[0].prompt = "HP:10> ".to_string();
         type_input(&mut app, "look");
@@ -2718,7 +2719,7 @@
         app.worlds[0].prompt = "HP:12> ".to_string();
         type_input(&mut app, "n");
         let (rows, cursor) = draw_input_area(&mut app, 40);
-        assert_eq!(rows, ["HP:10> look", "Password:", "HP:12> n"]);
+        assert_eq!(rows, ["look", "", "HP:12> n"]);
         assert_eq!(cursor, (8, 2));
         assert!(app.input.sent.iter().all(|e| !e.text.contains("secret")), "the password is never kept");
     }
@@ -10171,6 +10172,48 @@ third
         call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "newpassword");
         assert_eq!(app.settings.websocket_password, "newpassword",
             "ws_password must actually be applied - daemon's copy used to ignore this field entirely");
+    }
+
+    /// The web password a GUI runs its server with (gui_session_password): the saved one
+    /// when there is one, so other devices can log in with it; else a random session one
+    /// of this run's own.
+    #[test]
+    fn test_gui_session_password_reuses_the_saved_one() {
+        match gui_session_password("mine").unwrap() {
+            WsOverride::Saved(p) => assert_eq!(p, "mine"),
+            WsOverride::Session(_) => panic!("a saved password is reused"),
+        }
+        let (a, b) = (gui_session_password("").unwrap(), gui_session_password("").unwrap());
+        for o in [&a, &b] {
+            assert!(matches!(o, WsOverride::Session(p) if p.len() == 64 && p.chars().all(|c| c.is_ascii_hexdigit())),
+                "a random session password, 32 bytes as hex");
+        }
+        assert_ne!(a.password(), b.password(), "random every time");
+    }
+
+    /// apply_ws_override turns the server on with the password; only a session one is
+    /// remembered as such, and a password set afterwards in Settings > Web is what a later
+    /// save writes.
+    #[test]
+    fn test_apply_ws_override_remembers_only_a_session_password() {
+        let mut app = App::new();
+        apply_ws_override(&mut app, Some(WsOverride::Saved("mine".into())));
+        assert!(app.settings.http_enabled);
+        assert_eq!(app.settings.websocket_password, "mine");
+        assert_eq!(app.session_ws_password, None, "a saved password is no session password");
+
+        let mut app = App::new();
+        apply_ws_override(&mut app, Some(WsOverride::Session("r4nd0m".into())));
+        assert_eq!(app.settings.websocket_password, "r4nd0m");
+        assert_eq!(app.session_ws_password.as_deref(), Some("r4nd0m"));
+        call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "newpassword");
+        assert_eq!(app.settings.websocket_password, "newpassword");
+        let tmp = std::env::temp_dir().join(format!("clay_test_apply_ws_override_{}.dat", std::process::id()));
+        persistence::save_settings_to_path(&app, &tmp).unwrap();
+        let on_disk = std::fs::read_to_string(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let line = on_disk.lines().find(|l| l.starts_with("websocket_password=")).expect("the set password is saved");
+        assert_eq!(persistence::decrypt_password(line.trim_start_matches("websocket_password=")), "newpassword");
     }
 
     #[test]

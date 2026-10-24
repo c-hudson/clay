@@ -124,7 +124,9 @@ The world remains in your list for reconnection.
 Each world maintains its own output buffer:
 - Unlimited size (grows with available memory)
 - Independent scroll position per world
-- Independent more-mode pause state
+- Independent more-mode pause state, in every interface: the web/Android client and the
+  native GUI page a world they aren't showing too, so switching to a world with a backlog
+  shows one screenful and holds the rest under MORE, as the console does
 
 ### Prompts
 

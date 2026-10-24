@@ -447,12 +447,13 @@ pub fn run_master_webgui() -> io::Result<()> {
         disable_a11y_bridge_if_broken();
     }
 
-    // Read the configured HTTP port from settings (default 9000)
-    // The GUI uses the same port as the web interface
-    let port = {
+    // Read the configured HTTP port from settings (default 9000) - the GUI uses the same
+    // port as the web interface - and the web password the user saved, which the server
+    // runs with so other devices can log in with it (see below).
+    let (port, saved_password) = {
         let mut tmp_app = crate::App::new();
         let _ = crate::persistence::load_settings(&mut tmp_app);
-        tmp_app.settings.http_port
+        (tmp_app.settings.http_port, tmp_app.settings.websocket_password.clone())
     };
 
     // Detect duplicate instances: probe the port before spawning anything.
@@ -482,15 +483,18 @@ pub fn run_master_webgui() -> io::Result<()> {
         // Drop the test listeners immediately — the real bind happens inside run_app_headless.
     }
 
-    // Random session password from the OS CSPRNG (the server listens on all
-    // interfaces for remote clients, so this must not be guessable). Fail closed.
-    let mut random_bytes = [0u8; 32];
-    if let Err(e) = getrandom::getrandom(&mut random_bytes) {
-        let msg = format!("Could not generate a secure session password: {}", e);
-        show_error_dialog("Clay", &msg);
-        return Err(io::Error::other(msg));
-    }
-    let password = hex::encode(random_bytes);
+    // The saved web password, or a random session one from the OS CSPRNG (the server
+    // listens on all interfaces for remote clients, so it must not be guessable) that is
+    // never written to settings.dat. Fail closed.
+    let ws_override = match crate::gui_session_password(&saved_password) {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = format!("Could not generate a secure session password: {}", e);
+            show_error_dialog("Clay", &msg);
+            return Err(io::Error::other(msg));
+        }
+    };
+    let password = ws_override.password().to_string();
     let password_hash = hash_password(&password);
 
     // Build tokio runtime for the App
@@ -503,12 +507,11 @@ pub fn run_master_webgui() -> io::Result<()> {
 
     // Spawn the headless App with WS override (a failure to start it is reported fresh)
     *crate::GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    let ws_password = password.clone();
     handle.spawn(async move {
         if let Err(_e) = crate::run_app_headless(
             app_to_gui_tx,
             gui_to_app_rx,
-            Some(ws_password),
+            Some(ws_override),
             None, // No GUI repaint callback (webview is event-driven)
             None, // Port comes from settings.http_port (already probed above)
         ).await {

@@ -142,7 +142,8 @@ pub struct ClayView {
     /// Bumped whenever the same line would style differently (clears `styled`).
     style_epoch: u64,
     scroll: ScrollHandle,
-    more: MoreMode,
+    /// More-mode per world, by world name (more.rs): the console pages every world.
+    more: HashMap<String, MoreMode>,
     keys: Keys,
     /// TF's numeric prefix (`%kbnum`), shown as [N] after the world name.
     kbnum: Option<i64>,
@@ -249,7 +250,7 @@ impl ClayView {
             actions_sig: String::new(),
             style_epoch: 0,
             scroll: ScrollHandle::default(),
-            more: MoreMode::default(),
+            more: HashMap::new(),
             keys: Keys::default(),
             kbnum: None,
             shell_esc_armed: None,
@@ -282,6 +283,8 @@ impl ClayView {
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
         view.bridged_theme = view.theme_json.clone();
+        // A relaunch's input area (/reload, /update), as the console keeps its own.
+        view.restore_input_after_relaunch();
         view
     }
 
@@ -301,10 +304,12 @@ impl ClayView {
                 Effect::Changed => changed = true,
                 Effect::Event(msg) => match *msg {
                     crate::websocket::WsMessage::PendingReleased { world_index, count } => {
-                        // Released by any interface: count afresh, and show as many of ours.
-                        self.more.caught_up();
-                        if world_index == self.session.core.current {
-                            self.more.release(count);
+                        // Released by any interface: that world counts afresh, and shows as
+                        // many of its own.
+                        if let Some(name) = self.session.core.worlds.get(world_index).map(|w| w.name.clone()) {
+                            let m = self.more.entry(name).or_default();
+                            m.caught_up();
+                            m.release(count);
                         }
                         changed = true;
                     }
@@ -450,14 +455,20 @@ impl ClayView {
                     self.session.core.prefer_world(Some(name));
                 }
             }
+            // The world being left counts afresh if it holds nothing (the console's
+            // switch_world); the one arrived at shows its own held state (visible_lines
+            // stops at its first held line), so a backlog pages as on the console.
+            if let Some(old) = self.shown_world.and_then(|i| self.session.core.worlds.get(i)) {
+                if let Some(m) = self.more.get_mut(&old.name) {
+                    m.left();
+                }
+            }
             self.shown_world = current;
             // A switch stops the MUD's media; the server sends the new world's (app.js).
             if let Some(m) = self.media.as_mut() {
                 m.stop_all();
             }
-            self.more.reset(self.session.core.current_world());
             self.scroll.borrow_mut().follow_bottom();
-            return;
         }
         // More-mode counts rows, as the output will wrap the lines: they're measured
         // before they're laid out, since a held line never is.
@@ -468,7 +479,10 @@ impl ClayView {
         };
         let (indent, show_tags) = (self.wrapspace, self.show_tags);
         let enabled = self.more_mode_enabled();
-        if let Some(world) = self.session.core.current_world() {
+        // Every world's arrivals count for its own more-mode, on screen or not, as the
+        // console pages every world; only the shown world's pause moves the view.
+        let shown = self.session.core.current;
+        for (i, world) in self.session.core.worlds.iter().enumerate() {
             let mut styler = Styler {
                 styled: &mut self.styled,
                 palette: &self.palette,
@@ -485,14 +499,35 @@ impl ClayView {
                 let styled = styler.line(line);
                 rows_in_columns(&styled.text, &styled.breaks, cols, indent)
             };
-            if self.more.arrivals(world, enabled, threshold, &mut rows) {
+            let paused_now = self.more.entry(world.name.clone()).or_default().arrivals(world, enabled, threshold, &mut rows);
+            if paused_now && i == shown {
                 self.scroll.borrow_mut().follow_bottom();
             }
         }
         // Back at the bottom with nothing held: output flows again.
         if self.scroll.borrow().at_bottom() && self.pending_total() == 0 {
-            self.more.paused = false;
+            self.more_mut().paused = false;
         }
+    }
+
+    /// The shown world's more-mode state, if it has had any arrivals yet.
+    fn more(&self) -> Option<&MoreMode> {
+        self.session.core.current_world().and_then(|w| self.more.get(&w.name))
+    }
+
+    fn more_mut(&mut self) -> &mut MoreMode {
+        let name = self.session.core.current_world().map(|w| w.name.clone()).unwrap_or_default();
+        self.more.entry(name).or_default()
+    }
+
+    /// Whether the shown world's output is paused.
+    pub(super) fn more_paused(&self) -> bool {
+        self.more().is_some_and(|m| m.paused)
+    }
+
+    /// How many lines this window holds back for the shown world.
+    pub(super) fn held_here(&self) -> usize {
+        self.more().map_or(0, |m| m.held())
     }
 
     fn more_mode_enabled(&self) -> bool {
@@ -867,8 +902,9 @@ impl ClayView {
         // Nothing below a line more-mode holds back is drawn (more.rs): released lines
         // come out at the bottom, never in above something already shown.
         let mut holding = false;
+        let more = self.more.get(&world.name);
         for line in &world.lines {
-            holding |= self.more.is_held(line.id);
+            holding |= more.is_some_and(|m| m.is_held(line.id));
             if holding || (line.gagged && !self.show_tags) || hidden_line(&line.text) {
                 if Some(line.id) == cut {
                     break;
@@ -1153,14 +1189,16 @@ impl Render for ClayView {
                 let at_bottom = this.scroll.borrow().at_bottom();
                 if dy > 0.0 && at_bottom && this.pending_total() > 0 {
                     // Wheel past the bottom feeds held output in a row at a time.
-                    this.more.wheel_px += dy;
-                    let rows = (this.more.wheel_px / this.font_size).floor() as usize;
+                    let font_size = this.font_size;
+                    let more = this.more_mut();
+                    more.wheel_px += dy;
+                    let rows = (more.wheel_px / font_size).floor() as usize;
                     if rows > 0 {
-                        this.more.wheel_px -= rows as f32 * this.font_size;
+                        more.wheel_px -= rows as f32 * font_size;
                         this.release_rows(rows, cx);
                     }
                 } else {
-                    this.more.wheel_px = 0.0;
+                    this.more_mut().wheel_px = 0.0;
                     let rows = (dy / this.font_size).round() as isize;
                     if rows != 0 {
                         this.user_scroll(rows);

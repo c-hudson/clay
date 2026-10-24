@@ -1212,11 +1212,29 @@
         partialLines = next;
     }
 
-    // More-mode state (per world)
+    // More-mode state, per world - the console's rule (World::add_output): every world
+    // pauses on its own once a screenful less two rows has arrived since the user last
+    // caught up with it, whether or not it is on screen, and holds the rest until released;
+    // a switch shows the world's held state (renderOutput leaves held lines out). A world
+    // keeps {paused, held, rowsSincePause} in its `more`; nothing is held at a connect (the
+    // server's pending_count stands in, as for the console). Before this, only the shown
+    // world was counted and a switch dropped the hold: a backlog came out all at once.
     let moreModeEnabled = true;
-    let paused = false;
-    let pendingLines = [];
-    let linesSincePause = 0;
+    function moreOf(worldIndex) {
+        const w = worlds[worldIndex];
+        if (!w) return { paused: false, held: [], rowsSincePause: 0 };
+        if (!w.more) w.more = { paused: false, held: [], rowsSincePause: 0 };
+        return w.more;
+    }
+    function moreNow() { return moreOf(currentWorldIndex); }
+    // Nothing held and counting afresh: a connect, or a world flushed.
+    function resetMore(worldIndex) {
+        const w = worlds[worldIndex];
+        if (w) w.more = { paused: false, held: [], rowsSincePause: 0 };
+    }
+    function resetAllMore() {
+        for (let i = 0; i < worlds.length; i++) resetMore(i);
+    }
 
     // Synchronized more-mode: track last sent view state to avoid redundant messages
     let lastSentViewState = null;  // {worldIndex, visibleLines}
@@ -3806,9 +3824,10 @@
                 }
                 splashLines = msg.splash_lines || [];
                 // Reset client-side more-mode state (each client handles more locally)
-                paused = false;
-                pendingLines = [];
-                linesSincePause = 0;
+                resetAllMore();
+                // A relaunch's input area, once the rest of this state (the settings, the
+                // input height) has been applied.
+                setTimeout(restoreInputAfterRelaunch, 0);
                 partialLines = {};
                 // Initialize output cache for each world (empty - will be populated on render)
                 worldOutputCache = worlds.map(() => []);
@@ -4499,11 +4518,9 @@
                         partialLines[msg.world_index] = '';
                         world._max_seq = 0; // Reset dedup tracking after flush
                         world._seenRanges = [];
+                        resetMore(msg.world_index);
                         if (msg.world_index === currentWorldIndex) {
                             elements.output.innerHTML = '';
-                            linesSincePause = 0;
-                            paused = false;
-                            pendingLines = [];
                         }
                     }
                     if (msg.data) {
@@ -4676,24 +4693,25 @@
                                     });
                                 }
                             }
-                            if (msg.world_index === currentWorldIndex) {
-                                // A live arrival is never owned by anyone (ownership is only
-                                // assigned when a client displays a world), so this is false
-                                // here today - evaluated anyway so the incremental-append path
-                                // stays consistent with a full renderOutput().
-                                const lineMarkedNew = lineIsNew(lineObj, world);
-                                // Gagged lines are stored but not rendered (only visible with F2)
-                                // They bypass more-mode entirely
-                                if (msg.gagged) {
-                                    // Not counted for more-mode; drawn only with F2 (as a full render does)
-                                    if (showTags) appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
-                                } else if (!hasRealSeq && isFromServer) {
-                                    // Released pending lines (seq=0, from_server=true) bypass local
-                                    // more-mode to avoid flickering the More indicator
-                                    appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
-                                } else {
-                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
-                                }
+                            // Every world's lines are counted for its own more-mode
+                            // (handleIncomingLine); only the shown world's are drawn now.
+                            const onScreen = msg.world_index === currentWorldIndex;
+                            // A live arrival is never owned by anyone (ownership is only
+                            // assigned when a client displays a world), so this is false
+                            // here today - evaluated anyway so the incremental-append path
+                            // stays consistent with a full renderOutput().
+                            const lineMarkedNew = onScreen && lineIsNew(lineObj, world);
+                            // Gagged lines are stored but not rendered (only visible with F2)
+                            // They bypass more-mode entirely
+                            if (msg.gagged) {
+                                // Not counted for more-mode; drawn only with F2 (as a full render does)
+                                if (onScreen && showTags) appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
+                            } else if (!hasRealSeq && isFromServer) {
+                                // Released pending lines (seq=0, from_server=true) bypass local
+                                // more-mode to avoid flickering the More indicator
+                                if (onScreen) appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
+                            } else {
+                                handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
                             }
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and sends UnseenUpdate messages to keep all clients in sync
@@ -4903,12 +4921,10 @@
                     // Clear any partial line buffer
                     partialLines[msg.world_index] = '';
                     // If it's the current world, clear the display and reset more-mode state
+                    // Reset more-mode state to prevent immediate pause on new data
+                    resetMore(msg.world_index);
                     if (msg.world_index === currentWorldIndex) {
                         elements.output.innerHTML = '';
-                        // Reset more-mode state to prevent immediate pause on new data
-                        linesSincePause = 0;
-                        paused = false;
-                        pendingLines = [];
                     }
                 }
                 break;
@@ -5482,9 +5498,9 @@
                 // Server/another client released pending lines - sync our state
                 // Reset linesSincePause because released lines are broadcast as ServerData
                 // and would otherwise inflate the counter, causing premature more-mode trigger
-                linesSincePause = 0;
-                if (msg.world_index === currentWorldIndex && msg.count > 0) {
-                    doReleasePending(msg.count);
+                moreOf(msg.world_index).rowsSincePause = 0;
+                if (msg.count > 0) {
+                    doReleasePending(msg.world_index, msg.count);
                 }
                 // A gap-fill can come back short because the server clamped it against this
                 // world's pending backlog - more was owed, just not deliverable yet. The
@@ -5684,7 +5700,6 @@
                     currentWorldIndex = msg.world_index;
                     if (worlds[msg.world_index]) {
                         worlds[msg.world_index].pending_count = msg.pending_count || 0;
-                        worlds[msg.world_index].paused = msg.paused || false;
                     }
                     updateStatusBar();
                     // Same reason as in switchWorldLocal: claim before the paint so ▶ is
@@ -6040,6 +6055,9 @@
             case 'ServerReloading':
                 reloadReconnect = true;
                 reloadReconnectAttempts = 0;
+                // The server that runs this GUI starts it again with itself: keep the
+                // input area for the page that follows (best effort, the restart is near).
+                stashInputForRelaunch();
                 break;
 
             default:
@@ -6063,24 +6081,30 @@
         const obj = heldWorld && heldWorld.output_lines ? heldWorld.output_lines[lineIndex] : null;
 
         // Counted in rows, as the console and the native GUI count: a screenful of wrapped
-        // prose is fewer lines than rows. A line that isn't drawn costs nothing.
-        const rows = (paused || !moreModeEnabled) ? 0 : lineRows(text, !!(obj && obj.gagged));
+        // prose is fewer lines than rows. A line that isn't drawn costs nothing. The
+        // world's own count, on screen or not; only the shown world's lines are drawn, and
+        // only it moves the view or the badge.
+        const m = moreOf(worldIndex);
+        const onScreen = worldIndex === currentWorldIndex;
+        const rows = (m.paused || !moreModeEnabled) ? 0 : lineRows(text, !!(obj && obj.gagged));
 
-        if (paused) {
+        if (m.paused) {
             // Already paused, queue the line info
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
-            updateStatusBar();
-        } else if (moreModeEnabled && rows > 0 && linesSincePause > 0 && linesSincePause + rows > threshold) {
+            m.held.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
+            if (onScreen) updateStatusBar();
+        } else if (moreModeEnabled && rows > 0 && m.rowsSincePause > 0 && m.rowsSincePause + rows > threshold) {
             // Trigger pause: this line would not fit in what's left of the screenful.
-            paused = true;
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
-            // Scroll to bottom to show what we have so far
-            scrollToBottom();
-            updateStatusBar();
+            m.paused = true;
+            m.held.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
+            if (onScreen) {
+                // Scroll to bottom to show what we have so far
+                scrollToBottom();
+                updateStatusBar();
+            }
         } else {
             // Normal display - append the line
-            linesSincePause += rows;
-            appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer, highlightColor, archiveSourced);
+            m.rowsSincePause += rows;
+            if (onScreen) appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer, highlightColor, archiveSourced);
         }
     }
 
@@ -6120,7 +6144,7 @@
     // How many lines are held back for the current world, local queue plus the server's.
     function pendingTotal() {
         const world = worlds[currentWorldIndex];
-        return pendingLines.length + (world ? (world.pending_count || 0) : 0);
+        return moreNow().held.length + (world ? (world.pending_count || 0) : 0);
     }
 
     // Release `count` lines of pending output. `count` is a VISUAL ROW budget on the wire
@@ -6138,16 +6162,17 @@
     function releaseLines(count) {
         const world = worlds[currentWorldIndex];
         const serverPending = world ? (world.pending_count || 0) : 0;
+        const m = moreNow();
 
         // Check if there's anything to release (local or server)
-        if (pendingLines.length === 0 && serverPending === 0) return;
+        if (m.held.length === 0 && serverPending === 0) return;
 
         let left = count;
-        if (pendingLines.length > 0) {
+        if (m.held.length > 0) {
             left = Math.max(0, count - releaseHeldRows(count));
         }
 
-        if (pendingLines.length === 0 && left > 0 && serverPending > 0) {
+        if (m.held.length === 0 && left > 0 && serverPending > 0) {
             // Optimistic UI update: immediately reduce pending_count so rapid PageDown
             // presses don't send redundant requests. Server will correct with PendingLinesUpdate.
             const toRelease = Math.min(left, serverPending);
@@ -6168,8 +6193,8 @@
         const serverPending = world ? (world.pending_count || 0) : 0;
 
         // Release local pending lines
-        if (pendingLines.length > 0) {
-            doReleasePending(0);
+        if (moreNow().held.length > 0) {
+            doReleasePending(currentWorldIndex, 0);
         }
 
         // Also request server to release all pending lines
@@ -6183,38 +6208,46 @@
 
     // Show `count` held lines, oldest first (0: all of them). A LINE count: what the
     // server's PendingReleased reports, and releaseAll's "everything".
-    function doReleasePending(count) {
-        if (pendingLines.length === 0) return;
-        showHeldLines(count === 0 ? pendingLines.length : Math.min(count, pendingLines.length));
+    function doReleasePending(worldIndex, count) {
+        const held = moreOf(worldIndex).held;
+        if (held.length === 0) return;
+        showHeldLines(worldIndex, count === 0 ? held.length : Math.min(count, held.length));
     }
 
     // Show held lines, oldest first, as many as fit in `budget` rows - at least one, so a
     // line taller than the budget still comes out. Returns the rows shown.
     function releaseHeldRows(budget) {
+        const held = moreNow().held;
         let used = 0;
         let n = 0;
-        while (n < pendingLines.length) {
-            const item = pendingLines[n];
+        while (n < held.length) {
+            const item = held[n];
             const rows = lineRows(item.text, !!(item.obj && item.obj.gagged));
             if (used > 0 && used + rows > budget) break;
             used += rows;
             n++;
         }
-        showHeldLines(n);
+        showHeldLines(currentWorldIndex, n);
         return used;
     }
 
-    // Append the oldest `n` held lines; once none are held, output flows again.
-    function showHeldLines(n) {
-        const released = pendingLines.splice(0, n);
+    // Let go of the oldest `n` lines a world holds; once none are held, output flows
+    // again. The shown world's are drawn now (a line claimed ▶ since it was held - a switch
+    // to its world - takes its marker); another world's wait in its buffer for a switch.
+    function showHeldLines(worldIndex, n) {
+        const m = moreOf(worldIndex);
+        const released = m.held.splice(0, n);
 
-        released.forEach(item => {
-            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew, item.fromServer, item.highlightColor, item.archiveSourced);
-        });
+        if (worldIndex === currentWorldIndex) {
+            released.forEach(item => {
+                const markedNew = item.markedNew || lineIsNew(item.obj, worlds[worldIndex]);
+                appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, markedNew, item.fromServer, item.highlightColor, item.archiveSourced);
+            });
+        }
 
-        if (pendingLines.length === 0) {
-            paused = false;
-            linesSincePause = 0;
+        if (m.held.length === 0) {
+            m.paused = false;
+            m.rowsSincePause = 0;
         }
 
         updateStatusBar();
@@ -7019,11 +7052,11 @@
         // the bottom. If the user has scrolled up to read history, keep their position —
         // the command still sends and its reply queues below, revealed on scroll-down.
         if (isAtBottom()) {
-            if (paused) {
+            if (moreNow().paused) {
                 releaseAll();
             }
             // Reset lines since pause counter on user input
-            linesSincePause = 0;
+            moreNow().rowsSincePause = 0;
         }
 
         // Clear splash on user input (server will also clear and send WorldFlushed)
@@ -7054,6 +7087,11 @@
         }
 
         const cmdTrimmed = cmd.trim();
+        // /reload restarts this GUI (below, or the server's reload when it runs this GUI):
+        // keep the input area for the page that follows, this line above it.
+        if (cmdTrimmed === '/reload' || cmdTrimmed.startsWith('/reload ')) {
+            stashInputForRelaunch('', sentLineFor(cmd).text);
+        }
 
         // Intercept /window --grep locally only — this opens a client-side filtered
         // view that the server has no concept of (parse_command's Command::Window
@@ -7897,10 +7935,14 @@
             if (newWorld && newWorld.showing_splash && newWorld.was_connected && newWorld.output_lines && newWorld.output_lines.length > 0) {
                 newWorld.showing_splash = false;
             }
-            // Reset more-mode state for new world
-            paused = false;
-            pendingLines = [];
-            linesSincePause = 0;
+            // The world being left counts afresh if it holds nothing, as the console's
+            // switch_world does; the one arrived at shows its own held state (renderOutput
+            // leaves its held lines out), so a backlog pages as it does on the console.
+            const left = moreOf(previousWorldIndex);
+            if (left.held.length === 0) {
+                left.paused = false;
+                left.rowsSincePause = 0;
+            }
             // Take ▶ ownership before the first paint, not after the MarkWorldSeen below
             // round-trips - otherwise this render shows the text bare and the markers appear
             // a moment later. The ClaimedNew that MarkWorldSeen triggers reconciles it.
@@ -9589,8 +9631,8 @@
         // until released: doReleasePending() appends them then, so drawing them here too
         // showed every held line twice (once now, once on release).
         const held = new Set();
-        for (const p of pendingLines) {
-            if (p.worldIndex === currentWorldIndex && p.obj) held.add(p.obj);
+        for (const p of moreNow().held) {
+            if (p.obj) held.add(p.obj);
         }
 
         // TF's %textdiv: above the first line shown that arrived after what this client had
@@ -11485,7 +11527,7 @@
             elements.moreLabel.textContent = 'History';
             elements.moreCount.textContent = formatCount(linesFromBottom);
             elements.statusMore.style.display = '';
-        } else if ((paused && pendingLines.length > 0) || serverPending > 0) {
+        } else if ((moreNow().paused && moreNow().held.length > 0) || serverPending > 0) {
             elements.moreLabel.textContent = 'More';
             elements.moreCount.textContent = formatCount(totalPending);
             elements.statusMore.style.display = '';
@@ -11704,8 +11746,8 @@
     // and never comes back, not even when the typed line shrinks again. Never on a phone,
     // which keeps the input that clears on Enter. Display state of this page alone; the
     // console's is InputArea::sent (src/input.rs), the native GUI's InputState::sent.
-    // #input-sent holds one .sent-line per line, its prompt then its text; `sentRows` is
-    // how many of their last rows show above the textarea.
+    // #input-sent holds one .sent-line per line, its text alone (the prompt belongs to the
+    // textarea's line); `sentRows` is how many of their last rows show above the textarea.
     let sentRows = 0;
 
     function keepsSentLines() {
@@ -11716,32 +11758,69 @@
         return (webFontLineHeight || 1.2) * (currentFontSize || 14);
     }
 
-    // What is typed now, with the prompt it is typed after, to leave on screen once sent
-    // (keepSentLine). A line typed while the world masks echo keeps only its prompt, as TF
-    // leaves it - and the password is never kept.
+    // What is typed now, to leave on screen once sent (keepSentLine): the text alone, never
+    // the prompt it was typed after (that belongs to the line being typed; TF keeps it, Clay
+    // doesn't - user ruling). A line typed while the world masks echo keeps nothing, an
+    // empty row - and the password is never kept.
     function sentLineFor(text) {
         const w = worlds[currentWorldIndex];
         // Of a huge paste only its end, all that can show (SentEntry::MAX_TEXT).
         const kept = text.length > 8192 ? text.slice(-8192) : text;
-        return { text: (w && w.echo_masked) ? '' : kept, prompt: elements.prompt.cloneNode(true) };
+        return { text: (w && w.echo_masked) ? '' : kept };
     }
 
     function keepSentLine(line) {
         if (!keepsSentLines() || shellActive()) return;
         const entry = document.createElement('div');
         entry.className = 'sent-line';
-        const prompt = line.prompt;
-        prompt.removeAttribute('id');
-        prompt.removeAttribute('style');
-        prompt.className = 'sent-prompt';
-        entry.appendChild(prompt);
         const text = document.createElement('span');
         text.className = 'sent-text';
         // An empty line takes its row too (a zero-width space gives it a line box).
-        text.textContent = line.text || (prompt.textContent ? '' : '\u200b');
+        text.textContent = line.text || '\u200b';
         entry.appendChild(text);
         elements.inputSent.appendChild(entry);
         sentRows += Math.max(1, Math.round(entry.getBoundingClientRect().height / inputRowPx()));
+        layoutInputArea();
+    }
+
+    // The input area across this GUI's relaunch (/reload, and the server's reload when
+    // it runs this GUI): the line being typed, its caret and the lines sent above it,
+    // kept in the browser's storage for this server and taken back by the page the
+    // relaunch opens, within two minutes - as the console keeps its input in the reload
+    // state (every interface keeps it, user ruling 2026-10-24). The WebView only: a
+    // browser page is never restarted by a server reload, and the Android app has no
+    // reload. `text` stands in for the typed line (a typed /reload isn't it), `also` is a
+    // line that will go above it once sent.
+    function inputRelaunchKey() {
+        return 'clay-input-relaunch:' + (window.WS_HOST || window.location.hostname) + ':' + (window.WS_PORT || window.location.port);
+    }
+    function stashInputForRelaunch(text, also) {
+        if (!window.WEBVIEW_MODE) return;
+        try {
+            const sent = elements.inputSent ? Array.from(elements.inputSent.children).map(e => e.textContent.replace(/\u200b/g, '')) : [];
+            let rows = sentRows;
+            if (also !== undefined && keepsSentLines()) { sent.push(also); rows += 1; }
+            const typed = text !== undefined ? text : elements.input.value;
+            if (!typed && sent.length === 0) { localStorage.removeItem(inputRelaunchKey()); return; }
+            const cursor = text !== undefined ? typed.length : elements.input.selectionStart;
+            localStorage.setItem(inputRelaunchKey(), JSON.stringify({ at: Date.now(), text: typed, cursor, sent, sentRows: rows }));
+        } catch (e) { /* storage unavailable: nothing kept */ }
+    }
+    let inputRestoredAfterRelaunch = false;
+    function restoreInputAfterRelaunch() {
+        if (!window.WEBVIEW_MODE || inputRestoredAfterRelaunch) return;
+        inputRestoredAfterRelaunch = true;
+        let saved = null;
+        try {
+            saved = JSON.parse(localStorage.getItem(inputRelaunchKey()) || 'null');
+            localStorage.removeItem(inputRelaunchKey());
+        } catch (e) { return; }
+        if (!saved || typeof saved.at !== 'number' || Date.now() - saved.at > 120000) return;
+        for (const t of (Array.isArray(saved.sent) ? saved.sent : [])) keepSentLine({ text: String(t) });
+        if (typeof saved.sentRows === 'number') sentRows = Math.min(sentRows, saved.sentRows);
+        elements.input.value = String(saved.text || '');
+        const cursor = Math.min(elements.input.value.length, saved.cursor || 0);
+        try { elements.input.setSelectionRange(cursor, cursor); } catch (e) {}
         layoutInputArea();
     }
 
@@ -16004,8 +16083,8 @@
                 elements.outputContainer.scrollBy(0, n >= 0 ? amount : -amount);
                 if (isAtBottom()) {
                     if (pendingTotal() === 0) {
-                        paused = false;
-                        linesSincePause = 0;
+                        moreNow().paused = false;
+                        moreNow().rowsSincePause = 0;
                         updateStatusBar();
                     } else {
                         releaseScreenful();
@@ -16079,7 +16158,7 @@
             }
             // TF PAUSE: pause the current world so new output queues as pending.
             case 'pause_output':
-                paused = true;
+                moreNow().paused = true;
                 updateStatusBar();
                 return true;
             // TF kb_expand_line: substitute %var/$[]/$() in the current input line in
@@ -17065,8 +17144,8 @@
             // again. pendingTotal() covers both the local queue and the server's count - the
             // same predicate every other site uses.
             if (isAtBottom() && pendingTotal() === 0) {
-                paused = false;
-                linesSincePause = 0;
+                moreNow().paused = false;
+                moreNow().rowsSincePause = 0;
             }
             updateStatusBar();
         }
@@ -17205,7 +17284,7 @@
                         away_px: Math.round(away), st: Math.round(c.scrollTop), sh: c.scrollHeight,
                         ch: c.clientHeight, dom: elements.output.childElementCount,
                         win: (worlds[currentWorldIndex] || {})._renderWindow || null,
-                        paused: paused, since_visible_ms: Math.round(performance.now() - lastVisibleAt),
+                        paused: moreNow().paused, since_visible_ms: Math.round(performance.now() - lastVisibleAt),
                         vv: window.visualViewport ? Math.round(window.visualViewport.height) : null,
                         causes: scrollCauses.join(','),
                     }));
@@ -17525,15 +17604,15 @@
             // If the user scrolls up, trigger pause (like console behavior). followBottom,
             // not raw isAtBottom(): a late or code-caused scroll event on a following view
             // must never pause it - see followBottom's declaration.
-            if (moreModeEnabled && !paused && !followBottom && !isAtBottom()) {
-                paused = true;
+            if (moreModeEnabled && !moreNow().paused && !followBottom && !isAtBottom()) {
+                moreNow().paused = true;
                 updateStatusBar();
             }
             // If user scrolls to bottom, check pending state
             if (isAtBottom()) {
                 if (pendingTotal() === 0) {
-                    paused = false;
-                    linesSincePause = 0;
+                    moreNow().paused = false;
+                    moreNow().rowsSincePause = 0;
                     updateStatusBar();
                 }
                 // With pending held back we simply park here. This used to call releaseAll(),

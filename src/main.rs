@@ -1522,6 +1522,58 @@ fn resolve_web_cert_files(app: &mut App) -> Option<(String, String)> {
     resolve_web_cert_files_inner(app, true)
 }
 
+/// The web password a GUI or the Android app hands `run_app_headless` for its in-process
+/// server, and whether it may be saved.
+///
+/// The desktop GUIs' windows log in over loopback with it, and the server listens on
+/// every interface for other devices with it. For those devices to log in with the
+/// password the user set in Settings > Web, the GUI must use that one; it used to make a
+/// random one at every start, which the server then took instead (locking the phone out
+/// at the next restart) and `save_settings` wrote over the user's.
+pub enum WsOverride {
+    /// For this run only, never written to settings.dat: the GUI's random password when
+    /// none is saved, and the Android app's (it keeps its own in its prefs and passes it
+    /// at every start).
+    Session(String),
+    /// The password already in settings.dat, re-read by the GUI so its window can log in.
+    #[cfg_attr(not(any(feature = "native-gui", feature = "webview-gui")), allow(dead_code))]
+    Saved(String),
+}
+
+impl WsOverride {
+    pub(crate) fn password(&self) -> &str {
+        match self {
+            WsOverride::Session(p) | WsOverride::Saved(p) => p,
+        }
+    }
+}
+
+/// The password a desktop GUI runs its server with: the one saved in settings.dat
+/// (`saved`, decrypted) when there is one, else 32 random bytes as hex for this run only -
+/// unguessable, since the server listens on every interface. `Err` is the OS's reason no
+/// randomness was available: the GUI must not start without a password.
+#[cfg_attr(not(any(feature = "native-gui", feature = "webview-gui")), allow(dead_code))]
+pub(crate) fn gui_session_password(saved: &str) -> Result<WsOverride, String> {
+    if !saved.is_empty() {
+        return Ok(WsOverride::Saved(saved.to_string()));
+    }
+    let mut random = [0u8; 32];
+    getrandom::getrandom(&mut random).map_err(|e| format!("could not make a session password: {e}"))?;
+    Ok(WsOverride::Session(hex::encode(random)))
+}
+
+/// Apply a GUI's or the Android app's password to the App it runs in-process: the web
+/// server comes on with it, and a session password is remembered so `write_settings_dat`
+/// never saves it while it is still the current password.
+pub(crate) fn apply_ws_override(app: &mut App, ws_override: Option<WsOverride>) {
+    let Some(o) = ws_override else { return };
+    app.settings.http_enabled = true;
+    app.settings.websocket_password = o.password().to_string();
+    if let WsOverride::Session(p) = o {
+        app.session_ws_password = Some(p);
+    }
+}
+
 /// `resolve_web_cert_files` for `--multiuser`: same cert choice, but never writes
 /// settings.dat — that App's settings come from multiuser.dat, and saving them
 /// would overwrite this machine's single-user settings. Status goes to stdout: the
@@ -5698,6 +5750,10 @@ pub struct App {
     pub web_restart_needed: bool,
     /// True if this session started from a hot reload (suppress server startup messages)
     pub is_reload: bool,
+    /// A GUI's or the Android app's web password for this run only (`WsOverride::Session`):
+    /// `write_settings_dat` never saves it while it is still the current password, so it
+    /// can't overwrite the one the user set. `None` for the TUI, `-D` and multiuser.
+    pub session_ws_password: Option<String>,
     /// The reload state carried the TF engine's state (`tf::snapshot`) and it was
     /// restored: the macros, bindings and variables startup would build are already here,
     /// so startup actions (and the TF rc) must not run again.
@@ -5990,6 +6046,7 @@ impl App {
             web_reconnect_needed: false,
             web_restart_needed: false,
             is_reload: false, // Set to true in run_app if started from hot reload
+            session_ws_password: None,
             tf_state_restored: false, // Set by the reload-state loader
             needs_output_redraw: true, // Start with true to ensure initial render
             needs_terminal_clear: false, // Set to true by Ctrl+L in --console mode
@@ -17828,15 +17885,14 @@ impl App {
     /// Take the typed line for Enter (the console's key, `/dokey NEWLINE`, the SSH
     /// console's key), into history unless `record_history` is false (a masked prompt).
     /// Unless Clear Input on Send (TF's `%cleardone`) is on, the line stays on screen above
-    /// the next one with the prompt it was typed after, as in TF; a masked one leaves only
-    /// the prompt. An empty line takes a row too.
+    /// the next one, as in TF - its text alone, not the prompt it was typed after (user
+    /// ruling: the prompt belongs to the line being typed); a masked one leaves an empty
+    /// row. An empty line takes a row too.
     pub(crate) fn take_input_line(&mut self, record_history: bool) -> String {
         let line = self.input.take_input(record_history);
         if !self.settings.clear_input_on_send {
-            let world = self.current_world();
-            let text = if world.protocol.echo_masked { String::new() } else { line.clone() };
-            let entry = crate::input::SentEntry::new(world.prompt.clone(), text);
-            self.input.push_sent(entry);
+            let text = if self.current_world().protocol.echo_masked { String::new() } else { line.clone() };
+            self.input.push_sent(crate::input::SentEntry::new(text));
         }
         line
     }
@@ -21987,7 +22043,7 @@ fn pull_in_deadline(mut sleep: std::pin::Pin<&mut tokio::time::Sleep>, at: std::
 pub async fn run_app_headless(
     gui_tx: mpsc::UnboundedSender<WsMessage>,
     mut gui_rx: mpsc::UnboundedReceiver<WsMessage>,
-    ws_override: Option<String>,  // password for auto-started WS (GUI master mode)
+    ws_override: Option<WsOverride>,  // the GUI's/Android app's web password (`apply_ws_override`)
     gui_repaint: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     port_override: Option<u16>,   // force http_port (e.g. --local-server on Android)
 ) -> io::Result<()> {
@@ -22374,14 +22430,12 @@ pub async fn run_app_headless(
         app.add_output(reload_msg);
     }
 
-    // In GUI master mode, enable the web interface and set the auto-generated password.
+    // In GUI master mode, enable the web interface with the GUI's password: the one the
+    // user saved, or a session one that is never written to settings.dat (WsOverride).
     // The server always runs TLS-capable now (see http::route_connection's loopback
     // branch): localhost — where the WebView connects — is served plain regardless,
     // so there's no cert prompt for the desktop GUI; remote clients get TLS.
-    if let Some(ref ws_password) = ws_override {
-        app.settings.http_enabled = true;
-        app.settings.websocket_password = ws_password.clone();
-    }
+    apply_ws_override(&mut app, ws_override);
     if let Some(port) = port_override {
         app.settings.http_port = port;
     }

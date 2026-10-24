@@ -1178,7 +1178,7 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 }
-/* The text after a prompt starts where the textarea's would: past its 2px padding. */
+/* A sent line's text starts where the textarea's does: past its 2px padding. */
 #input-sent .sent-text {
     padding-left: 2px;
 }

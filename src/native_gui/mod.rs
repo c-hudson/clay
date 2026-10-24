@@ -122,10 +122,13 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
 /// password of its own (the server listens for remote clients too, so it mustn't be
 /// guessable), and this window logged in to it over the loopback.
 fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
-    let port = {
+    // The port, and the web password the user saved (Settings > Web): the server runs
+    // with that one, so phones and browsers can log in with it; without one, a session
+    // password of this run's own (crate::gui_session_password).
+    let (port, saved_password) = {
         let mut app = crate::App::new();
         let _ = crate::persistence::load_settings(&mut app);
-        app.settings.http_port
+        (app.settings.http_port, app.settings.websocket_password.clone())
     };
     // Another Clay already there? (Not on a reload: the old process may hold the port
     // a moment longer, and the server's bind retries.)
@@ -143,20 +146,19 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
             }
         }
     }
-    let mut random = [0u8; 32];
-    if let Err(e) = getrandom::getrandom(&mut random) {
-        fail(format!("Clay failed to start: could not make a session password: {e}"));
-    }
-    let password = hex::encode(random);
+    let ws_override = match crate::gui_session_password(&saved_password) {
+        Ok(o) => o,
+        Err(e) => fail(format!("Clay failed to start: {e}")),
+    };
+    let password = ws_override.password().to_string();
     // The app's GUI channels (run_app_headless's API): kept open for the whole run.
     let (to_gui, from_app) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
     let (to_app, from_gui) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
     std::mem::forget((from_app, to_app));
     crate::GUI_HTTP_READY.store(false, std::sync::atomic::Ordering::SeqCst);
     *crate::GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    let session_password = password.clone();
     runtime.spawn(async move {
-        let _ = crate::run_app_headless(to_gui, from_gui, Some(session_password), None, None).await;
+        let _ = crate::run_app_headless(to_gui, from_gui, Some(ws_override), None, None).await;
     });
     // Wait for the server to have its port (it sets GUI_HTTP_READY once bound), or to
     // say why it can't (GUI_HTTP_FAILED: the port taken after all, no certificate).
