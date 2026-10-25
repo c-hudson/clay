@@ -31,6 +31,8 @@ pub enum Kind {
     Confirm,
     ModifyKey,
     RemoteAccess,
+    /// The number the Settings' Text Reveal "Custom" asks for.
+    RevealSpeed,
     /// The MUD's simpleedit text, over the whole window.
     McpEdit,
     /// A file on the main instance's machine (`/note <file>`), over the whole window.

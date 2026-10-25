@@ -71,9 +71,51 @@ pub fn editor_side_options() -> Vec<SelectOption> {
     ]
 }
 
-/// Text reveal options (`TextReveal::OPTIONS`: off, or a speed).
-pub fn text_reveal_options() -> Vec<SelectOption> {
-    crate::TextReveal::OPTIONS.iter().map(|(name, label)| SelectOption::new(*name, *label)).collect()
+/// Text reveal options (`TextReveal::OPTIONS`): off, the preset speeds, and Custom. When
+/// `current` is a custom value the Custom entry IS that value (`custom:<n>`, labelled
+/// "Custom (n)"); otherwise it is the bare entry that asks for a number when picked
+/// (`text_reveal_custom_picked`, the reveal_speed popup). The native GUI's pick is built
+/// from this too, so the two lists never differ.
+pub fn text_reveal_options(current: &str) -> Vec<SelectOption> {
+    let current = crate::TextReveal::from_name(current);
+    crate::TextReveal::OPTIONS
+        .iter()
+        .map(|(name, label)| match current.custom_cps() {
+            Some(_) if *name == crate::TextReveal::CUSTOM => SelectOption::new(current.name(), current.label()),
+            _ => SelectOption::new(*name, *label),
+        })
+        .collect()
+}
+
+/// Which of `text_reveal_options(current)` is `current` (Off when unknown).
+pub fn text_reveal_index(current: &str) -> usize {
+    let name = crate::TextReveal::from_name(current).name();
+    text_reveal_options(current).iter().position(|o| o.value == name).unwrap_or(0)
+}
+
+/// The Setup select is on the entry that asks for a number: Custom, bare or as a value
+/// picked again to change it.
+pub fn text_reveal_custom_picked(state: &crate::popup::PopupState) -> bool {
+    state.get_selected(SETUP_FIELD_TEXT_REVEAL).is_some_and(|v| v.starts_with(crate::TextReveal::CUSTOM))
+}
+
+/// Put `value` (a TextReveal name) on the Setup select: a custom value takes the Custom
+/// entry over, relabelled; a preset selects its own entry. The reveal_speed popup's OK
+/// (`custom:<n>`) and Cancel (the value before) both come here.
+pub fn set_text_reveal_value(state: &mut crate::popup::PopupState, value: &str) {
+    let reveal = crate::TextReveal::from_name(value);
+    let name = reveal.name();
+    if let Some(FieldKind::Select { options, selected_index }) = state.field_mut(SETUP_FIELD_TEXT_REVEAL).map(|f| &mut f.kind) {
+        if reveal.custom_cps().is_some() {
+            if let Some(custom) = options.iter_mut().find(|o| o.value.starts_with(crate::TextReveal::CUSTOM)) {
+                custom.value = name.clone();
+                custom.label = reveal.label();
+            }
+        }
+        if let Some(at) = options.iter().position(|o| o.value == name) {
+            *selected_index = at;
+        }
+    }
 }
 
 /// TTS mode options (the one list every UI shows, `TtsMode::OPTIONS`)
@@ -145,7 +187,7 @@ pub fn create_setup_popup(
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = crate::theme::BUILTIN_THEMES.iter().position(|(name, _)| *name == gui_theme).unwrap_or(0);
     let editor_side_idx = if editor_side == "right" { 1 } else { 0 };
-    let text_reveal_idx = crate::TextReveal::OPTIONS.iter().position(|(name, _)| *name == text_reveal).unwrap_or(0);
+    let text_reveal_idx = text_reveal_index(text_reveal);
     let tts_mode_idx = crate::tts::TtsMode::OPTIONS.iter().position(|(v, _)| *v == tts_mode).unwrap_or(0);
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
     let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
@@ -231,7 +273,7 @@ pub fn create_setup_popup(
         .with_field(Field::new(
             SETUP_FIELD_TEXT_REVEAL,
             "Text Reveal",
-            FieldKind::select(text_reveal_options(), text_reveal_idx),
+            FieldKind::select(text_reveal_options(text_reveal), text_reveal_idx),
         ))
         .with_field(Field::new(
             SETUP_FIELD_KEYBOARD_VISIBLE,
@@ -397,7 +439,8 @@ fn setup_help_text() -> Vec<String> {
         "Text Reveal: Type newly arrived lines, and the screen a",
         "  world switch shows, onto the screen behind a glitching",
         "  cursor (Slow 30, Normal 60, Fast 120, Super Fast 240",
-        "  characters a second; a wrapped line's rows together).",
+        "  characters a second, or Custom, which asks for the",
+        "  number; a wrapped line's rows together).",
         "  Only how the console draws them: scrolling and paging",
         "  are unchanged. Console only.",
         "",
@@ -457,10 +500,51 @@ fn setup_help_text() -> Vec<String> {
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
+/// A Setup popup at the defaults but for its Text Reveal, for the prompt's tests.
+#[cfg(test)]
+pub fn create_setup_popup_for_test(text_reveal: &str) -> PopupDefinition {
+    create_setup_popup(
+        true, true, false, "unseen_first",
+        false, 3, "dark", false, "", "left", false, false, true,
+        false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
+        text_reveal,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::popup::PopupState;
+
+    /// The Text Reveal select: Custom is the last entry, bare until a number is chosen,
+    /// then the value itself, relabelled; Cancel's restore selects a preset again.
+    #[test]
+    fn the_text_reveal_select_shows_a_custom_value_on_its_custom_entry() {
+        let names: Vec<String> = text_reveal_options("fast").iter().map(|o| o.value.clone()).collect();
+        assert_eq!(names, ["off", "slow", "normal", "fast", "superfast", "custom"]);
+        assert_eq!(text_reveal_index("fast"), 3);
+        assert_eq!(text_reveal_index("nonsense"), 0);
+        let custom = text_reveal_options("custom:150");
+        assert_eq!((custom[5].value.as_str(), custom[5].label.as_str()), ("custom:150", "Custom (150)"));
+        assert_eq!(text_reveal_index("custom:150"), 5);
+        assert_eq!(text_reveal_index("custom:0"), 0, "out of range is Off");
+
+        let mut state = PopupState::new(create_setup_popup_for_test("normal"));
+        assert!(!text_reveal_custom_picked(&state));
+        set_text_reveal_value(&mut state, "custom:75");
+        assert_eq!(state.get_selected(SETUP_FIELD_TEXT_REVEAL), Some("custom:75"));
+        assert!(text_reveal_custom_picked(&state));
+        let label = match &state.field(SETUP_FIELD_TEXT_REVEAL).unwrap().kind {
+            FieldKind::Select { options, selected_index } => options[*selected_index].label.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(label, "Custom (75)");
+        set_text_reveal_value(&mut state, "slow");
+        assert_eq!(state.get_selected(SETUP_FIELD_TEXT_REVEAL), Some("slow"));
+        // Cycling onto the Custom entry again offers the kept number.
+        set_text_reveal_value(&mut state, "custom:75");
+        assert_eq!(state.get_selected(SETUP_FIELD_TEXT_REVEAL), Some("custom:75"));
+    }
 
     #[test]
     fn test_setup_popup_creation() {

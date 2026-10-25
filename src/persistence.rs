@@ -3926,9 +3926,13 @@ mod tests {
             tabs: TabsMode::Top,               // default: None
             icon_bar: IconBarMode::All,        // default: AppTablet
             picture_host: crate::picture::PictureService::from_name("x0+short"), // default: catbox
-            text_reveal_profiles: [("native-linux".to_string(), TextReveal::SuperFast), ("console-remote".to_string(), TextReveal::Slow)]
-                .into_iter()
-                .collect(),                 // default: empty
+            text_reveal_profiles: [
+                ("native-linux".to_string(), TextReveal::SuperFast),
+                ("console-remote".to_string(), TextReveal::Slow),
+                ("browser-linux".to_string(), TextReveal::Custom(150)), // custom:150 on disk
+            ]
+            .into_iter()
+            .collect(),                 // default: empty
             font_profiles: [(
                 "native-windows".to_string(),
                 crate::font_profile::FontProfile {

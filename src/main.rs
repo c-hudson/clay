@@ -619,9 +619,9 @@ pub fn valid_text_reveal_key(key: &str) -> bool {
     key == REMOTE_CONSOLE_REVEAL_KEY || font_profile::valid_key(key)
 }
 
-/// The text-reveal effect (src/reveal.rs): off, or how fast a newly arrived line is typed
-/// onto the screen. Console only, by user ruling (2026-10-24): it is not on
-/// the wire and the GUIs have no counterpart, like `editor_side`.
+/// The text-reveal effect (src/reveal.rs): off, a preset speed, or a speed the user typed
+/// in (`Custom`; user request 2026-10-25: the pickers' Custom entry asks for the number in
+/// a popup). Kept per interface, by name (`name`/`from_name`): a preset's, or `custom:<n>`.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum TextReveal {
     #[default]
@@ -630,36 +630,78 @@ pub enum TextReveal {
     Normal,
     Fast,
     SuperFast,
+    /// The user's own speed, characters a second, within `CUSTOM_RANGE`.
+    Custom(u32),
 }
 
 impl TextReveal {
-    /// `(name, label)` for the Setup picker, in display order.
+    /// `(name, label)` for the pickers, in display order. The last is `CUSTOM`, the entry
+    /// that asks for a number; a picker showing a custom value relabels it `Custom (n)`
+    /// with the value's own name (`custom:n`).
     pub const OPTIONS: &'static [(&'static str, &'static str)] =
-        &[("off", "Off"), ("slow", "Slow"), ("normal", "Normal"), ("fast", "Fast"), ("superfast", "Super Fast")];
+        &[("off", "Off"), ("slow", "Slow"), ("normal", "Normal"), ("fast", "Fast"), ("superfast", "Super Fast"), (Self::CUSTOM, "Custom")];
+    /// The pickers' Custom entry, and the prefix of a custom value's name.
+    pub const CUSTOM: &'static str = "custom";
+    /// What a custom speed may be, characters a second.
+    pub const CUSTOM_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
+    /// The prompt's complaint about a value outside it (app.js says the same).
+    pub const CUSTOM_PROBLEM: &'static str = "Enter a whole number from 1 to 10000";
 
-    pub fn name(&self) -> &'static str {
+    /// The name the setting is kept and sent under.
+    pub fn name(&self) -> String {
         match self {
-            TextReveal::Off => "off",
-            TextReveal::Slow => "slow",
-            TextReveal::Normal => "normal",
-            TextReveal::Fast => "fast",
-            TextReveal::SuperFast => "superfast",
+            TextReveal::Off => "off".to_string(),
+            TextReveal::Slow => "slow".to_string(),
+            TextReveal::Normal => "normal".to_string(),
+            TextReveal::Fast => "fast".to_string(),
+            TextReveal::SuperFast => "superfast".to_string(),
+            TextReveal::Custom(cps) => format!("{}:{cps}", Self::CUSTOM),
+        }
+    }
+
+    /// The pickers' label for it: a preset's, or `Custom (n)`.
+    pub fn label(&self) -> String {
+        match self {
+            TextReveal::Custom(cps) => format!("Custom ({cps})"),
+            other => {
+                let name = other.name();
+                Self::OPTIONS.iter().find(|(n, _)| *n == name).map_or_else(|| name.clone(), |(_, l)| l.to_string())
+            }
         }
     }
 
     pub fn from_name(name: &str) -> Self {
-        match name.to_lowercase().as_str() {
+        let name = name.trim().to_lowercase();
+        if let Some(cps) = name.strip_prefix(Self::CUSTOM).and_then(|rest| rest.strip_prefix(':')) {
+            // A custom value outside the range (a hand-edited settings.dat) is off.
+            return Self::parse_custom(cps).map_or(TextReveal::Off, TextReveal::Custom);
+        }
+        match name.as_str() {
             "slow" => TextReveal::Slow,
             "normal" => TextReveal::Normal,
             "fast" => TextReveal::Fast,
             "superfast" | "super-fast" | "super_fast" => TextReveal::SuperFast,
-            // Unrecognised (a hand-edited settings.dat) is off, never a guess.
+            // Unrecognised (a hand-edited settings.dat, or the pickers' bare "custom"
+            // before a number was given) is off, never a guess.
             _ => TextReveal::Off,
         }
     }
 
+    /// A typed custom speed: a whole number in `CUSTOM_RANGE`, or nothing.
+    pub fn parse_custom(text: &str) -> Option<u32> {
+        text.trim().parse::<u32>().ok().filter(|cps| Self::CUSTOM_RANGE.contains(cps))
+    }
+
+    /// The custom speed, when this is one.
+    pub fn custom_cps(&self) -> Option<u32> {
+        match self {
+            TextReveal::Custom(cps) => Some(*cps),
+            _ => None,
+        }
+    }
+
     /// Characters revealed a second; 0 = off. Normal is tfr's 1200-baud default, each
-    /// step doubles (Super Fast: user request 2026-10-24).
+    /// step doubles (Super Fast: user request 2026-10-24); Custom is the user's number.
     pub fn chars_per_second(&self) -> f32 {
         match self {
             TextReveal::Off => 0.0,
@@ -667,6 +709,7 @@ impl TextReveal {
             TextReveal::Normal => 60.0,
             TextReveal::Fast => 120.0,
             TextReveal::SuperFast => 240.0,
+            TextReveal::Custom(cps) => *cps as f32,
         }
     }
 
@@ -6433,8 +6476,8 @@ impl App {
             tabs: self.settings.tabs.name().to_string(),
             icon_bar: self.settings.icon_bar.name().to_string(),
             picture_host: self.settings.picture_host.name(),
-            text_reveal: self.settings.text_reveal.name().to_string(),
-            text_reveal_profiles: self.settings.text_reveal_profiles.iter().map(|(k, v)| (k.clone(), v.name().to_string())).collect(),
+            text_reveal: self.settings.text_reveal.name(),
+            text_reveal_profiles: self.settings.text_reveal_profiles.iter().map(|(k, v)| (k.clone(), v.name())).collect(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             tf_bound_keys_json: self.tf_bound_keys_json(),
@@ -7506,7 +7549,7 @@ impl App {
             self.settings.icon_bar.name(),
             &self.settings.picture_host.name(),
             self.settings.clear_input_on_send,
-            self.settings.text_reveal.name(),
+            &self.settings.text_reveal.name(),
         );
         if self.is_master {
             add_import_button(&mut def);
@@ -19408,6 +19451,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     let is_setup = popup_id == Some(popup::PopupId("setup"));
     let is_web = popup_id == Some(popup::PopupId("web"));
     let is_modify_key = popup_id == Some(popup::PopupId("modify_key"));
+    let is_reveal_speed = popup_id == Some(popup::PopupId("reveal_speed"));
     let is_remote_access = popup_id == Some(popup::PopupId("remote_access"));
     let is_connections = popup_id == Some(popup::PopupId("connections"));
     let is_actions_list = popup_id == Some(popup::PopupId("actions_list"));
@@ -19690,6 +19734,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
 
         // Setup popup handling
         if is_setup {
+            // Text Reveal's value before this key: a change onto Custom asks for the number.
+            let reveal_before = state.get_selected(SETUP_FIELD_TEXT_REVEAL).map(str::to_string);
             // Helper to extract settings before closing
             let extract_settings = || -> SetupSettings {
                 SetupSettings {
@@ -19866,6 +19912,93 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     }
                 }
                 _ => {}
+            }
+            // Cycled onto Text Reveal's Custom entry (reveal_speed.rs): ask for the number.
+            // The popup is looked up afresh: Esc and Cancel above closed it.
+            let custom_picked = app.popup_manager.current().is_some_and(|s| {
+                s.definition.id == popup::PopupId("setup")
+                    && s.get_selected(SETUP_FIELD_TEXT_REVEAL).map(str::to_string) != reveal_before
+                    && popup::definitions::setup::text_reveal_custom_picked(s)
+            });
+            if custom_picked {
+                popup::definitions::reveal_speed::open_reveal_speed_prompt(&mut app.popup_manager, reveal_before.as_deref().unwrap_or("off"));
+            }
+            return NewPopupAction::None;
+        }
+
+        // The Custom Text Reveal Speed prompt over /setup (reveal_speed.rs): OK puts the
+        // number on the Setup select, Cancel and Esc put the entry before back.
+        if is_reveal_speed {
+            use popup::definitions::reveal_speed::{REVEAL_SPEED_BTN_CANCEL, REVEAL_SPEED_BTN_OK, REVEAL_SPEED_PREVIOUS, typed_speed};
+            use popup::definitions::setup::set_text_reveal_value;
+            enum SpeedAction { Ok, Cancel, None }
+            let on_button = |state: &popup::PopupState| {
+                if state.is_button_focused(REVEAL_SPEED_BTN_OK) { SpeedAction::Ok }
+                else if state.is_button_focused(REVEAL_SPEED_BTN_CANCEL) { SpeedAction::Cancel }
+                else { SpeedAction::None }
+            };
+            let action = match key.code {
+                Esc => SpeedAction::Cancel,
+                Enter => {
+                    if state.editing {
+                        // Typing the number and pressing Enter is the whole prompt.
+                        state.commit_edit();
+                        SpeedAction::Ok
+                    } else if state.is_on_button() {
+                        on_button(state)
+                    } else {
+                        state.start_edit();
+                        SpeedAction::None
+                    }
+                }
+                Char(' ') if !state.editing => on_button(state),
+                Char(c) => {
+                    if state.editing {
+                        state.insert_char(c);
+                        SpeedAction::None
+                    } else {
+                        match state.find_button_by_shortcut(c) {
+                            Some(id) if id == REVEAL_SPEED_BTN_OK => SpeedAction::Ok,
+                            Some(id) if id == REVEAL_SPEED_BTN_CANCEL => SpeedAction::Cancel,
+                            _ => SpeedAction::None,
+                        }
+                    }
+                }
+                Up => { if state.editing { state.commit_edit(); } state.prev_item(); SpeedAction::None }
+                Down => { if state.editing { state.commit_edit(); } state.next_item(); SpeedAction::None }
+                Left => { if state.editing { state.cursor_left(); } SpeedAction::None }
+                Right => { if state.editing { state.cursor_right(); } SpeedAction::None }
+                Tab => { if state.editing { state.commit_edit(); } state.cycle_field_buttons(); SpeedAction::None }
+                BackTab => { if state.editing { state.commit_edit(); } state.cycle_field_buttons_rev(); SpeedAction::None }
+                Backspace => { if state.editing { state.backspace(); } SpeedAction::None }
+                Delete => { if state.editing { state.delete_char(); } SpeedAction::None }
+                Home => { if state.editing { state.cursor_home(); } SpeedAction::None }
+                End => { if state.editing { state.cursor_end(); } SpeedAction::None }
+                _ => SpeedAction::None,
+            };
+            match action {
+                SpeedAction::Ok => match typed_speed(state) {
+                    Ok(cps) => {
+                        app.popup_manager.close();
+                        if let Some(setup) = app.popup_manager.current_mut() {
+                            set_text_reveal_value(setup, &TextReveal::Custom(cps).name());
+                        }
+                    }
+                    Err(problem) => {
+                        state.error = Some(problem.to_string());
+                        state.error_at = Some(std::time::Instant::now());
+                        state.select_field(popup::definitions::reveal_speed::REVEAL_SPEED_FIELD_CPS);
+                        state.start_edit();
+                    }
+                },
+                SpeedAction::Cancel => {
+                    let previous = state.definition.custom_data.get(REVEAL_SPEED_PREVIOUS).cloned().unwrap_or_default();
+                    app.popup_manager.close();
+                    if let Some(setup) = app.popup_manager.current_mut() {
+                        set_text_reveal_value(setup, &previous);
+                    }
+                }
+                SpeedAction::None => {}
             }
             return NewPopupAction::None;
         }

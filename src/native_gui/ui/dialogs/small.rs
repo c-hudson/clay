@@ -7,6 +7,7 @@
 //! - a MUD world's changed certificate (`showCertMismatchDialog`)
 //! - /import and its plaintext warning (`showImportDialog`, `showImportInsecureConfirmDialog`)
 //! - Recent Worlds (`showRecentWorldsModal`; the console's recent-worlds popup)
+//! - Custom Text Reveal Speed (`showRevealSpeedDialog`; the console's reveal_speed popup)
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
@@ -349,6 +350,87 @@ impl Render for Confirm {
                         }))),
                     ))
                     .child(k.button("confirm-no", "No", Btn::Plain, Some(Box::new(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Close)))))),
+            )
+            .into_any_element()
+    }
+}
+
+// ---- Custom Text Reveal Speed -------------------------------------------------------
+
+/// What OK does with the number.
+pub type OnSpeed = Box<dyn Fn(u32, &mut Window, &mut App)>;
+/// What Cancel and Esc do.
+pub type OnCancel = Box<dyn Fn(&mut Window, &mut App)>;
+
+/// The number the Settings' Text Reveal "Custom" asks for (the console's reveal_speed
+/// popup, app.js `showRevealSpeedDialog`): OK or Enter takes it, Cancel or Esc puts the
+/// choice before back; a number outside `TextReveal::CUSTOM_RANGE` complains and stays.
+pub struct RevealSpeed {
+    main: WeakEntity<ClayView>,
+    input: Entity<InputState>,
+    ok: OnSpeed,
+    cancel: OnCancel,
+    pub error: Option<String>,
+}
+
+impl RevealSpeed {
+    pub fn new(main: WeakEntity<ClayView>, current: Option<u32>, ok: OnSpeed, cancel: OnCancel, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let value = current.map(|cps| cps.to_string()).unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder("1 to 10000".to_string()));
+        cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                this.accept(window, cx);
+            }
+        })
+        .detach();
+        Self { main, input, ok, cancel, error: None }
+    }
+
+    fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.input.read(cx).value().to_string();
+        match crate::TextReveal::parse_custom(&typed) {
+            Some(cps) => {
+                (self.ok)(cps, window, cx);
+                cx.emit(DialogEvent::Close);
+            }
+            None => {
+                self.error = Some(crate::TextReveal::CUSTOM_PROBLEM.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        (self.cancel)(window, cx);
+        cx.emit(DialogEvent::Close);
+    }
+}
+
+impl EventEmitter<DialogEvent> for RevealSpeed {}
+impl Focusable for RevealSpeed {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.read(cx).focus_handle(cx)
+    }
+}
+
+impl Render for RevealSpeed {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(k) = kit(&self.main, cx) else { return div().into_any_element() };
+        k.panel("reveal-speed")
+            .w(px(360.0))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key.as_str() == "escape" {
+                    this.dismiss(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(k.heading("Custom Text Reveal Speed"))
+            .child(k.field("Characters a second:", &self.input))
+            .child(k.error(self.error.as_deref()))
+            .child(
+                k.buttons()
+                    .child(k.button("reveal-speed-cancel", "Cancel", Btn::Plain, Some(Box::new(cx.listener(|this, _, w, cx| this.dismiss(w, cx))))))
+                    .child(k.button("reveal-speed-ok", "OK", Btn::Primary, Some(Box::new(cx.listener(|this, _, w, cx| this.accept(w, cx)))))),
             )
             .into_any_element()
     }

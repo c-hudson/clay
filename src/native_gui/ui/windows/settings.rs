@@ -12,6 +12,7 @@ use gpui::{
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative,
 };
 use gpui_component::input::{InputEvent, InputState};
+use gpui_component::select::SelectEvent;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 
 use super::MainEvent;
@@ -107,6 +108,8 @@ pub struct SettingsView {
     icon_bar: Pick,
     picture_host: Pick,
     text_reveal: Pick,
+    /// The Text Reveal value before Custom was picked, which the prompt's Cancel restores.
+    reveal_before: String,
     port_mode: Pick,
     custom_cert: Pick,
     transparency: Entity<SliderState>,
@@ -196,6 +199,10 @@ impl SettingsView {
             }
         }));
         let advanced = edit.web_font_line_height != 1.2 || edit.web_font_letter_spacing != 0.0 || edit.web_font_word_spacing != 0.0;
+        // Text Reveal: this GUI's own value; picking its Custom entry asks for the number.
+        let reveal_value = edit.text_reveal_profiles.get(key).cloned().unwrap_or_else(|| "off".to_string());
+        let text_reveal = Self::reveal_pick(&reveal_value, window, cx);
+        subs.push(cx.subscribe_in(&text_reveal.state, window, |this, _, _: &SelectEvent<Vec<SharedString>>, window, cx| this.text_reveal_changed(window, cx)));
         let v = Self {
             world_switch: Pick::new(&[("Unseen First", "Unseen First"), ("Alphabetical", "Alphabetical")], &edit.world_switch_mode, window, cx),
             theme: Pick::new(&crate::theme::BUILTIN_THEMES, &edit.gui_theme, window, cx),
@@ -204,12 +211,8 @@ impl SettingsView {
             tabs: Pick::new(&[("none", "None"), ("top", "Show Top Ribbon"), ("bottom", "Show Bottom Ribbon")], &edit.tabs, window, cx),
             icon_bar: Pick::new(&[("none", "None"), ("app_tablet", "App/Tablet"), ("all", "All")], &edit.icon_bar, window, cx),
             picture_host: Pick::new(crate::picture::PictureService::OPTIONS, &edit.picture_host, window, cx),
-            text_reveal: Pick::new(
-                crate::TextReveal::OPTIONS,
-                edit.text_reveal_profiles.get(crate::font_profile::native_key()).map_or("off", String::as_str),
-                window,
-                cx,
-            ),
+            text_reveal,
+            reveal_before: reveal_value,
             port_mode: Pick::new(&[("disabled", "Disabled"), ("9000", "9000"), ("custom", "Custom")], port_mode, window, cx),
             custom_cert: Pick::new(&[("no", "No"), ("yes", "Yes")], if edit.tls_configured { "yes" } else { "no" }, window, cx),
             main,
@@ -240,6 +243,51 @@ impl SettingsView {
 
     fn text(&self, f: &Entity<InputState>, cx: &App) -> String {
         f.read(cx).value().to_string()
+    }
+
+    /// The Text Reveal pick, from the console's list (`setup::text_reveal_options`, so the
+    /// two never differ): a custom value sits on its Custom entry as "Custom (n)".
+    fn reveal_pick(value: &str, window: &mut Window, cx: &mut Context<Self>) -> Pick {
+        let options = crate::popup::definitions::setup::text_reveal_options(value);
+        let options: Vec<(&str, &str)> = options.iter().map(|o| (o.value.as_str(), o.label.as_str())).collect();
+        Pick::new(&options, &crate::TextReveal::from_name(value).name(), window, cx)
+    }
+
+    /// Put `value` on the Text Reveal pick, asking nothing.
+    fn set_reveal_value(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = crate::TextReveal::from_name(value).name();
+        let options = crate::popup::definitions::setup::text_reveal_options(&name);
+        let options: Vec<(&str, &str)> = options.iter().map(|o| (o.value.as_str(), o.label.as_str())).collect();
+        self.text_reveal.replace(&options, &name, window, cx);
+        self.reveal_before = name;
+        cx.notify();
+    }
+
+    /// The user picked a Text Reveal entry. Custom - bare, or a custom value picked again
+    /// to change it - asks for the number (the console's reveal_speed popup, app.js
+    /// `showRevealSpeedDialog`): the prompt's OK puts `custom:<n>` on the pick, its
+    /// Cancel the entry before.
+    fn text_reveal_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.text_reveal.value(cx);
+        if !value.starts_with(crate::TextReveal::CUSTOM) {
+            self.reveal_before = value;
+            return;
+        }
+        let previous = self.reveal_before.clone();
+        let current = crate::TextReveal::from_name(&value).custom_cps();
+        let me = cx.weak_entity();
+        let ok = {
+            let me = me.clone();
+            move |cps: u32, window: &mut Window, cx: &mut App| {
+                let _ = me.update(cx, |s, cx| s.set_reveal_value(&crate::TextReveal::Custom(cps).name(), window, cx));
+            }
+        };
+        let cancel = move |window: &mut Window, cx: &mut App| {
+            let _ = me.update(cx, |s, cx| s.set_reveal_value(&previous, window, cx));
+        };
+        let main = self.main.clone();
+        let d = cx.new(|cx| dialogs::small::RevealSpeed::new(main, current, Box::new(ok), Box::new(cancel), window, cx));
+        dialogs::open(self, dialogs::Kind::RevealSpeed, d, window, cx);
     }
 
     /// What the Web tab says, and whether Save is blocked.

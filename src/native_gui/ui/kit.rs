@@ -340,6 +340,18 @@ impl Pick {
         self.state.read(cx).selected_index(cx).and_then(|i| self.values.get(i.row)).cloned().unwrap_or_default()
     }
 
+    /// New options and value, in place: the owner's subscriptions stay, and nothing is
+    /// emitted (a programmatic choice is not the user's).
+    pub fn replace(&mut self, options: &[(&str, &str)], value: &str, window: &mut Window, cx: &mut App) {
+        let labels: Vec<SharedString> = options.iter().map(|(_, l)| SharedString::from(l.to_string())).collect();
+        self.values = options.iter().map(|(v, _)| v.to_string()).collect();
+        let at = self.values.iter().position(|v| v.eq_ignore_ascii_case(value)).unwrap_or(0);
+        self.state.update(cx, |s, cx| {
+            s.set_items(labels, window, cx);
+            s.set_selected_index(Some(gpui_component::IndexPath::new(at)), window, cx);
+        });
+    }
+
     /// The select, full width.
     pub fn view(&self) -> gpui::AnyElement {
         use gpui::IntoElement;

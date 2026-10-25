@@ -6496,16 +6496,86 @@
     /// Every Text Reveal name round-trips, an unknown one is Off, and each speed doubles.
     #[test]
     fn test_text_reveal_names_and_speeds() {
-        for (name, _) in TextReveal::OPTIONS {
+        let presets: Vec<&str> = TextReveal::OPTIONS.iter().map(|(n, _)| *n).filter(|n| *n != TextReveal::CUSTOM).collect();
+        for name in &presets {
             assert_eq!(TextReveal::from_name(name).name(), *name);
         }
+        assert_eq!(TextReveal::OPTIONS.last().map(|(n, l)| (*n, *l)), Some(("custom", "Custom")), "Custom is the pickers' last entry");
         assert_eq!(TextReveal::from_name("gibberish"), TextReveal::Off);
         assert_eq!(TextReveal::from_name("Super_Fast"), TextReveal::SuperFast);
-        let speeds: Vec<f32> = TextReveal::OPTIONS.iter().map(|(n, _)| TextReveal::from_name(n).chars_per_second()).collect();
+        let speeds: Vec<f32> = presets.iter().map(|n| TextReveal::from_name(n).chars_per_second()).collect();
         assert_eq!(speeds, [0.0, 30.0, 60.0, 120.0, 240.0]);
         // The native GUI's Super Fast is slower (user ruling 2026-10-25); the rest match.
-        let native: Vec<f32> = TextReveal::OPTIONS.iter().map(|(n, _)| TextReveal::from_name(n).native_chars_per_second()).collect();
+        let native: Vec<f32> = presets.iter().map(|n| TextReveal::from_name(n).native_chars_per_second()).collect();
         assert_eq!(native, [0.0, 30.0, 60.0, 120.0, 200.0]);
+        // Custom (user request 2026-10-25): the user's number, kept as custom:<n>, the same
+        // speed everywhere; the bare picker entry and an out-of-range number are Off.
+        let custom = TextReveal::from_name("custom:150");
+        assert_eq!(custom, TextReveal::Custom(150));
+        assert_eq!(custom.name(), "custom:150");
+        assert_eq!(custom.label(), "Custom (150)");
+        assert_eq!(custom.custom_cps(), Some(150));
+        assert_eq!(custom.chars_per_second(), 150.0);
+        assert_eq!(custom.native_chars_per_second(), 150.0);
+        assert_eq!(TextReveal::from_name("Custom: 10000 "), TextReveal::Custom(10000));
+        for bad in ["custom", "custom:", "custom:0", "custom:10001", "custom:abc", "custom:1.5"] {
+            assert_eq!(TextReveal::from_name(bad), TextReveal::Off, "{bad}");
+        }
+        assert_eq!(TextReveal::parse_custom(" 42 "), Some(42));
+        assert_eq!(TextReveal::parse_custom("-1"), None);
+        assert_eq!(TextReveal::SuperFast.label(), "Super Fast");
+        assert_eq!(TextReveal::Fast.custom_cps(), None);
+    }
+
+    /// /setup's Text Reveal: cycling onto Custom opens the speed prompt over the popup;
+    /// Enter with a number puts `custom:<n>` on the select (relabelled), a bad number
+    /// complains and stays, and Esc puts the entry selected before back.
+    #[test]
+    fn test_setup_text_reveal_custom_asks_for_the_number() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use popup::definitions::reveal_speed::REVEAL_SPEED_FIELD_CPS;
+        use popup::definitions::setup::{create_setup_popup_for_test, SETUP_FIELD_TEXT_REVEAL};
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let selected = |app: &App| app.popup_manager.current().unwrap().get_selected(SETUP_FIELD_TEXT_REVEAL).map(str::to_string);
+        let popup = |app: &App| app.popup_manager.current().unwrap().definition.id.clone();
+        let mut app = App::new();
+        app.popup_manager.open(create_setup_popup_for_test("superfast"));
+        app.popup_manager.current_mut().unwrap().select_field(SETUP_FIELD_TEXT_REVEAL);
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right)); // Super Fast -> Custom
+        assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
+        assert!(app.popup_manager.current().unwrap().editing, "typing goes straight into the number");
+        for c in "150".chars() {
+            let _ = handle_new_popup_key(&mut app, key(KeyCode::Char(c)));
+        }
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(popup(&app), popup::PopupId("setup"));
+        assert_eq!(selected(&app).as_deref(), Some("custom:150"));
+        // Away and back: the prompt again, prefilled; a bad number complains and stays.
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right)); // Custom (150) -> Off
+        assert_eq!(selected(&app).as_deref(), Some("off"));
+        assert_eq!(popup(&app), popup::PopupId("setup"));
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Left)); // Off -> Custom (150)
+        assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
+        assert_eq!(app.popup_manager.current().unwrap().get_text(REVEAL_SPEED_FIELD_CPS), Some("150"));
+        for _ in 0..3 {
+            let _ = handle_new_popup_key(&mut app, key(KeyCode::Backspace));
+        }
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Char('0')));
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
+        assert_eq!(app.popup_manager.current().unwrap().error.as_deref(), Some(TextReveal::CUSTOM_PROBLEM));
+        // Esc: the entry before (Off), the kept number still on the Custom entry.
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(popup(&app), popup::PopupId("setup"));
+        assert_eq!(selected(&app).as_deref(), Some("off"));
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Left));
+        assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(selected(&app).as_deref(), Some("off"));
+        // The saved setting is the value by name.
+        app.popup_manager.current_mut().unwrap().select_field(SETUP_FIELD_TEXT_REVEAL);
+        popup::definitions::setup::set_text_reveal_value(app.popup_manager.current_mut().unwrap(), "custom:150");
+        assert_eq!(TextReveal::from_name(&selected(&app).unwrap()), TextReveal::Custom(150));
     }
 
     /// The text-reveal effect (src/reveal.rs) types the screen a world switch shows on:
@@ -20983,9 +21053,16 @@ fn the_web_text_reveal_options_are_text_reveal_options() {
     assert_eq!(options, expected);
     // app.js knows every speed by the same name, and sends the setting back by name.
     let js = include_str!("web/app.js");
-    for (name, _) in TextReveal::OPTIONS {
+    for (name, _) in TextReveal::OPTIONS.iter().filter(|(n, _)| *n != TextReveal::CUSTOM) {
         assert!(js.contains(&format!("{name}:")) || js.contains(&format!("{name} :")), "REVEAL_CPS lacks {name}");
     }
+    // Custom: the same name, range and complaint as TextReveal's, asked for in a dialog.
+    assert_eq!(TextReveal::CUSTOM_RANGE, 1..=10000);
+    assert_eq!(TextReveal::CUSTOM_PROBLEM, "Enter a whole number from 1 to 10000");
+    assert!(js.contains("const REVEAL_CUSTOM = 'custom', REVEAL_CUSTOM_MIN = 1, REVEAL_CUSTOM_MAX = 10000;"));
+    assert!(js.contains("const REVEAL_CUSTOM_PROBLEM = 'Enter a whole number from 1 to 10000';"));
+    assert!(js.contains("if (this.value === REVEAL_CUSTOM) showRevealSpeedDialog(this, setupTextReveal);"));
+    assert!(js.contains("setupTextReveal = REVEAL_CUSTOM + ':' + cps;"));
     // A browser and the WebView GUI run Super Fast at 240; the Android app alone at the
     // native GUI's 200 (user ruling 2026-10-25).
     assert!(js.contains("superfast: 240"));

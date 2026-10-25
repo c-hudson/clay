@@ -1443,6 +1443,8 @@
 
     // /import dialog state (see the worldEditorPopupOpen guard below for why this is needed)
     let importDialogOpen = false;
+    let revealSpeedDialogOpen = false;  // the Settings' Custom Text Reveal Speed prompt (showRevealSpeedDialog)
+    let revealSpeedCancel = null;       // that prompt's Cancel, for Escape
     let importInsecureDialogOpen = false;
 
     // Web settings popup state (global state from server)
@@ -9367,6 +9369,10 @@
     // The Android app's Super Fast is 200, as the native GUI's (TextReveal::native_chars_per_second;
     // user ruling 2026-10-25: 240 was too fast on the phone and right in a browser and the WebView GUI).
     const REVEAL_CPS_ANDROID_SUPERFAST = 200;
+    // Custom (TextReveal::Custom, user request 2026-10-25): the Settings' Custom entry asks
+    // for the number (showRevealSpeedDialog); the value's name is then custom:<n>.
+    const REVEAL_CUSTOM = 'custom', REVEAL_CUSTOM_MIN = 1, REVEAL_CUSTOM_MAX = 10000;
+    const REVEAL_CUSTOM_PROBLEM = 'Enter a whole number from 1 to 10000';
     let textReveal = 'off';        // this page's own TextReveal name (kept per interface key)
     let textRevealSynced = false;  // the server sent the per-interface map (one from before the effect sends none)
     let setupTextReveal = 'off';
@@ -9374,8 +9380,41 @@
     // Set by lineHtml(): the delay to the line's next frame, null when it drew the line whole.
     let revealFrameNext = null;
     function textRevealCps() {
+        const custom = revealCustomCps(textReveal);
+        if (custom !== null) return custom;
         if (textReveal === 'superfast' && fontProfileKey === 'app-android') return REVEAL_CPS_ANDROID_SUPERFAST;
         return REVEAL_CPS[textReveal] || 0;
+    }
+    // TextReveal::parse_custom: a whole number in the range, else null.
+    function revealParseCustom(text) {
+        const t = String(text).trim();
+        if (!/^\d+$/.test(t)) return null;
+        const n = parseInt(t, 10);
+        return n >= REVEAL_CUSTOM_MIN && n <= REVEAL_CUSTOM_MAX ? n : null;
+    }
+    // The number of a custom value's name (TextReveal::custom_cps), else null.
+    function revealCustomCps(name) {
+        return typeof name === 'string' && name.startsWith(REVEAL_CUSTOM + ':') ? revealParseCustom(name.slice(REVEAL_CUSTOM.length + 1)) : null;
+    }
+    // The Settings' Text Reveal select (the console's text_reveal_options): a custom value
+    // sits on the Custom entry, relabelled "Custom (n)"; a preset is its own entry.
+    function showTextRevealChoice(select, name) {
+        const cps = revealCustomCps(name);
+        setSelectOptionText(select, REVEAL_CUSTOM, cps === null ? 'Custom' : 'Custom (' + cps + ')');
+        select.value = cps === null ? name : REVEAL_CUSTOM;
+        if (select.selectedIndex < 0) select.value = 'off';
+        updateCustomDropdown(select);
+    }
+    // Relabel one option of a select, and its custom dropdown's item (initCustomDropdowns
+    // copies each option's text once).
+    function setSelectOptionText(select, value, text) {
+        const option = Array.from(select.options).find(o => o.value === value);
+        if (option) option.text = text;
+        if (select._customMenu) {
+            select._customMenu.querySelectorAll('.custom-dropdown-item').forEach(item => {
+                if (item.dataset.value === value) item.textContent = text;
+            });
+        }
     }
 
     // reveal.rs `mix`/`unit`: the same small deterministic hash, on the low 32 bits.
@@ -13864,8 +13903,7 @@
             updateCustomDropdown(elements.setupPictureHostSelect);
         }
         if (elements.setupTextRevealSelect) {
-            elements.setupTextRevealSelect.value = setupTextReveal;
-            updateCustomDropdown(elements.setupTextRevealSelect);
+            showTextRevealChoice(elements.setupTextRevealSelect, setupTextReveal);
         }
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
@@ -17842,6 +17880,7 @@
                 !elements.settingsModal?.classList.contains('visible') &&
                 !elements.worldEditorModal?.classList.contains('visible') &&
                 !importDialogOpen &&
+                !revealSpeedDialogOpen &&
                 !importInsecureDialogOpen &&
                 !e.target.closest('#status-bar') &&
                 !e.target.closest('#stats-panel') &&
@@ -17871,6 +17910,7 @@
                     filterPopupOpen ||
                     activeCustomDropdown !== null ||
                     importDialogOpen ||
+                    revealSpeedDialogOpen ||
                     importInsecureDialogOpen ||
                     menuOpen ||
                     worldMenuOpen;
@@ -18347,6 +18387,14 @@
                 if (e.key === 'Escape') {
                     e.preventDefault();
                     hideImportDialog();
+                }
+                return;
+            }
+            // The Custom Text Reveal Speed prompt: a form too (its input takes Enter).
+            if (revealSpeedDialogOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    cancelRevealSpeedDialog();
                 }
                 return;
             }
@@ -18913,7 +18961,9 @@
         }
         if (elements.setupTextRevealSelect) {
             elements.setupTextRevealSelect.onchange = function() {
-                setupTextReveal = this.value;
+                // Custom asks for the number; the prompt's Cancel puts the choice before back.
+                if (this.value === REVEAL_CUSTOM) showRevealSpeedDialog(this, setupTextReveal);
+                else setupTextReveal = this.value;
             };
         }
         elements.setupTlsProxyToggle.onclick = function() {
@@ -19774,6 +19824,77 @@
     // Stashed credentials from the last ImportSettings attempt, so the insecure-confirm
     // retry (allow_insecure: true) can resend them without prompting the user again.
     let pendingImportCredentials = null;
+
+    // Custom Text Reveal Speed (the console's reveal_speed popup, the native GUI's
+    // RevealSpeed dialog): the number the Settings' Custom entry asks for. OK or Enter
+    // makes the choice custom:<n>, shown on the Custom entry as "Custom (n)"; Cancel or
+    // Escape puts `previous` back on the select.
+    function showRevealSpeedDialog(select, previous) {
+        let dlg = document.getElementById('reveal-speed-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'reveal-speed-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            document.body.appendChild(dlg);
+        }
+        const current = revealCustomCps(previous);
+        dlg.innerHTML = sanitizeHtml(`
+            <div class="modal-content js-dialog" style="max-width:360px;width:90%;">
+                <div class="js-dialog-title">Custom Text Reveal Speed</div>
+                <label style="display:block;margin-bottom:8px;">Characters a second (1 to 10000)<br>
+                    <input id="reveal-speed-input" type="text" style="width:100%;box-sizing:border-box;padding:6px;margin-top:4px;" autocomplete="off">
+                </label>
+                <div id="reveal-speed-error" style="min-height:1.3em;margin-bottom:12px;color:var(--theme-error, #e06c75);"></div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;">
+                    <button id="reveal-speed-cancel" class="btn">Cancel</button>
+                    <button id="reveal-speed-ok" class="btn btn-primary">OK</button>
+                </div>
+            </div>
+        `);
+        dlg.style.display = 'flex';
+        revealSpeedDialogOpen = true;
+        const input = document.getElementById('reveal-speed-input');
+        input.value = current === null ? '' : String(current);
+        input.setAttribute('inputmode', 'numeric');
+        input.focus();
+        input.select();
+        function accept() {
+            const cps = revealParseCustom(input.value);
+            if (cps === null) {
+                document.getElementById('reveal-speed-error').textContent = REVEAL_CUSTOM_PROBLEM;
+                input.focus();
+                return;
+            }
+            setupTextReveal = REVEAL_CUSTOM + ':' + cps;
+            showTextRevealChoice(select, setupTextReveal);
+            hideRevealSpeedDialog();
+        }
+        revealSpeedCancel = function() {
+            showTextRevealChoice(select, previous);
+            hideRevealSpeedDialog();
+        };
+        document.getElementById('reveal-speed-cancel').onclick = revealSpeedCancel;
+        document.getElementById('reveal-speed-ok').onclick = accept;
+        input.onkeydown = function(e) {
+            if (e.key === 'Enter') { e.preventDefault(); accept(); }
+            else if (e.key === 'Escape') { e.preventDefault(); cancelRevealSpeedDialog(); }
+            e.stopPropagation();
+        };
+    }
+
+    function cancelRevealSpeedDialog() {
+        if (revealSpeedCancel) revealSpeedCancel();
+        else hideRevealSpeedDialog();
+    }
+
+    function hideRevealSpeedDialog() {
+        revealSpeedDialogOpen = false;
+        revealSpeedCancel = null;
+        const dlg = document.getElementById('reveal-speed-dialog');
+        if (dlg) {
+            dlg.style.display = 'none';
+        }
+    }
 
     function showImportDialog(prefillAddr) {
         importDialogOpen = true;
