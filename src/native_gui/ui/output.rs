@@ -18,6 +18,7 @@
 //!   stay one em, so the image reaches a little into the rows around it; it paints last.
 //! - Underlines skip descenders (`text-decoration-skip-ink`), see `ink`.
 
+use crate::reveal::Draw;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -81,6 +82,18 @@ pub struct OutputSnapshot {
     /// A shell world's cursor, drawn in the grid (src/shell). `None` for an ordinary world
     /// or a hidden cursor.
     pub shell_cursor: Option<ShellCursor>,
+    /// The text-reveal effect (src/reveal.rs), when it is on, with the lines it applies to.
+    pub reveal: Option<RevealSnapshot>,
+}
+
+/// The text-reveal effect for one frame: how it looks, and when each line's reveal started
+/// (its live arrival, a switch to its world or more-mode letting it through). A line
+/// without an anchor is drawn whole. Nothing in the layout changes: `paint` leaves a hidden
+/// character out, draws a glitch glyph over a one-cell character's place and colours a
+/// fading one, so hit-testing and the selection are untouched.
+pub struct RevealSnapshot {
+    pub reveal: crate::reveal::Reveal,
+    pub anchors: HashMap<u64, Instant>,
 }
 
 /// Where and how to draw a shell world's cursor. One grid cell at (col, row).
@@ -285,6 +298,10 @@ struct VisibleRow {
 }
 
 pub struct Prepared {
+    /// The text-reveal effect's frame for each line of `lines` that is revealing.
+    frames: Vec<Option<crate::reveal::Frame>>,
+    /// When the earliest of those frames wants the next one.
+    reveal_next: Option<std::time::Duration>,
     snapshot: OutputSnapshot,
     metrics: Metrics,
     lines: Vec<LaidLine>,
@@ -763,11 +780,28 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         st.row_h = metrics.row;
     }
 
+    // The text-reveal effect's frame for each laid-out line with an anchor: the layout's
+    // rows reveal together, so each row's character count goes in.
+    let now = Instant::now();
+    let mut reveal_next: Option<std::time::Duration> = None;
+    let frames: Vec<Option<crate::reveal::Frame>> = lines
+        .iter()
+        .zip(&ids)
+        .map(|(l, id)| {
+            let rs = snapshot.reveal.as_ref()?;
+            let at = rs.anchors.get(id)?;
+            let row_lens: Vec<usize> = l.rows.iter().map(|r| l.styled.text[r.clone()].chars().count()).collect();
+            let f = rs.reveal.frame(*id, now.saturating_duration_since(*at), &row_lens)?;
+            reveal_next = Some(reveal_next.map_or(f.next(), |n| n.min(f.next())));
+            Some(f)
+        })
+        .collect();
+
     let ts = window.text_system();
     let bundled = [(false, false), (true, false), (false, true), (true, true)]
         .map(|(b, i)| ts.resolve_font(&snapshot.fonts.font(FontClass::Primary, b, i)));
     debug_assert!((0..4).all(|k| bundled_index(k & 1 == 1, k & 2 == 2) == k));
-    Prepared { snapshot, metrics, lines, rows, content, ids, bundled, thumb }
+    Prepared { snapshot, metrics, lines, rows, content, ids, bundled, thumb, frames, reveal_next }
 }
 
 fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App) {
@@ -797,6 +831,13 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                     hsla(bg),
                 ));
             }
+            // The text-reveal effect's frame for this line (src/reveal.rs): a hidden
+            // character is left out, a glitch is a random glyph in the accent colour over
+            // its place, a fade a colour; the layout is untouched.
+            let frame = p.frames[vr.line].as_ref();
+            let draw_at = |i: usize| reveal_draw(frame, line, vr.row, &range, i);
+            let hidden = |i: usize| frame.is_some() && matches!(draw_at(i), Draw::Hide);
+
             // Every coloured run's background, over the font's full height (CSS paints
             // an inline box's background over its content area, taller than the row).
             // Cells repaint their own exact boxes on top later.
@@ -809,6 +850,21 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                     continue;
                 }
                 if let Some(bg) = run.bg {
+                    if frame.is_some() {
+                        // Revealing: cell by cell, none behind a hidden character.
+                        for (o, c) in line.styled.text[s..e].char_indices() {
+                            let i = s + o;
+                            if hidden(i) {
+                                continue;
+                            }
+                            let j = i + c.len_utf8();
+                            window.paint_quad(fill(
+                                Bounds::new(point(px(left + line.x[i] - x0), px(vr.top + half_leading)), size(px(line.x[j] - line.x[i]), px(m.ascent + m.descent))),
+                                hsla(bg),
+                            ));
+                        }
+                        continue;
+                    }
                     let bx = left + line.x[s] - x0;
                     let bw = line.x[e] - line.x[s];
                     window.paint_quad(fill(
@@ -852,6 +908,15 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 Some(r) if r.contains(&i) => style_at(i).0.map(|c| (c as f32 * 1.3).min(255.0) as u8),
                 _ => style_at(i).0,
             };
+            // The colour a revealing character is drawn in: the accent while it glitches,
+            // on its way from the accent to its own while it fades.
+            let color_at = |i: usize| -> Rgb {
+                match (frame, draw_at(i)) {
+                    (Some(f), Draw::Glitch) => f.accent().array(),
+                    (Some(f), Draw::Fade(t)) => f.fade(t, Some(crate::reveal::Rgb::from_array(fg_at(i)))).array(),
+                    _ => fg_at(i),
+                }
+            };
             let text = &line.styled.text;
             // Blinking text is hidden for the last quarter of each second (style.css).
             let skip = |i: usize| {
@@ -886,7 +951,7 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                                 let next = xs.iter().skip(k + 1).copied().find(|&x| x > gx).unwrap_or(width);
                                 k += 1;
                                 let i = span.start + g.index;
-                                if i >= span.end || skip(i) {
+                                if i >= span.end || skip(i) || hidden(i) {
                                     continue;
                                 }
                                 let x = if mirror { width - next } else { gx };
@@ -894,7 +959,7 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                                 let _ = if g.is_emoji {
                                     window.paint_emoji(origin, run.font_id, g.id, m.font_size)
                                 } else {
-                                    window.paint_glyph(origin, run.font_id, g.id, m.font_size, hsla(fg_at(i)))
+                                    window.paint_glyph(origin, run.font_id, g.id, m.font_size, hsla(color_at(i)))
                                 };
                             }
                         }
@@ -908,12 +973,22 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                         if i < range.start || i >= range.end || skip(i) {
                             continue;
                         }
+                        let draw = draw_at(i);
+                        if frame.is_some() && matches!(draw, Draw::Hide) {
+                            continue;
+                        }
                         let within = f32::from(g.position.x) - line.cluster_origin[i];
                         let origin = point(px(left + line.x[i] - x0 + within), px(baseline) + g.position.y);
+                        if let (Some(f), Draw::Glitch) = (frame, draw) {
+                            let c = text[i..].chars().next().unwrap_or(' ');
+                            if paint_glitch(window, &p, f, vr.row, &range, line, i, c, px(left + line.x[i] - x0), baseline) {
+                                continue;
+                            }
+                        }
                         let _ = if g.is_emoji {
                             window.paint_emoji(origin, run.font_id, g.id, m.font_size)
                         } else {
-                            window.paint_glyph(origin, run.font_id, g.id, m.font_size, hsla(fg_at(i)))
+                            window.paint_glyph(origin, run.font_id, g.id, m.font_size, hsla(color_at(i)))
                         };
                         if !g.is_emoji && style_at(i).1 {
                             if let Some(face) = p.bundled.iter().position(|f| *f == run.font_id) {
@@ -933,14 +1008,35 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 if s >= e || !underlined(run) || (run.blink && !blink_on) {
                     continue;
                 }
-                let (sx, ex) = (left + line.x[s] - x0, left + line.x[e] - x0);
-                for (a, b) in ink::cut(sx, ex, &gaps) {
-                    if b - a >= 0.5 {
-                        window.paint_underline(
-                            point(px(a), px(baseline + ul.offset)),
-                            px(b - a),
-                            &UnderlineStyle { thickness: px(ul.thickness), color: Some(hsla(fg_at(s))), wavy: false },
-                        );
+                // Revealing: no underline under a hidden character.
+                let mut spans: Vec<(f32, f32)> = Vec::new();
+                if frame.is_some() {
+                    let mut start: Option<usize> = None;
+                    for (o, _) in line.styled.text[s..e].char_indices() {
+                        let i = s + o;
+                        if hidden(i) {
+                            if let Some(st) = start.take() {
+                                spans.push((left + line.x[st] - x0, left + line.x[i] - x0));
+                            }
+                        } else if start.is_none() {
+                            start = Some(i);
+                        }
+                    }
+                    if let Some(st) = start {
+                        spans.push((left + line.x[st] - x0, left + line.x[e] - x0));
+                    }
+                } else {
+                    spans.push((left + line.x[s] - x0, left + line.x[e] - x0));
+                }
+                for (sx, ex) in spans {
+                    for (a, b) in ink::cut(sx, ex, &gaps) {
+                        if b - a >= 0.5 {
+                            window.paint_underline(
+                                point(px(a), px(baseline + ul.offset)),
+                                px(b - a),
+                                &UnderlineStyle { thickness: px(ul.thickness), color: Some(hsla(fg_at(s))), wavy: false },
+                            );
+                        }
                     }
                 }
             }
@@ -952,6 +1048,8 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
             let range = line.rows[vr.row].clone();
             let left = f32::from(p.content.origin.x) + if vr.row > 0 { indent } else { 0.0 };
             let x0 = line.x[range.start];
+            let frame = p.frames[vr.line].as_ref();
+            let baseline = vr.top + half_leading + m.ascent;
             let mut at = 0;
             for run in &line.styled.runs {
                 let (s, e) = (at, at + run.len);
@@ -961,17 +1059,25 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 if s >= e {
                     continue;
                 }
-                for (off, _) in line.styled.text[s..e].char_indices() {
+                for (off, c) in line.styled.text[s..e].char_indices() {
                     let i = s + off;
+                    // A picture cell reveals like a glyph: left out while hidden, glitched over.
+                    let draw = reveal_draw(frame, line, vr.row, &range, i);
+                    if frame.is_some() && matches!(draw, Draw::Hide) {
+                        continue;
+                    }
                     let cell_box = Bounds::new(point(px(left + line.x[i] - x0), px(vr.top)), size(px(m.ch), px(m.row)));
                     paint_cell(window, cell_box, cell, run.fg, run.bg);
+                    if let (Some(f), Draw::Glitch) = (frame, draw) {
+                        paint_glitch(window, &p, f, vr.row, &range, line, i, if c == ' ' { 'x' } else { c }, px(left + line.x[i] - x0), baseline);
+                    }
                 }
             }
         }
 
         // Discord emoji last: an image reaches past its row.
         let now = Instant::now();
-        let mut next_frame: Option<Instant> = None;
+        let mut next_frame: Option<Instant> = p.reveal_next.map(|d| now + d);
         let height = emoji::HEIGHT_EM * f32::from(m.font_size);
         let middle = ink::x_height_em() * f32::from(m.font_size) / 2.0;
         for vr in &p.rows {
@@ -986,6 +1092,9 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                 at += run.len;
                 let Some(e) = &run.emoji else { continue };
                 if !range.contains(&s) {
+                    continue;
+                }
+                if p.frames[vr.line].is_some() && matches!(reveal_draw(p.frames[vr.line].as_ref(), line, vr.row, &range, s), Draw::Hide) {
                     continue;
                 }
                 let x = left + line.x[s] - x0;
@@ -1042,6 +1151,63 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
             window.paint_quad(fill(b, color).corner_radii(px(BAR_W / 2.0)));
         }
     });
+}
+
+/// What the text-reveal effect does with the character at byte `i` of `line`'s row
+/// `range` this frame (`Keep` for a line that isn't revealing, or outside the row). The
+/// character's index in its row is its place among the row's characters; a space with no
+/// background is a word gap, which is never glitched.
+fn reveal_draw(frame: Option<&crate::reveal::Frame>, line: &LaidLine, row: usize, range: &Range<usize>, i: usize) -> Draw {
+    let Some(f) = frame else { return Draw::Keep };
+    if i < range.start || i >= range.end {
+        return Draw::Keep;
+    }
+    let text = &line.styled.text;
+    let ord = text[range.start..i].chars().count();
+    let c = text[i..].chars().next().unwrap_or(' ');
+    let mut at = 0;
+    let mut bg = None;
+    for run in &line.styled.runs {
+        at += run.len;
+        if i < at {
+            bg = run.bg;
+            break;
+        }
+    }
+    f.draw(row, ord, c.is_whitespace() && bg.is_none())
+}
+
+/// The text-reveal effect's glitch over a one-cell character: a random glyph shaped in the
+/// bold primary font, painted in the accent colour at the character's place. False for a
+/// character that isn't one cell (it keeps its own glyph, in the accent colour).
+#[allow(clippy::too_many_arguments)]
+fn paint_glitch(
+    window: &mut Window,
+    p: &Prepared,
+    frame: &crate::reveal::Frame,
+    row: usize,
+    range: &Range<usize>,
+    line: &LaidLine,
+    i: usize,
+    ch: char,
+    x: Pixels,
+    baseline: f32,
+) -> bool {
+    if unicode_width::UnicodeWidthChar::width(ch) != Some(1) {
+        return false;
+    }
+    let ord = line.styled.text[range.start..i].chars().count();
+    let glyph = frame.glitch_glyph(row, ord).to_string();
+    let font = p.snapshot.fonts.font(FontClass::Primary, true, false);
+    let runs = [TextRun { len: glyph.len(), font, color: Hsla::default(), ..Default::default() }];
+    let lay = window.text_system().layout_line(&glyph, p.metrics.font_size, &runs, None);
+    let color = hsla(frame.accent().array());
+    for run in &lay.runs {
+        for g in &run.glyphs {
+            let _ = window.paint_glyph(point(x + g.position.x, px(baseline) + g.position.y), run.font_id, g.id, p.metrics.font_size, color);
+        }
+    }
+    true
 }
 
 /// Whether a run's text is underlined (cells and emoji never are).

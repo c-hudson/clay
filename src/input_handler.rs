@@ -803,6 +803,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
+                app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
                 // Update mouse setting; if disabled, turn off capture immediately
                 app.settings.mouse_enabled = settings.mouse_enabled;
                 if !settings.mouse_enabled && app.mouse_capture_active {

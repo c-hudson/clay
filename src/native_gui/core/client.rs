@@ -2060,6 +2060,11 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         icon_bar: s.icon_bar.clone(),
         // Empty: a server from before Import Picture sent none.
         picture_host: (!s.picture_host.is_empty()).then(|| s.picture_host.clone()),
+        // This GUI's own Text Reveal on this OS, once it has one (the Settings window
+        // puts it under the GUI's key).
+        text_reveal_profile: s.text_reveal_profiles.get(crate::font_profile::native_key()).map(|value| {
+            crate::websocket::TextRevealProfile { key: crate::font_profile::native_key().to_string(), value: value.clone() }
+        }),
         // This GUI's own fonts on this OS, once it has them (src/font_profile.rs).
         font_profile: s.font_update_for(crate::font_profile::native_key()),
     }

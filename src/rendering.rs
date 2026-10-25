@@ -1094,27 +1094,42 @@ pub fn build_display_lines(
 
 /// Render output area using raw crossterm (bypasses ratatui's buggy rendering)
 /// Returns early if splash screen, popup, or editor is visible (let ratatui handle those)
-pub(crate) fn render_output_crossterm(app: &App) {
+/// Paint the output area with raw crossterm. Returns the delay until the text-reveal
+/// effect's next frame (src/reveal.rs) when a line on screen is still being revealed, so
+/// the loop can repaint then; `None` when nothing animates (the setting is off, every
+/// line has settled, or the user scrolled the revealing lines away), and the loop's frame
+/// timer stays parked.
+pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> {
     use std::io::Write;
     use crossterm::{style::Print, QueueableCommand};
 
     // Skip if showing splash screen or editor is visible
     // When editor is visible, ratatui handles all rendering for the split-screen layout
     if app.current_world().showing_splash || app.editor.visible {
-        return;
+        return None;
     }
 
     // Skip if any overlay popup is visible - ratatui handles output rendering behind popups
     if app.has_new_popup() || app.confirm_dialog.visible {
-        return;
+        return None;
     }
 
     // A shell world: the output area is a live terminal, drawn row for row with the real
     // cursor parked in the grid (src/shell). Nothing else about the frame changes.
     if app.current_world().shell_screen.is_some() {
         render_shell_crossterm(app);
-        return;
+        return None;
     }
+
+    // The text-reveal effect: applied to the wrapped row strings only, inside
+    // expand_and_wrap below, after the wrap and before anything counts or prints them. It
+    // never changes a row's width or a line's row count, so paging is untouched.
+    let reveal = match app.settings.text_reveal.chars_per_second() {
+        cps if cps > 0.0 => Some(crate::reveal::Reveal::for_console(cps, app.settings.theme)),
+        _ => None,
+    };
+    let reveal_now = std::time::SystemTime::now();
+    let mut next_frame: Option<std::time::Duration> = None;
 
     let mut stdout = std::io::stdout();
     // Undo any shell-world cursor shape (a prior frame on a shell world) now that an
@@ -1205,13 +1220,21 @@ pub(crate) fn render_output_crossterm(app: &App) {
     // Zero while the user is scrolled back: there is no new text to give context to, and
     // composing would discard rows out of the middle of the screen (see visible_row_ranges).
     let min_old_context: usize = if new_line_indicator && world.is_at_bottom() { 2 } else { 0 };
-    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool, bool)> {
+    let mut expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool, bool)> {
         // display_wrapped applies the same prefix-width reservations the draw loop below
         // relies on (▶ and 🛢️ are printed separately, not baked into the wrapped text).
-        let rows = display_wrapped(line, term_width, show_tags, &app.settings, cached_now);
+        let mut rows = display_wrapped(line, term_width, show_tags, &app.settings, cached_now);
         if rows.len() == 1 && rows[0].is_empty() {
             // Blank line: one empty row, drawn without any prefix.
             return vec![(String::new(), false, None, false, false)];
+        }
+        if let Some(reveal) = reveal.as_ref() {
+            // A line reveals from its arrival, the console's switch to this world or
+            // more-mode's release of it, whichever came last (`World::console_reveal_anchor`).
+            let anchor = world.console_reveal_anchor(line);
+            if let Some(due) = reveal.apply(line.seq, anchor, reveal_now, &mut rows) {
+                next_frame = Some(next_frame.map_or(due, |d| d.min(due)));
+            }
         }
         let hl_color = line.highlight_color.clone();
         let mn = line_is_new(line);
@@ -1392,6 +1415,14 @@ pub(crate) fn render_output_crossterm(app: &App) {
         lines_to_show.extend(visual_lines[tail].iter());
     }
 
+    // A reveal frame rewrites every row a few times a second: ask a terminal that knows
+    // synchronized output (DEC private mode 2026) to paint the frame in one go, so the
+    // glitching cursor never tears. Any other terminal ignores the private mode.
+    let synchronized = next_frame.is_some();
+    if synchronized {
+        let _ = stdout.queue(Print("\x1b[?2026h"));
+    }
+
     for (row_idx, (wrapped, highlight_f8, hl_color, marked_new, from_archive)) in lines_to_show.iter().enumerate() {
         let row_y = row_idx as u16;
 
@@ -1537,7 +1568,11 @@ pub(crate) fn render_output_crossterm(app: &App) {
 
     queue_input_cursor(app, &mut stdout);
 
+    if synchronized {
+        let _ = stdout.queue(Print("\x1b[?2026l"));
+    }
     let _ = stdout.flush();
+    next_frame
 }
 
 /// Queue the real cursor's move to its spot in the input area, for the crossterm pass

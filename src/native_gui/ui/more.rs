@@ -41,6 +41,11 @@ pub struct MoreMode {
     last_tail: Option<u64>,
     /// Wheel movement past the bottom not yet worth a whole row.
     pub wheel_px: f32,
+    /// Lines `arrivals` found shown at once (not held) since `take_arrived`, and lines let
+    /// through since `take_released`: the text-reveal effect types both on from that moment
+    /// (`ClayView::reveal_stamp`).
+    arrived: Vec<u64>,
+    released: Vec<u64>,
 }
 
 impl MoreMode {
@@ -89,8 +94,12 @@ impl MoreMode {
             }
             // Not paused: history caught up on, and lines the server never numbered
             // (released ones, from an older server, and this client's own notices),
-            // aren't arrivals; with more-mode off, nothing is counted.
+            // aren't arrivals; with more-mode off, nothing is counted. Shown at once all
+            // the same, unless they are history.
             if !self.paused && (line.scrollback || line.seq.is_none() || !enabled) {
+                if !line.scrollback {
+                    self.arrived.push(line.id);
+                }
                 continue;
             }
             let cost = rows(line);
@@ -105,6 +114,7 @@ impl MoreMode {
                 self.hold(line.id, cost);
             } else {
                 self.since_pause += cost;
+                self.arrived.push(line.id);
             }
         }
         paused_now
@@ -119,7 +129,18 @@ impl MoreMode {
     fn pop(&mut self) -> Option<usize> {
         let (id, rows) = self.held.pop_front()?;
         self.held_set.remove(&id);
+        self.released.push(id);
         Some(rows)
+    }
+
+    /// The lines let through since the last call (`pop`), oldest first.
+    pub fn take_released(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.released)
+    }
+
+    /// The lines `arrivals` has shown at once since the last call, oldest first.
+    pub fn take_arrived(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.arrived)
     }
 
     fn drained(&mut self) {
@@ -224,6 +245,28 @@ mod tests {
         assert!(!m.is_held(9) && m.is_held(10));
         m.release_all();
         assert!(!m.paused && m.held() == 0);
+    }
+
+    /// The text-reveal effect is told what was shown at once and what was let through.
+    #[test]
+    fn arrivals_shown_at_once_and_releases_are_reported() {
+        let mut w = World::default();
+        w.lines = (1..=3).map(line).collect();
+        let mut m = MoreMode::default();
+        m.reset(Some(&w));
+        assert!(m.take_arrived().is_empty(), "the backlog is not an arrival");
+        w.lines.extend((4..=8).map(line));
+        w.lines.push(caught_up_line(20));
+        assert!(!m.arrivals(&w, true, 5, &mut one_row));
+        assert_eq!(m.take_arrived(), vec![4, 5, 6, 7, 8], "shown at once; a gap fill is history");
+        w.lines.extend((9..=12).map(line));
+        assert!(m.arrivals(&w, true, 5, &mut one_row));
+        assert!(m.take_arrived().is_empty(), "held lines wait for their release");
+        assert_eq!(m.release(1), 1);
+        assert_eq!(m.take_released(), vec![9]);
+        m.release_all();
+        assert_eq!(m.take_released(), vec![10, 11, 12]);
+        assert!(m.take_released().is_empty());
     }
 
     #[test]

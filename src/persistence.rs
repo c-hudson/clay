@@ -485,6 +485,10 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
     }
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
+    writeln!(file, "text_reveal={}", app.settings.text_reveal.name())?;
+    for (key, value) in &app.settings.text_reveal_profiles {
+        writeln!(file, "text_reveal.{key}={}", value.name())?;
+    }
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
@@ -1343,6 +1347,15 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     }
                     "editor_side" => {
                         app.settings.editor_side = EditorSide::from_name(value);
+                    }
+                    "text_reveal" => {
+                        app.settings.text_reveal = TextReveal::from_name(value);
+                    }
+                    // One interface's own Text Reveal (see REMOTE_CONSOLE_REVEAL_KEY).
+                    k if k.starts_with("text_reveal.") => {
+                        if let Some(key) = k.strip_prefix("text_reveal.") {
+                            app.settings.text_reveal_profiles.insert(key.to_string(), TextReveal::from_name(value));
+                        }
                     }
                     "mouse_enabled" => {
                         app.settings.mouse_enabled = value == "true";
@@ -2232,6 +2245,10 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
     }
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
+    writeln!(file, "text_reveal={}", app.settings.text_reveal.name())?;
+    for (key, value) in &app.settings.text_reveal_profiles {
+        writeln!(file, "text_reveal.{key}={}", value.name())?;
+    }
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
@@ -3269,6 +3286,15 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "editor_side" => {
                         app.settings.editor_side = EditorSide::from_name(value);
                     }
+                    "text_reveal" => {
+                        app.settings.text_reveal = TextReveal::from_name(value);
+                    }
+                    // One interface's own Text Reveal (see REMOTE_CONSOLE_REVEAL_KEY).
+                    k if k.starts_with("text_reveal.") => {
+                        if let Some(key) = k.strip_prefix("text_reveal.") {
+                            app.settings.text_reveal_profiles.insert(key.to_string(), TextReveal::from_name(value));
+                        }
+                    }
                     "mouse_enabled" => {
                         app.settings.mouse_enabled = value == "true";
                     }
@@ -3882,6 +3908,7 @@ mod tests {
             tls_proxy_enabled: true,           // default: false
             dictionary_path: "/custom/dict".to_string(), // default: ""
             editor_side: EditorSide::Right,    // default: Left
+            text_reveal: TextReveal::Fast,     // default: Off
             mouse_enabled: false,              // default: true
             zwj_enabled: true,                 // default: false
             new_line_indicator: true,             // default: false
@@ -3899,6 +3926,9 @@ mod tests {
             tabs: TabsMode::Top,               // default: None
             icon_bar: IconBarMode::All,        // default: AppTablet
             picture_host: crate::picture::PictureService::from_name("x0+short"), // default: catbox
+            text_reveal_profiles: [("native-linux".to_string(), TextReveal::SuperFast), ("console-remote".to_string(), TextReveal::Slow)]
+                .into_iter()
+                .collect(),                 // default: empty
             font_profiles: [(
                 "native-windows".to_string(),
                 crate::font_profile::FontProfile {
@@ -4014,6 +4044,7 @@ mod tests {
         assert_eq!(a.tls_proxy_enabled, b.tls_proxy_enabled, "{context}: tls_proxy_enabled");
         assert_eq!(a.dictionary_path, b.dictionary_path, "{context}: dictionary_path");
         assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
+        assert_eq!(a.text_reveal, b.text_reveal, "{context}: text_reveal");
         assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
         assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
@@ -4027,6 +4058,7 @@ mod tests {
         assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
         assert_eq!(a.picture_host, b.picture_host, "{context}: picture_host");
         assert_eq!(a.font_profiles, b.font_profiles, "{context}: font_profiles");
+        assert_eq!(a.text_reveal_profiles, b.text_reveal_profiles, "{context}: text_reveal_profiles");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -5353,6 +5385,7 @@ pattern=foo
         assert_ne!(non_default.tls_proxy_enabled, default.tls_proxy_enabled, "tls_proxy_enabled should differ");
         assert_ne!(non_default.dictionary_path, default.dictionary_path, "dictionary_path should differ");
         assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
+        assert_ne!(non_default.text_reveal, default.text_reveal, "text_reveal should differ");
         assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
         assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
@@ -5366,6 +5399,7 @@ pattern=foo
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");
         assert_ne!(non_default.picture_host, default.picture_host, "picture_host should differ");
         assert_ne!(non_default.font_profiles, default.font_profiles, "font_profiles should differ");
+        assert_ne!(non_default.text_reveal_profiles, default.text_reveal_profiles, "text_reveal_profiles should differ");
     }
 
     #[test]

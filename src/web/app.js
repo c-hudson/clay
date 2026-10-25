@@ -690,6 +690,7 @@
         setupTabsSelect: document.getElementById('setup-tabs-select'),
         setupIconBarSelect: document.getElementById('setup-iconbar-select'),
         setupPictureHostSelect: document.getElementById('setup-picture-host-select'),
+        setupTextRevealSelect: document.getElementById('setup-text-reveal-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupKeyboardVisibleToggle: document.getElementById('setup-keyboard-visible-toggle'),
@@ -4144,6 +4145,12 @@
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
+                    // This page's own Text Reveal, under its interface key (per interface,
+                    // like fonts); a server from before the effect sends no map.
+                    if (msg.settings.text_reveal_profiles !== undefined) {
+                        textRevealSynced = true;
+                        textReveal = (msg.settings.text_reveal_profiles && msg.settings.text_reveal_profiles[fontProfileKey]) || 'off';
+                    }
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
                     }
@@ -5031,6 +5038,12 @@
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
+                    // This page's own Text Reveal, under its interface key (per interface,
+                    // like fonts); a server from before the effect sends no map.
+                    if (msg.settings.text_reveal_profiles !== undefined) {
+                        textRevealSynced = true;
+                        textReveal = (msg.settings.text_reveal_profiles && msg.settings.text_reveal_profiles[fontProfileKey]) || 'off';
+                    }
                     if (msg.settings.new_line_indicator !== undefined) {
                         const oldNli = newLineIndicator;
                         newLineIndicator = msg.settings.new_line_indicator;
@@ -5705,7 +5718,10 @@
                     // Same reason as in switchWorldLocal: claim before the paint so ▶ is
                     // there on the first frame rather than after MarkWorldSeen round-trips.
                     claimUnviewedLocally(msg.world_index);
-                    if (msg.world_index !== previousWorldIndex) arriveTextdiv(msg.world_index);
+                    if (msg.world_index !== previousWorldIndex) {
+                        arriveTextdiv(msg.world_index);
+                        revealStampWorld(worlds[msg.world_index]);
+                    }
                     renderOutput();
                     // Send MarkWorldSeen since we're now viewing this world; tell the server
                     // which world we left so it can clear that world's indicators even across
@@ -7948,6 +7964,7 @@
             // a moment later. The ClaimedNew that MarkWorldSeen triggers reconciles it.
             claimUnviewedLocally(index);
             arriveTextdiv(index);
+            revealStampWorld(worlds[index]);
             renderOutput();
             updateStatusBar();
             // Update prompt to show new world's prompt
@@ -9326,6 +9343,297 @@
 
     // One drawn line's HTML, the same for both paths. `o`: ts, fromServer, archiveSourced,
     // fromArchive, markedNew, highlightColor, worldName.
+
+    // ===== Text reveal (Settings::text_reveal; the algorithm is src/reveal.rs's) =====
+    // A newly shown line is typed onto the screen left to right behind a glitching run of
+    // glyphs, with a fade from the accent colour into each character's own. The constants,
+    // the hash and the per-character rules are the console's (src/reveal.rs), so a frame
+    // looks the same in every interface. It works on the line's ANSI text just before
+    // parseAnsi(): a hidden character stays in place under SGR 8 (conceal, drawn with
+    // visibility:hidden by .ansi-conceal), never replaced, so the browser's word-wrap and
+    // the line's height are the same in every frame; a glitch glyph is one cell for a
+    // one-cell character; a fade is a 24-bit foreground. A wrapped line's rows (counted in
+    // cells at the output's width) reveal together, each behind its own frontier.
+    // Anchors (World::console_reveal_anchor on the console): a line is stamped when it is
+    // appended live - an arrival or a more-mode release - and a world when it is switched
+    // to; the later of the two starts the reveal, so the screen a switch shows is typed on
+    // too, while the backlog at connect and scrollback prepends are not.
+    const REVEAL_FPS = 30, REVEAL_GLITCH_WIDTH = 3, REVEAL_SETTLE_WIDTH = 3, REVEAL_INLINE_CHANCE = 0.35,
+          REVEAL_SPEED_VARIATION = 0.25, REVEAL_MAX_SECS = 10, REVEAL_MAX_CHARS = 4096;
+    // Letters, digits and symbols a browser never breaks a line at (the console's set has
+    // every punctuation mark; '-', '/' or '?' in a glitch would move a wrap for a frame).
+    const REVEAL_GLYPHS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789#$%&*+=@^~!<>|';
+    const REVEAL_CPS = { off: 0, slow: 30, normal: 60, fast: 120, superfast: 240 };
+    let textReveal = 'off';        // this page's own TextReveal name (kept per interface key)
+    let textRevealSynced = false;  // the server sent the per-interface map (one from before the effect sends none)
+    let setupTextReveal = 'off';
+    let revealSeedCounter = 1;
+    // Set by lineHtml(): the delay to the line's next frame, null when it drew the line whole.
+    let revealFrameNext = null;
+    function textRevealCps() { return REVEAL_CPS[textReveal] || 0; }
+
+    // reveal.rs `mix`/`unit`: the same small deterministic hash, on the low 32 bits.
+    function revealMix(seed, frame, index) {
+        let v = ((seed >>> 0) ^ Math.imul(frame >>> 0, 0x9E3779B1) ^ Math.imul(index >>> 0, 0x85EBCA77)) >>> 0;
+        v = (v ^ (v >>> 16)) >>> 0;
+        v = Math.imul(v, 0x7FEB352D) >>> 0;
+        v = (v ^ (v >>> 15)) >>> 0;
+        return v;
+    }
+    function revealUnit(v) { return v / 4294967296; }
+
+    const REVEAL_ESC = /\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[\s\S]/g;
+    // The text as escapes (kept whole, as {esc}) and characters (strings, by code point).
+    function revealPieces(text) {
+        const out = [];
+        let last = 0, m;
+        REVEAL_ESC.lastIndex = 0;
+        while ((m = REVEAL_ESC.exec(text)) !== null) {
+            for (const ch of text.slice(last, m.index)) out.push(ch);
+            out.push({ esc: m[0] });
+            last = m.index + m[0].length;
+        }
+        for (const ch of text.slice(last)) out.push(ch);
+        return out;
+    }
+
+    // The 16 ANSI colours as the theme draws them (--theme-ansi-N), read once per frame.
+    let revealPaletteCache = null;
+    function revealPalette() {
+        if (revealPaletteCache) return revealPaletteCache;
+        const fallback = [[0,0,0],[205,0,0],[0,205,0],[205,205,0],[0,0,238],[205,0,205],[0,205,205],[229,229,229],
+                          [127,127,127],[255,0,0],[0,255,0],[255,255,0],[92,92,255],[255,0,255],[0,255,255],[255,255,255]];
+        const cs = getComputedStyle(document.documentElement);
+        revealPaletteCache = fallback.map((fb, n) => {
+            const v = cs.getPropertyValue('--theme-ansi-' + n).trim();
+            const m = /^#([0-9a-f]{6})$/i.exec(v);
+            return m ? [parseInt(m[1].slice(0, 2), 16), parseInt(m[1].slice(2, 4), 16), parseInt(m[1].slice(4, 6), 16)] : fb;
+        });
+        return revealPaletteCache;
+    }
+    function revealAnsiRgb(n) {
+        if (n < 16) return revealPalette()[n];
+        if (n < 232) {
+            const c = n - 16, level = v => v === 0 ? 0 : 55 + 40 * v;
+            return [level(Math.floor(c / 36)), level(Math.floor(c / 6) % 6), level(c % 6)];
+        }
+        const g = 8 + 10 * (n - 232);
+        return [g, g, g];
+    }
+    // What an SGR parameter list says about the colours: fg undefined = nothing, null =
+    // the default, [r,g,b] = a colour; bg undefined = nothing, true = set, false = cleared.
+    function revealSgrColors(params) {
+        const nums = params.split(';').map(x => x === '' ? NaN : parseInt(x, 10));
+        let fg, bg;
+        for (let k = 0; k < nums.length; k++) {
+            const c = nums[k];
+            if (c === 0 || (isNaN(c) && params === '')) { fg = null; bg = false; }
+            else if (c === 39) fg = null;
+            else if (c === 49) bg = false;
+            else if ((c >= 30 && c <= 37)) fg = revealAnsiRgb(c - 30);
+            else if ((c >= 90 && c <= 97)) fg = revealAnsiRgb(c - 90 + 8);
+            else if ((c >= 40 && c <= 47) || (c >= 100 && c <= 107)) bg = true;
+            else if (c === 38 || c === 48) {
+                const mode = nums[k + 1];
+                let rgb = undefined;
+                if (mode === 5 && nums[k + 2] >= 0 && nums[k + 2] < 256) { rgb = revealAnsiRgb(nums[k + 2]); k += 2; }
+                else if (mode === 2 && nums.length > k + 4) { rgb = [nums[k + 2] & 255, nums[k + 3] & 255, nums[k + 4] & 255]; k += 4; }
+                if (rgb) { if (c === 38) fg = rgb; else bg = true; }
+            }
+        }
+        return { fg, bg };
+    }
+    function revealSgrResets(esc) {
+        if (!esc.startsWith('\x1b[') || !esc.endsWith('m')) return undefined;
+        const params = esc.slice(2, -1);
+        return params === '' || params === '0' || params.startsWith('0;');
+    }
+    function revealLerp(a, b, t) {
+        t = Math.max(0, Math.min(1, t));
+        return [0, 1, 2].map(i => Math.round(a[i] + (b[i] - a[i]) * t));
+    }
+
+    // One line's ANSI text as it looks `elapsed` seconds into its reveal, with the delay to
+    // its next frame; null when the reveal is over (or the line is too long to run).
+    function revealApply(text, seed, elapsed, cols) {
+        const cps = textRevealCps();
+        if (cps <= 0 || elapsed < 0) return null;
+        const pieces = revealPieces(text);
+        cols = Math.max(1, cols | 0);
+        // Rows by cells at the output's width: each one reveals behind its own frontier.
+        const rows = [];
+        let row = { n: 0, cells: 0 };
+        const place = [];
+        let total = 0;
+        for (const p of pieces) {
+            if (typeof p !== 'string') { place.push(null); continue; }
+            const w = charCells(p.codePointAt(0));
+            if (row.cells > 0 && row.cells + w > cols) { rows.push(row); row = { n: 0, cells: 0 }; }
+            place.push([rows.length, row.n]);
+            row.n++; row.cells += w; total++;
+        }
+        rows.push(row);
+        if (total === 0 || total > REVEAL_MAX_CHARS) return null;
+        const longest = Math.max(...rows.map(r => r.n));
+        const span = longest + REVEAL_GLITCH_WIDTH + REVEAL_SETTLE_WIDTH;
+        const jitter = 1 + REVEAL_SPEED_VARIATION * (2 * revealUnit(revealMix(seed, 0xBEEF, 0)) - 1);
+        const interval = Math.min(1 / (cps * jitter), REVEAL_MAX_SECS / span);
+        const totalSecs = interval * span;
+        if (elapsed >= totalSecs - 1e-9) return null;
+        const frame = Math.floor((elapsed + 1e-9) * REVEAL_FPS);
+        const t = frame / REVEAL_FPS;
+        const frontier = Math.floor(t / interval + 1e-9);
+        const next = Math.max(0.001, Math.min((frame + 1) / REVEAL_FPS - elapsed, totalSecs - elapsed));
+        const light = themeBgIsLight() === true;
+        const accent = light ? [0, 0, 0] : [255, 255, 255];
+        const base = light ? [68, 68, 68] : [215, 215, 215];
+        const rowSeed = r => ((seed >>> 0) ^ Math.imul(r, 0x7F4A7C15)) >>> 0;
+
+        // reveal.rs RowFrame::inline_glitch_phase / draw.
+        function inlinePhase(rs, n, i) {
+            const fill = n * interval;
+            if (REVEAL_INLINE_CHANCE <= 0 || t >= fill) return null;
+            if (revealUnit(revealMix((rs ^ 0xA5A5A5A5) >>> 0, 0, i)) >= REVEAL_INLINE_CHANCE) return null;
+            const stableAt = (i + 1 + REVEAL_GLITCH_WIDTH + REVEAL_SETTLE_WIDTH) * interval;
+            const pulse = (1 + REVEAL_SETTLE_WIDTH) * interval;
+            const latestStart = fill - pulse;
+            if (latestStart <= stableAt) return null;
+            const start = stableAt + revealUnit(revealMix((rs ^ 0x5A5A5A5A) >>> 0, 0, i)) * (latestStart - stableAt);
+            const phase = t - start;
+            return phase >= 0 && phase < pulse ? phase : null;
+        }
+        // 'hide' | 'keep' | 'glitch' | a fade progress number (0 = accent .. 1 = own colour)
+        function draw(rs, n, blank, i) {
+            const revealed = Math.min(n, frontier);
+            if (i >= revealed) return 'hide';
+            const trail = frontier - 1 - i;
+            if (trail >= REVEAL_GLITCH_WIDTH + REVEAL_SETTLE_WIDTH || blank) {
+                const pulse = inlinePhase(rs, n, i);
+                if (pulse === null || blank) return 'keep';
+                if (pulse < interval) return 'glitch';
+                const fade = REVEAL_SETTLE_WIDTH * interval;
+                return fade <= 0 ? 'keep' : (pulse - interval) / fade;
+            }
+            if (trail >= REVEAL_GLITCH_WIDTH) {
+                const settle = trail - REVEAL_GLITCH_WIDTH;
+                if (REVEAL_SETTLE_WIDTH <= 1 || settle + 1 >= REVEAL_SETTLE_WIDTH) return 'keep';
+                return settle / (REVEAL_SETTLE_WIDTH - 1);
+            }
+            return 'glitch';
+        }
+
+        const HIDDEN = '\x1b[0;8m';
+        let out = '';
+        const active = [];
+        let ownFg = null, ownBg = false, open = null;
+        const restore = () => { out += '\x1b[0m' + active.join(''); };
+        for (let k = 0; k < pieces.length; k++) {
+            const p = pieces[k];
+            if (typeof p !== 'string') {
+                const esc = p.esc;
+                const resets = revealSgrResets(esc);
+                if (open !== null && resets !== true) restore();
+                open = null;
+                out += esc;
+                if (resets !== undefined) {
+                    if (resets) { active.length = 0; ownFg = null; ownBg = false; }
+                    const params = esc.slice(2, -1);
+                    const colors = revealSgrColors(params);
+                    if (colors.fg !== undefined) ownFg = colors.fg;
+                    if (colors.bg !== undefined) ownBg = colors.bg;
+                    if (!(params === '' || params === '0')) active.push(esc);
+                }
+                continue;
+            }
+            const [r, i] = place[k];
+            const rs = rowSeed(r), n = rows[r].n;
+            const blank = /\s/.test(p) && !ownBg;
+            const d = draw(rs, n, blank, i);
+            if (d === 'hide') {
+                // A reset is all a hidden run needs: the character stays, drawn invisible.
+                if (open !== HIDDEN) { out += HIDDEN; open = HIDDEN; }
+                out += p;
+                continue;
+            }
+            if (d === 'keep') {
+                if (open !== null) { restore(); open = null; }
+                out += p;
+                continue;
+            }
+            let style, glyph;
+            if (d === 'glitch') {
+                glyph = charCells(p.codePointAt(0)) === 1 ? REVEAL_GLYPHS[revealMix(rs, frame, i) % REVEAL_GLYPHS.length] : p;
+                style = '\x1b[1;38;2;' + accent.join(';') + 'm';
+            } else {
+                const c = revealLerp(accent, ownFg || base, d);
+                glyph = p;
+                style = '\x1b[38;2;' + c.join(';') + 'm';
+            }
+            if (open !== style) {
+                if (open !== null) restore();
+                out += style;
+                open = style;
+            }
+            out += glyph;
+        }
+        if (open !== null) restore();
+        return { text: out, next };
+    }
+
+    // When a line's reveal starts: its live arrival or the switch to its world, whichever
+    // came last; null when the setting is off or nothing stamped it.
+    function revealOptions(lineObj, world, now) {
+        if (textRevealCps() <= 0 || !lineObj || typeof lineObj !== 'object') return null;
+        const at = Math.max(lineObj._revealAt || -Infinity, (world && world._revealShownAt) || -Infinity);
+        if (at === -Infinity) return null;
+        if (typeof lineObj.seq !== 'number') lineObj._revealSeed = lineObj._revealSeed || revealSeedCounter++;
+        return { seed: typeof lineObj.seq === 'number' ? lineObj.seq : lineObj._revealSeed, elapsed: ((now || performance.now()) - at) / 1000 };
+    }
+    // The ".line" elements being redrawn frame by frame, with what lineHtml() needs again.
+    const revealing = new Map();
+    let revealRaf = 0, revealLast = 0;
+    function revealTrack(el, text, lineObj, o) {
+        if (!el) return;
+        revealing.set(el, { obj: lineObj, text, o });
+        revealSchedule();
+    }
+    function revealSchedule() {
+        if (!revealRaf && revealing.size) revealRaf = requestAnimationFrame(guard('revealTick', revealTick));
+    }
+    function revealTick() {
+        revealRaf = 0;
+        const now = performance.now();
+        if (now - revealLast < 1000 / REVEAL_FPS - 2) { revealSchedule(); return; }
+        revealLast = now;
+        revealPaletteCache = null;
+        const cr = elements.outputContainer.getBoundingClientRect();
+        const world = worlds[currentWorldIndex];
+        for (const [el, r] of revealing) {
+            if (!el.isConnected) { revealing.delete(el); continue; }
+            const rev = revealOptions(r.obj, world, now);
+            let html;
+            if (rev) {
+                html = lineHtml(r.text, Object.assign({ reveal: rev }, r.o));
+                if (revealFrameNext === null) {
+                    revealing.delete(el);
+                } else {
+                    // Off the screen: nothing to show until its last frame.
+                    const er = el.getBoundingClientRect();
+                    if (er.bottom < cr.top - 100 || er.top > cr.bottom + 100) continue;
+                }
+            } else {
+                html = lineHtml(r.text, r.o);
+                revealing.delete(el);
+            }
+            el.innerHTML = sanitizeHtml(html);
+        }
+        revealSchedule();
+    }
+    // A world the user just switched to: the screen it shows is typed on from now.
+    function revealStampWorld(world) {
+        if (world && textRevealCps() > 0) world._revealShownAt = performance.now();
+    }
+
     function lineHtml(cleanLine, o) {
         // Format timestamp prefix if showTags is enabled
         const tsPrefix = showTags && o.ts ? `<span class="timestamp">${formatTimestamp(o.ts)}</span>` : '';
@@ -9335,8 +9643,16 @@
         const taggedText = showTags ? cleanLine : stripMudTag(cleanLine);
         const strippedText = applyClientPrefix(taggedText, o.fromServer, o.archiveSourced);
         const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
+        // The text-reveal effect's frame, on the text as it will be parsed (ZWSPs included,
+        // so every frame lays out the same); revealFrameNext tells the caller to redraw.
+        let ansiText = insertWordBreaks(displayText);
+        revealFrameNext = null;
+        if (o.reveal) {
+            const frame = revealApply(ansiText, o.reveal.seed, o.reveal.elapsed, getVisibleColumnCount());
+            if (frame) { ansiText = frame.text; revealFrameNext = frame.next; }
+        }
         // Skip Discord emoji conversion when showTags is enabled so users can see original text
-        const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
+        const processed = linkifyUrls(parseAnsi(ansiText));
         const newLinePrefix = (nliDrawn() && o.markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
         // Mirrors OutputLine::shows_archive_prefix(): both flags mean "text from scrollback.db".
         const archivePrefix = (o.fromArchive || o.archiveSourced) ? '🛢️ ' : '';
@@ -9641,6 +9957,14 @@
             && !(filterPopupOpen && filterText.length > 0) && !grepRegex) ? world._textdiv : null;
         let dividerPlaced = false;
 
+        // The text-reveal effect: only lines that can be on the first screen of a switch get
+        // a frame here (the rest are above it and drawn whole); each ".line" element drawn
+        // mid-reveal is tracked for its next frames once the DOM exists (one entry per
+        // lineSpanHtml, in order, null when drawn whole).
+        const revealFrom = searchEndIdx - (getVisibleLineCount() * 2 + 10);
+        const revealTracked = [];
+        let revealAny = false;
+
         // Build lines as HTML with explicit <br> line breaks
         const htmlParts = [];
         for (let i = startIdx; i < searchEndIdx; i++) {
@@ -9665,8 +9989,13 @@
             // Gagged (unless F2), escape-only and idler lines, F4's filter, grep.
             if (!lineIsDrawn(cleanLine, lineGagged)) continue;
 
-            const html = lineHtml(cleanLine, { ts: lineTs, fromServer: lineFromServer, archiveSourced: lineArchiveSourced,
-                fromArchive: lineFromArchive, markedNew: lineMarkedNew, highlightColor: lineHighlightColor, worldName: world.name });
+            const o = { ts: lineTs, fromServer: lineFromServer, archiveSourced: lineArchiveSourced,
+                fromArchive: lineFromArchive, markedNew: lineMarkedNew, highlightColor: lineHighlightColor, worldName: world.name };
+            const reveal = i >= revealFrom ? revealOptions(lineObj, world) : null;
+            const html = lineHtml(cleanLine, reveal ? Object.assign({ reveal }, o) : o);
+            const tracked = revealFrameNext !== null ? { obj: lineObj, text: cleanLine, o } : null;
+            revealTracked.push(tracked);
+            revealAny = revealAny || tracked !== null;
 
             if (divider && !dividerPlaced && typeof lineObj === 'object' && typeof lineObj.seq === 'number'
                 && !lineObj.from_archive && (divider.afterSeq === null || lineObj.seq > divider.afterSeq)) {
@@ -9705,6 +10034,10 @@
             scrollToBottom();
         }
         lastRenderedWorld = world;
+        if (revealAny) {
+            const els = elements.output.querySelectorAll(':scope > .line');
+            revealTracked.forEach((t, k) => { if (t && els[k]) revealTrack(els[k], t.text, t.obj, t.o); });
+        }
 
         // Clear unseen for current world
         world.unseen_lines = 0;
@@ -9753,8 +10086,13 @@
         // search to close (which redraws).
         if (searchCutOff()) return;
 
-        const html = lineHtml(cleanText, { ts, fromServer, archiveSourced, fromArchive: false, markedNew,
-            highlightColor, worldName: world ? world.name : '' });
+        // Shown live (an arrival, or more-mode letting it through): the text-reveal effect
+        // types it on from now.
+        if (lineObj && typeof lineObj === 'object' && textRevealCps() > 0) lineObj._revealAt = performance.now();
+        const o = { ts, fromServer, archiveSourced, fromArchive: false, markedNew,
+            highlightColor, worldName: world ? world.name : '' };
+        const reveal = revealOptions(lineObj, world);
+        const html = lineHtml(cleanText, reveal ? Object.assign({ reveal }, o) : o);
 
         // "line" is a block-level element (see style.css) so it auto-stacks below the
         // previous one — no <br> separator needed (also what makes the wrapspace
@@ -9762,6 +10100,7 @@
         // Defense-in-depth: strip any event handler attributes that slipped through
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
         elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(lineSpanHtml(html, lineIndex, lineObj)));
+        if (revealFrameNext !== null) revealTrack(elements.output.lastElementChild, cleanText, lineObj, o);
 
         scheduleScrollToBottom();
     }
@@ -10130,6 +10469,10 @@
                     currentClasses.push('ansi-blink');
                 } else if (code === 7) {
                     currentReversed = true;
+                } else if (code === 8) {
+                    // Conceal: drawn invisible, laid out as itself (the text-reveal effect's
+                    // hidden characters, see revealApply).
+                    currentClasses.push('ansi-conceal');
                 } else if (code === 9) {
                     currentClasses.push('ansi-strike');
                 } else if (code === 22) {
@@ -10142,6 +10485,8 @@
                     currentClasses = currentClasses.filter(c => c !== 'ansi-blink');
                 } else if (code === 27) {
                     currentReversed = false;
+                } else if (code === 28) {
+                    currentClasses = currentClasses.filter(c => c !== 'ansi-conceal');
                 } else if (code === 29) {
                     currentClasses = currentClasses.filter(c => c !== 'ansi-strike');
                 } else if (code >= 30 && code <= 37) {
@@ -13386,6 +13731,7 @@
         setupTabsMode = tabsMode;
         setupIconBarMode = iconBarMode;
         setupPictureHost = pictureHost || 'catbox';
+        setupTextReveal = textReveal || 'off';
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupKeyboardAlwaysVisible = keyboardAlwaysVisible;
@@ -13511,6 +13857,10 @@
             elements.setupPictureHostSelect.value = setupPictureHost;
             updateCustomDropdown(elements.setupPictureHostSelect);
         }
+        if (elements.setupTextRevealSelect) {
+            elements.setupTextRevealSelect.value = setupTextReveal;
+            updateCustomDropdown(elements.setupTextRevealSelect);
+        }
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
         } else {
@@ -13625,6 +13975,9 @@
             icon_bar: iconBarMode,
             // null = unchanged (a server from before Import Picture sent none).
             picture_host: pictureHost || null,
+            // This page's own Text Reveal under its key; null = unchanged (a server from
+            // before the effect sent none).
+            text_reveal_profile: textRevealSynced ? { key: fontProfileKey, value: textReveal } : null,
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
@@ -13756,6 +14109,7 @@
         applyTabsMode(setupTabsMode);
         applyIconBarMode(setupIconBarMode);
         if (pictureHost) pictureHost = setupPictureHost;
+        textReveal = setupTextReveal;
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         keyboardAlwaysVisible = setupKeyboardAlwaysVisible;
@@ -18549,6 +18903,11 @@
         if (elements.setupPictureHostSelect) {
             elements.setupPictureHostSelect.onchange = function() {
                 setupPictureHost = this.value;
+            };
+        }
+        if (elements.setupTextRevealSelect) {
+            elements.setupTextRevealSelect.onchange = function() {
+                setupTextReveal = this.value;
             };
         }
         elements.setupTlsProxyToggle.onclick = function() {

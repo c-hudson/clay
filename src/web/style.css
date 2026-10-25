@@ -394,6 +394,9 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
 @keyframes ansi-blink { 0%, 75% { opacity: 1; } 76%, 100% { opacity: 0; } }
 /* Shell worlds (src/shell): SGR dim (2) and strike (9). */
 .ansi-dim { opacity: 0.6; }
+/* SGR 8 conceal: the text-reveal effect's hidden characters stay in the line, laid out as
+   themselves, so wrapping and the line's height never move between frames. */
+.ansi-conceal { visibility: hidden; }
 .ansi-strike { text-decoration: line-through; }
 .ansi-underline.ansi-strike { text-decoration: underline line-through; }
 

@@ -861,6 +861,11 @@ pub enum WsMessage {
         /// which doesn't know it) = unchanged: a save from it must not reset the setting.
         #[serde(default)]
         picture_host: Option<String>,
+        /// This client's own Text Reveal (src/reveal.rs): its interface key and the
+        /// `TextReveal` name. `None` (an older client, or one that never changed it) =
+        /// unchanged. The console's own is never on the wire.
+        #[serde(default)]
+        text_reveal_profile: Option<TextRevealProfile>,
         /// This client's own fonts: its program on its OS (src/font_profile.rs). `None` (an
         /// older client, or one that never changed a font) = unchanged.
         #[serde(default)]
@@ -1823,6 +1828,14 @@ pub struct WorldSettingsMsg {
     pub has_slack_app_token: bool,
 }
 
+/// One interface's own Text Reveal (`UpdateGlobalSettings.text_reveal_profile`): its key
+/// and the `TextReveal` name it chose.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TextRevealProfile {
+    pub key: String,
+    pub value: String,
+}
+
 /// Global settings for WebSocket protocol
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GlobalSettingsMsg {
@@ -1951,6 +1964,16 @@ pub struct GlobalSettingsMsg {
     /// Empty = a server from before Import Picture.
     #[serde(default)]
     pub picture_host: String,
+    /// The console's own Text Reveal (`TextReveal` name: off, slow, normal, fast,
+    /// superfast; src/reveal.rs). Empty = a server from before the effect. Shown for
+    /// information only: every other interface has its own in `text_reveal_profiles`.
+    #[serde(default)]
+    pub text_reveal: String,
+    /// Each interface's own Text Reveal, by its key (`font_profile::native_key()`, app.js's
+    /// `fontProfileKey`, `REMOTE_CONSOLE_REVEAL_KEY`) - a key without one is Off. Missing
+    /// altogether from a server before the effect (serde leaves it empty).
+    #[serde(default)]
+    pub text_reveal_profiles: std::collections::BTreeMap<String, String>,
     /// Theme colors from ~/.clay/theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,

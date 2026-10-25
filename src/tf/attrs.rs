@@ -232,14 +232,16 @@ impl TfAttributes {
 }
 
 /// One piece of raw MUD text: an escape sequence (kept whole) or a visible character.
-enum Piece<'a> {
+/// Shared with the console's text-reveal effect (src/reveal.rs), which redraws a row's
+/// characters while copying its escapes through.
+pub(crate) enum Piece<'a> {
     Escape(&'a str),
     Char(char),
 }
 
 /// Split raw text into escape sequences and characters: CSI (`ESC [ ... final`), OSC
 /// (`ESC ] ... BEL` or `ESC \`), or any other two-character `ESC x`.
-fn pieces(raw: &str) -> Vec<Piece<'_>> {
+pub(crate) fn pieces(raw: &str) -> Vec<Piece<'_>> {
     let mut out = Vec::new();
     let mut iter = raw.char_indices().peekable();
     while let Some((start, c)) = iter.next() {
@@ -284,7 +286,7 @@ fn pieces(raw: &str) -> Vec<Piece<'_>> {
 
 /// What an SGR escape does to the color state it is applied to: None if `seq` is not an
 /// SGR at all, Some(true) if it resets everything first (`ESC[m`, `ESC[0m`, `ESC[0;...m`).
-fn sgr_resets(seq: &str) -> Option<bool> {
+pub(crate) fn sgr_resets(seq: &str) -> Option<bool> {
     let params = seq.strip_prefix("\x1b[")?.strip_suffix('m')?;
     Some(params.is_empty() || params == "0" || params.starts_with("0;"))
 }

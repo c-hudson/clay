@@ -31,6 +31,7 @@ pub mod keybindings;
 pub mod chords;
 pub mod input_handler;
 pub mod rendering;
+pub mod reveal;
 pub mod audio;
 pub mod platform;
 pub mod commands;
@@ -594,6 +595,87 @@ impl EditorSide {
         match name.to_lowercase().as_str() {
             "right" => EditorSide::Right,
             _ => EditorSide::Left,
+        }
+    }
+}
+
+/// A batch of lines more-mode let through, by seq, and when (`World::console_released`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReleasedRange {
+    pub(crate) first_seq: u64,
+    pub(crate) last_seq: u64,
+    pub(crate) at: SystemTime,
+}
+
+/// Text Reveal is kept per interface (user ruling 2026-10-25): the console's own is
+/// `Settings::text_reveal`; every other interface has its own in
+/// `Settings::text_reveal_profiles` under its font-profile key (`font_profile::native_key()`,
+/// app.js's `fontProfileKey`) or, for a console attached to another Clay, this one. A key
+/// without a value is Off.
+pub const REMOTE_CONSOLE_REVEAL_KEY: &str = "console-remote";
+
+/// Whether a client may own a Text Reveal under `key`.
+pub fn valid_text_reveal_key(key: &str) -> bool {
+    key == REMOTE_CONSOLE_REVEAL_KEY || font_profile::valid_key(key)
+}
+
+/// The text-reveal effect (src/reveal.rs): off, or how fast a newly arrived line is typed
+/// onto the screen. Console only, by user ruling (2026-10-24): it is not on
+/// the wire and the GUIs have no counterpart, like `editor_side`.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum TextReveal {
+    #[default]
+    Off,
+    Slow,
+    Normal,
+    Fast,
+    SuperFast,
+}
+
+impl TextReveal {
+    /// `(name, label)` for the Setup picker, in display order.
+    pub const OPTIONS: &'static [(&'static str, &'static str)] =
+        &[("off", "Off"), ("slow", "Slow"), ("normal", "Normal"), ("fast", "Fast"), ("superfast", "Super Fast")];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            TextReveal::Off => "off",
+            TextReveal::Slow => "slow",
+            TextReveal::Normal => "normal",
+            TextReveal::Fast => "fast",
+            TextReveal::SuperFast => "superfast",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "slow" => TextReveal::Slow,
+            "normal" => TextReveal::Normal,
+            "fast" => TextReveal::Fast,
+            "superfast" | "super-fast" | "super_fast" => TextReveal::SuperFast,
+            // Unrecognised (a hand-edited settings.dat) is off, never a guess.
+            _ => TextReveal::Off,
+        }
+    }
+
+    /// Characters revealed a second; 0 = off. Normal is tfr's 1200-baud default, each
+    /// step doubles (Super Fast: user request 2026-10-24).
+    pub fn chars_per_second(&self) -> f32 {
+        match self {
+            TextReveal::Off => 0.0,
+            TextReveal::Slow => 30.0,
+            TextReveal::Normal => 60.0,
+            TextReveal::Fast => 120.0,
+            TextReveal::SuperFast => 240.0,
+        }
+    }
+
+    /// The native GUI's speed: the same, except Super Fast, which is 200 there (user
+    /// ruling 2026-10-25: 240 was too fast in the GUI and right everywhere else).
+    pub fn native_chars_per_second(&self) -> f32 {
+        match self {
+            TextReveal::SuperFast => 200.0,
+            other => other.chars_per_second(),
         }
     }
 }
@@ -2019,6 +2101,10 @@ pub struct Settings {
     dictionary_path: String,
     // Editor side for split-screen editor (left or right)
     editor_side: EditorSide,
+    // The console's own text-reveal effect (src/reveal.rs); the other interfaces' are in
+    // text_reveal_profiles, by key (see REMOTE_CONSOLE_REVEAL_KEY)
+    text_reveal: TextReveal,
+    pub text_reveal_profiles: std::collections::BTreeMap<String, TextReveal>,
     // Mouse click support for console popups
     mouse_enabled: bool,
     // ZWJ emoji sequence handling (true = pass through, false = strip ZWJ + colored square)
@@ -2071,6 +2157,11 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// One interface's own Text Reveal, by its key; Off until it chose one.
+    pub fn text_reveal_for(&self, key: &str) -> TextReveal {
+        self.text_reveal_profiles.get(key).copied().unwrap_or_default()
+    }
+
     /// Clay's ▶ new-text markers are drawn: the setting is on, and no script has set TF's
     /// %textdiv, which takes their place (`App::apply_tf_textdiv`).
     pub(crate) fn nli_drawn(&self) -> bool {
@@ -2128,6 +2219,8 @@ impl Default for Settings {
             tls_proxy_enabled: false,
             dictionary_path: String::new(),
             editor_side: EditorSide::Left,
+            text_reveal: TextReveal::Off,
+            text_reveal_profiles: std::collections::BTreeMap::new(),
             mouse_enabled: true,
             zwj_enabled: false,
             new_line_indicator: false,
@@ -3966,6 +4059,16 @@ pub struct World {
     /// TF's %textdiv divider for this visit of the console's to this world, when a script
     /// has set %textdiv (`App::track_console_world`); dropped as the console leaves.
     pub(crate) console_textdiv: Option<ConsoleTextDiv>,
+    /// When the console last switched to this world (`App::track_console_world`): the
+    /// text-reveal effect (src/reveal.rs) types the screen that switch showed on from this
+    /// moment. None until a real switch - the first draw after a start or a reload is not
+    /// one. Runtime only, this console's.
+    pub(crate) console_shown_at: Option<SystemTime>,
+    /// When more-mode let lines through (`release_pending`, `release_all_pending`, a
+    /// `/flush`, more-mode switched off), by seq range: the text-reveal effect types a
+    /// released page on from then, not from its arrival (user ruling 2026-10-25). Entries
+    /// older than any reveal can last are dropped as new ones are added. Runtime only.
+    pub(crate) console_released: Vec<ReleasedRange>,
     pub paused: bool,
     pub search_active: bool,  // true while the F5 search popup is open for this world
     pub pending_lines: Vec<OutputLine>,
@@ -4327,6 +4430,8 @@ impl World {
             tls_cipher: None,
             console_seen_seq: None,
             console_textdiv: None,
+            console_shown_at: None,
+            console_released: Vec::new(),
             tf_noactivity: Vec::new(),
             paused: false,
             search_active: false,
@@ -5051,7 +5156,9 @@ impl World {
         if !settings.more_mode_enabled {
             self.paused = false;
             if !self.pending_lines.is_empty() {
+                let (first, last) = (self.pending_lines[0].seq, self.pending_lines[self.pending_lines.len() - 1].seq);
                 self.output_lines.append(&mut self.pending_lines);
+                self.note_console_release_seqs(first, last);
             }
         }
 
@@ -5452,6 +5559,7 @@ impl World {
         for line in &to_release {
             self.output_lines.push(line.clone());
         }
+        self.note_console_release(&to_release);
         if self.pending_lines.is_empty() {
             self.paused = false;
             self.pending_since = None;
@@ -5470,12 +5578,47 @@ impl World {
         to_release
     }
 
+    /// Lines more-mode just let through: the console's text-reveal effect types them on
+    /// from now (`console_released`, read by `console_reveal_anchor`).
+    pub(crate) fn note_console_release(&mut self, lines: &[OutputLine]) {
+        let seqs = lines.iter().map(|l| l.seq);
+        if let (Some(first), Some(last)) = (seqs.clone().min(), seqs.max()) {
+            self.note_console_release_seqs(first, last);
+        }
+    }
+
+    pub(crate) fn note_console_release_seqs(&mut self, first_seq: u64, last_seq: u64) {
+        let now = SystemTime::now();
+        // Older than any reveal can last: of no use to the renderer any more.
+        let stale = Duration::from_secs_f32(reveal::MAX_SECS + 1.0);
+        self.console_released.retain(|r| now.duration_since(r.at).is_ok_and(|age| age <= stale));
+        self.console_released.push(ReleasedRange { first_seq, last_seq, at: now });
+    }
+
+    /// When the console's text-reveal effect (src/reveal.rs) starts typing `line` on: its
+    /// arrival, the console's switch to this world (`console_shown_at`) or more-mode's
+    /// release of it (`console_released`), whichever came last. A line arriving after the
+    /// switch keeps its own moment.
+    pub(crate) fn console_reveal_anchor(&self, line: &OutputLine) -> SystemTime {
+        let mut at = line.timestamp;
+        if let Some(shown) = self.console_shown_at {
+            at = at.max(shown);
+        }
+        for released in &self.console_released {
+            if (released.first_seq..=released.last_seq).contains(&line.seq) {
+                at = at.max(released.at);
+            }
+        }
+        at
+    }
+
     /// Releases every pending line into `output_lines` and returns exactly the lines that
     /// were moved (in order) — see `release_pending`'s doc comment for why callers must
     /// broadcast from this return value rather than re-deriving their own copy.
     pub fn release_all_pending(&mut self) -> Vec<OutputLine> {
         let released: Vec<OutputLine> = std::mem::take(&mut self.pending_lines);
         self.output_lines.extend(released.iter().cloned());
+        self.note_console_release(&released);
         self.paused = false;
         self.lines_since_pause = 0;
         self.pending_since = None; // Clear pending timestamp
@@ -6288,6 +6431,8 @@ impl App {
             tabs: self.settings.tabs.name().to_string(),
             icon_bar: self.settings.icon_bar.name().to_string(),
             picture_host: self.settings.picture_host.name(),
+            text_reveal: self.settings.text_reveal.name().to_string(),
+            text_reveal_profiles: self.settings.text_reveal_profiles.iter().map(|(k, v)| (k.clone(), v.name().to_string())).collect(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             tf_bound_keys_json: self.tf_bound_keys_json(),
@@ -6390,6 +6535,11 @@ impl App {
         // Empty: a server from before Import Picture (which can't upload anyway).
         if !settings.picture_host.is_empty() {
             self.settings.picture_host = picture::PictureService::from_name(&settings.picture_host);
+        }
+        // This attached console's own Text Reveal, kept by the server under its key; a
+        // server with none for it (or from before the effect) leaves this console's as is.
+        if let Some(mine) = settings.text_reveal_profiles.get(REMOTE_CONSOLE_REVEAL_KEY) {
+            self.settings.text_reveal = TextReveal::from_name(mine);
         }
         let old_tts_mode = self.settings.tts_mode;
         self.settings.tts_mode = tts::TtsMode::from_name(&settings.tts_mode);
@@ -7354,6 +7504,7 @@ impl App {
             self.settings.icon_bar.name(),
             &self.settings.picture_host.name(),
             self.settings.clear_input_on_send,
+            self.settings.text_reveal.name(),
         );
         if self.is_master {
             add_import_button(&mut def);
@@ -8992,6 +9143,10 @@ impl App {
                     let has_new = world.output_lines.last().is_some_and(is_new) || world.pending_lines.iter().any(is_new);
                     (mode != TextDivMode::On || has_new).then_some(ConsoleTextDiv { after_seq, mode, forced: false })
                 });
+                // The text-reveal effect (src/reveal.rs) types the screen a switch shows on
+                // as if it had just arrived (user ruling 2026-10-24): a real switch only, so
+                // the first draw after a start or a reload leaves the screen as it was.
+                world.console_shown_at = Some(SystemTime::now());
             }
         }
         self.console_drawn_world = Some(now);
@@ -10929,6 +11084,7 @@ impl App {
         tabs: String,
         icon_bar: String,
         picture_host: Option<String>,
+        text_reveal_profile: Option<websocket::TextRevealProfile>,
         font_profile: Option<font_profile::FontProfileUpdate>,
     ) {
         self.settings.more_mode_enabled = more_mode_enabled;
@@ -11022,6 +11178,12 @@ impl App {
         self.settings.icon_bar = IconBarMode::from_name(&icon_bar);
         if let Some(picture_host) = picture_host {
             self.settings.picture_host = picture::PictureService::from_name(&picture_host);
+        }
+        // One interface's own Text Reveal; the console's is never set from a client.
+        if let Some(profile) = text_reveal_profile {
+            if valid_text_reveal_key(&profile.key) {
+                self.settings.text_reveal_profiles.insert(profile.key, TextReveal::from_name(&profile.value));
+            }
         }
         let tts_was = self.settings.tts_mode;
         self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
@@ -11294,6 +11456,7 @@ impl App {
             }
         }
         self.worlds[world_index].output_lines.extend(kept.iter().cloned());
+        self.worlds[world_index].note_console_release(&kept);
         // Route through the shared release broadcaster (see its doc comment) instead of the
         // old per-line loop, which forced `marked_new: false` for every line regardless of
         // its real flag and broadcast the line's original `seq` — a value that can be <=
@@ -17053,7 +17216,7 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, font_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -17063,7 +17226,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                     mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, font_profile,
+                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -18992,6 +19155,8 @@ pub(crate) struct SetupSettings {
     pub(crate) tabs: String,
     pub(crate) icon_bar: String,
     pub(crate) picture_host: String,
+    /// `TextReveal` by name (console only).
+    pub(crate) text_reveal: String,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -19154,7 +19319,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE, SETUP_FIELD_TTS_VOICE,
         SETUP_FIELD_SCROLLBACK, SETUP_FIELD_LOG_INPUT, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
-        SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR, SETUP_FIELD_PICTURE_HOST, SETUP_FIELD_CLEAR_INPUT,
+        SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR, SETUP_FIELD_PICTURE_HOST, SETUP_FIELD_CLEAR_INPUT, SETUP_FIELD_TEXT_REVEAL,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL, SETUP_BTN_IMPORT,
         update_setup_visibility,
     };
@@ -19559,6 +19724,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     tabs: state.get_selected(SETUP_FIELD_TABS).unwrap_or("none").to_string(),
                     icon_bar: state.get_selected(SETUP_FIELD_ICON_BAR).unwrap_or("app_tablet").to_string(),
                     picture_host: state.get_selected(SETUP_FIELD_PICTURE_HOST).unwrap_or("catbox").to_string(),
+                    text_reveal: state.get_selected(SETUP_FIELD_TEXT_REVEAL).unwrap_or("off").to_string(),
                 }
             };
 
@@ -23946,8 +24112,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Force ratatui to redraw everything by resizing (clears internal buffer cache)
     terminal.resize(terminal.size()?)?;
     terminal.draw(|f| ui(f, &mut app))?;
-    // Render output with crossterm (needed after reload when ratatui early-returns)
-    render_output_crossterm(&app);
+    // Render output with crossterm (needed after reload when ratatui early-returns).
+    // A line still revealing (after a reload: "Reload successful" itself) needs its
+    // next frame scheduled once the loop's timer exists below.
+    let mut startup_frame = render_output_crossterm(&app);
     app.needs_output_redraw = false;
     // Flush stdout to ensure everything is displayed
     std::io::Write::flush(&mut std::io::stdout())?;
@@ -23983,6 +24151,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Auto-reconnect timer — fires when a world is due for reconnection
     let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(reconnect_sleep);
+
+    // The text-reveal effect's next frame (src/reveal.rs) — armed only by a draw that
+    // found a line still revealing on screen (render_output_crossterm's return value), so
+    // it costs nothing while nothing animates.
+    let reveal_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(reveal_sleep);
     // Job 5 (T2.7): a hot reload restores `World::reconnect_at` from the state file,
     // but this timer always starts at FAR_FUTURE and is only ever re-armed by later
     // events (a disconnect, a web-triggered reconnect) or by firing once - nothing
@@ -24013,7 +24187,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     if app.needs_output_redraw {
         terminal.clear()?;
         terminal.draw(|f| ui(f, &mut app))?;
-        render_output_crossterm(&app);
+        startup_frame = render_output_crossterm(&app);
         app.needs_output_redraw = false;
         std::io::Write::flush(&mut std::io::stdout())?;
     }
@@ -24023,6 +24197,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Counter for debugging first few loop iterations
     let mut loop_count: u64 = 0;
 
+    // The start-up draws above could not arm the frame timer (it did not exist yet).
+    if let Some(next_frame) = startup_frame {
+        reveal_sleep.as_mut().reset(tokio::time::Instant::now() + next_frame);
+    }
     loop {
         loop_count += 1;
         // Log first 5 iterations to debug early crashes
@@ -24983,6 +25161,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
             }
 
+            // Text reveal: the next frame of a line being typed onto the screen. Both
+            // flags, or the ratatui pass runs and the output pass is skipped.
+            _ = &mut reveal_sleep => {
+                // Park it again first: an elapsed Sleep stays ready, so without this the
+                // arm would fire on every iteration. The draw below re-arms it for the
+                // next frame if a line is still revealing.
+                reveal_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                needs_draw = true;
+                app.needs_output_redraw = true;
+            }
+
             // TF repeat process tick — only fires when processes exist
             _ = &mut process_tick_sleep => {
                 needs_draw = true; // Process may produce output
@@ -25474,7 +25663,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Also redraw when popup visibility changes (including popup open/close)
             // When popup is visible, render_output_crossterm is a no-op (ratatui handles it)
             if app.needs_output_redraw || popup_visibility_changed {
-                render_output_crossterm(&app);
+                // A line still revealing on screen asks for its next frame; otherwise the
+                // timer stays parked (a reveal that scrolled off or finished re-arms nothing).
+                if let Some(next_frame) = render_output_crossterm(&app) {
+                    reveal_sleep.as_mut().reset(tokio::time::Instant::now() + next_frame);
+                }
                 app.needs_output_redraw = false;
                 // Mark current world as seen since its output was just displayed
                 let has_unseen = app.current_world().unseen_lines > 0;

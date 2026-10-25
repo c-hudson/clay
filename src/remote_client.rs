@@ -1330,6 +1330,9 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     let (offline_tx, mut offline_rx) = mpsc::unbounded_channel::<WsMessage>();
     // Set by an arm below when the connection has just gone.
     let mut connection_lost = false;
+    // The text-reveal effect's next frame (src/reveal.rs), set only by a draw that found a
+    // line still revealing on screen.
+    let mut reveal_due: Option<tokio::time::Instant> = None;
 
     loop {
         // /reload or /update on Windows: the new console starts once this loop is over.
@@ -1389,7 +1392,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 
             terminal.draw(|f| ui(f, &mut app))?;
             // Render output with crossterm (bypasses ratatui's buggy ANSI handling)
-            render_output_crossterm(&app);
+            reveal_due = render_output_crossterm(&app).map(|d| tokio::time::Instant::now() + d);
             needs_redraw = false;
             app.needs_output_redraw = false;
             // The output area as just laid out - not the terminal's height less a guess at
@@ -1789,6 +1792,12 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                     own_update_running = start_own_update(&mut app, &update_tx, force);
                     needs_redraw = true;
                 }
+            }
+            // Text reveal: the next frame of a line being typed onto the screen.
+            _ = tokio::time::sleep_until(reveal_due.unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86400))), if reveal_due.is_some() => {
+                reveal_due = None;
+                needs_redraw = true;
+                app.needs_output_redraw = true;
             }
             // Import Picture: resend after a lost ack, give up on no answer.
             _ = picture_tick.tick(), if app.picture_client.is_busy() => {
@@ -2227,6 +2236,9 @@ pub(crate) fn handle_remote_client_key(
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
+                // Applied here at once; the master keeps it under this console's own key
+                // (REMOTE_CONSOLE_REVEAL_KEY) in the UpdateGlobalSettings below.
+                app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
                 // Update mouse setting; if disabled, turn off capture immediately
                 app.settings.mouse_enabled = settings.mouse_enabled;
                 if !settings.mouse_enabled && app.mouse_capture_active {
@@ -2308,6 +2320,11 @@ pub(crate) fn handle_remote_client_key(
                     tabs: app.settings.tabs.name().to_string(),
                     icon_bar: app.settings.icon_bar.name().to_string(),
                     picture_host: Some(app.settings.picture_host.name()),
+                    // This console's own Text Reveal, kept by the server under its key.
+                    text_reveal_profile: Some(crate::websocket::TextRevealProfile {
+                        key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string(),
+                        value: app.settings.text_reveal.name().to_string(),
+                    }),
                     font_profile: None,
                 });
             }
@@ -3515,6 +3532,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         tabs: app.settings.tabs.name().to_string(),  // unchanged — this function only touches web settings
         icon_bar: app.settings.icon_bar.name().to_string(),  // unchanged — this function only touches web settings
         picture_host: None,
+        text_reveal_profile: None,
         font_profile: None,
     });
 }

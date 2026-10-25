@@ -703,6 +703,23 @@ fn this_guis_fonts_are_its_own_on_this_os_and_the_shared_ones_stay() {
     assert!(matches!(settings_update(&old), WsMessage::UpdateGlobalSettings { font_profile: None, web_font_size_desktop, .. } if web_font_size_desktop == 12.0));
 }
 
+/// This GUI's own Text Reveal round-trips through its Settings save under its key; the
+/// console's stays what it was, and a GUI that never chose one sends `None`, "unchanged".
+#[test]
+fn text_reveal_saves_from_the_native_settings_under_its_own_key() {
+    let key = crate::font_profile::native_key();
+    let mut app = crate::App::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let mut s = app.build_global_settings_msg();
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { text_reveal_profile: None, .. }));
+    s.text_reveal_profiles.insert(key.to_string(), "fast".to_string());
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { text_reveal_profile: Some(ref p), .. } if p.key == key && p.value == "fast"));
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.text_reveal_for(key), crate::TextReveal::Fast);
+    assert_eq!(app.settings.text_reveal, crate::TextReveal::Off, "the console's own is untouched");
+    assert_eq!(app.build_global_settings_msg().text_reveal_profiles.get(key).map(String::as_str), Some("fast"));
+}
+
 /// Clear Input on Send (TF's %cleardone) round-trips through this GUI's Settings save, as
 /// a value the server applies - never left out, which would mean "unchanged".
 #[test]

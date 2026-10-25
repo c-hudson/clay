@@ -6462,6 +6462,76 @@
         app
     }
 
+    /// More-mode's release stamps the released lines, so the text-reveal effect types them on
+    /// from then; an unreleased line keeps its arrival, and stale stamps are dropped.
+    #[test]
+    fn test_a_more_mode_release_anchors_the_reveal_at_the_release() {
+        let mut world = World::new("w");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for seq in 0..3u64 {
+            world.output_lines.push(OutputLine::new_with_timestamp(format!("shown {seq}"), old, seq));
+        }
+        for seq in 3..6u64 {
+            world.pending_lines.push(OutputLine::new_with_timestamp(format!("held {seq}"), old, seq));
+        }
+        world.paused = true;
+        world.console_released.push(ReleasedRange { first_seq: 100, last_seq: 100, at: old });
+        let before = std::time::SystemTime::now();
+        let released = world.release_all_pending();
+        assert_eq!(released.len(), 3);
+        assert_eq!(world.console_released.len(), 1, "the minute-old stamp is dropped, the new one kept");
+        assert_eq!((world.console_released[0].first_seq, world.console_released[0].last_seq), (3, 5));
+        assert!(world.console_reveal_anchor(&world.output_lines[4]) >= before, "a released line reveals from the release");
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[1]), old, "a line shown all along keeps its arrival");
+        // A switch to the world after the release wins over it.
+        let switched = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        world.console_shown_at = Some(switched);
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[4]), switched);
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[1]), switched);
+        // A line arriving after both keeps its own moment.
+        let fresh = OutputLine::new_with_timestamp("new".into(), switched + std::time::Duration::from_secs(1), 9);
+        assert_eq!(world.console_reveal_anchor(&fresh), fresh.timestamp);
+    }
+
+    /// Every Text Reveal name round-trips, an unknown one is Off, and each speed doubles.
+    #[test]
+    fn test_text_reveal_names_and_speeds() {
+        for (name, _) in TextReveal::OPTIONS {
+            assert_eq!(TextReveal::from_name(name).name(), *name);
+        }
+        assert_eq!(TextReveal::from_name("gibberish"), TextReveal::Off);
+        assert_eq!(TextReveal::from_name("Super_Fast"), TextReveal::SuperFast);
+        let speeds: Vec<f32> = TextReveal::OPTIONS.iter().map(|(n, _)| TextReveal::from_name(n).chars_per_second()).collect();
+        assert_eq!(speeds, [0.0, 30.0, 60.0, 120.0, 240.0]);
+        // The native GUI's Super Fast is slower (user ruling 2026-10-25); the rest match.
+        let native: Vec<f32> = TextReveal::OPTIONS.iter().map(|(n, _)| TextReveal::from_name(n).native_chars_per_second()).collect();
+        assert_eq!(native, [0.0, 30.0, 60.0, 120.0, 200.0]);
+    }
+
+    /// The text-reveal effect (src/reveal.rs) types the screen a world switch shows on:
+    /// a real switch stamps the world's `console_shown_at`; the first draw after a start or
+    /// a reload, and a redraw of the same world, do not.
+    #[test]
+    fn test_a_world_switch_stamps_the_console_shown_time_but_the_first_draw_does_not() {
+        let lines = |n: u64| -> Vec<OutputLine> { (0..n).map(|i| OutputLine::new(format!("line {}", i), i)).collect() };
+        let mut app = app_with_lines(lines(3), 10, 40, false, 0);
+        app.worlds.push(World::new("other"));
+        app.console_drawn_world = None;
+        app.track_console_world();
+        assert!(app.worlds[0].console_shown_at.is_none(), "the first draw is not a switch");
+        app.current_world_index = 1;
+        app.track_console_world();
+        assert!(app.worlds[1].console_shown_at.is_some(), "arriving at a world stamps it");
+        assert!(app.worlds[0].console_shown_at.is_none(), "leaving one does not");
+        app.current_world_index = 0;
+        let before = std::time::SystemTime::now();
+        app.track_console_world();
+        let shown = app.worlds[0].console_shown_at.expect("stamped on the switch back");
+        assert!(shown >= before);
+        app.track_console_world();
+        assert_eq!(app.worlds[0].console_shown_at, Some(shown), "a redraw of the same world leaves it");
+    }
+
     /// TF's %textdiv on the console: the divider row sits above the first line that
     /// arrived after the console last showed the world, counts as that line's row, and
     /// Page Up walks across it row-exactly. "always" puts it below the old text when
@@ -10128,8 +10198,62 @@ third
             String::new(), String::new(), ws_password.to_string(),
             false, String::new(), true, true, false,
             "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
-            "none".to_string(), "app_tablet".to_string(), None, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, None,
         );
+    }
+
+    /// Text Reveal is per interface: a client's save sets only its own key, an older
+    /// client's `None` leaves everything, an unknown key is refused, and the console's own
+    /// is never changed from a client; an attached console mirrors its own key back.
+    #[test]
+    fn test_update_global_settings_text_reveal_is_per_interface() {
+        let mut app = App::new();
+        assert_eq!(app.build_global_settings_msg().text_reveal, "off");
+        assert!(app.build_global_settings_msg().text_reveal_profiles.is_empty());
+        let profile = |key: &str, value: &str| Some(crate::websocket::TextRevealProfile { key: key.to_string(), value: value.to_string() });
+        app.update_global_settings(
+            0, true, true, true,
+            "unseen".to_string(), false, false, true,
+            "dark".to_string(), "dark".to_string(),
+            1.0, 0, 0, 500,
+            5, None, None, None, "monospace".to_string(), 14.0,
+            14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
+            String::new(), false, false, 9000, String::new(),
+            String::new(), String::new(), String::new(),
+            false, String::new(), true, true, false,
+            "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
+            "none".to_string(), "app_tablet".to_string(), None, profile("native-linux", "superfast"), None,
+        );
+        assert_eq!(app.settings.text_reveal_for("native-linux"), TextReveal::SuperFast);
+        assert_eq!(app.settings.text_reveal, TextReveal::Off, "the console's own is not a client's to set");
+        assert_eq!(app.build_global_settings_msg().text_reveal_profiles.get("native-linux").map(String::as_str), Some("superfast"));
+        call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "");
+        assert_eq!(app.settings.text_reveal_for("native-linux"), TextReveal::SuperFast, "an older client's save must not reset it");
+        app.update_global_settings(
+            0, true, true, true,
+            "unseen".to_string(), false, false, true,
+            "dark".to_string(), "dark".to_string(),
+            1.0, 0, 0, 500,
+            5, None, None, None, "monospace".to_string(), 14.0,
+            14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
+            String::new(), false, false, 9000, String::new(),
+            String::new(), String::new(), String::new(),
+            false, String::new(), true, true, false,
+            "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
+            "none".to_string(), "app_tablet".to_string(), None, profile("bogus", "fast"), None,
+        );
+        assert!(!app.settings.text_reveal_profiles.contains_key("bogus"), "an unknown key is refused");
+        assert_eq!(app.settings.text_reveal_for("app-android"), TextReveal::Off, "an interface that never chose is Off");
+        // The attached console keeps its own under REMOTE_CONSOLE_REVEAL_KEY: mirrored back
+        // when the server has it, left alone (an older server, or none yet) otherwise.
+        let mut remote = App::new();
+        remote.settings.text_reveal = TextReveal::Slow;
+        let mut msg = app.build_global_settings_msg();
+        remote.apply_global_settings(&msg);
+        assert_eq!(remote.settings.text_reveal, TextReveal::Slow, "nothing for it yet: unchanged");
+        msg.text_reveal_profiles.insert(REMOTE_CONSOLE_REVEAL_KEY.to_string(), "fast".to_string());
+        remote.apply_global_settings(&msg);
+        assert_eq!(remote.settings.text_reveal, TextReveal::Fast);
     }
 
     /// Clear Input on Send from a client that knows it is applied; a save from an older
@@ -20840,6 +20964,31 @@ fn the_remote_consoles_picture_goes_to_the_server_and_its_link_comes_back() {
 }
 
 /// The web settings' Picture Host choices are the ones every other interface lists.
+/// The web Settings' Text Reveal picker lists exactly `TextReveal::OPTIONS`, in order.
+#[test]
+fn the_web_text_reveal_options_are_text_reveal_options() {
+    let html = include_str!("web/index.html");
+    let start = html.find("id=\"setup-text-reveal-select\"").expect("the select");
+    let end = start + html[start..].find("</select>").unwrap();
+    let options: Vec<(String, String)> = html[start..end]
+        .split("<option value=\"")
+        .skip(1)
+        .map(|o| {
+            let (value, rest) = o.split_once("\">").unwrap();
+            (value.to_string(), rest.split("</option>").next().unwrap().to_string())
+        })
+        .collect();
+    let expected: Vec<(String, String)> =
+        TextReveal::OPTIONS.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect();
+    assert_eq!(options, expected);
+    // app.js knows every speed by the same name, and sends the setting back by name.
+    let js = include_str!("web/app.js");
+    for (name, _) in TextReveal::OPTIONS {
+        assert!(js.contains(&format!("{name}:")) || js.contains(&format!("{name} :")), "REVEAL_CPS lacks {name}");
+    }
+    assert!(js.contains("text_reveal_profile: textRevealSynced ? { key: fontProfileKey, value: textReveal } : null"));
+}
+
 #[test]
 fn the_web_picture_host_options_are_picture_service_options() {
     let html = include_str!("web/index.html");

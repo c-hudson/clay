@@ -144,6 +144,13 @@ pub struct ClayView {
     scroll: ScrollHandle,
     /// More-mode per world, by world name (more.rs): the console pages every world.
     more: HashMap<String, MoreMode>,
+    /// The text-reveal effect (src/reveal.rs) as the settings and theme have it; None = off.
+    reveal: Option<crate::reveal::Reveal>,
+    /// When each line was shown live (an arrival, or more-mode letting it through), and
+    /// when the view last switched to each world (by name): the later one starts the
+    /// line's reveal (`reveal_snapshot`; the console's `World::console_reveal_anchor`).
+    reveal_at: HashMap<u64, Instant>,
+    reveal_shown: HashMap<String, Instant>,
     keys: Keys,
     /// TF's numeric prefix (`%kbnum`), shown as [N] after the world name.
     kbnum: Option<i64>,
@@ -251,6 +258,9 @@ impl ClayView {
             style_epoch: 0,
             scroll: ScrollHandle::default(),
             more: HashMap::new(),
+            reveal: None,
+            reveal_at: HashMap::new(),
+            reveal_shown: HashMap::new(),
             keys: Keys::default(),
             kbnum: None,
             shell_esc_armed: None,
@@ -306,11 +316,14 @@ impl ClayView {
                     crate::websocket::WsMessage::PendingReleased { world_index, count } => {
                         // Released by any interface: that world counts afresh, and shows as
                         // many of its own.
+                        let mut released = Vec::new();
                         if let Some(name) = self.session.core.worlds.get(world_index).map(|w| w.name.clone()) {
                             let m = self.more.entry(name).or_default();
                             m.caught_up();
                             m.release(count);
+                            released = m.take_released();
                         }
+                        self.reveal_stamp(released);
                         changed = true;
                     }
                     ref m if self.surface_message(m, cx) => {}
@@ -463,6 +476,13 @@ impl ClayView {
                     m.left();
                 }
             }
+            // A real switch - not the first draw after a start or a reload - types the
+            // screen it shows on again (the console's World::console_shown_at).
+            if self.shown_world.is_some() {
+                if let Some(new) = self.session.core.current_world() {
+                    self.reveal_shown.insert(new.name.clone(), Instant::now());
+                }
+            }
             self.shown_world = current;
             // A switch stops the MUD's media; the server sends the new world's (app.js).
             if let Some(m) = self.media.as_mut() {
@@ -482,6 +502,7 @@ impl ClayView {
         // Every world's arrivals count for its own more-mode, on screen or not, as the
         // console pages every world; only the shown world's pause moves the view.
         let shown = self.session.core.current;
+        let mut arrived_all: Vec<u64> = Vec::new();
         for (i, world) in self.session.core.worlds.iter().enumerate() {
             let mut styler = Styler {
                 styled: &mut self.styled,
@@ -499,15 +520,58 @@ impl ClayView {
                 let styled = styler.line(line);
                 rows_in_columns(&styled.text, &styled.breaks, cols, indent)
             };
-            let paused_now = self.more.entry(world.name.clone()).or_default().arrivals(world, enabled, threshold, &mut rows);
+            let m = self.more.entry(world.name.clone()).or_default();
+            let paused_now = m.arrivals(world, enabled, threshold, &mut rows);
+            arrived_all.extend(m.take_arrived());
             if paused_now && i == shown {
                 self.scroll.borrow_mut().follow_bottom();
             }
         }
+        // Shown at once: the text-reveal effect types them on from now.
+        self.reveal_stamp(arrived_all);
         // Back at the bottom with nothing held: output flows again.
         if self.scroll.borrow().at_bottom() && self.pending_total() == 0 {
             self.more_mut().paused = false;
         }
+    }
+
+    /// Lines just shown live (arrivals, or lines more-mode let through): the text-reveal
+    /// effect types them on from now. Stamps older than any reveal can last are dropped
+    /// first, now and then.
+    pub(super) fn reveal_stamp(&mut self, ids: Vec<u64>) {
+        if self.reveal.is_none() || ids.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        if self.reveal_at.len() > 512 {
+            let stale = std::time::Duration::from_secs_f32(crate::reveal::MAX_SECS + 1.0);
+            self.reveal_at.retain(|_, at| now.saturating_duration_since(*at) <= stale);
+        }
+        for id in ids {
+            self.reveal_at.insert(id, now);
+        }
+    }
+
+    /// The text-reveal effect for this frame: its look, and when each shown line's reveal
+    /// started - its live arrival (`reveal_at`) or the switch to its world (`reveal_shown`),
+    /// whichever came last. None when it is off, or on a shell world.
+    fn reveal_snapshot(&self, lines: &[(u64, Arc<StyledLine>)], shell: bool) -> Option<output::RevealSnapshot> {
+        let reveal = self.reveal.filter(|_| !shell)?;
+        let now = Instant::now();
+        let fresh = |at: &Instant| now.saturating_duration_since(*at).as_secs_f32() <= crate::reveal::MAX_SECS + 1.0;
+        let shown = self.session.core.current_world().and_then(|w| self.reveal_shown.get(&w.name)).filter(|at| fresh(at)).copied();
+        let mut anchors = HashMap::new();
+        for (id, _) in lines {
+            let own = self.reveal_at.get(id).filter(|at| fresh(at)).copied();
+            let at = match (own, shown) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            if let Some(at) = at {
+                anchors.insert(*id, at);
+            }
+        }
+        Some(output::RevealSnapshot { reveal, anchors })
     }
 
     /// The shown world's more-mode state, if it has had any arrivals yet.
@@ -787,6 +851,11 @@ impl ClayView {
             self.palette = Palette::from_theme(&self.theme);
             restyle = true;
         }
+        // The text-reveal effect: the setting's speed (this GUI's own Super Fast), in the
+        // theme's colours.
+        let mine = s.text_reveal_profiles.get(crate::font_profile::native_key()).map_or("off", String::as_str);
+        let cps = crate::TextReveal::from_name(mine).native_chars_per_second();
+        self.reveal = (cps > 0.0).then(|| crate::reveal::Reveal::for_gui(cps, self.theme.is_light()));
         // This GUI's fonts on this OS: its own, or the shared ones (src/font_profile.rs).
         let font = s.font_for(crate::font_profile::native_key());
         if font.size_desktop > 0.0 {
@@ -1105,6 +1174,7 @@ impl Render for ClayView {
                     None => (self.visible_lines(), None),
                 };
                 let is_shell = shell_cursor.is_some() || self.session.core.current_world().is_some_and(|w| w.shell.is_some());
+                let reveal = self.reveal_snapshot(&lines, is_shell);
                 let snapshot = OutputSnapshot {
                     lines,
                     background: self.palette.bg,
@@ -1123,6 +1193,7 @@ impl Render for ClayView {
                     bar_thumb_hot: self.chrome.tokens.fg2,
                     bar_hot: self.select.bar_hot(),
                     shell_cursor,
+                    reveal,
                 };
                 let link = self.select.hover_link.is_some();
                 let bar = self.select.bar_hot();

@@ -338,6 +338,8 @@ impl ClayView {
     /// server's `PendingReleased` then released as many again here.
     pub(super) fn release_rows(&mut self, rows: usize, cx: &mut Context<Self>) {
         let used = self.more_mut().release_rows(rows);
+        let released = self.more_mut().take_released();
+        self.reveal_stamp(released);
         self.more_mut().caught_up();
         let left = rows.saturating_sub(used);
         let world = self.session.core.current;
@@ -355,6 +357,8 @@ impl ClayView {
 
     pub(super) fn release_all(&mut self, cx: &mut Context<Self>) {
         self.more_mut().release_all();
+        let released = self.more_mut().take_released();
+        self.reveal_stamp(released);
         let world = self.session.core.current;
         let fx = self.session.core.release_pending(world, 0);
         let rest = self.session.apply(fx);

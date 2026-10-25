@@ -40,6 +40,8 @@ pub const SETUP_FIELD_TTS_VOICE: FieldId = FieldId(27);
 pub const SETUP_FIELD_PICTURE_HOST: FieldId = FieldId(28);
 /// TF's `%cleardone` (`Settings::clear_input_on_send`).
 pub const SETUP_FIELD_CLEAR_INPUT: FieldId = FieldId(29);
+/// The console's text-reveal effect (`Settings::text_reveal`, src/reveal.rs).
+pub const SETUP_FIELD_TEXT_REVEAL: FieldId = FieldId(30);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -67,6 +69,11 @@ pub fn editor_side_options() -> Vec<SelectOption> {
         SelectOption::new("left", "Left"),
         SelectOption::new("right", "Right"),
     ]
+}
+
+/// Text reveal options (`TextReveal::OPTIONS`: off, or a speed).
+pub fn text_reveal_options() -> Vec<SelectOption> {
+    crate::TextReveal::OPTIONS.iter().map(|(name, label)| SelectOption::new(*name, *label)).collect()
 }
 
 /// TTS mode options (the one list every UI shows, `TtsMode::OPTIONS`)
@@ -133,10 +140,12 @@ pub fn create_setup_popup(
     icon_bar: &str,
     picture_host: &str,
     clear_input_on_send: bool,
+    text_reveal: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = crate::theme::BUILTIN_THEMES.iter().position(|(name, _)| *name == gui_theme).unwrap_or(0);
     let editor_side_idx = if editor_side == "right" { 1 } else { 0 };
+    let text_reveal_idx = crate::TextReveal::OPTIONS.iter().position(|(name, _)| *name == text_reveal).unwrap_or(0);
     let tts_mode_idx = crate::tts::TtsMode::OPTIONS.iter().position(|(v, _)| *v == tts_mode).unwrap_or(0);
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
     let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
@@ -218,6 +227,11 @@ pub fn create_setup_popup(
             SETUP_FIELD_NEW_LINE_INDICATOR,
             "New Indicator",
             FieldKind::toggle(new_line_indicator),
+        ))
+        .with_field(Field::new(
+            SETUP_FIELD_TEXT_REVEAL,
+            "Text Reveal",
+            FieldKind::select(text_reveal_options(), text_reveal_idx),
         ))
         .with_field(Field::new(
             SETUP_FIELD_KEYBOARD_VISIBLE,
@@ -380,6 +394,13 @@ fn setup_help_text() -> Vec<String> {
         "New Indicator: Show a marker on new lines arriving",
         "  while scrolled up in the output buffer.",
         "",
+        "Text Reveal: Type newly arrived lines, and the screen a",
+        "  world switch shows, onto the screen behind a glitching",
+        "  cursor (Slow 30, Normal 60, Fast 120, Super Fast 240",
+        "  characters a second; a wrapped line's rows together).",
+        "  Only how the console draws them: scrolling and paging",
+        "  are unchanged. Console only.",
+        "",
         "Keyboard Visible: Force the on-screen keyboard to stay",
         "  up on phone/tablet web and Android clients. Off lets",
         "  the OS decide. Always ignored (soft keyboard hidden)",
@@ -447,12 +468,13 @@ mod tests {
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
             false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
+            "off",
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 25);
+        assert_eq!(state.definition.fields.len(), 26);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -462,6 +484,7 @@ mod tests {
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
             false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
+            "off",
         );
         add_import_button(&mut def);
         let left: Vec<&str> = def.buttons.iter().filter(|b| b.left_align).map(|b| b.label.as_str()).collect();
@@ -477,6 +500,7 @@ mod tests {
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
             false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
+            "fast",
         );
         let state = PopupState::new(def);
 
@@ -498,5 +522,6 @@ mod tests {
         assert_eq!(state.get_selected(SETUP_FIELD_ICON_BAR), Some("all"));
         assert_eq!(state.get_selected(SETUP_FIELD_PICTURE_HOST), Some("sxcu+short"));
         assert_eq!(state.get_bool(SETUP_FIELD_CLEAR_INPUT), Some(true));
+        assert_eq!(state.get_selected(SETUP_FIELD_TEXT_REVEAL), Some("fast"));
     }
 }
