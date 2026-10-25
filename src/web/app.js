@@ -9364,13 +9364,19 @@
     // every punctuation mark; '-', '/' or '?' in a glitch would move a wrap for a frame).
     const REVEAL_GLYPHS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789#$%&*+=@^~!<>|';
     const REVEAL_CPS = { off: 0, slow: 30, normal: 60, fast: 120, superfast: 240 };
+    // The Android app's Super Fast is 200, as the native GUI's (TextReveal::native_chars_per_second;
+    // user ruling 2026-10-25: 240 was too fast on the phone and right in a browser and the WebView GUI).
+    const REVEAL_CPS_ANDROID_SUPERFAST = 200;
     let textReveal = 'off';        // this page's own TextReveal name (kept per interface key)
     let textRevealSynced = false;  // the server sent the per-interface map (one from before the effect sends none)
     let setupTextReveal = 'off';
     let revealSeedCounter = 1;
     // Set by lineHtml(): the delay to the line's next frame, null when it drew the line whole.
     let revealFrameNext = null;
-    function textRevealCps() { return REVEAL_CPS[textReveal] || 0; }
+    function textRevealCps() {
+        if (textReveal === 'superfast' && fontProfileKey === 'app-android') return REVEAL_CPS_ANDROID_SUPERFAST;
+        return REVEAL_CPS[textReveal] || 0;
+    }
 
     // reveal.rs `mix`/`unit`: the same small deterministic hash, on the low 32 bits.
     function revealMix(seed, frame, index) {

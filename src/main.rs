@@ -671,7 +671,9 @@ impl TextReveal {
     }
 
     /// The native GUI's speed: the same, except Super Fast, which is 200 there (user
-    /// ruling 2026-10-25: 240 was too fast in the GUI and right everywhere else).
+    /// ruling 2026-10-25: 240 was too fast in the GUI and right everywhere else). The
+    /// Android app's Super Fast is 200 as well (app.js `textRevealCps`, user ruling
+    /// 2026-10-25); a browser and the WebView GUI keep 240.
     pub fn native_chars_per_second(&self) -> f32 {
         match self {
             TextReveal::SuperFast => 200.0,

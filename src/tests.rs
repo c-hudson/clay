@@ -20986,6 +20986,12 @@ fn the_web_text_reveal_options_are_text_reveal_options() {
     for (name, _) in TextReveal::OPTIONS {
         assert!(js.contains(&format!("{name}:")) || js.contains(&format!("{name} :")), "REVEAL_CPS lacks {name}");
     }
+    // A browser and the WebView GUI run Super Fast at 240; the Android app alone at the
+    // native GUI's 200 (user ruling 2026-10-25).
+    assert!(js.contains("superfast: 240"));
+    assert!(js.contains("const REVEAL_CPS_ANDROID_SUPERFAST = 200;"));
+    assert!(js.contains("if (textReveal === 'superfast' && fontProfileKey === 'app-android') return REVEAL_CPS_ANDROID_SUPERFAST;"));
+    assert_eq!(TextReveal::SuperFast.native_chars_per_second(), 200.0);
     assert!(js.contains("text_reveal_profile: textRevealSynced ? { key: fontProfileKey, value: textReveal } : null"));
 }
 
