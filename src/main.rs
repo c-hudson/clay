@@ -19597,6 +19597,61 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     let is_recent_worlds = popup_id == Some(popup::PopupId("recent_worlds"));
     let is_import = popup_id == Some(popup::PopupId("import"));
 
+    // The Setup popup's settings, as Save gives them (also the Text Reveal prompt's OK when
+    // that Save asked for the number first).
+    fn setup_settings(state: &popup::PopupState) -> SetupSettings {
+        SetupSettings {
+            more_mode: state.get_bool(SETUP_FIELD_MORE_MODE).unwrap_or(true),
+            spell_check: state.get_bool(SETUP_FIELD_SPELL_CHECK).unwrap_or(true),
+            temp_convert: state.get_bool(SETUP_FIELD_TEMP_CONVERT).unwrap_or(false),
+            world_switching: state.get_selected(SETUP_FIELD_WORLD_SWITCHING)
+                .unwrap_or("unseen_first").to_string(),
+            debug: state.get_bool(SETUP_FIELD_DEBUG).unwrap_or(false),
+            input_height: state.get_number(SETUP_FIELD_INPUT_HEIGHT).unwrap_or(3),
+            gui_theme: state.get_selected(SETUP_FIELD_GUI_THEME)
+                .unwrap_or("dark").to_string(),
+            tls_proxy: state.get_bool(SETUP_FIELD_TLS_PROXY).unwrap_or(false),
+            dictionary_path: state.get_text(SETUP_FIELD_DICTIONARY)
+                .unwrap_or("").to_string(),
+            editor_side: state.get_selected(SETUP_FIELD_EDITOR_SIDE)
+                .unwrap_or("left").to_string(),
+            mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
+            zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
+            ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
+            new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
+            tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
+            tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
+            tts_voice: state.get_text(SETUP_FIELD_TTS_VOICE).unwrap_or(kokoro::DEFAULT_VOICE).to_string(),
+            scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
+            // Read regardless of the field's current visibility: if Archive
+            // Input/Output was just unchecked in this same edit (hiding Log
+            // Input), the field's last value should still round-trip rather than
+            // silently resetting to false.
+            log_input: state.get_bool(SETUP_FIELD_LOG_INPUT).unwrap_or(false),
+            clear_input_on_send: state.get_bool(SETUP_FIELD_CLEAR_INPUT).unwrap_or(false),
+            wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
+            keyboard_always_visible: state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE).unwrap_or(true),
+            tabs: state.get_selected(SETUP_FIELD_TABS).unwrap_or("none").to_string(),
+            icon_bar: state.get_selected(SETUP_FIELD_ICON_BAR).unwrap_or("app_tablet").to_string(),
+            picture_host: state.get_selected(SETUP_FIELD_PICTURE_HOST).unwrap_or("catbox").to_string(),
+            text_reveal: state.get_selected(SETUP_FIELD_TEXT_REVEAL).unwrap_or("off").to_string(),
+        }
+    }
+
+    // Save the Setup popup (the current one), unless its Text Reveal rests on Custom or New
+    // Only without the number: that is asked for first, and the prompt's OK saves.
+    fn save_setup(app: &mut App) -> NewPopupAction {
+        let Some(state) = app.popup_manager.current_mut() else { return NewPopupAction::None };
+        if popup::definitions::setup::text_reveal_needs_number(state) {
+            let current = state.get_selected(SETUP_FIELD_TEXT_REVEAL).unwrap_or("off").to_string();
+            popup::definitions::reveal_speed::open_reveal_speed_prompt(&mut app.popup_manager, &current, true);
+            return NewPopupAction::None;
+        }
+        let settings = setup_settings(state);
+        app.popup_manager.close();
+        NewPopupAction::SetupSaved(settings)
+    }
+
     if let Some(state) = app.popup_manager.current_mut() {
         // World selector has special handling
         if is_world_selector {
@@ -19870,47 +19925,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
 
         // Setup popup handling
         if is_setup {
-            // Text Reveal's value before this key: a change onto Custom asks for the number.
-            let reveal_before = state.get_selected(SETUP_FIELD_TEXT_REVEAL).map(str::to_string);
-            // Helper to extract settings before closing
-            let extract_settings = || -> SetupSettings {
-                SetupSettings {
-                    more_mode: state.get_bool(SETUP_FIELD_MORE_MODE).unwrap_or(true),
-                    spell_check: state.get_bool(SETUP_FIELD_SPELL_CHECK).unwrap_or(true),
-                    temp_convert: state.get_bool(SETUP_FIELD_TEMP_CONVERT).unwrap_or(false),
-                    world_switching: state.get_selected(SETUP_FIELD_WORLD_SWITCHING)
-                        .unwrap_or("unseen_first").to_string(),
-                    debug: state.get_bool(SETUP_FIELD_DEBUG).unwrap_or(false),
-                    input_height: state.get_number(SETUP_FIELD_INPUT_HEIGHT).unwrap_or(3),
-                    gui_theme: state.get_selected(SETUP_FIELD_GUI_THEME)
-                        .unwrap_or("dark").to_string(),
-                    tls_proxy: state.get_bool(SETUP_FIELD_TLS_PROXY).unwrap_or(false),
-                    dictionary_path: state.get_text(SETUP_FIELD_DICTIONARY)
-                        .unwrap_or("").to_string(),
-                    editor_side: state.get_selected(SETUP_FIELD_EDITOR_SIDE)
-                        .unwrap_or("left").to_string(),
-                    mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
-                    zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
-                    ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
-                    new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
-                    tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
-                    tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
-                    tts_voice: state.get_text(SETUP_FIELD_TTS_VOICE).unwrap_or(kokoro::DEFAULT_VOICE).to_string(),
-                    scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
-                    // Read regardless of the field's current visibility: if Archive
-                    // Input/Output was just unchecked in this same edit (hiding Log
-                    // Input), the field's last value should still round-trip rather than
-                    // silently resetting to false.
-                    log_input: state.get_bool(SETUP_FIELD_LOG_INPUT).unwrap_or(false),
-                    clear_input_on_send: state.get_bool(SETUP_FIELD_CLEAR_INPUT).unwrap_or(false),
-                    wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
-                    keyboard_always_visible: state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE).unwrap_or(true),
-                    tabs: state.get_selected(SETUP_FIELD_TABS).unwrap_or("none").to_string(),
-                    icon_bar: state.get_selected(SETUP_FIELD_ICON_BAR).unwrap_or("app_tablet").to_string(),
-                    picture_host: state.get_selected(SETUP_FIELD_PICTURE_HOST).unwrap_or("catbox").to_string(),
-                    text_reveal: state.get_selected(SETUP_FIELD_TEXT_REVEAL).unwrap_or("off").to_string(),
-                }
-            };
 
             // Check if current field is a text field
             let is_text_field = state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false);
@@ -19928,15 +19942,21 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         state.commit_edit();
                     } else if state.is_on_button() {
                         if state.is_button_focused(SETUP_BTN_SAVE) {
-                            let settings = extract_settings();
-                            app.popup_manager.close();
-                            return NewPopupAction::SetupSaved(settings);
+                            return save_setup(app);
                         } else if state.is_button_focused(SETUP_BTN_CANCEL) {
                             app.popup_manager.close();
                         } else if state.is_button_focused(SETUP_BTN_IMPORT) {
                             app.popup_manager.close();
                             return NewPopupAction::Command("/import".to_string());
                         }
+                    } else if state.selected == popup::ElementSelection::Field(SETUP_FIELD_TEXT_REVEAL)
+                        && popup::definitions::setup::text_reveal_speed_picked(state).is_some()
+                    {
+                        // Enter on Text Reveal's Custom or New Only asks for its number (prefilled
+                        // when it has one), where Enter on any other entry cycles; nothing else
+                        // asks, so both can be passed and the field left (user ruling 2026-10-26).
+                        let current = state.get_selected(SETUP_FIELD_TEXT_REVEAL).unwrap_or("off").to_string();
+                        popup::definitions::reveal_speed::open_reveal_speed_prompt(&mut app.popup_manager, &current, false);
                     } else {
                         // Toggle current field or start editing text field
                         if is_text_field {
@@ -19952,9 +19972,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         state.insert_char(' ');
                     } else if state.is_on_button() {
                         if state.is_button_focused(SETUP_BTN_SAVE) {
-                            let settings = extract_settings();
-                            app.popup_manager.close();
-                            return NewPopupAction::SetupSaved(settings);
+                            return save_setup(app);
                         } else if state.is_button_focused(SETUP_BTN_CANCEL) {
                             app.popup_manager.close();
                         } else if state.is_button_focused(SETUP_BTN_IMPORT) {
@@ -20036,9 +20054,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
                         // Not editing: bare letters are button hotkeys only.
                         if btn_id == SETUP_BTN_SAVE {
-                            let settings = extract_settings();
-                            app.popup_manager.close();
-                            return NewPopupAction::SetupSaved(settings);
+                            return save_setup(app);
                         } else if btn_id == SETUP_BTN_CANCEL {
                             app.popup_manager.close();
                         } else if btn_id == SETUP_BTN_IMPORT {
@@ -20049,23 +20065,14 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 }
                 _ => {}
             }
-            // Cycled onto Text Reveal's Custom or New Only entry (reveal_speed.rs): ask for
-            // the number. The popup is looked up afresh: Esc and Cancel above closed it.
-            let custom_picked = app.popup_manager.current().is_some_and(|s| {
-                s.definition.id == popup::PopupId("setup")
-                    && s.get_selected(SETUP_FIELD_TEXT_REVEAL).map(str::to_string) != reveal_before
-                    && popup::definitions::setup::text_reveal_speed_picked(s).is_some()
-            });
-            if custom_picked {
-                popup::definitions::reveal_speed::open_reveal_speed_prompt(&mut app.popup_manager, reveal_before.as_deref().unwrap_or("off"));
-            }
             return NewPopupAction::None;
         }
 
         // The Custom / New Only Text Reveal Speed prompt over /setup (reveal_speed.rs): OK
-        // puts the number on the Setup select, Cancel and Esc put the entry before back.
+        // puts the number on the Setup select (and saves, when a Save asked), Cancel and Esc
+        // put back the value it was opened on.
         if is_reveal_speed {
-            use popup::definitions::reveal_speed::{REVEAL_SPEED_BTN_CANCEL, REVEAL_SPEED_BTN_OK, REVEAL_SPEED_PREVIOUS, typed_value};
+            use popup::definitions::reveal_speed::{REVEAL_SPEED_BTN_CANCEL, REVEAL_SPEED_BTN_OK, REVEAL_SPEED_PREVIOUS, REVEAL_SPEED_THEN_SAVE, typed_value};
             use popup::definitions::setup::set_text_reveal_value;
             enum SpeedAction { Ok, Cancel, None }
             let on_button = |state: &popup::PopupState| {
@@ -20115,9 +20122,13 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             match action {
                 SpeedAction::Ok => match typed_value(state) {
                     Ok(value) => {
+                        let then_save = state.definition.custom_data.contains_key(REVEAL_SPEED_THEN_SAVE);
                         app.popup_manager.close();
                         if let Some(setup) = app.popup_manager.current_mut() {
                             set_text_reveal_value(setup, &value.name());
+                        }
+                        if then_save {
+                            return save_setup(app);
                         }
                     }
                     Err(problem) => {

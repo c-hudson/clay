@@ -6560,67 +6560,97 @@
         assert_eq!(TextReveal::with_speed(TextReveal::CUSTOM, 7), TextReveal::Custom(7));
     }
 
-    /// /setup's Text Reveal: cycling onto Custom opens the speed prompt over the popup;
-    /// Enter with a number puts `custom:<n>` on the select (relabelled), a bad number
-    /// complains and stays, and Esc puts the entry selected before back.
+    /// /setup's Text Reveal: only Enter on Custom or New Only asks for its number (user
+    /// rulings 2026-10-26: cycling onto Custom asked at once, which put New Only out of
+    /// reach, and Down must move to the next field rather than ask). Enter with a number puts
+    /// `custom:<n>` / `new:<n>` on the select (relabelled), a bad number complains and stays,
+    /// Esc leaves the select as it was, and a Save on an entry without its number asks first
+    /// and saves on OK.
     #[test]
-    fn test_setup_text_reveal_custom_asks_for_the_number() {
+    fn test_setup_text_reveal_asks_for_the_number_on_enter() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use popup::definitions::reveal_speed::REVEAL_SPEED_FIELD_CPS;
         use popup::definitions::setup::{create_setup_popup_for_test, SETUP_FIELD_TEXT_REVEAL};
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let selected = |app: &App| app.popup_manager.current().unwrap().get_selected(SETUP_FIELD_TEXT_REVEAL).map(str::to_string);
         let popup = |app: &App| app.popup_manager.current().unwrap().definition.id.clone();
+        let on_field = |app: &App| app.popup_manager.current().unwrap().selected == popup::ElementSelection::Field(SETUP_FIELD_TEXT_REVEAL);
         let mut app = App::new();
         app.popup_manager.open(create_setup_popup_for_test("superfast"));
         app.popup_manager.current_mut().unwrap().select_field(SETUP_FIELD_TEXT_REVEAL);
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right)); // Super Fast -> Custom
+        // Cycling past both entries asks nothing.
+        for (code, value) in [(KeyCode::Right, "custom"), (KeyCode::Right, "new"), (KeyCode::Char(' '), "off"), (KeyCode::Left, "new")] {
+            let _ = handle_new_popup_key(&mut app, key(code));
+            assert_eq!((popup(&app), selected(&app).as_deref()), (popup::PopupId("setup"), Some(value)), "{code:?}");
+        }
+        // Down and Up move off the field and back on it, asking nothing.
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Up, KeyCode::Down, KeyCode::Tab] {
+            let _ = handle_new_popup_key(&mut app, key(code));
+            assert_eq!(popup(&app), popup::PopupId("setup"), "{code:?}");
+        }
+        assert!(!on_field(&app));
+        assert_eq!(selected(&app).as_deref(), Some("new"));
+        // Enter on New Only asks, typing straight into the number.
+        app.popup_manager.current_mut().unwrap().select_field(SETUP_FIELD_TEXT_REVEAL);
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
         assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
+        assert_eq!(app.popup_manager.current().unwrap().definition.title, "New Only Text Reveal Speed");
         assert!(app.popup_manager.current().unwrap().editing, "typing goes straight into the number");
-        for c in "150".chars() {
+        assert_eq!(app.popup_manager.current().unwrap().get_text(REVEAL_SPEED_FIELD_CPS), Some(""));
+        for c in "40".chars() {
             let _ = handle_new_popup_key(&mut app, key(KeyCode::Char(c)));
         }
         let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
-        assert_eq!(popup(&app), popup::PopupId("setup"));
-        assert_eq!(selected(&app).as_deref(), Some("custom:150"));
-        // Away and back: the prompt again, prefilled; a bad number complains and stays.
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Left)); // Custom (150) -> Super Fast
-        assert_eq!(selected(&app).as_deref(), Some("superfast"));
-        assert_eq!(popup(&app), popup::PopupId("setup"));
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right)); // Super Fast -> Custom (150)
+        assert_eq!((popup(&app), selected(&app).as_deref()), (popup::PopupId("setup"), Some("new:40")));
+        assert!(on_field(&app));
+        // Enter on New Only (40) again: prefilled, to change it; a bad number complains and
+        // stays; Esc leaves the select as it was.
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
         assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
-        assert_eq!(app.popup_manager.current().unwrap().get_text(REVEAL_SPEED_FIELD_CPS), Some("150"));
-        for _ in 0..3 {
+        assert_eq!(app.popup_manager.current().unwrap().get_text(REVEAL_SPEED_FIELD_CPS), Some("40"));
+        for _ in 0..2 {
             let _ = handle_new_popup_key(&mut app, key(KeyCode::Backspace));
         }
         let _ = handle_new_popup_key(&mut app, key(KeyCode::Char('0')));
         let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
         assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
         assert_eq!(app.popup_manager.current().unwrap().error.as_deref(), Some(TextReveal::CUSTOM_PROBLEM));
-        // Esc: the entry before (Super Fast), the kept number still on the Custom entry.
         let _ = handle_new_popup_key(&mut app, key(KeyCode::Esc));
-        assert_eq!(popup(&app), popup::PopupId("setup"));
-        assert_eq!(selected(&app).as_deref(), Some("superfast"));
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right));
-        assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
+        assert_eq!((popup(&app), selected(&app).as_deref()), (popup::PopupId("setup"), Some("new:40")));
+        // Enter on a preset still cycles it; on Custom it asks, under Custom's title.
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Left)); // New Only (40) -> Custom
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Left)); // -> Super Fast
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!((popup(&app), selected(&app).as_deref()), (popup::PopupId("setup"), Some("custom")));
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.popup_manager.current().unwrap().definition.title, "Custom Text Reveal Speed");
         let _ = handle_new_popup_key(&mut app, key(KeyCode::Esc));
-        assert_eq!(selected(&app).as_deref(), Some("superfast"));
-        // The saved setting is the value by name.
-        app.popup_manager.current_mut().unwrap().select_field(SETUP_FIELD_TEXT_REVEAL);
-        popup::definitions::setup::set_text_reveal_value(app.popup_manager.current_mut().unwrap(), "custom:150");
-        assert_eq!(TextReveal::from_name(&selected(&app).unwrap()), TextReveal::Custom(150));
-        // New Only, the next entry, asks the same way under its own title and makes new:<n>.
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right)); // Custom (150) -> New Only
-        assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
-        assert_eq!(app.popup_manager.current().unwrap().definition.title, "New Only Text Reveal Speed");
-        assert_eq!(app.popup_manager.current().unwrap().get_text(REVEAL_SPEED_FIELD_CPS), Some(""));
-        for c in "40".chars() {
+        assert_eq!((popup(&app), selected(&app).as_deref()), (popup::PopupId("setup"), Some("custom")));
+        // Save on Custom without its number asks first; Esc there is not a Save.
+        assert!(matches!(handle_new_popup_key(&mut app, key(KeyCode::Char('s'))), NewPopupAction::None));
+        assert_eq!(app.popup_manager.current().unwrap().definition.title, "Custom Text Reveal Speed");
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Esc));
+        assert_eq!((popup(&app), selected(&app).as_deref()), (popup::PopupId("setup"), Some("custom")));
+        // Asked again, its OK saves custom:<n>.
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Char('s')));
+        for c in "150".chars() {
             let _ = handle_new_popup_key(&mut app, key(KeyCode::Char(c)));
         }
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
-        assert_eq!(popup(&app), popup::PopupId("setup"));
-        assert_eq!(selected(&app).as_deref(), Some("new:40"));
-        assert_eq!(TextReveal::from_name(&selected(&app).unwrap()), TextReveal::NewOnly(40));
+        match handle_new_popup_key(&mut app, key(KeyCode::Enter)) {
+            NewPopupAction::SetupSaved(settings) => {
+                assert_eq!(settings.text_reveal, "custom:150");
+                assert_eq!(TextReveal::from_name(&settings.text_reveal), TextReveal::Custom(150));
+            }
+            _ => panic!("OK on a prompt that Save asked for saves"),
+        }
+        assert!(app.popup_manager.current().is_none(), "both popups are closed");
+        // A Save on an entry that has its number saves at once.
+        app.popup_manager.open(create_setup_popup_for_test("new:40"));
+        app.popup_manager.current_mut().unwrap().select_field(SETUP_FIELD_TEXT_REVEAL);
+        match handle_new_popup_key(&mut app, key(KeyCode::Char('s'))) {
+            NewPopupAction::SetupSaved(settings) => assert_eq!(settings.text_reveal, "new:40"),
+            _ => panic!("New Only (40) saves as it is"),
+        }
     }
 
     /// The text-reveal effect (src/reveal.rs) types the screen a world switch shows on:
@@ -21212,7 +21242,11 @@ fn the_web_text_reveal_options_are_text_reveal_options() {
         assert_eq!(TextReveal::speed_title(entry), format!("{label} Text Reveal Speed"), "the web's title is built the same way");
     }
     assert!(js.contains("const REVEAL_CUSTOM_PROBLEM = 'Enter a whole number from 1 to 10000';"));
-    assert!(js.contains("if (revealSpeedEntry(this.value)) showRevealSpeedDialog(this, setupTextReveal, revealSpeedEntry(this.value));"));
+    // A pick asks at once; a step by key never does - Enter or Save does (the console's
+    // setup.rs `text_reveal_needs_number`), so Custom and New Only can be passed and left.
+    assert!(js.contains("else if (!stepped) showRevealSpeedDialog(this, setupTextReveal, entry);"));
+    assert!(js.contains("if (entry && !revealSpeedDialogOpen) showRevealSpeedDialog(select, setupTextReveal, entry);"));
+    assert!(js.contains("showRevealSpeedDialog(revealSelect, setupTextReveal, revealEntry, saveSettingsAll);"));
     assert!(js.contains("setupTextReveal = entry + ':' + cps;"));
     assert!(js.contains("<div class=\"js-dialog-title\">${REVEAL_SPEED_ENTRIES[entry]} Text Reveal Speed</div>"));
     // New Only: a switch counts only for a line newer than the world's seen mark.

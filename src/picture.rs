@@ -104,13 +104,13 @@ impl PictureService {
     /// `/setup`, the native GUI and (by a test) index.html's `<select>` all list these.
     pub const OPTIONS: &'static [(&'static str, &'static str)] = &[
         ("catbox", "catbox.moe"),
-        ("catbox+short", "catbox.moe + URL shortening"),
+        ("catbox+short", "catbox.moe + URL Short"),
         ("sxcu", "sxcu.net"),
-        ("sxcu+short", "sxcu.net + URL shortening"),
+        ("sxcu+short", "sxcu.net + URL Short"),
         ("x0", "x0.at"),
-        ("x0+short", "x0.at + URL shortening"),
-        ("tmpfiles", "tmpfiles.org (2 days)"),
-        ("tmpfiles+short", "tmpfiles.org (2 days) + URL shortening"),
+        ("x0+short", "x0.at + URL Short"),
+        ("tmpfiles", "tmpfiles.org (2d)"),
+        ("tmpfiles+short", "tmpfiles.org (2d) + URL Short"),
         ("off", "Off"),
     ];
 

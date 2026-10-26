@@ -242,10 +242,6 @@ pub(crate) fn handle_popup_mouse_click(app: &mut App, column: u16, row: u16) -> 
                     popup::ElementSelection::Field(field_id) => {
                         let field_id = *field_id;
                         let (rel_col, rel_row) = ((column - rect.x) as usize, (row - rect.y) as usize);
-                        // /setup's Text Reveal before this click: cycling onto Custom asks
-                        // for the number (reveal_speed.rs), as the keys do.
-                        let is_setup = state.definition.id == popup::PopupId("setup");
-                        let reveal_before = state.get_selected(popup::definitions::setup::SETUP_FIELD_TEXT_REVEAL).map(str::to_string);
                         // If currently editing a different field, commit the edit first
                         if state.editing {
                             if let popup::ElementSelection::Field(current_id) = &state.selected {
@@ -297,12 +293,6 @@ pub(crate) fn handle_popup_mouse_click(app: &mut App, column: u16, row: u16) -> 
                                     }
                                 }
                                 _ => {}
-                            }
-                        }
-                        if is_setup && field_id == popup::definitions::setup::SETUP_FIELD_TEXT_REVEAL {
-                            let reveal_after = state.get_selected(field_id).map(str::to_string);
-                            if reveal_after != reveal_before && popup::definitions::setup::text_reveal_speed_picked(state).is_some() {
-                                popup::definitions::reveal_speed::open_reveal_speed_prompt(&mut app.popup_manager, reveal_before.as_deref().unwrap_or("off"));
                             }
                         }
                         return false;

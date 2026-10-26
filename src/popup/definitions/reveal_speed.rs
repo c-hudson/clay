@@ -1,9 +1,11 @@
 //! Custom Text Reveal Speed: the number the Setup popup's Text Reveal "Custom" entry asks
 //! for (user request 2026-10-25: "a custom option ... the user will be prompted with a pop
 //! up to type in the value"), and New Only's the same way (2026-10-26). Pushed over /setup
-//! when either entry is picked; OK puts `custom:<n>` / `new:<n>` on the Setup select
-//! (relabelled "Custom (n)" / "New Only (n)"), Cancel and Esc put back the entry that was
-//! selected before. The web client (app.js `showRevealSpeedDialog`) and the native GUI
+//! by Enter on either entry of its Text Reveal, or by a Save while one has no number yet -
+//! cycling past them, and moving off the field, never asks (`setup::text_reveal_needs_number`);
+//! OK puts `custom:<n>` / `new:<n>` on the Setup select (relabelled "Custom (n)" /
+//! "New Only (n)") and finishes a Save that asked, Cancel and Esc leave the select as it was.
+//! The web client (app.js `showRevealSpeedDialog`) and the native GUI
 //! (`dialogs::small::RevealSpeed`) ask the same way.
 
 use crate::popup::{Button, ButtonId, Field, FieldId, FieldKind, PopupDefinition, PopupId, PopupLayout, PopupManager, PopupState};
@@ -18,6 +20,8 @@ pub const REVEAL_SPEED_BTN_CANCEL: ButtonId = ButtonId(11);
 pub const REVEAL_SPEED_PREVIOUS: &str = "reveal_speed_previous";
 /// custom_data: the entry that asked (`TextReveal::CUSTOM` or `NEW_ONLY`), what OK makes.
 pub const REVEAL_SPEED_ENTRY: &str = "reveal_speed_entry";
+/// custom_data: Save asked for the number, so OK saves the Setup popup too.
+pub const REVEAL_SPEED_THEN_SAVE: &str = "reveal_speed_then_save";
 
 /// The prompt for `entry`, prefilled with its current speed when there is one.
 pub fn create_reveal_speed_popup(entry: &str, current: Option<u32>, previous: &str) -> PopupDefinition {
@@ -49,12 +53,16 @@ pub fn create_reveal_speed_popup(entry: &str, current: Option<u32>, previous: &s
 
 /// Push the prompt over the Setup popup (which is the current one) for the entry its
 /// select is on, typing straight into its field: prefilled with that entry's speed,
-/// remembering `previous` for Cancel.
-pub fn open_reveal_speed_prompt(popups: &mut PopupManager, previous: &str) {
+/// remembering `previous` for Cancel, and whether a Save asked (`then_save`).
+pub fn open_reveal_speed_prompt(popups: &mut PopupManager, previous: &str, then_save: bool) {
     let picked = popups.current().and_then(|s| s.get_selected(super::setup::SETUP_FIELD_TEXT_REVEAL)).map(str::to_string);
     let Some(entry) = picked.as_deref().and_then(crate::TextReveal::speed_entry) else { return };
     let current = picked.as_deref().and_then(|v| crate::TextReveal::from_name(v).typed_cps());
-    popups.push(create_reveal_speed_popup(entry, current, previous));
+    let mut def = create_reveal_speed_popup(entry, current, previous);
+    if then_save {
+        def.custom_data.insert(REVEAL_SPEED_THEN_SAVE.to_string(), "1".to_string());
+    }
+    popups.push(def);
     if let Some(state) = popups.current_mut() {
         state.start_edit();
     }
@@ -105,7 +113,7 @@ mod tests {
     fn the_prompt_opens_over_setup_prefilled_from_its_select() {
         let mut popups = PopupManager::new();
         popups.open(super::super::setup::create_setup_popup_for_test("custom:75"));
-        open_reveal_speed_prompt(&mut popups, "normal");
+        open_reveal_speed_prompt(&mut popups, "normal", false);
         let state = popups.current().unwrap();
         assert_eq!(state.definition.id, PopupId("reveal_speed"));
         assert!(state.editing);
@@ -116,14 +124,14 @@ mod tests {
         // On New Only, the New Only prompt, prefilled from its value.
         let mut popups = PopupManager::new();
         popups.open(super::super::setup::create_setup_popup_for_test("new:30"));
-        open_reveal_speed_prompt(&mut popups, "fast");
+        open_reveal_speed_prompt(&mut popups, "fast", false);
         let state = popups.current().unwrap();
         assert_eq!(state.definition.title, "New Only Text Reveal Speed");
         assert_eq!(state.get_text(REVEAL_SPEED_FIELD_CPS), Some("30"));
         // On a preset, no prompt.
         let mut popups = PopupManager::new();
         popups.open(super::super::setup::create_setup_popup_for_test("fast"));
-        open_reveal_speed_prompt(&mut popups, "off");
+        open_reveal_speed_prompt(&mut popups, "off", false);
         assert_eq!(popups.current().unwrap().definition.id, PopupId("setup"));
     }
 }

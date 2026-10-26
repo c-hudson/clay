@@ -74,7 +74,8 @@ pub fn editor_side_options() -> Vec<SelectOption> {
 /// Text reveal options (`TextReveal::OPTIONS`): off, the preset speeds, Custom and New
 /// Only. When `current` has a typed speed, its entry IS that value (`custom:<n>` labelled
 /// "Custom (n)", `new:<n>` labelled "New Only (n)"); otherwise each is the bare entry that
-/// asks for a number when picked (`text_reveal_speed_picked`, the reveal_speed popup). The
+/// asks for a number when Enter is pressed on it, or Save (`text_reveal_needs_number`, the
+/// reveal_speed popup). The
 /// native GUI's pick is built from this too, so the two lists never differ.
 pub fn text_reveal_options(current: &str) -> Vec<SelectOption> {
     let current = crate::TextReveal::from_name(current);
@@ -99,12 +100,26 @@ pub fn text_reveal_speed_picked(state: &crate::popup::PopupState) -> Option<&'st
     state.get_selected(SETUP_FIELD_TEXT_REVEAL).and_then(crate::TextReveal::speed_entry)
 }
 
+/// The Setup select rests on Custom or New Only without its number (the bare entry), which
+/// cannot be saved: Save asks for the number first. Cycling never asks - Custom and New Only
+/// can be passed, and the field left, on the way to anything else (user rulings 2026-10-26:
+/// New Only could not be reached without answering Custom's prompt, and Down must move to
+/// the next field); Enter on either entry is what asks.
+pub fn text_reveal_needs_number(state: &crate::popup::PopupState) -> bool {
+    state.get_selected(SETUP_FIELD_TEXT_REVEAL)
+        .is_some_and(|v| crate::TextReveal::speed_entry(v).is_some() && crate::TextReveal::from_name(v).typed_cps().is_none())
+}
+
 /// Put `value` (a TextReveal name) on the Setup select: a value with a typed speed takes
 /// its entry over, relabelled; a preset selects its own entry. The reveal_speed popup's OK
 /// (`custom:<n>`, `new:<n>`) and Cancel (the value before) both come here.
 pub fn set_text_reveal_value(state: &mut crate::popup::PopupState, value: &str) {
     let reveal = crate::TextReveal::from_name(value);
-    let name = reveal.name();
+    // A bare Custom or New Only (Cancel on a prompt opened from one) stays itself, not Off.
+    let name = match crate::TextReveal::speed_entry(value) {
+        Some(entry) if reveal.typed_cps().is_none() => entry.to_string(),
+        _ => reveal.name(),
+    };
     if let Some(FieldKind::Select { options, selected_index }) = state.field_mut(SETUP_FIELD_TEXT_REVEAL).map(|f| &mut f.kind) {
         if reveal.typed_cps().is_some() {
             if let Some(entry) = options.iter_mut().find(|o| crate::TextReveal::speed_entry(&o.value) == Some(reveal.entry())) {
@@ -330,7 +345,9 @@ pub fn create_setup_popup(
         .with_layout(PopupLayout {
             label_width: 19,
             min_width: 40,
-            max_width_percent: 60,
+            // Wide enough on an 80-column terminal for the longest Picture Host
+            // choice; the popup is only as wide as its widest field needs.
+            max_width_percent: 80,
             center_horizontal: true,
             // Top-aligned (matches world_selector.rs) so the popup's height budget reserves
             // the separator+input rows at the bottom instead of centering blind to them —
@@ -439,10 +456,11 @@ fn setup_help_text() -> Vec<String> {
         "Text Reveal: Type newly arrived lines, and the screen a",
         "  world switch shows, onto the screen behind a glitching",
         "  cursor (Slow 30, Normal 60, Fast 120, Super Fast 240",
-        "  characters a second, or Custom, which asks for the",
-        "  number; a wrapped line's rows together). New Only",
-        "  asks for a number too, but types on only text not",
-        "  shown yet: a switch draws what you saw before whole.",
+        "  characters a second, or Custom: press Enter on it to",
+        "  type the number; a wrapped line's rows together). New",
+        "  Only asks for a number the same way, but types on only",
+        "  text not shown yet: a switch draws what you saw before",
+        "  whole.",
         "  Only how the console draws them: scrolling and paging",
         "  are unchanged. Console only.",
         "",
@@ -496,8 +514,9 @@ fn setup_help_text() -> Vec<String> {
         "Picture Host: Where Import Picture uploads a picture",
         "  (dragged onto the terminal or window, or chosen from",
         "  the menu in the web/GUI/Android UI); its link goes",
-        "  into the input line. '+ URL shortening' runs the link",
-        "  through /url's shortening. Uploads are public. 'Off'",
+        "  into the input line. '+ URL Short' runs the link",
+        "  through /url's shortening. '(2d)': tmpfiles.org",
+        "  deletes it after 2 days. Uploads are public. 'Off'",
         "  turns picture uploads off.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
@@ -587,6 +606,37 @@ mod tests {
         let right: Vec<&str> = def.buttons.iter().filter(|b| !b.left_align).map(|b| b.label.as_str()).collect();
         assert_eq!(right, ["Cancel", "Save"]);
         assert!(def.layout.min_width >= 44, "room for both groups with a gap");
+    }
+
+    /// Every Picture Host choice is drawn whole on an 80-column terminal, tall enough to
+    /// show every field or so short the fields scroll (a scroll bar takes a column).
+    #[test]
+    fn every_picture_host_choice_fits_an_80_column_console() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for height in [45, 20] {
+            for (value, label) in crate::picture::PictureService::OPTIONS {
+                let mut def = create_setup_popup(
+                    true, true, false, "unseen_first",
+                    false, 3, "dark", false, "", "left", false, false, true,
+                    false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", value, false,
+                    "off",
+                );
+                add_import_button(&mut def);
+                let mut state = PopupState::new(def);
+                state.visible = true;
+                state.select_field(SETUP_FIELD_PICTURE_HOST);
+                let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+                terminal
+                    .draw(|f| crate::popup::console_renderer::render_popup(f, &mut state, &crate::encoding::Theme::Dark))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let rows: Vec<String> = (0..height)
+                    .map(|y| (0..80).map(|x| buffer.get(x, y).symbol().to_string()).collect())
+                    .collect();
+                let row = rows.iter().find(|r| r.contains("Picture Host:")).expect("the Picture Host row");
+                assert!(row.contains(&format!("[ {} ]", label)), "{label:?} cut off at height {height}: {row:?}");
+            }
+        }
     }
 
     #[test]

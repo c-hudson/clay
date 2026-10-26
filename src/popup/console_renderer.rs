@@ -211,6 +211,12 @@ fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
                 layout.min_width
             }
             FieldKind::Grid { columns, .. } => columns * CELL_STRIDE + 2,
+            // "[ label ]" after the label column, plus both borders and a scroll bar's
+            // column: room for the widest choice, or a long one ran off the popup.
+            FieldKind::Select { options, .. } => {
+                let widest = options.iter().map(|o| display_width(&o.label)).max().unwrap_or(0);
+                (layout.label_width + 20).max(layout.label_width + widest + 4 + 3)
+            }
             _ => layout.label_width + 20,
         };
 

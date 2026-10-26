@@ -8705,8 +8705,9 @@
             'Picture Host: Where Import Picture uploads a picture',
             '  (dragged onto the window or terminal, or chosen with',
             '  Import Picture in the menu); its link goes into the',
-            '  input line. "+ URL shortening" runs the link through',
-            '  /url\'s shortening. Uploads are public. "Off" turns',
+            '  input line. "+ URL Short" runs the link through',
+            '  /url\'s shortening. "(2d)": tmpfiles.org deletes it',
+            '  after 2 days. Uploads are public. "Off" turns',
             '  picture uploads off.', '',
             'Import: copy settings, theme and keybindings',
             '  from another Clay (/import). Settings closes first;',
@@ -9459,6 +9460,13 @@
     let textReveal = 'off';        // this page's own TextReveal name (kept per interface key)
     let textRevealSynced = false;  // the server sent the per-interface map (one from before the effect sends none)
     let setupTextReveal = 'off';
+    // Arrow keys on a closed select step it, with a change at every step, so a step by key
+    // must not ask for Custom's or New Only's number, or neither could be passed on the way
+    // to another entry, and leaving the select must not ask either (user rulings 2026-10-26;
+    // the console's rule, setup.rs `text_reveal_needs_number`): Enter on one asks, and so
+    // does Save while one has no number. A pick from the list (a click, a tap) asks at once.
+    const REVEAL_STEP_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End']);
+    let revealStepKey = false;      // a key that steps the select (or types ahead in it) is down
     let revealSeedCounter = 1;
     // Set by lineHtml(): the delay to the line's next frame, null when it drew the line whole.
     let revealFrameNext = null;
@@ -9502,6 +9510,7 @@
         for (const entry in REVEAL_SPEED_ENTRIES) {
             setSelectOptionText(select, entry, entry === own ? REVEAL_SPEED_ENTRIES[entry] + ' (' + cps + ')' : REVEAL_SPEED_ENTRIES[entry]);
         }
+        select._revealNumbered = own ? name : null;  // the value the entry showing a number holds
         select.value = own || name;
         if (select.selectedIndex < 0) select.value = 'off';
         updateCustomDropdown(select);
@@ -14157,6 +14166,15 @@
     }
 
     function saveSettingsAll() {
+        if (revealSpeedDialogOpen) return;
+        // Text Reveal stepped onto Custom or New Only by key and not given its number: ask
+        // first (the console's `save_setup`); the prompt's OK saves.
+        const revealSelect = elements.setupTextRevealSelect;
+        const revealEntry = revealSelect && revealSpeedEntry(revealSelect.value);
+        if (revealEntry && revealSpeedEntry(setupTextReveal) !== revealEntry) {
+            showRevealSpeedDialog(revealSelect, setupTextReveal, revealEntry, saveSettingsAll);
+            return;
+        }
         // Clay Server tab (Android only) — save to SharedPreferences and reload
         if (settingsActiveTab === 'clay-server' && window.Android) {
             var runMode = ((document.getElementById('cs-run-mode') || {}).value || 'remote');
@@ -19070,11 +19088,30 @@
             };
         }
         if (elements.setupTextRevealSelect) {
+            elements.setupTextRevealSelect.onkeydown = function(e) {
+                revealStepKey = REVEAL_STEP_KEYS.has(e.key) || (e.key.length === 1 && e.key !== ' ');
+                if (e.key === 'Enter') {
+                    // Enter on Custom or New Only asks for its number. In an open list Enter
+                    // is a pick, which has asked by the time this runs.
+                    const select = this;
+                    setTimeout(function() {
+                        const entry = revealSpeedEntry(select.value);
+                        if (entry && !revealSpeedDialogOpen) showRevealSpeedDialog(select, setupTextReveal, entry);
+                    }, 0);
+                }
+            };
+            elements.setupTextRevealSelect.onkeyup = function() {
+                setTimeout(function() { revealStepKey = false; }, 0);
+            };
             elements.setupTextRevealSelect.onchange = function() {
-                // Custom and New Only ask for the number; the prompt's Cancel puts the choice
-                // before back.
-                if (revealSpeedEntry(this.value)) showRevealSpeedDialog(this, setupTextReveal, revealSpeedEntry(this.value));
-                else setupTextReveal = this.value;
+                // Custom and New Only ask for the number when picked; stepped onto by key, when
+                // Enter is pressed or Save is. The prompt's Cancel puts the choice before back.
+                const entry = revealSpeedEntry(this.value);
+                const stepped = revealStepKey;
+                revealStepKey = false;
+                if (!entry) setupTextReveal = this.value;
+                else if (!stepped) showRevealSpeedDialog(this, setupTextReveal, entry);
+                else if (revealSpeedEntry(this._revealNumbered) === entry) setupTextReveal = this._revealNumbered;
             };
         }
         elements.setupTlsProxyToggle.onclick = function() {
@@ -19940,7 +19977,8 @@
     // GUI's RevealSpeed dialog): the number the Settings' Custom or New Only entry
     // (`entry`) asks for. OK or Enter makes the choice <entry>:<n>, shown on that entry as
     // "Custom (n)" / "New Only (n)"; Cancel or Escape puts `previous` back on the select.
-    function showRevealSpeedDialog(select, previous, entry) {
+    // `afterOk` runs after OK (Save, when a Save asked).
+    function showRevealSpeedDialog(select, previous, entry, afterOk) {
         entry = entry || REVEAL_CUSTOM;
         let dlg = document.getElementById('reveal-speed-dialog');
         if (!dlg) {
@@ -19981,10 +20019,18 @@
             setupTextReveal = entry + ':' + cps;
             showTextRevealChoice(select, setupTextReveal);
             hideRevealSpeedDialog();
+            backToSelect();
+            if (afterOk) afterOk();
+        }
+        // Keys go on where they were: on the select (shown on a desktop; a phone's is hidden).
+        function backToSelect() {
+            if (select.offsetParent !== null) select.focus();
         }
         revealSpeedCancel = function() {
+            setupTextReveal = previous;
             showTextRevealChoice(select, previous);
             hideRevealSpeedDialog();
+            backToSelect();
         };
         document.getElementById('reveal-speed-cancel').onclick = revealSpeedCancel;
         document.getElementById('reveal-speed-ok').onclick = accept;
