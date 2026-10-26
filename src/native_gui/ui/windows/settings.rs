@@ -263,30 +263,30 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// The user picked a Text Reveal entry. Custom - bare, or a custom value picked again
-    /// to change it - asks for the number (the console's reveal_speed popup, app.js
-    /// `showRevealSpeedDialog`): the prompt's OK puts `custom:<n>` on the pick, its
-    /// Cancel the entry before.
+    /// The user picked a Text Reveal entry. Custom or New Only - bare, or a value picked
+    /// again to change it - asks for the number (the console's reveal_speed popup, app.js
+    /// `showRevealSpeedDialog`): the prompt's OK puts `custom:<n>` / `new:<n>` on the
+    /// pick, its Cancel the entry before.
     fn text_reveal_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self.text_reveal.value(cx);
-        if !value.starts_with(crate::TextReveal::CUSTOM) {
+        let Some(entry) = crate::TextReveal::speed_entry(&value) else {
             self.reveal_before = value;
             return;
-        }
+        };
         let previous = self.reveal_before.clone();
-        let current = crate::TextReveal::from_name(&value).custom_cps();
+        let current = crate::TextReveal::from_name(&value).typed_cps();
         let me = cx.weak_entity();
         let ok = {
             let me = me.clone();
             move |cps: u32, window: &mut Window, cx: &mut App| {
-                let _ = me.update(cx, |s, cx| s.set_reveal_value(&crate::TextReveal::Custom(cps).name(), window, cx));
+                let _ = me.update(cx, |s, cx| s.set_reveal_value(&crate::TextReveal::with_speed(entry, cps).name(), window, cx));
             }
         };
         let cancel = move |window: &mut Window, cx: &mut App| {
             let _ = me.update(cx, |s, cx| s.set_reveal_value(&previous, window, cx));
         };
         let main = self.main.clone();
-        let d = cx.new(|cx| dialogs::small::RevealSpeed::new(main, current, Box::new(ok), Box::new(cancel), window, cx));
+        let d = cx.new(|cx| dialogs::small::RevealSpeed::new(main, entry, current, Box::new(ok), Box::new(cancel), window, cx));
         dialogs::open(self, dialogs::Kind::RevealSpeed, d, window, cx);
     }
 

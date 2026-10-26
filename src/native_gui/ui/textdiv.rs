@@ -45,6 +45,12 @@ impl Textdiv {
         }
     }
 
+    /// The newest seq this client had shown of the world named `name` when it last left
+    /// it (`None`: nothing, or never seen): what New Only text reveal counts as old.
+    pub fn seen(&self, name: &str) -> Option<u64> {
+        self.seen.get(name).copied().flatten()
+    }
+
     /// Leaving a world: shown up to here, and this visit's divider goes.
     pub fn leave(&mut self, w: &World) {
         if let Some(seq) = last_seq(w) {

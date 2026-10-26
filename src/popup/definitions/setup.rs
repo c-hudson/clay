@@ -71,17 +71,17 @@ pub fn editor_side_options() -> Vec<SelectOption> {
     ]
 }
 
-/// Text reveal options (`TextReveal::OPTIONS`): off, the preset speeds, and Custom. When
-/// `current` is a custom value the Custom entry IS that value (`custom:<n>`, labelled
-/// "Custom (n)"); otherwise it is the bare entry that asks for a number when picked
-/// (`text_reveal_custom_picked`, the reveal_speed popup). The native GUI's pick is built
-/// from this too, so the two lists never differ.
+/// Text reveal options (`TextReveal::OPTIONS`): off, the preset speeds, Custom and New
+/// Only. When `current` has a typed speed, its entry IS that value (`custom:<n>` labelled
+/// "Custom (n)", `new:<n>` labelled "New Only (n)"); otherwise each is the bare entry that
+/// asks for a number when picked (`text_reveal_speed_picked`, the reveal_speed popup). The
+/// native GUI's pick is built from this too, so the two lists never differ.
 pub fn text_reveal_options(current: &str) -> Vec<SelectOption> {
     let current = crate::TextReveal::from_name(current);
     crate::TextReveal::OPTIONS
         .iter()
-        .map(|(name, label)| match current.custom_cps() {
-            Some(_) if *name == crate::TextReveal::CUSTOM => SelectOption::new(current.name(), current.label()),
+        .map(|(name, label)| match current.typed_cps() {
+            Some(_) if *name == current.entry() => SelectOption::new(current.name(), current.label()),
             _ => SelectOption::new(*name, *label),
         })
         .collect()
@@ -93,23 +93,23 @@ pub fn text_reveal_index(current: &str) -> usize {
     text_reveal_options(current).iter().position(|o| o.value == name).unwrap_or(0)
 }
 
-/// The Setup select is on the entry that asks for a number: Custom, bare or as a value
-/// picked again to change it.
-pub fn text_reveal_custom_picked(state: &crate::popup::PopupState) -> bool {
-    state.get_selected(SETUP_FIELD_TEXT_REVEAL).is_some_and(|v| v.starts_with(crate::TextReveal::CUSTOM))
+/// The Setup select is on an entry that asks for a number - Custom or New Only, bare or as
+/// a value picked again to change it: which one.
+pub fn text_reveal_speed_picked(state: &crate::popup::PopupState) -> Option<&'static str> {
+    state.get_selected(SETUP_FIELD_TEXT_REVEAL).and_then(crate::TextReveal::speed_entry)
 }
 
-/// Put `value` (a TextReveal name) on the Setup select: a custom value takes the Custom
-/// entry over, relabelled; a preset selects its own entry. The reveal_speed popup's OK
-/// (`custom:<n>`) and Cancel (the value before) both come here.
+/// Put `value` (a TextReveal name) on the Setup select: a value with a typed speed takes
+/// its entry over, relabelled; a preset selects its own entry. The reveal_speed popup's OK
+/// (`custom:<n>`, `new:<n>`) and Cancel (the value before) both come here.
 pub fn set_text_reveal_value(state: &mut crate::popup::PopupState, value: &str) {
     let reveal = crate::TextReveal::from_name(value);
     let name = reveal.name();
     if let Some(FieldKind::Select { options, selected_index }) = state.field_mut(SETUP_FIELD_TEXT_REVEAL).map(|f| &mut f.kind) {
-        if reveal.custom_cps().is_some() {
-            if let Some(custom) = options.iter_mut().find(|o| o.value.starts_with(crate::TextReveal::CUSTOM)) {
-                custom.value = name.clone();
-                custom.label = reveal.label();
+        if reveal.typed_cps().is_some() {
+            if let Some(entry) = options.iter_mut().find(|o| crate::TextReveal::speed_entry(&o.value) == Some(reveal.entry())) {
+                entry.value = name.clone();
+                entry.label = reveal.label();
             }
         }
         if let Some(at) = options.iter().position(|o| o.value == name) {
@@ -440,7 +440,9 @@ fn setup_help_text() -> Vec<String> {
         "  world switch shows, onto the screen behind a glitching",
         "  cursor (Slow 30, Normal 60, Fast 120, Super Fast 240",
         "  characters a second, or Custom, which asks for the",
-        "  number; a wrapped line's rows together).",
+        "  number; a wrapped line's rows together). New Only",
+        "  asks for a number too, but types on only text not",
+        "  shown yet: a switch draws what you saw before whole.",
         "  Only how the console draws them: scrolling and paging",
         "  are unchanged. Console only.",
         "",
@@ -516,24 +518,33 @@ mod tests {
     use super::*;
     use crate::popup::PopupState;
 
-    /// The Text Reveal select: Custom is the last entry, bare until a number is chosen,
-    /// then the value itself, relabelled; Cancel's restore selects a preset again.
+    /// The Text Reveal select: Custom and New Only are the last entries, bare until a
+    /// number is chosen, then the value itself, relabelled; Cancel's restore selects a
+    /// preset again.
     #[test]
     fn the_text_reveal_select_shows_a_custom_value_on_its_custom_entry() {
         let names: Vec<String> = text_reveal_options("fast").iter().map(|o| o.value.clone()).collect();
-        assert_eq!(names, ["off", "slow", "normal", "fast", "superfast", "custom"]);
+        assert_eq!(names, ["off", "slow", "normal", "fast", "superfast", "custom", "new"]);
         assert_eq!(text_reveal_index("fast"), 3);
         assert_eq!(text_reveal_index("nonsense"), 0);
         let custom = text_reveal_options("custom:150");
         assert_eq!((custom[5].value.as_str(), custom[5].label.as_str()), ("custom:150", "Custom (150)"));
+        assert_eq!((custom[6].value.as_str(), custom[6].label.as_str()), ("new", "New Only"));
         assert_eq!(text_reveal_index("custom:150"), 5);
         assert_eq!(text_reveal_index("custom:0"), 0, "out of range is Off");
+        let new_only = text_reveal_options("new:90");
+        assert_eq!((new_only[5].value.as_str(), new_only[5].label.as_str()), ("custom", "Custom"));
+        assert_eq!((new_only[6].value.as_str(), new_only[6].label.as_str()), ("new:90", "New Only (90)"));
+        assert_eq!(text_reveal_index("new:90"), 6);
 
         let mut state = PopupState::new(create_setup_popup_for_test("normal"));
-        assert!(!text_reveal_custom_picked(&state));
+        assert_eq!(text_reveal_speed_picked(&state), None);
+        set_text_reveal_value(&mut state, "new:40");
+        assert_eq!(state.get_selected(SETUP_FIELD_TEXT_REVEAL), Some("new:40"));
+        assert_eq!(text_reveal_speed_picked(&state), Some("new"));
         set_text_reveal_value(&mut state, "custom:75");
         assert_eq!(state.get_selected(SETUP_FIELD_TEXT_REVEAL), Some("custom:75"));
-        assert!(text_reveal_custom_picked(&state));
+        assert_eq!(text_reveal_speed_picked(&state), Some("custom"));
         let label = match &state.field(SETUP_FIELD_TEXT_REVEAL).unwrap().kind {
             FieldKind::Select { options, selected_index } => options[*selected_index].label.clone(),
             _ => unreachable!(),

@@ -1128,6 +1128,7 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
         cps if cps > 0.0 => Some(crate::reveal::Reveal::for_console(cps, app.settings.theme)),
         _ => None,
     };
+    let reveal_new_only = app.settings.text_reveal.new_only();
     let reveal_now = std::time::SystemTime::now();
     let mut next_frame: Option<std::time::Duration> = None;
 
@@ -1230,8 +1231,9 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
         }
         if let Some(reveal) = reveal.as_ref() {
             // A line reveals from its arrival, the console's switch to this world or
-            // more-mode's release of it, whichever came last (`World::console_reveal_anchor`).
-            let anchor = world.console_reveal_anchor(line);
+            // more-mode's release of it, whichever came last (`World::console_reveal_anchor`;
+            // in New Only, the switch only for a line the console hadn't shown).
+            let anchor = world.console_reveal_anchor(line, reveal_new_only);
             if let Some(due) = reveal.apply(line.seq, anchor, reveal_now, &mut rows) {
                 next_frame = Some(next_frame.map_or(due, |d| d.min(due)));
             }

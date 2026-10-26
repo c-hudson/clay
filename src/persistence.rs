@@ -3930,6 +3930,7 @@ mod tests {
                 ("native-linux".to_string(), TextReveal::SuperFast),
                 ("console-remote".to_string(), TextReveal::Slow),
                 ("browser-linux".to_string(), TextReveal::Custom(150)), // custom:150 on disk
+                ("app-android".to_string(), TextReveal::NewOnly(90)),   // new:90 on disk
             ]
             .into_iter()
             .collect(),                 // default: empty

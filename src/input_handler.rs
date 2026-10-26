@@ -301,7 +301,7 @@ pub(crate) fn handle_popup_mouse_click(app: &mut App, column: u16, row: u16) -> 
                         }
                         if is_setup && field_id == popup::definitions::setup::SETUP_FIELD_TEXT_REVEAL {
                             let reveal_after = state.get_selected(field_id).map(str::to_string);
-                            if reveal_after != reveal_before && popup::definitions::setup::text_reveal_custom_picked(state) {
+                            if reveal_after != reveal_before && popup::definitions::setup::text_reveal_speed_picked(state).is_some() {
                                 popup::definitions::reveal_speed::open_reveal_speed_prompt(&mut app.popup_manager, reveal_before.as_deref().unwrap_or("off"));
                             }
                         }

@@ -6481,26 +6481,41 @@
         assert_eq!(released.len(), 3);
         assert_eq!(world.console_released.len(), 1, "the minute-old stamp is dropped, the new one kept");
         assert_eq!((world.console_released[0].first_seq, world.console_released[0].last_seq), (3, 5));
-        assert!(world.console_reveal_anchor(&world.output_lines[4]) >= before, "a released line reveals from the release");
-        assert_eq!(world.console_reveal_anchor(&world.output_lines[1]), old, "a line shown all along keeps its arrival");
+        assert!(world.console_reveal_anchor(&world.output_lines[4], false) >= before, "a released line reveals from the release");
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[1], false), old, "a line shown all along keeps its arrival");
         // A switch to the world after the release wins over it.
         let switched = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
         world.console_shown_at = Some(switched);
-        assert_eq!(world.console_reveal_anchor(&world.output_lines[4]), switched);
-        assert_eq!(world.console_reveal_anchor(&world.output_lines[1]), switched);
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[4], false), switched);
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[1], false), switched);
         // A line arriving after both keeps its own moment.
         let fresh = OutputLine::new_with_timestamp("new".into(), switched + std::time::Duration::from_secs(1), 9);
-        assert_eq!(world.console_reveal_anchor(&fresh), fresh.timestamp);
+        assert_eq!(world.console_reveal_anchor(&fresh, false), fresh.timestamp);
+        // New Only (user request 2026-10-26): the switch counts only for a line newer than
+        // the console had shown of the world when it left it; the rest is drawn whole
+        // (its arrival, long over), a release still reveals what it let through.
+        world.console_seen_seq = Some(1);
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[1], true), old, "seen before: no switch reveal");
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[2], true), switched, "new since: the switch reveals it");
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[4], true), switched);
+        assert_eq!(world.console_reveal_anchor(&fresh, true), fresh.timestamp);
+        world.console_seen_seq = Some(5);
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[2], true), old, "nothing new: the screen is drawn whole");
+        assert!(world.console_reveal_anchor(&world.output_lines[4], true) >= before, "a released line still reveals from the release");
+        world.console_seen_seq = None;
+        assert_eq!(world.console_reveal_anchor(&world.output_lines[1], true), switched, "never shown: all of it is new");
     }
 
     /// Every Text Reveal name round-trips, an unknown one is Off, and each speed doubles.
     #[test]
     fn test_text_reveal_names_and_speeds() {
-        let presets: Vec<&str> = TextReveal::OPTIONS.iter().map(|(n, _)| *n).filter(|n| *n != TextReveal::CUSTOM).collect();
+        let presets: Vec<&str> = TextReveal::OPTIONS.iter().map(|(n, _)| *n).filter(|n| TextReveal::speed_entry(n).is_none()).collect();
         for name in &presets {
             assert_eq!(TextReveal::from_name(name).name(), *name);
+            assert_eq!(TextReveal::from_name(name).entry(), *name);
         }
-        assert_eq!(TextReveal::OPTIONS.last().map(|(n, l)| (*n, *l)), Some(("custom", "Custom")), "Custom is the pickers' last entry");
+        let last: Vec<(&str, &str)> = TextReveal::OPTIONS.iter().rev().take(2).rev().copied().collect();
+        assert_eq!(last, [("custom", "Custom"), ("new", "New Only")], "the entries that ask come last");
         assert_eq!(TextReveal::from_name("gibberish"), TextReveal::Off);
         assert_eq!(TextReveal::from_name("Super_Fast"), TextReveal::SuperFast);
         let speeds: Vec<f32> = presets.iter().map(|n| TextReveal::from_name(n).chars_per_second()).collect();
@@ -6514,9 +6529,11 @@
         assert_eq!(custom, TextReveal::Custom(150));
         assert_eq!(custom.name(), "custom:150");
         assert_eq!(custom.label(), "Custom (150)");
-        assert_eq!(custom.custom_cps(), Some(150));
+        assert_eq!(custom.typed_cps(), Some(150));
         assert_eq!(custom.chars_per_second(), 150.0);
         assert_eq!(custom.native_chars_per_second(), 150.0);
+        assert!(!custom.new_only());
+        assert_eq!(custom.entry(), TextReveal::CUSTOM);
         assert_eq!(TextReveal::from_name("Custom: 10000 "), TextReveal::Custom(10000));
         for bad in ["custom", "custom:", "custom:0", "custom:10001", "custom:abc", "custom:1.5"] {
             assert_eq!(TextReveal::from_name(bad), TextReveal::Off, "{bad}");
@@ -6524,7 +6541,23 @@
         assert_eq!(TextReveal::parse_custom(" 42 "), Some(42));
         assert_eq!(TextReveal::parse_custom("-1"), None);
         assert_eq!(TextReveal::SuperFast.label(), "Super Fast");
-        assert_eq!(TextReveal::Fast.custom_cps(), None);
+        assert_eq!(TextReveal::Fast.typed_cps(), None);
+        assert!(!TextReveal::Fast.new_only());
+        // New Only (user request 2026-10-26): a typed speed too, kept as new:<n>.
+        let new_only = TextReveal::from_name("new:90");
+        assert_eq!(new_only, TextReveal::NewOnly(90));
+        assert_eq!((new_only.name().as_str(), new_only.label().as_str()), ("new:90", "New Only (90)"));
+        assert_eq!((new_only.typed_cps(), new_only.chars_per_second(), new_only.native_chars_per_second()), (Some(90), 90.0, 90.0));
+        assert!(new_only.new_only());
+        assert_eq!(new_only.entry(), TextReveal::NEW_ONLY);
+        for bad in ["new", "new:", "new:0", "new:10001", "newx:5"] {
+            assert_eq!(TextReveal::from_name(bad), TextReveal::Off, "{bad}");
+        }
+        for (value, entry) in [("custom", Some("custom")), ("custom:5", Some("custom")), ("new", Some("new")), ("new:5", Some("new")), ("normal", None), ("newx", None), ("fast", None)] {
+            assert_eq!(TextReveal::speed_entry(value), entry, "{value}");
+        }
+        assert_eq!(TextReveal::with_speed(TextReveal::NEW_ONLY, 7), TextReveal::NewOnly(7));
+        assert_eq!(TextReveal::with_speed(TextReveal::CUSTOM, 7), TextReveal::Custom(7));
     }
 
     /// /setup's Text Reveal: cycling onto Custom opens the speed prompt over the popup;
@@ -6551,10 +6584,10 @@
         assert_eq!(popup(&app), popup::PopupId("setup"));
         assert_eq!(selected(&app).as_deref(), Some("custom:150"));
         // Away and back: the prompt again, prefilled; a bad number complains and stays.
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right)); // Custom (150) -> Off
-        assert_eq!(selected(&app).as_deref(), Some("off"));
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Left)); // Custom (150) -> Super Fast
+        assert_eq!(selected(&app).as_deref(), Some("superfast"));
         assert_eq!(popup(&app), popup::PopupId("setup"));
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Left)); // Off -> Custom (150)
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right)); // Super Fast -> Custom (150)
         assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
         assert_eq!(app.popup_manager.current().unwrap().get_text(REVEAL_SPEED_FIELD_CPS), Some("150"));
         for _ in 0..3 {
@@ -6564,18 +6597,30 @@
         let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
         assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
         assert_eq!(app.popup_manager.current().unwrap().error.as_deref(), Some(TextReveal::CUSTOM_PROBLEM));
-        // Esc: the entry before (Off), the kept number still on the Custom entry.
+        // Esc: the entry before (Super Fast), the kept number still on the Custom entry.
         let _ = handle_new_popup_key(&mut app, key(KeyCode::Esc));
         assert_eq!(popup(&app), popup::PopupId("setup"));
-        assert_eq!(selected(&app).as_deref(), Some("off"));
-        let _ = handle_new_popup_key(&mut app, key(KeyCode::Left));
+        assert_eq!(selected(&app).as_deref(), Some("superfast"));
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right));
         assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
         let _ = handle_new_popup_key(&mut app, key(KeyCode::Esc));
-        assert_eq!(selected(&app).as_deref(), Some("off"));
+        assert_eq!(selected(&app).as_deref(), Some("superfast"));
         // The saved setting is the value by name.
         app.popup_manager.current_mut().unwrap().select_field(SETUP_FIELD_TEXT_REVEAL);
         popup::definitions::setup::set_text_reveal_value(app.popup_manager.current_mut().unwrap(), "custom:150");
         assert_eq!(TextReveal::from_name(&selected(&app).unwrap()), TextReveal::Custom(150));
+        // New Only, the next entry, asks the same way under its own title and makes new:<n>.
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Right)); // Custom (150) -> New Only
+        assert_eq!(popup(&app), popup::PopupId("reveal_speed"));
+        assert_eq!(app.popup_manager.current().unwrap().definition.title, "New Only Text Reveal Speed");
+        assert_eq!(app.popup_manager.current().unwrap().get_text(REVEAL_SPEED_FIELD_CPS), Some(""));
+        for c in "40".chars() {
+            let _ = handle_new_popup_key(&mut app, key(KeyCode::Char(c)));
+        }
+        let _ = handle_new_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(popup(&app), popup::PopupId("setup"));
+        assert_eq!(selected(&app).as_deref(), Some("new:40"));
+        assert_eq!(TextReveal::from_name(&selected(&app).unwrap()), TextReveal::NewOnly(40));
     }
 
     /// The text-reveal effect (src/reveal.rs) types the screen a world switch shows on:
@@ -21152,16 +21197,26 @@ fn the_web_text_reveal_options_are_text_reveal_options() {
     assert_eq!(options, expected);
     // app.js knows every speed by the same name, and sends the setting back by name.
     let js = include_str!("web/app.js");
-    for (name, _) in TextReveal::OPTIONS.iter().filter(|(n, _)| *n != TextReveal::CUSTOM) {
+    for (name, _) in TextReveal::OPTIONS.iter().filter(|(n, _)| TextReveal::speed_entry(n).is_none()) {
         assert!(js.contains(&format!("{name}:")) || js.contains(&format!("{name} :")), "REVEAL_CPS lacks {name}");
     }
-    // Custom: the same name, range and complaint as TextReveal's, asked for in a dialog.
+    // Custom and New Only: the same names, range and complaint as TextReveal's, asked for
+    // in a dialog titled for the entry, which makes <entry>:<n>.
     assert_eq!(TextReveal::CUSTOM_RANGE, 1..=10000);
     assert_eq!(TextReveal::CUSTOM_PROBLEM, "Enter a whole number from 1 to 10000");
     assert!(js.contains("const REVEAL_CUSTOM = 'custom', REVEAL_CUSTOM_MIN = 1, REVEAL_CUSTOM_MAX = 10000;"));
+    assert!(js.contains(&format!("const REVEAL_NEW_ONLY = '{}';", TextReveal::NEW_ONLY)));
+    assert!(js.contains("const REVEAL_SPEED_ENTRIES = { [REVEAL_CUSTOM]: 'Custom', [REVEAL_NEW_ONLY]: 'New Only' };"));
+    for entry in [TextReveal::CUSTOM, TextReveal::NEW_ONLY] {
+        let label = TextReveal::OPTIONS.iter().find(|(n, _)| *n == entry).unwrap().1;
+        assert_eq!(TextReveal::speed_title(entry), format!("{label} Text Reveal Speed"), "the web's title is built the same way");
+    }
     assert!(js.contains("const REVEAL_CUSTOM_PROBLEM = 'Enter a whole number from 1 to 10000';"));
-    assert!(js.contains("if (this.value === REVEAL_CUSTOM) showRevealSpeedDialog(this, setupTextReveal);"));
-    assert!(js.contains("setupTextReveal = REVEAL_CUSTOM + ':' + cps;"));
+    assert!(js.contains("if (revealSpeedEntry(this.value)) showRevealSpeedDialog(this, setupTextReveal, revealSpeedEntry(this.value));"));
+    assert!(js.contains("setupTextReveal = entry + ':' + cps;"));
+    assert!(js.contains("<div class=\"js-dialog-title\">${REVEAL_SPEED_ENTRIES[entry]} Text Reveal Speed</div>"));
+    // New Only: a switch counts only for a line newer than the world's seen mark.
+    assert!(js.contains("(typeof seen !== 'number' || lineObj.seq > seen)"));
     // A browser and the WebView GUI run Super Fast at 240; the Android app alone at the
     // native GUI's 200 (user ruling 2026-10-25).
     assert!(js.contains("superfast: 240"));

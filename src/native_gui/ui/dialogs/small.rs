@@ -362,11 +362,14 @@ pub type OnSpeed = Box<dyn Fn(u32, &mut Window, &mut App)>;
 /// What Cancel and Esc do.
 pub type OnCancel = Box<dyn Fn(&mut Window, &mut App)>;
 
-/// The number the Settings' Text Reveal "Custom" asks for (the console's reveal_speed
-/// popup, app.js `showRevealSpeedDialog`): OK or Enter takes it, Cancel or Esc puts the
-/// choice before back; a number outside `TextReveal::CUSTOM_RANGE` complains and stays.
+/// The number the Settings' Text Reveal "Custom" or "New Only" asks for (the console's
+/// reveal_speed popup, app.js `showRevealSpeedDialog`): OK or Enter takes it, Cancel or Esc
+/// puts the choice before back; a number outside `TextReveal::CUSTOM_RANGE` complains and
+/// stays.
 pub struct RevealSpeed {
     main: WeakEntity<ClayView>,
+    /// The prompt's title, for the entry that asked (`TextReveal::speed_title`).
+    title: &'static str,
     input: Entity<InputState>,
     ok: OnSpeed,
     cancel: OnCancel,
@@ -374,7 +377,7 @@ pub struct RevealSpeed {
 }
 
 impl RevealSpeed {
-    pub fn new(main: WeakEntity<ClayView>, current: Option<u32>, ok: OnSpeed, cancel: OnCancel, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(main: WeakEntity<ClayView>, entry: &str, current: Option<u32>, ok: OnSpeed, cancel: OnCancel, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let value = current.map(|cps| cps.to_string()).unwrap_or_default();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder("1 to 10000".to_string()));
         cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
@@ -383,7 +386,7 @@ impl RevealSpeed {
             }
         })
         .detach();
-        Self { main, input, ok, cancel, error: None }
+        Self { main, title: crate::TextReveal::speed_title(entry), input, ok, cancel, error: None }
     }
 
     fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -424,7 +427,7 @@ impl Render for RevealSpeed {
                     cx.stop_propagation();
                 }
             }))
-            .child(k.heading("Custom Text Reveal Speed"))
+            .child(k.heading(self.title))
             .child(k.field("Characters a second:", &self.input))
             .child(k.error(self.error.as_deref()))
             .child(

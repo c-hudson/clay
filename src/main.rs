@@ -621,7 +621,10 @@ pub fn valid_text_reveal_key(key: &str) -> bool {
 
 /// The text-reveal effect (src/reveal.rs): off, a preset speed, or a speed the user typed
 /// in (`Custom`; user request 2026-10-25: the pickers' Custom entry asks for the number in
-/// a popup). Kept per interface, by name (`name`/`from_name`): a preset's, or `custom:<n>`.
+/// a popup), or a typed speed for new text only (`NewOnly`, user request 2026-10-26: a
+/// world switch types on only what this interface hasn't shown yet, the rest is drawn
+/// whole). Kept per interface, by name (`name`/`from_name`): a preset's, `custom:<n>` or
+/// `new:<n>`.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum TextReveal {
     #[default]
@@ -632,16 +635,23 @@ pub enum TextReveal {
     SuperFast,
     /// The user's own speed, characters a second, within `CUSTOM_RANGE`.
     Custom(u32),
+    /// The user's own speed, for new text only (`new_only`).
+    NewOnly(u32),
 }
 
 impl TextReveal {
-    /// `(name, label)` for the pickers, in display order. The last is `CUSTOM`, the entry
-    /// that asks for a number; a picker showing a custom value relabels it `Custom (n)`
-    /// with the value's own name (`custom:n`).
-    pub const OPTIONS: &'static [(&'static str, &'static str)] =
-        &[("off", "Off"), ("slow", "Slow"), ("normal", "Normal"), ("fast", "Fast"), ("superfast", "Super Fast"), (Self::CUSTOM, "Custom")];
+    /// `(name, label)` for the pickers, in display order. The last two, `CUSTOM` and
+    /// `NEW_ONLY`, are the entries that ask for a number (`speed_entry`); a picker showing
+    /// such a value relabels its entry `Custom (n)` / `New Only (n)` with the value's own
+    /// name (`custom:n`, `new:n`).
+    pub const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("off", "Off"), ("slow", "Slow"), ("normal", "Normal"), ("fast", "Fast"), ("superfast", "Super Fast"),
+        (Self::CUSTOM, "Custom"), (Self::NEW_ONLY, "New Only"),
+    ];
     /// The pickers' Custom entry, and the prefix of a custom value's name.
     pub const CUSTOM: &'static str = "custom";
+    /// The pickers' New Only entry, and the prefix of a new-only value's name.
+    pub const NEW_ONLY: &'static str = "new";
     /// What a custom speed may be, characters a second.
     pub const CUSTOM_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
     /// The prompt's complaint about a value outside it (app.js says the same).
@@ -656,13 +666,15 @@ impl TextReveal {
             TextReveal::Fast => "fast".to_string(),
             TextReveal::SuperFast => "superfast".to_string(),
             TextReveal::Custom(cps) => format!("{}:{cps}", Self::CUSTOM),
+            TextReveal::NewOnly(cps) => format!("{}:{cps}", Self::NEW_ONLY),
         }
     }
 
-    /// The pickers' label for it: a preset's, or `Custom (n)`.
+    /// The pickers' label for it: a preset's, `Custom (n)` or `New Only (n)`.
     pub fn label(&self) -> String {
         match self {
             TextReveal::Custom(cps) => format!("Custom ({cps})"),
+            TextReveal::NewOnly(cps) => format!("New Only ({cps})"),
             other => {
                 let name = other.name();
                 Self::OPTIONS.iter().find(|(n, _)| *n == name).map_or_else(|| name.clone(), |(_, l)| l.to_string())
@@ -672,36 +684,74 @@ impl TextReveal {
 
     pub fn from_name(name: &str) -> Self {
         let name = name.trim().to_lowercase();
-        if let Some(cps) = name.strip_prefix(Self::CUSTOM).and_then(|rest| rest.strip_prefix(':')) {
-            // A custom value outside the range (a hand-edited settings.dat) is off.
-            return Self::parse_custom(cps).map_or(TextReveal::Off, TextReveal::Custom);
+        for entry in [Self::CUSTOM, Self::NEW_ONLY] {
+            if let Some(cps) = name.strip_prefix(entry).and_then(|rest| rest.strip_prefix(':')) {
+                // A typed speed outside the range (a hand-edited settings.dat) is off.
+                return Self::parse_custom(cps).map_or(TextReveal::Off, |cps| Self::with_speed(entry, cps));
+            }
         }
         match name.as_str() {
             "slow" => TextReveal::Slow,
             "normal" => TextReveal::Normal,
             "fast" => TextReveal::Fast,
             "superfast" | "super-fast" | "super_fast" => TextReveal::SuperFast,
-            // Unrecognised (a hand-edited settings.dat, or the pickers' bare "custom"
-            // before a number was given) is off, never a guess.
+            // Unrecognised (a hand-edited settings.dat, or the pickers' bare "custom" or
+            // "new" before a number was given) is off, never a guess.
             _ => TextReveal::Off,
         }
     }
 
-    /// A typed custom speed: a whole number in `CUSTOM_RANGE`, or nothing.
+    /// A typed speed: a whole number in `CUSTOM_RANGE`, or nothing.
     pub fn parse_custom(text: &str) -> Option<u32> {
         text.trim().parse::<u32>().ok().filter(|cps| Self::CUSTOM_RANGE.contains(cps))
     }
 
-    /// The custom speed, when this is one.
-    pub fn custom_cps(&self) -> Option<u32> {
+    /// The typed speed of a Custom or New Only value.
+    pub fn typed_cps(&self) -> Option<u32> {
         match self {
-            TextReveal::Custom(cps) => Some(*cps),
+            TextReveal::Custom(cps) | TextReveal::NewOnly(cps) => Some(*cps),
             _ => None,
         }
     }
 
+    /// Only text this interface hasn't shown yet is typed on: a world switch draws what
+    /// was already shown whole (`World::console_reveal_anchor`, app.js `revealOptions`, the
+    /// native `reveal_snapshot`).
+    pub fn new_only(&self) -> bool {
+        matches!(self, TextReveal::NewOnly(_))
+    }
+
+    /// The pickers' entry this value sits on: a preset's own, or the entry that asks for
+    /// its speed.
+    pub fn entry(&self) -> &'static str {
+        match self {
+            TextReveal::Custom(_) => Self::CUSTOM,
+            TextReveal::NewOnly(_) => Self::NEW_ONLY,
+            other => Self::OPTIONS.iter().map(|(n, _)| *n).find(|n| *n == other.name()).unwrap_or("off"),
+        }
+    }
+
+    /// A picker value that is an entry asking for a speed (bare, or holding a value):
+    /// which one.
+    pub fn speed_entry(value: &str) -> Option<&'static str> {
+        [Self::CUSTOM, Self::NEW_ONLY]
+            .into_iter()
+            .find(|entry| value == *entry || value.strip_prefix(entry).is_some_and(|rest| rest.starts_with(':')))
+    }
+
+    /// What an entry asking for a speed makes of the number typed.
+    pub fn with_speed(entry: &str, cps: u32) -> TextReveal {
+        if entry == Self::NEW_ONLY { TextReveal::NewOnly(cps) } else { TextReveal::Custom(cps) }
+    }
+
+    /// The speed prompt's title for that entry.
+    pub fn speed_title(entry: &str) -> &'static str {
+        if entry == Self::NEW_ONLY { "New Only Text Reveal Speed" } else { "Custom Text Reveal Speed" }
+    }
+
     /// Characters revealed a second; 0 = off. Normal is tfr's 1200-baud default, each
-    /// step doubles (Super Fast: user request 2026-10-24); Custom is the user's number.
+    /// step doubles (Super Fast: user request 2026-10-24); Custom and New Only are the
+    /// user's number.
     pub fn chars_per_second(&self) -> f32 {
         match self {
             TextReveal::Off => 0.0,
@@ -709,7 +759,7 @@ impl TextReveal {
             TextReveal::Normal => 60.0,
             TextReveal::Fast => 120.0,
             TextReveal::SuperFast => 240.0,
-            TextReveal::Custom(cps) => *cps as f32,
+            TextReveal::Custom(cps) | TextReveal::NewOnly(cps) => *cps as f32,
         }
     }
 
@@ -5669,11 +5719,15 @@ impl World {
     /// When the console's text-reveal effect (src/reveal.rs) starts typing `line` on: its
     /// arrival, the console's switch to this world (`console_shown_at`) or more-mode's
     /// release of it (`console_released`), whichever came last. A line arriving after the
-    /// switch keeps its own moment.
-    pub(crate) fn console_reveal_anchor(&self, line: &OutputLine) -> SystemTime {
+    /// switch keeps its own moment. `new_only` (TextReveal::NewOnly): the switch counts
+    /// only for a line newer than the console had shown when it last left this world
+    /// (`console_seen_seq`), so a switch with nothing new types nothing on.
+    pub(crate) fn console_reveal_anchor(&self, line: &OutputLine, new_only: bool) -> SystemTime {
         let mut at = line.timestamp;
         if let Some(shown) = self.console_shown_at {
-            at = at.max(shown);
+            if !new_only || self.console_seen_seq.is_none_or(|seen| line.seq > seen) {
+                at = at.max(shown);
+            }
         }
         for released in &self.console_released {
             if (released.first_seq..=released.last_seq).contains(&line.seq) {
@@ -19995,12 +20049,12 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 }
                 _ => {}
             }
-            // Cycled onto Text Reveal's Custom entry (reveal_speed.rs): ask for the number.
-            // The popup is looked up afresh: Esc and Cancel above closed it.
+            // Cycled onto Text Reveal's Custom or New Only entry (reveal_speed.rs): ask for
+            // the number. The popup is looked up afresh: Esc and Cancel above closed it.
             let custom_picked = app.popup_manager.current().is_some_and(|s| {
                 s.definition.id == popup::PopupId("setup")
                     && s.get_selected(SETUP_FIELD_TEXT_REVEAL).map(str::to_string) != reveal_before
-                    && popup::definitions::setup::text_reveal_custom_picked(s)
+                    && popup::definitions::setup::text_reveal_speed_picked(s).is_some()
             });
             if custom_picked {
                 popup::definitions::reveal_speed::open_reveal_speed_prompt(&mut app.popup_manager, reveal_before.as_deref().unwrap_or("off"));
@@ -20008,10 +20062,10 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             return NewPopupAction::None;
         }
 
-        // The Custom Text Reveal Speed prompt over /setup (reveal_speed.rs): OK puts the
-        // number on the Setup select, Cancel and Esc put the entry before back.
+        // The Custom / New Only Text Reveal Speed prompt over /setup (reveal_speed.rs): OK
+        // puts the number on the Setup select, Cancel and Esc put the entry before back.
         if is_reveal_speed {
-            use popup::definitions::reveal_speed::{REVEAL_SPEED_BTN_CANCEL, REVEAL_SPEED_BTN_OK, REVEAL_SPEED_PREVIOUS, typed_speed};
+            use popup::definitions::reveal_speed::{REVEAL_SPEED_BTN_CANCEL, REVEAL_SPEED_BTN_OK, REVEAL_SPEED_PREVIOUS, typed_value};
             use popup::definitions::setup::set_text_reveal_value;
             enum SpeedAction { Ok, Cancel, None }
             let on_button = |state: &popup::PopupState| {
@@ -20059,11 +20113,11 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 _ => SpeedAction::None,
             };
             match action {
-                SpeedAction::Ok => match typed_speed(state) {
-                    Ok(cps) => {
+                SpeedAction::Ok => match typed_value(state) {
+                    Ok(value) => {
                         app.popup_manager.close();
                         if let Some(setup) = app.popup_manager.current_mut() {
-                            set_text_reveal_value(setup, &TextReveal::Custom(cps).name());
+                            set_text_reveal_value(setup, &value.name());
                         }
                     }
                     Err(problem) => {

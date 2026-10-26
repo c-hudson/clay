@@ -9449,8 +9449,12 @@
     // user ruling 2026-10-25: 240 was too fast on the phone and right in a browser and the WebView GUI).
     const REVEAL_CPS_ANDROID_SUPERFAST = 200;
     // Custom (TextReveal::Custom, user request 2026-10-25): the Settings' Custom entry asks
-    // for the number (showRevealSpeedDialog); the value's name is then custom:<n>.
+    // for the number (showRevealSpeedDialog); the value's name is then custom:<n>. New Only
+    // (TextReveal::NewOnly, 2026-10-26) asks the same way and is new:<n>: a world switch
+    // types on only lines this page hadn't shown (revealOptions).
     const REVEAL_CUSTOM = 'custom', REVEAL_CUSTOM_MIN = 1, REVEAL_CUSTOM_MAX = 10000;
+    const REVEAL_NEW_ONLY = 'new';
+    const REVEAL_SPEED_ENTRIES = { [REVEAL_CUSTOM]: 'Custom', [REVEAL_NEW_ONLY]: 'New Only' };
     const REVEAL_CUSTOM_PROBLEM = 'Enter a whole number from 1 to 10000';
     let textReveal = 'off';        // this page's own TextReveal name (kept per interface key)
     let textRevealSynced = false;  // the server sent the per-interface map (one from before the effect sends none)
@@ -9459,10 +9463,14 @@
     // Set by lineHtml(): the delay to the line's next frame, null when it drew the line whole.
     let revealFrameNext = null;
     function textRevealCps() {
-        const custom = revealCustomCps(textReveal);
-        if (custom !== null) return custom;
+        const typed = revealCustomCps(textReveal);
+        if (typed !== null) return typed;
         if (textReveal === 'superfast' && fontProfileKey === 'app-android') return REVEAL_CPS_ANDROID_SUPERFAST;
         return REVEAL_CPS[textReveal] || 0;
+    }
+    // TextReveal::new_only: a switch types on only what this page hadn't shown.
+    function textRevealNewOnly() {
+        return revealSpeedEntry(textReveal) === REVEAL_NEW_ONLY && revealCustomCps(textReveal) !== null;
     }
     // TextReveal::parse_custom: a whole number in the range, else null.
     function revealParseCustom(text) {
@@ -9471,16 +9479,30 @@
         const n = parseInt(t, 10);
         return n >= REVEAL_CUSTOM_MIN && n <= REVEAL_CUSTOM_MAX ? n : null;
     }
-    // The number of a custom value's name (TextReveal::custom_cps), else null.
-    function revealCustomCps(name) {
-        return typeof name === 'string' && name.startsWith(REVEAL_CUSTOM + ':') ? revealParseCustom(name.slice(REVEAL_CUSTOM.length + 1)) : null;
+    // TextReveal::speed_entry: the entry asking for a speed that a name or select value is
+    // (custom, new - bare or with a number), else null.
+    function revealSpeedEntry(name) {
+        if (typeof name !== 'string') return null;
+        for (const entry of [REVEAL_CUSTOM, REVEAL_NEW_ONLY]) {
+            if (name === entry || name.startsWith(entry + ':')) return entry;
+        }
+        return null;
     }
-    // The Settings' Text Reveal select (the console's text_reveal_options): a custom value
-    // sits on the Custom entry, relabelled "Custom (n)"; a preset is its own entry.
+    // The typed number of a custom:<n> or new:<n> name (TextReveal::typed_cps), else null.
+    function revealCustomCps(name) {
+        const entry = revealSpeedEntry(name);
+        return entry && name.length > entry.length ? revealParseCustom(name.slice(entry.length + 1)) : null;
+    }
+    // The Settings' Text Reveal select (the console's text_reveal_options): a value with a
+    // typed speed sits on its entry, relabelled "Custom (n)" / "New Only (n)"; a preset is
+    // its own entry.
     function showTextRevealChoice(select, name) {
         const cps = revealCustomCps(name);
-        setSelectOptionText(select, REVEAL_CUSTOM, cps === null ? 'Custom' : 'Custom (' + cps + ')');
-        select.value = cps === null ? name : REVEAL_CUSTOM;
+        const own = cps === null ? null : revealSpeedEntry(name);
+        for (const entry in REVEAL_SPEED_ENTRIES) {
+            setSelectOptionText(select, entry, entry === own ? REVEAL_SPEED_ENTRIES[entry] + ' (' + cps + ')' : REVEAL_SPEED_ENTRIES[entry]);
+        }
+        select.value = own || name;
         if (select.selectedIndex < 0) select.value = 'off';
         updateCustomDropdown(select);
     }
@@ -9705,10 +9727,19 @@
     }
 
     // When a line's reveal starts: its live arrival or the switch to its world, whichever
-    // came last; null when the setting is off or nothing stamped it.
+    // came last; null when the setting is off or nothing stamped it. New Only: the switch
+    // counts only for a line newer than this page had shown when it last left the world
+    // (_seenSeq, as the console's World::console_reveal_anchor), so a switch with nothing
+    // new draws the screen whole.
     function revealOptions(lineObj, world, now) {
         if (textRevealCps() <= 0 || !lineObj || typeof lineObj !== 'object') return null;
-        const at = Math.max(lineObj._revealAt || -Infinity, (world && world._revealShownAt) || -Infinity);
+        let shownAt = (world && world._revealShownAt) || -Infinity;
+        if (shownAt !== -Infinity && textRevealNewOnly()) {
+            const seen = world._seenSeq;
+            const unseen = typeof lineObj.seq === 'number' && !lineObj.from_archive && (typeof seen !== 'number' || lineObj.seq > seen);
+            if (!unseen) shownAt = -Infinity;
+        }
+        const at = Math.max(lineObj._revealAt || -Infinity, shownAt);
         if (at === -Infinity) return null;
         if (typeof lineObj.seq !== 'number') lineObj._revealSeed = lineObj._revealSeed || revealSeedCounter++;
         return { seed: typeof lineObj.seq === 'number' ? lineObj.seq : lineObj._revealSeed, elapsed: ((now || performance.now()) - at) / 1000 };
@@ -19040,8 +19071,9 @@
         }
         if (elements.setupTextRevealSelect) {
             elements.setupTextRevealSelect.onchange = function() {
-                // Custom asks for the number; the prompt's Cancel puts the choice before back.
-                if (this.value === REVEAL_CUSTOM) showRevealSpeedDialog(this, setupTextReveal);
+                // Custom and New Only ask for the number; the prompt's Cancel puts the choice
+                // before back.
+                if (revealSpeedEntry(this.value)) showRevealSpeedDialog(this, setupTextReveal, revealSpeedEntry(this.value));
                 else setupTextReveal = this.value;
             };
         }
@@ -19904,11 +19936,12 @@
     // retry (allow_insecure: true) can resend them without prompting the user again.
     let pendingImportCredentials = null;
 
-    // Custom Text Reveal Speed (the console's reveal_speed popup, the native GUI's
-    // RevealSpeed dialog): the number the Settings' Custom entry asks for. OK or Enter
-    // makes the choice custom:<n>, shown on the Custom entry as "Custom (n)"; Cancel or
-    // Escape puts `previous` back on the select.
-    function showRevealSpeedDialog(select, previous) {
+    // Custom / New Only Text Reveal Speed (the console's reveal_speed popup, the native
+    // GUI's RevealSpeed dialog): the number the Settings' Custom or New Only entry
+    // (`entry`) asks for. OK or Enter makes the choice <entry>:<n>, shown on that entry as
+    // "Custom (n)" / "New Only (n)"; Cancel or Escape puts `previous` back on the select.
+    function showRevealSpeedDialog(select, previous, entry) {
+        entry = entry || REVEAL_CUSTOM;
         let dlg = document.getElementById('reveal-speed-dialog');
         if (!dlg) {
             dlg = document.createElement('div');
@@ -19916,10 +19949,11 @@
             dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
             document.body.appendChild(dlg);
         }
-        const current = revealCustomCps(previous);
+        // Prefilled with the entry's own number, when the choice before was that entry's.
+        const current = revealSpeedEntry(previous) === entry ? revealCustomCps(previous) : null;
         dlg.innerHTML = sanitizeHtml(`
             <div class="modal-content js-dialog" style="max-width:360px;width:90%;">
-                <div class="js-dialog-title">Custom Text Reveal Speed</div>
+                <div class="js-dialog-title">${REVEAL_SPEED_ENTRIES[entry]} Text Reveal Speed</div>
                 <label style="display:block;margin-bottom:8px;">Characters a second (1 to 10000)<br>
                     <input id="reveal-speed-input" type="text" style="width:100%;box-sizing:border-box;padding:6px;margin-top:4px;" autocomplete="off">
                 </label>
@@ -19944,7 +19978,7 @@
                 input.focus();
                 return;
             }
-            setupTextReveal = REVEAL_CUSTOM + ':' + cps;
+            setupTextReveal = entry + ':' + cps;
             showTextRevealChoice(select, setupTextReveal);
             hideRevealSpeedDialog();
         }

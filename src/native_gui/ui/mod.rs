@@ -146,6 +146,8 @@ pub struct ClayView {
     more: HashMap<String, MoreMode>,
     /// The text-reveal effect (src/reveal.rs) as the settings and theme have it; None = off.
     reveal: Option<crate::reveal::Reveal>,
+    /// The setting is New Only: a switch types on only lines this window hadn't shown.
+    reveal_new_only: bool,
     /// When each line was shown live (an arrival, or more-mode letting it through), and
     /// when the view last switched to each world (by name): the later one starts the
     /// line's reveal (`reveal_snapshot`; the console's `World::console_reveal_anchor`).
@@ -259,6 +261,7 @@ impl ClayView {
             scroll: ScrollHandle::default(),
             more: HashMap::new(),
             reveal: None,
+            reveal_new_only: false,
             reveal_at: HashMap::new(),
             reveal_shown: HashMap::new(),
             keys: Keys::default(),
@@ -554,15 +557,30 @@ impl ClayView {
 
     /// The text-reveal effect for this frame: its look, and when each shown line's reveal
     /// started - its live arrival (`reveal_at`) or the switch to its world (`reveal_shown`),
-    /// whichever came last. None when it is off, or on a shell world.
+    /// whichever came last; in New Only, the switch only for a line newer than this window
+    /// had shown when it last left the world (`Textdiv::seen`, the console's
+    /// `World::console_reveal_anchor`). None when it is off, or on a shell world.
     fn reveal_snapshot(&self, lines: &[(u64, Arc<StyledLine>)], shell: bool) -> Option<output::RevealSnapshot> {
         let reveal = self.reveal.filter(|_| !shell)?;
         let now = Instant::now();
         let fresh = |at: &Instant| now.saturating_duration_since(*at).as_secs_f32() <= crate::reveal::MAX_SECS + 1.0;
-        let shown = self.session.core.current_world().and_then(|w| self.reveal_shown.get(&w.name)).filter(|at| fresh(at)).copied();
+        let world = self.session.core.current_world();
+        let shown = world.and_then(|w| self.reveal_shown.get(&w.name)).filter(|at| fresh(at)).copied();
+        // New Only, just after a switch: the lines that arrived since this window last left
+        // the world - the newest ones, so the walk stops at the first one it had shown.
+        let unseen: Option<std::collections::HashSet<u64>> = world.filter(|_| self.reveal_new_only && shown.is_some()).map(|w| {
+            let seen = self.textdiv.seen(&w.name);
+            w.lines.iter().rev()
+                .filter(|l| !l.from_archive)
+                .filter_map(|l| l.seq.map(|seq| (l.id, seq)))
+                .take_while(|(_, seq)| seen.is_none_or(|s| *seq > s))
+                .map(|(id, _)| id)
+                .collect()
+        });
         let mut anchors = HashMap::new();
         for (id, _) in lines {
             let own = self.reveal_at.get(id).filter(|at| fresh(at)).copied();
+            let shown = shown.filter(|_| unseen.as_ref().is_none_or(|u| u.contains(id)));
             let at = match (own, shown) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
@@ -853,9 +871,10 @@ impl ClayView {
         }
         // The text-reveal effect: the setting's speed (this GUI's own Super Fast), in the
         // theme's colours.
-        let mine = s.text_reveal_profiles.get(crate::font_profile::native_key()).map_or("off", String::as_str);
-        let cps = crate::TextReveal::from_name(mine).native_chars_per_second();
+        let mine = crate::TextReveal::from_name(s.text_reveal_profiles.get(crate::font_profile::native_key()).map_or("off", String::as_str));
+        let cps = mine.native_chars_per_second();
         self.reveal = (cps > 0.0).then(|| crate::reveal::Reveal::for_gui(cps, self.theme.is_light()));
+        self.reveal_new_only = mine.new_only();
         // This GUI's fonts on this OS: its own, or the shared ones (src/font_profile.rs).
         let font = s.font_for(crate::font_profile::native_key());
         if font.size_desktop > 0.0 {
