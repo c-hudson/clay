@@ -8210,7 +8210,7 @@
             { heading: 'Display' },
             { l: '/menu', r: 'Menu of windows and popups (console)' },
             { l: '/flush', r: 'Clear output buffer' },
-            { l: '/dump', r: 'Dump scrollback to file' },
+            { l: '/dump [-w world] [-n lines]', r: 'Dump scrollback to file' },
             { l: '/note [file]', r: 'Open split-screen editor' },
             { l: '/window [world]', r: 'Open new browser window/tab' },
             { l: '/window --grep [pattern]', r: 'Open grep/filter window' },
@@ -9331,16 +9331,95 @@
     // a copy still has it.
     const EMOJI_OR_TEXT_FORM = new RegExp(EMOJI_CLUSTER.source + '|(\\p{Extended_Pictographic})(\\uFE0E?)', 'gu');
 
+    // Or a character that may need a box (glyphFitStyle): a symbol, punctuation, an "other
+    // number" or a Greek letter above Latin-1, outside the ranges already drawn as cells
+    // (box drawing, block elements) and the right-to-left scripts. The native GUI's
+    // core::style::glyph_fit_candidate is the same rule.
+    const EMOJI_TEXT_OR_FIT = new RegExp(EMOJI_OR_TEXT_FORM.source
+        + '|((?=[^\\x00-\\xA0])(?![\\u0590-\\u08FF\\u2500-\\u259F])[\\p{S}\\p{P}\\p{No}\\u0370-\\u03FF\\u1F00-\\u1FFF])', 'gu');
+
+    // A character whose glyph is not one cell wide in the output's font - one the font
+    // lacks, drawn from a fallback font of other widths: FANSI art's ■ (CP437 0xFE) is a
+    // quarter of a column wider on Android and ☼ half of one, and every row holding one
+    // ended to the right of the rest (user report 2026-10-25). It is drawn in a box
+    // exactly one cell wide (.gfit), centred, and drawn smaller when wider, as the native
+    // GUI fits the advance it shaped. Measured once per font, at 100px against '0' (1ch),
+    // a text-form symbol in its own font list (.emoji-text): '' = fits already, null = not
+    // laid out (the output hidden), so ask again later.
+    const glyphFitCache = new Map();
+    let glyphFitFont = '';
+    function measureGlyphFit(c, textForm) {
+        const out = elements.output;
+        if (!out) return null;
+        const probe = document.createElement('span');
+        probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;left:-9999px;top:0;'
+            + 'font-size:100px;letter-spacing:0;word-spacing:0;';
+        const zero = document.createElement('span');
+        zero.textContent = '0'.repeat(10);
+        const glyph = document.createElement('span');
+        glyph.textContent = c.repeat(10);
+        if (textForm) glyph.className = 'emoji-text';
+        probe.append(zero, glyph);
+        out.appendChild(probe);
+        const cell = zero.getBoundingClientRect().width;
+        const w = glyph.getBoundingClientRect().width;
+        probe.remove();
+        if (!(cell > 0) || !(w > 0)) return null;
+        const r = w / cell;
+        // To a thousandth: a glyph 2% wide of the cell still puts a row of 80 of them a
+        // column and a half off.
+        if (Math.abs(r - 1) < 0.001) return '';
+        // Wider: a smaller font whose advance is the cell (r ch of the smaller font is one
+        // of the output's). Narrower: the cell, centred.
+        return r > 1 ? 'font-size:' + (1 / r).toFixed(4) + 'em;width:' + r.toFixed(4) + 'ch' : 'width:1ch';
+    }
+    function glyphFitStyle(c, textForm, font) {
+        if (font !== glyphFitFont) {
+            glyphFitCache.clear();
+            glyphFitFont = font;
+        }
+        const key = (textForm ? 't' : 'p') + c;
+        let style = glyphFitCache.get(key);
+        if (style === undefined) {
+            style = measureGlyphFit(c, textForm);
+            if (style !== null) glyphFitCache.set(key, style);
+        }
+        return style || '';
+    }
+    // A font still loading was measured as its fallback: measure again.
+    if (document.fonts && document.fonts.addEventListener) {
+        document.fonts.addEventListener('loadingdone', function() {
+            if (!glyphFitCache.size) return;
+            glyphFitCache.clear();
+            renderOutput({ preserveScroll: true });
+        });
+    }
+
     // Emoji in the colour emoji font. A font earlier in the output's font list can have its
     // own black-and-white glyph for an emoji - Windows' Cascadia Code draws ⬛⬜ as a filled
     // and an outlined square, which read as one shape - and the font list wins over the
-    // emoji fallback. Text between tags only, never an attribute (a link's href).
+    // emoji fallback. Text between tags only, never an attribute (a link's href). And a
+    // symbol whose glyph is not one cell wide, in its box (glyphFitStyle).
     function wrapEmoji(html) {
-        if (!/[\u00A9-\u{1FAFF}]/u.test(html)) return html;
+        if (!/[^\x00-\xA0]/.test(html)) return html;
+        let font = null;
+        const fit = (c, textForm) => {
+            if (font === null) {
+                font = elements.output ? getComputedStyle(elements.output).fontFamily + '|' + document.body.style.fontWeight : '';
+            }
+            return charCells(c.codePointAt(0)) === 1 ? glyphFitStyle(c, textForm, font) : '';
+        };
         return html.split(/(<[^>]*>)/).map((part, i) =>
-            i % 2 === 1 ? part : part.replace(EMOJI_OR_TEXT_FORM, (m, symbol, vs15) => symbol === undefined
-                ? '<span class="emoji">' + m + '</span>'
-                : '<span class="emoji-text">' + symbol + '</span>' + vs15)).join('');
+            i % 2 === 1 ? part : part.replace(EMOJI_TEXT_OR_FIT, (m, symbol, vs15, other) => {
+                if (other !== undefined) {
+                    const style = fit(other, false);
+                    return style ? '<span class="gfit" style="' + style + '">' + other + '</span>' : other;
+                }
+                if (symbol === undefined) return '<span class="emoji">' + m + '</span>';
+                const style = fit(symbol, true);
+                return (style ? '<span class="emoji-text gfit" style="' + style + '">' : '<span class="emoji-text">')
+                    + symbol + '</span>' + vs15;
+            })).join('');
     }
 
     // One drawn line's HTML, the same for both paths. `o`: ts, fromServer, archiveSourced,

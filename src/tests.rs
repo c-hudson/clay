@@ -20768,6 +20768,105 @@ fn a_clients_commands_on_the_console_master_are_its_own() {
     assert!(app.worlds[0].output_lines.iter().any(|l| l.text.contains("my dump macro")));
 }
 
+/// `/dump [-w world] [-n lines]`, each value attached or the next word: kept as typed by
+/// parse_command, then read by the one resolver the console and both server handlers use.
+#[test]
+fn dump_takes_a_world_and_a_line_count() {
+    let words = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    assert_eq!(parse_command("/dump"), Command::Dump { args: vec![] });
+    assert_eq!(parse_command("/DUMP -w 8bit -n200"), Command::Dump { args: words("-w 8bit -n200") });
+    for yes in ["/dump", "/dump -w x -n 3", " /Dump "] {
+        assert!(is_dump_command(yes), "{yes:?}");
+    }
+    for no in ["/dumpx", "say /dump", ""] {
+        assert!(!is_dump_command(no), "{no:?}");
+    }
+
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("Alpha"));
+    app.worlds.push(World::new("8bit"));
+    let scope = |s: &str| app.resolve_dump_scope(&words(s));
+    assert_eq!(scope(""), Ok(DumpScope::default()));
+    for both in ["-w 8bit -n 200", "-w8bit -n200", "-n 200 -w 8BIT", "-n200 -w 8bit"] {
+        assert_eq!(scope(both), Ok(DumpScope { world: Some(1), lines: Some(200) }), "{both:?}");
+    }
+    assert_eq!(scope("-w 8bit"), Ok(DumpScope { world: Some(1), lines: None }));
+    assert_eq!(scope("-n5"), Ok(DumpScope { world: None, lines: Some(5) }), "-n alone: every world");
+    assert_eq!(scope("-w nope"), Err("No world named 'nope'.".to_string()));
+    for bad in ["8bit", "8bit 200", "-w", "-n", "-w 8bit -n", "-n 0", "-n -3", "-n abc", "-x 3", "-w 8bit 200"] {
+        assert_eq!(scope(bad), Err("Usage: /dump [-w world] [-n lines]".to_string()), "{bad:?}");
+    }
+}
+
+/// `/dump -w <world> -n <lines>` writes that world alone, its last lines across the output
+/// and pending boundary with their escapes, and tells the client that asked, in both
+/// server handlers. One test, because every dump writes the same dump.log.
+#[tokio::test]
+async fn a_dump_of_one_world_writes_only_its_last_lines() {
+    let mut app = App::new();
+    app.worlds.clear();
+    let mut alpha = World::new("Alpha");
+    alpha.output_lines.push(OutputLine::new("alpha line".into(), 0));
+    let mut mush = World::new("8bit");
+    for i in 0..5 {
+        mush.output_lines.push(OutputLine::new(format!("\x1b[31mout {i}\x1b[0m"), i));
+    }
+    for i in 5..7 {
+        mush.pending_lines.push(OutputLine::new(format!("pend {i}"), i));
+    }
+    app.worlds.push(alpha);
+    app.worlds.push(mush);
+
+    let args = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    let scope = app.resolve_dump_scope(&args("-w 8bit -n 3")).unwrap();
+    assert_eq!(scope.line_window(&app.worlds[1]), 4..7);
+    let text = std::fs::read_to_string(app.write_debug_dump("test", &scope).unwrap()).unwrap();
+    assert!(!text.contains("[Alpha]") && !text.contains("alpha line"), "{text}");
+    assert!(text.contains("=== WORLD 1 [8bit]"), "{text}");
+    assert!(text.contains("--- OUTPUT LINES (last 1 of 5) ---"), "{text}");
+    assert!(text.contains("--- PENDING LINES (2) ---"), "{text}");
+    let dumped: Vec<&str> = text.lines().filter(|l| l.contains("out ") || l.contains("pend ")).collect();
+    assert_eq!(dumped.len(), 3, "{dumped:?}");
+    assert!(dumped[0].ends_with(",\x1b[31mout 4\x1b[0m"), "{dumped:?}");
+    assert!(dumped[1].starts_with("P,") && dumped[1].ends_with(",pend 5"), "{dumped:?}");
+    assert!(dumped[2].ends_with(",pend 6"), "{dumped:?}");
+
+    // More lines than the world has is all of them; no scope is every world, as before.
+    let all = app.resolve_dump_scope(&args("-w8bit -n500")).unwrap();
+    assert_eq!(all.line_window(&app.worlds[1]), 0..7);
+    let text = std::fs::read_to_string(app.write_debug_dump("test", &DumpScope::default()).unwrap()).unwrap();
+    assert!(text.contains("alpha line") && text.contains("--- OUTPUT LINES (5) ---") && text.contains("out 0"), "{text}");
+
+    // -n alone: every world, each its own last lines.
+    let each = app.resolve_dump_scope(&args("-n 1")).unwrap();
+    let text = std::fs::read_to_string(app.write_debug_dump("test", &each).unwrap()).unwrap();
+    assert!(text.contains("alpha line") && text.contains("pend 6") && !text.contains("pend 5") && !text.contains("out 4"), "{text}");
+    assert!(text.contains("--- OUTPUT LINES (last 0 of 5) ---") && text.contains("--- PENDING LINES (last 1 of 2) ---"), "{text}");
+
+    for handler_b in [false, true] {
+        let (gui_tx, mut gui_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.gui_tx = Some(gui_tx);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        app.worlds[1].lines_since_pause = 7;
+        for command in ["/dump -w 8bit -n2", "/dump -w Nope", "/dump -w 8bit -n x", "/dump -n 1"] {
+            send_to_handler(&mut app, handler_b, WsMessage::SendCommand { world_index: 1, command: command.into() }, &event_tx).await;
+        }
+        let mut told = Vec::new();
+        while let Ok(m) = gui_rx.try_recv() {
+            if let WsMessage::ServerData { data, .. } = m {
+                told.push(data);
+            }
+        }
+        assert_eq!(told.len(), 4, "handler_b={handler_b}: {told:?}");
+        assert!(told[0].starts_with("Dumped 2 lines of 8bit to ") && told[0].ends_with("dump.log"), "{told:?}");
+        assert_eq!(told[1], "No world named 'Nope'.");
+        assert_eq!(told[2], "Usage: /dump [-w world] [-n lines]");
+        assert!(told[3].starts_with("Dumped 2 lines from 2 worlds to "), "{told:?}");
+        assert_eq!(app.worlds[1].lines_since_pause, 7, "/dump is passive");
+    }
+}
+
 /// Which typed client lines TF takes first (App::client_line_for_tf), as at the console.
 #[test]
 fn client_lines_for_tf_are_the_consoles() {

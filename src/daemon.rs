@@ -772,8 +772,9 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             // Use shared command parsing (same as console mode)
             let parsed = crate::parse_typed_line(&command);
 
-            // Reset more-mode counter when user sends a command
-            if world_index < app.worlds.len() {
+            // Reset more-mode counter when user sends a command - except /dump, which is
+            // passive, as at the console.
+            if world_index < app.worlds.len() && !crate::is_dump_command(&command) {
                 app.worlds[world_index].lines_since_pause = 0;
                 app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
                 // Also clear paused flag if no pending lines
@@ -1009,7 +1010,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     app.emit_client_text(world_index, &format!("Notification sent: {}", message), true);
                 }
                 Command::Say { text } => app.ws_say(client_id, world_index, &text),
-                Command::Dump => app.ws_dump(client_id, world_index, "daemon"),
+                Command::Dump { args } => app.ws_dump(client_id, world_index, "daemon", &args),
                 Command::Mssp => {
                     execute_mssp_command(app, world_index, true);
                 }

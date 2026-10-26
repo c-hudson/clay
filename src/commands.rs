@@ -1590,10 +1590,18 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 "  Example: /url https://github.com/c-hudson/clay",
             ], false);
         }
-        Command::Dump => {
+        Command::Dump { args } => {
             // Don't use add_output on success — it resets lines_since_pause and
             // scrolls. /dump must be passive and not disturb more-mode state.
-            let _ = app.write_debug_dump("console");
+            match app.resolve_dump_scope(&args) {
+                Ok(scope) => {
+                    let _ = app.write_debug_dump("console", &scope);
+                }
+                Err(e) => {
+                    let world_idx = app.current_world_index;
+                    app.emit_usage(world_idx, &[e.as_str()], false);
+                }
+            }
         }
         Command::Mssp => {
             let world_idx = app.current_world_index;

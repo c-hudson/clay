@@ -46,7 +46,7 @@ EOF
 done <<'PAGES'
 Prose,16 colours
 256 colours,Truecolour,Attributes
-Block art,Box drawing
+Block art,Box drawing,FANSI symbols
 CJK,Emoji
 Long words and URLs,Combining marks and scripts,Tabs and spacing,Discord and MUD tags
 PAGES

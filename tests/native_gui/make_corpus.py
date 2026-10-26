@@ -79,6 +79,18 @@ line("│ Aragorn  │ 87       │  ║ ┃ heavy  ║")
 line("└──────────┴──────────┘  ╚══════════╝")
 line("╭─rounded─╮ ━━━ ┅┅┅ ╱╲╳")
 
+section("FANSI symbols")
+# What Clay's FANSI (CP437) decoder makes of 0x01-0x1F, 0x7F and the high half outside the
+# block and box ranges, twenty to a row between bars on a background. A font without them
+# draws them from a fallback font of other widths; every row must still end where the
+# row of zeros does (app.js glyphFitStyle, the native core::style::glyph_fit).
+fansi = ("☺☻♥♦♣♠♂♀☼►◄↕‼¶§▬↨↑↓→∟↔▲▼⌂"
+         "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»"
+         "αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■")
+line(f"{E}30;47m|{'0' * 20}|{R}  the grid")
+for k in range(0, len(fansi), 20):
+    line(f"{E}30;47m|{fansi[k:k + 20].ljust(20)}|{R}")
+
 section("CJK")
 line("中文：你好，世界！这是一行中文文本，用来测试换行和字体回退。")
 line("日本語：こんにちは、世界。カタカナとひらがなと漢字が混ざっています。")

@@ -106,8 +106,8 @@ gpui-kit-assets = { version = "=0.7.1", optional = true }
 unicode-linebreak = { version = "0.1.5", optional = true }
 unicode-segmentation = { version = "1.12", optional = true }
 # Emoji_Presentation and friends: which clusters the browser draws from the colour
-# emoji font.
-unicode-properties = { version = "0.1.4", optional = true, default-features = false, features = ["emoji"] }
+# emoji font. General categories: which symbols are fitted to a cell (glyph_fit_candidate).
+unicode-properties = { version = "0.1.4", optional = true, default-features = false, features = ["emoji", "general-category"] }
 # Bidi classes: rows holding right-to-left text are reshaped on their own for display.
 unicode-bidi = { version = "0.3", optional = true }
 # Discord emoji (PNG, animated GIF) decoded for the output view, and

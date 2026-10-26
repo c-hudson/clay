@@ -35,7 +35,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::emoji::{self, Look};
 use super::fonts::{FontClass, Fonts, bundled_index, class_of};
 use super::ink;
-use crate::native_gui::core::style::{Cell, DiscordEmoji, Rgb, Run, StyledLine};
+use crate::native_gui::core::style::{Cell, DiscordEmoji, GlyphFit, Rgb, Run, StyledLine, glyph_fit, glyph_fit_candidate};
 use crate::native_gui::core::wrap::{rows_in_columns, wrap_rows};
 
 /// The GUI's `#output-container { padding: 2px 4px }` (webview_gui.rs's override of
@@ -287,6 +287,9 @@ struct LaidLine {
     rows: Vec<Range<usize>>,
     /// Per byte: drawn here rather than as a glyph (a cell, or a Discord emoji).
     no_glyph: Vec<bool>,
+    /// Per byte: a symbol whose glyph isn't one cell wide, drawn into its cell
+    /// (`core::style::glyph_fit`).
+    fit: Vec<Option<GlyphFit>>,
     /// Holds right-to-left text: such rows are reshaped for display.
     rtl: bool,
 }
@@ -443,6 +446,22 @@ fn lay_out(styled: Arc<StyledLine>, snapshot: &OutputSnapshot, m: &Metrics, widt
         }
     }
 
+    // A symbol whose glyph isn't one cell wide - a fallback font's, as FANSI's ■ and ☼
+    // were on Android - is one cell all the same, its glyph drawn into it (app.js's
+    // glyphFitStyle). Never a colour emoji's glyph.
+    let emoji_glyph: std::collections::HashSet<usize> = layout.runs.iter()
+        .flat_map(|r| r.glyphs.iter().filter(|g| g.is_emoji).map(|g| g.index))
+        .collect();
+    let mut fit: Vec<Option<GlyphFit>> = vec![None; n];
+    for (i, c) in text.char_indices() {
+        if fixed[i].is_none() && !emoji_glyph.contains(&i) && glyph_fit_candidate(c) {
+            if let Some(f) = glyph_fit(advance[i], m.ch) {
+                fixed[i] = Some(m.ch);
+                fit[i] = Some(f);
+            }
+        }
+    }
+
     // Letter spacing goes after each cluster (the last character of each), word spacing
     // after each space; neither for cells and emoji, as `#output span` has none there.
     let spaced = snapshot.letter_spacing != 0.0 || snapshot.word_spacing != 0.0;
@@ -489,7 +508,7 @@ fn lay_out(styled: Arc<StyledLine>, snapshot: &OutputSnapshot, m: &Metrics, widt
     // most wrap-columns wide.
     let width = if snapshot.wrap_columns > 0 { width.min(snapshot.wrap_columns as f32 * m.ch) } else { width };
     let rows = wrap_rows(text, &styled.breaks, width, indent, &|i| x[i]);
-    LaidLine { styled, layout, text_runs, x, cluster_origin, rows, no_glyph, rtl }
+    LaidLine { styled, layout, text_runs, x, cluster_origin, rows, no_glyph, fit, rtl }
 }
 
 /// How wide a Discord emoji is: its image at the web's height, a square until the image
@@ -978,7 +997,12 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                             continue;
                         }
                         let within = f32::from(g.position.x) - line.cluster_origin[i];
-                        let origin = point(px(left + line.x[i] - x0 + within), px(baseline) + g.position.y);
+                        // A fitted symbol: into its cell, smaller if its glyph is wider.
+                        let (dx, size) = match line.fit[i] {
+                            Some(f) => (f.dx, px(f32::from(m.font_size) * f.scale)),
+                            None => (0.0, m.font_size),
+                        };
+                        let origin = point(px(left + line.x[i] - x0 + within + dx), px(baseline) + g.position.y);
                         if let (Some(f), Draw::Glitch) = (frame, draw) {
                             let c = text[i..].chars().next().unwrap_or(' ');
                             if paint_glitch(window, &p, f, vr.row, &range, line, i, c, px(left + line.x[i] - x0), baseline) {
@@ -988,7 +1012,7 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                         let _ = if g.is_emoji {
                             window.paint_emoji(origin, run.font_id, g.id, m.font_size)
                         } else {
-                            window.paint_glyph(origin, run.font_id, g.id, m.font_size, hsla(color_at(i)))
+                            window.paint_glyph(origin, run.font_id, g.id, size, hsla(color_at(i)))
                         };
                         if !g.is_emoji && style_at(i).1 {
                             if let Some(face) = p.bundled.iter().position(|f| *f == run.font_id) {

@@ -1420,7 +1420,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         let input = app.take_input_line(record_history);
         if !input.is_empty() || app.current_world().connected {
             // /dump is passive — don't reset more-mode state
-            let is_dump = input.trim().eq_ignore_ascii_case("/dump");
+            let is_dump = crate::is_dump_command(&input);
             if !is_dump {
                 app.current_world_mut().reset_more_mode_on_send();
             }

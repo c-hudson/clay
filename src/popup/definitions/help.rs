@@ -160,9 +160,14 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "Clears the output buffer for the current world.",
         ],
         "dump" => vec![
-            "/dump                      Dump scrollback to file",
+            "/dump [-w world] [-n lines] Dump scrollback to file",
             "",
-            "Writes the current world's output buffer to a file.",
+            "Writes Clay's state and every world's output buffer",
+            "to dump.log in Clay's directory, on the machine Clay",
+            "runs on. -w writes only that world; -n only the last",
+            "that many lines of each world written. The space",
+            "after -w and -n is optional.",
+            "Example: /dump -w mymud -n 200",
         ],
         "mssp" => vec![
             "/mssp                      Show MSSP server status",

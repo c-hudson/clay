@@ -207,6 +207,18 @@ body {
     line-height: 0;
 }
 
+/* A character whose glyph is not one cell wide in the output's font (app.js
+   glyphFitStyle: FANSI's ■ and ☼ from a fallback font): a box exactly one cell wide, its
+   width (and, for a wider glyph, a smaller font) set on the element, the glyph centred.
+   An ANSI underline is the parent span's, which a box would otherwise not get. */
+#output .gfit {
+    display: inline-block;
+    text-align: center;
+    white-space: pre;
+    letter-spacing: 0;
+    text-decoration: inherit;
+}
+
 /* A Discord emoji (app.js convertDiscordEmojis): a little taller than the text, as on
    Discord, but the negative margins keep it from making its row taller than the others
    (the native GUI's rows are one line each too, and the History count assumes it). */

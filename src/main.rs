@@ -2854,8 +2854,11 @@ pub enum Command {
     Unban { host: String },
     /// /testmusic - play a test ANSI music sequence
     TestMusic,
-    /// /dump - dump all scrollback buffers to ~/.clay/dump.log
-    Dump,
+    /// /dump [-w world] [-n lines] - dump the state and scrollback buffers to
+    /// ~/.clay/dump.log: every world or one, every line or each world's last `lines`. The
+    /// words are kept as typed and read by `App::resolve_dump_scope`, so every interface
+    /// reports the same errors.
+    Dump { args: Vec<String> },
     /// /mssp - show the current world's MSSP (option 70) server status
     /// (plan Job 12 / 4.2). Read-only: MSSP is server -> client only.
     Mssp,
@@ -2932,6 +2935,29 @@ pub(crate) fn parse_typed_line(line: &str) -> Command {
 }
 
 /// Parse a command string into a Command enum
+/// Whether a typed line is `/dump`, with or without arguments: it must not reset more-mode.
+pub fn is_dump_command(input: &str) -> bool {
+    input.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/dump"))
+}
+
+/// What a `/dump` writes (`App::resolve_dump_scope`): every world or one, and every line
+/// or the last `lines`.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct DumpScope {
+    pub world: Option<usize>,
+    pub lines: Option<usize>,
+}
+
+impl DumpScope {
+    /// The lines of `world` this dump writes, as positions in its output lines followed
+    /// by its pending lines (the order they arrived in).
+    pub fn line_window(&self, world: &World) -> std::ops::Range<usize> {
+        let total = world.output_lines.len() + world.pending_lines.len();
+        let keep = self.lines.map_or(total, |n| n.min(total));
+        total - keep..total
+    }
+}
+
 pub fn parse_command(input: &str) -> Command {
     let trimmed = input.trim();
 
@@ -3034,7 +3060,7 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "/testmusic" => Command::TestMusic,
-        "/dump" => Command::Dump,
+        "/dump" => Command::Dump { args: args.iter().map(|a| a.to_string()).collect() },
         "/mssp" => Command::Mssp,
         "/stats" => Command::Stats,
         "/msdp" => parse_msdp_command(args),
@@ -6914,7 +6940,7 @@ impl App {
                 }
                 // /dump is passive — don't reset more-mode state (mirrors the real Enter
                 // key in input_handler::handle_key_event).
-                if !input.trim().eq_ignore_ascii_case("/dump") {
+                if !is_dump_command(&input) {
                     self.current_world_mut().reset_more_mode_on_send();
                 }
                 Some(KeyAction::SendCommand(input))
@@ -7268,13 +7294,55 @@ impl App {
         self.ws_tell(client_id, world_index, &format!("TTS: {}", text));
     }
 
+    /// `/dump`'s arguments as typed (`Command::Dump`): `-w world` and `-n lines`, each
+    /// value attached or the next word, in either order. The world is found as `/worlds`
+    /// finds it; the lines must be a positive whole number. One function, so the console
+    /// and every client get the same errors.
+    pub(crate) fn resolve_dump_scope(&self, args: &[String]) -> Result<DumpScope, String> {
+        const USAGE: &str = "Usage: /dump [-w world] [-n lines]";
+        let mut world = None;
+        let mut lines = None;
+        let mut words = args.iter();
+        while let Some(word) = words.next() {
+            // `-w name` or `-wname`, `-n 200` or `-n200`.
+            let (slot, attached) = match word.get(..2) {
+                Some("-w") => (&mut world, &word[2..]),
+                Some("-n") => (&mut lines, &word[2..]),
+                _ => return Err(USAGE.to_string()),
+            };
+            let value = if attached.is_empty() { words.next().ok_or_else(|| USAGE.to_string())?.as_str() } else { attached };
+            *slot = Some(value);
+        }
+        let world = match world {
+            None => None,
+            Some(name) => Some(self.find_world_index(name).ok_or_else(|| format!("No world named '{}'.", name))?),
+        };
+        let lines = match lines {
+            None => None,
+            Some(n) => match n.parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => return Err(USAGE.to_string()),
+            },
+        };
+        Ok(DumpScope { world, lines })
+    }
+
     /// A client's `/dump` (both server handlers): the dump file, and to that client only
     /// where it went (nothing broadcast: /dump must not disturb anyone's more-mode).
-    pub(crate) fn ws_dump(&mut self, client_id: u64, world_index: usize, label: &str) {
-        let total_lines: usize = self.worlds.iter().map(|w| w.output_lines.len() + w.pending_lines.len()).sum();
-        let text = match self.write_debug_dump(label) {
-            Ok(path) => format!("Dumped {} lines from {} worlds to {}", total_lines, self.worlds.len(), path.display()),
-            Err(e) => format!("Failed to create dump file: {}", e),
+    pub(crate) fn ws_dump(&mut self, client_id: u64, world_index: usize, label: &str, args: &[String]) {
+        let text = match self.resolve_dump_scope(args) {
+            Err(e) => e,
+            Ok(scope) => match self.write_debug_dump(label, &scope) {
+                Ok(path) => match scope.world {
+                    Some(wi) => format!("Dumped {} lines of {} to {}",
+                        scope.line_window(&self.worlds[wi]).len(), self.worlds[wi].name, path.display()),
+                    None => {
+                        let total_lines: usize = self.worlds.iter().map(|w| scope.line_window(w).len()).sum();
+                        format!("Dumped {} lines from {} worlds to {}", total_lines, self.worlds.len(), path.display())
+                    }
+                },
+                Err(e) => format!("Failed to create dump file: {}", e),
+            },
         };
         self.ws_tell(client_id, world_index, &text);
     }
@@ -11751,8 +11819,12 @@ impl App {
     /// Deliberately passive: never touches `add_output`/`ws_broadcast` itself
     /// (that would disturb more-mode state / scroll position) — callers
     /// decide what, if anything, to tell the user about the result.
-    pub(crate) fn write_debug_dump(&self, mode: &str) -> std::io::Result<std::path::PathBuf> {
+    ///
+    /// `scope` keeps the per-world sections to one world (`-w`) and each to its last lines
+    /// (`-n`); the global sections are always written.
+    pub(crate) fn write_debug_dump(&self, mode: &str, scope: &DumpScope) -> std::io::Result<std::path::PathBuf> {
         use std::io::Write;
+        let in_scope = |wi: usize| scope.world.is_none_or(|w| w == wi);
 
         let dump_path = clay_config_path("dump.log");
         let mut file = std::fs::File::create(&dump_path)?;
@@ -11809,7 +11881,7 @@ impl App {
             }
             for (cid, ip, acked, prev, fired) in snapshot {
                 writeln!(file, "  client {} [{}]:", cid, ip)?;
-                for (wi, world) in self.worlds.iter().enumerate() {
+                for (wi, world) in self.worlds.iter().enumerate().filter(|(wi, _)| in_scope(*wi)) {
                     let deliverable = world.deliverable_high_seq();
                     let a = acked.get(&wi).copied();
                     let behind = match (a, deliverable) {
@@ -11833,7 +11905,7 @@ impl App {
         writeln!(file)?;
 
         // Per-world state
-        for (wi, world) in self.worlds.iter().enumerate() {
+        for (wi, world) in self.worlds.iter().enumerate().filter(|(wi, _)| in_scope(*wi)) {
             let is_current = wi == self.current_world_index;
             writeln!(file, "=== WORLD {} [{}] {} ===",
                 wi, world.name, if is_current { "(CURRENT)" } else { "" })?;
@@ -11899,9 +11971,16 @@ impl App {
             writeln!(file, "effective_max_lines: {}", (eff_height as usize).saturating_sub(2))?;
             writeln!(file)?;
 
-            // Full scrollback dump (all output + pending lines)
-            writeln!(file, "--- OUTPUT LINES ({}) ---", world.output_lines.len())?;
-            for line in &world.output_lines {
+            // The scrollback (output then pending lines), or its last `scope.lines`.
+            let window = scope.line_window(world);
+            let out_len = world.output_lines.len();
+            let out = window.start.min(out_len)..out_len;
+            let pend = window.start.saturating_sub(out_len)..world.pending_lines.len();
+            let count = |shown: usize, all: usize| {
+                if shown == all { all.to_string() } else { format!("last {} of {}", shown, all) }
+            };
+            writeln!(file, "--- OUTPUT LINES ({}) ---", count(out.len(), out_len))?;
+            for line in &world.output_lines[out] {
                 let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
                 let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
                 writeln!(file, "{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
@@ -11910,8 +11989,8 @@ impl App {
             }
 
             if !world.pending_lines.is_empty() {
-                writeln!(file, "--- PENDING LINES ({}) ---", world.pending_lines.len())?;
-                for line in &world.pending_lines {
+                writeln!(file, "--- PENDING LINES ({}) ---", count(pend.len(), world.pending_lines.len()))?;
+                for line in &world.pending_lines[pend] {
                     let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
                     let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
                     writeln!(file, "P,{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
@@ -16718,7 +16797,7 @@ impl App {
                 self.emit_client_text(world_index, &format!("Notification sent: {}", message), false);
             }
             Command::Say { text } => self.ws_say(client_id, world_index, &text),
-            Command::Dump => self.ws_dump(client_id, world_index, "master-ws"),
+            Command::Dump { args } => self.ws_dump(client_id, world_index, "master-ws", &args),
             Command::Mssp => {
                 execute_mssp_command(self, world_index, false);
             }
@@ -17045,13 +17124,16 @@ impl App {
                     self.shell_input(world_index, None, Some(format!("{command}\r")), false);
                     return WsAsyncAction::Done;
                 }
-                // Reset more-mode counter when ANY client sends a command
+                // Reset more-mode counter when ANY client sends a command - except /dump,
+                // which is passive, as at the console.
                 if world_index < self.worlds.len() {
-                    self.worlds[world_index].lines_since_pause = 0;
-                    self.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
-                    // Clear paused flag if no pending lines (matches console Enter behavior)
-                    if self.worlds[world_index].pending_lines.is_empty() {
-                        self.worlds[world_index].paused = false;
+                    if !is_dump_command(&command) {
+                        self.worlds[world_index].lines_since_pause = 0;
+                        self.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                        // Clear paused flag if no pending lines (matches console Enter behavior)
+                        if self.worlds[world_index].pending_lines.is_empty() {
+                            self.worlds[world_index].paused = false;
+                        }
                     }
                     // Update client's viewing world to ensure they receive output
                     // (fixes race condition where client sends command before UpdateViewState)

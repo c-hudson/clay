@@ -279,6 +279,44 @@ fn is_block_element(c: char) -> bool {
     ('\u{2580}'..='\u{259F}').contains(&c)
 }
 
+/// A character that is drawn in a box one cell wide if its glyph isn't (`glyph_fit`): a
+/// symbol, punctuation, an "other number" or a Greek letter above Latin-1, one column
+/// wide, outside the ranges drawn as cells (box drawing, block elements) and the
+/// right-to-left scripts. app.js's EMOJI_TEXT_OR_FIT is the same rule.
+pub fn glyph_fit_candidate(c: char) -> bool {
+    use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCategory};
+    use unicode_width::UnicodeWidthChar;
+    let cp = c as u32;
+    if cp <= 0xA0 || (0x0590..=0x08FF).contains(&cp) || (0x2500..=0x259F).contains(&cp) || c.width() != Some(1) {
+        return false;
+    }
+    matches!(c.general_category_group(), GeneralCategoryGroup::Symbol | GeneralCategoryGroup::Punctuation)
+        || c.general_category() == GeneralCategory::OtherNumber
+        || (0x0370..=0x03FF).contains(&cp)
+        || (0x1F00..=0x1FFF).contains(&cp)
+}
+
+/// How a glyph `advance` wide is drawn in a cell `cell` wide: `None` when it fits (to a
+/// thousandth, as app.js's glyphFitStyle: 2% off still puts a row of 80 a column and a
+/// half out), else its offset into the cell and the scale of its font size - centred,
+/// and drawn smaller when wider. A fallback font's ■ and ☼ in FANSI art made every row
+/// holding one end to the right of the rest (user report 2026-10-25).
+pub fn glyph_fit(advance: f32, cell: f32) -> Option<GlyphFit> {
+    if advance <= 0.0 || cell <= 0.0 || (advance / cell - 1.0).abs() < 0.001 {
+        return None;
+    }
+    let scale = (cell / advance).min(1.0);
+    Some(GlyphFit { dx: (cell - advance * scale) / 2.0, scale })
+}
+
+/// A glyph drawn in its cell (`glyph_fit`): `dx` from the cell's left edge, its font
+/// size times `scale`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlyphFit {
+    pub dx: f32,
+    pub scale: f32,
+}
+
 /// One element of a line once escape sequences are recognised.
 enum Token<'a> {
     Text(&'a str),
@@ -603,6 +641,41 @@ mod tests {
         assert_eq!(l.runs[0].len, 2);
         assert_eq!(l.runs[1].cell, Some(Cell::Block('▀')));
         assert_eq!(l.runs[2].cell, None);
+    }
+
+    /// The FANSI symbols a fallback font draws at other widths are fitted; letters, ASCII,
+    /// the ranges already drawn as cells, wide characters and right-to-left text are not.
+    #[test]
+    fn symbols_not_one_cell_wide_are_fitted() {
+        for c in ['■', '☼', '≡', '↔', '►', '▲', '∟', '⌂', '°', '±', 'α', 'Ω', '½', '‼', '§', '€', '🬀'] {
+            assert!(glyph_fit_candidate(c), "{c:?} U+{:04X}", c as u32);
+        }
+        for c in ['a', '#', '-', ' ', '\u{a0}', 'é', 'Ж', '▄', '█', '│', '═', '中', '。', '،', 'א', '\u{301}', '😀'] {
+            assert!(!glyph_fit_candidate(c), "{c:?} U+{:04X}", c as u32);
+        }
+        // ■ measured on Android: 5.25 against a 4.2 cell.
+        let f = glyph_fit(5.25, 4.2).unwrap();
+        assert!((f.scale - 0.8).abs() < 1e-6 && f.dx.abs() < 1e-6, "{f:?}");
+        let narrow = glyph_fit(3.0, 4.0).unwrap();
+        assert_eq!(narrow, GlyphFit { dx: 0.5, scale: 1.0 });
+        assert_eq!(glyph_fit(4.2, 4.2), None);
+        assert_eq!(glyph_fit(4.202, 4.2), None, "within a thousandth fits");
+        assert!(glyph_fit(4.2126, 4.2).is_some(), "0.3% off (Firefox's ■ on Linux) does not");
+        assert_eq!(glyph_fit(0.0, 4.2), None);
+    }
+
+    /// app.js fits the same characters to the same tolerance (EMOJI_TEXT_OR_FIT,
+    /// glyphFitStyle): both clients must put the same symbols on the grid.
+    #[test]
+    fn app_js_fits_the_same_symbols() {
+        let js = include_str!("../../web/app.js");
+        for part in [
+            r"(?=[^\\x00-\\xA0])(?![\\u0590-\\u08FF\\u2500-\\u259F])[\\p{S}\\p{P}\\p{No}\\u0370-\\u03FF\\u1F00-\\u1FFF]",
+            "charCells(c.codePointAt(0)) === 1 ? glyphFitStyle(",
+            "if (Math.abs(r - 1) < 0.001) return '';",
+        ] {
+            assert!(js.contains(part), "app.js no longer has {part:?}: keep it and glyph_fit_candidate/glyph_fit in step");
+        }
     }
 
     #[test]
