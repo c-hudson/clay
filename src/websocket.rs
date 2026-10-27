@@ -828,8 +828,6 @@ pub enum WsMessage {
         ws_password: String,
         tls_proxy_enabled: bool,
         #[serde(default)]
-        dictionary_path: String,
-        #[serde(default)]
         mouse_enabled: bool,
         #[serde(default)]
         zwj_enabled: bool,
@@ -1924,8 +1922,6 @@ pub struct GlobalSettingsMsg {
     pub tls_configured: bool,  // True if TLS cert+key are configured
     #[serde(default)]
     pub tls_proxy_enabled: bool,
-    #[serde(default)]
-    pub dictionary_path: String,
     #[serde(default)]
     pub mouse_enabled: bool,
     #[serde(default)]

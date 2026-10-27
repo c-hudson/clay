@@ -887,7 +887,7 @@ impl ClayView {
             restyle = true;
         }
         restyle |= self.fonts.set_user(&font.name, font.weight);
-        let (spell_on, dict) = (s.spell_check_enabled, s.dictionary_path.clone());
+        let spell_on = s.spell_check_enabled;
         self.input.clear_on_send = s.clear_input_on_send;
         if s.clear_input_on_send {
             self.input.clear_sent();
@@ -897,7 +897,7 @@ impl ClayView {
             self.input_height_seen = height;
             self.input.rows = (height as usize).clamp(1, 15);
         }
-        self.spell_settings(spell_on, &dict);
+        self.spell_settings(spell_on);
         let Some(s) = self.surf.preview.as_ref().or(self.session.core.settings.as_ref()) else { return };
         let tokens = Tokens::new(&self.theme, self.theme.is_light());
         if tokens != self.chrome.tokens {

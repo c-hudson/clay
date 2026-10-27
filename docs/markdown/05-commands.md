@@ -184,6 +184,10 @@ Reload successful
 
 Already up to date, or a failed download, is one line saying so.
 
+`clay --upgrade` does the same download and install from the command line, without
+starting the console or a GUI, and exits; it ends with a line saying where the new version
+is installed (there is no reload to say so).
+
 Typed in a remote client - the desktop GUI attached with `--gui=host`, the SSH console,
 the web page, the Android app - it updates what can be updated: first the Clay you are
 attached to (it hot-reloads; the client reconnects), then the client's own binary, which

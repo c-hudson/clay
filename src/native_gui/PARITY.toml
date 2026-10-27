@@ -2745,7 +2745,7 @@ section = "input"
 phase = 3
 status = "done"
 feature = "misspelled words get a red wavy underline; suggestions on right-click"
-note = "ISpellChecker on Windows, NSSpellChecker on macOS, spell.rs on Linux or with a dictionary file"
+note = "ISpellChecker on Windows, NSSpellChecker on macOS, spell.rs on Linux"
 
 [[item]]
 id = "ui:input.temperature"

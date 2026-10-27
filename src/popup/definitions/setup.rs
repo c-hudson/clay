@@ -17,7 +17,7 @@ pub const SETUP_FIELD_DEBUG: FieldId = FieldId(5);
 pub const SETUP_FIELD_INPUT_HEIGHT: FieldId = FieldId(7);
 pub const SETUP_FIELD_GUI_THEME: FieldId = FieldId(8);
 pub const SETUP_FIELD_TLS_PROXY: FieldId = FieldId(9);
-pub const SETUP_FIELD_DICTIONARY: FieldId = FieldId(10);
+// Note: FieldId(10) was dictionary_path, removed - the spell checker uses the system's dictionary
 pub const SETUP_FIELD_EDITOR_SIDE: FieldId = FieldId(11);
 pub const SETUP_FIELD_MOUSE: FieldId = FieldId(12);
 pub const SETUP_FIELD_ZWJ: FieldId = FieldId(13);
@@ -180,7 +180,6 @@ pub fn create_setup_popup(
     input_height: i64,
     gui_theme: &str,
     tls_proxy: bool,
-    dictionary_path: &str,
     editor_side: &str,
     mouse_enabled: bool,
     zwj_enabled: bool,
@@ -254,11 +253,6 @@ pub fn create_setup_popup(
             SETUP_FIELD_TLS_PROXY,
             "TLS Proxy",
             FieldKind::toggle(tls_proxy),
-        ))
-        .with_field(Field::new(
-            SETUP_FIELD_DICTIONARY,
-            "Dictionary Path",
-            FieldKind::text(dictionary_path),
         ))
         .with_field(Field::new(
             SETUP_FIELD_EDITOR_SIDE,
@@ -396,7 +390,19 @@ fn update_setup_visibility_def(def: &mut PopupDefinition) {
     if let Some(field) = def.get_field_mut(SETUP_FIELD_LOG_INPUT) {
         field.visible = show_log_input;
     }
+    // Only what acts in a console: these are the web page's and the GUI's. Hidden rather
+    // than left out, so Save sends their values back unchanged.
+    for id in CONSOLE_HIDDEN_FIELDS {
+        if let Some(field) = def.get_field_mut(id) {
+            field.visible = false;
+        }
+    }
 }
+
+/// Settings the console's `/setup` (and the SSH console's) doesn't show: they have no
+/// effect on a console.
+pub const CONSOLE_HIDDEN_FIELDS: [FieldId; 4] =
+    [SETUP_FIELD_GUI_THEME, SETUP_FIELD_KEYBOARD_VISIBLE, SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR];
 
 /// Help text for the Setup popup
 fn setup_help_text() -> Vec<String> {
@@ -431,13 +437,8 @@ fn setup_help_text() -> Vec<String> {
         "  clears them. On, Enter clears the input area.",
         "  Phones always clear. TF's %cleardone.",
         "",
-        "GUI Theme: Dark or Light theme for web/GUI clients.",
-        "",
         "TLS Proxy: Keeps a background proxy process alive",
         "  during hot reload so TLS connections survive.",
-        "",
-        "Dictionary Path: Path to a custom dictionary file",
-        "  for the spell checker.",
         "",
         "Editor Side: Which side the split-screen editor opens.",
         "",
@@ -462,13 +463,7 @@ fn setup_help_text() -> Vec<String> {
         "  text not shown yet: a switch draws what you saw before",
         "  whole.",
         "  Only how the console draws them: scrolling and paging",
-        "  are unchanged. Console only.",
-        "",
-        "Keyboard Visible: Force the on-screen keyboard to stay",
-        "  up on phone/tablet web and Android clients. Off lets",
-        "  the OS decide. Always ignored (soft keyboard hidden)",
-        "  when a hardware keyboard is attached. No effect on",
-        "  the console/desktop GUI.",
+        "  are unchanged. Each interface keeps its own.",
         "",
         "TTS: Text-to-speech mode for MUD output.",
         "  Off: disabled. Local: uses espeak/say subprocess.",
@@ -498,19 +493,6 @@ fn setup_help_text() -> Vec<String> {
         "  continuation lines of long MUD output (0 = off).",
         "  Like TinyFugue's wrapspace, but defaults to 0.",
         "",
-        "Tabs: Show a ribbon of connected-world tabs in the",
-        "  web/GUI/Android UI (no effect on the console). 'Show",
-        "  Top Ribbon' places it above the output area; 'Show",
-        "  Bottom Ribbon' places it directly above the separator",
-        "  bar. 'None' (default) keeps the current look.",
-        "",
-        "Icon Bar: Show a row of large Worlds/Actions/Settings/Find",
-        "  icons (plus any Action marked GUI Menu Shortcut) above",
-        "  the output area in the web/GUI/Android UI (no effect on",
-        "  the console). 'None' hides it; 'App/Tablet' (default)",
-        "  shows it in the desktop GUI app and on tablet-width web",
-        "  clients; 'All' also shows it on phone.",
-        "",
         "Picture Host: Where Import Picture uploads a picture",
         "  (dragged onto the terminal or window, or chosen from",
         "  the menu in the web/GUI/Android UI); its link goes",
@@ -526,7 +508,7 @@ fn setup_help_text() -> Vec<String> {
 pub fn create_setup_popup_for_test(text_reveal: &str) -> PopupDefinition {
     create_setup_popup(
         true, true, false, "unseen_first",
-        false, 3, "dark", false, "", "left", false, false, true,
+        false, 3, "dark", false, "left", false, false, true,
         false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
         text_reveal,
     )
@@ -580,7 +562,7 @@ mod tests {
     fn test_setup_popup_creation() {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
-            false, 3, "dark", false, "", "left", false, false, true,
+            false, 3, "dark", false, "left", false, false, true,
             false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
             "off",
         );
@@ -588,7 +570,7 @@ mod tests {
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 26);
+        assert_eq!(state.definition.fields.len(), 25);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -596,7 +578,7 @@ mod tests {
     fn the_master_consoles_import_button_comes_before_the_help_button() {
         let mut def = create_setup_popup(
             true, true, false, "unseen_first",
-            false, 3, "dark", false, "", "left", false, false, true,
+            false, 3, "dark", false, "left", false, false, true,
             false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
             "off",
         );
@@ -617,7 +599,7 @@ mod tests {
             for (value, label) in crate::picture::PictureService::OPTIONS {
                 let mut def = create_setup_popup(
                     true, true, false, "unseen_first",
-                    false, 3, "dark", false, "", "left", false, false, true,
+                    false, 3, "dark", false, "left", false, false, true,
                     false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", value, false,
                     "off",
                 );
@@ -639,11 +621,35 @@ mod tests {
         }
     }
 
+    /// The web page's and the GUI's settings are hidden in a console, but still hold the
+    /// values Save sends back.
+    #[test]
+    fn a_console_hides_what_only_the_gui_and_web_use() {
+        let def = create_setup_popup(
+            true, false, true, "alphabetical",
+            true, 5, "light", true, "left", true, true, true,
+            false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
+            "fast",
+        );
+        for id in CONSOLE_HIDDEN_FIELDS {
+            assert!(!def.get_field(id).unwrap().visible, "{id:?} shown in the console");
+        }
+        let state = PopupState::new(def);
+        assert_eq!(state.get_selected(SETUP_FIELD_GUI_THEME), Some("light"));
+        assert_eq!(state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE), Some(false));
+        assert_eq!(state.get_selected(SETUP_FIELD_TABS), Some("top"));
+        assert_eq!(state.get_selected(SETUP_FIELD_ICON_BAR), Some("all"));
+        let help = setup_help_text().join("\n");
+        for gone in ["GUI Theme:", "Keyboard Visible:", "Tabs:", "Icon Bar:", "Console only"] {
+            assert!(!help.contains(gone), "the console's help still has {gone:?}");
+        }
+    }
+
     #[test]
     fn test_setup_popup_values() {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
-            true, 5, "light", true, "/custom/dict", "left", true, true, true,
+            true, 5, "light", true, "left", true, true, true,
             false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
             "fast",
         );

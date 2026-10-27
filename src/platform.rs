@@ -1499,6 +1499,11 @@ pub(crate) fn is_newer_version(remote: &str, current: &str) -> bool {
     false
 }
 
+/// How `check_and_download_update`'s "nothing newer" answer starts (`clay --upgrade` takes
+/// it for a success).
+#[cfg(not(target_os = "android"))]
+pub(crate) const UP_TO_DATE: &str = "Already up to date";
+
 /// Check GitHub for latest release and download the binary if newer. `found` is told the
 /// new release's version before the download starts (`selfupdate::updating`'s line).
 #[cfg(not(target_os = "android"))]
@@ -1551,7 +1556,7 @@ where
     // Compare versions
     if !force && !is_newer_version(remote_version, VERSION) {
         return Err(format!(
-            "Already up to date (current: v{}, latest: v{})",
+            "{UP_TO_DATE} (current: v{}, latest: v{})",
             VERSION, remote_version
         ));
     }

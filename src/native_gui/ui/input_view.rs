@@ -437,30 +437,28 @@ impl ClayView {
         cx.notify();
     }
 
-    /// Load the dictionary when spell checking is on (again when its path changes).
-    pub(super) fn spell_settings(&mut self, enabled: bool, path: &str) {
-        let want = enabled.then(|| path.to_string());
-        if want == self.input.speller_source {
+    /// Load the dictionary when spell checking is turned on.
+    pub(super) fn spell_settings(&mut self, enabled: bool) {
+        if enabled == self.input.speller_on {
             return;
         }
-        self.input.speller_source = want.clone();
+        self.input.speller_on = enabled;
         *self.input.speller.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.input.native = None;
         self.input.misspelled.clear();
-        // The system's checker, unless the user chose a dictionary file.
-        if want.as_deref() == Some("") {
-            self.input.native = super::native_spell::Native::new();
-            if self.input.native.is_some() {
-                return;
-            }
+        if !enabled {
+            return;
         }
-        if let Some(path) = want {
-            let slot = self.input.speller.clone();
-            std::thread::spawn(move || {
-                let checker = crate::spell::SpellChecker::new(&path);
-                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(checker));
-            });
+        // The system's checker, where there is one.
+        self.input.native = super::native_spell::Native::new();
+        if self.input.native.is_some() {
+            return;
         }
+        let slot = self.input.speller.clone();
+        std::thread::spawn(move || {
+            let checker = crate::spell::SpellChecker::new();
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(checker));
+        });
     }
 
     fn speller(&self) -> Option<Arc<crate::spell::SpellChecker>> {
@@ -1203,10 +1201,10 @@ pub struct InputState {
     /// Byte ranges of misspelled words.
     pub misspelled: Vec<Range<usize>>,
     /// The dictionary, once loaded (in the background: a system word list takes a moment),
-    /// and what it was loaded from.
+    /// and whether spell checking is on.
     pub speller: Arc<std::sync::Mutex<Option<Arc<crate::spell::SpellChecker>>>>,
-    speller_source: Option<String>,
-    /// The system's own checker (Windows, macOS), used unless a dictionary file is set.
+    speller_on: bool,
+    /// The system's own checker (Windows, macOS), used instead of the dictionary there.
     native: Option<super::native_spell::Native>,
     /// The input's right-click menu: where, and the word it's for (with suggestions).
     pub menu: Option<(Point<Pixels>, Option<Suggestions>)>,
@@ -1236,7 +1234,7 @@ impl Default for InputState {
             literal_next: false,
             misspelled: Vec::new(),
             speller: Arc::new(std::sync::Mutex::new(None)),
-            speller_source: None,
+            speller_on: false,
             native: None,
             menu: None,
             sent: VecDeque::new(),

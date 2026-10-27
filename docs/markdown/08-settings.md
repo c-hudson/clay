@@ -29,6 +29,19 @@ Open with `/setup` command:
 | Kokoro Voice | Which of Kokoro's 54 voices speaks, e.g. `af_heart`, `am_michael`, `bf_emma`; `/tts voices` lists them by language. In `settings.dat`: `tts_voice` | af_heart |
 | Picture Host | Where Import Picture uploads a picture (see **Importing a Picture**): catbox.moe, sxcu.net, x0.at or tmpfiles.org (2d: deleted after two days), each also "+ URL Short" (the link goes through `/url`'s shortening), or Off. In `settings.dat`: `picture_host` (`catbox`, `catbox+short`, ..., `off`) | catbox.moe |
 
+### Settings Shown per Interface
+
+Each interface's Settings shows only what acts in that interface. A setting that isn't
+shown keeps its value; saving from there never changes it.
+
+| Setting | Shown in |
+|---------|----------|
+| GUI Theme, Tabs, Icon Bar | the GUIs, the web page and the Android app; not the console's `/setup` |
+| Keyboard Visible | the web page on a phone or tablet layout (the Android app, a mobile browser) |
+| ZWJ Sequence | the console's `/setup` only |
+| Clear Input on Send | everywhere but a phone, which always clears |
+| Font sizes: Phone and Tablet | a browser and the Android app; the GUIs are desktops and show only Desktop |
+
 ### World Switching Modes
 
 **Unseen First:**

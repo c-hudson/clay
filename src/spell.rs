@@ -65,19 +65,6 @@ fn find_hunspell_dict_paths() -> Vec<std::path::PathBuf> {
             }
         }
     }
-    // Also check next to the executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let words = exe_dir.join("words");
-            if words.exists() {
-                paths.push(words);
-            }
-            let dic = exe_dir.join("en_US.dic");
-            if dic.exists() {
-                paths.push(dic);
-            }
-        }
-    }
     paths
 }
 
@@ -105,23 +92,15 @@ pub struct SpellChecker {
 }
 
 impl SpellChecker {
-    pub fn new(custom_path: &str) -> Self {
+    /// The system's dictionary: its word list, else LibreOffice's (Windows), else aspell's.
+    pub fn new() -> Self {
         let mut words = HashSet::new();
 
-        // Try custom dictionary path first
-        if !custom_path.is_empty() {
-            if let Ok(content) = std::fs::read_to_string(custom_path) {
-                words = content.lines().filter_map(parse_dict_word).collect();
-            }
-        }
-
         // Try system dictionary paths
-        if words.is_empty() {
-            for path in SYSTEM_DICT_PATHS {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    words = content.lines().filter_map(parse_dict_word).collect();
-                    break;
-                }
+        for path in SYSTEM_DICT_PATHS {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                words = content.lines().filter_map(parse_dict_word).collect();
+                break;
             }
         }
 
@@ -245,7 +224,7 @@ impl SpellChecker {
 
 impl Default for SpellChecker {
     fn default() -> Self {
-        Self::new("")
+        Self::new()
     }
 }
 

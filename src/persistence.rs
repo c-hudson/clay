@@ -481,9 +481,6 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         writeln!(file, "websocket_auth_key={}|{}", secret(&ak.key), ak.created_at)?;
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
-    if !app.settings.dictionary_path.is_empty() {
-        writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
-    }
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
     writeln!(file, "text_reveal={}", app.settings.text_reveal.name())?;
     for (key, value) in &app.settings.text_reveal_profiles {
@@ -1342,9 +1339,8 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "tls_proxy_enabled" => {
                         app.settings.tls_proxy_enabled = value == "true";
                     }
-                    "dictionary_path" => {
-                        app.settings.dictionary_path = value.to_string();
-                    }
+                    // Legacy: the spell checker's dictionary is the system's now
+                    "dictionary_path" => {}
                     "editor_side" => {
                         app.settings.editor_side = EditorSide::from_name(value);
                     }
@@ -2241,9 +2237,6 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         writeln!(file, "web_key_pem={}", encrypt_password(&BASE64.encode(app.settings.web_key_pem.as_bytes())))?;
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
-    if !app.settings.dictionary_path.is_empty() {
-        writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
-    }
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
     writeln!(file, "text_reveal={}", app.settings.text_reveal.name())?;
     for (key, value) in &app.settings.text_reveal_profiles {
@@ -3280,9 +3273,6 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "tls_proxy_enabled" => {
                         app.settings.tls_proxy_enabled = value == "true";
                     }
-                    "dictionary_path" => {
-                        app.settings.dictionary_path = value.to_string();
-                    }
                     "editor_side" => {
                         app.settings.editor_side = EditorSide::from_name(value);
                     }
@@ -3906,7 +3896,6 @@ mod tests {
                 },
             ],
             tls_proxy_enabled: true,           // default: false
-            dictionary_path: "/custom/dict".to_string(), // default: ""
             editor_side: EditorSide::Right,    // default: Left
             text_reveal: TextReveal::Fast,     // default: Off
             mouse_enabled: false,              // default: true
@@ -4047,7 +4036,6 @@ mod tests {
             assert_eq!(aa.suppress_blanks, bb.suppress_blanks, "{context}: action[{i}].suppress_blanks");
         }
         assert_eq!(a.tls_proxy_enabled, b.tls_proxy_enabled, "{context}: tls_proxy_enabled");
-        assert_eq!(a.dictionary_path, b.dictionary_path, "{context}: dictionary_path");
         assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
         assert_eq!(a.text_reveal, b.text_reveal, "{context}: text_reveal");
         assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
@@ -5388,7 +5376,6 @@ pattern=foo
         assert!(non_default.websocket_auth_key.is_some(), "websocket_auth_key should be Some");
         assert!(!non_default.actions.is_empty(), "actions should be non-empty");
         assert_ne!(non_default.tls_proxy_enabled, default.tls_proxy_enabled, "tls_proxy_enabled should differ");
-        assert_ne!(non_default.dictionary_path, default.dictionary_path, "dictionary_path should differ");
         assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
         assert_ne!(non_default.text_reveal, default.text_reveal, "text_reveal should differ");
         assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");

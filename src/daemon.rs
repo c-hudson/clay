@@ -87,11 +87,6 @@ pub async fn run_daemon_server() -> io::Result<()> {
     // Ensure at least one world exists
     app.ensure_has_world();
 
-    // Re-create spell checker with custom dictionary path if configured
-    if !app.settings.dictionary_path.is_empty() {
-        app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-    }
-
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
     app.tf_event_tx = Some(event_tx.clone());
     // Shell worlds (src/shell) report back on this channel, and `spawn_shell_connect`
@@ -1312,7 +1307,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1320,7 +1315,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet,
                 web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
-                ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
+                ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                 mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                 log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile,
             );

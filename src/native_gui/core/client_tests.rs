@@ -428,11 +428,13 @@ fn a_new_epoch_throws_the_old_buffer_away() {
 
 #[test]
 fn a_state_refresh_is_not_a_reconnect() {
-    // RequestState's answer carries no resume replay: a kept buffer gap-fills itself.
+    // RequestState's answer carries no resume replay: a kept buffer takes the newest lines
+    // it sent and gap-fills the hole below them itself.
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..5, 9)]);
     h.sent();
-    h.initial(vec![world_msg(0, "A", 0..8, 9)]);
+    h.initial(vec![world_msg(0, "A", 6..8, 9)]);
+    assert_eq!(h.seqs(0), vec![0, 1, 2, 3, 4, 6, 7]);
     h.advance(Duration::from_millis(10));
     assert!(h.sent().iter().any(|m| matches!(m, WsMessage::RequestScrollback { after_seq: Some(4), .. })));
 }
@@ -798,7 +800,7 @@ fn cached(name: &str, epoch: u64, seqs: std::ops::Range<u64>) -> crate::native_g
 }
 
 #[test]
-fn a_cold_start_shows_the_cached_lines_and_gap_fills_after_them() {
+fn a_cold_start_shows_the_cached_lines_with_the_newest_after_them() {
     let mut h = H::password();
     h.core.set_cache(vec![cached("A", 9, 0..5), cached("B", 3, 0..2)]);
     h.connect_and_login();
@@ -807,7 +809,7 @@ fn a_cold_start_shows_the_cached_lines_and_gap_fills_after_them() {
     assert!(resume.is_empty(), "a cache is never a resume list: its indices may be stale");
     // A's epoch still stands; B's sequence space is gone (a new epoch).
     h.initial(vec![world_msg(0, "A", 0..8, 9), world_msg(1, "B", 0..4, 4)]);
-    assert_eq!(h.texts(0), vec!["cached 0", "cached 1", "cached 2", "cached 3", "cached 4"]);
+    assert_eq!(h.texts(0), vec!["cached 0", "cached 1", "cached 2", "cached 3", "cached 4", "line 5", "line 6", "line 7"]);
     assert_eq!(h.texts(1), vec!["line 0", "line 1", "line 2", "line 3"]);
     h.advance(Duration::from_secs(1));
     let asks: Vec<(usize, Option<u64>)> = h
@@ -815,7 +817,7 @@ fn a_cold_start_shows_the_cached_lines_and_gap_fills_after_them() {
         .into_iter()
         .filter_map(|m| if let WsMessage::RequestScrollback { world_index, after_seq, .. } = m { Some((world_index, after_seq)) } else { None })
         .collect();
-    assert!(asks.contains(&(0, Some(4))), "A asks for what came after its cached frontier: {asks:?}");
+    assert!(!asks.iter().any(|&(w, after)| w == 0 && after.is_some()), "A has nothing missing, so no gap fill: {asks:?}");
     // And what gets cached back is capped, epoch-stamped, with the seq ranges.
     let snap = h.core.cache_snapshot();
     assert_eq!(snap.len(), 2);
@@ -823,32 +825,50 @@ fn a_cold_start_shows_the_cached_lines_and_gap_fills_after_them() {
     assert_eq!(snap[1].seen, vec![(0, 3)]);
 }
 
-/// A cold start's catch-up is appended at the tail, where live output goes: each of its
-/// lines says it came in a scrollback reply, so the GUI's more-mode doesn't take the
-/// hundreds of lines that arrived while it was closed for live output and hold them.
+/// A cold start long after the cache was written: the server's newest lines go on at
+/// once, so the window opens on the current screen, and the catch-up fills only the hole
+/// between them and the cache, above the view. It used to page forward from the cache's
+/// end, appending at the bottom a reply at a time, and the window scrolled through
+/// everything that had arrived while it was closed (user report 2026-10-26). Every line
+/// caught up on says it is history, so more-mode doesn't take it for live output.
 #[test]
-fn a_cold_starts_catch_up_is_marked_as_history_and_live_output_is_not() {
+fn a_cold_starts_catch_up_fills_the_hole_below_the_newest_lines() {
     let mut h = H::password();
     h.core.set_cache(vec![cached("A", 9, 0..5)]);
     h.connect_and_login();
-    h.initial(vec![world_msg(0, "A", 0..300, 9)]);
+    h.initial(vec![world_msg(0, "A", 200..300, 9)]);
+    assert_eq!(h.core.worlds[0].lines.last().and_then(|l| l.seq), Some(299), "the current screen, before any catch-up");
     h.advance(Duration::from_secs(1));
     let id = h
         .sent()
         .into_iter()
         .find_map(|m| if let WsMessage::RequestScrollback { after_seq: Some(4), request_id, .. } = m { request_id } else { None })
         .expect("a gap fill after the cached frontier");
-    let catch_up: Vec<TimestampedLine> = (5..300).map(|s| tl(s, &format!("missed {s}"))).collect();
-    h.msg(WsMessage::ScrollbackLines { world_index: 0, lines: catch_up, backfill_complete: true, clamped_by_pending: false, request_id: Some(id) });
+    // The server answers oldest first, past the hole into lines already held.
+    let reply: Vec<TimestampedLine> = (5..205).map(|s| tl(s, &format!("missed {s}"))).collect();
+    h.msg(WsMessage::ScrollbackLines { world_index: 0, lines: reply, backfill_complete: false, clamped_by_pending: false, request_id: Some(id) });
+    assert!(
+        !h.sent().iter().any(|m| matches!(m, WsMessage::RequestScrollback { after_seq: Some(_), .. })),
+        "the hole is filled: nothing more is owed, though the reply wasn't the last"
+    );
     h.msg(data(0, 300, "live\n"));
     let lines = &h.core.worlds[0].lines;
-    assert_eq!(lines.len(), 301);
-    assert_eq!(h.seqs(0), (0..=300).collect::<Vec<u64>>(), "the catch-up went on at the tail, in order");
+    assert_eq!(h.seqs(0), (0..=300).collect::<Vec<u64>>(), "in order: the hole went in above the newest lines");
+    assert_eq!(h.core.worlds[0].seen.ranges(), &[(0, 300)]);
     assert!(lines[..5].iter().all(|l| !l.scrollback), "the cached lines");
-    assert!(lines[5..300].iter().all(|l| l.scrollback), "the gap fill");
+    assert!(lines[5..300].iter().all(|l| l.scrollback), "the hole and the newest lines");
     assert!(!lines[300].scrollback, "live output");
     // A follower window's copy keeps the mark.
     assert!(h.core.follower().worlds[0].lines[5].scrollback);
+    // A range the server says this client is missing is still asked for whole.
+    h.msg(WsMessage::ResyncRequired { world_index: 0, from_seq: 300 });
+    let id = h
+        .sent()
+        .into_iter()
+        .find_map(|m| if let WsMessage::RequestScrollback { after_seq: Some(300), request_id, .. } = m { request_id } else { None })
+        .expect("the resync's gap fill");
+    h.msg(WsMessage::ScrollbackLines { world_index: 0, lines: vec![tl(301, "a"), tl(302, "b")], backfill_complete: false, clamped_by_pending: false, request_id: Some(id) });
+    assert!(h.sent().iter().any(|m| matches!(m, WsMessage::RequestScrollback { after_seq: Some(302), .. })), "and keeps going until the server says it's done");
 }
 
 /// The server's unprompted replay of a resumed world (request id 0) is history too.

@@ -27,20 +27,50 @@ pub fn last_seq(w: &World) -> Option<u64> {
     w.lines.iter().rev().filter(|l| !l.from_archive).find_map(|l| l.seq)
 }
 
+/// What this client had shown of one world: its newest seq, in the world's seq space.
+struct Mark {
+    seq: Option<u64>,
+    epoch: u64,
+    /// Set by the first switch to the world (or away from it). Until then, what the
+    /// client catches up on counts as shown too.
+    fixed: bool,
+}
+
 #[derive(Default)]
 pub struct Textdiv {
     /// Per world (by name): the newest seq this client had shown when it last left it.
-    seen: HashMap<String, Option<u64>>,
+    seen: HashMap<String, Mark>,
     /// This visit's divider: below seq (`None`: above every line), and the mode.
     pub visit: Option<(Option<u64>, String)>,
 }
 
 impl Textdiv {
-    /// What a world holds when this client first sees it counts as shown.
+    /// What a world holds when this client first sees it counts as shown, and so does
+    /// what it catches up on (a cold start's gap fill after the disk cache, the server's
+    /// resume replay: `Line::scrollback`) until the first switch to it. Only lines that
+    /// arrive live are new. A world whose seq space changed (the server restarted) starts
+    /// over from what it holds.
     pub fn note_worlds(&mut self, worlds: &[World]) {
         for w in worlds {
-            if !self.seen.contains_key(&w.name) {
-                self.seen.insert(w.name.clone(), last_seq(w));
+            match self.seen.get_mut(&w.name) {
+                Some(m) if m.epoch == w.epoch() => {
+                    if !m.fixed {
+                        // The tail newer than the mark, newest first.
+                        let caught_up = w.lines.iter().rev()
+                            .filter(|l| !l.from_archive)
+                            .filter_map(|l| l.seq.map(|seq| (seq, l.scrollback)))
+                            .take_while(|(seq, _)| m.seq.is_none_or(|s| *seq > s))
+                            .filter(|(_, scrollback)| *scrollback)
+                            .map(|(seq, _)| seq)
+                            .max();
+                        if caught_up.is_some() {
+                            m.seq = caught_up;
+                        }
+                    }
+                }
+                _ => {
+                    self.seen.insert(w.name.clone(), Mark { seq: last_seq(w), epoch: w.epoch(), fixed: false });
+                }
             }
         }
     }
@@ -48,24 +78,31 @@ impl Textdiv {
     /// The newest seq this client had shown of the world named `name` when it last left
     /// it (`None`: nothing, or never seen): what New Only text reveal counts as old.
     pub fn seen(&self, name: &str) -> Option<u64> {
-        self.seen.get(name).copied().flatten()
+        self.seen.get(name).and_then(|m| m.seq)
     }
 
     /// Leaving a world: shown up to here, and this visit's divider goes.
     pub fn leave(&mut self, w: &World) {
-        if let Some(seq) = last_seq(w) {
-            self.seen.insert(w.name.clone(), Some(seq));
+        let seq = last_seq(w);
+        let mark = self.seen.entry(w.name.clone()).or_insert(Mark { seq, epoch: w.epoch(), fixed: true });
+        if seq.is_some() {
+            (mark.seq, mark.epoch) = (seq, w.epoch());
         }
+        mark.fixed = true;
         self.visit = None;
     }
 
     /// Arriving at a world with `%textdiv` set to `mode`.
     pub fn arrive(&mut self, w: &World, mode: &str) {
         self.visit = None;
+        // From here on, only what arrives live is new.
+        if let Some(m) = self.seen.get_mut(&w.name) {
+            m.fixed = true;
+        }
         if !matches!(mode, "on" | "always" | "clear") {
             return;
         }
-        let after = self.seen.get(&w.name).copied().flatten();
+        let after = self.seen(&w.name);
         let last = last_seq(w);
         let has_new = last.is_some_and(|l| after.is_none_or(|a| l > a));
         if mode != "on" || has_new {
@@ -129,5 +166,69 @@ mod tests {
         assert_eq!(t.place(&seqs), Some(8), "nothing new: after the last line");
         t.arrive(&w, "");
         assert_eq!(t.visit, None);
+    }
+
+    /// `seqs` appended to `w`, as a catch-up (`scrollback`) or live.
+    fn append(w: &mut World, seqs: std::ops::Range<u64>, scrollback: bool) {
+        let mut more = world(&w.name, seqs).lines;
+        for l in &mut more {
+            l.scrollback = scrollback;
+        }
+        w.lines.extend(more);
+    }
+
+    /// A cold start: the disk cache, then the catch-up on what arrived while the GUI was
+    /// closed. The catch-up counts as shown until the first switch to the world; a line
+    /// that arrives live is new (user report 2026-10-26: New Only typed on whole screens).
+    #[test]
+    fn a_start_and_its_catch_up_count_as_shown_until_the_first_visit() {
+        let mut t = Textdiv::default();
+        let mut w = world("a", 0..30);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!(t.seen("a"), Some(29), "the cache");
+        append(&mut w, 30..90, true);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!(t.seen("a"), Some(89), "the catch-up is history, not news");
+        append(&mut w, 90..95, false);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!(t.seen("a"), Some(89), "a live line is new");
+        t.arrive(&w, "");
+        append(&mut w, 95..99, true);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!(t.seen("a"), Some(89), "after the first visit only leaving moves the mark");
+        t.leave(&w);
+        assert_eq!(t.seen("a"), Some(98));
+    }
+
+    /// A world that had nothing when first seen takes its catch-up too.
+    #[test]
+    fn an_empty_world_takes_its_catch_up_as_shown() {
+        let mut t = Textdiv::default();
+        let mut w = world("a", 0..0);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!(t.seen("a"), None);
+        append(&mut w, 0..40, true);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!(t.seen("a"), Some(39));
+    }
+
+    /// A new seq space (the server restarted) makes the old mark meaningless: what the
+    /// world holds now counts as shown, and its catch-up too.
+    #[test]
+    fn a_new_epoch_starts_the_mark_over() {
+        let mut t = Textdiv::default();
+        let mut w = world("a", 0..500);
+        w.set_epoch(7);
+        t.note_worlds(std::slice::from_ref(&w));
+        t.arrive(&w, "");
+        t.leave(&w);
+        assert_eq!(t.seen("a"), Some(499));
+        let mut w = world("a", 0..20);
+        w.set_epoch(8);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!(t.seen("a"), Some(19));
+        append(&mut w, 20..30, true);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!(t.seen("a"), Some(29));
     }
 }

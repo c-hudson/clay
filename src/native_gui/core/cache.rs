@@ -9,8 +9,9 @@
 //!   in-memory reconnect decide whether it stands: a different epoch, or a corrupted buffer,
 //!   and it's dropped. A world without an epoch (multiuser) is never cached.
 //! - Never sent as a resume list: world indices in a cache can be stale, and the server's
-//!   resume replay trusts them. A cached world catches up by gap fill instead, as app.js's
-//!   does.
+//!   resume replay trusts them. A cached world takes the newest lines InitialState carries
+//!   (`client.rs` `merge_newest`) and gap-fills the hole between them and the cache, out of
+//!   view, as app.js's does (`mergeNewestLines`).
 //!
 //! One file per server in `~/.clay/native-gui-cache/`, owner-only (it holds MUD text).
 

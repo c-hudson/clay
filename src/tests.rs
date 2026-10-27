@@ -9654,6 +9654,45 @@ third
         }
     }
 
+    /// The SSH console's New Only / %textdiv marks survive a reconnect: a world left before
+    /// it keeps its mark, so only what arrived meanwhile is new; a new seq space starts the
+    /// mark over from what the world holds. Before, every mark became None at a reconnect
+    /// and the next switch typed on the whole screen (user report 2026-10-26).
+    #[test]
+    fn the_console_mirrors_seen_marks_survive_a_reconnect() {
+        let mut server = App::new();
+        server.worlds = vec![World::new("alpha"), World::new("beta")];
+        let add = |server: &mut App, i: usize, n: usize| {
+            let w = &mut server.worlds[i];
+            for _ in 0..n {
+                let seq = w.next_seq;
+                w.output_lines.push(OutputLine::new_client(format!("line {seq}"), seq));
+                w.next_seq += 1;
+            }
+        };
+        add(&mut server, 0, 5);
+        add(&mut server, 1, 5);
+        let connect = |app: &mut App, server: &App| match server.build_initial_state(0) {
+            WsMessage::InitialState { worlds, settings, .. } => app.init_from_initial_state(worlds, 0, settings, Vec::new(), Vec::new()),
+            other => panic!("expected InitialState, got {other:?}"),
+        };
+        let mut app = App::new();
+        connect(&mut app, &server);
+        app.track_console_world();
+        app.current_world_index = 1;
+        app.track_console_world();
+        let alpha_seen = app.worlds[0].console_seen_seq;
+        assert_eq!(alpha_seen, server.worlds[0].output_lines.last().map(|l| l.seq), "left alpha at its last line");
+
+        add(&mut server, 0, 3);
+        connect(&mut app, &server);
+        assert_eq!(app.worlds[0].console_seen_seq, alpha_seen, "the reconnect keeps what the console had shown");
+
+        server.worlds[0].seq_epoch += 1;
+        connect(&mut app, &server);
+        assert_eq!(app.worlds[0].console_seen_seq, server.worlds[0].output_lines.last().map(|l| l.seq), "a new seq space: what it holds counts as seen");
+    }
+
     /// Mirrors app.js's `case 'WorldAdded'` index-bump rule (app.js:3869-3878):
     ///
     ///     const insertIndex = world.index !== undefined ? world.index : worlds.length;
@@ -10341,7 +10380,7 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), ws_password.to_string(),
-            false, String::new(), true, true, false,
+            false, true, true, false,
             "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
             "none".to_string(), "app_tablet".to_string(), None, None, None,
         );
@@ -10365,7 +10404,7 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), String::new(),
-            false, String::new(), true, true, false,
+            false, true, true, false,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
             "none".to_string(), "app_tablet".to_string(), None, profile("native-linux", "superfast"), None,
         );
@@ -10383,7 +10422,7 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), String::new(),
-            false, String::new(), true, true, false,
+            false, true, true, false,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
             "none".to_string(), "app_tablet".to_string(), None, profile("bogus", "fast"), None,
         );
@@ -21258,6 +21297,50 @@ fn the_web_text_reveal_options_are_text_reveal_options() {
     assert!(js.contains("if (textReveal === 'superfast' && fontProfileKey === 'app-android') return REVEAL_CPS_ANDROID_SUPERFAST;"));
     assert_eq!(TextReveal::SuperFast.native_chars_per_second(), 200.0);
     assert!(js.contains("text_reveal_profile: textRevealSynced ? { key: fontProfileKey, value: textReveal } : null"));
+}
+
+/// The web page's Settings show only what acts in that page (user report 2026-10-26: the
+/// desktop GUI showed Android's Keyboard Visible), and a hidden row is only hidden: Save
+/// still sends its value.
+#[test]
+fn the_web_settings_show_only_this_interfaces_rows() {
+    let js = include_str!("web/app.js");
+    for row in [
+        "['setup-zwj-toggle', false]",
+        "['setup-keyboard-visible-toggle', touch]",
+        "['setup-clear-input-toggle', deviceMode !== 'phone']",
+        "['font-phone-minus', !window.WEBVIEW_MODE]",
+        "['font-tablet-minus', !window.WEBVIEW_MODE]",
+    ] {
+        assert!(js.contains(row), "missing row rule {row}");
+    }
+    assert!(js.contains("        showOnlyThisInterfacesSettings();\n    }"), "asked at every opening (end of updateSetupPopupUI)");
+    assert!(js.contains("zwj_enabled: zwjEnabled,") && js.contains("keyboard_always_visible: keyboardAlwaysVisible"), "Save still sends the hidden values");
+}
+
+/// New Only's seen marks in the web page: taken after the buffer is hydrated (the message's
+/// worlds have no output_lines, so every mark was null), kept across a reconnect, and moved
+/// by history caught up on before the first switch to the world (user report 2026-10-26).
+#[test]
+fn the_web_seen_marks_survive_a_start_and_a_reconnect() {
+    let js = include_str!("web/app.js");
+    assert!(!js.contains("worlds.forEach(function(w) { if (w) w._seenSeq = lastLineSeq(w); });"), "marks taken before hydration");
+    assert!(js.contains("if (priorWorld && typeof priorWorld._seenSeq === 'number') {\n                        world._seenSeq = priorWorld._seenSeq;"));
+    assert!(js.contains("if (!world._seenFixed) advanceSeenSeq(world, msg.lines);"));
+    assert!(js.contains("        // From here on, only what arrives live is new.\n        world._seenFixed = true;"), "arriveTextdiv fixes the mark");
+    assert!(js.contains("            oldWorld._seenFixed = true;"), "leaving fixes the mark");
+}
+
+/// A start from a kept buffer (the page's IndexedDB cache above all) merges the server's
+/// newest lines and fills only the hole below them, out of view: catching up from the
+/// buffer's end scrolled the output through everything that arrived while the page was
+/// closed (user report 2026-10-26). The native GUI's is `client.rs` `merge_newest`.
+#[test]
+fn the_web_cold_start_merges_the_newest_lines_into_a_kept_buffer() {
+    let js = include_str!("web/app.js");
+    assert!(js.contains("const merged = mergeNewestLines(world, world.output_lines_ts);"));
+    assert!(js.contains("if (msg.backfill_complete || (world._holesOnly && !oldestSeqHole(world))) {"), "the hole filled, the catch-up stops");
+    assert!(js.contains("if (hasExplicitFromSeq) world._holesOnly = false;"), "a resync is owed whole");
 }
 
 #[test]

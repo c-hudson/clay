@@ -203,6 +203,9 @@ pub struct World {
     hydrated: bool,
     /// Listed in this connection's `resume`: the server replays its gap unprompted.
     resumed: bool,
+    /// `InitialState`'s newest lines were merged into the kept buffer: the catch-up owes
+    /// only the holes below them, never what follows (that comes live).
+    holes_only: bool,
     replay_deadline: Option<Instant>,
     claim: Option<(HashSet<u64>, Instant)>,
 }
@@ -215,6 +218,17 @@ impl World {
 
     fn touch(&mut self) {
         self.revision += 1;
+    }
+
+    /// The server's id for this world's seq space (`seq_epoch`; 0 when it sends none): a
+    /// seq means nothing against a buffer from another epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    #[cfg(test)]
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
     }
 }
 
@@ -1523,6 +1537,24 @@ impl ClientCore {
                     w.lines = dedup_by_seq(p.lines);
                     w.seen = p.seen;
                     rebuild_seen(&mut w, None);
+                    // The newest lines the server just sent, which a buffer from a while
+                    // ago (the disk cache above all) is short of: merged in, so the window
+                    // opens on the current screen and the catch-up fills only the hole
+                    // below them, out of view. Catching up from the buffer's end instead
+                    // appended everything that had arrived since at the bottom, 500 lines
+                    // a reply, and the window scrolled through all of it (user report
+                    // 2026-10-26).
+                    let newest: Vec<Line> = m
+                        .output_lines_ts
+                        .iter()
+                        .map(|t| {
+                            let mut l = self.line_from_ts(t);
+                            l.scrollback = true;
+                            l
+                        })
+                        .collect();
+                    w.holes_only = !newest.is_empty();
+                    merge_newest(&mut w, newest);
                     // ▶ on the kept lines is the server's to say: ours can be stale (see
                     // `WorldStateMsg::own_new_seqs`).
                     if let Some(own) = &m.own_new_seqs {
@@ -1739,8 +1771,9 @@ impl ClientCore {
                     }
                 }
                 let w = &mut self.worlds[world_index];
-                if complete {
+                if complete || (w.holes_only && w.seen.oldest_hole().is_none()) {
                     w.gap_fill_pending = false;
+                    w.holes_only = false;
                 } else if !clamped {
                     // Stay armed while clamped: `PendingReleased` asks again.
                     self.request_gap_fill(world_index, None, now);
@@ -1794,6 +1827,10 @@ impl ClientCore {
             return;
         }
         let after = from.unwrap_or_else(|| w.seen.frontier());
+        // A range the server names (a resync) is owed whole.
+        if from.is_some() {
+            w.holes_only = false;
+        }
         w.gap_fill_pending = true;
         let id = self.next_request_id;
         self.next_request_id += 1;
@@ -1842,8 +1879,11 @@ impl ClientCore {
         let rows = self.view.map_or(24, |v| v.0);
         let phase1 = 75.max(rows);
         for i in 0..self.worlds.len() {
-            let w = &self.worlds[i];
-            if w.hydrated && !w.seen.is_empty() && !w.resumed {
+            let w = &mut self.worlds[i];
+            if w.holes_only && w.seen.oldest_hole().is_none() {
+                // Merged up to the newest line with nothing missing below: caught up.
+                w.holes_only = false;
+            } else if w.hydrated && !w.seen.is_empty() && !w.resumed {
                 self.request_gap_fill(i, None, now);
             }
         }
@@ -2045,7 +2085,6 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         ws_key_file: s.ws_key_file.clone(),
         ws_password: String::new(),
         tls_proxy_enabled: s.tls_proxy_enabled,
-        dictionary_path: s.dictionary_path.clone(),
         mouse_enabled: s.mouse_enabled,
         zwj_enabled: s.zwj_enabled,
         new_line_indicator: s.new_line_indicator,
@@ -2103,6 +2142,15 @@ fn is_ansi_only(line: &str) -> bool {
 
 /// Insert lines (ascending by seq) after the last held line with a lower seq (app.js
 /// `insertLinesBySeq`).
+/// Add the lines of `newest` that `w` doesn't hold, in seq order, as delivered.
+fn merge_newest(w: &mut World, newest: Vec<Line>) {
+    let add: Vec<Line> = newest.into_iter().filter(|l| l.seq.is_some_and(|s| !w.seen.contains(s))).collect();
+    for s in add.iter().filter_map(|l| l.seq) {
+        w.seen.mark(s, s);
+    }
+    insert_by_seq(w, add);
+}
+
 fn insert_by_seq(w: &mut World, mut add: Vec<Line>) {
     add.sort_by_key(|l| l.seq);
     for line in add {

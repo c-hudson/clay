@@ -6,14 +6,22 @@ Clay includes real-time spell checking with suggestions, using the system dictio
 
 ### Location
 
-Clay looks for the system dictionary at:
-1. `/usr/share/dict/words`
-2. `/usr/share/dict/american-english` (fallback)
-3. `/usr/share/dict/british-english` (fallback)
+Clay uses the dictionary the system already has; there is no setting for a dictionary
+file. It takes the first one it finds:
+1. `/usr/share/dict/words`, `/usr/share/dict/american-english` or
+   `/usr/share/dict/british-english` (Linux, macOS; on Termux, the same files under
+   `/data/data/com.termux/files/usr`)
+2. On Windows, LibreOffice's English dictionary (`en_US.dic` or `en_GB.dic` under
+   `C:\Program Files\LibreOffice\share\extensions`)
+3. aspell's English word list (`aspell dump master`; e.g. `pkg install aspell aspell-en`
+   on Termux)
+
+The native GUI on Windows and macOS uses the system's own spell checker instead, as
+the WebView GUI and the web page use the browser's.
 
 ### Dictionary Format
 
-- Plain text file, one word per line
+- Plain text file, one word per line (a Hunspell `.dic` file's affix flags are ignored)
 - Case-insensitive matching
 - Typically 100,000+ words
 
@@ -33,6 +41,9 @@ sudo dnf install words
 
 # macOS
 # Dictionary exists at /usr/share/dict/words by default
+
+# Windows
+# Install LibreOffice (its English dictionary comes with it)
 ```
 
 ## Configuration
@@ -203,9 +214,8 @@ A word is considered complete when followed by:
 
 ### Too Many False Positives
 
-1. Consider adding custom dictionary
-2. Use `/setup` to disable if too distracting
-3. Technical content may not match dictionary
+1. Use `/setup` to disable if too distracting
+2. Technical content may not match dictionary
 
 ### Suggestions Not Working
 

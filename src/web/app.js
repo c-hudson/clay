@@ -368,6 +368,20 @@
     // Splice line objects (already carrying real .seq values) into world.output_lines at
     // the position seq order dictates, rather than assuming they belong at the tail —
     // used only for recovered gap-fill batches, which are older than what's already there.
+    // Add the lines of `newest` (an InitialState slice) that this world doesn't hold, each
+    // in its place by seq, as delivered. Returns the lines added.
+    function mergeNewestLines(world, newest) {
+        const add = newest.filter(l => l && typeof l.seq === 'number' && !l.from_archive && !hasSeenSeq(world, l.seq));
+        add.sort((a, b) => a.seq - b.seq);
+        for (const l of add) {
+            insertLinesBySeq(world, [l]);
+            markSeqRangeSeen(world, l.seq, l.seq);
+            if (typeof world._oldest_seq !== 'number' || l.seq < world._oldest_seq) world._oldest_seq = l.seq;
+        }
+        world._max_seq = maxSeenSeq(world);
+        return add;
+    }
+
     function insertLinesBySeq(world, newLineObjs) {
         if (newLineObjs.length === 0) return;
         const firstSeq = newLineObjs[0].seq;
@@ -1840,7 +1854,6 @@
     let debugEnabled = false;  // Debug logging
     let scrollbackEnabled = false;  // Long-term archive output
     let logInputEnabled = false;  // Write captured user input to the per-world log file too
-    let dictionaryPath = '';  // Custom dictionary path
     let spellCheckEnabled = true;  // Spell checking
     // Track whether the last edit was a deletion - mirrors Rust's
     // App.last_input_was_delete (main.rs), which check_temp_conversion() uses
@@ -3745,8 +3758,6 @@
                 }
 
                 worlds = msg.worlds || [];
-                // TF's %textdiv: what this client is given now counts as already shown.
-                worlds.forEach(function(w) { if (w) w._seenSeq = lastLineSeq(w); });
                 // Recent Worlds: the server's view of each world's last send or receive.
                 {
                     const nowMs = Date.now();
@@ -4032,6 +4043,19 @@
                     } else {
                         world.output_lines = [];
                     }
+                    // TF's %textdiv and Text Reveal's New Only: what this page holds now
+                    // counts as already shown, and a reconnect keeps the marks it had (a
+                    // kept buffer is in the same seq space, or priorWorld would be null).
+                    // Taken here, after the buffer is hydrated: the message's worlds have
+                    // no output_lines yet, which left every mark null and the first switch
+                    // to each world typing its whole screen on (user report 2026-10-26).
+                    if (priorWorld && typeof priorWorld._seenSeq === 'number') {
+                        world._seenSeq = priorWorld._seenSeq;
+                        world._seenFixed = !!priorWorld._seenFixed;
+                    } else {
+                        world._seenSeq = lastLineSeq(world);
+                        world._seenFixed = false;
+                    }
                     // Track oldest seq for backfill deduplication
                     world._oldest_seq = null;
                     // Track whether this world's history is known exhausted
@@ -4079,6 +4103,20 @@
                     // with whatever the previous session knew (see carriedSeenRanges above).
                     // Also (re)sets world._max_seq.
                     rebuildSeenRanges(world, carriedSeenRanges);
+                    // The newest lines the server just sent, which a buffer from a while
+                    // ago (the IndexedDB cache above all) is short of: merged in, so the
+                    // page opens on the current screen and the catch-up fills only the
+                    // hole below them, out of view. Catching up from the buffer's end
+                    // instead appended everything that had arrived since at the bottom, a
+                    // reply at a time, and the output scrolled through all of it (user
+                    // report 2026-10-26). The native GUI does the same (client.rs
+                    // merge_newest).
+                    world._holesOnly = false;
+                    if (world._hydratedFromLocal && Array.isArray(world.output_lines_ts) && world.output_lines_ts.length > 0) {
+                        const merged = mergeNewestLines(world, world.output_lines_ts);
+                        if (!world._seenFixed) advanceSeenSeq(world, merged);
+                        world._holesOnly = true;
+                    }
                     // ▶ on the lines kept above (this reconnect's buffer, the disk cache) is
                     // the server's to say: our copy's can be stale - released while we were
                     // away, or cached before a release - and a stale marker never clears,
@@ -4177,9 +4215,6 @@
                     }
                     if (msg.settings.log_input_enabled !== undefined) {
                         logInputEnabled = msg.settings.log_input_enabled;
-                    }
-                    if (msg.settings.dictionary_path !== undefined) {
-                        dictionaryPath = msg.settings.dictionary_path;
                     }
                     if (msg.settings.spell_check_enabled !== undefined) {
                         spellCheckEnabled = msg.settings.spell_check_enabled;
@@ -5075,9 +5110,6 @@
                     if (msg.settings.log_input_enabled !== undefined) {
                         logInputEnabled = msg.settings.log_input_enabled;
                     }
-                    if (msg.settings.dictionary_path !== undefined) {
-                        dictionaryPath = msg.settings.dictionary_path;
-                    }
                     if (msg.settings.spell_check_enabled !== undefined) {
                         spellCheckEnabled = msg.settings.spell_check_enabled;
                         // The browser's own squiggles follow the setting.
@@ -5784,6 +5816,9 @@
             case 'ScrollbackLines': {
                 if (msg.world_index === undefined || !worlds[msg.world_index]) break;
                 const world = worlds[msg.world_index];
+                // Until this page first switches to the world, the history it catches up
+                // on (the resume replay, a gap fill, a backfill) counts as shown too.
+                if (!world._seenFixed) advanceSeenSeq(world, msg.lines);
 
                 // Resolve which outstanding request this reply answers, and route on THAT
                 // instead of the ambiguous world._gapFillPending flag alone (the stuck-at-90%
@@ -5941,8 +5976,11 @@
                     }
                     if (appended) scheduleWorldCacheSave(msg.world_index);
 
-                    if (msg.backfill_complete) {
+                    // After InitialState's newest lines were merged in, only the holes
+                    // below them are owed: what follows them comes live.
+                    if (msg.backfill_complete || (world._holesOnly && !oldestSeqHole(world))) {
                         world._gapFillPending = false;
+                        world._holesOnly = false;
                     } else if (msg.clamped_by_pending) {
                         // The server withheld the rest behind this world's unreleased
                         // more-mode backlog. Asking again returns the identical answer until
@@ -6349,7 +6387,10 @@
             // real value (World::next_seq starts at 0), so a world whose only delivered line
             // is seq 0 used to fail this guard, skip the gap-fill, and fall through to the
             // older-history queues only - never fetching anything newer.
-            if (world._hydratedFromLocal && hasDeliveredSeqs(world) && !world._resumedFromServer) {
+            if (world._holesOnly && !oldestSeqHole(world)) {
+                // Merged up to the newest line with nothing missing below: caught up.
+                world._holesOnly = false;
+            } else if (world._hydratedFromLocal && hasDeliveredSeqs(world) && !world._resumedFromServer) {
                 requestGapFill(idx);
             }
         });
@@ -6754,6 +6795,8 @@
             queueNormalBackfill(worldIndex);
             return;
         }
+        // A range the server names (a resync) is owed whole.
+        if (hasExplicitFromSeq) world._holesOnly = false;
         world._gapFillPending = true;
         // request_id: 0 is RESERVED for the server-initiated unprompted resume replay (see
         // pendingScrollbackRequests' doc comment) - this is a client-initiated request, so
@@ -7868,8 +7911,20 @@
         if (oldWorld) {
             const seen = lastLineSeq(oldWorld);
             if (seen !== null) oldWorld._seenSeq = seen;
+            oldWorld._seenFixed = true;
             oldWorld._textdiv = null;
         }
+    }
+
+    // A world's seen mark (_seenSeq) moved up to the newest of `lines` (not prepended
+    // archive history), for history caught up on before the first switch to it.
+    function advanceSeenSeq(world, lines) {
+        (lines || []).forEach(function(l) {
+            if (l && typeof l.seq === 'number' && !l.from_archive
+                && (typeof world._seenSeq !== 'number' || l.seq > world._seenSeq)) {
+                world._seenSeq = l.seq;
+            }
+        });
     }
 
     // The seq of a world's newest line, or null.
@@ -7890,6 +7945,8 @@
         const world = worlds[index];
         if (!world) return;
         world._textdiv = null;
+        // From here on, only what arrives live is new.
+        world._seenFixed = true;
         if (textdivMode !== 'on' && textdivMode !== 'always' && textdivMode !== 'clear') return;
         const afterSeq = (typeof world._seenSeq === 'number') ? world._seenSeq : null;
         const last = lastLineSeq(world);
@@ -8693,15 +8750,16 @@
             '  arrives. Keeps you from missing important text.', '',
             'TLS Proxy: Keeps a proxy alive during hot reload', '  so TLS connections survive.', '',
             'New Indicator: Show a marker on new lines arriving', '  while scrolled up in the output buffer.', '',
-            'Keyboard Visible: Force the on-screen keyboard to',
-            '  stay up on phones/tablets. Off lets the OS decide.',
+            'Keyboard Visible (phones and tablets only): Force the',
+            '  on-screen keyboard to stay up. Off lets the OS decide.',
             '  Always ignored (keyboard hidden) when a hardware',
             '  keyboard is attached.', '',
             'Debug: Enables debug logging to ~/.clay/debug.log.', '',
             'ANSI Music: Play ANSI music sequences from MUDs.', '',
-            'ZWJ Sequence: For terminals that support combined',
-            '  emoji (ZWJ). If unsupported, shows two separate',
-            '  emoji instead of one combined one.', '',
+            'ZWJ Sequence (set in the console\'s /setup): For',
+            '  terminals that support combined emoji (ZWJ). If',
+            '  unsupported, shows two separate emoji instead of',
+            '  one combined one.', '',
             'Picture Host: Where Import Picture uploads a picture',
             '  (dragged onto the window or terminal, or chosen with',
             '  Import Picture in the menu); its link goes into the',
@@ -14081,6 +14139,28 @@
             elements.setupTransparencySlider.value = Math.round(setupTransparency * 100);
             elements.setupTransparencyValue.textContent = Math.round(setupTransparency * 100) + '%';
         }
+        showOnlyThisInterfacesSettings();
+    }
+
+    // Settings show only what acts in this page (Save still sends the others' values back
+    // as it was given them): ZWJ Sequence is the console's; Keyboard Visible acts only on a
+    // phone/tablet layout, which is also where Clear Input on Send can't (phones always
+    // clear); the WebView GUI is a desktop, so its Font tab has no Phone or Tablet size.
+    // Asked again at every opening, since the device mode can change.
+    function showOnlyThisInterfacesSettings() {
+        const touch = deviceMode === 'phone' || deviceMode === 'tablet';
+        const rows = [
+            ['setup-zwj-toggle', false],
+            ['setup-keyboard-visible-toggle', touch],
+            ['setup-clear-input-toggle', deviceMode !== 'phone'],
+            ['font-phone-minus', !window.WEBVIEW_MODE],
+            ['font-tablet-minus', !window.WEBVIEW_MODE],
+        ];
+        rows.forEach(function(r) {
+            const el = document.getElementById(r[0]);
+            const row = el && el.closest('.setting-row');
+            if (row) row.style.display = r[1] ? '' : 'none';
+        });
     }
 
     // Build an UpdateGlobalSettings message with current state
@@ -14144,7 +14224,6 @@
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
-            dictionary_path: dictionaryPath,
             scrollback_enabled: scrollbackEnabled,
             log_input_enabled: logInputEnabled,
             keyboard_always_visible: keyboardAlwaysVisible

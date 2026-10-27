@@ -1,7 +1,6 @@
 //! The system's own spell checker, where there is one: Windows' (ISpellChecker, in the
 //! user's language) and macOS's (NSSpellChecker), as the WebView's text field uses. On
-//! Linux, and wherever the user has set a dictionary file, Clay's own checker
-//! (`spell.rs`) does it instead.
+//! Linux Clay's own checker (`spell.rs`, the system's word list) does it instead.
 //!
 //! Both are used from the window's thread only (COM's apartment, AppKit's main thread).
 

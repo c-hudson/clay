@@ -2192,8 +2192,6 @@ pub struct Settings {
     actions: Vec<Action>,
     // TLS proxy for connection preservation over hot reload
     tls_proxy_enabled: bool,
-    // Custom dictionary path for spell checking (empty = use system defaults)
-    dictionary_path: String,
     // Editor side for split-screen editor (left or right)
     editor_side: EditorSide,
     // The console's own text-reveal effect (src/reveal.rs); the other interfaces' are in
@@ -2312,7 +2310,6 @@ impl Default for Settings {
             websocket_auth_key: None,
             actions: Vec::new(),
             tls_proxy_enabled: false,
-            dictionary_path: String::new(),
             editor_side: EditorSide::Left,
             text_reveal: TextReveal::Off,
             text_reveal_profiles: std::collections::BTreeMap::new(),
@@ -6254,7 +6251,7 @@ impl App {
             input_resize_drag: None,
             output_height: 20, // Will be updated by ui()
             output_width: 80,  // Will be updated by ui()
-            spell_checker: SpellChecker::new(""),
+            spell_checker: SpellChecker::new(),
             spell_state: SpellState::new(),
             last_input_was_delete: false,
             skip_temp_conversion: None,
@@ -6542,7 +6539,6 @@ impl App {
             ws_key_file: self.settings.websocket_key_file.clone(),
             tls_configured: !self.settings.websocket_cert_file.is_empty() && !self.settings.websocket_key_file.is_empty(),
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
-            dictionary_path: self.settings.dictionary_path.clone(),
             mouse_enabled: self.settings.mouse_enabled,
             zwj_enabled: self.settings.zwj_enabled,
             new_line_indicator: self.settings.new_line_indicator,
@@ -6651,7 +6647,6 @@ impl App {
         *self.ws_auth_key_shared.write().unwrap() =
             self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
         self.settings.tls_proxy_enabled = settings.tls_proxy_enabled;
-        self.settings.dictionary_path = settings.dictionary_path.clone();
         self.settings.mouse_enabled = settings.mouse_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
         self.settings.new_line_indicator = settings.new_line_indicator;
@@ -7654,7 +7649,6 @@ impl App {
             self.input_height as i64,
             &self.settings.gui_theme,
             self.settings.tls_proxy_enabled,
-            &self.settings.dictionary_path,
             self.settings.editor_side.name(),
             self.settings.mouse_enabled,
             self.settings.zwj_enabled,
@@ -9050,8 +9044,30 @@ impl App {
         splash_lines: Vec<String>,
         actions: Vec<Action>,
     ) {
-        let new_worlds: Vec<World> = worlds.into_iter().map(|w| self.world_from_state_msg(w)).collect();
+        // The console's New Only and %textdiv marks (`console_seen_seq`) outlive a
+        // reconnect for as long as the world's seq space does (the server's `seq_epoch`,
+        // kept on the mirrored world): a world new to this console, or in a new seq space,
+        // counts what it holds now as seen, as `track_console_world`'s first draw does.
+        let kept: std::collections::HashMap<String, (u64, Option<u64>)> =
+            self.worlds.iter().map(|w| (w.name.clone(), (w.seq_epoch, w.console_seen_seq))).collect();
+        let new_worlds: Vec<World> = worlds
+            .into_iter()
+            .map(|w| {
+                let epoch = w.seq_epoch;
+                let mut world = self.world_from_state_msg(w);
+                world.seq_epoch = epoch;
+                world
+            })
+            .collect();
         self.worlds = new_worlds;
+        if self.console_drawn_world.is_some() {
+            for w in &mut self.worlds {
+                w.console_seen_seq = match kept.get(&w.name) {
+                    Some(&(epoch, seen)) if epoch == w.seq_epoch => seen,
+                    _ => w.output_lines.last().map(|l| l.seq),
+                };
+            }
+        }
         self.current_world_index = current_world_index;
         self.apply_global_settings(&settings);
         self.is_master = false; // Remote client is never master
@@ -11237,7 +11253,6 @@ impl App {
         ws_key_file: String,
         ws_password: String,
         tls_proxy_enabled: bool,
-        dictionary_path: String,
         mouse_enabled: bool,
         zwj_enabled: bool,
         new_line_indicator: bool,
@@ -11359,10 +11374,6 @@ impl App {
         // Empty = unchanged: a client from before the Kokoro voice existed.
         if !tts_voice.is_empty() {
             self.settings.tts_voice = kokoro::normalize_voice(&tts_voice);
-        }
-        if self.settings.dictionary_path != dictionary_path {
-            self.settings.dictionary_path = dictionary_path;
-            self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
         }
         let scrollback_changed = self.settings.scrollback_enabled != scrollback_enabled;
         self.settings.scrollback_enabled = scrollback_enabled;
@@ -17397,7 +17408,7 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -17405,7 +17416,7 @@ impl App {
                     input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet,
                     web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
-                    ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
+                    ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                     mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                     log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile,
                 );
@@ -19319,7 +19330,6 @@ pub(crate) struct SetupSettings {
     pub(crate) input_height: i64,
     pub(crate) gui_theme: String,
     pub(crate) tls_proxy: bool,
-    pub(crate) dictionary_path: String,
     pub(crate) editor_side: String,
     pub(crate) mouse_enabled: bool,
     pub(crate) zwj_enabled: bool,
@@ -19497,7 +19507,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
-        SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
+        SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE, SETUP_FIELD_TTS_VOICE,
         SETUP_FIELD_SCROLLBACK, SETUP_FIELD_LOG_INPUT, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
         SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR, SETUP_FIELD_PICTURE_HOST, SETUP_FIELD_CLEAR_INPUT, SETUP_FIELD_TEXT_REVEAL,
@@ -19611,8 +19621,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             gui_theme: state.get_selected(SETUP_FIELD_GUI_THEME)
                 .unwrap_or("dark").to_string(),
             tls_proxy: state.get_bool(SETUP_FIELD_TLS_PROXY).unwrap_or(false),
-            dictionary_path: state.get_text(SETUP_FIELD_DICTIONARY)
-                .unwrap_or("").to_string(),
             editor_side: state.get_selected(SETUP_FIELD_EDITOR_SIDE)
                 .unwrap_or("left").to_string(),
             mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
@@ -21655,6 +21663,7 @@ async fn main() -> io::Result<()> {
     let mut multiuser_mode = false;
     let mut local_server_mode = false;
     let mut tts_install_mode = false;
+    let mut upgrade_mode = false;
     let mut local_server_port: Option<u16> = None;
     let mut is_reload_arg = false;
     let mut is_crash_arg = false;
@@ -21705,6 +21714,7 @@ async fn main() -> io::Result<()> {
                 "--multiuser" => multiuser_mode = true,
                 "--local-server" => local_server_mode = true,
                 "--tts-install" => tts_install_mode = true,
+                "--upgrade" => upgrade_mode = true,
                 "--reload" => is_reload_arg = true,
                 "--crash" => is_crash_arg = true,
                 "--console" => console_arg = Some(None),
@@ -21781,6 +21791,11 @@ async fn main() -> io::Result<()> {
         // only runs a client (src/kokoro.rs).
         std::process::exit(kokoro::install_files_cli().await);
     }
+    if upgrade_mode {
+        // `clay --upgrade`: /update's download and install, from the command line, with
+        // no GUI or console (selfupdate::upgrade_cli).
+        std::process::exit(selfupdate::upgrade_cli().await);
+    }
 
     if show_help {
         println!("Clay MUD Client v{}", VERSION);
@@ -21827,6 +21842,7 @@ async fn main() -> io::Result<()> {
         println!("      --noesc                 Strip ANSI color codes from output");
         println!("    --dump[=<dir>]       Export the offline scrollback archive to scrollback_dump.csv");
         println!("                         Default output directory: current working directory");
+        println!("    --upgrade            Update this binary to the newest release on GitHub and exit");
         println!("    -v, --version        Show version and build information");
         println!("    -h, --help           Show this help message");
         println!();
@@ -22573,11 +22589,6 @@ pub async fn run_app_headless(
     }
 
     app.ensure_has_world();
-
-    // Re-create spell checker with custom dictionary path if configured
-    if !app.settings.dictionary_path.is_empty() {
-        app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-    }
 
     // Open scrollback archive if enabled
     app.init_scrollback();
@@ -23810,11 +23821,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     debug_log(is_debug_enabled(), "STARTUP: Ensuring has world...");
     app.ensure_has_world();
     debug_log(is_debug_enabled(), &format!("STARTUP: Have {} worlds", app.worlds.len()));
-
-    // Re-create spell checker with custom dictionary path if configured
-    if !app.settings.dictionary_path.is_empty() {
-        app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-    }
 
     // Open scrollback archive if enabled
     app.init_scrollback();

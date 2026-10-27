@@ -124,7 +124,7 @@ Three modes (configured per-world):
 
 ## Spell Checking
 
-- Uses system dictionary at `/usr/share/dict/words` (fallback: american-english, british-english)
+- Uses the system dictionary: `/usr/share/dict/words` (fallback: american-english, british-english), LibreOffice's `en_US.dic`/`en_GB.dic` on Windows, else aspell; no dictionary-path setting
 - Words only checked when "complete" (followed by space/punctuation)
 - Contraction support (didn't, won't, I'm)
 - `Ctrl+Q` cycles through suggestions (Levenshtein distance, max 3)

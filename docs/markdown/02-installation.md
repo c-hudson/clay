@@ -160,6 +160,7 @@ On first run, Clay creates a settings file at `~/.clay.dat` and displays a color
 | `--multiuser` | Run as a multiuser server (separate config, one process serves several independent accounts) |
 | `--local-server` | Run headless, loopback-only, for an embedding client (e.g. the Android app); with `CLAY_LOCAL_SERVER_LAN=1` in the environment it listens on every interface (the app's Allow Other Devices) |
 | `--port=<N>` | Override the listen port (used with `--local-server`) |
+| `--upgrade` | Download the newest release from GitHub, install it over this binary and exit, without starting the console or a GUI (`/update`'s install, from the command line). A Clay already running from the same file keeps its version until it restarts or `/reload`s. Not on Termux |
 
 Remote connections always use `--console=host:port`, `--gui=host:port` or `--web-gui=host:port` — there is
 no separate flag for it.

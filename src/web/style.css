@@ -3456,6 +3456,12 @@ html.popup-window .settings-content {
     gap: 0;
 }
 
+/* The switches take only the width they need, the choices the rest: halves squeezed the
+   choices' text (the native GUI's General card does the same). */
+.settings-two-column > .settings-column:first-child {
+    flex: 0 0 auto;
+}
+
 .setting-label {
     width: 90px;
     min-width: 70px;

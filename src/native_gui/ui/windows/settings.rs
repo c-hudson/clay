@@ -466,32 +466,33 @@ impl SettingsView {
         let offset = if e.color_offset_percent == 0 { "OFF".to_string() } else { format!("{}%", e.color_offset_percent) };
         let (height, wrap) = (super::super::input_view::input_height_of(e).to_string(), e.wrapspace.to_string());
         let (archive, transparency) = (e.scrollback_enabled, (e.gui_transparency * 100.0).round() as u32);
-        let toggles = |pairs: Vec<Toggle>, cx: &mut Context<Self>| {
-            div().flex_1().flex().flex_col().children(pairs.into_iter().map(|(label, on, flip)| {
-                row(k, label, k.toggle(label, on, cx.listener(move |this, _, _w, cx| {
-                    flip(&mut this.edit);
-                    cx.notify();
-                })).into_any_element())
-            }))
-        };
-        let mut left: Vec<Toggle> = vec![
+        // Only what acts here: Keyboard Visible is the phone/tablet page's, ZWJ Sequence the
+        // console's (Save sends their values back unchanged). The switches on the left, only
+        // as wide as they need; the choices on the right with the rest of the width, which
+        // a choice needs and a switch doesn't (user report 2026-10-26: halves squeezed them).
+        let mut switches: Vec<Toggle> = vec![
             ("More mode", e.more_mode_enabled, |s| s.more_mode_enabled = !s.more_mode_enabled),
             ("TLS Proxy", e.tls_proxy_enabled, |s| s.tls_proxy_enabled = !s.tls_proxy_enabled),
             ("New Indicator", e.new_line_indicator, |s| s.new_line_indicator = !s.new_line_indicator),
-            ("Keyboard Visible", e.keyboard_always_visible, |s| s.keyboard_always_visible = !s.keyboard_always_visible),
+            ("Clear Input on Send", e.clear_input_on_send, |s| s.clear_input_on_send = !s.clear_input_on_send),
             ("Debug", e.debug_enabled, |s| s.debug_enabled = !s.debug_enabled),
             ("Archive Input/Output", e.scrollback_enabled, |s| s.scrollback_enabled = !s.scrollback_enabled),
         ];
         if archive {
-            left.push(("Log Input", e.log_input_enabled, |s| s.log_input_enabled = !s.log_input_enabled));
+            switches.push(("Log Input", e.log_input_enabled, |s| s.log_input_enabled = !s.log_input_enabled));
         }
-        let right_toggles: Vec<Toggle> = vec![
-            ("ANSI Music", e.ansi_music_enabled, |s| s.ansi_music_enabled = !s.ansi_music_enabled),
-            ("ZWJ Sequence", e.zwj_enabled, |s| s.zwj_enabled = !s.zwj_enabled),
-            ("Clear Input on Send", e.clear_input_on_send, |s| s.clear_input_on_send = !s.clear_input_on_send),
-        ];
-        let left = toggles(left, cx);
-        let right = toggles(right_toggles, cx)
+        switches.push(("ANSI Music", e.ansi_music_enabled, |s| s.ansi_music_enabled = !s.ansi_music_enabled));
+        let left = div().flex_none().flex().flex_col().children(switches.into_iter().map(|(label, on, flip)| {
+            row(k, label, k.toggle(label, on, cx.listener(move |this, _, _w, cx| {
+                flip(&mut this.edit);
+                cx.notify();
+            })).into_any_element())
+        }));
+        let right = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
             .child(row(k, "TTS", self.tts.view()))
             .child(row(k, "Speak Mode", self.speak.view()))
             .child(row(k, "Kokoro Voice", k.input(&self.fields.voice).font_family(k.fonts.ui.clone()).text_size(px(12.0)).into_any_element()))
@@ -616,8 +617,7 @@ impl SettingsView {
                     .flex_col()
                     .gap(px(6.0))
                     .child(row(k, "Weight", self.stepper(k, "font-weight", e.web_font_weight.to_string(), |v| v.edit.web_font_weight = v.edit.web_font_weight.saturating_sub(50).max(1), |v| v.edit.web_font_weight = (v.edit.web_font_weight + 50).min(900), cx)))
-                    .child(row(k, "Phone", self.stepper(k, "font-phone", (e.web_font_size_phone.round() as i32).to_string(), |v| v.edit.web_font_size_phone = (v.edit.web_font_size_phone.round() - 1.0).max(7.0), |v| v.edit.web_font_size_phone = (v.edit.web_font_size_phone.round() + 1.0).min(20.0), cx)))
-                    .child(row(k, "Tablet", self.stepper(k, "font-tablet", (e.web_font_size_tablet.round() as i32).to_string(), |v| v.edit.web_font_size_tablet = (v.edit.web_font_size_tablet.round() - 1.0).max(7.0), |v| v.edit.web_font_size_tablet = (v.edit.web_font_size_tablet.round() + 1.0).min(20.0), cx)))
+                    // This GUI is a desktop: the phone and tablet sizes are the web page's.
                     .child(row(k, "Desktop", self.stepper(k, "font-desktop", (e.web_font_size_desktop.round() as i32).to_string(), |v| v.edit.web_font_size_desktop = (v.edit.web_font_size_desktop.round() - 1.0).max(7.0), |v| v.edit.web_font_size_desktop = (v.edit.web_font_size_desktop.round() + 1.0).min(20.0), cx))),
             )
             .child(

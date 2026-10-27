@@ -288,7 +288,7 @@ VirtualBox VM: finish 6a (including the stop) before starting 6b.
 4. Copy it back:
    `scp -P 2222 -o UserKnownHostsFile=$HOME/VMs/macos/known_hosts adrick@127.0.0.1:clay/clay-macos-universal /tmp/clay-macos-universal`,
    then verify it contains this release's code, like any other asset.
-5. Prune its `target/` (see Step 9; the VM's python3 is 3.9, which the script supports):
+5. Prune its `target/` (see Step 10; the VM's python3 is 3.9, which the script supports):
    `~/VMs/macos/macvm.sh ssh 'cd ~/clay && python3 tools/prune-target.py'`. The deleted space
    goes back to the host, because the disk is attached with discard.
 6. **Always** `~/VMs/macos/macvm.sh stop` afterwards, whether the build passed or failed
@@ -333,7 +333,7 @@ ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no adrick@192.
    timeout can kill mid-link.
 2. `scp` the binary back: `scp adrick@192.168.2.14:clay/target/release/clay.exe /tmp/clay-windows-x86_64.exe`
 3. **Verify** it contains this release's code (`strings /tmp/clay-windows-x86_64.exe | grep -c '<release-marker>'` must be > 0). A `0` here means the cmd.exe sync didn't take and you built stale source — re-run step 1 and re-check the printed SHA.
-4. Prune its `target\` (see Step 9). This matters most here, because C: is only 70 GB. The VM
+4. Prune its `target\` (see Step 10). This matters most here, because C: is only 70 GB. The VM
    has no installed Python, so use the portable one from machines.md:
    `ssh adrick@192.168.2.14 "cd clay && %USERPROFILE%\python-embed\python.exe tools\prune-target.py"`
 
@@ -452,7 +452,34 @@ gh release create vX.Y.Z \
 Note: the three Termux assets are not bracketed above — all are cross-compiled locally
 (Step 5), so they're always included in a full release.
 
-### Step 9: Clean Up /tmp and target/
+### Step 9: Delete Old GitHub Releases
+
+Run this after every successful Step 8, partial releases included. A series is a
+major.minor (1.5, 1.6, 1.7). The current series keeps every release. Each older series keeps
+only its first and last version, so v1.5.0 ... v1.5.43 keeps v1.5.0 and v1.5.43. When 1.8.0
+ships, 1.7 drops to v1.7.0 and its last version:
+```bash
+python3 -I .claude/skills/release/prune-releases.py --current vX.Y.Z --dry-run   # the plan
+python3 -I .claude/skills/release/prune-releases.py --current vX.Y.Z
+```
+- **The current series** is the highest series released, or vX.Y.Z's if that is higher.
+  Releasing an older patch (a 1.6.26 after 1.7.x) leaves 1.7 current. It makes v1.6.26 that
+  series' last version, and v1.6.25 then goes.
+- **Versions order as semver**, so a pre-release comes before its release: 1.0 keeps
+  v1.0.0-alpha and v1.0.4.
+- **Never touched:** drafts, tags not of the form vMAJOR.MINOR.PATCH[-PRE], and vX.Y.Z
+  itself.
+- **Git tags stay.** Only the release pages and their binaries go (`gh release delete`
+  without `--cleanup-tag`).
+- **If vX.Y.Z isn't a published release,** the script deletes nothing and exits 1. That way
+  a failed upload never also costs old releases.
+- **Don't ask before deleting:** the user asked for this step.
+- **A deletion that fails** is listed and makes the script exit 1. Report it in the summary
+  and carry on; the next release's run retries it.
+
+Record the deleted tags for the summary.
+
+### Step 10: Clean Up /tmp and target/
 
 `/tmp` on this machine is a RAM-backed tmpfs, so the staged binaries (about 0.5 GB) hold RAM
 until deleted. Once `gh release view vX.Y.Z --json assets` lists every uploaded asset, record
@@ -483,7 +510,7 @@ the pre-bump Clay binaries and incremental caches. It never touches final binari
 running cargo holds. `--dry-run --list` shows what it would delete. The Mac and Windows VMs
 prune their own `target/` in Steps 6a and 6b. Report each `Freed N GB` line in the summary.
 
-### Step 10: Print Summary
+### Step 11: Print Summary
 
 Print a summary table showing:
 - Each build target attempted, pass/fail status, and file size
@@ -491,6 +518,7 @@ Print a summary table showing:
 - The GitHub release URL
 - Total number of assets uploaded
 - The space `tools/prune-target.py` freed here and on each VM
+- The old releases Step 9 deleted (count and tags), or "none"
 
 Example (full release, all machines reachable):
 ```
@@ -510,6 +538,7 @@ Example (full release, all machines reachable):
 Release: https://github.com/user/repo/releases/tag/vX.Y.Z
 Assets uploaded: 8
 Pruned target/: 41.2 GB here, 1.6 GB Mac VM, 1.9 GB Windows VM
+Old releases deleted: 22 (v1.7.1 ... v1.7.22; 1.7 keeps v1.7.0 and v1.7.23)
 ```
 
 Example (full release, Windows VM unreachable, Mac VM did not come up):
@@ -574,4 +603,5 @@ Assets uploaded: 1
 - **Build failure**: Read the error, fix the code, commit + push, git pull on remotes, retry
 - **SSH failure**: Report to user, ask if they want to skip that target or retry
 - **GitHub release failure**: Show the error and ask the user how to proceed
+- **Old-release deletion failure** (Step 9): report the failed tags in the summary, don't ask; the next release retries them
 - **Signing failure**: Check if keystore exists, report error details to user

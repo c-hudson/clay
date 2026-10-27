@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use crate::{
     popup, persistence, chords,
-    SpellChecker,
     WsMessage,
     WorldSwitchMode,
     Encoding, AutoConnectType, KeepAliveType, WorldType,
@@ -798,10 +797,6 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.input_height = settings.input_height as u16;
                 app.settings.gui_theme = crate::theme::normalize_theme_name(&settings.gui_theme);
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
-                if app.settings.dictionary_path != settings.dictionary_path {
-                    app.settings.dictionary_path = settings.dictionary_path.clone();
-                    app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-                }
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
                 app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
                 // Update mouse setting; if disabled, turn off capture immediately

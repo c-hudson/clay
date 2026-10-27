@@ -103,6 +103,45 @@ pub fn unavailable(label: &str) -> String {
     format!("{label}: update is not available on this platform.")
 }
 
+/// `clay --upgrade`: install the newest GitHub release over this binary and exit, with no
+/// console or GUI (it runs before either starts, so it prints). Up to date already is a
+/// success. A Clay already running from this file keeps its version until it restarts or
+/// `/reload`s. Returns the exit code.
+pub async fn upgrade_cli() -> i32 {
+    #[cfg(target_os = "android")]
+    {
+        eprintln!("{}", unavailable("Clay"));
+        1
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let downloaded = crate::platform::check_and_download_update(false, |version| async move {
+            println!("{}", updating(None, &version));
+        })
+        .await;
+        match downloaded.and_then(|s| crate::platform::install_update(&s.temp_path).map(|()| s.version)) {
+            Ok(version) => {
+                let at = crate::platform::get_executable_path().map(|(p, _)| p.display().to_string()).unwrap_or_default();
+                println!("{}", upgraded(&version, &at));
+                0
+            }
+            Err(e) if e.starts_with(crate::platform::UP_TO_DATE) => {
+                println!("{e}");
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        }
+    }
+}
+
+/// `clay --upgrade` installed a release (no reload follows to say so).
+pub fn upgraded(version: &str, at: &str) -> String {
+    format!("Clay v{version} is installed at {at}. A Clay already running keeps its version until it restarts or /reloads.")
+}
+
 /// The target a relaunched client attaches to, from this run's own arguments
 /// (`--gui=host`, `--web-gui=host`, `--console=host`), for the "still attached to"
 /// part of a message.

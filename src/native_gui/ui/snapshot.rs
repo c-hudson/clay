@@ -354,6 +354,27 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     });
                     Vec::new()
                 }
+                // Text Reveal's New Only: each world's seen mark and how many of its lines
+                // are newer than it (what a switch to the world types on).
+                "reveal" => {
+                    cx.run_until_parked();
+                    cx.update(|app| {
+                        let v = view.read(app);
+                        let core = &v.session.core;
+                        let worlds: Vec<String> = core.worlds.iter().map(|w| {
+                            let seen = v.textdiv.seen(&w.name);
+                            let newer = w.lines.iter().filter(|l| !l.from_archive && l.seq.is_some_and(|s| seen.is_none_or(|m| s > m))).count();
+                            format!("{}[lines={} seen={} newer={}]", w.name, w.lines.len(), seen.map_or("-".to_string(), |s| s.to_string()), newer)
+                        }).collect();
+                        println!(
+                            "snapshot-reveal: {arg} current={} new_only={} {}",
+                            core.current_world().map_or("-", |w| w.name.as_str()),
+                            v.reveal_new_only,
+                            worlds.join(" ")
+                        );
+                    });
+                    Vec::new()
+                }
                 // A capture of the main window now, as well as the one at the end.
                 "shot" => {
                     cx.run_until_parked();

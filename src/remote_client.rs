@@ -2231,10 +2231,6 @@ pub(crate) fn handle_remote_client_key(
                 app.input.visible_height = app.input_height;
                 app.settings.gui_theme = crate::theme::normalize_theme_name(&settings.gui_theme);
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
-                if app.settings.dictionary_path != settings.dictionary_path {
-                    app.settings.dictionary_path = settings.dictionary_path.clone();
-                    app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-                }
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
                 // Applied here at once; the master keeps it under this console's own key
                 // (REMOTE_CONSOLE_REVEAL_KEY) in the UpdateGlobalSettings below.
@@ -2306,7 +2302,6 @@ pub(crate) fn handle_remote_client_key(
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     ws_password: String::new(),  // Empty = unchanged (see apply_remote_web_settings)
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
-                    dictionary_path: app.settings.dictionary_path.clone(),
                     mouse_enabled: app.settings.mouse_enabled,
                     zwj_enabled: app.settings.zwj_enabled,
                     new_line_indicator: app.settings.new_line_indicator,
@@ -3518,7 +3513,6 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         // field starts blank); a value typed into the popup sets a new one.
         ws_password,
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
-        dictionary_path: app.settings.dictionary_path.clone(),
         mouse_enabled: app.settings.mouse_enabled,
         zwj_enabled: app.settings.zwj_enabled,
         new_line_indicator: app.settings.new_line_indicator,
