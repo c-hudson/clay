@@ -55,6 +55,10 @@ pub struct ScrollbackLine {
     pub text: String,
     /// Durable archive sequence, when the row has one (v2 schema).
     pub wseq: Option<i64>,
+    /// The line was gagged when it arrived. Filled only by the Page Up readers
+    /// (`load_before_wseq`/`load_before_path`), which show it the way it was shown live;
+    /// a search's results leave it false.
+    pub gagged: bool,
 }
 
 /// A search against the archive.
@@ -901,6 +905,7 @@ impl ScrollbackDb {
                 world: row.get(1)?,
                 text: row.get(2)?,
                 wseq: None,
+                gagged: false,
             })
         });
 
@@ -1137,7 +1142,7 @@ pub fn query(path: &Path, q: &ArchiveQuery) -> Vec<ScrollbackLine> {
                     })
                     .clone()
             };
-            out.push(ScrollbackLine { ts_ms, world, text, wseq: Some(wseq) });
+            out.push(ScrollbackLine { ts_ms, world, text, wseq: Some(wseq), gagged: false });
             if out.len() >= q.limit {
                 break;
             }
@@ -1175,7 +1180,7 @@ pub fn load_before_wseq(path: &Path, world: &str, before_wseq: i64, count: usize
         Err(_) => return Vec::new(),
     };
     let mut stmt = match conn.prepare(
-        "SELECT ts_ms, line_raw, wseq FROM output_log
+        "SELECT ts_ms, line_raw, wseq, gagged FROM output_log
          WHERE wid = ?1 AND wseq < ?2 ORDER BY wseq DESC LIMIT ?3",
     ) {
         Ok(s) => s,
@@ -1187,6 +1192,7 @@ pub fn load_before_wseq(path: &Path, world: &str, before_wseq: i64, count: usize
             world: world.to_string(),
             text: row.get(1)?,
             wseq: row.get(2).ok(),
+            gagged: row.get::<_, i64>(3).unwrap_or(0) != 0,
         })
     });
     let mut lines: Vec<ScrollbackLine> =
@@ -1203,12 +1209,16 @@ pub fn load_before_path(path: &Path, world: &str, before_ts_ms: i64, count: usiz
 
     // Fetch the N rows just before the timestamp, then reverse to get oldest-first
     let sql = if archive_state(&conn) == ArchiveState::Ready {
-        "SELECT o.ts_ms, w.name, o.line_raw FROM output_log o \
+        "SELECT o.ts_ms, w.name, o.line_raw, o.gagged FROM output_log o \
          JOIN worlds w ON w.wid = o.wid \
          WHERE w.name = ?1 COLLATE NOCASE AND o.ts_ms < ?2 \
          ORDER BY o.ts_ms DESC LIMIT ?3"
+    } else if has_column(&conn, "output_log", "gagged") {
+        "SELECT ts_ms, world, line_raw, gagged FROM output_log \
+         WHERE world = ?1 AND ts_ms < ?2 \
+         ORDER BY ts_ms DESC LIMIT ?3"
     } else {
-        "SELECT ts_ms, world, line_raw FROM output_log \
+        "SELECT ts_ms, world, line_raw, 0 FROM output_log \
          WHERE world = ?1 AND ts_ms < ?2 \
          ORDER BY ts_ms DESC LIMIT ?3"
     };
@@ -1224,6 +1234,7 @@ pub fn load_before_path(path: &Path, world: &str, before_ts_ms: i64, count: usiz
             world: row.get(1)?,
             text: row.get(2)?,
             wseq: None,
+            gagged: row.get::<_, i64>(3).unwrap_or(0) != 0,
         })
     });
 

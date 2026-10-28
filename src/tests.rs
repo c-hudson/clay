@@ -9588,11 +9588,56 @@ third
              gap-fill splice path's seq > last_contiguous_seq filter");
         assert_eq!(app.worlds[0].output_lines.first().map(|l| l.text.as_str()), Some("line90"),
             "the oldest line must end up at the very front of the buffer (prepended)");
-        assert_eq!(app.worlds[0].pending_gap, Some((5, 105)),
-            "pending_gap must be completely untouched by this reply - it belongs to a \
-             different, still-unanswered request");
+        assert_eq!(app.worlds[0].pending_gap, Some((5 + older_count, 105)),
+            "pending_gap must stay open - it belongs to a different, still-unanswered \
+             request - with its place moved along by the lines put in front of it, or the \
+             gap fill would land among the older lines");
         assert!(!app.pending_scrollback_requests.contains_key(&backfill_id),
             "the resolved request must be removed from pending_scrollback_requests");
+    }
+
+    #[test]
+    fn test_console_client_page_up_past_the_top_asks_for_history_and_installs_it() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("world0"));
+        app.current_world_index = 0;
+        let (tx, mut _rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        app.ws_client_tx = Some(tx);
+        app.handle_remote_ws_message(console_server_data(0, 101,
+            &["line101", "line102", "line103", "line104", "line105"]));
+
+        assert!(app.remote_history_request(0).is_none(), "not to a server that doesn't take it");
+        app.server_history_on_demand = true;
+        let Some(WsMessage::RequestHistory { request_id, before_seq, archive_before, .. }) = app.remote_history_request(0) else {
+            panic!("no RequestHistory");
+        };
+        assert_eq!((before_seq, archive_before), (Some(101), None), "from the oldest live line");
+        assert!(app.remote_history_request(0).is_none(), "one request at a time");
+
+        let live: Vec<TimestampedLine> = (98..=100u64).map(|seq| TimestampedLine { archive_sourced: false,
+            text: format!("line{seq}"), ts: 0, gagged: false, from_server: true, seq,
+            highlight_color: None, from_archive: false, viewed: false, display_id: None,
+        }).collect();
+        let archive: Vec<crate::websocket::ArchiveLine> = (0..3).map(|i| crate::websocket::ArchiveLine {
+            text: format!("old{i}"), ts_ms: 5_000 + i, wseq: Some(40 + i), gagged: i == 1,
+        }).collect();
+        // A reply to something else changes nothing.
+        app.handle_remote_ws_message(WsMessage::HistoryLines { world_index: 0, request_id: request_id + 1,
+            before_seq, archive_before, lines: live.clone(), archive: archive.clone(), done: true });
+        assert_eq!(app.worlds[0].output_lines.len(), 5);
+        app.handle_remote_ws_message(WsMessage::HistoryLines { world_index: 0, request_id,
+            before_seq, archive_before, lines: live, archive, done: true });
+
+        let texts: Vec<&str> = app.worlds[0].output_lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["old0", "old1", "old2", "line98", "line99", "line100",
+            "line101", "line102", "line103", "line104", "line105"], "no separator line");
+        let w = &app.worlds[0];
+        assert!(w.output_lines[..3].iter().all(|l| l.from_archive));
+        assert!(w.output_lines[1].gagged, "gagged as it was live");
+        assert_eq!(w.history_position(), (None, Some(crate::websocket::ArchiveCursor { wseq: Some(40), ts_ms: 5_000 })),
+            "the next request goes on from the oldest archive line");
+        assert!(app.remote_history_request(0).is_none(), "the server said nothing older exists");
     }
 
     /// `PongCheck.acked` must report the last *contiguous* seq, not the highest seq seen -
@@ -10380,9 +10425,9 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), ws_password.to_string(),
-            false, true, true, false,
+            false, true, false,
             "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None,
         );
     }
 
@@ -10404,9 +10449,9 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), String::new(),
-            false, true, true, false,
+            false, true, false,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, profile("native-linux", "superfast"), None,
+            "none".to_string(), "app_tablet".to_string(), None, None, profile("native-linux", "superfast"), None,
         );
         assert_eq!(app.settings.text_reveal_for("native-linux"), TextReveal::SuperFast);
         assert_eq!(app.settings.text_reveal, TextReveal::Off, "the console's own is not a client's to set");
@@ -10422,9 +10467,9 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), String::new(),
-            false, true, true, false,
+            false, true, false,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, profile("bogus", "fast"), None,
+            "none".to_string(), "app_tablet".to_string(), None, None, profile("bogus", "fast"), None,
         );
         assert!(!app.settings.text_reveal_profiles.contains_key("bogus"), "an unknown key is refused");
         assert_eq!(app.settings.text_reveal_for("app-android"), TextReveal::Off, "an interface that never chose is Off");
@@ -11010,6 +11055,7 @@ third
             other_views: false,
             expand_line: false,
             picture_upload: false,
+            history_on_demand: false,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -14756,7 +14802,7 @@ third
     /// including on the separator line.
     fn splice_archive_lines(world: &mut World, count: usize) {
         let archived: Vec<crate::scrollback::ScrollbackLine> = (0..count)
-            .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
+            .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false,
                 ts_ms: 1_000 + i as i64,
                 world: world.name.clone(),
                 text: format!("archived line {}", i),
@@ -14768,14 +14814,16 @@ third
     }
 
     #[test]
-    fn test_every_line_of_an_archive_block_is_marked_including_the_separator() {
+    fn test_every_line_of_an_archive_block_is_marked_and_there_is_no_separator() {
         // The from_archive marker is the ONLY thing keeping this block out of the sequence
         // contract. One unmarked line is enough to reintroduce the bug: it carries a
         // fabricated seq, is never broadcast, and slips past every filter - producing a
-        // permanent ledger hole and a duplicate seq. The separator is built with
-        // `new_client`, which does not set the marker, so it is the line that gets missed.
+        // permanent ledger hole and a duplicate seq. No interface draws a "── archive ──"
+        // separator above the block (user ruling 2026-10-27); the one the console had also
+        // carried "now" as its time, which made the timestamp fallback load the newest rows
+        // again once the archive ran out. A gagged line stays gagged.
         let archived: Vec<crate::scrollback::ScrollbackLine> = (0..5)
-            .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
+            .map(|i| crate::scrollback::ScrollbackLine { wseq: Some(10 + i), gagged: i == 2,
                 ts_ms: 1_000 + i,
                 world: "W".to_string(),
                 text: format!("old {}", i),
@@ -14784,12 +14832,16 @@ third
 
         let block = App::build_archive_prepend(archived, 100);
 
-        assert_eq!(block.len(), 6, "separator plus five archived lines");
+        assert_eq!(block.len(), 5, "the five archived lines and nothing else");
         for (i, line) in block.iter().enumerate() {
             assert!(line.from_archive,
                 "line {} of the archive block is not marked from_archive: {:?}",
                 i, line.text);
+            assert_eq!(line.text, format!("old {}", i));
+            assert_eq!(line.archive_seq, Some(10 + i as i64));
+            assert_eq!(line.gagged, i == 2, "line {} keeps its gagged flag", i);
         }
+        assert!(block.iter().all(|l| !l.text.contains("archive")), "no separator line");
     }
 
     #[test]
@@ -14901,6 +14953,182 @@ third
         }
     }
 
+    // ---- On-demand history (RequestHistory / HistoryLines) ----
+
+    /// Archive `n` lines of `world` into the test home's scrollback.db - the file the server
+    /// reads - returning their wseqs. Every test in the process shares that one file, so each
+    /// test archives under a world name of its own.
+    fn seed_history_archive(world: &str, n: i64, gagged: impl Fn(i64) -> bool) -> Vec<i64> {
+        let path = clay_config_path("scrollback.db");
+        let mut sdb = crate::scrollback::ScrollbackDb::open(&path, &[]).expect("open archive");
+        let tx = sdb.sender();
+        let mut seqs = Vec::new();
+        for i in 0..n {
+            let (wid, wseq) = tx.alloc_wseq(&format!("uuid-{world}"), world).expect("alloc");
+            let mut e = crate::scrollback::ArchiveEntry::new(world.into(), 1_000_000 + i, format!("archived {i}"), gagged(i));
+            e.wid = Some(wid);
+            e.wseq = Some(wseq);
+            assert!(tx.send(e));
+            seqs.push(wseq);
+        }
+        sdb.flush_and_close();
+        seqs
+    }
+
+    fn history_reply(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) -> (Vec<TimestampedLine>, Vec<crate::websocket::ArchiveLine>, bool, u64) {
+        while let Ok(out) = rx.try_recv() {
+            if let crate::websocket::Outbound::Message(msg) = out {
+                if let WsMessage::HistoryLines { lines, archive, done, request_id, .. } = *msg {
+                    return (lines, archive, done, request_id);
+                }
+            }
+        }
+        panic!("no HistoryLines reply");
+    }
+
+    #[test]
+    fn test_history_serves_memory_then_the_archive_just_below_it() {
+        // 100 lines archived; the newest 40 are in memory too (seq 0..39, each with its
+        // archive_seq), as after a cold start that went on archiving.
+        let name = "HistMemThenArchive";
+        let wseqs = seed_history_archive(name, 100, |_| false);
+        let mut app = App::new();
+        app.worlds = vec![World::new(name)];
+        for (seq, w) in wseqs[60..].iter().enumerate() {
+            let mut l = OutputLine::new(format!("archived {}", 60 + seq), seq as u64);
+            l.archive_seq = Some(*w);
+            app.worlds[0].output_lines.push(l);
+        }
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        while rx.try_recv().is_ok() {}
+
+        // Memory first: 20 of the 30 live lines older than the client's oldest.
+        app.handle_request_history(client_id, 0, 20, 7, Some(30), Some(0), None);
+        let (lines, archive, done, id) = history_reply(&mut rx);
+        assert_eq!(id, 7, "the request id is echoed");
+        assert_eq!(lines.iter().map(|l| l.seq).collect::<Vec<_>>(), (10..30).collect::<Vec<u64>>());
+        assert!(archive.is_empty() && !done, "memory had enough: no archive yet");
+
+        // The rest of memory, then the archive straight below it: nothing twice.
+        app.handle_request_history(client_id, 0, 50, 8, Some(10), Some(0), None);
+        let (lines, archive, done, _) = history_reply(&mut rx);
+        assert_eq!(lines.iter().map(|l| l.seq).collect::<Vec<_>>(), (0..10).collect::<Vec<u64>>());
+        assert_eq!(archive.iter().map(|a| a.text.clone()).collect::<Vec<_>>(),
+            (20..60).map(|i| format!("archived {i}")).collect::<Vec<_>>(),
+            "the 40 archived lines just older than memory's oldest, oldest first");
+        assert!(archive.iter().all(|a| a.wseq.is_some()));
+        assert!(!done);
+
+        // On from the oldest archive line: the last 20, and nothing older.
+        let cursor = crate::websocket::ArchiveCursor { wseq: archive[0].wseq, ts_ms: archive[0].ts_ms };
+        app.handle_request_history(client_id, 0, 50, 9, None, None, Some(cursor));
+        let (lines, archive, done, _) = history_reply(&mut rx);
+        assert!(lines.is_empty());
+        assert_eq!(archive.len(), 20);
+        assert_eq!(archive.first().map(|a| a.text.as_str()), Some("archived 0"));
+        assert_eq!(archive.last().map(|a| a.text.as_str()), Some("archived 19"));
+        assert!(done, "fewer rows than asked for: nothing older");
+    }
+
+    #[test]
+    fn test_history_cuts_by_time_and_keeps_gagged_lines_gagged() {
+        // Memory lines that predate archiving (no archive_seq): the archive is cut by the
+        // oldest one's time. A line gagged when it arrived comes back gagged.
+        let name = "HistTimeFallback";
+        seed_history_archive(name, 10, |i| i == 8);
+        let mut app = App::new();
+        app.worlds = vec![World::new(name)];
+        for seq in 0..5u64 {
+            app.worlds[0].output_lines.push(OutputLine::new(format!("live {seq}"), seq));
+        }
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        while rx.try_recv().is_ok() {}
+
+        app.handle_request_history(client_id, 0, 500, 1, Some(0), Some(0), None);
+        let (lines, archive, done, _) = history_reply(&mut rx);
+        assert!(lines.is_empty(), "nothing in memory is older than seq 0");
+        assert_eq!(archive.len(), 10);
+        assert_eq!(archive.iter().filter(|a| a.gagged).map(|a| a.text.as_str()).collect::<Vec<_>>(), vec!["archived 8"]);
+        assert!(done);
+    }
+
+    #[test]
+    fn test_history_never_sends_an_archive_block_the_console_paged_in_as_live_lines() {
+        let name = "HistConsoleBlock";
+        let mut app = App::new();
+        app.worlds = vec![World::new(name)];
+        for seq in 0..60u64 {
+            app.worlds[0].output_lines.push(OutputLine::new(format!("real {}", seq), seq));
+        }
+        app.worlds[0].next_seq = 60;
+        splice_archive_lines(&mut app.worlds[0], 500);
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        while rx.try_recv().is_ok() {}
+        app.handle_request_history(client_id, 0, 1000, 1, Some(30), Some(0), None);
+        let (lines, _archive, _, _) = history_reply(&mut rx);
+        assert_eq!(lines.len(), 30, "the 30 real lines older than seq 30, and no archive block line");
+        assert!(lines.iter().all(|l| !l.from_archive && l.text.starts_with("real ")));
+    }
+
+    #[test]
+    fn test_console_page_up_reads_the_archive_to_its_end_without_repeats() {
+        // The separator the console used to put above each block carried "now" as its time,
+        // and was the oldest line once a block was in: when the archive ran out, the time
+        // fallback read the newest 500 rows again.
+        let name = "HistConsolePageUp";
+        seed_history_archive(name, 700, |_| false);
+        let mut app = App::new();
+        app.worlds = vec![World::new(name)];
+        app.worlds[0].output_lines.push(OutputLine::new("live".into(), 0));
+        assert_eq!(app.try_load_archive_lines(0), 500);
+        assert_eq!(app.try_load_archive_lines(0), 200);
+        assert_eq!(app.try_load_archive_lines(0), 0, "at the archive's end nothing is loaded again");
+        let texts: Vec<String> = app.worlds[0].output_lines.iter().map(|l| l.text.clone()).collect();
+        let mut want: Vec<String> = (0..700).map(|i| format!("archived {i}")).collect();
+        want.push("live".into());
+        assert_eq!(texts, want, "every archived line once, in order, with no separator");
+    }
+
+    #[test]
+    fn test_an_archive_block_and_archive_seqs_survive_a_reload() {
+        // A reload used to write a Page Up block as ordinary lines: afterwards they went to
+        // every client in InitialState, and every line lost its archive_seq, which is where
+        // the archive is cut for the next Page Up or a client's RequestHistory.
+        let mut app = App::new();
+        app.worlds = vec![World::new("Reloaded")];
+        for seq in 0..3u64 {
+            let mut l = OutputLine::new(format!("real {seq}"), seq);
+            l.archive_seq = Some(1000 + seq as i64);
+            app.worlds[0].output_lines.push(l);
+        }
+        app.worlds[0].next_seq = 3;
+        splice_archive_lines(&mut app.worlds[0], 4);
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
+
+        let lines = &restored.worlds[0].output_lines;
+        assert_eq!(lines.len(), 7);
+        assert!(lines[..4].iter().all(|l| l.from_archive), "the block stays an archive block");
+        assert!(lines[4..].iter().all(|l| !l.from_archive));
+        assert_eq!(lines[4..].iter().map(|l| l.archive_seq).collect::<Vec<_>>(), vec![Some(1000), Some(1001), Some(1002)]);
+        let (sent, _) = App::build_initial_output_lines(lines, false, 10_000);
+        assert!(sent.iter().all(|l| l.text.starts_with("real ")), "InitialState carries only live lines after the reload");
+    }
+
+    #[test]
+    fn test_initial_state_advertises_history_on_demand() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("w")];
+        match app.build_initial_state(0) {
+            WsMessage::InitialState { history_on_demand, .. } => assert!(history_on_demand),
+            _ => panic!("not an InitialState"),
+        }
+    }
+
     #[test]
     fn test_archive_load_keeps_next_seq_above_everything_in_the_buffer() {
         // Reproduces the reported cave world: /dump showed output_lines.len 1648 against
@@ -14924,7 +15152,7 @@ third
         for _ in 0..3 {
             let oldest = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),
@@ -14959,7 +15187,7 @@ third
         for _ in 0..3 {
             let oldest = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),
@@ -15031,7 +15259,7 @@ third
         for _ in 0..3 {
             let oldest = app.worlds[0].output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),
@@ -21343,6 +21571,26 @@ fn the_web_cold_start_merges_the_newest_lines_into_a_kept_buffer() {
     assert!(js.contains("if (hasExplicitFromSeq) world._holesOnly = false;"), "a resync is owed whole");
 }
 
+/// On-demand history in the web client (`requestOlderHistory`/`applyHistoryLines`): asked
+/// for only to a server that takes it, archive lines held seq-less and never cached or
+/// taken for the pre-1.5.23 corruption, the window sliding instead of stopping at
+/// RENDER_WINDOW_MAX, and a slid window never mistaken for the bottom. The native GUI's is
+/// `ClientCore::request_history`/`on_history`.
+#[test]
+fn the_web_client_reads_history_on_demand() {
+    let js = include_str!("web/app.js");
+    assert!(js.contains("serverHistoryOnDemand = !!msg.history_on_demand;"));
+    assert!(js.contains("if (!world || world.shell || !serverHistoryOnDemand || !authenticated) return;"), "gated");
+    assert!(js.contains("            case 'HistoryLines':\n                applyHistoryLines(msg);"));
+    assert!(js.contains("if (!sameHistoryPosition(asked, historyPosition(world))) return;"), "a reply that no longer fits is dropped");
+    assert!(js.contains("            if (line._archive) continue;\n"), "bufferIsCorrupted passes archive lines by");
+    assert!(js.contains(".filter(l => !(l && l._archive)).slice(-cap);"), "never cached");
+    assert!(js.contains("        if (renderSlid()) return false;"), "isAtBottom: a slid window doesn't draw the bottom");
+    assert!(js.contains("        if (world && world._renderEndLine && worldIndex === currentWorldIndex) return;"), "no live append while slid");
+    assert!(js.contains("        if (world._history && (world._history.inflight || world._history.applied)) {"), "the backfill stands down");
+    assert!(js.contains("        let insertAt = archiveLead(world);"), "nothing with a seq goes above the archive lines");
+}
+
 #[test]
 fn the_web_picture_host_options_are_picture_service_options() {
     let html = include_str!("web/index.html");
@@ -21361,6 +21609,223 @@ fn the_web_picture_host_options_are_picture_service_options() {
         .map(|(v, l)| (v.to_string(), l.to_string()))
         .collect();
     assert_eq!(options, expected);
+}
+
+/// The web page's Separator Style choices are `SeparatorStyle::OPTIONS`, as the console's
+/// and the native GUI's are.
+#[test]
+fn the_web_separator_style_options_are_the_enums_options() {
+    let html = include_str!("web/index.html");
+    let start = html.find("id=\"setup-separator-style-select\"").expect("the select");
+    let end = start + html[start..].find("</select>").unwrap();
+    let options: Vec<(String, String)> = html[start..end]
+        .split("<option value=\"")
+        .skip(1)
+        .map(|o| {
+            let (value, rest) = o.split_once("\">").unwrap();
+            (value.to_string(), rest.split("</option>").next().unwrap().to_string())
+        })
+        .collect();
+    let expected: Vec<(String, String)> =
+        crate::SeparatorStyle::OPTIONS.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect();
+    assert_eq!(options, expected);
+}
+
+/// The web page draws TF's status line in the Separator Style's look as the console does:
+/// the pad by look unless the script set one, and the TinyFugue look's class on the bar.
+#[test]
+fn the_web_page_draws_tfs_status_line_in_the_separator_styles_look() {
+    let js = include_str!("web/app.js");
+    assert!(js.contains("const pad = view.pad || (tinyfugue ? '_' : ' ');"));
+    assert!(js.contains("bar.classList.toggle('tf-status-tinyfugue', tinyfugue);"));
+    assert!(include_str!("web/style.css").contains("#status-bar.tf-status-on.tf-status-tinyfugue"));
+}
+
+/// The console's own ANSI-to-spans conversion (`rendering::ansi_line`): a sequence with
+/// several parameters applies them all (ansi-to-tui 4 dropped such a sequence whole), the
+/// extended colours are read, and a reset, `39` or `49` goes back to the caller's base -
+/// the row's own colours - never to the terminal's defaults.
+#[test]
+fn ansi_line_reads_every_sgr_parameter_and_resets_to_the_base() {
+    use ratatui::style::{Color, Modifier, Style};
+    let base = Style::default().fg(Color::White).bg(Color::Rgb(40, 75, 99));
+    let spans = |s: &str| rendering::ansi_line(s, base).spans;
+    let one = spans("plain");
+    assert_eq!(one.len(), 1);
+    assert_eq!((one[0].content.as_ref(), one[0].style), ("plain", base));
+    let s = spans("\x1b[96;44m__\x1b[1m42\x1b[0m__\x1b[1;31;104mx\x1b[22my\x1b[39mz\x1b[49mw");
+    let texts: Vec<&str> = s.iter().map(|sp| sp.content.as_ref()).collect();
+    assert_eq!(texts, ["__", "42", "__", "x", "y", "z", "w"]);
+    assert_eq!((s[0].style.fg, s[0].style.bg), (Some(Color::Indexed(14)), Some(Color::Indexed(4))), "both parameters apply");
+    assert_eq!((s[1].style.fg, s[1].style.bg), (Some(Color::Indexed(14)), Some(Color::Indexed(4))), "bold adds to the colours");
+    assert!(s[1].style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(s[2].style, base, "a reset is the base, not the terminal's defaults");
+    assert_eq!((s[3].style.fg, s[3].style.bg), (Some(Color::Indexed(1)), Some(Color::Indexed(12))));
+    assert!(s[3].style.add_modifier.contains(Modifier::BOLD));
+    assert!(!s[4].style.add_modifier.contains(Modifier::BOLD), "22 ends bold");
+    assert_eq!(s[4].style.fg, Some(Color::Indexed(1)));
+    assert_eq!(s[5].style.fg, Some(Color::White), "39: the base foreground");
+    assert_eq!(s[5].style.bg, Some(Color::Indexed(12)));
+    assert_eq!(s[6].style.bg, Some(Color::Rgb(40, 75, 99)), "49: the base background");
+    let e = spans("\x1b[38;5;208ma\x1b[48;2;1;2;3mb\x1b[38;2;9;8;7;1mc");
+    assert_eq!(e[0].style.fg, Some(Color::Indexed(208)));
+    assert_eq!(e[1].style.bg, Some(Color::Rgb(1, 2, 3)));
+    assert_eq!((e[2].style.fg, e[2].style.add_modifier.contains(Modifier::BOLD)), (Some(Color::Rgb(9, 8, 7)), true), "the parameter after a 38;2;r;g;b group");
+    let other = spans("\x1b[Kq\x1b]8;;http://x\x1b\\r\x1b[?25hs");
+    assert_eq!(other.len(), 1, "escapes that are not SGR change nothing: {other:?}");
+    assert_eq!((other[0].content.as_ref(), other[0].style), ("qrs", base));
+}
+
+/// TF's status line is drawn in the Separator Style's look (user ruling 2026-10-28): Web
+/// with spaces between the fields on the theme's status-bar colour, TinyFugue with '_' on
+/// the terminal background; a %status_pad the script set shows in either. %status_attr
+/// colours the whole row - pad, text and an attributed field alike - in either look, as
+/// real tf draws it (ESC[96m ESC[44m before the row, ESC[1m ESC[96m ESC[44m 42 for a
+/// bold field), and after such a field the row is the look's own colours again.
+#[test]
+fn test_tf_status_line_is_drawn_in_the_separator_styles_look() {
+    use ratatui::{backend::TestBackend, layout::Rect, style::{Color, Modifier, Style}, Terminal};
+    use crate::SeparatorStyle;
+    const WIDTH: u16 = 30;
+    let draw = |app: &App| -> (String, Vec<Style>) {
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, 1)).unwrap();
+        terminal.draw(|f| rendering::render_separator_bar(f, app, Rect::new(0, 0, WIDTH, 1))).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..WIDTH).map(|x| buffer.get(x, 0).symbol().to_string()).collect();
+        (row, (0..WIDTH).map(|x| buffer.get(x, 0).style()).collect())
+    };
+    let mut app = App::new();
+    app.worlds = vec![World::new("alpha")];
+    app.current_world_index = 0;
+    app.tf_engine.execute("/status_add -c \"HP:\" hp:4 :1 @world");
+    app.tf_engine.execute("/set hp=42");
+    app.refresh_tf_status();
+    assert!(app.tf_status.contains_key(&0), "TF's line is on");
+    let bar = app.theme_colors().status_bar_bg.to_ratatui();
+    let (theme_fg, theme_bg) = (app.settings.theme.fg(), app.settings.theme.bg());
+    app.settings.separator_style = SeparatorStyle::Web;
+    let (row, cells) = draw(&app);
+    assert!(row.starts_with("HP:42   !alpha "), "Web: spaces between the fields: {row:?}");
+    assert!(!row.contains('_'), "Web: no underscores: {row:?}");
+    assert_eq!(cells[WIDTH as usize - 1].bg, Some(bar), "Web: the bar's colour");
+    app.settings.separator_style = SeparatorStyle::TinyFugue;
+    let (row, cells) = draw(&app);
+    assert!(row.starts_with("HP:42___!alpha_"), "TinyFugue: underscores: {row:?}");
+    assert_eq!(cells[WIDTH as usize - 1].bg, Some(theme_bg), "TinyFugue: the terminal background");
+    app.tf_engine.execute("/set status_pad=.");
+    app.tf_status_at = None;
+    app.refresh_tf_status();
+    let (row, _) = draw(&app);
+    assert!(row.starts_with("HP:42...!alpha."), "a pad the script set: {row:?}");
+    app.settings.separator_style = SeparatorStyle::Web;
+    let (row, _) = draw(&app);
+    assert!(row.starts_with("HP:42...!alpha."), "in either look: {row:?}");
+
+    // A bold field with no %status_attr: the row around it stays the look's own colours.
+    app.tf_engine.execute("/unset status_pad");
+    app.tf_engine.execute("/status_add -c \"HP:\" hp:4:B :1 @world");
+    for (look, bg) in [(SeparatorStyle::Web, bar), (SeparatorStyle::TinyFugue, theme_bg)] {
+        app.settings.separator_style = look;
+        app.tf_status_at = None;
+        app.refresh_tf_status();
+        let (row, cells) = draw(&app);
+        assert!(row.starts_with("HP:42"), "{look:?}: {row:?}");
+        assert!(cells[3].add_modifier.contains(Modifier::BOLD), "{look:?}: the field is bold");
+        for x in [0, 3, 6, 10, WIDTH as usize - 1] {
+            assert_eq!((cells[x].fg, cells[x].bg), (Some(theme_fg), Some(bg)), "{look:?}: cell {x} after a bold field keeps the look");
+        }
+    }
+    // %status_attr: the whole row, the bold field keeping its colours too.
+    app.tf_engine.execute("/set status_attr=Cbrightcyan,Cbgblue");
+    for look in [SeparatorStyle::Web, SeparatorStyle::TinyFugue] {
+        app.settings.separator_style = look;
+        app.tf_status_at = None;
+        app.refresh_tf_status();
+        let (row, cells) = draw(&app);
+        assert!(row.starts_with("HP:42"), "{look:?}: {row:?}");
+        for x in 0..WIDTH as usize {
+            assert_eq!((cells[x].fg, cells[x].bg), (Some(Color::Indexed(14)), Some(Color::Indexed(4))), "{look:?}: cell {x} of {row:?}");
+        }
+        assert!(cells[3].add_modifier.contains(Modifier::BOLD), "{look:?}: bold inside the colours");
+        assert!(!cells[6].add_modifier.contains(Modifier::BOLD), "{look:?}: bold ends with the field");
+    }
+}
+
+/// Separator Style is a look, and going from TinyFugue back to Web hands the status area
+/// back to Clay in both handlers (user ruling 2026-10-28): TF's line is dropped everywhere
+/// (TfStatus view: None), the script's status variables and layout are reset. Any other
+/// change of the setting keeps TF's line, only re-looked.
+#[tokio::test]
+async fn going_back_to_web_resets_tfs_status_line_in_both_handlers() {
+    use crate::SeparatorStyle;
+    for handler_b in [false, true] {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.current_world_index = 0;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        app.settings.separator_style = SeparatorStyle::TinyFugue;
+        app.tf_engine.execute("/set status_attr=B");
+        app.tf_engine.execute("/set status_pad=.");
+        app.tf_engine.execute("/status_add -A@world hp:4");
+        app.refresh_tf_status();
+        assert_eq!(app.tf_status.get(&0).map(|v| v.pad.as_str()), Some("."), "handler_b={handler_b}: TF's line, the script's pad");
+        let none_sent = |app: &App| app.ws_broadcast_log.lock().unwrap().iter()
+            .filter(|m| matches!(m, WsMessage::TfStatus { view: None, .. })).count();
+        // TinyFugue -> TinyFugue: nothing happens.
+        send_to_handler(&mut app, handler_b, WsMessage::UpdateSeparatorStyle { style: "tinyfugue".into() }, &event_tx).await;
+        assert!(app.tf_engine.status.customized, "handler_b={handler_b}");
+        assert_eq!(none_sent(&app), 0, "handler_b={handler_b}");
+        // TinyFugue -> Web, from the Theme Editor's message: Clay's bar is back everywhere.
+        send_to_handler(&mut app, handler_b, WsMessage::UpdateSeparatorStyle { style: "web".into() }, &event_tx).await;
+        assert_eq!(app.settings.separator_style, SeparatorStyle::Web, "handler_b={handler_b}");
+        assert!(!app.tf_engine.status.customized, "handler_b={handler_b}: the status area is Clay's again");
+        assert!(app.tf_status.is_empty(), "handler_b={handler_b}");
+        assert_eq!(none_sent(&app), 1, "handler_b={handler_b}: every client drops TF's line");
+        assert!(app.tf_engine.get_var("status_attr").is_none(), "handler_b={handler_b}");
+        assert_eq!(app.tf_engine.get_var("status_pad").map(|v| v.to_string_value()), Some("_".to_string()), "handler_b={handler_b}");
+        // Web -> TinyFugue through Settings keeps a later script change, re-looked only.
+        app.tf_engine.execute("/set status_attr=B");
+        app.refresh_tf_status();
+        assert!(!app.tf_status.is_empty(), "handler_b={handler_b}");
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        crate::remote_client::send_global_settings(&mut app, String::new(), &ws_tx);
+        let mut msg = ws_rx.try_recv().unwrap();
+        if let WsMessage::UpdateGlobalSettings { ref mut separator_style, .. } = msg {
+            *separator_style = Some("tinyfugue".into());
+        }
+        send_to_handler(&mut app, handler_b, msg, &event_tx).await;
+        assert_eq!(app.settings.separator_style, SeparatorStyle::TinyFugue, "handler_b={handler_b}");
+        assert!(app.tf_engine.status.customized && !app.tf_status.is_empty(), "handler_b={handler_b}: TF's line stays");
+    }
+}
+
+/// Separator Style (the console's bar) is one global setting, set from any interface's
+/// Settings through both server handlers and redrawn at once; `None` (an older client, or
+/// the web popup's save) leaves it. User ruling 2026-10-27: every interface's Settings
+/// shows it, default Web.
+#[tokio::test]
+async fn the_separator_style_is_set_from_any_clients_settings_in_both_handlers() {
+    use crate::SeparatorStyle;
+    for handler_b in [false, true] {
+        let mut app = App::new();
+        assert_eq!(app.settings.separator_style, SeparatorStyle::Web, "the default");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        crate::remote_client::send_global_settings(&mut app, String::new(), &ws_tx);
+        let mut msg = ws_rx.try_recv().expect("an UpdateGlobalSettings");
+        assert!(matches!(msg, WsMessage::UpdateGlobalSettings { separator_style: None, .. }), "the web popup's save leaves the style alone");
+        app.settings.separator_style = SeparatorStyle::TinyFugue;
+        send_to_handler(&mut app, handler_b, msg.clone(), &event_tx).await;
+        assert_eq!(app.settings.separator_style, SeparatorStyle::TinyFugue, "handler_b={handler_b}: None = unchanged");
+        if let WsMessage::UpdateGlobalSettings { ref mut separator_style, .. } = msg {
+            *separator_style = Some("web".into());
+        }
+        app.needs_output_redraw = false;
+        send_to_handler(&mut app, handler_b, msg, &event_tx).await;
+        assert_eq!(app.settings.separator_style, SeparatorStyle::Web, "handler_b={handler_b}");
+        assert!(app.needs_output_redraw, "handler_b={handler_b}: the bar is redrawn");
+        assert_eq!(app.build_global_settings_msg().separator_style, "web", "handler_b={handler_b}: what every client is told");
+    }
 }
 
 /// A client's typed line reaches the MUD as typed, its spaces kept, in both handlers - as

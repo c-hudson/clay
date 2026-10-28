@@ -94,6 +94,10 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                 // speaks), so a /tts or ServerSpeak step goes through the same path.
                 view.media = Some(crate::native_gui::core::media::Media::new(super::emoji::runtime()));
                 view.warm_kokoro_if_wanted();
+                // The session came online before the view existed: take its world as shown,
+                // as the real window does when the InitialState arrives (else the first
+                // change after this looks like a world switch and moves the view).
+                view.follow_world();
                 window.focus(&view.focus.clone(), cx);
                 view
             });

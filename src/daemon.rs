@@ -1307,7 +1307,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1316,8 +1316,8 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
-                mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile,
+                zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
+                log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile,
             );
         }
         WsMessage::ToggleWorldGmcp { world_index } => app.toggle_world_gmcp(world_index),
@@ -1396,8 +1396,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             });
         }
         WsMessage::UpdateSeparatorStyle { style } => {
-            app.settings.separator_style = crate::SeparatorStyle::from_name(&style);
-            app.needs_output_redraw = true;
+            app.set_separator_style(crate::SeparatorStyle::from_name(&style));
             let settings_msg = app.build_global_settings_msg();
             app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
                 settings: settings_msg,
@@ -1679,6 +1678,9 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         }
         WsMessage::RequestScrollback { world_index, count, before_seq, after_seq, request_id } => {
             app.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq, request_id);
+        }
+        WsMessage::RequestHistory { world_index, count, request_id, before_seq, before_ts, archive_before } => {
+            app.handle_request_history(client_id, world_index, count, request_id, before_seq, before_ts, archive_before);
         }
         WsMessage::RequestWorldState { world_index } => {
             app.handle_request_world_state(client_id, world_index);
@@ -3055,6 +3057,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         expand_line: false,
         // Multiuser's uploads come with its command parsing (deferred task M1).
         picture_upload: false,
+        // Multiuser has no archive, and its scrollback is per user (deferred task M1).
+        history_on_demand: false,
         emoji_json: crate::emoji::emoji_json(),
         emoji_categories_json: crate::emoji::emoji_categories_json(),
         // Multiuser shows Clay's own status bar.
@@ -3176,8 +3180,8 @@ pub async fn handle_multiuser_ws_message(
                         if let Some(ref server) = app.ws_server {
                             server.record_acked_seq(client_id, &owned);
                         }
-                        // Mirrors the in-memory scrollback ring's cap (MAX_LINES, main.rs)
-                        // so a single replay always covers the entire ring if needed.
+                        // A bound on one replay; a client further behind goes on with
+                        // its own gap fill.
                         const RESUME_REPLAY_MAX: usize = 10_000;
                         for (world_index, last_seq) in owned {
                             // request_id: Some(0) is the reserved value marking a

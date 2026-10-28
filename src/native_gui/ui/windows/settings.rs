@@ -107,6 +107,9 @@ pub struct SettingsView {
     tabs: Pick,
     icon_bar: Pick,
     picture_host: Pick,
+    /// The console's separator bar: one global setting, shown here too (user ruling
+    /// 2026-10-27).
+    separator: Pick,
     text_reveal: Pick,
     /// The Text Reveal value before Custom was picked, which the prompt's Cancel restores.
     reveal_before: String,
@@ -211,6 +214,7 @@ impl SettingsView {
             tabs: Pick::new(&[("none", "None"), ("top", "Show Top Ribbon"), ("bottom", "Show Bottom Ribbon")], &edit.tabs, window, cx),
             icon_bar: Pick::new(&[("none", "None"), ("app_tablet", "App/Tablet"), ("all", "All")], &edit.icon_bar, window, cx),
             picture_host: Pick::new(crate::picture::PictureService::OPTIONS, &edit.picture_host, window, cx),
+            separator: Pick::new(crate::SeparatorStyle::OPTIONS, if edit.separator_style.is_empty() { "web" } else { edit.separator_style.as_str() }, window, cx),
             text_reveal,
             reveal_before: reveal_value,
             port_mode: Pick::new(&[("disabled", "Disabled"), ("9000", "9000"), ("custom", "Custom")], port_mode, window, cx),
@@ -350,6 +354,7 @@ impl SettingsView {
         s.tabs = self.tabs.value(cx);
         s.icon_bar = self.icon_bar.value(cx);
         s.picture_host = self.picture_host.value(cx);
+        s.separator_style = self.separator.value(cx);
         s.text_reveal_profiles.insert(crate::font_profile::native_key().to_string(), self.text_reveal.value(cx));
         let rows = super::super::input_view::input_height_of(&s).clamp(1, 15);
         super::super::input_view::set_input_height(&mut s, rows);
@@ -499,6 +504,7 @@ impl SettingsView {
             .child(row(k, "Tabs", self.tabs.view()))
             .child(row(k, "Icon Bar", self.icon_bar.view()))
             .child(row(k, "Picture Host", self.picture_host.view()))
+            .child(row(k, "Separator Style", self.separator.view()))
             .child(row(k, "Text Reveal", self.text_reveal.view()));
         // Two cards: the values, then the switches and the remaining choices.
         div()

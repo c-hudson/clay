@@ -128,6 +128,7 @@ impl H {
             other_views: true,
             expand_line: true,
             picture_upload: true,
+            history_on_demand: true,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -673,6 +674,27 @@ fn saving_the_settings_back_unchanged_changes_nothing_but_what_was_edited() {
     assert_eq!(app.settings.websocket_allow_list, "10.0.0.*");
 }
 
+/// Separator Style (the console's bar) is one global setting, saved from this GUI's
+/// Settings like any other: sent as the value shown, or as None from a server that never
+/// sent one (user ruling 2026-10-27: every interface's Settings shows it).
+#[test]
+fn the_separator_style_is_saved_from_this_guis_settings() {
+    let mut app = crate::App::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let mut s = app.build_global_settings_msg();
+    assert_eq!(s.separator_style, "web", "the default");
+    s.separator_style = "tinyfugue".into();
+    app.needs_output_redraw = false;
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.separator_style, crate::SeparatorStyle::TinyFugue);
+    assert!(app.needs_output_redraw, "the console's bar is redrawn");
+    // A server from before the style was on the wire sent none: nothing goes back.
+    s.separator_style = String::new();
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { separator_style: None, .. }));
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.separator_style, crate::SeparatorStyle::TinyFugue, "None = unchanged");
+}
+
 #[test]
 fn this_guis_fonts_are_its_own_on_this_os_and_the_shared_ones_stay() {
     let mut app = crate::App::new();
@@ -1213,6 +1235,7 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
         other_views: false,
         expand_line: false,
         picture_upload: false,
+        history_on_demand: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1246,6 +1269,7 @@ fn version_names_this_gui_and_the_server() {
         other_views: true,
         expand_line: true,
         picture_upload: true,
+        history_on_demand: true,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1274,6 +1298,7 @@ fn version_names_this_gui_and_the_server() {
         other_views: true,
         expand_line: true,
         picture_upload: true,
+        history_on_demand: true,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1303,4 +1328,104 @@ fn a_disconnect_ends_the_echo_mask() {
     h.msg(WsMessage::WorldDisconnected { world_index: 0 });
     assert!(!h.core.worlds[0].echo_masked, "the mask ends with the connection");
     assert!(!h.core.worlds[0].connected);
+}
+
+// ---- On-demand history (RequestHistory / HistoryLines) ----
+
+fn archive_line(i: i64) -> crate::websocket::ArchiveLine {
+    crate::websocket::ArchiveLine { text: format!("old {i}"), ts_ms: 500_000 + i, wseq: Some(40 + i), gagged: false }
+}
+
+/// The RequestHistory sent since the last look, if any.
+fn history_request(h: &mut H) -> Option<(u64, Option<u64>, Option<crate::websocket::ArchiveCursor>)> {
+    h.sent().into_iter().find_map(|m| match m {
+        WsMessage::RequestHistory { request_id, before_seq, archive_before, .. } => Some((request_id, before_seq, archive_before)),
+        _ => None,
+    })
+}
+
+#[test]
+fn scrolling_past_the_top_asks_for_history_memory_then_the_archive() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 100..110, 9)]);
+    h.sent();
+    let e = h.core.request_history(0, h.now);
+    h.keep(e);
+    let (id, before_seq, archive_before) = history_request(&mut h).expect("a RequestHistory");
+    assert_eq!((before_seq, archive_before), (Some(100), None), "from the oldest live line");
+    let e = h.core.request_history(0, h.now);
+    h.keep(e);
+    assert!(history_request(&mut h).is_none(), "one request at a time");
+
+    // Memory's last lines and the archive below them.
+    let live: Vec<TimestampedLine> = (95..100).map(|s| tl(s, &format!("line {s}"))).collect();
+    let archive: Vec<_> = (0..3).map(archive_line).collect();
+    h.msg(WsMessage::HistoryLines { world_index: 0, request_id: id, before_seq, archive_before, lines: live, archive, done: false });
+    let w = &h.core.worlds[0];
+    assert_eq!(h.texts(0)[..9], ["old 0", "old 1", "old 2", "line 95", "line 96", "line 97", "line 98", "line 99", "line 100"]);
+    assert!(w.lines[..3].iter().all(|l| l.from_archive && l.seq.is_none() && l.archive.is_some()), "archive lines carry no seq");
+    assert_eq!(w.seen.frontier(), 109, "older lines don't move the frontier");
+
+    // The next one goes on from the oldest archive line; then nothing older.
+    let e = h.core.request_history(0, h.now);
+    h.keep(e);
+    let (id, before_seq, archive_before) = history_request(&mut h).expect("a second RequestHistory");
+    assert_eq!(before_seq, None);
+    assert_eq!(archive_before, Some(crate::websocket::ArchiveCursor { wseq: Some(40), ts_ms: 500_000 }));
+    h.msg(WsMessage::HistoryLines { world_index: 0, request_id: id, before_seq, archive_before, lines: Vec::new(), archive: vec![archive_line(-1)], done: true });
+    assert_eq!(h.texts(0)[0], "old -1");
+    let e = h.core.request_history(0, h.now);
+    h.keep(e);
+    assert!(history_request(&mut h).is_none(), "done: nothing older exists");
+}
+
+#[test]
+fn a_history_reply_that_no_longer_fits_the_buffer_is_dropped() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 100..110, 9)]);
+    h.sent();
+    // Another window's answer (no request of ours), from where this buffer doesn't begin.
+    h.msg(WsMessage::HistoryLines { world_index: 0, request_id: 77, before_seq: Some(50), archive_before: None,
+        lines: vec![tl(40, "elsewhere")], archive: vec![archive_line(0)], done: false });
+    assert_eq!(h.seqs(0), (100..110).collect::<Vec<_>>());
+    // One that does fit applies in every window, asked or not.
+    h.msg(WsMessage::HistoryLines { world_index: 0, request_id: 78, before_seq: Some(100), archive_before: None,
+        lines: vec![tl(99, "line 99")], archive: Vec::new(), done: false });
+    assert_eq!(h.seqs(0)[0], 99);
+}
+
+#[test]
+fn no_history_request_to_a_server_that_doesnt_take_it() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 100..110, 9)]);
+    h.sent();
+    h.core.server_history_on_demand = false;
+    let e = h.core.request_history(0, h.now);
+    h.keep(e);
+    assert!(history_request(&mut h).is_none());
+}
+
+#[test]
+fn archive_lines_survive_a_reconnect_and_stay_out_of_the_cache() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 100..110, 9)]);
+    h.sent();
+    let e = h.core.request_history(0, h.now);
+    h.keep(e);
+    let (id, before_seq, archive_before) = history_request(&mut h).expect("a RequestHistory");
+    h.msg(WsMessage::HistoryLines { world_index: 0, request_id: id, before_seq, archive_before,
+        lines: Vec::new(), archive: (0..3).map(archive_line).collect(), done: false });
+    assert!(h.core.cache_snapshot().iter().all(|w| w.lines.iter().all(|l| !l.text.starts_with("old "))), "never cached");
+    // A reconnect to the same epoch keeps the buffer, archive lines and all (they are not
+    // the pre-1.5.23 archive lines that mark a corrupted buffer).
+    h.input(Input::Closed("blip".into()));
+    h.advance(Duration::from_secs(3));
+    h.input(Input::Opened);
+    h.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: "c2".into() });
+    h.msg(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false });
+    h.initial(vec![world_msg(0, "A", 108..112, 9)]);
+    assert_eq!(h.texts(0)[..4], ["old 0", "old 1", "old 2", "line 100"]);
+    assert_eq!(h.core.worlds[0].history_position().0, (None, Some(crate::websocket::ArchiveCursor { wseq: Some(40), ts_ms: 500_000 })));
+    // A gap fill's lines go below the archive, never above it.
+    assert_eq!(h.seqs(0).last(), Some(&111));
 }

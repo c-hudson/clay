@@ -30,8 +30,8 @@ use crate::actions::Action;
 use crate::stats::StatEntry;
 use crate::tf::status::StatusView;
 use crate::websocket::{
-    GlobalSettingsMsg, RemoteClientType, TimestampedLine, WorldSettingsMsg, WorldStateMsg, WsMessage, hash_password,
-    hash_with_challenge,
+    ArchiveCursor, ArchiveLine, GlobalSettingsMsg, RemoteClientType, TimestampedLine, WorldSettingsMsg, WorldStateMsg,
+    WsMessage, hash_password, hash_with_challenge,
 };
 
 /// What this client calls itself in the diagnostics it sends (`ReportGap` and friends).
@@ -52,6 +52,11 @@ const CLAIM_TTL: Duration = Duration::from_secs(5);
 /// Gap-fill replies in a row that bring nothing before the hole is given up.
 const GAPFILL_MAX_NO_PROGRESS: u32 = 2;
 const GAPFILL_COUNT: usize = 500;
+/// Lines asked for at a time when the user scrolls up past everything held
+/// (`RequestHistory`): the console's archive page.
+const HISTORY_CHUNK: usize = 500;
+/// A history request with no answer by then is given up, so the next scroll asks again.
+const HISTORY_WATCHDOG: Duration = Duration::from_secs(15);
 const BACKFILL_DELAY: Duration = Duration::from_millis(500);
 /// A tick arriving this much later than the last means the machine slept: check the
 /// connection is still alive before trusting it (app.js's wake check).
@@ -161,6 +166,10 @@ pub struct Line {
     /// start's catch-up after the disk cache is appended at the tail like live output,
     /// so the position alone can't tell them apart.
     pub scrollback: bool,
+    /// Read from the server's archive on demand (`HistoryLines.archive`): where it sits in
+    /// the archive, which is where the next request continues. Such a line has no seq
+    /// and is `from_archive`, so every seq rule, the cache, ▶ and New Only pass it by.
+    pub archive: Option<ArchiveCursor>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -208,9 +217,37 @@ pub struct World {
     holes_only: bool,
     replay_deadline: Option<Instant>,
     claim: Option<(HashSet<u64>, Instant)>,
+    /// On-demand history: the server said nothing older exists.
+    history_done: bool,
+    /// The history request out: its id, the position it asked from, when it's given up.
+    history_inflight: Option<(u64, HistoryPos, Instant)>,
 }
 
+/// Where a world's history begins, as `RequestHistory` names it: `(before_seq,
+/// archive_before)`.
+type HistoryPos = (Option<u64>, Option<ArchiveCursor>);
+
 impl World {
+    /// Where the next older lines come from: the oldest archive line once the buffer
+    /// starts with some, else the oldest live line (with its time, for a server that has
+    /// lost it).
+    fn history_position(&self) -> (HistoryPos, Option<u64>) {
+        if let Some(c) = self.lines.first().and_then(|l| l.archive) {
+            return ((None, Some(c)), None);
+        }
+        let ts = self.oldest_seq.and_then(|s| self.lines.iter().find(|l| l.seq == Some(s))).map(|l| l.ts);
+        ((self.oldest_seq, None), ts)
+    }
+
+    /// Lines held that aren't archive lines read on demand.
+    fn live_len(&self) -> usize {
+        self.lines.len() - archive_lead(&self.lines)
+    }
+
+    /// Whether more history can be asked for (not done, nothing out).
+    pub fn history_more(&self) -> bool {
+        !self.history_done && self.history_inflight.is_none()
+    }
     /// The last line held, if it has a real seq (for the order check).
     fn last_real_seq(&self) -> Option<u64> {
         self.lines.iter().rev().find_map(|l| l.seq)
@@ -313,6 +350,9 @@ pub struct ClientCore {
     pub server_expands_line: bool,
     /// The server takes `PictureUpload` (`InitialState.picture_upload`): Import Picture.
     pub server_picture_upload: bool,
+    /// The server takes `RequestHistory` (`InitialState.history_on_demand`): scrolling up
+    /// past everything held asks it for older lines, then its archive's.
+    pub server_history_on_demand: bool,
     /// The server's build, for the `Remote` line of `/version` (`version_lines`).
     server_version_detail: Option<String>,
     requests: HashMap<u64, (RequestKind, usize, Instant)>,
@@ -370,6 +410,7 @@ impl ClientCore {
             server_takes_other_views: false,
             server_expands_line: false,
             server_picture_upload: false,
+            server_history_on_demand: false,
             server_version_detail: None,
             requests: HashMap::new(),
             next_request_id: 1,
@@ -1055,11 +1096,12 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, server_version, server_version_detail, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, .. } => {
                 self.server_version_detail = crate::server_version_detail(&server_version_detail, &server_version);
                 self.server_takes_other_views = other_views;
                 self.server_expands_line = expand_line;
                 self.server_picture_upload = picture_upload;
+                self.server_history_on_demand = history_on_demand;
                 self.initial_states += 1;
                 self.actions = actions;
                 self.splash_lines = splash_lines;
@@ -1093,6 +1135,9 @@ impl ClientCore {
             }
             WsMessage::ScrollbackLines { world_index, lines, backfill_complete, clamped_by_pending, request_id } => {
                 self.on_scrollback(world_index, lines, backfill_complete, clamped_by_pending, request_id, now)
+            }
+            WsMessage::HistoryLines { world_index, request_id, before_seq, archive_before, lines, archive, done } => {
+                self.on_history(world_index, request_id, (before_seq, archive_before), lines, archive, done)
             }
             WsMessage::ResyncRequired { world_index, from_seq } => self.request_gap_fill(world_index, Some(from_seq), now),
             WsMessage::WorldStateResponse { world_index, pending_count, prompt, deliverable_high_seq, .. } => {
@@ -1150,6 +1195,8 @@ impl ClientCore {
                     w.showing_splash = false;
                     w.lines.clear();
                     w.partial.clear();
+                    w.history_done = false;
+                    w.history_inflight = None;
                     w.touch();
                     self.changed();
                 }
@@ -1441,7 +1488,19 @@ impl ClientCore {
             archive_sourced: false,
             from_archive: false,
             scrollback: false,
+            archive: None,
         }
+    }
+
+    /// A line from `HistoryLines.archive`.
+    fn line_from_archive(&mut self, a: &ArchiveLine) -> Line {
+        let mut l = self.new_line(&a.text, (a.ts_ms.max(0) / 1000) as u64, None);
+        l.gagged = a.gagged;
+        l.viewed = true;
+        l.from_archive = true;
+        l.scrollback = true;
+        l.archive = Some(ArchiveCursor { wseq: a.wseq, ts_ms: a.ts_ms });
+        l
     }
 
     fn line_from_ts(&mut self, t: &TimestampedLine) -> Line {
@@ -1633,6 +1692,8 @@ impl ClientCore {
             w.lines.clear();
             w.seen.clear();
             w.partial.clear();
+            w.history_done = false;
+            w.history_inflight = None;
             w.touch();
             gap_fill = false;
         }
@@ -1796,10 +1857,7 @@ impl ClientCore {
                 } else {
                     // Older lines: prepended, and deliberately not marked as delivered —
                     // marking them would pull the frontier back to them.
-                    let held: HashSet<u64> = w.lines.iter().filter_map(|l| l.seq).collect();
-                    let mut older: Vec<Line> = new_lines.into_iter().filter(|l| l.seq.is_none_or(|s| !held.contains(&s))).collect();
-                    older.append(&mut w.lines);
-                    w.lines = older;
+                    prepend_live(w, new_lines);
                 }
                 if let Some(min) = lines.iter().map(|l| l.seq).min() {
                     w.oldest_seq = Some(w.oldest_seq.map_or(min, |o| o.min(min)));
@@ -1814,6 +1872,70 @@ impl ClientCore {
                 self.backfill_at = Some(now + Duration::from_millis(if self.backfill_phase == 1 { 0 } else { 30 }));
             }
         }
+        self.changed();
+    }
+
+    /// The user scrolled up to the top of what this client holds of `world_index`: ask the
+    /// server for what is older (its memory, then its archive), unless it said there is
+    /// none, a request is out, the server can't take one, or the startup backfill is still
+    /// fetching this world (its reply moves where the history begins). Never called but
+    /// for a scroll the user made.
+    pub fn request_history(&mut self, world_index: usize, now: Instant) -> Vec<Effect> {
+        let pumping = self.requests.values().any(|&(k, w, _)| w == world_index && k != RequestKind::GapFill);
+        if self.phase == Phase::Online && self.server_history_on_demand && !pumping {
+            if let Some(w) = self.worlds.get_mut(world_index) {
+                if w.history_more() && w.shell.is_none() {
+                    let (pos, before_ts) = w.history_position();
+                    let id = self.next_request_id;
+                    self.next_request_id += 1;
+                    w.history_inflight = Some((id, pos, now + HISTORY_WATCHDOG));
+                    self.send(WsMessage::RequestHistory {
+                        world_index,
+                        count: HISTORY_CHUNK,
+                        request_id: id,
+                        before_seq: pos.0,
+                        before_ts,
+                        archive_before: pos.1,
+                    });
+                }
+            }
+        }
+        self.take()
+    }
+
+    /// `HistoryLines`: older lines, put in front of the buffer when it still begins where
+    /// the request said (a reply that doesn't fit - stale, or another window's that this
+    /// one has already had - is dropped). Live lines go before the live lines held and the
+    /// archive's before everything. Every window on this connection gets the reply, so the
+    /// windows showing the world grow alike.
+    fn on_history(&mut self, world_index: usize, request_id: u64, pos: HistoryPos, lines: Vec<TimestampedLine>, archive: Vec<ArchiveLine>, done: bool) {
+        let Some(w) = self.worlds.get_mut(world_index) else { return };
+        if w.history_inflight.is_some_and(|(id, _, _)| id == request_id) {
+            w.history_inflight = None;
+        }
+        if w.history_position().0 != pos {
+            return;
+        }
+        let live: Vec<Line> = lines
+            .iter()
+            .filter(|t| !t.from_archive && pos.0.is_none_or(|b| t.seq < b))
+            .map(|t| {
+                let mut l = self.line_from_ts(t);
+                l.scrollback = true;
+                l
+            })
+            .collect();
+        let archive: Vec<Line> = archive.iter().map(|a| self.line_from_archive(a)).collect();
+        let w = &mut self.worlds[world_index];
+        w.history_done = done;
+        if let Some(min) = live.iter().filter_map(|l| l.seq).min() {
+            w.oldest_seq = Some(w.oldest_seq.map_or(min, |o| o.min(min)));
+        }
+        // Older live lines, like the startup backfill's: not marked as delivered, which
+        // would pull the frontier back to them.
+        prepend_live(w, live);
+        w.lines.splice(0..0, archive);
+        w.touch();
         self.changed();
     }
 
@@ -1859,6 +1981,11 @@ impl ClientCore {
                     self.backfill_inflight = false;
                     self.backfill_at = Some(now);
                 }
+            }
+        }
+        for w in &mut self.worlds {
+            if w.history_inflight.is_some_and(|(_, _, until)| now >= until) {
+                w.history_inflight = None;
             }
         }
         let replays: Vec<usize> =
@@ -1909,7 +2036,7 @@ impl ClientCore {
         let initial = self.settings.as_ref().map_or(0, |s| s.remote_initial_lines as usize);
         let total = if initial == 0 { 100 } else { initial }.max(phase1);
         let wanted = |w: &World, target: usize| {
-            w.lines.len() < target && w.total_visible > w.lines.len() && !w.backfill_exhausted && !w.gap_fill_pending
+            w.live_len() < target && w.total_visible > w.live_len() && !w.backfill_exhausted && !w.gap_fill_pending && w.history_inflight.is_none()
         };
         loop {
             if self.backfill_phase == 1 && self.backfill_queue.is_empty() {
@@ -1926,7 +2053,7 @@ impl ClientCore {
             if !wanted(w, target) {
                 continue;
             }
-            let count = if self.backfill_phase == 1 { target - w.lines.len() } else { 500.min(target - w.lines.len()) };
+            let count = if self.backfill_phase == 1 { target - w.live_len() } else { 500.min(target - w.live_len()) };
             let kind = if w.oldest_seq.is_none() { RequestKind::InitialFill } else { RequestKind::Backfill };
             let before_seq = w.oldest_seq;
             let id = self.next_request_id;
@@ -2099,6 +2226,8 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         icon_bar: s.icon_bar.clone(),
         // Empty: a server from before Import Picture sent none.
         picture_host: (!s.picture_host.is_empty()).then(|| s.picture_host.clone()),
+        // Empty: a server from before the separator style was on the wire.
+        separator_style: (!s.separator_style.is_empty()).then(|| s.separator_style.clone()),
         // This GUI's own Text Reveal on this OS, once it has one (the Settings window
         // puts it under the GUI's key).
         text_reveal_profile: s.text_reveal_profiles.get(crate::font_profile::native_key()).map(|value| {
@@ -2155,9 +2284,24 @@ fn insert_by_seq(w: &mut World, mut add: Vec<Line>) {
     add.sort_by_key(|l| l.seq);
     for line in add {
         let s = line.seq.unwrap_or(u64::MAX);
-        let at = w.lines.iter().rposition(|l| l.seq.is_some_and(|x| x < s)).map_or(0, |p| p + 1);
+        let lead = archive_lead(&w.lines);
+        let at = w.lines.iter().rposition(|l| l.seq.is_some_and(|x| x < s)).map_or(lead, |p| (p + 1).max(lead));
         w.lines.insert(at, line);
     }
+}
+
+/// How many lines at the front are archive lines read on demand (always the oldest).
+fn archive_lead(lines: &[Line]) -> usize {
+    lines.iter().take_while(|l| l.archive.is_some()).count()
+}
+
+/// Older live lines put in front of the live lines held - after the archive lines, which
+/// are older still - dropping any already held.
+fn prepend_live(w: &mut World, lines: Vec<Line>) {
+    let held: HashSet<u64> = w.lines.iter().filter_map(|l| l.seq).collect();
+    let older: Vec<Line> = lines.into_iter().filter(|l| l.seq.is_none_or(|s| !held.contains(&s))).collect();
+    let at = archive_lead(&w.lines);
+    w.lines.splice(at..at, older);
 }
 
 /// This client's ▶ markers on `lines` are exactly `own` (`InitialState.own_new_seqs`).
@@ -2195,7 +2339,12 @@ fn keep_buffer(prior: &World, m: &WorldStateMsg) -> bool {
 fn is_corrupted(lines: &[Line]) -> bool {
     let (mut prev_seq, mut prev_ts): (Option<u64>, Option<u64>) = (None, None);
     for l in lines {
+        if l.archive.is_some() {
+            // Read from the archive on demand: older than everything, and seq-less.
+            continue;
+        }
         if l.from_archive {
+            // Only a pre-1.5.23 server put archive lines in the seq stream.
             return true;
         }
         if l.ts > 0 {

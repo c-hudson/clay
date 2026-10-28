@@ -271,6 +271,11 @@ impl ClayView {
         let core = &self.session.core;
         let world = core.current_world();
         let tf = world.and_then(|w| w.tf_status.clone());
+        // The Separator Style's look (user ruling 2026-10-28): TinyFugue pads TF's line
+        // with '_' on the output's background, Web with spaces on the bar's colour; a
+        // %status_pad the script set (view.pad, else empty) is used in either.
+        let tinyfugue = core.settings.as_ref().is_some_and(|s| s.separator_style == "tinyfugue");
+        let tf_on_output_bg = tinyfugue && tf.is_some();
 
         let mut row = div().flex().flex_1().items_center().px(px(12.0)).gap(px(10.0)).text_size(px(11.5)).font_family(sans.clone()).line_height(relative(SANS_LH));
 
@@ -290,8 +295,9 @@ impl ClayView {
             let cols = self.chrome.tf_cols.get().max(1);
             let opts = StyleOptions { discord_emoji: false, ..Default::default() };
             let mut rows = div().flex().flex_col().flex_1().min_w_0().overflow_hidden().font_family(mono.clone()).line_height(relative(1.2)).text_color(t.fg);
+            let pad = crate::tf::status::pad_for(&view.pad, if tinyfugue { '_' } else { ' ' });
             for cells in &view.rows {
-                let laid = crate::tf::status::layout_row(cells, cols, &view.pad, &view.attr);
+                let laid = crate::tf::status::layout_row(cells, cols, &pad, &view.attr);
                 let styled = style_line(&laid, &self.palette, &opts);
                 rows = rows.child(div().overflow_hidden().whitespace_nowrap().child(styled_text(&styled, &mono)));
             }
@@ -466,7 +472,7 @@ impl ClayView {
             .flex_col()
             .flex_shrink_0()
             .min_h(px(BAR_HEIGHT))
-            .bg(t.bar)
+            .bg(if tf_on_output_bg { hsla(self.palette.bg) } else { t.bar })
             .child(div().h(px(1.0)).bg(t.border))
             .child(div().flex().min_h(px(BAR_HEIGHT - 2.0)).child(row))
             .child(div().h(px(1.0)).bg(t.border_subtle))

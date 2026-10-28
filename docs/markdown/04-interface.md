@@ -33,7 +33,8 @@ The output area displays text from the MUD server:
 
 ### Separator Bar
 
-The separator bar (made of underscores) contains several indicators:
+The separator bar contains several indicators. Its gaps are spaces on the status bar
+colour, or underscores with Settings > Separator Style set to TinyFugue (see **Settings**):
 
 | Position | Component | Description |
 |----------|-----------|-------------|
@@ -53,7 +54,7 @@ The separator bar (made of underscores) contains several indicators:
 The input area is where you type commands:
 
 - **Prompt display**: Server prompts (detected via telnet GA/EOR, or by timing on MUD - Timed Prompt worlds) shown in cyan
-- **Multi-line support**: Resize with `Alt+Up/Down` (1-15 lines), or drag its top edge — the separator bar in the console, the line above the input in the GUI and web — up or down with the mouse. Either way the height is kept (it is that interface's Input height setting: the console, phones, tablets and desktop clients each have their own) and comes back on the next start and after `/reload`
+- **Multi-line support**: Resize with `Alt+Up/Down` (1-15 lines). In the GUI and the web client you can also drag the line above the input up or down with the mouse; the console has no drag, only the keys. Either way the height is kept (it is that interface's Input height setting: the console, phones, tablets and desktop clients each have their own) and comes back on the next start and after `/reload`
 - **Lines sent stay on screen**: as in TinyFugue, a line you send stays in the input area (its text alone; the prompt belongs to the line you are typing, which shows the current world's), and the next one starts on the row below. Once the area is full, the oldest row scrolls off the top, and the line being typed takes the rows it needs from them. A line typed at a password prompt leaves an empty row. `Ctrl+L` (Redraw) clears them. Turn **Clear Input on Send** on in Settings (TF's `/cleardone on`) to have Enter clear the input instead. On a phone the input always clears
 - **Cursor**: Standard text cursor with left/right movement
 - **Spell checking**: Misspelled words highlighted in red
@@ -111,13 +112,24 @@ Use PageUp/PageDown to scroll through output history:
 
 When scrolled back, the separator shows `Hist: XXXX` indicating lines from bottom.
 
+With Archive Input/Output on, PageUp at the top of what's in memory goes on into the
+archive (`scrollback.db`), 500 lines at a time; archived lines are marked 🛢️.
+
+A GUI, a browser, the Android app or a console attached to another Clay scrolls back the
+same way. When it connects it downloads only the newest lines (the **Remote Lines**
+setting's worth), never the archive. Scrolling or paging up past the oldest line it holds
+(the mouse wheel, a drag, PageUp) asks the server for more, 500 lines at a time: first the
+rest of the server's memory, then its archive. Each batch is asked for only when you reach
+it. A browser page or the app keeps 5000 lines on the page at once; going further back
+drops the newest from the page, and they come back as you scroll down again.
+
 In the GUIs (`--gui` and `--web-gui`) and in a desktop browser, the output also has a
 scroll bar along its right edge. Drag its thumb to move through the scrollback, or click
 the bar beside the thumb to jump there (in Firefox a click there moves one page instead).
 Dragging up pauses output just as PageUp does, and dragging back to the bottom follows new
 output again. The thumb takes the theme's muted text colour and brightens under the mouse.
-The bar covers what the GUI holds, which on a GUI attached to another Clay is the **Remote
-Lines** setting's worth. Phones and tablets keep the platform's own scroll bar.
+The bar covers what the GUI holds, and grows as scrolling back fetches more. Phones and
+tablets keep the platform's own scroll bar.
 
 ## Themes
 

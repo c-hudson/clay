@@ -402,6 +402,7 @@ mod tests {
             "/setenv CLAY_SNAPSHOT_TEST yes",
             "/status_add -A@world hp:4",
             "/status_add -r1 -c mana:5",
+            "/set status_pad=.",
         ] {
             engine.execute(line);
         }
@@ -446,6 +447,7 @@ mod tests {
         assert_eq!(fresh.watchdog_n1, 3);
         assert_eq!(fresh.status, engine.status, "the status area, customized");
         assert!(fresh.status.customized);
+        assert!(fresh.status.set_vars.contains("status_pad"), "the script's status variables are remembered");
         assert_eq!(fresh.processes.len(), 1);
         let (old, new) = (&engine.processes[0], &fresh.processes[0]);
         assert_eq!((old.id, &old.command, old.interval, old.remaining), (new.id, &new.command, new.interval, new.remaining));

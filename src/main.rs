@@ -2198,8 +2198,6 @@ pub struct Settings {
     // text_reveal_profiles, by key (see REMOTE_CONSOLE_REVEAL_KEY)
     text_reveal: TextReveal,
     pub text_reveal_profiles: std::collections::BTreeMap<String, TextReveal>,
-    // Mouse click support for console popups
-    mouse_enabled: bool,
     // ZWJ emoji sequence handling (true = pass through, false = strip ZWJ + colored square)
     zwj_enabled: bool,
     // New line indicator - prefix unseen/pending lines with green "+"
@@ -2313,7 +2311,6 @@ impl Default for Settings {
             editor_side: EditorSide::Left,
             text_reveal: TextReveal::Off,
             text_reveal_profiles: std::collections::BTreeMap::new(),
-            mouse_enabled: true,
             zwj_enabled: false,
             new_line_indicator: false,
             tts_mode: tts::TtsMode::Off,
@@ -4439,6 +4436,11 @@ pub struct World {
     /// no reordering compensation layer" design (unlike `app.js`'s `_seqGaps`, which
     /// exists for a different, still-open problem - see PROTOCOL-ROADMAP.md Step 7).
     pub pending_gap: Option<(usize, u64)>,
+    /// Remote console only: older history the server has been asked for (Page Up past
+    /// the oldest line, `RequestHistory`) and not yet answered, by request id.
+    pub remote_history_inflight: Option<(u64, std::time::Instant)>,
+    /// Remote console only: the server said nothing older exists (`HistoryLines.done`).
+    pub remote_history_done: bool,
     // The ▶ new-text state lives on each line now (`OutputLine::viewed`/`display_id`), not
     // in a pair of per-world watermarks here. See those fields' doc comments for why the
     // watermark pair had to go: one shared pair per world cannot express "new for you but
@@ -4622,6 +4624,8 @@ impl World {
             connection_id: 0,
             max_received_seq: 0,
             pending_gap: None,
+            remote_history_inflight: None,
+            remote_history_done: false,
             visual_line_offset: 0,
             watchdog_history: std::collections::VecDeque::new(),
             watchname_history: std::collections::VecDeque::new(),
@@ -4989,6 +4993,38 @@ impl World {
         }
     }
 
+    /// Where this world's history begins, as `RequestHistory` names it: the oldest archive
+    /// line when the buffer starts with some (an archive block), else the oldest live line's
+    /// seq. A remote console's request and the reply it accepts both use this.
+    pub(crate) fn history_position(&self) -> (Option<u64>, Option<websocket::ArchiveCursor>) {
+        match self.output_lines.first() {
+            Some(l) if l.from_archive => (None, Some(websocket::ArchiveCursor {
+                wseq: l.archive_seq,
+                ts_ms: l.timestamp.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
+            })),
+            first => (first.map(|l| l.seq), None),
+        }
+    }
+
+    /// Older live lines (a remote console's backfill or history reply) put in front of what
+    /// it holds of them: after an archive block, which is older still, with the view and a
+    /// pending gap's place moved along.
+    pub(crate) fn prepend_live_history(&mut self, lines: Vec<OutputLine>) {
+        let n = lines.len();
+        if n == 0 {
+            return;
+        }
+        let at = self.output_lines.iter().take_while(|l| l.from_archive).count();
+        self.output_lines.splice(at..at, lines);
+        // Keep viewing the same content.
+        self.scroll_offset += n;
+        if let Some((gap_at, s)) = self.pending_gap {
+            if gap_at >= at {
+                self.pending_gap = Some((gap_at + n, s));
+            }
+        }
+    }
+
     pub(crate) fn install_archive_block(&mut self, prepend: Vec<OutputLine>) {
         let highest_fabricated = prepend.iter().map(|l| l.seq).max().unwrap_or(0);
         let inserted = prepend.len();
@@ -4998,15 +5034,9 @@ impl World {
         if highest_fabricated >= self.next_seq {
             self.next_seq = highest_fabricated.saturating_add(1);
         }
-
-        // Cap buffer size: keep the newest 10_000 lines to avoid unbounded growth.
-        // output_lines is ordered oldest->newest, so drain from the FRONT (oldest).
-        const MAX_LINES: usize = 10_000;
-        if self.output_lines.len() > MAX_LINES {
-            let excess = self.output_lines.len() - MAX_LINES;
-            self.output_lines.drain(0..excess);
-            self.scroll_offset = self.scroll_offset.saturating_sub(excess);
-        }
+        // No cap here: live output has none, and one here dropped from the front - exactly
+        // the block just installed - once the buffer held about 9,500 lines, so Page Up
+        // reported lines loaded and showed none.
     }
 
     /// Record `[start, end]` (inclusive) as broadcast, coalescing with any adjacent or
@@ -5989,6 +6019,12 @@ pub struct App {
     pub server_expands_line: bool,
     /// Remote console only: the server takes `PictureUpload` (its `InitialState.picture_upload`).
     pub server_picture_upload: bool,
+    /// Remote console only: the server takes `RequestHistory` (its
+    /// `InitialState.history_on_demand`): Page Up past the oldest line asks for older ones,
+    /// from the server's memory and then its archive.
+    pub server_history_on_demand: bool,
+    /// Remote console only: the last `RequestHistory.request_id` sent.
+    pub next_history_request_id: u64,
     /// Remote console only: the server's build for `/version`'s `Remote` line (its
     /// `InitialState.server_version_detail`), while connected to it.
     pub server_version_detail: Option<String>,
@@ -6300,6 +6336,8 @@ impl App {
             remote_reachability_json: String::new(),
             server_expands_line: false,
             server_picture_upload: false,
+            server_history_on_demand: false,
+            next_history_request_id: 0,
             server_version_detail: None,
             picture_uploads: picture::IncomingUploads::default(),
             console_pictures: picture::ConsolePictures::default(),
@@ -6539,7 +6577,9 @@ impl App {
             ws_key_file: self.settings.websocket_key_file.clone(),
             tls_configured: !self.settings.websocket_cert_file.is_empty() && !self.settings.websocket_key_file.is_empty(),
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
-            mouse_enabled: self.settings.mouse_enabled,
+            // Always on (the Console Mouse setting is gone); still sent, because an older
+            // client reads a missing field as off.
+            mouse_enabled: true,
             zwj_enabled: self.settings.zwj_enabled,
             new_line_indicator: self.settings.new_line_indicator,
             tts_mode: self.settings.tts_mode.name().to_string(),
@@ -6647,7 +6687,6 @@ impl App {
         *self.ws_auth_key_shared.write().unwrap() =
             self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
         self.settings.tls_proxy_enabled = settings.tls_proxy_enabled;
-        self.settings.mouse_enabled = settings.mouse_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
         self.settings.new_line_indicator = settings.new_line_indicator;
         self.settings.tabs = TabsMode::from_name(&settings.tabs);
@@ -7650,7 +7689,6 @@ impl App {
             &self.settings.gui_theme,
             self.settings.tls_proxy_enabled,
             self.settings.editor_side.name(),
-            self.settings.mouse_enabled,
             self.settings.zwj_enabled,
             self.settings.ansi_music_enabled,
             self.settings.new_line_indicator,
@@ -7666,6 +7704,7 @@ impl App {
             &self.settings.picture_host.name(),
             self.settings.clear_input_on_send,
             &self.settings.text_reveal.name(),
+            self.settings.separator_style.name(),
         );
         if self.is_master {
             add_import_button(&mut def);
@@ -8540,12 +8579,7 @@ impl App {
                             tf_attrs: None,
                         }
                     }).collect();
-                    let prepended_count = new_lines.len();
-                    let mut combined = new_lines;
-                    combined.append(&mut world.output_lines);
-                    world.output_lines = combined;
-                    // Adjust scroll_offset to keep viewing the same content
-                    world.scroll_offset += prepended_count;
+                    world.prepend_live_history(new_lines);
                     self.needs_output_redraw = true;
                 }
                 // Track backfill progress for remote console. This is a one-time, one-chunk-
@@ -8555,6 +8589,54 @@ impl App {
                 // anything beyond the initial screenful is fetched only on demand, via
                 // scroll_page_up.
                 self.backfill_advance_to_next();
+            }
+            WsMessage::HistoryLines { world_index, request_id, before_seq, archive_before, lines, archive, done } => {
+                let Some(world) = self.worlds.get_mut(world_index) else { return };
+                if world.remote_history_inflight.map(|(id, _)| id) != Some(request_id) {
+                    return;
+                }
+                world.remote_history_inflight = None;
+                // It continues the buffer only if the buffer still begins where it did.
+                if world.history_position() != (before_seq, archive_before) {
+                    return;
+                }
+                world.remote_history_done = done;
+                let live: Vec<OutputLine> = lines.into_iter()
+                    .filter(|l| before_seq.is_none_or(|b| l.seq < b))
+                    .map(|line| OutputLine { archive_seq: None,
+                        text: line.text,
+                        timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
+                        from_server: line.from_server,
+                        gagged: line.gagged,
+                        is_input: false, // remote-console mirror: see the note above
+                        seq: line.seq,
+                        highlight_color: line.highlight_color,
+                        from_archive: false,
+                        archive_sourced: line.archive_sourced,
+                        viewed: false,
+                        display_id: None,
+                        hist: LineHistory::default(),
+                        tf_attrs: None,
+                    }).collect();
+                world.prepend_live_history(live);
+                if !archive.is_empty() {
+                    // Drawn as the console draws its own Page Up into the archive.
+                    let rows = archive.into_iter().map(|a| scrollback::ScrollbackLine {
+                        ts_ms: a.ts_ms,
+                        world: String::new(),
+                        text: a.text,
+                        wseq: a.wseq,
+                        gagged: a.gagged,
+                    }).collect();
+                    let oldest_seq = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
+                    let block = Self::build_archive_prepend(rows, oldest_seq);
+                    let n = block.len();
+                    world.install_archive_block(block);
+                    if let Some((at, s)) = world.pending_gap {
+                        world.pending_gap = Some((at + n, s));
+                    }
+                }
+                self.needs_output_redraw = true;
             }
             WsMessage::GlobalSettingsUpdated { settings, input_height: _ } => {
                 // Master or another client updated global settings - sync our local copy
@@ -9118,6 +9200,29 @@ impl App {
     /// deep-fill. Once the queue drains, backfill_next simply becomes None and
     /// nothing further is auto-requested; any history beyond the initial screenful
     /// is fetched only on demand, via scroll_page_up.
+    /// Remote console: ask the server for the history older than everything this console
+    /// holds of `world_index` (Page Up at the top), unless it said there is none or a request
+    /// is already out. `None` = nothing to send.
+    pub(crate) fn remote_history_request(&mut self, world_index: usize) -> Option<WsMessage> {
+        /// A request is given up on after this, so another Page Up can ask again.
+        const HISTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        if !self.server_history_on_demand {
+            return None;
+        }
+        let world = self.worlds.get_mut(world_index)?;
+        if world.remote_history_done || world.remote_history_inflight.is_some_and(|(_, at)| at.elapsed() < HISTORY_TIMEOUT) {
+            return None;
+        }
+        let (before_seq, archive_before) = world.history_position();
+        let before_ts = world.output_lines.first().filter(|_| archive_before.is_none()).map(|l| {
+            l.timestamp.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+        });
+        self.next_history_request_id += 1;
+        let request_id = self.next_history_request_id;
+        world.remote_history_inflight = Some((request_id, std::time::Instant::now()));
+        Some(WsMessage::RequestHistory { world_index, count: 500, request_id, before_seq, before_ts, archive_before })
+    }
+
     fn backfill_advance_to_next(&mut self) {
         while let Some(world_idx) = self.backfill_queue.first().copied() {
             self.backfill_queue.remove(0);
@@ -9133,8 +9238,8 @@ impl App {
                 // they stay permanently empty until the user manually focuses + scrolls
                 // them. Only a genuinely missing world (removed since being queued) falls
                 // through to try the next queue entry below.
-                let oldest_seq = world.output_lines.first().map(|l| l.seq);
-                let received = world.output_lines.len();
+                let oldest_seq = world.output_lines.iter().find(|l| !l.from_archive).map(|l| l.seq);
+                let received = world.output_lines.iter().filter(|l| !l.from_archive).count();
                 let count = self.backfill_phase1_target.saturating_sub(received).max(1);
                 let request_id = self.register_scrollback_request(world_idx, ScrollbackRequestKind::Backfill);
                 self.backfill_next = Some((world_idx, oldest_seq, count, request_id));
@@ -10037,6 +10142,99 @@ impl App {
                 // Deliberate silent no-op — see doc comment above.
             }
         }
+    }
+
+    /// `WsMessage::RequestHistory` handling, shared by both server handlers: a client
+    /// scrolled up past everything it holds of a world. The next `count` older lines: live
+    /// ones from `output_lines` first (as `RequestScrollback`'s `before_seq` branch serves
+    /// them, `count` visible lines), and once those run out the rest from the archive, cut
+    /// where the client's buffer begins. Only the server can find that cut: it knows each
+    /// live line's `archive_seq`, which never goes on the wire.
+    ///
+    /// `archive_before` (the client's oldest archive line) continues in the archive alone.
+    /// The archive is read as the console's Page Up reads it (`archive_page`), whenever the
+    /// file exists. Archive lines go out as `ArchiveLine`s, without a protocol seq, so they
+    /// can never enter a client's seq tracking; an archive block the console paged in
+    /// (`from_archive` in `output_lines`) is never sent as live lines.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_request_history(
+        &mut self,
+        client_id: u64,
+        world_index: usize,
+        count: usize,
+        request_id: u64,
+        before_seq: Option<u64>,
+        before_ts: Option<u64>,
+        archive_before: Option<websocket::ArchiveCursor>,
+    ) {
+        /// One reply's most; a client asks for 500.
+        const HISTORY_MAX: usize = 5000;
+        let Some(world) = self.worlds.get(world_index) else { return };
+        let count = count.clamp(1, HISTORY_MAX);
+        let ts_ms = |l: &OutputLine| l.timestamp.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        let world_name = world.name.clone();
+        let mut lines = Vec::new();
+        // Where to read the archive from, and how many rows.
+        let (cut, wanted) = match archive_before {
+            Some(c) => (Some((c.wseq, c.ts_ms)), count),
+            None => {
+                let live: Vec<&OutputLine> = world.output_lines.iter()
+                    .filter(|l| !l.from_archive && before_seq.is_none_or(|b| l.seq < b))
+                    .collect();
+                let (range, visible) = Self::take_visible_range(&live, count, true, |l| l.gagged);
+                let exhausted = range.start == 0;
+                lines = live[range].iter().map(|l| TimestampedLine::from_output_line(l)).collect();
+                if exhausted && visible < count {
+                    // Every live line older than the client's is in this reply, so the
+                    // client will hold the server's whole buffer: the archive continues
+                    // below its oldest archived line. Unless the client holds lines the
+                    // server no longer does (a flush took them): then by the client's time.
+                    let mut held = world.output_lines.iter().filter(|l| !l.from_archive);
+                    let oldest = held.clone().next();
+                    let server_has_clients_oldest = match (before_seq, oldest) {
+                        (Some(b), Some(o)) => o.seq <= b,
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                    };
+                    let cut = if server_has_clients_oldest {
+                        let wseq = held.by_ref().filter_map(|l| l.archive_seq).min();
+                        let ts = oldest.map(ts_ms).unwrap_or_else(|| {
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+                        });
+                        (wseq, ts)
+                    } else {
+                        (None, before_ts.map(|t| (t as i64).saturating_mul(1000)).unwrap_or(0))
+                    };
+                    (Some(cut), count - visible)
+                } else {
+                    (None, 0)
+                }
+            }
+        };
+        let (archive, done) = match cut {
+            Some((wseq, ts)) if ts > 0 || wseq.is_some() => {
+                let rows = Self::archive_page(&world_name, wseq, ts, wanted);
+                let done = rows.len() < wanted;
+                let archive = rows.into_iter().map(|r| websocket::ArchiveLine {
+                    text: r.text.replace('\r', ""),
+                    ts_ms: r.ts_ms,
+                    wseq: r.wseq,
+                    gagged: r.gagged,
+                }).collect();
+                (archive, done)
+            }
+            Some(_) => (Vec::new(), true),
+            None => (Vec::new(), false),
+        };
+        self.ws_send_to_client(client_id, WsMessage::HistoryLines {
+            world_index,
+            request_id,
+            before_seq,
+            archive_before,
+            lines,
+            archive,
+            done,
+        });
     }
 
     /// `WsMessage::RequestState` handling — shared by master-WS and daemon (T40). Confirmed
@@ -11215,6 +11413,27 @@ impl App {
     /// meaning a daemon-mode client could push unvalidated values that main.rs would have
     /// rejected/clamped.
     #[allow(clippy::too_many_arguments)]
+    /// Separator Style (`Settings::separator_style`) from any interface's Settings, the
+    /// console's `/setup` or the Theme Editor: the look of the bar - Clay's own and TF's
+    /// status line alike. Going from TinyFugue back to Web hands the status area back to
+    /// Clay (`tf::status::reset_to_clay`: TF's layout and the `status_*` variables a
+    /// script set go back to a fresh engine's - user ruling 2026-10-28), which is the one
+    /// way back short of a cold start. `refresh_tf_status` then drops TF's line in every
+    /// interface, or re-evaluates it for the new look.
+    pub(crate) fn set_separator_style(&mut self, style: SeparatorStyle) {
+        let was = self.settings.separator_style;
+        if was == style {
+            return;
+        }
+        self.settings.separator_style = style;
+        self.needs_output_redraw = true;
+        if was == SeparatorStyle::TinyFugue && style == SeparatorStyle::Web {
+            tf::status::reset_to_clay(&mut self.tf_engine);
+        }
+        self.tf_status_at = None;
+        self.refresh_tf_status();
+    }
+
     pub(crate) fn update_global_settings(
         &mut self,
         client_id: u64,
@@ -11253,7 +11472,6 @@ impl App {
         ws_key_file: String,
         ws_password: String,
         tls_proxy_enabled: bool,
-        mouse_enabled: bool,
         zwj_enabled: bool,
         new_line_indicator: bool,
         tts_mode: String,
@@ -11266,6 +11484,7 @@ impl App {
         tabs: String,
         icon_bar: String,
         picture_host: Option<String>,
+        separator_style: Option<String>,
         text_reveal_profile: Option<websocket::TextRevealProfile>,
         font_profile: Option<font_profile::FontProfileUpdate>,
     ) {
@@ -11353,13 +11572,16 @@ impl App {
             self.settings.websocket_key_file = ws_key_file;
         }
         self.settings.tls_proxy_enabled = tls_proxy_enabled;
-        self.settings.mouse_enabled = mouse_enabled;
         self.settings.zwj_enabled = zwj_enabled;
         self.settings.new_line_indicator = new_line_indicator;
         self.settings.tabs = TabsMode::from_name(&tabs);
         self.settings.icon_bar = IconBarMode::from_name(&icon_bar);
         if let Some(picture_host) = picture_host {
             self.settings.picture_host = picture::PictureService::from_name(&picture_host);
+        }
+        // The bar's look: one global setting, set from any interface's Settings.
+        if let Some(style) = separator_style {
+            self.set_separator_style(SeparatorStyle::from_name(&style));
         }
         // One interface's own Text Reveal; the console's is never set from a client.
         if let Some(profile) = text_reveal_profile {
@@ -16181,9 +16403,8 @@ impl App {
             if let Some(ref server) = self.ws_server {
                 server.record_acked_seq(client_id, &resume);
             }
-            // Mirrors the in-memory scrollback ring's cap (MAX_LINES, main.rs) so a
-            // single replay always covers the entire ring if needed - the ring can never
-            // hold more than that many lines per world regardless of how big the gap is.
+            // A bound on one replay; a client further behind than this goes on with its
+            // own gap fill (after_seq), as for any reply that isn't backfill_complete.
             const RESUME_REPLAY_MAX: usize = 10_000;
             for (world_index, last_seq) in resume {
                 // request_id: Some(0) is the reserved value marking a server-initiated
@@ -17408,7 +17629,7 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -17417,8 +17638,8 @@ impl App {
                     web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
-                    mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, text_reveal_profile, font_profile,
+                    zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
+                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -17543,10 +17764,8 @@ impl App {
                 });
             }
             WsMessage::UpdateSeparatorStyle { style } => {
-                self.settings.separator_style = SeparatorStyle::from_name(&style);
-                self.needs_output_redraw = true;
-                // Console-only setting, but GUI/web clients mirror it in their own
-                // settings views, so keep every client's copy in sync.
+                self.set_separator_style(SeparatorStyle::from_name(&style));
+                // Every client's Settings shows it, so keep every client's copy in sync.
                 let settings_msg = self.build_global_settings_msg();
                 self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
                     settings: settings_msg,
@@ -17745,6 +17964,9 @@ impl App {
             }
             WsMessage::RequestScrollback { world_index, count, before_seq, after_seq, request_id } => {
                 self.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq, request_id);
+            }
+            WsMessage::RequestHistory { world_index, count, request_id, before_seq, before_ts, archive_before } => {
+                self.handle_request_history(client_id, world_index, count, request_id, before_seq, before_ts, archive_before);
             }
             WsMessage::ToggleWorldGmcp { world_index } => self.toggle_world_gmcp(world_index),
             // Plan Job 13 (Phase 4, 4.4): folded into one shared function with the two
@@ -18143,7 +18365,9 @@ impl App {
                 // connecting mid-password-prompt (or reconnecting) - live changes
                 // afterward arrive via WsMessage::EchoMaskChanged.
                 echo_masked: world.protocol.echo_masked,
-                total_output_lines: world.output_lines.len(),
+                // Lines a client can be sent: an archive block the console paged in is
+                // local to it (`from_archive`), so it is left out of both totals.
+                total_output_lines: world.output_lines.iter().filter(|l| !l.from_archive).count(),
                 // Visible (non-gagged) total, so the client can know how many VISIBLE lines
                 // still remain to fetch without being able to derive that itself - gagged
                 // status of not-yet-downloaded lines is server-only knowledge. Plain O(n)
@@ -18152,7 +18376,7 @@ impl App {
                 // an incrementally-maintained counter was considered and rejected (Ctrl+L's
                 // World::filter_to_server_output retroactively regags client lines in bulk,
                 // which would force a full recount at that site anyway).
-                total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
+                total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged && !l.from_archive).count()),
                 pending_count: world.pending_lines.len(),
                 next_seq: world.next_seq,
                 seq_epoch: world.seq_epoch,
@@ -18192,6 +18416,7 @@ impl App {
             other_views: true,
             expand_line: true,
             picture_upload: true,
+            history_on_demand: true,
             emoji_json: crate::emoji::emoji_json(),
             emoji_categories_json: crate::emoji::emoji_categories_json(),
             tf_status: self.tf_status.iter()
@@ -18643,55 +18868,62 @@ impl App {
     }
 
     /// Build the display block `try_load_archive_lines` splices onto the front of a world's
-    /// buffer: an "archive" separator followed by the archived lines, oldest first.
+    /// buffer: the archived lines, oldest first, each drawn with the 🛢️ prefix. No separator
+    /// line goes above them (user ruling 2026-10-27: no interface draws one).
     ///
     /// Extracted so it is testable - `try_load_archive_lines` itself reads a fixed
     /// `~/.clay/scrollback.db`, which a unit test must not touch. Every line this returns is
-    /// marked `from_archive`, **including the separator**: that marker is what keeps the whole
-    /// block out of the sequence-number contract (never broadcast, never in `InitialState`,
-    /// never in a `RequestScrollback` reply, exempt from the broadcast-ledger audit).
+    /// marked `from_archive`: that marker is what keeps the whole block out of the
+    /// sequence-number contract (never broadcast, never in `InitialState`, never in a
+    /// `RequestScrollback` reply, exempt from the broadcast-ledger audit). A gagged line
+    /// stays gagged, so it is hidden here as it was when it arrived.
     ///
     /// The seqs here are fabricated by counting backwards from the buffer's oldest and
     /// saturate at 0, so on a young world they collide with live ones. That is tolerable only
     /// because the marker keeps them local; if a caller ever puts one of these lines on the
     /// wire, a client records a seq that real output later reuses and then drops that real
-    /// output as a duplicate - the v1.5.22 "one world went silent" report.
+    /// output as a duplicate - the v1.5.22 "one world went silent" report. A client is sent
+    /// archive text only as `HistoryLines.archive`, which has no seq at all.
     pub(crate) fn build_archive_prepend(
         archive_lines: Vec<scrollback::ScrollbackLine>,
         oldest_seq: u64,
     ) -> Vec<OutputLine> {
         let count = archive_lines.len();
         let seq_start = oldest_seq.saturating_sub(count as u64);
-
-        // Build separator then archive OutputLines (oldest first)
-        let mut prepend: Vec<OutputLine> = Vec::with_capacity(count + 1);
-        let sep_seq = seq_start.saturating_sub(1);
-        let mut separator = OutputLine::new_client(
-            format!("\x1b[2m{}\x1b[0m", "─".repeat(30) + " archive " + &"─".repeat(30)),
-            sep_seq,
-        );
-        // The separator is part of the archive block and must carry the same marker as the
-        // lines it introduces. `new_client` leaves `from_archive` false, so without this it
-        // is the one line of the block that still looks like real output: it holds a
-        // fabricated seq (which collides with a live one whenever seq_start saturates at 0),
-        // is never broadcast, and slips past every from_archive filter — leaving exactly one
-        // permanent ledger hole and one duplicate seq. Both surfaced as test failures while
-        // fixing the v1.5.22 report.
-        separator.from_archive = true;
-        prepend.push(separator);
-        for (i, al) in archive_lines.into_iter().enumerate() {
+        archive_lines.into_iter().enumerate().map(|(i, al)| {
             let ts = std::time::UNIX_EPOCH + std::time::Duration::from_millis(al.ts_ms as u64);
             let mut line = OutputLine::new_with_timestamp(al.text, ts, seq_start + i as u64);
             line.from_server = true;
             line.from_archive = true;
+            line.gagged = al.gagged;
             // Carry the REAL archive sequence (the protocol `seq` above stays
             // fabricated, and `from_archive` still keeps these off the wire). This
             // is what stops a Page Up followed by /recall -D from listing the same
             // text twice: these lines now participate in the boundary.
             line.archive_seq = al.wseq;
-            prepend.push(line);
+            line
+        }).collect()
+    }
+
+    /// The `count` archived lines of `world_name` just older than a boundary, oldest first:
+    /// by the durable sequence when the boundary has one (an exact cut, so nothing is shown
+    /// twice or skipped on a timestamp tie), else by time. The time is the fallback for a
+    /// boundary line that predates archiving, a pre-migration archive (whose rows have no
+    /// sequence; `load_before_wseq` declines on it) and a reload state that carried no
+    /// sequence. The console's Page Up and a client's `RequestHistory` both read through
+    /// this. Empty when there is no archive file.
+    pub(crate) fn archive_page(world_name: &str, wseq: Option<i64>, ts_ms: i64, count: usize) -> Vec<scrollback::ScrollbackLine> {
+        let db_path = clay_config_path("scrollback.db");
+        if count == 0 || !db_path.exists() {
+            return Vec::new();
         }
-        prepend
+        if let Some(w) = wseq {
+            let by_seq = scrollback::load_before_wseq(&db_path, world_name, w, count);
+            if !by_seq.is_empty() {
+                return by_seq;
+            }
+        }
+        scrollback::load_before_path(&db_path, world_name, ts_ms, count)
     }
 
     /// Load older lines from the archive and prepend them to the world's output buffer.
@@ -18717,31 +18949,12 @@ impl App {
             (world.name.clone(), ts, wseq)
         };
 
-        let db_path = clay_config_path("scrollback.db");
-
-        if !db_path.exists() {
-            return 0;
-        }
-
-        let archive_lines = match oldest_wseq {
-            Some(w) => {
-                let by_seq = scrollback::load_before_wseq(&db_path, &world_name, w, 500);
-                if by_seq.is_empty() {
-                    // Pre-migration archive, or nothing older: the timestamp path
-                    // still answers.
-                    scrollback::load_before_path(&db_path, &world_name, oldest_ts_ms, 500)
-                } else {
-                    by_seq
-                }
-            }
-            None => scrollback::load_before_path(&db_path, &world_name, oldest_ts_ms, 500),
-        };
+        let archive_lines = Self::archive_page(&world_name, oldest_wseq, oldest_ts_ms, 500);
         if archive_lines.is_empty() {
             return 0;
         }
 
-        // Captured before the Vec is moved; this is the return value (archived lines loaded,
-        // not counting the separator the block adds).
+        // Captured before the Vec is moved; this is the return value.
         let count = archive_lines.len();
         let oldest_seq = self.worlds[world_idx].output_lines.first().map(|l| l.seq).unwrap_or(0);
         let prepend = Self::build_archive_prepend(archive_lines, oldest_seq);
@@ -19331,7 +19544,6 @@ pub(crate) struct SetupSettings {
     pub(crate) gui_theme: String,
     pub(crate) tls_proxy: bool,
     pub(crate) editor_side: String,
-    pub(crate) mouse_enabled: bool,
     pub(crate) zwj_enabled: bool,
     pub(crate) ansi_music: bool,
     pub(crate) new_line_indicator: bool,
@@ -19348,6 +19560,8 @@ pub(crate) struct SetupSettings {
     pub(crate) picture_host: String,
     /// `TextReveal` by name (console only).
     pub(crate) text_reveal: String,
+    /// `SeparatorStyle` by name: the console's bar, one global setting.
+    pub(crate) separator_style: String,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -19507,10 +19721,10 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
-        SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
+        SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE, SETUP_FIELD_TTS_VOICE,
         SETUP_FIELD_SCROLLBACK, SETUP_FIELD_LOG_INPUT, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
-        SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR, SETUP_FIELD_PICTURE_HOST, SETUP_FIELD_CLEAR_INPUT, SETUP_FIELD_TEXT_REVEAL,
+        SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR, SETUP_FIELD_PICTURE_HOST, SETUP_FIELD_CLEAR_INPUT, SETUP_FIELD_TEXT_REVEAL, SETUP_FIELD_SEPARATOR_STYLE,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL, SETUP_BTN_IMPORT,
         update_setup_visibility,
     };
@@ -19623,7 +19837,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             tls_proxy: state.get_bool(SETUP_FIELD_TLS_PROXY).unwrap_or(false),
             editor_side: state.get_selected(SETUP_FIELD_EDITOR_SIDE)
                 .unwrap_or("left").to_string(),
-            mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
             zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
             ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
             new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
@@ -19643,6 +19856,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             icon_bar: state.get_selected(SETUP_FIELD_ICON_BAR).unwrap_or("app_tablet").to_string(),
             picture_host: state.get_selected(SETUP_FIELD_PICTURE_HOST).unwrap_or("catbox").to_string(),
             text_reveal: state.get_selected(SETUP_FIELD_TEXT_REVEAL).unwrap_or("off").to_string(),
+            separator_style: state.get_selected(SETUP_FIELD_SEPARATOR_STYLE).unwrap_or("web").to_string(),
         }
     }
 
@@ -23728,7 +23942,7 @@ fn perform_terminal_redraw(app: &mut App, terminal: &mut Terminal<CrosstermBacke
         cursor::MoveTo(0, 0)
     )?;
     // Re-enable mouse capture only if a popup is currently visible
-    if app.settings.mouse_enabled && app.has_new_popup() {
+    if app.has_new_popup() {
         let _ = execute!(std::io::stdout(), EnableMouseCapture);
         app.mouse_capture_active = true;
     }
@@ -24512,9 +24726,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 if let Some(Ok(event)) = maybe_event {
                 // Handle mouse events
                 if let Event::Mouse(mouse) = event {
-                    if !app.settings.mouse_enabled {
-                        continue;
-                    }
                     if app.has_new_popup() {
                         // Popup mode: existing popup mouse handling
                         match mouse.kind {
@@ -24544,25 +24755,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 handle_popup_mouse_highlight_end(&mut app);
                                 continue;
                             }
-                            MouseEventKind::ScrollUp => {
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                                 if let Some(state) = app.popup_manager.current_mut() {
-                                    state.mouse_scroll_up();
+                                    if up { state.mouse_scroll_up() } else { state.mouse_scroll_down() }
                                 }
-                                let tc = app.settings.theme;
-                                if let Some(state) = app.popup_manager.current() {
-                                    popup::console_renderer::render_popup_content_direct(terminal, state, &tc);
+                                // A list, help text or the emoji grid is redrawn directly; a
+                                // field list's selection falls through to the full draw.
+                                if app.popup_manager.current().is_some_and(|s| s.wheel_draws_directly()) {
+                                    let tc = app.settings.theme;
+                                    if let Some(state) = app.popup_manager.current() {
+                                        popup::console_renderer::render_popup_content_direct(terminal, state, &tc);
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if let Some(state) = app.popup_manager.current_mut() {
-                                    state.mouse_scroll_down();
-                                }
-                                let tc = app.settings.theme;
-                                if let Some(state) = app.popup_manager.current() {
-                                    popup::console_renderer::render_popup_content_direct(terminal, state, &tc);
-                                }
-                                continue;
                             }
                             _ => { continue; }
                         }
@@ -25919,18 +26125,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
             app.popup_was_visible = any_popup_visible;
 
-            // Toggle mouse capture when popup visibility changes
-            if app.settings.mouse_enabled {
-                // A live shell world wants the mouse too, so the wheel and any mouse-mode
-                // program (vi, tmux, htop) work; otherwise only popups capture it.
-                let want_mouse = any_popup_visible || app.shell_live_current();
-                if want_mouse && !app.mouse_capture_active {
-                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                    app.mouse_capture_active = true;
-                } else if !want_mouse && app.mouse_capture_active {
-                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                    app.mouse_capture_active = false;
-                }
+            // Toggle mouse capture when popup visibility changes. A live shell world wants
+            // the mouse too, so the wheel and any mouse-mode program (vi, tmux, htop) work;
+            // otherwise only popups capture it, and the terminal keeps its own selection.
+            let want_mouse = any_popup_visible || app.shell_live_current();
+            if want_mouse && !app.mouse_capture_active {
+                let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                app.mouse_capture_active = true;
+            } else if !want_mouse && app.mouse_capture_active {
+                let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                app.mouse_capture_active = false;
             }
 
             // Handle terminal clear request (e.g., after closing editor)

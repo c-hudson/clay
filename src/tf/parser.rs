@@ -653,6 +653,9 @@ fn cmd_unset(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 
     if engine.unset_global(name) {
+        if name.starts_with("status_") {
+            super::status::on_unset(engine, name);
+        }
         // A variable Clay applies (%wrapsize, %clock_format, %textdiv...) goes back to
         // Clay's own behaviour once unset - the App has to hear about it, as for a /set.
         if super::special_vars::APPLIED.contains(&name) {
@@ -2690,7 +2693,11 @@ Fields: "" (padding, :<width>), @more @world @read @active @log @mail @clock
 (shown by the expression in %status_int_<name>), a variable (shown by
 %status_var_<name>, else its value), or a "literal". One field may have no
 width: it takes what the others leave; a negative width right-justifies.
-%status_pad fills fields out; %status_attr colors the whole line.
+%status_pad fills fields out; %status_attr colors the whole line. Unset, the
+look of Settings > Separator Style decides: Web draws the fields with spaces
+between them on the bar's colour, TinyFugue with _ on the terminal
+background. Changing that setting from TinyFugue back to Web puts the status
+line back to Clay's (TF's layout and the status_* variables reset).
 
 Example: /status_add -A@world hp:4"#.to_string()
             )),

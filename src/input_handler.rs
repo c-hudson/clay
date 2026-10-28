@@ -1,16 +1,13 @@
 //! Input handling and mouse event functions extracted from main.rs
 
-use crossterm::{
-    event::{KeyCode, KeyEvent, KeyModifiers, DisableMouseCapture},
-    execute,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::{
     popup, persistence, chords,
     WsMessage,
-    WorldSwitchMode,
+    WorldSwitchMode, SeparatorStyle,
     Encoding, AutoConnectType, KeepAliveType, WorldType,
     App, World, EditorFocus, EditorSide, TabsMode, IconBarMode, DEBUG_ENABLED,
     handle_new_popup_key, NewPopupAction,
@@ -799,12 +796,6 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
                 app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
-                // Update mouse setting; if disabled, turn off capture immediately
-                app.settings.mouse_enabled = settings.mouse_enabled;
-                if !settings.mouse_enabled && app.mouse_capture_active {
-                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                    app.mouse_capture_active = false;
-                }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_line_indicator = settings.new_line_indicator;
@@ -812,6 +803,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
                 app.settings.picture_host = crate::picture::PictureService::from_name(&settings.picture_host);
+                app.set_separator_style(SeparatorStyle::from_name(&settings.separator_style));
                 let old_tts_mode = app.settings.tts_mode;
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.note_kokoro_selected(old_tts_mode);
@@ -840,6 +832,14 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 }
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
+                // Tell every attached client, as a client's own save does: a GUI's Settings
+                // window edits the copy it was last sent and its Save sends it all back, so
+                // without this a GUI's next save put the console's old choices back.
+                let settings_msg = app.build_global_settings_msg();
+                app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                    settings: settings_msg,
+                    input_height: app.input_height,
+                });
             }
             NewPopupAction::WebSaved(settings) => {
                 // Check for wildcard '*' in allow list — warn user

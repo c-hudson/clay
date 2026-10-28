@@ -158,6 +158,8 @@ pub struct Scroll {
     pending: isize,
     /// After the last layout: rows below the view (the History count).
     pub rows_below: usize,
+    /// After the last layout: rows above the view, held but not shown.
+    pub rows_above: usize,
     /// After the last layout: whole rows the view holds.
     pub view_rows: usize,
     /// After the last layout: whole cells of the font across the view.
@@ -187,6 +189,7 @@ impl Default for Scroll {
             top: None,
             pending: 0,
             rows_below: 0,
+            rows_above: 0,
             view_rows: 24,
             view_cols: 80,
             rows_cache: (0, 0, 0),
@@ -214,6 +217,12 @@ impl Scroll {
 
     pub fn at_bottom(&self) -> bool {
         self.follow || self.rows_below == 0
+    }
+
+    /// The rows above the view once the move not laid out yet is: how near the top of
+    /// what's held a scroll the user just made goes.
+    pub fn rows_above_after_pending(&self) -> usize {
+        (self.rows_above as isize + self.pending).max(0) as usize
     }
 
     /// The scroll bar, if (x, y) is on it.
@@ -710,6 +719,7 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         (bar_top + ratio * (bar_h - thumb_h), thumb_h)
     });
     let (thumb_top, thumb_h) = thumb.unwrap_or((bar_top, bar_h));
+    st.rows_above = total.saturating_sub(below + view_rows);
     let left = f32::from(bounds.origin.x + bounds.size.width) - BAR_W - BAR_GAP;
     st.bar = Some(Bar { left, top: bar_top, height: bar_h, thumb_top, thumb_h, total });
     drop(st);

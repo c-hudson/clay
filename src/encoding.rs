@@ -574,6 +574,12 @@ pub enum SeparatorStyle {
 }
 
 impl SeparatorStyle {
+    /// (value, label) as every Settings window lists them - the console's `/setup`, the
+    /// native GUI's Pick and the web page's select (a test pins index.html to this). One
+    /// global setting shown in every interface (user ruling 2026-10-27), though only a
+    /// console's bar changes.
+    pub const OPTIONS: &'static [(&'static str, &'static str)] = &[("web", "Web"), ("tinyfugue", "TinyFugue")];
+
     pub fn name(&self) -> &'static str {
         match self {
             SeparatorStyle::TinyFugue => "tinyfugue",

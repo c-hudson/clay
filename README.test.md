@@ -292,7 +292,7 @@ All keybindings are configurable via `~/.clay/keybindings.dat` (defaults follow 
 | `F9` | Toggle GMCP media audio |
 | `Ctrl+C` (x2) | Quit |
 
-**Mouse (enabled by default via "Console Mouse" in `/setup`):** click popup buttons/fields/list items, scroll wheel in popups, click-drag to highlight lines.
+**Mouse (console, in popups):** click popup buttons/fields/list items, scroll wheel in popups, click-drag to highlight lines.
 
 ## Android App
 

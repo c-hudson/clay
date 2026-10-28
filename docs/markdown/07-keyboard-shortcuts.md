@@ -84,7 +84,7 @@ key — bind them in `keybindings.dat` or the keybind editor.
 | `Esc-.` / `Esc-_` | Insert the last word of the previous history entry |
 | `Esc-^E` | Expand line (substitute `%var`/`$[...]`/`$(...)` in the input line in place — TF `kb_expand_line`) |
 | `Esc-Tab` | Command completion (`Tab` itself keeps its own more-mode-priority paging behavior — see Output/Scrollback below) |
-| `Alt-Up` / `Alt-Down` | Grow/shrink the input area (1-15 lines; saved as the Input height setting, as a mouse drag of the separator bar is) |
+| `Alt-Up` / `Alt-Down` | Grow/shrink the input area (1-15 lines; saved as the Input height setting, as a drag of the input's top edge in the GUI and web client is) |
 | `^Q` | Spell suggestions (Clay keeps this; TF's own `^Q` is literal-next, which Clay puts on `^V`) |
 
 **Kill ring:** `^K`, `^U`, `^W`, `Esc-d`, and `Esc-Backspace` all push the
@@ -318,16 +318,25 @@ own, like Settings and Help, so it can sit beside the main window while you type
 | `Enter` | Confirm the current selection |
 | `Esc` | Cancel and close |
 
-## Mouse (Console, when "Console Mouse" is enabled in /setup — default: on)
+## Mouse (Console)
+
+The console takes the mouse only while a popup is open or a shell world is on screen.
+Everywhere else the terminal keeps it, so its own select, copy and paste work over the
+output. In a popup or a shell world, most terminals still select text while you hold Shift
+(Option in iTerm2, Fn in macOS Terminal).
 
 - Click popup buttons and fields to interact
 - Click list items to select them
-- Scroll wheel to scroll lists and scrollable content in popups (and the emoji grid)
+- Scroll wheel to scroll lists and scrollable content in popups (and the emoji grid), and to
+  move through the fields of a popup like `/setup` or the world editor
 - Click and drag to highlight lines in scrollable content
 - The emoji picker: click an emoji to insert it (the picker stays open), a tab to switch
   category, and the `[x]` in its top-right corner to close it
-- Drag the separator bar up or down to resize the input area; the height is saved when
-  you let go (the SSH console sends it to the server it is attached to)
+- In a shell world, clicks, drags and the wheel go to a program that asked for the mouse
+  (like `vi` or `tmux`)
+
+Resizing the input area by dragging is in the GUI and the web client only (the line above
+the input); in the console use `Alt-Up` / `Alt-Down`.
 
 ---
 

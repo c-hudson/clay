@@ -84,6 +84,14 @@ bar.) From then on Clay draws TF's, with tfstatus.tf's formats:
 in the console, in the web and desktop clients (next to their menu, notes and
 font controls), and on Android, each laid out to its own width.
 
+TF's line takes the look of Settings > Separator Style (any interface's Settings; one
+global setting), as Clay's own bar does: Web, the default, draws the fields with spaces
+between them on the status bar's colour; TinyFugue fills the gaps with underscores on
+the terminal background, as TF does. A `%status_pad` or `%status_attr` your script sets
+is used in either look. Changing the setting from TinyFugue back to Web gives you
+Clay's own bar again: TF's layout and every `status_*` variable the script set go back
+to their defaults, so set them again if you want TF's line back.
+
 ## New text when you switch worlds
 
 `%textdiv` works as in TF once your `.tfrc` sets it: switching to a world shows a

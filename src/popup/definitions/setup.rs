@@ -19,7 +19,8 @@ pub const SETUP_FIELD_GUI_THEME: FieldId = FieldId(8);
 pub const SETUP_FIELD_TLS_PROXY: FieldId = FieldId(9);
 // Note: FieldId(10) was dictionary_path, removed - the spell checker uses the system's dictionary
 pub const SETUP_FIELD_EDITOR_SIDE: FieldId = FieldId(11);
-pub const SETUP_FIELD_MOUSE: FieldId = FieldId(12);
+// Note: FieldId(12) was mouse_enabled ("Console Mouse"), removed - the console always takes
+// the mouse in a popup and a live shell world
 pub const SETUP_FIELD_ZWJ: FieldId = FieldId(13);
 pub const SETUP_FIELD_ANSI_MUSIC: FieldId = FieldId(14);
 pub const SETUP_FIELD_NEW_LINE_INDICATOR: FieldId = FieldId(17);
@@ -42,6 +43,9 @@ pub const SETUP_FIELD_PICTURE_HOST: FieldId = FieldId(28);
 pub const SETUP_FIELD_CLEAR_INPUT: FieldId = FieldId(29);
 /// The console's text-reveal effect (`Settings::text_reveal`, src/reveal.rs).
 pub const SETUP_FIELD_TEXT_REVEAL: FieldId = FieldId(30);
+/// The console's separator-bar style (`Settings::separator_style`): one global setting,
+/// shown in every interface's Settings (user ruling 2026-10-27).
+pub const SETUP_FIELD_SEPARATOR_STYLE: FieldId = FieldId(31);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -169,6 +173,11 @@ pub fn picture_host_options() -> Vec<SelectOption> {
     crate::picture::PictureService::OPTIONS.iter().map(|(v, l)| SelectOption::new(*v, *l)).collect()
 }
 
+/// Separator-bar style options (the one list every UI shows, `SeparatorStyle::OPTIONS`)
+pub fn separator_style_options() -> Vec<SelectOption> {
+    crate::SeparatorStyle::OPTIONS.iter().map(|(v, l)| SelectOption::new(*v, *l)).collect()
+}
+
 /// Create the setup popup definition with current values
 #[allow(clippy::too_many_arguments)]
 pub fn create_setup_popup(
@@ -181,7 +190,6 @@ pub fn create_setup_popup(
     gui_theme: &str,
     tls_proxy: bool,
     editor_side: &str,
-    mouse_enabled: bool,
     zwj_enabled: bool,
     ansi_music: bool,
     new_line_indicator: bool,
@@ -197,6 +205,7 @@ pub fn create_setup_popup(
     picture_host: &str,
     clear_input_on_send: bool,
     text_reveal: &str,
+    separator_style: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = crate::theme::BUILTIN_THEMES.iter().position(|(name, _)| *name == gui_theme).unwrap_or(0);
@@ -207,6 +216,7 @@ pub fn create_setup_popup(
     let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
     let icon_bar_idx = icon_bar_options().iter().position(|o| o.value == icon_bar).unwrap_or(1);
     let picture_host_idx = picture_host_options().iter().position(|o| o.value == picture_host).unwrap_or(0);
+    let separator_style_idx = separator_style_options().iter().position(|o| o.value == separator_style).unwrap_or(0);
 
     let mut def = PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -258,11 +268,6 @@ pub fn create_setup_popup(
             SETUP_FIELD_EDITOR_SIDE,
             "Editor Side",
             FieldKind::select(editor_side_options(), editor_side_idx),
-        ))
-        .with_field(Field::new(
-            SETUP_FIELD_MOUSE,
-            "Console Mouse",
-            FieldKind::toggle(mouse_enabled),
         ))
         .with_field(Field::new(
             SETUP_FIELD_ZWJ,
@@ -333,6 +338,11 @@ pub fn create_setup_popup(
             SETUP_FIELD_PICTURE_HOST,
             "Picture Host",
             FieldKind::select(picture_host_options(), picture_host_idx),
+        ))
+        .with_field(Field::new(
+            SETUP_FIELD_SEPARATOR_STYLE,
+            "Separator Style",
+            FieldKind::select(separator_style_options(), separator_style_idx),
         ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
@@ -442,9 +452,6 @@ fn setup_help_text() -> Vec<String> {
         "",
         "Editor Side: Which side the split-screen editor opens.",
         "",
-        "Console Mouse: Enable mouse support in the terminal",
-        "  for clicking on popups, scrolling, and selecting.",
-        "",
         "ZWJ Sequence: For terminals that support combined",
         "  emoji (ZWJ). If unsupported, enabling this shows",
         "  two separate emoji instead of one combined one.",
@@ -500,6 +507,13 @@ fn setup_help_text() -> Vec<String> {
         "  through /url's shortening. '(2d)': tmpfiles.org",
         "  deletes it after 2 days. Uploads are public. 'Off'",
         "  turns picture uploads off.",
+        "",
+        "Separator Style: How the console draws the bar above",
+        "  the input. Web: gaps as spaces on the status bar",
+        "  colour, the look of the GUIs and the web page.",
+        "  TinyFugue: gaps filled with underscores on the",
+        "  terminal background. One setting for every",
+        "  interface; only a console's bar changes.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -508,9 +522,9 @@ fn setup_help_text() -> Vec<String> {
 pub fn create_setup_popup_for_test(text_reveal: &str) -> PopupDefinition {
     create_setup_popup(
         true, true, false, "unseen_first",
-        false, 3, "dark", false, "left", false, false, true,
+        false, 3, "dark", false, "left", false, true,
         false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
-        text_reveal,
+        text_reveal, "web",
     )
 }
 
@@ -562,9 +576,9 @@ mod tests {
     fn test_setup_popup_creation() {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
-            false, 3, "dark", false, "left", false, false, true,
+            false, 3, "dark", false, "left", false, true,
             false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
-            "off",
+            "off", "web",
         );
         let state = PopupState::new(def);
 
@@ -578,9 +592,9 @@ mod tests {
     fn the_master_consoles_import_button_comes_before_the_help_button() {
         let mut def = create_setup_popup(
             true, true, false, "unseen_first",
-            false, 3, "dark", false, "left", false, false, true,
+            false, 3, "dark", false, "left", false, true,
             false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
-            "off",
+            "off", "web",
         );
         add_import_button(&mut def);
         let left: Vec<&str> = def.buttons.iter().filter(|b| b.left_align).map(|b| b.label.as_str()).collect();
@@ -599,9 +613,9 @@ mod tests {
             for (value, label) in crate::picture::PictureService::OPTIONS {
                 let mut def = create_setup_popup(
                     true, true, false, "unseen_first",
-                    false, 3, "dark", false, "left", false, false, true,
+                    false, 3, "dark", false, "left", false, true,
                     false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", value, false,
-                    "off",
+                    "off", "web",
                 );
                 add_import_button(&mut def);
                 let mut state = PopupState::new(def);
@@ -627,9 +641,9 @@ mod tests {
     fn a_console_hides_what_only_the_gui_and_web_use() {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
-            true, 5, "light", true, "left", true, true, true,
+            true, 5, "light", true, "left", true, true,
             false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
-            "fast",
+            "fast", "tinyfugue",
         );
         for id in CONSOLE_HIDDEN_FIELDS {
             assert!(!def.get_field(id).unwrap().visible, "{id:?} shown in the console");
@@ -639,7 +653,12 @@ mod tests {
         assert_eq!(state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE), Some(false));
         assert_eq!(state.get_selected(SETUP_FIELD_TABS), Some("top"));
         assert_eq!(state.get_selected(SETUP_FIELD_ICON_BAR), Some("all"));
+        // Separator Style acts on a console only, but is one global setting shown in
+        // every interface (user ruling 2026-10-27).
+        assert!(state.definition.get_field(SETUP_FIELD_SEPARATOR_STYLE).unwrap().visible, "Separator Style hidden in the console");
+        assert_eq!(state.get_selected(SETUP_FIELD_SEPARATOR_STYLE), Some("tinyfugue"));
         let help = setup_help_text().join("\n");
+        assert!(help.contains("Separator Style:"), "the console's help lacks Separator Style");
         for gone in ["GUI Theme:", "Keyboard Visible:", "Tabs:", "Icon Bar:", "Console only"] {
             assert!(!help.contains(gone), "the console's help still has {gone:?}");
         }
@@ -649,9 +668,9 @@ mod tests {
     fn test_setup_popup_values() {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
-            true, 5, "light", true, "left", true, true, true,
+            true, 5, "light", true, "left", true, true,
             false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
-            "fast",
+            "fast", "tinyfugue",
         );
         let state = PopupState::new(def);
 
@@ -665,7 +684,6 @@ mod tests {
         assert_eq!(state.get_number(SETUP_FIELD_INPUT_HEIGHT), Some(5));
         assert_eq!(state.get_selected(SETUP_FIELD_GUI_THEME), Some("light"));
         assert_eq!(state.get_bool(SETUP_FIELD_TLS_PROXY), Some(true));
-        assert_eq!(state.get_bool(SETUP_FIELD_MOUSE), Some(true));
         assert_eq!(state.get_bool(SETUP_FIELD_ZWJ), Some(true));
         assert_eq!(state.get_number(SETUP_FIELD_WRAPSPACE), Some(4));
         assert_eq!(state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE), Some(false));
@@ -674,5 +692,17 @@ mod tests {
         assert_eq!(state.get_selected(SETUP_FIELD_PICTURE_HOST), Some("sxcu+short"));
         assert_eq!(state.get_bool(SETUP_FIELD_CLEAR_INPUT), Some(true));
         assert_eq!(state.get_selected(SETUP_FIELD_TEXT_REVEAL), Some("fast"));
+        assert_eq!(state.get_selected(SETUP_FIELD_SEPARATOR_STYLE), Some("tinyfugue"));
+    }
+
+    /// The Separator Style choices are `SeparatorStyle::OPTIONS`, Web first (the default),
+    /// and an unknown saved value shows as Web.
+    #[test]
+    fn the_separator_style_choices_are_the_enums_options_web_first() {
+        let values: Vec<String> = separator_style_options().iter().map(|o| o.value.clone()).collect();
+        assert_eq!(values, ["web", "tinyfugue"]);
+        assert_eq!(crate::SeparatorStyle::default().name(), "web");
+        let def = create_setup_popup_for_test("off");
+        assert_eq!(PopupState::new(def).get_selected(SETUP_FIELD_SEPARATOR_STYLE), Some("web"));
     }
 }

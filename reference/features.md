@@ -155,7 +155,7 @@ Three modes (configured per-world):
 Per-world: name, hostname, port, user, password, SSL, log file, encoding, auto login type, keep alive type/cmd
 
 ### Global Settings (`/setup`)
-More mode, spell check, temp convert, world switching, show tags, input height, console theme, GUI theme, console mouse, ZWJ, ANSI music, TLS proxy
+More mode, spell check, temp convert, world switching, show tags, input height, console theme, GUI theme, ZWJ, ANSI music, TLS proxy
 
 ### Web Settings (`/web`)
 WebSocket (secure/non-secure), HTTP/HTTPS, TLS cert/key, allow list
@@ -164,7 +164,11 @@ WebSocket (secure/non-secure), HTTP/HTTPS, TLS cert/key, allow list
 Browser page for editing the colour variables in `~/.clay/theme.dat` (background, foreground,
 semantic, UI elements, ANSI palette), with a live Clay mockup preview.
 
-- **Separator Bar**: chooses how the console (TUI) separator bar is drawn.
+- **Separator Bar**: chooses how the console (TUI) separator bar is drawn. The same
+  setting is **Separator Style** in every interface's Settings (console `/setup`, web,
+  native GUI): one global value, default Web. It is the look of TF's status line too,
+  in every interface, once a script has changed it; going from TinyFugue back to Web
+  resets TF's status line (layout and `status_*` variables) to Clay's bar.
   - **Web Coloring** (default): the bar's layout with the underscores replaced by spaces,
     drawn on the `status_bar.bg` colour the web interface's status bar uses, so a fresh
     install matches the web/GUI look.

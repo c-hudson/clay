@@ -130,7 +130,7 @@ cycling too, so Clay spends the redundant pair on its own cycling instead.
 - Buttons have highlighted shortcut letters (the actual letter varies by popup and button - e.g. the World Selector's Add/Edit/Delete/Cancel/Connect buttons are `A`/`E`/`D`/`C`/`O`)
 - Popups size dynamically based on content
 
-### Mouse Controls (when Console Mouse enabled in /setup, default: on)
+### Mouse Controls (console popups; the console takes the mouse only in a popup or a shell world)
 - Left click on popup buttons to activate them
 - Left click on popup fields to select and edit/toggle them
 - Left click on list items to select them

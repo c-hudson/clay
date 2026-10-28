@@ -486,7 +486,6 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     for (key, value) in &app.settings.text_reveal_profiles {
         writeln!(file, "text_reveal.{key}={}", value.name())?;
     }
-    writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
     writeln!(file, "keyboard_always_visible={}", app.settings.keyboard_always_visible)?;
@@ -1353,9 +1352,8 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                             app.settings.text_reveal_profiles.insert(key.to_string(), TextReveal::from_name(value));
                         }
                     }
-                    "mouse_enabled" => {
-                        app.settings.mouse_enabled = value == "true";
-                    }
+                    // Legacy: Console Mouse is gone, the console always takes the mouse
+                    "mouse_enabled" => {}
                     "zwj_enabled" => {
                         app.settings.zwj_enabled = value == "true";
                     }
@@ -2157,6 +2155,25 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     save_reload_state_to(app, &mut file)
 }
 
+/// The reload state's archive flags for a line: `a` for an archive block's line, `w<n>`
+/// for the archive's own number. See `save_reload_state_to`.
+fn push_archive_flags(flags: &mut String, line: &OutputLine) {
+    if line.from_archive {
+        flags.push('a');
+    }
+    if let Some(w) = line.archive_seq {
+        flags.push('w');
+        flags.push_str(&w.to_string());
+    }
+}
+
+/// The `w<n>` flag `push_archive_flags` wrote, if any.
+fn archive_seq_flag(flags: &str) -> Option<i64> {
+    let rest = &flags[flags.find('w')? + 1..];
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 /// Serializing half of `save_reload_state`, split from the file creation so the emitted
 /// format can be asserted in a test — the caller writes to a fixed `~/.clay` path that a
 /// unit test must not touch, and a format field silently going missing here is invisible to
@@ -2242,7 +2259,6 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     for (key, value) in &app.settings.text_reveal_profiles {
         writeln!(file, "text_reveal.{key}={}", value.name())?;
     }
-    writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
     writeln!(file, "keyboard_always_visible={}", app.settings.keyboard_always_visible)?;
@@ -2604,7 +2620,11 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     // already been on somebody's screen and can never be claimed as ▶ again). `display_id`
     // is deliberately NOT persisted: a reload has no live clients, so every marker restores
     // as unowned, and an unviewed line is simply re-claimable by whoever displays it first.
-    // h, W, L, G: the line's place in TF's history (`LineHistory::flags`).
+    // h, W, L, G: the line's place in TF's history (`LineHistory::flags`). a = from_archive
+    // (a block the console's Page Up read from scrollback.db: it must stay local after the
+    // reload, or its text goes to every client as live output), w<n> = archive_seq (the
+    // archive's own number for the line, which is where Page Up and a client's
+    // RequestHistory cut the archive). An older build ignores both.
     for (idx, world) in app.worlds.iter().enumerate() {
         writeln!(file)?;
         writeln!(file, "[output:{}]", idx)?;
@@ -2616,6 +2636,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             if line.is_input { flags.push('i'); }
             if line.viewed { flags.push('v'); }
             flags.push_str(&line.hist.flags());
+            push_archive_flags(&mut flags, line);
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -2628,6 +2649,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             if line.is_input { flags.push('i'); }
             if line.viewed { flags.push('v'); }
             flags.push_str(&line.hist.flags());
+            push_archive_flags(&mut flags, line);
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -2839,7 +2861,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     let from_server = flags.contains('s');
                     let gagged = flags.contains('g');
                     let is_input = flags.contains('i');
-                    return OutputLine { archive_seq: None,
+                    return OutputLine { archive_seq: archive_seq_flag(flags),
                         text,
                         timestamp,
                         from_server,
@@ -2847,7 +2869,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         is_input,
                         seq,
                         highlight_color: None,
-                        from_archive: false,
+                        from_archive: flags.contains('a'),
                         archive_sourced: false,
                         viewed: flags.contains('v'),
                         display_id: None,
@@ -3285,9 +3307,8 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             app.settings.text_reveal_profiles.insert(key.to_string(), TextReveal::from_name(value));
                         }
                     }
-                    "mouse_enabled" => {
-                        app.settings.mouse_enabled = value == "true";
-                    }
+                    // Legacy: Console Mouse is gone, the console always takes the mouse
+                    "mouse_enabled" => {}
                     "zwj_enabled" => {
                         app.settings.zwj_enabled = value == "true";
                     }
@@ -3898,7 +3919,6 @@ mod tests {
             tls_proxy_enabled: true,           // default: false
             editor_side: EditorSide::Right,    // default: Left
             text_reveal: TextReveal::Fast,     // default: Off
-            mouse_enabled: false,              // default: true
             zwj_enabled: true,                 // default: false
             new_line_indicator: true,             // default: false
             tts_mode: crate::tts::TtsMode::Edge,  // default: Off
@@ -4038,7 +4058,6 @@ mod tests {
         assert_eq!(a.tls_proxy_enabled, b.tls_proxy_enabled, "{context}: tls_proxy_enabled");
         assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
         assert_eq!(a.text_reveal, b.text_reveal, "{context}: text_reveal");
-        assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
         assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
         assert_eq!(a.tts_mode, b.tts_mode, "{context}: tts_mode");
@@ -5378,7 +5397,6 @@ pattern=foo
         assert_ne!(non_default.tls_proxy_enabled, default.tls_proxy_enabled, "tls_proxy_enabled should differ");
         assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
         assert_ne!(non_default.text_reveal, default.text_reveal, "text_reveal should differ");
-        assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
         assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
         assert_ne!(non_default.tts_mode, default.tts_mode, "tts_mode should differ");

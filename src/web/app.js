@@ -307,6 +307,9 @@
         let prevTs = null;
         for (const line of lines) {
             if (!line) continue;
+            // Read from the archive on demand (HistoryLines): seq-less, older than
+            // everything, never on the wire as from_archive. Says nothing either way.
+            if (line._archive) continue;
             // Direct evidence: the server marked this line as archived. Only a pre-1.5.23
             // server ever put one on the wire.
             if (line.from_archive) return true;
@@ -382,10 +385,26 @@
         return add;
     }
 
+    // How many lines at the front of a world's buffer were read from the archive on demand
+    // (HistoryLines): always the oldest, and nothing with a seq goes above them.
+    function archiveLead(world) {
+        const lines = world.output_lines || [];
+        let n = 0;
+        while (n < lines.length && lines[n] && lines[n]._archive) n++;
+        return n;
+    }
+
+    // Older live lines put in front of the live lines held: after the archive lines.
+    function prependLive(world, lineObjs) {
+        if (!lineObjs.length) return;
+        const at = archiveLead(world);
+        world.output_lines.splice(at, 0, ...lineObjs);
+    }
+
     function insertLinesBySeq(world, newLineObjs) {
         if (newLineObjs.length === 0) return;
         const firstSeq = newLineObjs[0].seq;
-        let insertAt = 0;
+        let insertAt = archiveLead(world);
         for (let i = world.output_lines.length - 1; i >= 0; i--) {
             const existing = world.output_lines[i];
             // Same "real seq" predicate as every other seq walk here (`!== false` plus a
@@ -394,7 +413,7 @@
             // requiring `=== true` treated a whole restored buffer as seq-less, so a
             // recovered gap-fill batch was spliced in at index 0 - above all of history.
             if (existing && existing._has_real_seq !== false && typeof existing.seq === 'number' && existing.seq < firstSeq) {
-                insertAt = i + 1;
+                insertAt = Math.max(insertAt, i + 1);
                 break;
             }
         }
@@ -704,6 +723,7 @@
         setupTabsSelect: document.getElementById('setup-tabs-select'),
         setupIconBarSelect: document.getElementById('setup-iconbar-select'),
         setupPictureHostSelect: document.getElementById('setup-picture-host-select'),
+        setupSeparatorStyleSelect: document.getElementById('setup-separator-style-select'),
         setupTextRevealSelect: document.getElementById('setup-text-reveal-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
@@ -904,6 +924,9 @@
     var serverExpandsLine = false;
     // The server takes PictureUpload (InitialState.picture_upload): Import Picture works.
     var serverPictureUpload = false;
+    // The server takes RequestHistory (InitialState.history_on_demand); an older one would
+    // close the connection on it.
+    var serverHistoryOnDemand = false;
     let pendingReconnectCommand = null;  // Command to resend after reconnect
     // T1.12/D3: the world to resend to is remembered by NAME, not index. Indices
     // shift across a reconnect exactly like the InitialState focus resolution below
@@ -1507,6 +1530,7 @@
     let setupTabsMode = 'none';
     let setupIconBarMode = 'app_tablet';
     let setupPictureHost = 'catbox';
+    let setupSeparatorStyle = 'web';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
     let setupKeyboardAlwaysVisible = true;
@@ -1530,7 +1554,7 @@
     // Search popup state (F5)
     let searchPopupOpen = false;
     let searchText = '';
-    let searchMatchIndices = [];  // indices into output_lines that match
+    let searchMatchIndices = [];  // the output_lines objects that match (an index goes stale when older history is put in front)
     let searchCurrentPos = -1;    // which match is currently shown at bottom
 
     // Emoji picker popup state (Esc-e, EMOJI-PICKER-ROADMAP.md Step 7; navigation
@@ -1730,6 +1754,10 @@
 
     // Current theme values (synced from server)
     let consoleTheme = 'dark';
+    // The console's separator-bar style ('web' | 'tinyfugue'): one global setting that
+    // every interface's Settings shows (only a console's bar changes). '' = a server
+    // from before it was on the wire, which a save then leaves alone.
+    let separatorStyle = '';
     let guiTheme = 'dark';
 
     // Menu state
@@ -2768,6 +2796,8 @@
 
     // Check if scrolled to bottom
     function isAtBottom() {
+        // A window slid up into history (setRenderRange) doesn't draw the bottom at all.
+        if (renderSlid()) return false;
         const container = elements.outputContainer;
         return container.scrollHeight - container.scrollTop <= container.clientHeight + 5;
     }
@@ -3093,6 +3123,12 @@
         // against whatever new state exists after reconnecting.
         for (const id of Array.from(pendingScrollbackRequests.keys())) {
             resolveScrollbackRequest(id);
+        }
+        for (const w of worlds) {
+            if (w && w._history && w._history.inflight) {
+                clearTimeout(w._history.inflight.timer);
+                w._history.inflight = null;
+            }
         }
 
         if (reloadReconnect) {
@@ -3722,6 +3758,8 @@
                 serverExpandsLine = !!msg.expand_line;
                 // The server uploads pictures (Import Picture; InitialState.picture_upload).
                 serverPictureUpload = !!msg.picture_upload;
+                // The server answers RequestHistory (older lines on demand, then its archive).
+                serverHistoryOnDemand = !!msg.history_on_demand;
                 // The server's build, for /version's Remote line; from a server before
                 // that field, its version number alone.
                 serverVersionDetail = msg.server_version_detail ||
@@ -4275,6 +4313,10 @@
                     if (msg.settings.console_theme !== undefined) {
                         consoleTheme = msg.settings.console_theme;
                     }
+                    if (msg.settings.separator_style && msg.settings.separator_style !== separatorStyle) {
+                        separatorStyle = msg.settings.separator_style;
+                        renderTfStatus();  // TF's line, if shown, takes the new look
+                    }
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
                         markGuiTheme(guiTheme);
@@ -4556,6 +4598,8 @@
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
                     if (msg.flush) {
                         world.output_lines = [];
+                        world._renderEndLine = null;
+                        world._history = null;
                         world.pendingCount = 0;
                         world.showing_splash = false;
                         worldOutputCache[msg.world_index] = [];
@@ -4956,6 +5000,8 @@
                 // Clear output buffer for this world (splash screen cleared, etc.)
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].output_lines = [];
+                    worlds[msg.world_index]._renderEndLine = null;
+                    worlds[msg.world_index]._history = null;
                     worlds[msg.world_index].pendingCount = 0;
                     worlds[msg.world_index].showing_splash = false;
                     // Clear the cache for this world
@@ -5164,6 +5210,10 @@
                     wsPasswordSet = !!(msg.settings.ws_password_set || msg.settings.ws_password);
                     if (msg.settings.console_theme !== undefined) {
                         consoleTheme = msg.settings.console_theme;
+                    }
+                    if (msg.settings.separator_style && msg.settings.separator_style !== separatorStyle) {
+                        separatorStyle = msg.settings.separator_style;
+                        renderTfStatus();  // TF's line, if shown, takes the new look
                     }
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
@@ -5813,6 +5863,10 @@
                 }
                 break;
 
+            case 'HistoryLines':
+                applyHistoryLines(msg);
+                break;
+
             case 'ScrollbackLines': {
                 if (msg.world_index === undefined || !worlds[msg.world_index]) break;
                 const world = worlds[msg.world_index];
@@ -6025,8 +6079,9 @@
                             }
                             world._max_seq = maxSeenSeq(world);
                         } else {
-                            // Prepend received lines (they are older than what we have)
-                            world.output_lines = msg.lines.concat(world.output_lines);
+                            // Prepend received lines (they are older than what we have; an
+                            // archive block read on demand is older still)
+                            prependLive(world, msg.lines);
 
                             // Deliberately NOT marked into _seenRanges. This branch is the
                             // downward-growing deep-history region (a before_seq request); the
@@ -6088,6 +6143,11 @@
                     // to whichever world is now at the front (may be a different one).
                     if (msg.backfill_complete) {
                         world._backfill_exhausted = true;
+                    }
+                    // The user scrolled to the top while this was out (requestOlderHistory).
+                    if (world._history && world._history.wantAfterPump) {
+                        world._history.wantAfterPump = false;
+                        if (msg.world_index === currentWorldIndex) scheduleRenderWindowCheck();
                     }
                     if (backfillPhase === 2) {
                         const received = visibleLineCount(world);
@@ -6297,7 +6357,7 @@
         if (worldIndex === currentWorldIndex) {
             released.forEach(item => {
                 const markedNew = item.markedNew || lineIsNew(item.obj, worlds[worldIndex]);
-                appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, markedNew, item.fromServer, item.highlightColor, item.archiveSourced);
+                appendNewLine(item.text, item.ts, item.worldIndex, item.obj || item.lineIndex, markedNew, item.fromServer, item.highlightColor, item.archiveSourced);
             });
         }
 
@@ -6332,7 +6392,7 @@
         if (!world.output_lines) return 0;
         let count = 0;
         for (const line of world.output_lines) {
-            if (!line.gagged) count++;
+            if (!line.gagged && !line._archive) count++;
         }
         return count;
     }
@@ -6543,6 +6603,113 @@
         elements.statusScrollbackPct.textContent = pct + '%';
     }
 
+    // ---- On-demand history (RequestHistory / HistoryLines) ----
+    // The user scrolled up past everything this client holds of a world: older lines from
+    // the server's memory, then from its archive - asked for only then, never at connect.
+    // Where the world's history begins is read off the buffer each time (historyPosition),
+    // so nothing has to survive a reconnect but the lines. Archive lines are held without a
+    // seq (`_archive`, `_has_real_seq: false`) and drawn with 🛢️ (archive_sourced): every
+    // seq rule, the cache, the markers and New Only pass them by. `world._history`:
+    // { done, inflight: {id, pos, timer}, wantAfterPump, applied }.
+    const HISTORY_CHUNK = 500;
+    const HISTORY_TIMEOUT_MS = 15000;
+
+    function historyPosition(world) {
+        const lines = world.output_lines || [];
+        const first = lines[0];
+        if (first && first._archive) {
+            return { before_seq: null, before_ts: null, archive_before: { wseq: first._archive.wseq, ts_ms: first._archive.ts_ms } };
+        }
+        const seq = typeof world._oldest_seq === 'number' ? world._oldest_seq : null;
+        let ts = null;
+        if (seq !== null) {
+            for (const l of lines) {
+                if (l && l.seq === seq && l._has_real_seq !== false) { ts = l.ts; break; }
+            }
+        }
+        return { before_seq: seq, before_ts: typeof ts === 'number' ? Math.floor(ts) : null, archive_before: null };
+    }
+
+    function sameHistoryPosition(a, b) {
+        const ca = a.archive_before, cb = b.archive_before;
+        if ((a.before_seq === undefined ? null : a.before_seq) !== (b.before_seq === undefined ? null : b.before_seq)) return false;
+        if (!ca || !cb) return !ca && !cb;
+        return (ca.wseq === undefined ? null : ca.wseq) === (cb.wseq === undefined ? null : cb.wseq) && ca.ts_ms === cb.ts_ms;
+    }
+
+    function requestOlderHistory(worldIndex) {
+        const world = worlds[worldIndex];
+        if (!world || world.shell || !serverHistoryOnDemand || !authenticated) return;
+        const h = world._history || (world._history = { done: false, inflight: null, wantAfterPump: false, applied: false });
+        if (h.done || h.inflight || historyChainLeft <= 0) return;
+        // The startup backfill is still fetching this world: its reply moves where the
+        // history begins. Ask once it lands.
+        for (const entry of pendingScrollbackRequests.values()) {
+            if (entry.worldIndex === worldIndex && entry.kind !== 'gapfill') {
+                h.wantAfterPump = true;
+                return;
+            }
+        }
+        const pos = historyPosition(world);
+        const id = nextScrollbackRequestId++;
+        historyChainLeft--;
+        const timer = setTimeout(function() {
+            if (world._history && world._history.inflight && world._history.inflight.id === id) world._history.inflight = null;
+        }, HISTORY_TIMEOUT_MS);
+        h.inflight = { id: id, pos: pos, timer: timer };
+        if (!send({ type: 'RequestHistory', world_index: worldIndex, count: HISTORY_CHUNK, request_id: id,
+                    before_seq: pos.before_seq, before_ts: pos.before_ts, archive_before: pos.archive_before })) {
+            clearTimeout(timer);
+            h.inflight = null;
+        }
+    }
+
+    // A HistoryLines reply: put in front of the buffer if it still begins where the request
+    // said, the live lines before the live lines held and the archive's before everything.
+    function applyHistoryLines(msg) {
+        const world = worlds[msg.world_index];
+        const h = world && world._history;
+        if (!h || !h.inflight || h.inflight.id !== msg.request_id) return;
+        clearTimeout(h.inflight.timer);
+        const asked = h.inflight.pos;
+        h.inflight = null;
+        if (!sameHistoryPosition(asked, historyPosition(world))) return;
+        h.done = !!msg.done;
+        h.applied = true;
+        const live = (msg.lines || []).filter(l => l && typeof l.seq === 'number' && !l.from_archive
+            && (asked.before_seq === null || l.seq < asked.before_seq));
+        const arch = (msg.archive || []).map(a => ({
+            text: a.text, ts: Math.floor(a.ts_ms / 1000), from_server: true, gagged: !!a.gagged,
+            viewed: true, archive_sourced: true, highlight_color: null, _has_real_seq: false,
+            _archive: { wseq: typeof a.wseq === 'number' ? a.wseq : null, ts_ms: a.ts_ms },
+        }));
+        const added = live.length + arch.length;
+        if (added === 0) return;
+        // Older live lines, as the backfill's: not marked into _seenRanges, which would pull
+        // contiguousFrontier() back to them.
+        prependLive(world, live);
+        world.output_lines.splice(0, 0, ...arch);
+        for (const l of live) {
+            if (typeof world._oldest_seq !== 'number' || l.seq < world._oldest_seq) world._oldest_seq = l.seq;
+        }
+        if (msg.world_index === currentWorldIndex) {
+            if (followBottom) {
+                // A world shorter than the screen: drawn whole, still at the bottom.
+                renderOutput();
+            } else {
+                // Open the window over the new lines (sliding off the newest past the
+                // limit), the reader's line staying put.
+                setRenderRange(world, Math.max(0, renderStartIdx(world) - added), renderEndIdx(world));
+                renderOutput({ preserveScroll: true });
+                // Mostly gagged lines may leave the reader still at the top: the check asks
+                // again, as far as this gesture's chain allows.
+                scheduleRenderWindowCheck();
+            }
+            updateStatusBar();
+        }
+        if (live.length) scheduleWorldCacheSave(msg.world_index);
+    }
+
     // Send a RequestScrollback for the given world. Phase 1 asks for just enough
     // to reach a screenful; phase 2 asks for a round-robin chunk, clamped so the
     // final chunk for a world never overshoots backfillTotalTarget.
@@ -6550,6 +6717,12 @@
         const world = worlds[worldIndex];
         if (!world) {
             // World no longer exists (e.g. removed since being queued), skip it.
+            backfillNextWorld();
+            return;
+        }
+        // The user's scrolling has taken over this world's history (requestOlderHistory):
+        // a backfill now would race it for the same lines.
+        if (world._history && (world._history.inflight || world._history.applied)) {
             backfillNextWorld();
             return;
         }
@@ -6746,7 +6919,9 @@
             const w = worlds[worldIndex];
             if (!w || w.name !== name) return; // world list changed under us
             const cap = Math.max(10, remoteInitialLines || 100);
-            const lines = (w.output_lines || []).slice(-cap);
+            // Never an archive line read on demand: it has no seq to be checked by, and the
+            // archive is still there to read again.
+            const lines = (w.output_lines || []).filter(l => !(l && l._archive)).slice(-cap);
             const maxSeq = w._max_seq || 0;
             // Persist the delivered-seq record too (PROTOCOL-ROADMAP.md Phase C) - without
             // this, a hole known mid-session is silently forgotten across a full reload
@@ -7906,7 +8081,10 @@
         // later starts fresh at RENDER_WINDOW_INITIAL rather than wherever a previous
         // deep-scroll session left it - keeps per-world DOM cost bounded across
         // multiple world visits, not just within one.
-        if (oldWorld) oldWorld._renderWindow = RENDER_WINDOW_INITIAL;
+        if (oldWorld) {
+            oldWorld._renderWindow = RENDER_WINDOW_INITIAL;
+            oldWorld._renderEndLine = null;
+        }
         // TF's %textdiv: shown up to here; the divider of this visit goes with it.
         if (oldWorld) {
             const seen = lastLineSeq(oldWorld);
@@ -8190,7 +8368,7 @@
             const rawLine = typeof lineObj === 'string' ? lineObj : lineObj.text;
             const plain = stripAnsiForFilter(String(rawLine).replace(/[\r\n]+/g, ''));
             if (matchesFilter(plain, searchText)) {
-                searchMatchIndices.push(i);
+                searchMatchIndices.push(lineObj);
             }
         }
         // Start at most recent match
@@ -9123,8 +9301,9 @@
     }
 
     // Get raw ANSI text for given line indices (used by WebView debug selection)
-    // `lineIndices`: the selected lines' data-line-idx numbers, or {idx, seq} objects. A seq
-    // names its line for good; an index goes stale once history is prepended above it.
+    // `lineIndices`: the selected lines' data-line-idx numbers, or {idx, seq, lid} objects. A
+    // lid (lineId) or a seq names its line for good; an index goes stale once history is
+    // prepended above it, and an archive line has no seq.
     window.getDebugSelectionText = function(lineIndices) {
         var world = worlds[currentWorldIndex];
         if (!world) return '';
@@ -9133,7 +9312,11 @@
         for (var i = 0; i < lineIndices.length; i++) {
             var item = lineIndices[i];
             var idx = typeof item === 'object' && item !== null ? item.idx : item;
-            if (typeof item === 'object' && item !== null && typeof item.seq === 'number') {
+            if (typeof item === 'object' && item !== null && typeof item.lid === 'number') {
+                for (var j = 0; j < lines.length; j++) {
+                    if (lineId(lines[j]) === item.lid) { idx = j; break; }
+                }
+            } else if (typeof item === 'object' && item !== null && typeof item.seq === 'number') {
                 for (var k = 0; k < lines.length; k++) {
                     if (lines[k] && lines[k].seq === item.seq && lines[k]._has_real_seq !== false) { idx = k; break; }
                 }
@@ -9186,7 +9369,9 @@
     // remote_initial_lines' own upper clamp, so a --gui/Android client can reach everything
     // it's permitted to hold locally. The ceiling is a deliberate performance bound for
     // WebKitGTK/Android WebView (tested-safe, not arbitrary) - lower RENDER_WINDOW_MAX if a
-    // low-end device struggles, don't remove the mechanism.
+    // low-end device struggles, don't remove the mechanism. Past it the window slides
+    // instead of growing (setRenderRange), so history the client holds or fetches on demand
+    // (requestOlderHistory) stays reachable however far back it goes.
     const RENDER_WINDOW_INITIAL = 500;
     const RENDER_WINDOW_STEP = 500;
     const RENDER_WINDOW_MAX = 5000;
@@ -9219,6 +9404,62 @@
         }
     }
 
+    // The window can slide (on-demand history): reading far enough back that the page would
+    // hold more than RENDER_WINDOW_MAX lines drops the newest from the page instead, and
+    // they come back as the reader scrolls down again. `world._renderEndLine` is the last
+    // line drawn while slid, null when the window ends at the tail (the normal case); it is
+    // a line object, not an index, since older history put in front moves every index.
+    // While slid the page's bottom is not the real bottom: isAtBottom() says no, so nothing
+    // follows or releases there, live lines aren't appended (appendNewLine), and every way
+    // back to the bottom goes through scrollToBottom(), which redraws the tail.
+    function renderEndIdx(world) {
+        const lines = world.output_lines || [];
+        if (world._renderEndLine) {
+            const k = lines.indexOf(world._renderEndLine);
+            if (k >= 0) return k + 1;
+            world._renderEndLine = null;
+        }
+        return lines.length;
+    }
+
+    // Draw lines [s, e) at the next render: at most RENDER_WINDOW_MAX of them, dropping the
+    // newest when there are more.
+    function setRenderRange(world, s, e) {
+        const lines = world.output_lines || [];
+        if (e - s > RENDER_WINDOW_MAX) e = s + RENDER_WINDOW_MAX;
+        world._renderWindow = Math.max(1, e - s);
+        world._renderEndLine = e >= lines.length ? null : lines[e - 1];
+    }
+
+    // The current world's window has slid up off the tail.
+    function renderSlid() {
+        const w = worlds[currentWorldIndex];
+        return !!(w && w._renderEndLine);
+    }
+
+    // The first line the page draws, by index now.
+    function renderStartIdx(world) {
+        const lines = world.output_lines || [];
+        const k = world._renderStartObj ? lines.indexOf(world._renderStartObj) : -1;
+        return k >= 0 ? k : Math.max(0, renderEndIdx(world) - (world._renderWindow || RENDER_WINDOW_INITIAL));
+    }
+
+    // When the user last scrolled the output up (toward older lines), and how many
+    // history requests that gesture may still chain (requestOlderHistory).
+    let lastUserUpScrollAt = -Infinity;
+    let historyChainLeft = 0;
+    const HISTORY_CHAIN_MAX = 3;
+    // The user asked the output to scroll (a key, a button, the wheel, a touch drag): `up`
+    // = toward older lines. A scroll that can't move - at the very top, or at the bottom of
+    // a slid window - fires no scroll event, so the window check runs from here too.
+    function userScrolled(up) {
+        if (up) {
+            lastUserUpScrollAt = performance.now();
+            historyChainLeft = HISTORY_CHAIN_MAX;
+        }
+        scheduleRenderWindowCheck();
+    }
+
     // rAF-throttled: outputContainer.onscroll can fire many times per animation frame, but
     // growing the window triggers a full renderOutput() rebuild, which is not something to
     // do more than once per frame.
@@ -9229,32 +9470,53 @@
         requestAnimationFrame(function() {
             renderWindowCheckScheduled = false;
             const world = worlds[currentWorldIndex];
-            if (!world) return;
+            if (!world || world.shell) return;
             const container = elements.outputContainer;
-            const totalHeld = world.output_lines ? world.output_lines.length : 0;
+            const lines = world.output_lines || [];
             const currentWindow = world._renderWindow || RENDER_WINDOW_INITIAL;
-            const ceiling = Math.min(RENDER_WINDOW_MAX, totalHeld);
+            const st = renderStartIdx(world);
+            const end = renderEndIdx(world);
+            const belowPx = container.scrollHeight - container.scrollTop - container.clientHeight;
+            const nothingToScroll = container.scrollHeight <= container.clientHeight + 5;
             // !followBottom: only a user who has scrolled back into history grows the
             // window. A following view near the top can only be a code-caused drop (a
             // cleared/rebuilding DOM, a reflow) - growing then would add 500 lines above it
-            // and strand it hundreds of lines up (the keyboard/resume jump).
-            if (!followBottom && container.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && currentWindow < ceiling) {
+            // and strand it hundreds of lines up (the keyboard/resume jump). A search match
+            // on display fixes the window's end: no growing or sliding then.
+            if (!followBottom && !searchCutOff() && container.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && st > 0) {
                 noteScrollCause('grow');
-                world._renderWindow = Math.min(currentWindow + RENDER_WINDOW_STEP, ceiling);
-                // Obey the same contract as every other preserveScroll rebuild (both
-                // ScrollbackLines branches already do this; this site was the one that
-                // didn't). appendNewLine() only ever appends, and the at-the-bottom reset
-                // below drops _renderWindow to 500 WITHOUT rebuilding, so by the time a
-                // scrolled-up user trips this trigger the DOM routinely holds thousands of
-                // lines more than the window. Rebuilding at the stepped window clamps that
-                // surplus away, and the lines it drops are the oldest ones — i.e. exactly
-                // what a user scrolling back through history is looking at. Measured on a
-                // real device before this call was added: DOM 2672 -> 1000 in one rebuild,
-                // moving the viewer from MUDLINE 0468 to MUDLINE 1785, 1317 lines from
-                // where they were reading. Grow AFTER the step so the step still widens the
-                // window; this only ever raises it.
-                growRenderWindowToDom(world);
+                // Obey the same contract as every other preserveScroll rebuild: cover every
+                // line the DOM holds. appendNewLine() only ever appends, and the
+                // at-the-bottom reset below drops _renderWindow to 500 WITHOUT rebuilding,
+                // so by the time a scrolled-up user trips this trigger the DOM routinely
+                // holds thousands of lines more than the window. Rebuilding at the stepped
+                // window clamped that surplus away, and the lines it dropped were the oldest
+                // ones — exactly what a user scrolling back through history is looking at
+                // (measured on a real device: DOM 2672 -> 1000 in one rebuild, 1317 lines
+                // from where they were reading). The range runs from a step above the first
+                // line drawn to the last; past RENDER_WINDOW_MAX the window slides, dropping
+                // the newest.
+                setRenderRange(world, Math.max(0, st - RENDER_WINDOW_STEP), end);
                 renderOutput({ preserveScroll: true });
+                updateStatusBar();
+            } else if (world._renderEndLine && !searchCutOff() && belowPx < RENDER_WINDOW_GROW_TRIGGER_PX) {
+                // Slid, and the reader is back near the page's bottom: slide down a step
+                // (all the way back to the tail at the end).
+                noteScrollCause('slide-down');
+                const e = Math.min(lines.length, end + RENDER_WINDOW_STEP);
+                setRenderRange(world, Math.max(st, e - RENDER_WINDOW_MAX), e);
+                renderOutput({ preserveScroll: true });
+                // Back at the tail and at its bottom: following again, as reaching the
+                // bottom any other way is.
+                if (isAtBottom()) followBottom = true;
+                updateStatusBar();
+            } else if (st === 0 && !searchCutOff() && (!followBottom || nothingToScroll)
+                && performance.now() - lastUserUpScrollAt < 1000
+                && container.scrollTop < Math.max(RENDER_WINDOW_GROW_TRIGGER_PX, container.clientHeight * 2)) {
+                // Everything held is drawn and the user is scrolling up near its top:
+                // older lines from the server, then its archive. Only ever after the user's
+                // own scroll up (lastUserUpScrollAt): never at startup, never for live output.
+                requestOlderHistory(currentWorldIndex);
             } else if (isAtBottom() && currentWindow !== RENDER_WINDOW_INITIAL) {
                 // Back at the bottom: reset so the DOM shrinks back down on the next full
                 // render (world switch away and back, resync, etc.) rather than staying
@@ -9917,10 +10179,27 @@
 
     // The line's element. data-seq names the line for good (Debug Selection, the view anchor);
     // data-line-idx goes stale once history is prepended above it.
+    // A number for each line object, for the life of the page: what a drawn line is found by
+    // again after a rebuild. Its seq can't do that for an archive line (it has none) and its
+    // index goes stale when older history is put in front. Kept beside the objects rather
+    // than on them, so it never reaches the IndexedDB cache and comes back clashing.
+    const lineIds = new WeakMap();
+    let nextLineId = 1;
+    function lineId(lineObj) {
+        if (!lineObj || typeof lineObj !== 'object') return null;
+        let id = lineIds.get(lineObj);
+        if (id === undefined) {
+            id = nextLineId++;
+            lineIds.set(lineObj, id);
+        }
+        return id;
+    }
+
     function lineSpanHtml(html, idx, lineObj) {
         const seq = lineObj && typeof lineObj === 'object' && typeof lineObj.seq === 'number'
             && lineObj._has_real_seq !== false ? lineObj.seq : null;
-        return `<span class="line" data-line-idx="${idx}"${seq !== null ? ` data-seq="${seq}"` : ''}>${html}</span>`;
+        const lid = lineId(lineObj);
+        return `<span class="line" data-line-idx="${idx}"${lid !== null ? ` data-lid="${lid}"` : ''}${seq !== null ? ` data-seq="${seq}"` : ''}>${html}</span>`;
     }
 
     // The line at the top of the view and how far its top sits from the view's, so a rebuild
@@ -9937,15 +10216,17 @@
         for (let i = lo; i < kids.length; i++) {
             const el = kids[i];
             if (!el.classList.contains('line')) continue;
-            return { seq: el.dataset.seq, idx: el.dataset.lineIdx, offset: el.getBoundingClientRect().top - top };
+            return { lid: el.dataset.lid, seq: el.dataset.seq, idx: el.dataset.lineIdx, offset: el.getBoundingClientRect().top - top };
         }
         return null;
     }
 
+    // Returns whether the line was found (and the view put back on it).
     function restoreViewAnchor(anchor) {
-        if (!anchor) return;
+        if (!anchor) return false;
         let el = null;
-        if (anchor.seq !== undefined) {
+        if (anchor.lid !== undefined) el = elements.output.querySelector(`.line[data-lid="${anchor.lid}"]`);
+        if (!el && anchor.seq !== undefined) {
             // The same line, or the next one drawn (a filter may have hidden it).
             const want = Number(anchor.seq);
             for (const c of elements.output.querySelectorAll('.line[data-seq]')) {
@@ -9953,9 +10234,10 @@
             }
         }
         if (!el && anchor.idx !== undefined) el = elements.output.querySelector(`.line[data-line-idx="${anchor.idx}"]`);
-        if (!el) return;
+        if (!el) return false;
         const container = elements.outputContainer;
         container.scrollTop += (el.getBoundingClientRect().top - container.getBoundingClientRect().top) - anchor.offset;
+        return true;
     }
 
     // The world the output area last showed: a rebuild of the same world keeps the reader's
@@ -10150,11 +10432,18 @@
             && world === lastRenderedWorld && !searchCutOff();
         const anchor = keepView ? viewAnchor() : null;
 
+        // A rebuild that puts the view at the bottom shows the tail: the window stops
+        // sliding (see setRenderRange).
+        if (!preserveScroll && !keepView) world._renderEndLine = null;
+        const slid = !!world._renderEndLine;
+
         // When search popup is active and has a match, truncate output at the match line
-        // so the matched line appears at the bottom of the output area
-        let searchEndIdx = lines.length;
+        // so the matched line appears at the bottom of the output area. Otherwise the
+        // window ends at the tail, or where it has slid to.
+        let searchEndIdx = renderEndIdx(world);
         if (searchPopupOpen && searchCurrentPos >= 0 && searchCurrentPos < searchMatchIndices.length) {
-            searchEndIdx = searchMatchIndices[searchCurrentPos] + 1;
+            const k = lines.indexOf(searchMatchIndices[searchCurrentPos]);
+            searchEndIdx = k >= 0 ? k + 1 : lines.length;
         }
 
         // Render window: starts at RENDER_WINDOW_INITIAL, grows toward RENDER_WINDOW_MAX as
@@ -10164,6 +10453,7 @@
         // of _renderWindow's current size.
         const renderWindow = world._renderWindow || RENDER_WINDOW_INITIAL;
         const startIdx = Math.max(0, searchEndIdx - renderWindow);
+        world._renderStartObj = lines[startIdx] || null;
 
         // Lines held back by more-mode are already in output_lines but must not be drawn
         // until released: doReleasePending() appends them then, so drawing them here too
@@ -10183,7 +10473,7 @@
         // a frame here (the rest are above it and drawn whole); each ".line" element drawn
         // mid-reveal is tracked for its next frames once the DOM exists (one entry per
         // lineSpanHtml, in order, null when drawn whole).
-        const revealFrom = searchEndIdx - (getVisibleLineCount() * 2 + 10);
+        const revealFrom = slid ? Infinity : searchEndIdx - (getVisibleLineCount() * 2 + 10);
         const revealTracked = [];
         let revealAny = false;
 
@@ -10226,7 +10516,7 @@
             }
             htmlParts.push(lineSpanHtml(html, i, lineObj));
         }
-        if (divider && !dividerPlaced && divider.mode !== 'on') {
+        if (divider && !dividerPlaced && divider.mode !== 'on' && !slid) {
             htmlParts.push(textdivHtml(divider.mode));
         }
 
@@ -10238,16 +10528,19 @@
         // Defense-in-depth: strip any event handler attributes that slipped through
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
         if (preserveScroll) {
-            // Growing the render window while scrolled up must not jump the view - capture
-            // the height before rebuilding and restore scrollTop by the delta, the same
-            // pattern the ScrollbackLines handler already uses for a prepend. Deliberately
-            // does NOT call scrollToBottom() (that's the whole point of preserving position).
+            // Growing or sliding the render window while scrolled up must not jump the view:
+            // the line at the top goes back where it was. Deliberately does NOT call
+            // scrollToBottom() (that's the whole point of preserving position). The height
+            // difference is the fallback only: it is right when lines were added above the
+            // view, but a slide also takes lines away below it.
             const container = elements.outputContainer;
+            const anchor = viewAnchor();
             const oldScrollHeight = container.scrollHeight;
             const oldScrollTop = container.scrollTop;
             elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
-            const newScrollHeight = container.scrollHeight;
-            container.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
+            if (!restoreViewAnchor(anchor)) {
+                container.scrollTop = oldScrollTop + (container.scrollHeight - oldScrollHeight);
+            }
         } else if (keepView) {
             elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
             restoreViewAnchor(anchor);
@@ -10296,11 +10589,18 @@
     // plain until something forced a full re-render (a world switch, a resync) - at which
     // point the same line suddenly gained its background. renderOutput() below is the
     // reference for what a line should look like; keep the two in step.
+    // `lineIndex`: the line's index in output_lines, or the line object itself (more-mode's
+    // held lines pass the object: older history put in front moves every index).
     function appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null, archiveSourced = false) {
         // Strip newlines/carriage returns
         const cleanText = String(text).replace(/[\r\n]+/g, '');
         const world = worlds[worldIndex];
-        const lineObj = world && world.output_lines ? world.output_lines[lineIndex] : null;
+        // The window has slid up into history (setRenderRange): the tail isn't drawn, so
+        // neither is this; sliding back down draws it.
+        if (world && world._renderEndLine && worldIndex === currentWorldIndex) return;
+        const byObject = lineIndex !== null && typeof lineIndex === 'object';
+        const lineObj = byObject ? lineIndex : (world && world.output_lines ? world.output_lines[lineIndex] : null);
+        if (byObject) lineIndex = world && world.output_lines ? world.output_lines.lastIndexOf(lineObj) : -1;
         const gagged = !!(lineObj && typeof lineObj === 'object' && lineObj.gagged);
         // The same rules as renderOutput(): a line it wouldn't draw isn't drawn here either.
         if (!lineIsDrawn(cleanText, gagged)) return;
@@ -11700,6 +12000,15 @@
 
     // Scroll to bottom
     function scrollToBottom() {
+        // Slid up into history: the tail isn't on the page, so draw it (renderOutput comes
+        // back here once it has).
+        if (renderSlid()) {
+            const w = worlds[currentWorldIndex];
+            w._renderEndLine = null;
+            w._renderWindow = RENDER_WINDOW_INITIAL;
+            renderOutput({ toBottom: true });
+            return;
+        }
         followBottom = true;
         elements.outputContainer.scrollTop = elements.outputContainer.scrollHeight;
     }
@@ -12090,7 +12399,9 @@
         const totalPending = pendingTotal();
         if (!isAtBottom() && !scrollRafPending) {
             const container = elements.outputContainer;
-            const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeightPx());
+            let linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeightPx());
+            // Slid up into history: the lines below the page count too.
+            if (world && world._renderEndLine) linesFromBottom += (world.output_lines || []).length - renderEndIdx(world);
             elements.moreLabel.textContent = 'History';
             elements.moreCount.textContent = formatCount(linesFromBottom);
             elements.statusMore.style.display = '';
@@ -12234,17 +12545,24 @@
         if (!view) {
             if (bar.classList.contains('tf-status-on')) {
                 bar.classList.remove('tf-status-on');
+                bar.classList.remove('tf-status-tinyfugue');
                 box.style.display = 'none';
                 box.innerHTML = '';
             }
             return;
         }
         bar.classList.add('tf-status-on');
+        // The Separator Style's look (user ruling 2026-10-28): TinyFugue pads with '_' on
+        // the page background, Web with spaces on the bar's colour; a %status_pad the
+        // script set (view.pad, else empty) is used in either. '' = an older server: Web.
+        const tinyfugue = separatorStyle === 'tinyfugue';
+        bar.classList.toggle('tf-status-tinyfugue', tinyfugue);
+        const pad = view.pad || (tinyfugue ? '_' : ' ');
         box.style.display = '';
         const cols = tfStatusColumns(box);
         let html = '';
         for (const cells of (view.rows || [])) {
-            html += '<div class="tf-status-row">' + parseAnsi(layoutTfStatusRow(cells, cols, view.pad, view.attr)) + '</div>';
+            html += '<div class="tf-status-row">' + parseAnsi(layoutTfStatusRow(cells, cols, pad, view.attr)) + '</div>';
         }
         box.innerHTML = sanitizeHtml(html);
     }
@@ -13953,6 +14271,7 @@
         setupTabsMode = tabsMode;
         setupIconBarMode = iconBarMode;
         setupPictureHost = pictureHost || 'catbox';
+        setupSeparatorStyle = separatorStyle || 'web';
         setupTextReveal = textReveal || 'off';
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
@@ -14078,6 +14397,10 @@
         if (elements.setupPictureHostSelect) {
             elements.setupPictureHostSelect.value = setupPictureHost;
             updateCustomDropdown(elements.setupPictureHostSelect);
+        }
+        if (elements.setupSeparatorStyleSelect) {
+            elements.setupSeparatorStyleSelect.value = setupSeparatorStyle;
+            updateCustomDropdown(elements.setupSeparatorStyleSelect);
         }
         if (elements.setupTextRevealSelect) {
             showTextRevealChoice(elements.setupTextRevealSelect, setupTextReveal);
@@ -14218,6 +14541,9 @@
             icon_bar: iconBarMode,
             // null = unchanged (a server from before Import Picture sent none).
             picture_host: pictureHost || null,
+            // The console's bar, one global setting; null = unchanged (an older server
+            // sent none).
+            separator_style: separatorStyle || null,
             // This page's own Text Reveal under its key; null = unchanged (a server from
             // before the effect sent none).
             text_reveal_profile: textRevealSynced ? { key: fontProfileKey, value: textReveal } : null,
@@ -14360,6 +14686,7 @@
         applyTabsMode(setupTabsMode);
         applyIconBarMode(setupIconBarMode);
         if (pictureHost) pictureHost = setupPictureHost;
+        if (separatorStyle) separatorStyle = setupSeparatorStyle;
         textReveal = setupTextReveal;
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
@@ -16676,6 +17003,7 @@
                 const rows = Math.max(1, Math.abs(n));
                 const amount = (pgH - pgLH) * rows;
                 elements.outputContainer.scrollBy(0, n >= 0 ? -amount : amount);
+                userScrolled(n >= 0);
                 return true;
             }
             case 'scroll_page_down': {
@@ -16686,6 +17014,7 @@
                 const rows = Math.max(1, Math.abs(n));
                 const amount = (pgH - pgLH) * rows;
                 elements.outputContainer.scrollBy(0, n >= 0 ? amount : -amount);
+                userScrolled(n < 0);
                 if (isAtBottom()) {
                     if (pendingTotal() === 0) {
                         moreNow().paused = false;
@@ -16719,6 +17048,7 @@
                 } else {
                     elements.outputContainer.scrollBy(0, -halfPage);
                 }
+                userScrolled(n < 0);
                 return true;
             }
             case 'scroll_half_page_back': {
@@ -16726,6 +17056,7 @@
                 const n = takeKbnum();
                 const halfPage = Math.floor(elements.outputContainer.clientHeight / 2) * Math.max(1, Math.abs(n));
                 elements.outputContainer.scrollBy(0, n >= 0 ? -halfPage : halfPage);
+                userScrolled(n >= 0);
                 return true;
             }
             // TF LINE/LINEBACK: scroll by exactly one output line, kbnum-aware.
@@ -16734,6 +17065,7 @@
                 const n = takeKbnum();
                 const amount = lineHeightPx() * Math.max(1, Math.abs(n));
                 elements.outputContainer.scrollBy(0, n >= 0 ? amount : -amount);
+                userScrolled(n < 0);
                 return true;
             }
             case 'scroll_line_back': {
@@ -16741,6 +17073,7 @@
                 const n = takeKbnum();
                 const amount = lineHeightPx() * Math.max(1, Math.abs(n));
                 elements.outputContainer.scrollBy(0, n >= 0 ? -amount : amount);
+                userScrolled(n >= 0);
                 return true;
             }
             case 'flush_output':
@@ -17734,12 +18067,15 @@
             const container = elements.outputContainer;
             const pageHeight = container.clientHeight * 0.9;
             container.scrollTop = Math.max(0, container.scrollTop - pageHeight);
+            userScrolled(true);
             updateStatusBar();
         }
         function handlePgDn() {
             noteUserScrollIntent();
             const container = elements.outputContainer;
-            if (pendingTotal() > 0) {
+            userScrolled(false);
+            // Slid up into history: held output is released at the tail, not here.
+            if (pendingTotal() > 0 && !renderSlid()) {
                 releaseScreenful();
             } else {
                 const pageHeight = container.clientHeight * 0.9;
@@ -17879,6 +18215,8 @@
             }
             if (movedUp && userScrollRecent()) {
                 followBottom = false;
+                lastUserUpScrollAt = performance.now();
+                historyChainLeft = HISTORY_CHAIN_MAX;
                 return;
             }
             if (followBottom) {
@@ -17956,6 +18294,10 @@
             // the same direction that scrolls toward the newest output.
             const dy = lastTouchY - y;
             lastTouchY = y;
+            // A drag toward older lines at the very top, or toward newer ones at the bottom
+            // of a slid window, moves nothing and fires no scroll event.
+            if (dy < 0 && elements.outputContainer.scrollTop <= 0) userScrolled(true);
+            else if (dy > 0 && renderSlid()) userScrolled(false);
             if (dy <= 0 || !canRevealPending()) return;
             revealAccumPx += dy;
             // Suppress the overscroll glow / rubber-band while we're consuming the gesture.
@@ -17979,6 +18321,10 @@
                 return;
             }
             const dy = wheelDeltaToPx(e);
+            // As for a touch drag: at the very top, or the bottom of a slid window, the
+            // wheel moves nothing and fires no scroll event.
+            if (dy < 0 && elements.outputContainer.scrollTop <= 0) userScrolled(true);
+            else if (dy > 0 && renderSlid()) userScrolled(false);
             if (dy <= 0 || !canRevealPending()) return;
             revealAccumPx += dy;
             e.preventDefault();
@@ -19164,6 +19510,11 @@
         if (elements.setupPictureHostSelect) {
             elements.setupPictureHostSelect.onchange = function() {
                 setupPictureHost = this.value;
+            };
+        }
+        if (elements.setupSeparatorStyleSelect) {
+            elements.setupSeparatorStyleSelect.onchange = function() {
+                setupSeparatorStyle = this.value;
             };
         }
         if (elements.setupTextRevealSelect) {

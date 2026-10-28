@@ -212,6 +212,7 @@ mod tests {
             archive_sourced: false,
             from_archive: false,
             scrollback: false,
+            archive: None,
         }
     }
 

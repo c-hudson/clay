@@ -9,6 +9,8 @@
 //! `evaluate` turns the fields into text for a world, and each interface lays the
 //! rows out to its own width with `layout_row` (app.js has a port of it).
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
@@ -182,12 +184,16 @@ pub struct StatusLayout {
     /// A script has changed the status area (a status command, or setting one of its
     /// variables): from then on it is drawn in place of Clay's own bar.
     pub customized: bool,
+    /// The `status_*` variables a user or script assigned (the seeded defaults don't
+    /// count): an interface then knows %status_pad was the script's choice rather than
+    /// TF's default, and `reset_to_clay` knows what to put back. `/unset` takes one out.
+    pub set_vars: BTreeSet<String>,
 }
 
 impl StatusLayout {
     /// TF's: its default row 0.
     pub fn tf_default() -> StatusLayout {
-        StatusLayout { rows: vec![parse_fields(DEFAULT_FIELDS).unwrap_or_default()], customized: false }
+        StatusLayout { rows: vec![parse_fields(DEFAULT_FIELDS).unwrap_or_default()], customized: false, set_vars: BTreeSet::new() }
     }
 
     fn row_mut(&mut self, row: usize) -> &mut Vec<StatusField> {
@@ -294,8 +300,56 @@ pub fn on_assign(engine: &mut TfEngine, name: &str, value: &str) -> Option<Strin
     }
     if name.starts_with("status_") && !name.starts_with("status_std_") && name != "status_field_defaults" {
         engine.status.customized = true;
+        engine.status.set_vars.insert(name.to_string());
     }
     None
+}
+
+/// A `status_*` variable was `/unset` (the caller removed it): it is no longer the
+/// script's choice.
+pub fn on_unset(engine: &mut TfEngine, name: &str) {
+    engine.status.set_vars.remove(name);
+}
+
+/// Separator Style went from TinyFugue back to Web (user ruling 2026-10-28): the status
+/// area is Clay's again. TF's layout goes back to its default, every `status_*` variable a
+/// script set goes back to what a fresh engine has (its seed, or gone), tfstatus.tf's
+/// formats are restored, and the area stops being the script's. %clock_format and the
+/// /status_save'd rows are left alone.
+pub fn reset_to_clay(engine: &mut TfEngine) {
+    let set_vars = std::mem::take(&mut engine.status.set_vars);
+    let seeded = seeded_names();
+    for name in set_vars {
+        if seeded.contains(&name) {
+            continue; // put back below
+        }
+        match super::special_vars::lookup(&name) {
+            Some(var) if var.seed.is_some() => {
+                let seed = var.seed.unwrap_or_default();
+                let value = match var.kind {
+                    super::special_vars::Kind::Int => TfValue::Integer(seed.parse().unwrap_or(0)),
+                    _ => TfValue::String(seed.to_string()),
+                };
+                engine.set_global(&name, value);
+            }
+            _ => {
+                engine.unset_global(&name);
+            }
+        }
+    }
+    for (name, _) in STD_FORMATS {
+        if let Some(value) = engine.get_var(&format!("status_std_{}", name)).cloned() {
+            engine.set_global(&format!("status_{}", name), value);
+        }
+    }
+    engine.status = StatusLayout::tf_default();
+    sync_fields_var(engine);
+}
+
+/// What fills a field out for an interface: %status_pad as a script set it, else the
+/// look's own character (`SeparatorStyle::fill_char`: a space for Web, `_` for TinyFugue).
+pub fn pad_for(view_pad: &str, look: char) -> String {
+    if view_pad.is_empty() { look.to_string() } else { view_pad.to_string() }
 }
 
 /// `-r<N>` and the rest of a status command's arguments.
@@ -550,7 +604,8 @@ pub struct StatusCell {
 #[serde(default)]
 pub struct StatusView {
     pub rows: Vec<Vec<StatusCell>>,
-    /// %status_pad: what fills a field to its width.
+    /// %status_pad, when a script set it (`StatusLayout::set_vars`); empty otherwise, and
+    /// the interface's look decides what fills a field (`pad_for`).
     pub pad: String,
     /// %status_attr, as SGR, over the whole area.
     pub attr: String,
@@ -574,9 +629,14 @@ pub fn evaluate(engine: &mut TfEngine, world: Option<&str>) -> StatusView {
     let _ = engine.end_frame();
     engine.current_world = saved_fg;
     let attr = engine.get_var("status_attr").map(|v| v.to_string_value()).unwrap_or_default();
+    let pad = if engine.status.set_vars.contains("status_pad") {
+        engine.get_var("status_pad").map(|v| v.to_string_value()).unwrap_or_default()
+    } else {
+        String::new()
+    };
     StatusView {
         rows,
-        pad: engine.get_var("status_pad").map(|v| v.to_string_value()).unwrap_or_default(),
+        pad,
         attr: TfAttributes::parse(&attr).map(|a| a.to_sgr()).unwrap_or_default(),
     }
 }
@@ -809,7 +869,7 @@ mod tests {
         engine.set_global("insert", TfValue::String("on".to_string()));
         let view = evaluate(&mut engine, None);
         assert_eq!(view.rows.len(), 1);
-        assert_eq!(view.pad, "_");
+        assert_eq!(view.pad, "", "TF's default pad is the interface's look to choose");
         let texts: Vec<&str> = view.rows[0].iter().map(|c| c.text.as_str()).filter(|t| !t.is_empty()).collect();
         assert_eq!(texts[0], "(no world)");
         assert_eq!(texts.len(), 2, "the world and the clock: {:?}", texts);
@@ -825,7 +885,47 @@ mod tests {
         assert!(row[3].flex);
         assert_eq!(row[3].text, "!Mud", "a world that isn't open is marked, as in TF");
         assert_eq!(engine.current_world, None, "the foreground is put back");
-        assert_eq!(layout_row(row, 20, &view.pad, &view.attr), "HP:\x1b[1m42\x1b[0m___!Mud________");
+        assert_eq!(layout_row(row, 20, "_", &view.attr), "HP:\x1b[1m42\x1b[0m___!Mud________");
+        assert_eq!(pad_for(&view.pad, '_'), "_");
+        assert_eq!(pad_for(".", ' '), ".");
+    }
+
+    /// %status_pad reaches the interfaces only once a script set it, and /unset takes it
+    /// back. Separator Style going from TinyFugue back to Web (`reset_to_clay`, user
+    /// ruling 2026-10-28) puts every status variable a script set back to a fresh engine's
+    /// and the layout to TF's default: Clay's bar again.
+    #[test]
+    fn test_status_pad_is_the_scripts_only_when_set_and_web_resets_it_all() {
+        let mut engine = TfEngine::new();
+        assert_eq!(evaluate(&mut engine, None).pad, "");
+        engine.execute("/set status_pad=.");
+        assert_eq!(evaluate(&mut engine, None).pad, ".");
+        assert!(engine.status.customized);
+        engine.execute("/unset status_pad");
+        assert_eq!(evaluate(&mut engine, None).pad, "");
+        assert!(engine.status.set_vars.is_empty());
+
+        engine.execute("/set status_pad=~");
+        engine.execute("/set status_attr=B");
+        engine.execute("/set status_height=2");
+        engine.execute("/set status_int_world=\"W\"");
+        engine.execute("/set status_attr_int_more=r");
+        engine.execute("/status_add -A@world hp:4");
+        let std_world = engine.get_var("status_std_int_world").cloned();
+        assert_ne!(engine.get_var("status_int_world").cloned(), std_world);
+        assert_eq!(evaluate(&mut engine, None).rows.len(), 2);
+        reset_to_clay(&mut engine);
+        assert!(!engine.status.customized);
+        assert!(engine.status.set_vars.is_empty());
+        assert_eq!(engine.status.rows, StatusLayout::tf_default().rows);
+        assert_eq!(engine.get_var("status_pad").map(|v| v.to_string_value()), Some("_".to_string()), "back to its seed");
+        assert_eq!(engine.get_var("status_height").and_then(|v| v.to_int()), Some(1));
+        assert!(engine.get_var("status_attr").is_none(), "no seed: gone");
+        assert!(engine.get_var("status_attr_int_more").is_none());
+        assert_eq!(engine.get_var("status_int_world").cloned(), std_world, "tfstatus.tf's format again");
+        assert_eq!(engine.get_var("status_fields").map(|v| v.to_string_value()), Some(StatusLayout::tf_default().fields_text(0)));
+        let view = evaluate(&mut engine, None);
+        assert_eq!((view.pad.as_str(), view.attr.as_str(), view.rows.len()), ("", "", 1));
     }
 
     /// layout_row draws as real tf does: fixed widths, the flexible field filling the

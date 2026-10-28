@@ -24,7 +24,7 @@ use crate::{
     WsMessage, WorldStateMsg, TimestampedLine,
     hash_password, hash_with_challenge,
     strip_ansi_codes, local_time_from_epoch,
-    Encoding, Theme, WorldSwitchMode, SpellChecker,
+    Encoding, Theme, WorldSwitchMode, SeparatorStyle, SpellChecker,
     get_version_string, parse_command,
     UpdateSuccess,
     NewPopupAction, WebSettings,
@@ -898,11 +898,12 @@ async fn reconnect_once(
 /// console's worlds, settings and view become the server's again. What belongs to the
 /// console - the input line, its history, an open editor - stays.
 fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSender<WsMessage>, version_mismatch_shown: &mut bool) {
-    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, .. } = msg else {
+    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, .. } = msg else {
         return;
     };
     app.server_expands_line = expand_line;
     app.server_picture_upload = picture_upload;
+    app.server_history_on_demand = history_on_demand;
     app.server_version_detail = crate::server_version_detail(&server_version_detail, &server_version);
     // An open editor is kept by its world's name: the world list is the server's again.
     let notes_world = app.editor.world_index.and_then(|i| app.worlds.get(i)).map(|w| w.name.clone());
@@ -1354,15 +1355,13 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             app.popup_was_visible = any_popup_visible;
 
             // Toggle mouse capture when popup visibility changes
-            if app.settings.mouse_enabled {
-                let want_mouse = any_popup_visible || app.shell_live(app.current_world_index);
-                if want_mouse && !app.mouse_capture_active {
-                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                    app.mouse_capture_active = true;
-                } else if !want_mouse && app.mouse_capture_active {
-                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                    app.mouse_capture_active = false;
-                }
+            let want_mouse = any_popup_visible || app.shell_live(app.current_world_index);
+            if want_mouse && !app.mouse_capture_active {
+                let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                app.mouse_capture_active = true;
+            } else if !want_mouse && app.mouse_capture_active {
+                let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                app.mouse_capture_active = false;
             }
 
             // Handle Ctrl+L terminal reset and redraw request
@@ -1382,7 +1381,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                     crossterm::cursor::MoveTo(0, 0)
                 )?;
                 // Re-enable mouse capture only if a popup is currently visible
-                if app.settings.mouse_enabled && app.has_new_popup() {
+                if app.has_new_popup() {
                     let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
                     app.mouse_capture_active = true;
                 }
@@ -1434,8 +1433,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                 if let Some(Ok(event)) = maybe_event {
                     match event {
                         Event::Mouse(mouse)
-                            if app.settings.mouse_enabled
-                                && !app.has_new_popup()
+                            if !app.has_new_popup()
                                 && (app.input_resize_drag.is_some()
                                     || (matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && app.on_separator_row(mouse.row))) =>
                         {
@@ -1453,7 +1451,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 _ => {}
                             }
                         }
-                        Event::Mouse(mouse) if app.settings.mouse_enabled && !app.has_new_popup() && app.shell_live(app.current_world_index) => {
+                        Event::Mouse(mouse) if !app.has_new_popup() && app.shell_live(app.current_world_index) => {
                             // A live shell world: forward the mouse to the server (it
                             // decides what the program receives). 1-based → 0-based grid.
                             let kind = match mouse.kind {
@@ -1478,7 +1476,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 });
                             }
                         }
-                        Event::Mouse(mouse) if app.settings.mouse_enabled && app.has_new_popup() => {
+                        Event::Mouse(mouse) if app.has_new_popup() => {
                             match mouse.kind {
                                 MouseEventKind::Down(MouseButton::Left) => {
                                     if !handle_popup_mouse_highlight_start(&mut app, mouse.column, mouse.row) {
@@ -1497,27 +1495,21 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 MouseEventKind::Up(MouseButton::Left) => {
                                     handle_popup_mouse_highlight_end(&mut app);
                                 }
-                                MouseEventKind::ScrollUp => {
+                                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                                    let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                                     if let Some(state) = app.popup_manager.current_mut() {
-                                        state.mouse_scroll_up();
+                                        if up { state.mouse_scroll_up() } else { state.mouse_scroll_down() }
                                     }
-                                    // Fast direct render bypassing ratatui
-                                    let tc = app.settings.theme;
-                                    if let Some(state) = app.popup_manager.current() {
-                                        popup::console_renderer::render_popup_content_direct(&mut terminal, state, &tc);
+                                    // Fast direct render bypassing ratatui, for a list, help
+                                    // text or the emoji grid; a field list's selection (/setup)
+                                    // needs the full redraw below.
+                                    if app.popup_manager.current().is_some_and(|s| s.wheel_draws_directly()) {
+                                        let tc = app.settings.theme;
+                                        if let Some(state) = app.popup_manager.current() {
+                                            popup::console_renderer::render_popup_content_direct(&mut terminal, state, &tc);
+                                        }
+                                        continue; // Skip full redraw
                                     }
-                                    continue; // Skip full redraw
-                                }
-                                MouseEventKind::ScrollDown => {
-                                    if let Some(state) = app.popup_manager.current_mut() {
-                                        state.mouse_scroll_down();
-                                    }
-                                    // Fast direct render bypassing ratatui
-                                    let tc = app.settings.theme;
-                                    if let Some(state) = app.popup_manager.current() {
-                                        popup::console_renderer::render_popup_content_direct(&mut terminal, state, &tc);
-                                    }
-                                    continue; // Skip full redraw
                                 }
                                 _ => {}
                             }
@@ -2235,12 +2227,6 @@ pub(crate) fn handle_remote_client_key(
                 // Applied here at once; the master keeps it under this console's own key
                 // (REMOTE_CONSOLE_REVEAL_KEY) in the UpdateGlobalSettings below.
                 app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
-                // Update mouse setting; if disabled, turn off capture immediately
-                app.settings.mouse_enabled = settings.mouse_enabled;
-                if !settings.mouse_enabled && app.mouse_capture_active {
-                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                    app.mouse_capture_active = false;
-                }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_line_indicator = settings.new_line_indicator;
@@ -2248,6 +2234,13 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
                 app.settings.picture_host = crate::picture::PictureService::from_name(&settings.picture_host);
+                // This console draws its own bar, so it follows at once; the server keeps
+                // the setting (and sends it back in GlobalSettingsUpdated).
+                let separator_style = SeparatorStyle::from_name(&settings.separator_style);
+                if app.settings.separator_style != separator_style {
+                    app.settings.separator_style = separator_style;
+                    app.needs_output_redraw = true;
+                }
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
                 app.settings.tts_voice = crate::kokoro::normalize_voice(&settings.tts_voice);
@@ -2302,7 +2295,7 @@ pub(crate) fn handle_remote_client_key(
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     ws_password: String::new(),  // Empty = unchanged (see apply_remote_web_settings)
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
-                    mouse_enabled: app.settings.mouse_enabled,
+                    mouse_enabled: true,  // always on; an older server reads a missing field as off
                     zwj_enabled: app.settings.zwj_enabled,
                     new_line_indicator: app.settings.new_line_indicator,
                     tts_mode: app.settings.tts_mode.name().to_string(),
@@ -2315,6 +2308,7 @@ pub(crate) fn handle_remote_client_key(
                     tabs: app.settings.tabs.name().to_string(),
                     icon_bar: app.settings.icon_bar.name().to_string(),
                     picture_host: Some(app.settings.picture_host.name()),
+                    separator_style: Some(app.settings.separator_style.name().to_string()),
                     // This console's own Text Reveal, kept by the server under its key.
                     text_reveal_profile: Some(crate::websocket::TextRevealProfile {
                         key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string(),
@@ -3179,7 +3173,8 @@ pub(crate) fn dispatch_remote_action(
 
         // Scrollback, kbnum-aware as the master console's (`input_handler::dispatch_action`):
         // N pages, a negative N the other way. A page up that reaches the top asks the server
-        // for as many rows as it moved.
+        // for what is older: its memory, then its archive (`RequestHistory`), or from a
+        // server older than that, as many rows as it moved.
         "scroll_page_up" => {
             let n = app.input.take_kbnum();
             let page = (app.output_height as usize).saturating_sub(2).max(1);
@@ -3192,7 +3187,11 @@ pub(crate) fn dispatch_remote_action(
             // shares that renderer). The old logical-index subtraction ignored wrapping
             // entirely, so a single wrapped paragraph could swallow a whole page.
             app.move_viewport_up(rows);
-            if app.viewport_at_top() {
+            if app.viewport_at_top() && app.server_history_on_demand {
+                if let Some(msg) = app.remote_history_request(app.current_world_index) {
+                    let _ = ws_tx.send(msg);
+                }
+            } else if app.viewport_at_top() {
                 let before_seq = app.current_world().output_lines.first().map(|l| l.seq);
                 // Registered as Backfill (PROTOCOL-ROADMAP.md's seq-drift fix, Step 12b): a
                 // scroll-triggered request must never be misrouted into the gap-fill splice
@@ -3513,7 +3512,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         // field starts blank); a value typed into the popup sets a new one.
         ws_password,
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
-        mouse_enabled: app.settings.mouse_enabled,
+        mouse_enabled: true,  // always on; an older server reads a missing field as off
         zwj_enabled: app.settings.zwj_enabled,
         new_line_indicator: app.settings.new_line_indicator,
         tts_mode: app.settings.tts_mode.name().to_string(),
@@ -3526,6 +3525,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         tabs: app.settings.tabs.name().to_string(),  // unchanged — this function only touches web settings
         icon_bar: app.settings.icon_bar.name().to_string(),  // unchanged — this function only touches web settings
         picture_host: None,
+        separator_style: None,
         text_reveal_profile: None,
         font_profile: None,
     });

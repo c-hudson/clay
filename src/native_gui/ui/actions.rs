@@ -321,6 +321,11 @@ impl ClayView {
     }
 
     fn note_user_scroll(&mut self, rows: isize) {
+        // An upward scroll may reach the top of what's held: the next frame sees whether
+        // it did and asks the server for older lines (`ask_history`).
+        if rows < 0 {
+            self.history_check = true;
+        }
         if rows < 0 && self.more_mode_enabled() && !self.more_paused() {
             self.more_mut().pause();
         }

@@ -2171,16 +2171,9 @@ pub(crate) fn render_splash_centered<'a>(world: &World, visible_height: usize, a
             line.text.clone()
         };
 
-        // Parse ANSI codes and convert to ratatui spans
-        match ansi_to_tui::IntoText::into_text(&padded) {
-            Ok(text) => {
-                for l in text.lines {
-                    lines.push(l);
-                }
-            }
-            Err(_) => {
-                lines.push(Line::raw(padded));
-            }
+        // Its ANSI colours as spans (a reset goes back to the paragraph's own style).
+        for part in padded.split('\n') {
+            lines.push(ansi_line(part, Style::default()));
         }
     }
 
@@ -2305,16 +2298,123 @@ pub(crate) fn build_stats_line_text(entries: &[crate::stats::StatEntry], max_wid
 /// yet) or entries are empty (the world just disconnected and the latch hasn't caught
 /// up to that on this exact frame — better to render a blank reserved row for one
 /// frame than stale text).
+/// ANSI text as ratatui spans, one per style run, starting from `base`: what a reset,
+/// `39` and `49` go back to - the row's own colours, never the terminal's defaults. Only a
+/// CSI `...m` changes the style; every other escape sequence is dropped.
+///
+/// Clay's own, because ansi-to-tui 4 dropped every SGR sequence with two or more
+/// parameters whole (`ESC[96;44m` applied nothing while `ESC[44m` alone worked, so TF's
+/// `status_attr=Cbrightcyan,Cbgblue` showed no colour - user report 2026-10-28; a MUD's
+/// `ESC[1;31m` lost both behind a popup) and turned a reset into `Color::Reset`, which
+/// overrode the Paragraph's base and lost the Web look's bar colour after a field with
+/// its own attributes.
+pub(crate) fn ansi_line(text: &str, base: Style) -> Line<'static> {
+    use crate::tf::attrs::Piece;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = base;
+    let mut run = String::new();
+    for piece in crate::tf::attrs::pieces(text) {
+        match piece {
+            Piece::Char(c) => run.push(c),
+            Piece::Escape(seq) => {
+                let Some(params) = seq.strip_prefix("\x1b[").and_then(|s| s.strip_suffix('m')) else { continue };
+                let next = apply_sgr(style, base, params);
+                if next != style {
+                    if !run.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut run), style));
+                    }
+                    style = next;
+                }
+            }
+        }
+    }
+    if !run.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
+}
+
+/// `style` after the SGR parameters `params` ("1;44", "38;5;208", "" = reset), read as
+/// a terminal reads them.
+fn apply_sgr(mut style: Style, base: Style, params: &str) -> Style {
+    use ratatui::style::Color;
+    let nums: Vec<Option<u16>> =
+        if params.is_empty() { vec![Some(0)] } else { params.split(';').map(|p| p.parse::<u16>().ok()).collect() };
+    let mut k = 0;
+    while k < nums.len() {
+        match nums[k] {
+            Some(0) => style = base,
+            Some(1) => style = style.add_modifier(Modifier::BOLD),
+            Some(2) => style = style.add_modifier(Modifier::DIM),
+            Some(3) => style = style.add_modifier(Modifier::ITALIC),
+            Some(4) => style = style.add_modifier(Modifier::UNDERLINED),
+            Some(5) | Some(6) => style = style.add_modifier(Modifier::SLOW_BLINK),
+            Some(7) => style = style.add_modifier(Modifier::REVERSED),
+            Some(8) => style = style.add_modifier(Modifier::HIDDEN),
+            Some(9) => style = style.add_modifier(Modifier::CROSSED_OUT),
+            Some(22) => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            Some(23) => style = style.remove_modifier(Modifier::ITALIC),
+            Some(24) => style = style.remove_modifier(Modifier::UNDERLINED),
+            Some(25) => style = style.remove_modifier(Modifier::SLOW_BLINK | Modifier::RAPID_BLINK),
+            Some(27) => style = style.remove_modifier(Modifier::REVERSED),
+            Some(28) => style = style.remove_modifier(Modifier::HIDDEN),
+            Some(29) => style = style.remove_modifier(Modifier::CROSSED_OUT),
+            Some(c @ 30..=37) => style.fg = Some(Color::Indexed((c - 30) as u8)),
+            Some(c @ 90..=97) => style.fg = Some(Color::Indexed((c - 90 + 8) as u8)),
+            Some(c @ 40..=47) => style.bg = Some(Color::Indexed((c - 40) as u8)),
+            Some(c @ 100..=107) => style.bg = Some(Color::Indexed((c - 100 + 8) as u8)),
+            Some(39) => style.fg = base.fg,
+            Some(49) => style.bg = base.bg,
+            Some(c @ (38 | 48)) => {
+                let (color, used) = extended_color(&nums[k + 1..]);
+                if let Some(color) = color {
+                    if c == 38 {
+                        style.fg = Some(color);
+                    } else {
+                        style.bg = Some(color);
+                    }
+                }
+                k += used;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    style
+}
+
+/// The colour after a `38`/`48` (`5;n` or `2;r;g;b`) and how many parameters it took.
+fn extended_color(rest: &[Option<u16>]) -> (Option<ratatui::style::Color>, usize) {
+    use ratatui::style::Color;
+    let at = |i: usize| rest.get(i).copied().flatten().filter(|v| *v < 256).map(|v| v as u8);
+    match rest.first().copied().flatten() {
+        Some(5) => (at(1).map(Color::Indexed), 2),
+        Some(2) => match (at(1), at(2), at(3)) {
+            (Some(r), Some(g), Some(b)) => (Some(Color::Rgb(r, g, b)), 4),
+            _ => (None, 4),
+        },
+        _ => (None, 0),
+    }
+}
+
 /// TF's status area (`tf::status`) in place of the separator bar: each row laid out to
-/// the screen's width as TF draws it.
+/// the screen's width as TF draws it, in the Separator Style's look (user ruling
+/// 2026-10-28) - Web on the theme's status-bar colour with spaces between the fields,
+/// TinyFugue on the terminal background with `_`; a %status_pad the script set is used in
+/// either, and %status_attr comes through the row's SGR.
 fn render_tf_status(f: &mut Frame, app: &App, view: &crate::tf::status::StatusView, area: Rect) {
     let theme = app.settings.theme;
-    let base = Style::default().bg(theme.bg()).fg(theme.fg());
+    let look = app.settings.separator_style;
+    let bg = match look {
+        crate::SeparatorStyle::TinyFugue => theme.bg(),
+        crate::SeparatorStyle::Web => app.theme_colors().status_bar_bg.to_ratatui(),
+    };
+    let base = Style::default().bg(bg).fg(theme.fg());
+    let pad = crate::tf::status::pad_for(&view.pad, look.fill_char());
     for (i, cells) in view.rows.iter().enumerate().take(area.height as usize) {
         let row_area = Rect { x: area.x, y: area.y + i as u16, width: area.width, height: 1 };
-        let line = crate::tf::status::layout_row(cells, area.width as usize, &view.pad, &view.attr);
-        let text = ansi_to_tui::IntoText::into_text(&line).unwrap_or_else(|_| Text::raw(crate::util::strip_ansi_codes(&line)));
-        f.render_widget(Paragraph::new(text).style(base), row_area);
+        let line = crate::tf::status::layout_row(cells, area.width as usize, &pad, &view.attr);
+        f.render_widget(Paragraph::new(ansi_line(&line, base)).style(base), row_area);
     }
 }
 
@@ -3002,11 +3102,8 @@ fn prompt_spans(prompt: &str) -> Vec<Span<'static>> {
     if !prompt.contains("\x1b[") {
         return vec![Span::raw(prompt.to_string())];
     }
-    match ansi_to_tui::IntoText::into_text(&prompt) {
-        // Every line's spans on one line: a prompt is drawn on a single row.
-        Ok(text) => text.lines.into_iter().flat_map(|line| line.spans).collect(),
-        Err(_) => vec![Span::raw(prompt.to_string())],
-    }
+    // On one row: a prompt is drawn on a single line.
+    ansi_line(&prompt.replace('\n', ""), Style::default()).spans
 }
 
 /// The last `count` rows of the lines sent from the input area (TF's %cleardone off),

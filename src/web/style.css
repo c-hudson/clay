@@ -478,6 +478,9 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
 /* TF's status area (/help status area), once a script has made it its own: its rows
    take the place of the bar's own indicators; the controls stay. */
 #status-bar.tf-status-on { height: auto; min-height: var(--status-height); }
+/* The TinyFugue look (Settings > Separator Style): TF's rows on the page background, as
+   the console draws them on the terminal's; Web keeps the bar's colour. */
+#status-bar.tf-status-on.tf-status-tinyfugue { background: var(--theme-bg, #121212); }
 #status-bar.tf-status-on > :not(.status-menu-btn):not(.tf-status):not(.status-note-btn):not(.status-font-slider) {
     display: none !important;
 }

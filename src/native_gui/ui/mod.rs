@@ -144,6 +144,9 @@ pub struct ClayView {
     scroll: ScrollHandle,
     /// More-mode per world, by world name (more.rs): the console pages every world.
     more: HashMap<String, MoreMode>,
+    /// The user just scrolled up: the next frame looks whether that reached the top of
+    /// what's held (`ask_history`).
+    history_check: bool,
     /// The text-reveal effect (src/reveal.rs) as the settings and theme have it; None = off.
     reveal: Option<crate::reveal::Reveal>,
     /// The setting is New Only: a switch types on only lines this window hadn't shown.
@@ -260,6 +263,7 @@ impl ClayView {
             style_epoch: 0,
             scroll: ScrollHandle::default(),
             more: HashMap::new(),
+            history_check: false,
             reveal: None,
             reveal_new_only: false,
             reveal_at: HashMap::new(),
@@ -1058,6 +1062,26 @@ impl ClayView {
 
     /// Tell the server how much the output shows (it sizes more-mode, history and a shell
     /// world's PTY by it).
+    /// After a scroll up the user made: within two screens of the top of what this window
+    /// holds of the world, ask the server for what is older - its memory, then its archive
+    /// (`ClientCore::request_history`). Only ever for the user's scroll: live output, a
+    /// world switch and the startup catch-up never ask. A world shorter than the window
+    /// asks too, since nothing there can scroll.
+    fn ask_history(&mut self) {
+        if !std::mem::take(&mut self.history_check) {
+            return;
+        }
+        let near_top = {
+            let scroll = self.scroll.borrow();
+            scroll.rows_above_after_pending() < scroll.view_rows.max(1) * 2
+        };
+        if near_top {
+            let world = self.session.core.current;
+            let fx = self.session.core.request_history(world, Instant::now());
+            let _ = self.session.apply(fx);
+        }
+    }
+
     fn report_view(&mut self) {
         // The rows and font cells the output held when last laid out - measured there, not
         // estimated from the window: a column count from the window's width and a nominal
@@ -1163,6 +1187,7 @@ impl Render for ClayView {
         }
         self.run_later(window, cx);
         self.report_view();
+        self.ask_history();
         // A `/window` takes its main window's, which a Transparency being previewed is on.
         let alpha = self.link.leader.as_ref().and_then(|l| l.upgrade()).map_or_else(|| self.transparency(), |l| l.read(cx).transparency());
         self.opacity.apply(window, alpha);

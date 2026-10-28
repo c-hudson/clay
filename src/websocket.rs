@@ -426,6 +426,11 @@ pub enum WsMessage {
         /// multiuser server says false. `serde(default)` = false.
         #[serde(default)]
         picture_upload: bool,
+        /// `true` = this server takes `RequestHistory` (a client scrolled up past everything
+        /// it holds: older lines from memory, then from the archive). Gated as `other_views`
+        /// is; a multiuser server, which has no archive, says false. `serde(default)` = false.
+        #[serde(default)]
+        history_on_demand: bool,
         /// The emoji picker's curated table, in the compact wire form
         /// `[[ch, name, "kw1 kw2", category_index], ...]` from `emoji::emoji_json()`. The
         /// table is static, so it is sent once per connection here rather than on every
@@ -827,6 +832,8 @@ pub enum WsMessage {
         #[serde(default)]
         ws_password: String,
         tls_proxy_enabled: bool,
+        /// Ignored: Console Mouse is gone. Clients still send `true`, because an older
+        /// server reads a missing field as off and would turn its console's mouse off.
         #[serde(default)]
         mouse_enabled: bool,
         #[serde(default)]
@@ -859,6 +866,12 @@ pub enum WsMessage {
         /// which doesn't know it) = unchanged: a save from it must not reset the setting.
         #[serde(default)]
         picture_host: Option<String>,
+        /// The console's separator-bar style (`SeparatorStyle` name: "web" | "tinyfugue"):
+        /// one global setting that every interface's Settings shows (user ruling
+        /// 2026-10-27), though only a console's bar changes. `None` (an older client) =
+        /// unchanged.
+        #[serde(default)]
+        separator_style: Option<String>,
         /// This client's own Text Reveal (src/reveal.rs): its interface key and the
         /// `TextReveal` name. `None` (an older client, or one that never changed it) =
         /// unchanged. The console's own is never on the wire.
@@ -1164,6 +1177,34 @@ pub enum WsMessage {
     // chunks go in order from offset 0, the last one says so. Sent only to a server whose
     // InitialState.picture_upload says it takes it.
     PictureUpload { id: u64, name: String, size: u64, offset: u64, data: String, last: bool },
+    // (client -> server) The user scrolled up past everything this client holds of a world:
+    // the next `count` older lines, asked for only then (never at connect). Where the client
+    // is comes from its own buffer: `archive_before`, from its oldest archive line, once it
+    // holds any; otherwise `before_seq`/`before_ts` of its oldest live line. Answered with
+    // HistoryLines: memory first, then the archive. Sent only to a server whose
+    // InitialState.history_on_demand says it takes it.
+    RequestHistory {
+        world_index: usize,
+        count: usize,
+        request_id: u64,
+        #[serde(default)] before_seq: Option<u64>,
+        #[serde(default)] before_ts: Option<u64>,
+        #[serde(default)] archive_before: Option<ArchiveCursor>,
+    },
+    // (server -> client) The answer to RequestHistory, its position echoed so a client can
+    // tell whether it still continues the buffer it holds. `lines` are live lines older than
+    // `before_seq` (real seqs, oldest first); `archive` is older still, from scrollback.db
+    // (oldest first, no protocol seq: an archive line must never take part in seq
+    // tracking). `done`: nothing older exists.
+    HistoryLines {
+        world_index: usize,
+        request_id: u64,
+        #[serde(default)] before_seq: Option<u64>,
+        #[serde(default)] archive_before: Option<ArchiveCursor>,
+        #[serde(default)] lines: Vec<TimestampedLine>,
+        #[serde(default)] archive: Vec<ArchiveLine>,
+        #[serde(default)] done: bool,
+    },
     // (server -> client) This many bytes of upload `id` have arrived (one per chunk; the
     // client keeps picture::ACK_WINDOW chunks unacknowledged).
     PictureUploadAck { id: u64, received: u64 },
@@ -1486,6 +1527,27 @@ pub enum ScrollbackDoneReason {
     /// line, so there is nothing to walk; answering immediately stops the client's progress
     /// badge hanging forever waiting on a batch that will never come.
     Unsupported,
+}
+
+/// Where a client's history reaches into the archive: its oldest archive line's durable
+/// sequence (`None` for a row read by timestamp from a pre-migration archive) and time.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveCursor {
+    #[serde(default)]
+    pub wseq: Option<i64>,
+    pub ts_ms: i64,
+}
+
+/// A line read from the scrollback.db archive for a client (`HistoryLines.archive`). It has
+/// no protocol `seq` on purpose: see `HistoryLines`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ArchiveLine {
+    pub text: String,
+    pub ts_ms: i64,
+    #[serde(default)]
+    pub wseq: Option<i64>,
+    #[serde(default)]
+    pub gagged: bool,
 }
 
 /// A line of output with timestamp
@@ -1846,7 +1908,9 @@ pub struct GlobalSettingsMsg {
     pub show_tags: bool,
     pub ansi_music_enabled: bool,
     pub console_theme: String,
-    /// Console separator-bar style ("tinyfugue" | "web") — see SeparatorStyle.
+    /// Console separator-bar style ("tinyfugue" | "web") — see SeparatorStyle. One global
+    /// setting that every interface's Settings shows and sends back as
+    /// `UpdateGlobalSettings.separator_style`. Empty = a server from before it was sent.
     #[serde(default)]
     pub separator_style: String,
     pub gui_theme: String,
@@ -1922,6 +1986,8 @@ pub struct GlobalSettingsMsg {
     pub tls_configured: bool,  // True if TLS cert+key are configured
     #[serde(default)]
     pub tls_proxy_enabled: bool,
+    /// Always `true`: Console Mouse is gone. Still sent, because an older client reads a
+    /// missing field as off (an older SSH console would then ignore the mouse).
     #[serde(default)]
     pub mouse_enabled: bool,
     #[serde(default)]

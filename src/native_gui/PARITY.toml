@@ -330,6 +330,14 @@ feature = "handle ScrollbackLines"
 note = ""
 
 [[item]]
+id = "msg:HistoryLines"
+section = "connection"
+phase = 4
+status = "done"
+feature = "handle HistoryLines"
+note = "older lines (memory, then the archive) put in front of the buffer when the position still matches"
+
+[[item]]
 id = "msg:ServerData"
 section = "output"
 phase = 1
@@ -2592,8 +2600,8 @@ id = "ui:status.tf"
 section = "status"
 phase = 2
 status = "done"
-feature = "TF status rows replace the bar items (tf::status::layout_row)"
-note = ""
+feature = "TF status rows replace the bar items (tf::status::layout_row), in the Separator Style's look: '_' on the output background for TinyFugue, spaces on the bar's colour for Web; a %status_pad the script set wins (status::pad_for)"
+note = "app.js renderTfStatus, tf-status-tinyfugue"
 
 [[item]]
 id = "ui:status.stats"
@@ -2916,6 +2924,14 @@ feature = "the Font tab previews family, size, weight and spacing on the main wi
 note = "app.js previewFontEdit"
 
 [[item]]
+id = "ui:settings.separator_style"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "General > Separator Style (Web | TinyFugue): the console's bar, one global setting shown in every interface's Settings (user ruling 2026-10-27); Save sends UpdateGlobalSettings.separator_style, None from a server that never sent one"
+note = "app.js setupSeparatorStyle"
+
+[[item]]
 id = "ui:dialog.modify_key"
 section = "dialogs"
 phase = 4
@@ -3202,6 +3218,22 @@ phase = 4
 status = "done"
 feature = "handle PictureUploaded"
 note = "Import Picture: the link into the input line at the cursor (Editor::insert_link), or why not as a line"
+
+[[item]]
+id = "wire:RequestHistory"
+section = "wire"
+phase = 4
+status = "done"
+feature = "wire RequestHistory"
+note = "a scroll up past everything held, when InitialState.history_on_demand says the server takes it"
+
+[[item]]
+id = "wire:HistoryLines"
+section = "wire"
+phase = 4
+status = "see"
+feature = "wire HistoryLines"
+note = "handled: see msg:HistoryLines"
 
 [[item]]
 id = "wire:PictureUpload"

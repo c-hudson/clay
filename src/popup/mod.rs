@@ -1408,12 +1408,12 @@ impl PopupState {
     }
 
     /// Move selection to the next/prev FIELD only, clamped at both ends — never onto a
-    /// button, and never wrapping past the first/last field either. Used instead of the
-    /// button-inclusive cycle when `field_list_needs_scroll` is set (popups with more
-    /// scalar fields than fit the screen, e.g. `/setup`, `/world -e`), so Up/Down/the
-    /// mouse wheel stay confined to the field list and only Tab/Shift+Tab reach the
-    /// buttons — matching how a `FieldKind::List` field already keeps arrow/wheel
-    /// navigation confined to itself.
+    /// button, and never wrapping past the first/last field either. The mouse wheel always
+    /// uses it; Up/Down use it instead of the button-inclusive cycle when
+    /// `field_list_needs_scroll` is set (popups with more scalar fields than fit the
+    /// screen, e.g. `/setup`, `/world -e`), so they stay confined to the field list and only
+    /// Tab/Shift+Tab reach the buttons — matching how a `FieldKind::List` field already
+    /// keeps arrow/wheel navigation confined to itself.
     fn select_field_only(&mut self, forward: bool) {
         let elements = self.definition.ordered_elements();
         let field_positions: Vec<usize> = elements.iter()
@@ -2122,12 +2122,11 @@ impl PopupState {
             self.scroll_any_content_up(1);
             return;
         }
-        // No List/ScrollableContent field — for popups with a scrollable top-level field
-        // list (e.g. /setup, /world -e), move the selection up through the fields, same as
-        // pressing Up (see select_field_only).
-        if self.field_list_needs_scroll {
-            self.select_field_only(false);
-        }
+        // No List/ScrollableContent field (e.g. /setup, /world -e): move the selection up
+        // through the fields, never onto a button (see select_field_only). Whether or not the
+        // field list fits: gated on `field_list_needs_scroll`, the wheel did nothing in a
+        // terminal tall enough to show all of /setup.
+        self.select_field_only(false);
     }
 
     /// Handle mouse scroll down: moves list selection or scrolls content
@@ -2147,9 +2146,19 @@ impl PopupState {
             self.scroll_any_content_down(1);
             return;
         }
-        if self.field_list_needs_scroll {
-            self.select_field_only(true);
-        }
+        self.select_field_only(true);
+    }
+
+    /// Whether `render_popup_content_direct` can show what the wheel just moved: a list,
+    /// scrollable content or the emoji grid. A field list's selection (/setup, the world
+    /// editor) needs the full draw, which also scrolls the list to keep it in view - the
+    /// direct render drew nothing for it, so the wheel's moves showed only at the next
+    /// key or line of output.
+    pub fn wheel_draws_directly(&self) -> bool {
+        self.definition.fields.iter().any(|f| matches!(
+            &f.kind,
+            FieldKind::List { .. } | FieldKind::ScrollableContent { .. } | FieldKind::Grid { .. }
+        ))
     }
 
     /// Handle mouse scrollbar click: scroll up by amount (lists or content)
@@ -2708,6 +2717,28 @@ mod tests {
         state.mouse_scroll_up();
         assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
         // Clamps at the top too.
+        state.mouse_scroll_up();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+    }
+
+    /// A field list that fits moves on the wheel too (the terminal tall enough for all of
+    /// /setup used to ignore it), and stays off the buttons.
+    #[test]
+    fn test_mouse_wheel_moves_through_fields_that_fit() {
+        let def = create_test_popup();
+        let mut state = PopupState::new(def);
+        state.open();
+        assert!(!state.field_list_needs_scroll);
+        // The direct render can't show a field list's selection: the console draws it whole.
+        assert!(!state.wheel_draws_directly());
+
+        state.mouse_scroll_down();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_EMAIL)));
+        state.mouse_scroll_down();
+        state.mouse_scroll_down();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+        state.mouse_scroll_up();
+        state.mouse_scroll_up();
         state.mouse_scroll_up();
         assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
     }
