@@ -56,6 +56,8 @@ pub struct OutputSnapshot {
     /// The lines shown, oldest first, each with its `Line::id`.
     pub lines: Vec<(u64, Arc<StyledLine>)>,
     pub background: Rgb,
+    /// The new-text glow's first cell (src/newbg.rs): green, or a Custom scheme's colour.
+    pub new_glow_start: Rgb,
     pub font_size: f32,
     pub fonts: Fonts,
     /// wrapspace: hanging indent of continuation rows, in columns.
@@ -165,14 +167,19 @@ pub struct Scroll {
     /// After the last layout: whole cells of the font across the view.
     pub view_cols: usize,
     /// Rows per line at the current width, font and style, so counting rows below the
-    /// view costs a layout only once per line.
+    /// view costs a layout only once per line. Each count is kept with the styled line it
+    /// was measured from (`RowCount`): a line is re-decorated under the same id when its ▶
+    /// comes or goes, and `▶ ` can move it across the wrap edge. Keyed by the id alone, the
+    /// old count outlived that, the bottom-anchored view built a row the new layout didn't
+    /// have, and indexing it ended the GUI ("index out of bounds: the len is 1 but the index
+    /// is 1" in `prepare`, three times on the user's machine 2026-10-19..27).
     rows_cache: (u32, u32, u64),
-    rows: HashMap<u64, usize>,
+    rows: HashMap<u64, RowCount>,
     /// For the lines not laid out yet, the rows they'll wrap to, counted in columns
     /// (`rows_in_columns`), for the scroll bar's sense of the whole: counting each as one
     /// row put the thumb of a world of wrapped prose far from where the view was, and
-    /// moved it as the drag laid lines out.
-    estimates: HashMap<u64, usize>,
+    /// moved it as the drag laid lines out. Kept the same way as `rows`.
+    estimates: HashMap<u64, RowCount>,
     /// After the last layout: the rows painted, top to bottom, and their height.
     pub hits: Vec<HitRow>,
     pub row_h: f32,
@@ -181,6 +188,36 @@ pub struct Scroll {
 }
 
 pub type ScrollHandle = Rc<RefCell<Scroll>>;
+
+/// A line's row count and the styled line it was counted from. The `Weak` keeps that
+/// line's allocation (not its contents) alive, so a re-decorated line - a new `Arc` - can
+/// never land at the same address and pass for the one counted.
+struct RowCount {
+    of: std::sync::Weak<StyledLine>,
+    rows: usize,
+}
+
+impl RowCount {
+    fn new(of: &Arc<StyledLine>, rows: usize) -> Self {
+        RowCount { of: Arc::downgrade(of), rows }
+    }
+
+    /// The count, if it was taken from this very line.
+    fn for_line(&self, line: &Arc<StyledLine>) -> Option<usize> {
+        std::ptr::eq(self.of.as_ptr(), Arc::as_ptr(line)).then_some(self.rows)
+    }
+}
+
+/// `cache`'s count for line `id` when it was taken from `line`, else `measure`d now and
+/// kept. The one way `prepare` reads both of its row caches.
+fn cached_rows(cache: &mut HashMap<u64, RowCount>, id: u64, line: &Arc<StyledLine>, measure: impl FnOnce() -> usize) -> usize {
+    if let Some(rows) = cache.get(&id).and_then(|c| c.for_line(line)) {
+        return rows;
+    }
+    let rows = measure();
+    cache.insert(id, RowCount::new(line, rows));
+    rows
+}
 
 impl Default for Scroll {
     fn default() -> Self {
@@ -653,19 +690,24 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         st.rows.clear();
         st.estimates.clear();
     }
+    // Lines that left the buffer (or belong to another world) needn't be remembered
+    // forever: past a margin, keep only what this snapshot shows.
+    if st.rows.len() + st.estimates.len() > 4 * n + 8192 {
+        let live: std::collections::HashSet<u64> = snapshot.lines.iter().map(|l| l.0).collect();
+        st.rows.retain(|id, _| live.contains(id));
+        st.estimates.retain(|id, _| live.contains(id));
+    }
 
     // Lines are laid out only as far as the view (and the scroll) needs.
     let mut laid: HashMap<usize, LaidLine> = HashMap::new();
     let rows_of = |i: usize, st: &mut Scroll, laid: &mut HashMap<usize, LaidLine>| -> usize {
-        let id = snapshot.lines[i].0;
-        if let Some(&r) = st.rows.get(&id) {
-            return r;
-        }
-        let l = lay_out(snapshot.lines[i].1.clone(), &snapshot, &metrics, width, window);
-        let r = l.rows.len().max(1);
-        st.rows.insert(id, r);
-        laid.insert(i, l);
-        r
+        let (id, line) = &snapshot.lines[i];
+        cached_rows(&mut st.rows, *id, line, || {
+            let l = lay_out(line.clone(), &snapshot, &metrics, width, window);
+            let r = l.rows.len().max(1);
+            laid.insert(i, l);
+            r
+        })
     };
 
     // Where the view is, worked out against the lines' row counts.
@@ -695,6 +737,7 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     }
     st.view_rows = view_rows;
     st.view_cols = view_cols;
+    crate::crashlog::set_context("view", format!("{view_cols}x{view_rows} follow={} shown={n}", st.follow));
     // Rows in all, for the scroll bar: a line laid out by its rows, one that isn't by
     // its count in columns at the wrap the layout uses.
     let cols = if snapshot.wrap_columns > 0 { view_cols.min(snapshot.wrap_columns) } else { view_cols };
@@ -703,9 +746,9 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         snapshot
             .lines
             .iter()
-            .map(|(id, line)| match rows.get(id) {
-                Some(&r) => r,
-                None => *estimates.entry(*id).or_insert_with(|| rows_in_columns(&line.text, &line.breaks, cols, snapshot.wrapspace)),
+            .map(|(id, line)| match rows.get(id).and_then(|c| c.for_line(line)) {
+                Some(r) => r,
+                None => cached_rows(estimates, *id, line, || rows_in_columns(&line.text, &line.breaks, cols, snapshot.wrapspace)),
             })
             .sum()
     };
@@ -786,6 +829,14 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     }
     let lines: Vec<LaidLine> = order.iter().map(|i| laid.remove(i).expect("laid out")).collect();
     let ids: Vec<u64> = order.iter().map(|&i| snapshot.lines[i].0).collect();
+    // Every pass below indexes a line's rows by `VisibleRow::row`: a row the layout doesn't
+    // have (a count that went stale some way the caches above don't know) is dropped here,
+    // and said once in debug.log, rather than ending the GUI.
+    let before = rows.len();
+    rows.retain(|vr: &VisibleRow| vr.row < lines[vr.line].rows.len());
+    if rows.len() != before {
+        note_dropped_rows(before - rows.len());
+    }
 
     // What each painted row holds, for the mouse.
     let indent = snapshot.wrapspace as f32 * metrics.ch;
@@ -833,6 +884,14 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     Prepared { snapshot, metrics, lines, rows, content, ids, bundled, thumb, frames, reveal_next }
 }
 
+/// Once a session: rows `prepare` had to drop because a line's layout didn't have them.
+fn note_dropped_rows(count: usize) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::debug_log(true, &format!("native-gui: {count} row(s) a line's layout didn't have were skipped (a stale row count)"));
+    }
+}
+
 fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App) {
     window.paint_quad(fill(bounds, hsla(p.snapshot.background)));
     let m = &p.metrics;
@@ -859,6 +918,20 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                     Bounds::new(point(bounds.origin.x, px(vr.top)), size(bounds.size.width, px(m.row))),
                     hsla(bg),
                 ));
+            } else if line.styled.new_glow {
+                // New Indicator's background style (src/newbg.rs): the glow behind the first
+                // cells of every row of a line this window owns, green fading to the theme's
+                // background; a run's own background paints over it below. A /highlight
+                // colour above takes the row instead, as on the console.
+                let to = crate::reveal::Rgb::from_array(p.snapshot.background);
+                let start = crate::reveal::Rgb::from_array(p.snapshot.new_glow_start);
+                for i in 0..crate::newbg::CELLS {
+                    let x = f32::from(p.content.origin.x) + i as f32 * m.ch;
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(x), px(vr.top)), size(px(m.ch), px(m.row))),
+                        hsla(crate::newbg::colour(i, start, to).array()),
+                    ));
+                }
             }
             // The text-reveal effect's frame for this line (src/reveal.rs): a hidden
             // character is left out, a glitch is a random glyph in the accent colour over
@@ -1509,5 +1582,24 @@ mod tests {
         assert!(s.bar_at(498.5, 60.0).is_some(), "2px of grace to its left");
         assert!(s.bar_at(490.0, 60.0).is_none());
         assert!(s.bar_at(504.0, 40.0).is_none() && s.bar_at(504.0, 450.0).is_none(), "not above or below it");
+    }
+
+    /// The crash on the user's machine (2026-10-19, -23, -27): a line counted at 2 rows with
+    /// its ▶, re-decorated without it under the same id, must be counted again - 1 row -
+    /// not answered from the count of the line it was.
+    #[test]
+    fn a_row_count_belongs_to_the_styled_line_it_was_taken_from() {
+        let mut cache: HashMap<u64, RowCount> = HashMap::new();
+        let with_marker = Arc::new(StyledLine { text: "▶ a line that wraps with its marker".into(), ..Default::default() });
+        assert_eq!(cached_rows(&mut cache, 7, &with_marker, || 2), 2);
+        assert_eq!(cached_rows(&mut cache, 7, &with_marker, || panic!("measured again")), 2, "the same line: the kept count");
+        let without = Arc::new(StyledLine { text: "a line that wraps with its marker".into(), ..Default::default() });
+        assert_eq!(cached_rows(&mut cache, 7, &without, || 1), 1, "re-decorated: counted again");
+        // The old line gone, a new one in its place, even if the allocator hands back the
+        // same address: the kept Weak holds that allocation, so it can't.
+        drop(with_marker);
+        let again = Arc::new(StyledLine { text: "x".into(), ..Default::default() });
+        assert_eq!(cached_rows(&mut cache, 7, &again, || 3), 3);
+        assert_eq!(cached_rows(&mut cache, 7, &without, || 5), 5, "the cache holds one count per id: the latest");
     }
 }

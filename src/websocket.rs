@@ -840,6 +840,10 @@ pub enum WsMessage {
         zwj_enabled: bool,
         #[serde(default)]
         new_line_indicator: bool,
+        /// The new-text marker's style (`NewIndicator` name: "none" | "character" |
+        /// "background"). `None` (an older client) = read `new_line_indicator` instead.
+        #[serde(default)]
+        new_indicator: Option<String>,
         #[serde(default)]
         tts_mode: String,
         #[serde(default)]
@@ -1994,6 +1998,10 @@ pub struct GlobalSettingsMsg {
     pub zwj_enabled: bool,
     #[serde(default)]
     pub new_line_indicator: bool,
+    /// The new-text marker's style (`NewIndicator` name); `new_line_indicator` is its bool
+    /// for an older client. Empty = a server from before the styles: use the bool.
+    #[serde(default)]
+    pub new_indicator: String,
     #[serde(default)]
     pub tts_mode: String,
     #[serde(default)]

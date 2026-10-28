@@ -99,8 +99,9 @@ to their defaults, so set them again if you want TF's line back.
 since (`on`), shows one even when nothing arrived (`always`), or takes the old text
 out of view (`clear`) - in the console and in the web, desktop and Android clients.
 Each of those keeps track of what it has shown you, and the divider is gone once you
-switch away. While `%textdiv` is unset, Clay marks new text its own way (the ▶ new
-line indicator, when it's turned on); `/unset textdiv` brings that back.
+switch away. While `%textdiv` is unset, Clay marks new text its own way (Setup's New
+Indicator, when it's turned on: a ▶ in front of each new line, or a green glow behind
+its first characters); `/unset textdiv` brings that back.
 
 ## History
 

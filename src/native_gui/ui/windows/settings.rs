@@ -110,6 +110,12 @@ pub struct SettingsView {
     /// The console's separator bar: one global setting, shown here too (user ruling
     /// 2026-10-27).
     separator: Pick,
+    /// New Indicator's style (`setup::new_indicator_options`); a toggle until 2026-10-28.
+    /// Picking its Custom entry opens the scheme picker (`dialogs::small::GlowScheme`).
+    new_indicator: Pick,
+    /// The New Indicator value before the Custom entry was picked, which the picker's
+    /// Cancel restores.
+    indicator_before: String,
     text_reveal: Pick,
     /// The Text Reveal value before Custom was picked, which the prompt's Cancel restores.
     reveal_before: String,
@@ -202,6 +208,10 @@ impl SettingsView {
             }
         }));
         let advanced = edit.web_font_line_height != 1.2 || edit.web_font_letter_spacing != 0.0 || edit.web_font_word_spacing != 0.0;
+        // New Indicator: picking its Custom entry opens the scheme picker.
+        let indicator_value = crate::NewIndicator::from_wire(&edit.new_indicator, edit.new_line_indicator).name();
+        let new_indicator = Self::indicator_pick(&indicator_value, window, cx);
+        subs.push(cx.subscribe_in(&new_indicator.state, window, |this, _, _: &SelectEvent<Vec<SharedString>>, window, cx| this.new_indicator_changed(window, cx)));
         // Text Reveal: this GUI's own value; picking its Custom entry asks for the number.
         let reveal_value = edit.text_reveal_profiles.get(key).cloned().unwrap_or_else(|| "off".to_string());
         let text_reveal = Self::reveal_pick(&reveal_value, window, cx);
@@ -215,6 +225,8 @@ impl SettingsView {
             icon_bar: Pick::new(&[("none", "None"), ("app_tablet", "App/Tablet"), ("all", "All")], &edit.icon_bar, window, cx),
             picture_host: Pick::new(crate::picture::PictureService::OPTIONS, &edit.picture_host, window, cx),
             separator: Pick::new(crate::SeparatorStyle::OPTIONS, if edit.separator_style.is_empty() { "web" } else { edit.separator_style.as_str() }, window, cx),
+            new_indicator,
+            indicator_before: indicator_value,
             text_reveal,
             reveal_before: reveal_value,
             port_mode: Pick::new(&[("disabled", "Disabled"), ("9000", "9000"), ("custom", "Custom")], port_mode, window, cx),
@@ -255,6 +267,51 @@ impl SettingsView {
         let options = crate::popup::definitions::setup::text_reveal_options(value);
         let options: Vec<(&str, &str)> = options.iter().map(|o| (o.value.as_str(), o.label.as_str())).collect();
         Pick::new(&options, &crate::TextReveal::from_name(value).name(), window, cx)
+    }
+
+    fn indicator_pick(value: &str, window: &mut Window, cx: &mut Context<Self>) -> Pick {
+        let options = crate::popup::definitions::setup::new_indicator_options(value);
+        let options: Vec<(&str, &str)> = options.iter().map(|o| (o.value.as_str(), o.label.as_str())).collect();
+        Pick::new(&options, &crate::NewIndicator::from_name(value).name(), window, cx)
+    }
+
+    /// Put `value` on the New Indicator pick (its Custom entry relabelled), asking nothing.
+    fn set_indicator_value(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = crate::NewIndicator::from_name(value).name();
+        let options = crate::popup::definitions::setup::new_indicator_options(&name);
+        let options: Vec<(&str, &str)> = options.iter().map(|o| (o.value.as_str(), o.label.as_str())).collect();
+        self.new_indicator.replace(&options, &name, window, cx);
+        self.indicator_before = name;
+        cx.notify();
+    }
+
+    /// The user picked a New Indicator entry: the Custom one opens the scheme picker (the
+    /// console's glow_scheme popup, app.js `showGlowSchemeDialog`), whose choice goes on the
+    /// pick, and whose Cancel puts back the entry before.
+    fn new_indicator_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.new_indicator.value(cx);
+        if !crate::NewIndicator::is_custom_name(&value) {
+            self.indicator_before = value;
+            return;
+        }
+        let current = match crate::NewIndicator::from_name(&value) {
+            crate::NewIndicator::Custom(i) => i as usize,
+            _ => 0,
+        };
+        let previous = self.indicator_before.clone();
+        let me = cx.weak_entity();
+        let ok = {
+            let me = me.clone();
+            move |i: usize, window: &mut Window, cx: &mut App| {
+                let _ = me.update(cx, |s, cx| s.set_indicator_value(&crate::NewIndicator::Custom(i as u8).name(), window, cx));
+            }
+        };
+        let cancel = move |window: &mut Window, cx: &mut App| {
+            let _ = me.update(cx, |s, cx| s.set_indicator_value(&previous, window, cx));
+        };
+        let main = self.main.clone();
+        let d = cx.new(|cx| dialogs::small::GlowScheme::new(main, current, Box::new(ok), Box::new(cancel), cx));
+        dialogs::open(self, dialogs::Kind::GlowScheme, d, window, cx);
     }
 
     /// Put `value` on the Text Reveal pick, asking nothing.
@@ -355,6 +412,9 @@ impl SettingsView {
         s.icon_bar = self.icon_bar.value(cx);
         s.picture_host = self.picture_host.value(cx);
         s.separator_style = self.separator.value(cx);
+        // The style by name, and the bool an older server reads (`settings_update`).
+        s.new_indicator = crate::NewIndicator::from_name(&self.new_indicator.value(cx)).name();
+        s.new_line_indicator = crate::NewIndicator::from_name(&s.new_indicator).is_on();
         s.text_reveal_profiles.insert(crate::font_profile::native_key().to_string(), self.text_reveal.value(cx));
         let rows = super::super::input_view::input_height_of(&s).clamp(1, 15);
         super::super::input_view::set_input_height(&mut s, rows);
@@ -478,7 +538,6 @@ impl SettingsView {
         let mut switches: Vec<Toggle> = vec![
             ("More mode", e.more_mode_enabled, |s| s.more_mode_enabled = !s.more_mode_enabled),
             ("TLS Proxy", e.tls_proxy_enabled, |s| s.tls_proxy_enabled = !s.tls_proxy_enabled),
-            ("New Indicator", e.new_line_indicator, |s| s.new_line_indicator = !s.new_line_indicator),
             ("Clear Input on Send", e.clear_input_on_send, |s| s.clear_input_on_send = !s.clear_input_on_send),
             ("Debug", e.debug_enabled, |s| s.debug_enabled = !s.debug_enabled),
             ("Archive Input/Output", e.scrollback_enabled, |s| s.scrollback_enabled = !s.scrollback_enabled),
@@ -505,6 +564,7 @@ impl SettingsView {
             .child(row(k, "Icon Bar", self.icon_bar.view()))
             .child(row(k, "Picture Host", self.picture_host.view()))
             .child(row(k, "Separator Style", self.separator.view()))
+            .child(row(k, "New Indicator", self.new_indicator.view()))
             .child(row(k, "Text Reveal", self.text_reveal.view()));
         // Two cards: the values, then the switches and the remaining choices.
         div()

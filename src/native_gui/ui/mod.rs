@@ -257,7 +257,7 @@ impl ClayView {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             styled: HashMap::new(),
-            decor: DecorOptions { show_tags: false, new_markers: false, temp_convert: false, accent: [0, 0, 0], hover_bg: [0, 0, 0] },
+            decor: DecorOptions { show_tags: false, new_markers: false, new_background: false, temp_convert: false, accent: [0, 0, 0], hover_bg: [0, 0, 0] },
             matcher: ActionMatcher::default(),
             actions_sig: String::new(),
             style_epoch: 0,
@@ -918,7 +918,8 @@ impl ClayView {
         let rgb = |c: &crate::theme::ThemeColor| [c.r, c.g, c.b];
         let decor = DecorOptions {
             show_tags: s.show_tags,
-            new_markers: s.new_line_indicator && s.textdiv.is_empty(),
+            new_markers: crate::NewIndicator::from_wire(&s.new_indicator, s.new_line_indicator) == crate::NewIndicator::Character && s.textdiv.is_empty(),
+            new_background: crate::NewIndicator::from_wire(&s.new_indicator, s.new_line_indicator).glow_start().is_some() && s.textdiv.is_empty(),
             temp_convert: s.temp_convert_enabled,
             accent: rgb(&self.theme.accent),
             hover_bg: rgb(&self.theme.bg_hover),
@@ -1183,7 +1184,28 @@ impl Render for ClayView {
             static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 crate::debug_log(true, &format!("native-gui: first frame {} ms after start", at.elapsed().as_millis()));
+                // The graphics stack is up now, and may have put fatal-signal handlers of
+                // its own in: ours again, in front of (and passing on to) theirs.
+                crate::crashlog::reinstall_fatal_handlers();
             }
+        }
+        // An earlier Clay here that crashed (src/crashlog.rs): said once, in the first world
+        // this window shows once it is online (a line added before InitialState is lost)
+        // and off its splash (which draws no output lines, and whose end flushes them).
+        if !self.is_follower() && self.session.core.is_online() && self.session.core.current_world().is_some_and(|w| !w.showing_splash) {
+            static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                for notice in crate::crashlog::take_notices() {
+                    self.client_line(&notice, cx);
+                }
+            }
+        }
+        // What a crash should say about this window's state (crashlog's CRASH CONTEXT).
+        if let Some(w) = self.session.core.current_world() {
+            crate::crashlog::set_context("world", format!("{:?} lines={}", w.name, w.lines.len()));
+        }
+        if let Some(s) = self.session.core.settings.as_ref() {
+            crate::crashlog::set_context("new_indicator", crate::NewIndicator::from_wire(&s.new_indicator, s.new_line_indicator).name().to_string());
         }
         self.run_later(window, cx);
         self.report_view();
@@ -1229,6 +1251,15 @@ impl Render for ClayView {
                     letter_spacing: self.letter_spacing,
                     word_spacing: self.word_spacing,
                     style_epoch: self.style_epoch,
+                    // The glow's first colour (New Background, or its Custom scheme).
+                    new_glow_start: self
+                        .session
+                        .core
+                        .settings
+                        .as_ref()
+                        .and_then(|s| crate::NewIndicator::from_wire(&s.new_indicator, s.new_line_indicator).glow_start())
+                        .unwrap_or(crate::newbg::GREEN)
+                        .array(),
                     scroll: self.scroll.clone(),
                     selection: self.selection_ranges(),
                     selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],

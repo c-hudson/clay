@@ -25,10 +25,24 @@ pub fn runs_clay() -> bool {
 /// to that file and exit; with `verify` set (`--gui-verify[=SECONDS]`) run the
 /// client headless and check its buffer (both attach, to this machine when no host).
 pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>, ssh: bool) -> std::io::Result<()> {
-    log_crashes();
     // The window's run: what the graphics drivers print goes to debug.log (quiet.rs). With
     // --ssh only once the tunnel is up, since it may ask for a passphrase on the terminal.
     let interactive = snapshot.is_none() && verify.is_none();
+    // Its session in debug.log, and an exit line for however it ends (src/crashlog.rs;
+    // the panic hook is crashlog's too, installed at the top of main). The snapshot and
+    // verify runs are tools, not sessions.
+    if interactive {
+        let mode = match (&target, ssh) {
+            (_, true) => format!("gui over ssh to {}", target.as_deref().unwrap_or("?")),
+            (Some(host), false) => format!("gui attached to {host}"),
+            (None, false) => "gui".to_string(),
+        };
+        crate::crashlog::session(&mode);
+        // Attached, nothing here handles SIGTERM/SIGHUP (a Clay of its own would).
+        if target.is_some() || ssh {
+            crate::crashlog::record_ending_signals();
+        }
+    }
     if interactive && !ssh {
         quiet::capture();
     }
@@ -51,7 +65,7 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
             Ok(t) => t,
             Err(e) => {
                 quiet::terminal(&format!("Error: {e}"));
-                std::process::exit(1);
+                crate::crashlog::exit_process(1, &format!("bad address: {e}"));
             }
         }
     };
@@ -114,7 +128,7 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
     // The windows are closed and the quit's cleanup is done (ui::run's on_app_quit):
     // end here, as the WebView GUI's event loop does, rather than return through
     // main, whose runtime would first wait out any blocking call still running.
-    std::process::exit(0);
+    crate::crashlog::exit_process(0, "quit");
 }
 
 /// `--gui` alone: Clay itself, in this process, as `--web-gui` runs it
@@ -188,7 +202,7 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
 fn fail(message: String) -> ! {
     quiet::terminal(&message);
     crate::debug_log(true, &format!("native-gui: {message}"));
-    std::process::exit(1);
+    crate::crashlog::exit_process(1, "failed to start");
 }
 
 #[cfg(target_os = "macos")]
@@ -209,7 +223,7 @@ fn disable_font_smoothing() {
 fn ssh_target(spec: Option<&str>, runtime: &tokio::runtime::Handle) -> core::net::Target {
     let Some(spec) = spec else {
         eprintln!("Error: --ssh requires --gui=<[user@]host[:clayport[:sshport]]>.");
-        std::process::exit(1);
+        crate::crashlog::exit_process(1, "ssh tunnel failed");
     };
     #[cfg(feature = "ssh-transport")]
     {
@@ -217,7 +231,7 @@ fn ssh_target(spec: Option<&str>, runtime: &tokio::runtime::Handle) -> core::net
             Ok(t) => t,
             Err(e) => {
                 eprintln!("Error: invalid --ssh target: {e}");
-                std::process::exit(1);
+                crate::crashlog::exit_process(1, "ssh tunnel failed");
             }
         };
         let name = format!("ssh:{}@{}:{}", t.user, t.host, t.clay_port);
@@ -225,7 +239,7 @@ fn ssh_target(spec: Option<&str>, runtime: &tokio::runtime::Handle) -> core::net
             Ok(port) => core::net::Target::tunnel(port, name),
             Err(e) => {
                 eprintln!("clay: {e}");
-                std::process::exit(1);
+                crate::crashlog::exit_process(1, "ssh tunnel failed");
             }
         }
     }
@@ -233,20 +247,8 @@ fn ssh_target(spec: Option<&str>, runtime: &tokio::runtime::Handle) -> core::net
     {
         let _ = (spec, runtime);
         eprintln!("clay: --ssh requires the 'ssh-transport' feature.");
-        std::process::exit(1);
+        crate::crashlog::exit_process(1, "ssh tunnel failed");
     }
-}
-
-/// A crash leaves what happened and where in debug.log (the console's crash handler is
-/// set up after the native GUI has taken over, and a window started from a desktop
-/// launcher has no terminal to show the panic on). Background tasks' panics too.
-fn log_crashes() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        crate::debug_log(true, &format!("native-gui CRASH: {info}"));
-        crate::debug_log(true, &format!("BACKTRACE:\n{}", std::backtrace::Backtrace::force_capture()));
-        default_hook(info);
-    }));
 }
 
 /// Linux without a GPU: when Vulkan's only devices are software ones (Mesa's lavapipe,

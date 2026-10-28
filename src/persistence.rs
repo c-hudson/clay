@@ -487,7 +487,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         writeln!(file, "text_reveal.{key}={}", value.name())?;
     }
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
-    writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
+    // The bool first (an older build reads on/off), then the style, which wins here.
+    writeln!(file, "new_line_indicator={}", app.settings.new_indicator.is_on())?;
+    writeln!(file, "new_indicator={}", app.settings.new_indicator.name())?;
     writeln!(file, "keyboard_always_visible={}", app.settings.keyboard_always_visible)?;
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
@@ -911,6 +913,8 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
     let mut dropped_tf_globals: Vec<String> = Vec::new();
     // Whether this file knows the per-interface input heights (see the end).
     let mut split_heights_seen = false;
+    // Whether a `new_indicator=` line was read (then `new_line_indicator=` is ignored).
+    let mut saw_new_indicator = false;
 
     for line in content.lines() {
         let line = line.trim();
@@ -1357,9 +1361,16 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "zwj_enabled" => {
                         app.settings.zwj_enabled = value == "true";
                     }
-                    "new_line_indicator" => {
-                        app.settings.new_line_indicator = value == "true";
+                    // The style by name; the bool is an older build's file (or the line
+                    // before the name in this one's) and only counts while no name was read.
+                    "new_indicator" => {
+                        app.settings.new_indicator = NewIndicator::from_name(value);
+                        saw_new_indicator = true;
                     }
+                    "new_line_indicator" if !saw_new_indicator => {
+                        app.settings.new_indicator = NewIndicator::from_legacy(value == "true");
+                    }
+                    "new_line_indicator" => {}
                     "keyboard_always_visible" => {
                         app.settings.keyboard_always_visible = value == "true";
                     }
@@ -2089,6 +2100,15 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
                 writeln!(file, "slack_channels={}", world.settings.slack_channels)?;
             }
             writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
+            // Notes (escaped as settings.dat's are): the Note editor's `UpdateNote` saves here;
+            // it used to call `save_settings`, which wrote them to settings.dat.
+            if !world.settings.notes.is_empty() {
+                let escaped_notes = world.settings.notes
+                    .replace('\\', "\\\\")
+                    .replace('\n', "\\n")
+                    .replace('=', "\\e");
+                writeln!(file, "notes={}", escaped_notes)?;
+            }
         }
     }
 
@@ -2260,7 +2280,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         writeln!(file, "text_reveal.{key}={}", value.name())?;
     }
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
-    writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
+    // The bool first (an older build reads on/off), then the style, which wins here.
+    writeln!(file, "new_line_indicator={}", app.settings.new_indicator.is_on())?;
+    writeln!(file, "new_indicator={}", app.settings.new_indicator.name())?;
     writeln!(file, "keyboard_always_visible={}", app.settings.keyboard_always_visible)?;
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
@@ -2930,6 +2952,8 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
     }
 
     let mut temp_worlds: Vec<TempWorld> = Vec::new();
+    // Whether a `new_indicator=` line was read (then `new_line_indicator=` is ignored).
+    let mut saw_new_indicator = false;
 
     for line in lines {
         // Check for section headers FIRST (before output/pending line handling)
@@ -3312,9 +3336,16 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "zwj_enabled" => {
                         app.settings.zwj_enabled = value == "true";
                     }
-                    "new_line_indicator" => {
-                        app.settings.new_line_indicator = value == "true";
+                    // The style by name; the bool is an older build's file (or the line
+                    // before the name in this one's) and only counts while no name was read.
+                    "new_indicator" => {
+                        app.settings.new_indicator = NewIndicator::from_name(value);
+                        saw_new_indicator = true;
                     }
+                    "new_line_indicator" if !saw_new_indicator => {
+                        app.settings.new_indicator = NewIndicator::from_legacy(value == "true");
+                    }
+                    "new_line_indicator" => {}
                     "keyboard_always_visible" => {
                         app.settings.keyboard_always_visible = value == "true";
                     }
@@ -3920,7 +3951,7 @@ mod tests {
             editor_side: EditorSide::Right,    // default: Left
             text_reveal: TextReveal::Fast,     // default: Off
             zwj_enabled: true,                 // default: false
-            new_line_indicator: true,             // default: false
+            new_indicator: NewIndicator::Background, // default: None
             tts_mode: crate::tts::TtsMode::Edge,  // default: Off
             tts_speak_mode: crate::tts::TtsSpeakMode::All, // default: All
             tts_voice: "am_michael".to_string(), // default: af_heart
@@ -4059,7 +4090,7 @@ mod tests {
         assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
         assert_eq!(a.text_reveal, b.text_reveal, "{context}: text_reveal");
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
-        assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
+        assert_eq!(a.new_indicator, b.new_indicator, "{context}: new_indicator");
         assert_eq!(a.tts_mode, b.tts_mode, "{context}: tts_mode");
         assert_eq!(a.tts_voice, b.tts_voice, "{context}: tts_voice");
         assert_eq!(a.scrollback_enabled, b.scrollback_enabled, "{context}: scrollback_enabled");
@@ -4464,6 +4495,33 @@ mod tests {
                 "a value that is not byte-identical to the legacy default must be left alone: {customized:?}"
             );
         }
+    }
+
+    /// New Indicator is saved by name beside the bool an older build reads; the name wins
+    /// whichever comes first, and a file with only the bool (an older Clay's, `/import`)
+    /// loads as the character.
+    #[test]
+    fn test_new_indicator_loads_by_name_with_the_legacy_bool_as_a_fallback() {
+        let mut app = App::new();
+        load_settings_from_str(&mut app, "[global]\nnew_line_indicator=true\n");
+        assert_eq!(app.settings.new_indicator, NewIndicator::Character, "an older file's bool");
+        let mut app = App::new();
+        load_settings_from_str(&mut app, "[global]\nnew_line_indicator=true\nnew_indicator=background\n");
+        assert_eq!(app.settings.new_indicator, NewIndicator::Background, "the name after the bool");
+        let mut app = App::new();
+        load_settings_from_str(&mut app, "[global]\nnew_indicator=background\nnew_line_indicator=false\n");
+        assert_eq!(app.settings.new_indicator, NewIndicator::Background, "the name before the bool");
+        let mut app = App::new();
+        load_settings_from_str(&mut app, "[global]\nnew_indicator=none\nnew_line_indicator=true\n");
+        assert_eq!(app.settings.new_indicator, NewIndicator::None, "a name of none is none");
+        // What this build writes: the bool first, then the name.
+        app.settings.new_indicator = NewIndicator::Background;
+        let mut buf = Vec::new();
+        write_settings_dat(&app, &mut buf, false).unwrap();
+        let written = String::from_utf8(buf).unwrap();
+        let bool_at = written.find("new_line_indicator=true\n").expect("the bool, on");
+        let name_at = written.find("new_indicator=background\n").expect("the name");
+        assert!(bool_at < name_at, "the bool is written before the name: {written}");
     }
 
     #[test]
@@ -5398,7 +5456,7 @@ pattern=foo
         assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
         assert_ne!(non_default.text_reveal, default.text_reveal, "text_reveal should differ");
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
-        assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
+        assert_ne!(non_default.new_indicator, default.new_indicator, "new_indicator should differ");
         assert_ne!(non_default.tts_mode, default.tts_mode, "tts_mode should differ");
         assert_ne!(non_default.tts_voice, default.tts_voice, "tts_voice should differ");
         assert_ne!(non_default.scrollback_enabled, default.scrollback_enabled, "scrollback_enabled should differ");

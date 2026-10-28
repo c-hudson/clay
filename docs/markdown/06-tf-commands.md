@@ -172,7 +172,7 @@ Once a script sets `%textdiv`, switching to a world shows TF's divider:
 /set textdiv=always    ...even when nothing new arrived
 /set textdiv=clear     the old text taken out of view instead
 /set textdiv=off       nothing
-/unset textdiv         back to Clay's own ▶ markers
+/unset textdiv         back to Clay's own new-text markers (▶ or the glow)
 ```
 
 The console, the web/GUI/Android client and the SSH console each track what they

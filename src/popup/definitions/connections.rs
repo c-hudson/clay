@@ -92,7 +92,7 @@ pub fn create_connections_popup(connections: &[ConnectionInfo], visible_height: 
             ListItem {
                 id: c.name.clone(),
                 columns,
-                style: ListItemStyle {
+                style: ListItemStyle { swatch: None,
                     is_current: c.is_current,
                     is_connected: c.is_connected,
                     ..Default::default()

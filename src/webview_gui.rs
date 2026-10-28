@@ -940,6 +940,17 @@ fn build_html(params: &WebViewParams) -> String {
         &format!("window.WS_PROTOCOL = '{}';\n        window.CLIENT_VERSION_DETAIL = '{}';",
             params.ws_protocol, crate::version_detail().replace('\\', "\\\\").replace('\'', "\\'")),
     );
+    // An earlier Clay here that crashed (src/crashlog.rs): the page says so once it has a
+    // world (app.js showCrashNotices). JSON is valid JavaScript; `<` is escaped so the text
+    // can't close the script element.
+    let notices = crate::crashlog::take_notices();
+    if !notices.is_empty() {
+        let json = serde_json::to_string(&notices).unwrap_or_else(|_| "[]".to_string()).replace('<', "\\u003c");
+        html = html.replace(
+            &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
+            &format!("window.WS_PROTOCOL = '{}';\n        window.CLAY_CRASH_NOTICES = {};", params.ws_protocol, json),
+        );
+    }
 
     // Inject world lock from env var (set by parent when spawning /window <world>)
     if let Ok(world_name) = std::env::var("CLAY_WINDOW_WORLD") {
@@ -1606,8 +1617,13 @@ fn create_webview_window(
                     // Same as WvEvent::Quit: /quit's cleanup in the Clay this GUI runs,
                     // then exit, which drops every remaining window with the event loop.
                     crate::quit_in_process_clay();
+                    // tao ends the process itself (Windows' ExitProcess runs no atexit).
+                    crate::crashlog::exit_reason("window closed");
+                    crate::crashlog::finish();
                     *control_flow = ControlFlow::Exit;
                 } else if windows.is_empty() {
+                    crate::crashlog::exit_reason("last window closed");
+                    crate::crashlog::finish();
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -1617,6 +1633,8 @@ fn create_webview_window(
                 // router its port back. Attached to another Clay, only a UPnP mapping
                 // (none) is looked at.
                 crate::quit_in_process_clay();
+                crate::crashlog::exit_reason("quit");
+                crate::crashlog::finish();
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(WvEvent::SetOpacity(opacity)) => {
@@ -1675,6 +1693,7 @@ fn create_webview_window(
                             .map(|a| a.as_ptr())
                             .chain(std::iter::once(std::ptr::null()))
                             .collect();
+                        crate::crashlog::replacing("reload");
                         unsafe { libc::execv(c_exe.as_ptr(), c_arg_ptrs.as_ptr()); }
                         // If exec fails, show error in WebView
                         if let Some(wv) = _first_wv {
@@ -1693,7 +1712,7 @@ fn create_webview_window(
                     if let Ok((exe_path, _)) = crate::get_executable_path() {
                         let args: Vec<String> = std::env::args().collect();
                         match std::process::Command::new(&exe_path).args(&args[1..]).spawn() {
-                            Ok(_) => std::process::exit(0),
+                            Ok(_) => crate::crashlog::exit_process(0, "reload"),
                             Err(_) => {
                                 if let Some(wv) = _first_wv {
                                     let _ = wv.evaluate_script(
@@ -1819,6 +1838,8 @@ fn create_webview_window(
                 webviews.remove(&id);
                 forget_popup_window(&mut popup_windows, id, &webviews);
                 if windows.is_empty() {
+                    crate::crashlog::exit_reason("last window closed");
+                    crate::crashlog::finish();
                     *control_flow = ControlFlow::Exit;
                 }
             }

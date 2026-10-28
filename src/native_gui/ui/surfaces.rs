@@ -1063,6 +1063,10 @@ impl ClayView {
                     let msg = WsMessage::McpEditOpen { world_index: 0, reference: "#123.desc".into(), name: "My Room".into(), edit_type: "string-list".into(), content: "A small room with a view.\nThe walls are blue.".into() };
                     self.surface_message(&msg, cx);
                 }
+                "glow-scheme" => {
+                    let d = cx.new(|cx| super::dialogs::small::GlowScheme::new(main, 2, Box::new(|_, _, _| {}), Box::new(|_, _| {}), cx));
+                    dialogs::open(self, dialogs::Kind::GlowScheme, d, window, cx);
+                }
                 "insecure" => {
                     let d = cx.new(|cx| ImportInsecure::new(main, "192.168.1.20:9000".into(), cx));
                     dialogs::open(self, Kind::ImportInsecure, d, window, cx);

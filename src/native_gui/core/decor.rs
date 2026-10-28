@@ -5,7 +5,8 @@
 //! 2. `✨ ` before a line Clay itself wrote;
 //! 3. temperatures converted (while tags are shown and the setting is on);
 //! 4. the text styled (`style::style_line`);
-//! 5. in front: the timestamp (while tags are shown), `▶ ` on a line this client owns,
+//! 5. in front: the timestamp (while tags are shown), `▶ ` on a line this client owns
+//!    (or, with New Background, the line flagged for the glow the output paints),
 //!    `🛢️ ` on archived text;
 //! 6. a `/highlight` colour behind the whole line, or else the F8 action highlight behind
 //!    its text.
@@ -20,8 +21,11 @@ use super::style::{Palette, Rgb, Run, StyleOptions, StyledLine, strip_mud_tag, s
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecorOptions {
     pub show_tags: bool,
-    /// `new_line_indicator` on and no TF `%textdiv` (app.js `nliDrawn`).
+    /// New Indicator is the ▶ character and no TF `%textdiv` (`Settings::nli_prefix`).
     pub new_markers: bool,
+    /// New Indicator is the background glow and no `%textdiv` (`Settings::nli_glow`): the
+    /// line is flagged (`StyledLine::new_glow`) for the output to paint (src/newbg.rs).
+    pub new_background: bool,
     pub temp_convert: bool,
     /// The theme's accent colour (timestamps).
     pub accent: Rgb,
@@ -65,6 +69,7 @@ pub fn decorate(f: &LineFacts, palette: &Palette, style: &StyleOptions, opts: &D
         prefix.push(("▶".into(), NEW_MARKER));
         prefix.push((" ".into(), palette.fg));
     }
+    line.new_glow = opts.new_background && f.is_new;
     if f.from_archive || f.archive_sourced {
         prefix.push(("🛢️ ".into(), palette.fg));
     }
@@ -264,7 +269,7 @@ mod tests {
     }
 
     fn opts() -> DecorOptions {
-        DecorOptions { show_tags: false, new_markers: true, temp_convert: true, accent: [1, 2, 3], hover_bg: [9, 9, 9] }
+        DecorOptions { show_tags: false, new_markers: true, new_background: false, temp_convert: true, accent: [1, 2, 3], hover_bg: [9, 9, 9] }
     }
 
     fn facts(text: &str) -> LineFacts<'_> {
@@ -305,8 +310,20 @@ mod tests {
         let mut f = facts("x");
         f.is_new = true;
         let off = DecorOptions { new_markers: false, ..opts() };
-        assert_eq!(decorate(&f, &p, &StyleOptions::default(), &off).text, "x");
-        assert_eq!(decorate(&f, &p, &StyleOptions::default(), &opts()).text, "▶ x");
+        let none = decorate(&f, &p, &StyleOptions::default(), &off);
+        assert_eq!(none.text, "x");
+        assert!(!none.new_glow);
+        let character = decorate(&f, &p, &StyleOptions::default(), &opts());
+        assert_eq!(character.text, "▶ x");
+        assert!(!character.new_glow, "the character style paints no glow");
+        // New Background: no prefix (nothing to wrap), the line flagged for the glow.
+        let glow = DecorOptions { new_markers: false, new_background: true, ..opts() };
+        let background = decorate(&f, &p, &StyleOptions::default(), &glow);
+        assert_eq!(background.text, "x");
+        assert!(background.new_glow);
+        let mut old = facts("y");
+        old.is_new = false;
+        assert!(!decorate(&old, &p, &StyleOptions::default(), &glow).new_glow, "only a line this client owns");
     }
 
     #[test]

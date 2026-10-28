@@ -832,6 +832,123 @@ impl Render for RecentWorlds {
     }
 }
 
+// ---- New Background - Custom ------------------------------------------------------------
+
+/// The scheme picked: its index in `newbg::SCHEMES`.
+pub type OnScheme = Box<dyn Fn(usize, &mut Window, &mut App)>;
+
+/// "New Background - Custom" (the console's glow_scheme popup, app.js
+/// `showGlowSchemeDialog`): the schemes of `newbg::SCHEMES`, each drawn as
+/// `newbg::SAMPLE_WORD` over its four cells, fading to this window's background. A click or
+/// Enter picks one; Esc or Cancel leaves the choice as it was.
+pub struct GlowScheme {
+    main: WeakEntity<ClayView>,
+    focus: FocusHandle,
+    selected: usize,
+    ok: OnScheme,
+    cancel: OnCancel,
+}
+
+impl GlowScheme {
+    pub fn new(main: WeakEntity<ClayView>, current: usize, ok: OnScheme, cancel: OnCancel, cx: &mut Context<Self>) -> Self {
+        Self { main, focus: cx.focus_handle(), selected: current.min(crate::newbg::SCHEMES.len() - 1), ok, cancel }
+    }
+
+    fn choose(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        (self.ok)(i, window, cx);
+        cx.emit(DialogEvent::Close);
+    }
+
+    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        (self.cancel)(window, cx);
+        cx.emit(DialogEvent::Close);
+    }
+}
+
+impl EventEmitter<DialogEvent> for GlowScheme {}
+impl Focusable for GlowScheme {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for GlowScheme {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(k) = kit(&self.main, cx) else { return div().into_any_element() };
+        let t = k.t.clone();
+        // What the glow fades to: this window's output background.
+        let to = self.main.upgrade().map_or(crate::reveal::Rgb(0, 0, 0), |m| crate::reveal::Rgb::from_array(m.read(cx).palette.bg));
+        let mono = k.fonts.primary.clone();
+        let rows: Vec<gpui::AnyElement> = crate::newbg::SCHEMES
+            .iter()
+            .enumerate()
+            .map(|(n, s)| {
+                let selected = n == self.selected;
+                let hover = t.hover;
+                let cells = crate::newbg::swatch(s.start, to);
+                let word = div().flex().font_family(mono.clone()).font_weight(FontWeight::BOLD).children(
+                    crate::newbg::SAMPLE_WORD.chars().zip(cells).map(|(ch, bg)| {
+                        div()
+                            .w(px(14.0))
+                            .flex()
+                            .justify_center()
+                            .bg(crate::native_gui::ui::output::hsla(bg.array()))
+                            .text_color(crate::native_gui::ui::output::hsla(crate::newbg::text_on(bg).array()))
+                            .child(SharedString::from(ch.to_string()))
+                    }),
+                );
+                let row = div()
+                    .id(("glow-scheme", n))
+                    .flex()
+                    .items_center()
+                    .gap(px(16.0))
+                    .px(px(12.0))
+                    .py(px(5.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .child(word)
+                    .child(div().child(SharedString::from(s.label)))
+                    .on_click(cx.listener(move |this, _, w, cx| this.choose(n, w, cx)));
+                if selected { row.bg(t.accent).text_color(gpui::black()) } else { row.hover(move |s| s.bg(hover)) }.into_any_element()
+            })
+            .collect();
+        let count = crate::newbg::SCHEMES.len();
+        k.panel("glow-scheme")
+            .track_focus(&self.focus)
+            .w(px(300.0))
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, w, cx| {
+                match ev.keystroke.key.as_str() {
+                    "escape" => this.dismiss(w, cx),
+                    "up" | "down" => {
+                        let by = if ev.keystroke.key == "up" { -1 } else { 1 };
+                        if let Some(at) = crate::native_gui::ui::kit::list_step(Some(this.selected), count, by) {
+                            this.selected = at;
+                        }
+                        cx.notify();
+                    }
+                    "enter" => {
+                        let i = this.selected;
+                        this.choose(i, w, cx);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
+            .child(k.heading("New Background - Custom"))
+            .child(div().flex().flex_col().gap(px(2.0)).py(px(4.0)).children(rows))
+            .child(k.note("↑↓ select, Enter choose, Esc cancel"))
+            .child(
+                k.buttons()
+                    .child(k.button("glow-scheme-cancel", "Cancel", Btn::Plain, Some(Box::new(cx.listener(|this, _, w, cx| this.dismiss(w, cx))))))
+                    .child(k.button("glow-scheme-ok", "OK", Btn::Primary, Some(Box::new(cx.listener(|this, _, w, cx| {
+                        let i = this.selected;
+                        this.choose(i, w, cx);
+                    }))))),
+            )
+            .into_any_element()
+    }
+}
+
 // ---- Notes List ---------------------------------------------------------------------
 
 /// `/note -l` (the console's notes list, app.js `openNotesList`): the worlds with notes and

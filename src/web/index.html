@@ -937,10 +937,15 @@
                                                 <div id="setup-tls-proxy-toggle" class="toggle"></div>
                                             </div>
                                         </div>
-                                        <div class="setting-row">
+                                        <div class="setting-row" title="How text that arrived while you were in another world is marked. New Character: a green ▶ in front of each line. New Background: a green glow behind its first 4 characters, fading to the theme's background. New Background - Custom: the same glow in another colour, picked from ten. None: not marked. Leaving the world or Ctrl+L clears the marks, in either style.">
                                             <span class="setting-label">New Indicator</span>
                                             <div class="setting-value">
-                                                <div id="setup-new-line-indicator-toggle" class="toggle"></div>
+                                                <select id="setup-new-indicator-select" class="form-select">
+                                                    <option value="none">None</option>
+                                                    <option value="character">New Character</option>
+                                                    <option value="background">New Background</option>
+                                                    <option value="custom">New Background - Custom</option>
+                                                </select>
                                             </div>
                                         </div>
                                         <div class="setting-row" title="Off (TinyFugue's default): lines you send stay in the input area above the next one until they scroll off. On: Enter clears the input. Phones always clear.">

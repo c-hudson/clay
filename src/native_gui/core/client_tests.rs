@@ -675,6 +675,31 @@ fn saving_the_settings_back_unchanged_changes_nothing_but_what_was_edited() {
 }
 
 /// Separator Style (the console's bar) is one global setting, saved from this GUI's
+/// New Indicator's style goes by name, with the bool an older server reads; from a server
+/// that never sent a name nothing but the bool goes back, and that server keeps its style.
+#[test]
+fn the_new_indicator_style_is_saved_from_this_guis_settings() {
+    let mut app = crate::App::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let mut s = app.build_global_settings_msg();
+    assert_eq!((s.new_indicator.as_str(), s.new_line_indicator), ("none", false), "the default");
+    s.new_indicator = "background".into();
+    s.new_line_indicator = true;
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.new_indicator, crate::NewIndicator::Background);
+    // An older server sent no name: only the bool goes back, and "on" leaves its style.
+    s.new_indicator = String::new();
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { new_indicator: None, new_line_indicator: true, .. }));
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.new_indicator, crate::NewIndicator::Background, "on = the style it has");
+    s.new_line_indicator = false;
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.new_indicator, crate::NewIndicator::None, "off = none");
+    s.new_line_indicator = true;
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.new_indicator, crate::NewIndicator::Character, "on from none = the character");
+}
+
 /// Settings like any other: sent as the value shown, or as None from a server that never
 /// sent one (user ruling 2026-10-27: every interface's Settings shows it).
 #[test]

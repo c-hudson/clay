@@ -1165,6 +1165,10 @@ pub struct HttpsServer {
     pub running: Arc<RwLock<bool>>,
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub port: u16,
+    /// Keep trying the bind while the port is in use (see `bind_listener`): a reload or
+    /// crash successor (`port_released_by_predecessor`), or `restart_http_server` dropping its own
+    /// old listener. Off, a cold start's bind answers at once.
+    pub bind_retry: bool,
 }
 
 #[cfg(feature = "native-tls-backend")]
@@ -1174,6 +1178,7 @@ impl HttpsServer {
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: None,
             port,
+            bind_retry: false,
         }
     }
 }
@@ -1205,28 +1210,7 @@ pub async fn start_https_server(
     let tls_acceptor = tokio_native_tls::TlsAcceptor::from(tls_acceptor);
     let tls_acceptor = Arc::new(tls_acceptor);
 
-    // Loopback-only for --local-server (the on-device server), all interfaces otherwise.
-    let addr = format!("{}:{}", http_bind_host(), server.port);
-    // Retry binding with delays — on reload, the previous process may still be releasing the port
-    let listener = {
-        let mut last_err = None;
-        let mut bound = None;
-        for attempt in 0..10 {
-            match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => { crate::platform::not_inherited(&l); bound = Some(l); break; }
-                Err(e) => {
-                    last_err = Some(e);
-                    if attempt < 9 {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    }
-                }
-            }
-        }
-        match bound {
-            Some(l) => l,
-            None => return Err(bind_failure("HTTPS", server.port, last_err.as_ref()).into()),
-        }
-    };
+    let listener = bind_listener("HTTPS", server.port, server.bind_retry).await?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
@@ -1338,6 +1322,10 @@ pub struct HttpsServer {
     pub running: Arc<RwLock<bool>>,
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub port: u16,
+    /// Keep trying the bind while the port is in use (see `bind_listener`): a reload or
+    /// crash successor (`port_released_by_predecessor`), or `restart_http_server` dropping its own
+    /// old listener. Off, a cold start's bind answers at once.
+    pub bind_retry: bool,
 }
 
 #[cfg(feature = "rustls-backend")]
@@ -1347,6 +1335,7 @@ impl HttpsServer {
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: None,
             port,
+            bind_retry: false,
         }
     }
 }
@@ -1372,28 +1361,7 @@ pub async fn start_https_server(
 
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
 
-    // Loopback-only for --local-server (the on-device server), all interfaces otherwise.
-    let addr = format!("{}:{}", http_bind_host(), server.port);
-    // Retry binding with delays — on reload, the previous process may still be releasing the port
-    let listener = {
-        let mut last_err = None;
-        let mut bound = None;
-        for attempt in 0..10 {
-            match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => { crate::platform::not_inherited(&l); bound = Some(l); break; }
-                Err(e) => {
-                    last_err = Some(e);
-                    if attempt < 9 {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    }
-                }
-            }
-        }
-        match bound {
-            Some(l) => l,
-            None => return Err(bind_failure("HTTPS", server.port, last_err.as_ref()).into()),
-        }
-    };
+    let listener = bind_listener("HTTPS", server.port, server.bind_retry).await?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
@@ -1681,6 +1649,8 @@ pub struct HttpServer {
     pub listener_handle: Option<u64>,
     #[cfg(not(windows))]
     pub listener_handle: Option<i32>,
+    /// As `HttpsServer::bind_retry`.
+    pub bind_retry: bool,
 }
 
 impl HttpServer {
@@ -1690,23 +1660,103 @@ impl HttpServer {
             shutdown_tx: None,
             listener_handle: None,
             port,
+            bind_retry: false,
         }
     }
 }
 
-/// Why the server couldn't have its port. When another program holds it, say which
-/// (`platform::port_owner`): Windows lets a loopback bind succeed beside a program
-/// listening on all interfaces, so the GUIs' own check can miss it, and this message -
-/// in the console's output, or the GUI's "Clay failed to start" - is where it shows.
-pub(crate) fn bind_failure(what: &str, port: u16, err: Option<&std::io::Error>) -> String {
-    match err {
-        Some(e) if e.kind() == std::io::ErrorKind::AddrInUse => match crate::platform::port_owner(port) {
-            Some(owner) => format!("Failed to bind {what} to port {port}: it is in use by {owner}"),
-            None => format!("Failed to bind {what} to port {port}: it is in use by another program ({e})"),
-        },
-        Some(e) => format!("Failed to bind {what} to port {port}: {e}"),
-        None => format!("Failed to bind {what} to port {port}"),
+/// The web server couldn't have its port.
+///
+/// `Display` is the long form, for the GUIs' "Clay failed to start" dialog
+/// (`GUI_HTTP_FAILED`): when another program holds the port, which one, where
+/// `platform::port_owner` can tell (Windows lets a loopback bind succeed beside a program
+/// listening on all interfaces, so the GUIs' own check can miss it). The line every
+/// interface prints is the short form, [`start_warning`].
+#[derive(Debug)]
+pub(crate) struct BindError {
+    what: &'static str,
+    port: u16,
+    err: std::io::Error,
+}
+
+impl BindError {
+    /// Another program - a Clay already running, as a rule - has the port.
+    pub(crate) fn in_use(&self) -> bool {
+        self.err.kind() == std::io::ErrorKind::AddrInUse
     }
+}
+
+impl std::fmt::Display for BindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let BindError { what, port, err } = self;
+        if !self.in_use() {
+            return write!(f, "Failed to bind {what} to port {port}: {err}");
+        }
+        match crate::platform::port_owner(*port) {
+            Some(owner) => write!(f, "Failed to bind {what} to port {port}: it is in use by {owner}"),
+            None => write!(f, "Failed to bind {what} to port {port}: it is in use by another program ({err})"),
+        }
+    }
+}
+
+impl std::error::Error for BindError {}
+
+/// The one warning for a web server that couldn't start, in every interface (the
+/// console's output, the GUIs' headless log, `-D`'s stderr): `Warning: Failed to start
+/// HTTPS server [port in use]` when another program has the port - a second Clay, as a
+/// rule (user wording, 2026-10-28) - and the bare error otherwise.
+pub(crate) fn start_warning(what: &str, e: &(dyn std::error::Error + 'static)) -> String {
+    let reason = match e.downcast_ref::<BindError>() {
+        Some(b) if b.in_use() => "port in use".to_string(),
+        Some(b) => b.err.to_string(),
+        None => e.to_string(),
+    };
+    format!("Warning: Failed to start {what} server [{reason}]")
+}
+
+/// This process replaced a Clay (a hot reload, a crash restart) whose listener had `port`
+/// and may still be letting go of it - the one case a bind is worth retrying. The
+/// predecessor says so in `CLAY_RELOAD_WEB_PORT` (`platform::pass_web_port_to_successor`;
+/// `*` when a crash had no App to ask); a predecessor that never had the port left nothing,
+/// and its successor binds once - it used to wait the full 2.7 s on a port another program
+/// holds (user report 2026-10-28). Read once and removed, so neither this process's
+/// children nor its own successor see a stale value.
+pub(crate) fn port_released_by_predecessor(port: u16) -> bool {
+    let value = std::env::var(crate::platform::RELOAD_WEB_PORT_ENV).ok();
+    std::env::remove_var(crate::platform::RELOAD_WEB_PORT_ENV);
+    match value.as_deref() {
+        Some("*") => true,
+        Some(v) => v.parse::<u16>().ok() == Some(port),
+        None => false,
+    }
+}
+
+/// How long a retried bind keeps trying: `BIND_ATTEMPTS` tries, `BIND_RETRY_DELAY` apart.
+const BIND_ATTEMPTS: u32 = 10;
+const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Bind the web server's listener. One attempt, answered at once - unless `retry`, when
+/// it keeps trying while the port is merely in use (a reload or crash successor waiting
+/// for the previous process, `restart_http_server` for its own old listener). Any other
+/// error is final the first time. Before the switch every start sat through all
+/// `BIND_ATTEMPTS`: a second Clay waited 2.7 s on a blank screen for its first draw.
+async fn bind_listener(what: &'static str, port: u16, retry: bool) -> Result<tokio::net::TcpListener, BindError> {
+    // Loopback-only for --local-server (the on-device server), all interfaces otherwise.
+    let addr = format!("{}:{}", http_bind_host(), port);
+    let attempts = if retry { BIND_ATTEMPTS } else { 1 };
+    for attempt in 1..=attempts {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => {
+                crate::platform::not_inherited(&l);
+                return Ok(l);
+            }
+            Err(err) if attempt < attempts && err.kind() == std::io::ErrorKind::AddrInUse => {
+                tokio::time::sleep(BIND_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(BindError { what, port, err }),
+        }
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// Host to bind the HTTP+WS listener to. Loopback-only when running as `--local-server`
@@ -1745,25 +1795,7 @@ pub async fn start_http_server(
             return Err("inherited_handle not supported on this platform".into());
         }
     } else {
-        let addr = format!("{}:{}", http_bind_host(), server.port);
-        // Retry binding with delays — on reload, the previous process may still be releasing the port
-        let mut last_err = None;
-        let mut bound = None;
-        for attempt in 0..10 {
-            match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => { crate::platform::not_inherited(&l); bound = Some(l); break; }
-                Err(e) => {
-                    last_err = Some(e);
-                    if attempt < 9 {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    }
-                }
-            }
-        }
-        match bound {
-            Some(l) => l,
-            None => return Err(bind_failure("HTTP", server.port, last_err.as_ref()).into()),
-        }
+        bind_listener("HTTP", server.port, server.bind_retry).await?
     };
 
     // Store the listener handle for passing to child process on reload
@@ -2624,5 +2656,109 @@ mod knock_tests {
 
         let result = handle.await.unwrap();
         assert_eq!(result, GateResult::Proceed { knocked: false, in_allow_list: false });
+    }
+}
+
+/// The web server's bind: one attempt at a cold start, answered at once, the retry only
+/// for a successor or a restart; and the one short warning every interface prints.
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn boxed(e: BindError) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(e)
+    }
+
+    #[test]
+    fn start_warning_is_short_for_a_port_in_use_and_bare_otherwise() {
+        let in_use = boxed(BindError {
+            what: "HTTPS",
+            port: 9000,
+            err: std::io::Error::new(std::io::ErrorKind::AddrInUse, "Address already in use (os error 98)"),
+        });
+        // The user's wording (2026-10-28), nothing longer.
+        assert_eq!(start_warning("HTTPS", in_use.as_ref()), "Warning: Failed to start HTTPS server [port in use]");
+        assert_eq!(start_warning("HTTPS+WSS", in_use.as_ref()), "Warning: Failed to start HTTPS+WSS server [port in use]");
+        // The long form keeps the detail for the GUIs' dialog.
+        if !cfg!(windows) {
+            assert_eq!(
+                in_use.to_string(),
+                "Failed to bind HTTPS to port 9000: it is in use by another program (Address already in use (os error 98))"
+            );
+        }
+
+        let denied = boxed(BindError {
+            what: "HTTPS",
+            port: 80,
+            err: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied (os error 13)"),
+        });
+        assert_eq!(start_warning("HTTPS", denied.as_ref()), "Warning: Failed to start HTTPS server [Permission denied (os error 13)]");
+        assert_eq!(denied.to_string(), "Failed to bind HTTPS to port 80: Permission denied (os error 13)");
+
+        let other: Box<dyn std::error::Error + Send + Sync> = "Failed to build TLS config: bad key".into();
+        assert_eq!(start_warning("HTTPS", other.as_ref()), "Warning: Failed to start HTTPS server [Failed to build TLS config: bad key]");
+    }
+
+    /// The successor retries only for the port its predecessor said it held (or `*`, a
+    /// crash with nothing to ask), and reads the word once.
+    #[test]
+    fn a_successor_retries_only_for_the_port_its_predecessor_held() {
+        let var = crate::platform::RELOAD_WEB_PORT_ENV;
+        std::env::remove_var(var);
+        assert!(!port_released_by_predecessor(9000), "nothing said: a cold start, or a predecessor without the port");
+        std::env::set_var(var, "9000");
+        assert!(!port_released_by_predecessor(9001), "another port is nobody's to release");
+        std::env::set_var(var, "9000");
+        assert!(port_released_by_predecessor(9000));
+        assert!(std::env::var(var).is_err(), "read once: the successor's own children never see it");
+        assert!(!port_released_by_predecessor(9000), "and its own successor starts afresh");
+        std::env::set_var(var, "*");
+        assert!(port_released_by_predecessor(9000), "unknown: retry as before");
+        std::env::set_var(var, "junk");
+        assert!(!port_released_by_predecessor(9000));
+    }
+
+    /// A second Clay: the port is held, and without the retry the answer comes at once
+    /// instead of after `BIND_ATTEMPTS` x `BIND_RETRY_DELAY` (2.7 s) on a blank screen.
+    #[tokio::test]
+    async fn bind_without_retry_reports_a_held_port_at_once() {
+        let port = crate::testserver::free_port();
+        let _holder = std::net::TcpListener::bind(("0.0.0.0", port)).expect("hold the port");
+        let started = Instant::now();
+        let err = bind_listener("HTTPS", port, false).await.err().expect("the port is held");
+        assert!(err.in_use(), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+    }
+
+    /// A reload successor: the previous process lets go a moment later, and the retry
+    /// gets the port where a single attempt would have failed.
+    #[tokio::test]
+    async fn bind_with_retry_waits_for_the_port_to_free() {
+        let port = crate::testserver::free_port();
+        let holder = std::net::TcpListener::bind(("0.0.0.0", port)).expect("hold the port");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(450));
+            drop(holder);
+        });
+        let listener = bind_listener("HTTPS", port, true).await.expect("the retry outlasts the holder");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        release.join().unwrap();
+    }
+
+    /// Only "in use" is worth waiting for: a port Clay may not have is final the first time,
+    /// retry or not.
+    #[tokio::test]
+    async fn bind_with_retry_gives_up_on_any_other_error_at_once() {
+        // Port 1 needs privileges on Unix; a process that may bind it (root, Windows)
+        // can't make this error and the case is passed over.
+        let started = Instant::now();
+        match bind_listener("HTTPS", 1, true).await {
+            Ok(_) => {}
+            Err(err) => {
+                assert!(!err.in_use(), "{err}");
+                assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+            }
+        }
     }
 }

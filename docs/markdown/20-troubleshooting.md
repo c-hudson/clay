@@ -278,5 +278,25 @@ Or start fresh - Clay creates defaults on startup.
 2. Start Clay (creates fresh settings)
 3. Manually migrate important settings
 
+### Clay Closed Unexpectedly
+
+Every Clay - the console, a GUI, `-D`, `--multiuser` - writes how it ended to
+`~/.clay/debug.log` (`~/clay/debug.log` on Windows), whether Debug mode is on or not. When
+Clay closes without warning, send the log from the last `=== Clay` banner before that time,
+and on Linux the kernel's log around it (`journalctl -k --since "<the session's start>"`).
+
+The lines to look for:
+
+| Line | What it means |
+|---|---|
+| `session pid=N mode=...` | That Clay started, and which kind it was (`gui attached to mini`, `console`, `daemon`, ...). |
+| `exit (quit) (pid N)` | It ended normally; the reason says how (`quit`, `window closed`, `SIGTERM`, `reload`, ...). |
+| `CRASH (pid N, thread T): ...` | A crash inside Clay, with the line in Clay's code, a `CRASH CONTEXT` line about what was on screen, and a backtrace. This is what a fix needs. |
+| `FATAL SIGNAL 11 (SIGSEGV) (pid N)` | The process was ended by a fatal signal (a crash in a library, or `kill -SEGV`). `FATAL EXCEPTION 0x...` is the Windows equivalent. |
+| `previous session: Clay (...) ... crashed: ...` | Written by the next Clay to start, for an earlier one that crashed. The window or console also says so once. |
+| `previous session: Clay (...) ... ended without a record` | An earlier Clay ended with none of the above: killed (`kill -9`, running out of memory), a logout, or the machine stopping. The kernel log shows an out-of-memory kill. |
+
+After a crash, the console restarts itself and says `Clay restarted after a crash: ...`.
+
 \newpage
 

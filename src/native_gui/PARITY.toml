@@ -2336,8 +2336,16 @@ id = "ui:output.prefix-new"
 section = "output"
 phase = 2
 status = "done"
-feature = "▶ (#00ff00 + space) on lines this client owns, when new_line_indicator and no textdiv"
+feature = "▶ (#00ff00 + space) on lines this client owns, when New Indicator is the character and no textdiv"
 note = "core/decor.rs; optimistic claims reconciled with ClaimedNew (core)"
+
+[[item]]
+id = "ui:output.new-glow"
+section = "output"
+phase = 2
+status = "done"
+feature = "New Indicator's background styles: a glow behind the first 4 cells of every row of a line this client owns - green, or a New Background - Custom scheme - fading to the theme's background (src/newbg.rs; app.js .new-glow / --new-glow); a /highlight colour covers it"
+note = "decor flags StyledLine::new_glow, ui/output.rs paints four cells per row"
 
 [[item]]
 id = "ui:output.prefix-archive"
@@ -2930,6 +2938,14 @@ phase = 4
 status = "done"
 feature = "General > Separator Style (Web | TinyFugue): the console's bar, one global setting shown in every interface's Settings (user ruling 2026-10-27); Save sends UpdateGlobalSettings.separator_style, None from a server that never sent one"
 note = "app.js setupSeparatorStyle"
+
+[[item]]
+id = "ui:settings.new_indicator"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "General > New Indicator (None | New Character | New Background | New Background - Custom), a select since 2026-10-28; the Custom entry opens the scheme picker (dialogs::small::GlowScheme, app.js showGlowSchemeDialog, the console's glow_scheme popup); Save sends UpdateGlobalSettings.new_indicator by name plus the bool an older server reads"
+note = "app.js setupNewIndicator"
 
 [[item]]
 id = "ui:dialog.modify_key"

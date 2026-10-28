@@ -245,9 +245,23 @@ pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
 
 #[cfg(not(target_os = "android"))]
 pub(crate) const RELOAD_FDS_ENV: &str = "CLAY_RELOAD_FDS";
+/// The web port this process's listener had, told to the reload/crash successor so its
+/// bind retries only while this process lets go of that port (`http::port_released_by_predecessor`);
+/// `*` when a crash had no App to ask. Removed when there was no listener: a stale value
+/// from a grandparent would make a successor wait on a port another program holds.
+pub(crate) const RELOAD_WEB_PORT_ENV: &str = "CLAY_RELOAD_WEB_PORT";
 pub(crate) const CRASH_COUNT_ENV: &str = "CLAY_CRASH_COUNT";
 #[cfg(not(target_os = "android"))]
 pub(crate) const MAX_CRASH_RESTARTS: u32 = 2;
+
+/// Set `RELOAD_WEB_PORT_ENV` for the successor from this process's listener, or clear it.
+#[cfg(not(target_os = "android"))]
+pub(crate) fn pass_web_port_to_successor(port: Option<u16>) {
+    match port {
+        Some(p) => std::env::set_var(RELOAD_WEB_PORT_ENV, p.to_string()),
+        None => std::env::remove_var(RELOAD_WEB_PORT_ENV),
+    }
+}
 // Sentinel env var for the desktop-Linux GUI hardware->software rendering fallback
 // (see gui_software_fallback_restart()): set right before the one-shot relaunch, it
 // both tells the relaunched process to force software rendering (webview_gui.rs)
@@ -275,6 +289,16 @@ pub(crate) fn get_crash_count() -> u32 {
         .unwrap_or(0)
 }
 
+/// The successor of a reload starts from this process's crash counter, which may have been
+/// reset since the environment was read (crashlog::session's ten quiet minutes).
+#[cfg(not(target_os = "android"))]
+pub(crate) fn sync_crash_count_env() {
+    match CRASH_COUNT.load(Ordering::SeqCst) {
+        0 => std::env::remove_var(CRASH_COUNT_ENV),
+        n => std::env::set_var(CRASH_COUNT_ENV, n.to_string()),
+    }
+}
+
 /// Clear the crash count (called after successful operation)
 pub(crate) fn clear_crash_count() {
     std::env::remove_var(CRASH_COUNT_ENV);
@@ -295,12 +319,9 @@ pub(crate) fn get_app_ptr() -> *mut App {
 /// Attempt to restart after a crash (Unix version - uses exec)
 #[cfg(all(unix, not(target_os = "android")))]
 pub(crate) fn crash_restart() {
-    // Read crash count directly from env var, not from atomic
-    // This ensures correct count even if crash happens before atomic is initialized
-    let crash_count = std::env::var(CRASH_COUNT_ENV)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // The counter crashlog::install read from the environment at the start (it starts again
+    // after ten minutes without a crash, crashlog::session).
+    let crash_count = CRASH_COUNT.load(Ordering::SeqCst);
     if crash_count >= MAX_CRASH_RESTARTS {
         // Already crashed too many times, don't restart
         eprintln!("Maximum crash restarts ({}) reached, not restarting.", MAX_CRASH_RESTARTS);
@@ -333,11 +354,19 @@ pub(crate) fn crash_restart() {
             .collect::<Vec<_>>()
             .join(",");
         std::env::set_var(RELOAD_FDS_ENV, &fds_str);
+        pass_web_port_to_successor(app.web_listener_port());
+    } else {
+        // No App to ask (a headless crash saves nothing): unknown, so the successor retries.
+        std::env::set_var(RELOAD_WEB_PORT_ENV, "*");
     }
 
     // Increment crash count in env
     let new_count = crash_count + 1;
     std::env::set_var(CRASH_COUNT_ENV, new_count.to_string());
+    // The restarted Clay says why it restarted (crashlog::restart_notice).
+    if let Some(reason) = crate::crashlog::last_crash() {
+        std::env::set_var(crate::crashlog::CRASH_REASON_ENV, reason);
+    }
     // Tell new process which reload file to load (PID-specific)
     std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
@@ -353,6 +382,7 @@ pub(crate) fn crash_restart() {
         args.push("--crash".to_string());
 
         // This replaces the current process if successful
+        crate::crashlog::replacing("crash restart");
         give_back_stderr();
         let _ = std::process::Command::new(&exe).args(&args).exec();
     }
@@ -402,10 +432,8 @@ pub(crate) fn maybe_gui_software_fallback() {
 /// Attempt to restart after a crash (Windows version - uses spawn + exit)
 #[cfg(windows)]
 pub(crate) fn crash_restart() {
-    let crash_count = std::env::var(CRASH_COUNT_ENV)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // As on Unix: the counter crashlog::install read, reset after ten quiet minutes.
+    let crash_count = CRASH_COUNT.load(Ordering::SeqCst);
     if crash_count >= MAX_CRASH_RESTARTS {
         eprintln!("Maximum crash restarts ({}) reached, not restarting.", MAX_CRASH_RESTARTS);
         return;
@@ -433,10 +461,17 @@ pub(crate) fn crash_restart() {
             .collect::<Vec<_>>()
             .join(",");
         std::env::set_var(RELOAD_FDS_ENV, &fds_str);
+        pass_web_port_to_successor(app.web_listener_port());
+    } else {
+        // No App to ask (a headless crash saves nothing): unknown, so the successor retries.
+        std::env::set_var(RELOAD_WEB_PORT_ENV, "*");
     }
 
     let new_count = crash_count + 1;
     std::env::set_var(CRASH_COUNT_ENV, new_count.to_string());
+    if let Some(reason) = crate::crashlog::last_crash() {
+        std::env::set_var(crate::crashlog::CRASH_REASON_ENV, reason);
+    }
     std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
     if let Ok((exe, _)) = get_executable_path() {
@@ -449,40 +484,9 @@ pub(crate) fn crash_restart() {
         args.push("--crash".to_string());
 
         if std::process::Command::new(&exe).args(&args).spawn().is_ok() {
-            std::process::exit(1);
+            crate::crashlog::exit_process(1, "crash restart");
         }
     }
-}
-
-/// Set up the crash handler (panic hook)
-#[cfg(not(target_os = "android"))]
-pub(crate) fn setup_crash_handler() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        // Restore terminal first to ensure output is visible
-        let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-
-        // Log crash to debug file (always log crashes regardless of debug setting)
-        let panic_msg = format!("CRASH: {}", panic_info);
-        debug_log(is_debug_enabled(), &panic_msg);
-
-        // Also log backtrace if available
-        let backtrace = std::backtrace::Backtrace::capture();
-        let bt_str = format!("{}", backtrace);
-        if !bt_str.is_empty() && !bt_str.contains("disabled") {
-            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
-        }
-
-        // Print the panic info using the default handler
-        eprintln!("\n\nClay crashed! Attempting to restart...\n");
-        default_hook(panic_info);
-
-        // Attempt to restart
-        crash_restart();
-
-        // If we get here, restart failed - exit normally
-    }));
 }
 
 // Hot reload helper - clear FD_CLOEXEC on Unix so fd survives exec
@@ -1908,7 +1912,11 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     std::env::set_var(RELOAD_FDS_ENV, &fds_str);
     // Tell new process which reload file to load (PID-specific)
     std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
+    // The exec closes our listener (close-on-exec), so the successor's first bind gets the
+    // port; it still learns which port was ours, as the Windows successor must.
+    pass_web_port_to_successor(app.web_listener_port());
 
+    sync_crash_count_env();
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
     // Without TinyFugue's startup options: a reload must not load the rc or connect again.
@@ -1916,6 +1924,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect());
     args.push("--reload".to_string());
     debug_log(is_debug_enabled(), &format!("RELOAD: About to exec {} with args={:?} fds={}", exe.display(), args, fds_str));
+    crate::crashlog::replacing("reload");
     give_back_stderr();
     let err = std::process::Command::new(&exe)
         .args(&args)
@@ -1949,6 +1958,10 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     }
 
     debug_log(is_debug_enabled(), "RELOAD: Starting exec_reload (Windows)");
+
+    // Which port the successor may have to wait for: ours, released by the shutdown below
+    // once the accept task sees it, which may be after the successor's first bind.
+    let web_port = app.web_listener_port();
 
     // Shut down HTTP/HTTPS servers to release the port before spawning new process
     if let Some(ref mut server) = app.http_server {
@@ -2002,6 +2015,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     std::env::set_var(RELOAD_FDS_ENV, &fds_str);
     // Tell new process which reload file to load (PID-specific)
     std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
+    pass_web_port_to_successor(web_port);
 
     // Detect GUI mode from App state (not args — GUI is default on Windows/macOS with no flag)
     let is_headless = app.gui_tx.is_some() || std::env::args().any(|a| a == "-D");
@@ -2031,6 +2045,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         args.push(if cfg!(feature = "native-gui") { "--gui" } else { "--web-gui" }.to_string());
     }
     debug_log(is_debug_enabled(), &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
+    sync_crash_count_env();
 
     // On Windows, disable raw mode and leave alternate screen BEFORE spawning
     let _ = crossterm::terminal::disable_raw_mode();
@@ -2075,7 +2090,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
                 // Use exit(0) for clean shutdown — lets the OS properly close sockets
                 // so the new process can bind port 9000. TerminateProcess was leaving
                 // the port in a zombie state on Windows.
-                std::process::exit(0);
+                crate::crashlog::exit_process(0, &format!("reload: replaced by pid {}", child.id()));
             }
             Err(e) => {
                 debug_log(true, &format!("RELOAD: could not start {}: {}", exe.display(), e));
@@ -2092,7 +2107,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             // Console mode: wait for the child to exit so the shell prompt
             // doesn't appear between the old and new process.
             let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(0);
-            std::process::exit(code);
+            crate::crashlog::exit_process(code, "reload: the successor ended");
         }
         Err(e) => {
             if sync_event != 0 {

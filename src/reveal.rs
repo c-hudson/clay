@@ -68,7 +68,8 @@ impl Rgb {
         Rgb(c[0], c[1], c[2])
     }
 
-    fn lerp(self, to: Rgb, t: f32) -> Rgb {
+    /// `t` of the way from `self` to `to` (0 = self, 1 = to).
+    pub fn lerp(self, to: Rgb, t: f32) -> Rgb {
         let t = t.clamp(0.0, 1.0);
         let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
         Rgb(mix(self.0, to.0), mix(self.1, to.1), mix(self.2, to.2))
@@ -76,6 +77,11 @@ impl Rgb {
 
     fn sgr_fg(self) -> String {
         format!("38;2;{};{};{}", self.0, self.1, self.2)
+    }
+
+    /// The whole escape setting this as the background (src/newbg.rs).
+    pub fn sgr_bg(self) -> String {
+        format!("\x1b[48;2;{};{};{}m", self.0, self.1, self.2)
     }
 }
 
@@ -399,12 +405,12 @@ impl Frame {
 /// `bg` is `Some(true)` when a background is set, `Some(false)` when cleared (49, or a
 /// reset), `None` when it says nothing.
 #[derive(Debug, Default, PartialEq)]
-struct SgrColors {
-    fg: Option<Option<Rgb>>,
-    bg: Option<bool>,
+pub(crate) struct SgrColors {
+    pub(crate) fg: Option<Option<Rgb>>,
+    pub(crate) bg: Option<bool>,
 }
 
-fn sgr_colors(params: &str) -> SgrColors {
+pub(crate) fn sgr_colors(params: &str) -> SgrColors {
     let nums: Vec<Option<u16>> = params.split(';').map(|p| p.parse::<u16>().ok()).collect();
     let mut fg: Option<Option<Rgb>> = None;
     let mut bg: Option<bool> = None;

@@ -32,6 +32,8 @@ pub mod chords;
 pub mod input_handler;
 pub mod rendering;
 pub mod reveal;
+pub mod newbg;
+pub mod crashlog;
 pub mod audio;
 pub mod platform;
 pub mod commands;
@@ -221,7 +223,7 @@ pub fn server_version_detail(detail: &str, version: &str) -> Option<String> {
 }
 
 // Re-export commonly used types from modules
-pub use encoding::{Encoding, SeparatorStyle, Theme, WorldSwitchMode, convert_discord_emojis, convert_discord_emojis_with_links, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
+pub use encoding::{Encoding, NewIndicator, SeparatorStyle, Theme, WorldSwitchMode, convert_discord_emojis, convert_discord_emojis_with_links, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     build_naws_subnegotiation, build_ttype_response,
@@ -2200,8 +2202,9 @@ pub struct Settings {
     pub text_reveal_profiles: std::collections::BTreeMap<String, TextReveal>,
     // ZWJ emoji sequence handling (true = pass through, false = strip ZWJ + colored square)
     zwj_enabled: bool,
-    // New line indicator - prefix unseen/pending lines with green "+"
-    pub new_line_indicator: bool,
+    /// How a line this viewer owns (its ▶ new text) is marked: `▶ ` in front, a green glow
+    /// behind its first cells (src/newbg.rs), or not at all (the default).
+    pub new_indicator: NewIndicator,
     /// Text-to-speech mode: Off, Local (espeak/say), or Edge (MS neural TTS)
     pub tts_mode: tts::TtsMode,
     /// World-tabs ribbon display mode (web/GUI/Android only, see TabsMode)
@@ -2253,10 +2256,24 @@ impl Settings {
         self.text_reveal_profiles.get(key).copied().unwrap_or_default()
     }
 
-    /// Clay's ▶ new-text markers are drawn: the setting is on, and no script has set TF's
-    /// %textdiv, which takes their place (`App::apply_tf_textdiv`).
+    /// Clay's new-text markers are drawn, in either style: the setting is on, and no script
+    /// has set TF's %textdiv, which takes their place (`App::apply_tf_textdiv`). What is
+    /// shared by both styles - the old-context rows, `%textdiv` - asks this; what differs
+    /// asks `nli_prefix` / `nli_glow`.
     pub(crate) fn nli_drawn(&self) -> bool {
-        self.new_line_indicator && self.textdiv.is_empty()
+        self.new_indicator.is_on() && self.textdiv.is_empty()
+    }
+
+    /// The `▶ ` prefix is drawn (New Character): the two columns it takes are reserved in
+    /// the console's wrap width.
+    pub(crate) fn nli_prefix(&self) -> bool {
+        self.new_indicator == NewIndicator::Character && self.textdiv.is_empty()
+    }
+
+    /// The glow is drawn behind a new line's first cells (New Background, or its Custom
+    /// scheme, src/newbg.rs): no text, so nothing is reserved. Its first cell's colour.
+    pub(crate) fn nli_glow_start(&self) -> Option<reveal::Rgb> {
+        self.new_indicator.glow_start().filter(|_| self.textdiv.is_empty())
     }
 }
 
@@ -2312,7 +2329,7 @@ impl Default for Settings {
             text_reveal: TextReveal::Off,
             text_reveal_profiles: std::collections::BTreeMap::new(),
             zwj_enabled: false,
-            new_line_indicator: false,
+            new_indicator: NewIndicator::None,
             tts_mode: tts::TtsMode::Off,
             tabs: TabsMode::None,
             icon_bar: IconBarMode::AppTablet,
@@ -6581,7 +6598,9 @@ impl App {
             // client reads a missing field as off.
             mouse_enabled: true,
             zwj_enabled: self.settings.zwj_enabled,
-            new_line_indicator: self.settings.new_line_indicator,
+            // The style by name, and the bool an older client reads (on = any style).
+            new_line_indicator: self.settings.new_indicator.is_on(),
+            new_indicator: self.settings.new_indicator.name().to_string(),
             tts_mode: self.settings.tts_mode.name().to_string(),
             tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
             tts_voice: self.settings.tts_voice.clone(),
@@ -6688,7 +6707,7 @@ impl App {
             self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
         self.settings.tls_proxy_enabled = settings.tls_proxy_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
-        self.settings.new_line_indicator = settings.new_line_indicator;
+        self.settings.new_indicator = NewIndicator::from_wire(&settings.new_indicator, settings.new_line_indicator);
         self.settings.tabs = TabsMode::from_name(&settings.tabs);
         self.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
         // Empty: a server from before Import Picture (which can't upload anyway).
@@ -7691,7 +7710,7 @@ impl App {
             self.settings.editor_side.name(),
             self.settings.zwj_enabled,
             self.settings.ansi_music_enabled,
-            self.settings.new_line_indicator,
+            &self.settings.new_indicator.name(),
             self.settings.tts_mode.name(),
             self.settings.tts_speak_mode.name(),
             &self.settings.tts_voice,
@@ -7865,7 +7884,7 @@ impl App {
                         world_part,
                         pattern_preview,
                     ],
-                    style: popup::ListItemStyle {
+                    style: popup::ListItemStyle { swatch: None,
                         is_disabled: !a.enabled,
                         ..Default::default()
                     },
@@ -8168,7 +8187,19 @@ impl App {
                 }
             }
             WsMessage::WorldSwitched { new_index } => {
-                self.current_world_index = new_index;
+                // The server moved this console's view (its answer to SwitchWorld, or to a
+                // typed /worlds, before the ExecuteLocalCommand that follows): tell it which
+                // world is left and which is shown, so its ▶ claims and releases follow
+                // (CalculatedWorld below does the same). It used to move silently, so the
+                // markers on the world left were never released and the new world's never
+                // claimed.
+                if new_index < self.worlds.len() && new_index != self.current_world_index {
+                    let previous = self.current_world_index;
+                    self.current_world_index = new_index;
+                    if let Some(ref tx) = self.ws_client_tx {
+                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: new_index, previous_world_index: Some(previous) });
+                    }
+                }
                 self.needs_output_redraw = true;
             }
             WsMessage::PromptUpdate { world_index, prompt } => {
@@ -9464,14 +9495,23 @@ impl App {
             }
             // Drop the console's own ▶ markers on the world we're leaving. Only the
             // console's - a remote client sitting on that same world keeps its markers,
-            // which is the behaviour the shared watermark could not provide.
-            self.release_world_for(old_index, CONSOLE_DISPLAY_ID, None);
+            // which is the behaviour the shared watermark could not provide. And only when
+            // there IS a console: a headless server (-D, a GUI master, --local-server) comes
+            // through here for a client's typed `/worlds`, and a claim for a console that
+            // doesn't exist took the lines from that client, whose own claim then found
+            // nothing (deferred bug G1, 2026-10-28).
+            let console = self.console_tui;
+            if console {
+                self.release_world_for(old_index, CONSOLE_DISPLAY_ID, None);
+            }
             // The world we leave goes to the front of the visit history (Esc-w's last tier).
             let leaving = self.worlds[old_index].name.clone();
             push_visited(&mut self.world_history, leaving);
             self.current_world_index = index;
             // ...and claim whatever accumulated unviewed on the world we're arriving at.
-            self.claim_world_for(index, CONSOLE_DISPLAY_ID, None);
+            if console {
+                self.claim_world_for(index, CONSOLE_DISPLAY_ID, None);
+            }
             // Note: mark_seen() is NOT called here - lines are only marked seen when displayed
             // Mark output for redraw since we switched worlds
             self.needs_output_redraw = true;
@@ -11434,6 +11474,7 @@ impl App {
         self.refresh_tf_status();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_global_settings(
         &mut self,
         client_id: u64,
@@ -11474,6 +11515,7 @@ impl App {
         tls_proxy_enabled: bool,
         zwj_enabled: bool,
         new_line_indicator: bool,
+        new_indicator: Option<String>,
         tts_mode: String,
         tts_speak_mode: String,
         tts_voice: String,
@@ -11573,7 +11615,14 @@ impl App {
         }
         self.settings.tls_proxy_enabled = tls_proxy_enabled;
         self.settings.zwj_enabled = zwj_enabled;
-        self.settings.new_line_indicator = new_line_indicator;
+        // The style by name from a client that knows styles; an older client sends only
+        // the bool, which must not knock New Background back to the character on one of its
+        // unrelated saves: on keeps whatever style is set (the character when none is).
+        self.settings.new_indicator = match new_indicator {
+            Some(name) => NewIndicator::from_name(&name),
+            None if new_line_indicator && self.settings.new_indicator.is_on() => self.settings.new_indicator,
+            None => NewIndicator::from_legacy(new_line_indicator),
+        };
         self.settings.tabs = TabsMode::from_name(&tabs);
         self.settings.icon_bar = IconBarMode::from_name(&icon_bar);
         if let Some(picture_host) = picture_host {
@@ -11770,7 +11819,9 @@ impl App {
             .filter(|cid| self.ws_client_worlds.contains_key(cid))
             .map(|cid| (self.display_owner_id(cid), Some(cid)))
             .or_else(|| {
-                if world_idx == self.current_world_index {
+                // The console's own world is the console's - when there is one; a headless
+                // server's current world is just the last brought forward.
+                if self.console_tui && world_idx == self.current_world_index {
                     Some((CONSOLE_DISPLAY_ID, None))
                 } else {
                     self.ws_client_worlds.iter()
@@ -12134,7 +12185,7 @@ impl App {
         writeln!(file, "worlds_count: {}", self.worlds.len())?;
         writeln!(file, "more_mode_enabled: {}", self.settings.more_mode_enabled)?;
         writeln!(file, "show_tags: {}", self.show_tags)?;
-        writeln!(file, "new_line_indicator: {}", self.settings.new_line_indicator)?;
+        writeln!(file, "new_indicator: {}", self.settings.new_indicator.name())?;
         writeln!(file, "clear_input_on_send: {} (sent entries kept: {}, rows shown: {})",
             self.settings.clear_input_on_send, self.input.sent.len(), self.input.sent_rows)?;
         // Hidden setting with no UI — /dump is the only way to see the list /url is
@@ -13297,6 +13348,31 @@ impl App {
     /// `owner_id` is the value stamped on the lines (stable across reconnects, see
     /// `display_owner_id`); `notify` is the CONNECTION id to message, which is a different
     /// number and must not be confused with it. `None` means the console, which has no socket.
+    /// What a crash should say about this Clay's state (src/crashlog.rs's CRASH CONTEXT),
+    /// refreshed at the keepalive tick of every loop.
+    pub(crate) fn note_crash_context(&self) {
+        let connected = self.worlds.iter().filter(|w| w.connected).count();
+        let current = self.worlds.get(self.current_world_index).map(|w| w.name.as_str()).unwrap_or("-");
+        crashlog::set_context("worlds", format!("{} connected={connected} current={current:?} clients={}", self.worlds.len(), self.ws_client_worlds.len()));
+    }
+
+    /// A client's view moved to `world_index` by its own request (a typed `/worlds`, a
+    /// `SwitchWorld`): record it, keeping what else the view state knows. The claim of the
+    /// world's unviewed lines is the client's own, by the `MarkWorldSeen` it sends as it
+    /// starts displaying the world (`handle_mark_world_seen`) - never made here, so the one
+    /// `ClaimedNew` answers the guess the client painted.
+    pub(crate) fn ws_client_view_world(&mut self, client_id: u64, world_index: usize) {
+        let prev = self.ws_client_worlds.get(&client_id);
+        let dimensions = prev.and_then(|s| s.dimensions);
+        let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
+        let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
+        let paused = prev.map(|v| v.paused).unwrap_or(false);
+        let visible = prev.map(|v| v.visible).unwrap_or(true);
+        let history = self.client_history_after(client_id, None, world_index);
+        self.ws_client_worlds.insert(client_id, ClientViewState { world_index, history, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
+        self.ws_set_client_world(client_id, Some(world_index));
+    }
+
     fn claim_world_for(&mut self, world_idx: usize, owner_id: u64, notify: Option<u64>) {
         if world_idx >= self.worlds.len() {
             return;
@@ -16081,6 +16157,18 @@ impl App {
         line
     }
 
+    /// The port this process's web listener has, if it has one: what a reload or crash
+    /// successor may have to wait for (`platform::pass_web_port_to_successor`); Android has
+    /// no reload, so no relauncher asks there.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    pub(crate) fn web_listener_port(&self) -> Option<u16> {
+        #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
+        if let Some(server) = self.https_server.as_ref() {
+            return Some(server.port);
+        }
+        self.http_server.as_ref().map(|server| server.port)
+    }
+
     /// Hook run whenever the HTTPS server has (re)started, on every path that
     /// starts it (cold start in both loops, `restart_http_server`): kick off the
     /// firewall query — and, once portmap.rs lands, the router mapping.
@@ -17215,15 +17303,7 @@ impl App {
             Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                 if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                     // Switch only the requesting client's world, not the console
-                    let prev = self.ws_client_worlds.get(&client_id);
-                    let dimensions = prev.and_then(|s| s.dimensions);
-                    let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
-                    let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
-                    let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    let visible = prev.map(|v| v.visible).unwrap_or(true);
-                    let history = self.client_history_after(client_id, None, idx);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, history, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
-                    self.ws_set_client_world(client_id, Some(idx));
+                    self.ws_client_view_world(client_id, idx);
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                     // Also send ExecuteLocalCommand so web clients can switch their local view:
                     // as `/world <name>`, the one form every client reads (TF's flags,
@@ -17482,15 +17562,7 @@ impl App {
             WsMessage::SwitchWorld { world_index } => {
                 // Switch only the requesting client's world, not the console
                 if world_index < self.worlds.len() {
-                    let prev = self.ws_client_worlds.get(&client_id);
-                    let dimensions = prev.and_then(|s| s.dimensions);
-                    let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
-                    let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
-                    let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    let visible = prev.map(|v| v.visible).unwrap_or(true);
-                    let history = self.client_history_after(client_id, None, world_index);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, history, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
-                    self.ws_set_client_world(client_id, Some(world_index));
+                    self.ws_client_view_world(client_id, world_index);
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                     // Send active media for the new world
                     self.ws_send_active_media_to_client(client_id, world_index);
@@ -17629,7 +17701,7 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -17638,7 +17710,7 @@ impl App {
                     web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
-                    zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
+                    zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                     log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile,
                 );
             }
@@ -19546,7 +19618,8 @@ pub(crate) struct SetupSettings {
     pub(crate) editor_side: String,
     pub(crate) zwj_enabled: bool,
     pub(crate) ansi_music: bool,
-    pub(crate) new_line_indicator: bool,
+    /// `NewIndicator` by name: the style of the new-text marker.
+    pub(crate) new_indicator: String,
     pub(crate) tts_mode: String,
     pub(crate) tts_speak_mode: String,
     pub(crate) tts_voice: String,
@@ -19812,6 +19885,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     let is_web = popup_id == Some(popup::PopupId("web"));
     let is_modify_key = popup_id == Some(popup::PopupId("modify_key"));
     let is_reveal_speed = popup_id == Some(popup::PopupId("reveal_speed"));
+    let is_glow_scheme = popup_id == Some(popup::PopupId("glow_scheme"));
     let is_remote_access = popup_id == Some(popup::PopupId("remote_access"));
     let is_connections = popup_id == Some(popup::PopupId("connections"));
     let is_actions_list = popup_id == Some(popup::PopupId("actions_list"));
@@ -19839,7 +19913,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 .unwrap_or("left").to_string(),
             zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
             ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
-            new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
+            new_indicator: state.get_selected(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or("none").to_string(),
             tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
             tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
             tts_voice: state.get_text(SETUP_FIELD_TTS_VOICE).unwrap_or(kokoro::DEFAULT_VOICE).to_string(),
@@ -20171,6 +20245,13 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             app.popup_manager.close();
                             return NewPopupAction::Command("/import".to_string());
                         }
+                    } else if state.selected == popup::ElementSelection::Field(SETUP_FIELD_NEW_LINE_INDICATOR)
+                        && popup::definitions::setup::new_indicator_custom_picked(state)
+                    {
+                        // Enter on New Indicator's Custom entry opens the scheme picker; on any
+                        // other entry it cycles, as Text Reveal's does.
+                        let theme = app.settings.theme;
+                        popup::definitions::glow_scheme::open_glow_scheme_picker(&mut app.popup_manager, theme);
                     } else if state.selected == popup::ElementSelection::Field(SETUP_FIELD_TEXT_REVEAL)
                         && popup::definitions::setup::text_reveal_speed_picked(state).is_some()
                     {
@@ -20286,6 +20367,49 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     }
                 }
                 _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // The New Background - Custom scheme picker over /setup (glow_scheme.rs): Enter or OK
+        // puts the highlighted scheme on the Setup select, Esc and Cancel change nothing.
+        if is_glow_scheme {
+            use popup::definitions::glow_scheme::{GLOW_SCHEME_BTN_CANCEL, GLOW_SCHEME_BTN_OK, GLOW_SCHEME_FIELD_LIST, picked_value};
+            enum Pick { Ok, Cancel, None }
+            let action = match key.code {
+                Esc => Pick::Cancel,
+                Enter | Char(' ') => {
+                    if state.is_button_focused(GLOW_SCHEME_BTN_CANCEL) { Pick::Cancel } else { Pick::Ok }
+                }
+                Up => {
+                    state.select_field(GLOW_SCHEME_FIELD_LIST);
+                    state.list_select_up();
+                    Pick::None
+                }
+                Down => {
+                    state.select_field(GLOW_SCHEME_FIELD_LIST);
+                    state.list_select_down();
+                    Pick::None
+                }
+                Tab => { state.cycle_field_buttons(); Pick::None }
+                BackTab => { state.cycle_field_buttons_rev(); Pick::None }
+                Char(c) => match state.find_button_by_shortcut(c) {
+                    Some(id) if id == GLOW_SCHEME_BTN_OK => Pick::Ok,
+                    Some(id) if id == GLOW_SCHEME_BTN_CANCEL => Pick::Cancel,
+                    _ => Pick::None,
+                },
+                _ => Pick::None,
+            };
+            match action {
+                Pick::Ok => {
+                    let value = picked_value(state);
+                    app.popup_manager.close();
+                    if let (Some(value), Some(setup)) = (value, app.popup_manager.current_mut()) {
+                        popup::definitions::setup::set_new_indicator_value(setup, &value);
+                    }
+                }
+                Pick::Cancel => app.popup_manager.close(),
+                Pick::None => {}
             }
             return NewPopupAction::None;
         }
@@ -21838,6 +21962,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // What any ending leaves in debug.log, in every mode (src/crashlog.rs): the panic hook,
+    // the fatal-signal / unhandled-exception handler, the start time for the banner.
+    crashlog::install();
 
     // On Windows, ensure Winsock is initialized before any socket operations.
     // This is needed because inherited socket handles from a parent process
@@ -22391,11 +22518,15 @@ async fn main() -> io::Result<()> {
 
     // Handle --multiuser mode
     if multiuser_mode {
+        crashlog::session("multiuser");
+        // It has no SIGTERM/SIGHUP handling of its own: an exit line rather than none.
+        crashlog::record_ending_signals();
         return run_multiuser_server().await;
     }
 
     // Handle -D (daemon mode)
     if daemon_mode {
+        crashlog::session("daemon");
         return run_daemon_server().await;
     }
 
@@ -22459,85 +22590,9 @@ async fn main() -> io::Result<()> {
     #[cfg(target_os = "linux")]
     platform::IS_GUI_MODE.store(use_gui, std::sync::atomic::Ordering::SeqCst);
 
-    // Set up signal handlers for crash debugging (not available on Android or
-    // Windows). Registered here, before the GUI dispatch below, rather than only
-    // in the TUI fall-through path — a GUI-mode crash (e.g. WebKit's own abort()
-    // when GBM/EGL init fails) needs exactly the same handling, and previously
-    // never reached it since the GUI arms below `return` before this point.
-    #[cfg(all(unix, not(target_os = "android")))]
-    unsafe {
-        extern "C" fn sigfpe_handler(_: libc::c_int) {
-            // Restore terminal before printing
-            let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-            debug_log(is_debug_enabled(), "CRASH: SIGFPE (Floating Point Exception)");
-            eprintln!("\n\n=== SIGFPE (Floating Point Exception) detected! ===");
-            eprintln!("This is typically caused by division by zero.");
-            eprintln!("Please report this bug with the steps to reproduce.");
-
-            // Try to print a backtrace
-            eprintln!("\nBacktrace:");
-            let bt = std::backtrace::Backtrace::force_capture();
-            let bt_str = format!("{}", bt);
-            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
-            eprintln!("{}", bt);
-
-            std::process::exit(136);  // 128 + 8 (SIGFPE)
-        }
-        libc::signal(libc::SIGFPE, sigfpe_handler as *const () as libc::sighandler_t);
-
-        extern "C" fn sigsegv_handler(_: libc::c_int) {
-            let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-            debug_log(is_debug_enabled(), "CRASH: SIGSEGV (Segmentation Fault)");
-            eprintln!("\n\n=== SIGSEGV (Segmentation Fault) detected! ===");
-            let bt = std::backtrace::Backtrace::force_capture();
-            let bt_str = format!("{}", bt);
-            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
-            eprintln!("{}", bt);
-            std::process::exit(139);  // 128 + 11 (SIGSEGV)
-        }
-        libc::signal(libc::SIGSEGV, sigsegv_handler as *const () as libc::sighandler_t);
-
-        extern "C" fn sigbus_handler(_: libc::c_int) {
-            let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-            debug_log(is_debug_enabled(), "CRASH: SIGBUS (Bus Error)");
-            eprintln!("\n\n=== SIGBUS (Bus Error) detected! ===");
-            let bt = std::backtrace::Backtrace::force_capture();
-            let bt_str = format!("{}", bt);
-            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
-            eprintln!("{}", bt);
-            std::process::exit(135);  // 128 + 7 (SIGBUS)
-        }
-        libc::signal(libc::SIGBUS, sigbus_handler as *const () as libc::sighandler_t);
-
-        extern "C" fn sigabrt_handler(_: libc::c_int) {
-            // GUI-mode-only, no-op everywhere else: if hardware-accelerated GUI
-            // rendering just aborted (e.g. WebKit2GTK's GBM/EGL init failure) and
-            // software rendering hasn't been tried yet, relaunch once with it
-            // forced instead of falling through to a scary crash report — this is
-            // an expected, handled condition on a machine without working
-            // GPU/EGL, not a bug. Only returns (continuing below) if that doesn't
-            // apply or the relaunch itself couldn't be started.
-            platform::maybe_gui_software_fallback();
-
-            let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-            debug_log(is_debug_enabled(), "CRASH: SIGABRT (Abort)");
-            eprintln!("\n\n=== SIGABRT (Abort) detected! ===");
-            let bt = std::backtrace::Backtrace::force_capture();
-            let bt_str = format!("{}", bt);
-            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
-            eprintln!("{}", bt);
-            std::process::exit(134);  // 128 + 6 (SIGABRT)
-        }
-        libc::signal(libc::SIGABRT, sigabrt_handler as *const () as libc::sighandler_t);
-    }
-
-    // Set up crash handler for automatic recovery (not available on Android)
-    #[cfg(not(target_os = "android"))]
-    setup_crash_handler();
+    // The console paths: a panic restores the terminal and restarts Clay, and a fatal
+    // signal restores the terminal (src/crashlog.rs, installed at the top of main).
+    crashlog::restart_on_panic();
 
     // Dispatch based on (interface, connection_mode)
     match (use_gui, remote_addr) {
@@ -22545,6 +22600,8 @@ async fn main() -> io::Result<()> {
         (true, Some(ref addr)) => {
             #[cfg(feature = "webview-gui")]
             {
+                crashlog::session(&format!("web-gui attached to {addr}"));
+                crashlog::record_ending_signals();
                 return webview_gui::run_remote_webgui(addr, ssh_target);
             }
             #[cfg(not(feature = "webview-gui"))]
@@ -22558,6 +22615,7 @@ async fn main() -> io::Result<()> {
         (true, None) => {
             #[cfg(feature = "webview-gui")]
             {
+                crashlog::session("web-gui");
                 return webview_gui::run_master_webgui();
             }
             #[cfg(not(feature = "webview-gui"))]
@@ -22567,6 +22625,8 @@ async fn main() -> io::Result<()> {
         }
         // Remote console: connect to a running Clay instance via WebSocket
         (false, Some(ref addr)) => {
+            crashlog::session(&format!("console attached to {addr}"));
+            crashlog::record_ending_signals();
             return remote_client::run_console_client(addr, ssh_target).await;
         }
         // Master console: default TUI mode (falls through to existing code below)
@@ -22607,7 +22667,9 @@ async fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    crashlog::session("console");
     let result = run_app(&mut terminal).await;
+    crashlog::default_exit_reason(if result.is_ok() { "quit" } else { "error" });
 
     disable_raw_mode()?;
     let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
@@ -22684,6 +22746,9 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
         match resolve_web_cert_files(app) {
             Some((cert_file, key_file)) => {
                 let mut https_server = HttpsServer::new(http_port);
+                // The old listener goes when its accept task sees the shutdown, which may
+                // be after this bind: keep trying while the port is still ours.
+                https_server.bind_retry = true;
                 match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, ban_list, theme_css, gate.clone()).await {
                     Ok(()) => {
                         app.add_output(&format!("HTTPS web interface restarted on port {http_port}"));
@@ -22691,7 +22756,7 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
                         app.after_http_server_started();
                     }
                     Err(e) => {
-                        app.add_output(&format!("Failed to start HTTPS server on port {http_port}: {e}"));
+                        app.add_output(&http::start_warning("HTTPS", e.as_ref()));
                     }
                 }
             }
@@ -23093,14 +23158,16 @@ pub async fn run_app_headless(
             }
         }
 
-        // Clear splash screen so the reload message is visible (splash hides output_lines)
-        app.current_world_mut().showing_splash = false;
+        // The current world may be on its splash (restored, or regenerated by
+        // ensure_has_world for an empty one) and stays there: the splash renderer draws
+        // the output lines centred under the art, so the message shows. Forcing the splash
+        // off here left the regenerated art at column 0 after every reload.
         let reload_msg = if is_crash {
-            "Crash recovery complete."
+            crashlog::restart_notice()
         } else {
-            selfupdate::RELOADED
+            selfupdate::RELOADED.to_string()
         };
-        app.add_output(reload_msg);
+        app.add_output(&reload_msg);
     }
 
     // In GUI master mode, enable the web interface with the GUI's password: the one the
@@ -23161,6 +23228,7 @@ pub async fn run_app_headless(
             #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
             {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
+                https_server.bind_retry = http::port_released_by_predecessor(app.settings.http_port);
                 match start_https_server(
                     &mut https_server,
                     &cert_file,
@@ -23178,7 +23246,9 @@ pub async fn run_app_headless(
                         app.after_http_server_started();
                     }
                     Err(e) => {
-                        app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
+                        app.add_output(&http::start_warning("HTTPS", e.as_ref()));
+                        // The GUI's "Clay failed to start" dialog gets the long form (the
+                        // port's owner, where known).
                         *GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
                     }
                 }
@@ -23419,7 +23489,7 @@ pub async fn run_app_headless(
                         tfrun::drain_deferred_tf_daemon(&mut app, &event_tx).await;
                         if event != tf::TfHookEvent::Sigusr2 {
                             tokio::time::sleep(Duration::from_millis(300)).await;
-                            std::process::exit(0);
+                            crashlog::exit_process(0, if event == tf::TfHookEvent::Sighup { "SIGHUP" } else { "SIGTERM" });
                         }
                     }
                     AppEvent::SystemMessage(msg) => {
@@ -23572,6 +23642,7 @@ pub async fn run_app_headless(
                 // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE);
                 // piggybacking on this existing once-a-minute tick rather than a new timer.
                 app.reap_stale_ws_client_worlds();
+                app.note_crash_context();
                 app.maybe_renew_port_mapping();
                 for world in &mut app.worlds {
                     if world.connected && world.wants_keepalive() {
@@ -24043,6 +24114,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // so that more-mode continues seamlessly. Disconnected worlds have their
     // pending_lines cleared in the cleanup pass below (line ~17205).
 
+    // An earlier Clay on this machine that crashed (src/crashlog.rs).
+    startup_messages.extend(crashlog::take_notices());
     // Now display any startup messages
     debug_log(is_debug_enabled(), "STARTUP: Displaying startup messages...");
     for msg in startup_messages {
@@ -24463,14 +24536,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        // Clear splash screen so the reload message is visible (splash hides output_lines)
-        app.current_world_mut().showing_splash = false;
+        // The current world may be on its splash (restored, or regenerated by
+        // ensure_has_world for an empty one) and stays there: the splash renderer draws
+        // the output lines centred under the art, so the message shows. Forcing the splash
+        // off here left the regenerated art at column 0 after every reload.
         let reload_msg = if is_crash {
-            "Crash recovery complete."
+            crashlog::restart_notice()
         } else {
-            selfupdate::RELOADED
+            selfupdate::RELOADED.to_string()
         };
-        app.add_output(reload_msg);
+        app.add_output(&reload_msg);
     }
 
     debug_log(is_debug_enabled(), "STARTUP: Keepalives sent, starting servers...");
@@ -24522,6 +24597,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             #[cfg(feature = "native-tls-backend")]
             {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
+                // A reload/crash successor waits for the port its predecessor held; a cold
+                // start, or a successor whose predecessor never had the port, binds once
+                // and says so at once (a second Clay).
+                https_server.bind_retry = http::port_released_by_predecessor(app.settings.http_port);
                 match start_https_server(
                     &mut https_server,
                     &cert_file,
@@ -24539,16 +24618,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.after_http_server_started();
                     }
                     Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                            app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
-                        }
+                        app.add_output(&http::start_warning("HTTPS", e.as_ref()));
                     }
                 }
             }
             #[cfg(feature = "rustls-backend")]
             {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
+                // A reload/crash successor waits for the port its predecessor held; a cold
+                // start, or a successor whose predecessor never had the port, binds once
+                // and says so at once (a second Clay).
+                https_server.bind_retry = http::port_released_by_predecessor(app.settings.http_port);
                 match start_https_server(
                     &mut https_server,
                     &cert_file,
@@ -24566,10 +24646,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.after_http_server_started();
                     }
                     Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                            app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
-                        }
+                        app.add_output(&http::start_warning("HTTPS", e.as_ref()));
                     }
                 }
             }
@@ -25212,6 +25289,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::TfSignal(event) => {
                         app.fire_tf_hook(None, event, "", false);
+                        if event != tf::TfHookEvent::Sigusr2 {
+                            crashlog::exit_reason(if event == tf::TfHookEvent::Sighup { "SIGHUP" } else { "SIGTERM" });
+                        }
                         if event != tf::TfHookEvent::Sigusr2
                             && handle_command("/quit", &mut app, event_tx.clone()).await
                         {
@@ -25422,6 +25502,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 needs_draw = true; // Clock display updates every minute
                 // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE).
                 app.reap_stale_ws_client_worlds();
+                app.note_crash_context();
                 app.maybe_renew_port_mapping();
 
                 // Clear popup error messages after timeout
@@ -25883,6 +25964,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Handled by the main select arm; a batch never holds one long.
                 AppEvent::TfSignal(event) => {
                     app.fire_tf_hook(None, event, "", false);
+                    if event != tf::TfHookEvent::Sigusr2 {
+                        crashlog::exit_reason(if event == tf::TfHookEvent::Sighup { "SIGHUP" } else { "SIGTERM" });
+                    }
                     if event != tf::TfHookEvent::Sigusr2
                         && handle_command("/quit", &mut app, event_tx.clone()).await
                     {

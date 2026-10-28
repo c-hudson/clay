@@ -23,6 +23,8 @@ pub const SETUP_FIELD_EDITOR_SIDE: FieldId = FieldId(11);
 // the mouse in a popup and a live shell world
 pub const SETUP_FIELD_ZWJ: FieldId = FieldId(13);
 pub const SETUP_FIELD_ANSI_MUSIC: FieldId = FieldId(14);
+/// The new-text marker's style (`Settings::new_indicator`, `NewIndicator::OPTIONS`): a
+/// select since 2026-10-28 (it was a toggle; the id is kept).
 pub const SETUP_FIELD_NEW_LINE_INDICATOR: FieldId = FieldId(17);
 pub const SETUP_FIELD_TTS: FieldId = FieldId(18);
 pub const SETUP_FIELD_TTS_SPEAK_MODE: FieldId = FieldId(19);
@@ -173,6 +175,50 @@ pub fn picture_host_options() -> Vec<SelectOption> {
     crate::picture::PictureService::OPTIONS.iter().map(|(v, l)| SelectOption::new(*v, *l)).collect()
 }
 
+/// New-text indicator style options (the one list every UI shows, `NewIndicator::OPTIONS`),
+/// the Custom entry shown as `current`'s scheme when it is one, else the first scheme
+/// ("New Background - Custom (Teal)"): picking it, or Enter on it, opens the scheme picker
+/// (glow_scheme.rs). The native GUI's pick is built from this too.
+pub fn new_indicator_options(current: &str) -> Vec<SelectOption> {
+    let custom = match crate::NewIndicator::from_name(current) {
+        c @ crate::NewIndicator::Custom(_) => c,
+        _ => crate::NewIndicator::Custom(0),
+    };
+    crate::NewIndicator::OPTIONS
+        .iter()
+        .map(|(v, l)| if *v == crate::NewIndicator::CUSTOM { SelectOption::new(custom.name(), custom.label()) } else { SelectOption::new(*v, *l) })
+        .collect()
+}
+
+/// Which of `new_indicator_options(current)` is `current` (None when unknown).
+pub fn new_indicator_index(current: &str) -> usize {
+    let name = crate::NewIndicator::from_name(current).name();
+    new_indicator_options(current).iter().position(|o| o.value == name).unwrap_or(0)
+}
+
+/// The Setup select rests on the Custom entry.
+pub fn new_indicator_custom_picked(state: &crate::popup::PopupState) -> bool {
+    state.get_selected(SETUP_FIELD_NEW_LINE_INDICATOR).is_some_and(crate::NewIndicator::is_custom_name)
+}
+
+/// Put `value` (a NewIndicator name) on the Setup select: a scheme takes the Custom entry
+/// over, relabelled; any other value selects its own entry.
+pub fn set_new_indicator_value(state: &mut crate::popup::PopupState, value: &str) {
+    let indicator = crate::NewIndicator::from_name(value);
+    let name = indicator.name();
+    if let Some(FieldKind::Select { options, selected_index }) = state.field_mut(SETUP_FIELD_NEW_LINE_INDICATOR).map(|f| &mut f.kind) {
+        if matches!(indicator, crate::NewIndicator::Custom(_)) {
+            if let Some(entry) = options.iter_mut().find(|o| crate::NewIndicator::is_custom_name(&o.value)) {
+                entry.value = name.clone();
+                entry.label = indicator.label();
+            }
+        }
+        if let Some(at) = options.iter().position(|o| o.value == name) {
+            *selected_index = at;
+        }
+    }
+}
+
 /// Separator-bar style options (the one list every UI shows, `SeparatorStyle::OPTIONS`)
 pub fn separator_style_options() -> Vec<SelectOption> {
     crate::SeparatorStyle::OPTIONS.iter().map(|(v, l)| SelectOption::new(*v, *l)).collect()
@@ -192,7 +238,7 @@ pub fn create_setup_popup(
     editor_side: &str,
     zwj_enabled: bool,
     ansi_music: bool,
-    new_line_indicator: bool,
+    new_indicator: &str,
     tts_mode: &str,
     tts_speak_mode: &str,
     tts_voice: &str,
@@ -217,6 +263,7 @@ pub fn create_setup_popup(
     let icon_bar_idx = icon_bar_options().iter().position(|o| o.value == icon_bar).unwrap_or(1);
     let picture_host_idx = picture_host_options().iter().position(|o| o.value == picture_host).unwrap_or(0);
     let separator_style_idx = separator_style_options().iter().position(|o| o.value == separator_style).unwrap_or(0);
+    let new_indicator_idx = new_indicator_index(new_indicator);
 
     let mut def = PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -282,7 +329,7 @@ pub fn create_setup_popup(
         .with_field(Field::new(
             SETUP_FIELD_NEW_LINE_INDICATOR,
             "New Indicator",
-            FieldKind::toggle(new_line_indicator),
+            FieldKind::select(new_indicator_options(new_indicator), new_indicator_idx),
         ))
         .with_field(Field::new(
             SETUP_FIELD_TEXT_REVEAL,
@@ -458,8 +505,14 @@ fn setup_help_text() -> Vec<String> {
         "",
         "ANSI Music: Play ANSI music sequences from MUDs.",
         "",
-        "New Indicator: Show a marker on new lines arriving",
-        "  while scrolled up in the output buffer.",
+        "New Indicator: How text that arrived while you were",
+        "  in another world is marked. New Character: a green",
+        "  ▶ in front of each line. New Background: a green",
+        "  glow behind its first 4 characters, fading to the",
+        "  theme's background. New Background - Custom: the",
+        "  same glow in another colour; press Enter on it to",
+        "  pick one of ten. None: not marked. Leaving the",
+        "  world or Ctrl+L clears the marks, in any style.",
         "",
         "Text Reveal: Type newly arrived lines, and the screen a",
         "  world switch shows, onto the screen behind a glitching",
@@ -523,7 +576,7 @@ pub fn create_setup_popup_for_test(text_reveal: &str) -> PopupDefinition {
     create_setup_popup(
         true, true, false, "unseen_first",
         false, 3, "dark", false, "left", false, true,
-        false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
+        "none", "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
         text_reveal, "web",
     )
 }
@@ -577,7 +630,7 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "left", false, true,
-            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
+            "none", "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
             "off", "web",
         );
         let state = PopupState::new(def);
@@ -593,7 +646,7 @@ mod tests {
         let mut def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "left", false, true,
-            false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
+            "none", "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", "catbox", false,
             "off", "web",
         );
         add_import_button(&mut def);
@@ -614,7 +667,7 @@ mod tests {
                 let mut def = create_setup_popup(
                     true, true, false, "unseen_first",
                     false, 3, "dark", false, "left", false, true,
-                    false, "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", value, false,
+                    "none", "off", "words", "af_heart", false, false, 0, true, "none", "app_tablet", value, false,
                     "off", "web",
                 );
                 add_import_button(&mut def);
@@ -642,7 +695,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "left", true, true,
-            false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
+            "background", "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
             "fast", "tinyfugue",
         );
         for id in CONSOLE_HIDDEN_FIELDS {
@@ -669,7 +722,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "left", true, true,
-            false, "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
+            "background", "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
             "fast", "tinyfugue",
         );
         let state = PopupState::new(def);
@@ -693,6 +746,36 @@ mod tests {
         assert_eq!(state.get_bool(SETUP_FIELD_CLEAR_INPUT), Some(true));
         assert_eq!(state.get_selected(SETUP_FIELD_TEXT_REVEAL), Some("fast"));
         assert_eq!(state.get_selected(SETUP_FIELD_SEPARATOR_STYLE), Some("tinyfugue"));
+    }
+
+    /// New Indicator is a select of `NewIndicator::OPTIONS`, None first (the default); its
+    /// value is read back by name, and an unknown saved value shows as None.
+    #[test]
+    fn the_new_indicator_choices_are_the_enums_options_none_first() {
+        let values: Vec<String> = new_indicator_options("none").iter().map(|o| o.value.clone()).collect();
+        assert_eq!(values, ["none", "character", "background", "custom:teal"]);
+        let custom = new_indicator_options("custom:red");
+        assert_eq!((custom[3].value.as_str(), custom[3].label.as_str()), ("custom:red", "New Background - Custom (Red)"));
+        assert_eq!(new_indicator_index("custom:red"), 3);
+        assert_eq!(crate::NewIndicator::default().name(), "none");
+        let def = create_setup_popup_for_test("off");
+        assert_eq!(PopupState::new(def).get_selected(SETUP_FIELD_NEW_LINE_INDICATOR), Some("none"));
+        let def = create_setup_popup(
+            true, false, true, "alphabetical",
+            true, 5, "light", true, "left", true, true,
+            "background", "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
+            "fast", "tinyfugue",
+        );
+        assert_eq!(PopupState::new(def).get_selected(SETUP_FIELD_NEW_LINE_INDICATOR), Some("background"));
+        let def = create_setup_popup(
+            true, false, true, "alphabetical",
+            true, 5, "light", true, "left", true, true,
+            "plaid", "edge", "sentences", "bm_george", true, false, 4, false, "top", "all", "sxcu+short", true,
+            "fast", "tinyfugue",
+        );
+        assert_eq!(PopupState::new(def).get_selected(SETUP_FIELD_NEW_LINE_INDICATOR), Some("none"));
+        let help = setup_help_text().join("\n");
+        assert!(help.contains("New Background:") && help.contains("New Character:"), "the help names both styles");
     }
 
     /// The Separator Style choices are `SeparatorStyle::OPTIONS`, Web first (the default),

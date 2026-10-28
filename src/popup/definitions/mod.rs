@@ -8,6 +8,7 @@ pub mod confirm;
 pub mod connections;
 pub mod emoji;
 pub mod filter;
+pub mod glow_scheme;
 pub mod help;
 pub mod import;
 pub mod menu;

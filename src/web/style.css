@@ -257,6 +257,15 @@ body {
     text-indent: calc(var(--wrapspace, 0) * -1ch);
 }
 
+/* New Indicator's background style (src/newbg.rs): the green glow behind the first 4 cells
+   of every row of a line this client owns. --new-glow is the four cells as hard stops, built
+   by newGlowGradient() in app.js from the theme's background; on the block, so each wrapped
+   row's column 0 gets it, and the text's own backgrounds and a /highlight's block paint over
+   it. The ▶ style adds text instead (lineHtml). */
+#output .line.new-glow {
+    background: var(--new-glow, none);
+}
+
 /* TF's %textdiv (textdivHtml() in app.js): the divider between text already shown and text
    that arrived since, and for "clear" a blank as tall as the output area. Not selectable:
    copying output must not pick them up. */

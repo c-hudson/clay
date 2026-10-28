@@ -2351,28 +2351,30 @@ pub(crate) fn execute_mssp_command(app: &mut App, world_idx: usize, is_daemon_mo
         return;
     }
     let pairs = app.worlds[world_idx].protocol.mssp_data.clone();
+    let lines = mssp_lines(&pairs);
     if pairs.is_empty() {
-        app.emit_client_text(
-            world_idx,
-            "No MSSP data for this world (not negotiated yet, or the server sent none).",
-            is_daemon_mode,
-        );
-        return;
+        app.emit_client_text(world_idx, &lines[0], is_daemon_mode);
+    } else {
+        app.emit_client_lines(world_idx, &lines, is_daemon_mode);
+    }
+}
+
+/// `/mssp`'s text for a connection's MSSP `pairs`: the table, or the one line saying
+/// there is none. One formatter for the single-user paths (the `World`'s data) and
+/// multiuser (the user's own connection's, `daemon::multiuser_typed_line`).
+pub(crate) fn mssp_lines(pairs: &[(String, String)]) -> Vec<String> {
+    if pairs.is_empty() {
+        return vec!["No MSSP data for this world (not negotiated yet, or the server sent none).".to_string()];
     }
     let mut lines = Vec::with_capacity(pairs.len() + 2);
     lines.push("MSSP Server Status:".to_string());
     lines.push("\u{2500}".repeat(50));
-    for (name, value) in &pairs {
-        // T1.5: `name`/`value` are raw subnegotiation bytes (`from_utf8_lossy`, never
-        // through `Encoding::decode`), and the console draw path strips only C1 — a
-        // raw ESC would otherwise reach the terminal (clear screen, move the cursor,
-        // rewrite the title). Same treatment as `execute_stats_command` above, for the
-        // same reason.
+    for (name, value) in pairs {
         let name = stats::sanitize_and_cap(name, stats::MAX_STAT_FIELD_WIDTH);
         let value = stats::sanitize_and_cap(value, stats::MAX_STAT_FIELD_WIDTH);
         lines.push(format!("{:<24} {}", name, value));
     }
-    app.emit_client_lines(world_idx, &lines, is_daemon_mode);
+    lines
 }
 
 /// Shared `/stats` body (mud-status-display.md Job 4; plan revision — D3 originally
@@ -2396,18 +2398,24 @@ pub(crate) fn execute_stats_command(app: &mut App, world_idx: usize, is_daemon_m
         return;
     }
     let entries = app.worlds[world_idx].current_stat_entries();
+    let lines = stats_lines(&entries);
     if entries.is_empty() {
-        app.emit_client_text(
-            world_idx,
-            "No status data for this world (no GMCP Char.* or MSDP data received yet).",
-            is_daemon_mode,
-        );
-        return;
+        app.emit_client_text(world_idx, &lines[0], is_daemon_mode);
+    } else {
+        app.emit_client_lines(world_idx, &lines, is_daemon_mode);
+    }
+}
+
+/// `/stats`'s text for a connection's status `entries`: the table, or the one line saying
+/// there is none (see `mssp_lines`).
+pub(crate) fn stats_lines(entries: &[stats::StatEntry]) -> Vec<String> {
+    if entries.is_empty() {
+        return vec!["No status data for this world (no GMCP Char.* or MSDP data received yet).".to_string()];
     }
     let mut lines = Vec::with_capacity(entries.len() + 2);
     lines.push("Status Display:".to_string());
     lines.push("\u{2500}".repeat(50));
-    for entry in &entries {
+    for entry in entries {
         let key = stats::sanitize_and_cap(&entry.key, stats::MAX_STAT_FIELD_WIDTH);
         let value = match &entry.value {
             stats::StatValue::Plain(v) => stats::sanitize_and_cap(v, stats::MAX_STAT_FIELD_WIDTH),
@@ -2419,7 +2427,7 @@ pub(crate) fn execute_stats_command(app: &mut App, world_idx: usize, is_daemon_m
         };
         lines.push(format!("{:<24} {}", key, value));
     }
-    app.emit_client_lines(world_idx, &lines, is_daemon_mode);
+    lines
 }
 
 /// Shared `/msdp <verb> [target]` body (plan Job 12 / 4.3): send an outbound

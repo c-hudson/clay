@@ -798,7 +798,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
-                app.settings.new_line_indicator = settings.new_line_indicator;
+                app.settings.new_indicator = crate::NewIndicator::from_name(&settings.new_indicator);
                 app.settings.keyboard_always_visible = settings.keyboard_always_visible;
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
@@ -941,7 +941,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                                         world_part,
                                                         pattern_preview,
                                                     ],
-                                                    style: popup::ListItemStyle {
+                                                    style: popup::ListItemStyle { swatch: None,
                                                         is_disabled: !info.enabled,
                                                         ..Default::default()
                                                     },
@@ -1006,7 +1006,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                             world_part,
                                             pattern_preview,
                                         ],
-                                        style: popup::ListItemStyle {
+                                        style: popup::ListItemStyle { swatch: None,
                                             is_disabled: !info.enabled,
                                             ..Default::default()
                                         },

@@ -48,7 +48,7 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
             ListItem {
                 id: w.name.clone(),
                 columns,
-                style: ListItemStyle {
+                style: ListItemStyle { swatch: None,
                     is_current: w.is_current,
                     is_connected: w.is_connected,
                     is_disabled: false,
@@ -165,7 +165,7 @@ pub fn update_world_list(state: &mut crate::popup::PopupState, worlds: &[WorldIn
                     ListItem {
                         id: w.name.clone(),
                         columns,
-                        style: ListItemStyle {
+                        style: ListItemStyle { swatch: None,
                             is_current: w.is_current,
                             is_connected: w.is_connected,
                             is_disabled: false,

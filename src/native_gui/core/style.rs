@@ -94,6 +94,9 @@ pub struct StyledLine {
     pub breaks: Vec<usize>,
     /// A background behind the whole line, edge to edge (`/highlight`).
     pub line_bg: Option<Rgb>,
+    /// New Indicator's background style on a line this client owns: the output paints the
+    /// green glow behind the first cells of each of its rows (src/newbg.rs).
+    pub new_glow: bool,
 }
 
 /// Settings that change how a line is styled.

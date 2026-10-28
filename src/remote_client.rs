@@ -982,6 +982,11 @@ fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSen
         world_index: current_world_index,
         previous_world_index: None,
     });
+    // An earlier Clay on this machine that crashed (src/crashlog.rs): said once, now that
+    // there is a world to say it in (taken, so a reconnect doesn't repeat it).
+    for notice in crate::crashlog::take_notices() {
+        app.add_output(&notice);
+    }
     app.needs_output_redraw = true;
 }
 
@@ -2229,7 +2234,7 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
-                app.settings.new_line_indicator = settings.new_line_indicator;
+                app.settings.new_indicator = crate::NewIndicator::from_name(&settings.new_indicator);
                 app.settings.keyboard_always_visible = settings.keyboard_always_visible;
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
@@ -2297,7 +2302,8 @@ pub(crate) fn handle_remote_client_key(
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
                     mouse_enabled: true,  // always on; an older server reads a missing field as off
                     zwj_enabled: app.settings.zwj_enabled,
-                    new_line_indicator: app.settings.new_line_indicator,
+                    new_line_indicator: app.settings.new_indicator.is_on(),
+                    new_indicator: Some(app.settings.new_indicator.name().to_string()),
                     tts_mode: app.settings.tts_mode.name().to_string(),
                     tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
                     tts_voice: app.settings.tts_voice.clone(),
@@ -2409,7 +2415,7 @@ pub(crate) fn handle_remote_client_key(
                                                         world_part,
                                                         pattern_preview,
                                                     ],
-                                                    style: popup::ListItemStyle {
+                                                    style: popup::ListItemStyle { swatch: None,
                                                         is_disabled: !info.enabled,
                                                         ..Default::default()
                                                     },
@@ -2469,7 +2475,7 @@ pub(crate) fn handle_remote_client_key(
                                             world_part,
                                             pattern_preview,
                                         ],
-                                        style: popup::ListItemStyle {
+                                        style: popup::ListItemStyle { swatch: None,
                                             is_disabled: !info.enabled,
                                             ..Default::default()
                                         },
@@ -2885,7 +2891,11 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
             if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                 let previous_idx = app.current_world_index;
                 app.current_world_index = idx;
-                let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
+                // Already shown (the server's WorldSwitched moved this console and marked
+                // it seen): no second claim for the same world.
+                if previous_idx != idx {
+                    let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
+                }
                 // From the server, it has connected the world already if it could.
                 if !from_server && !app.worlds[idx].connected {
                     if no_login {
@@ -3514,7 +3524,8 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
         mouse_enabled: true,  // always on; an older server reads a missing field as off
         zwj_enabled: app.settings.zwj_enabled,
-        new_line_indicator: app.settings.new_line_indicator,
+        new_line_indicator: app.settings.new_indicator.is_on(),
+        new_indicator: None,  // unchanged — this function only touches web settings
         tts_mode: app.settings.tts_mode.name().to_string(),
         tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
         tts_voice: app.settings.tts_voice.clone(),

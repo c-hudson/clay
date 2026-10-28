@@ -65,7 +65,7 @@ pub fn create_recent_worlds_popup(worlds: &[RecentWorldInfo], visible_height: us
                 w.name.clone(),
                 format_elapsed(w.last_secs),
             ],
-            style: ListItemStyle {
+            style: ListItemStyle { swatch: None,
                 is_current: false,  // current world is never in this list
                 is_connected: false,
                 is_disabled: false,

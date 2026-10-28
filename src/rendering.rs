@@ -596,7 +596,8 @@ pub(crate) fn display_wrapped_as(
         term_width,
         marked_new,
         line.shows_archive_prefix(),
-        settings.nli_drawn(),
+        // Only the ▶ character takes columns; the glow (New Background) is behind the text.
+        settings.nli_prefix(),
     );
     wrap_ansi_line(&text, width, settings.wrapspace as usize)
 }
@@ -1217,6 +1218,9 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
     let cached_now = CachedNow::new();
 
     let new_line_indicator = app.settings.nli_drawn();
+    // Which style: the ▶ in front of a new row, or the glow behind its first cells.
+    let new_prefix = app.settings.nli_prefix();
+    let new_glow = app.settings.nli_glow_start().map(|start| (start, crate::newbg::console_target(app.settings.theme)));
     // Minimum old (non-new) context rows to pin at the top when new text has arrived.
     // Zero while the user is scrolled back: there is no new text to give context to, and
     // composing would discard rows out of the middle of the screen (see visible_row_ranges).
@@ -1430,8 +1434,8 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
 
         let _ = stdout.queue(cursor::MoveTo(0, row_y));
 
-        // New line indicator: green triangle prefix for unseen/pending lines
-        if new_line_indicator && *marked_new {
+        // New line indicator, the character style: green triangle prefix for unseen lines
+        if new_prefix && *marked_new {
             let _ = stdout.queue(Print("\x1b[32m▶\x1b[0m "));
         }
 
@@ -1463,6 +1467,10 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
                 let padding = " ".repeat(term_width - line_visible_width);
                 let _ = stdout.queue(Print(padding));
             }
+        } else if let Some((start, to)) = new_glow.filter(|_| *marked_new) {
+            // New line indicator, the background style: the glow behind the row's first
+            // cells (src/newbg.rs). A /highlight or F8 colour above takes the row instead.
+            let _ = stdout.queue(Print(crate::newbg::glow_row(wrapped, start, to)));
         } else {
             let _ = stdout.queue(Print(wrapped));
         }
@@ -1931,19 +1939,25 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     //
     // Still crossterm-only, deliberately unchanged here: F8 highlight-action matching and
     // /highlight background painting, which this path has never drawn.
-    let new_line_indicator = app.settings.nli_drawn();
+    let new_prefix = app.settings.nli_prefix();
+    let new_glow = app.settings.nli_glow_start().map(|start| (start, crate::newbg::console_target(app.settings.theme)));
     let display = build_display_lines(world, &app.settings, visible_height, area_width, app.show_tags);
     let wrapped_lines: Vec<String> = display
         .into_iter()
         .map(|d| {
             // The ▶ and 🛢️ prefixes are added here, matching the width reserved for them by
             // display_wrap_width. ARCHIVE_PREFIX_WIDTH is hardcoded rather than measured
-            // because the VS16 emoji "🛢️" reports 1 col but renders as 2 cells.
-            match (new_line_indicator && d.marked_new, d.from_archive) {
-                (true, true) => format!("\x1b[32m▶\x1b[0m 🛢️ {}", d.text),
-                (true, false) => format!("\x1b[32m▶\x1b[0m {}", d.text),
-                (false, true) => format!("🛢️ {}", d.text),
-                (false, false) => d.text,
+            // because the VS16 emoji "🛢️" reports 1 col but renders as 2 cells. The glow
+            // (New Background) goes behind the row's first cells instead (src/newbg.rs).
+            let text = match new_glow.filter(|_| d.marked_new) {
+                Some((start, to)) => crate::newbg::glow_row(&d.text, start, to),
+                None => d.text,
+            };
+            match (new_prefix && d.marked_new, d.from_archive) {
+                (true, true) => format!("\x1b[32m▶\x1b[0m 🛢️ {}", text),
+                (true, false) => format!("\x1b[32m▶\x1b[0m {}", text),
+                (false, true) => format!("🛢️ {}", text),
+                (false, false) => text,
             }
         })
         .collect();

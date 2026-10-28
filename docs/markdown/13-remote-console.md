@@ -43,7 +43,13 @@ WebSocket server. That process is one of two things:
   only worlds/actions they own; per-user telnet negotiation, character encoding,
   GMCP/MSDP/MSSP, and echo-based password masking are all tracked separately per
   connection, not shared globally. It is not a bare or output-only mode — it runs the
-  same protocol handling as a single-user instance, just scoped per account.
+  same protocol handling as a single-user instance, just scoped per account. A line you
+  type is parsed as on any Clay server: text goes to your MUD (`///x` sends the text `/x`),
+  and a command about your own worlds or window works (`/worlds`, `/connect`, `/dc`,
+  `/send`, `/flush`, `/stats`, `/mssp`, `/msdp`, `/help`, `/version`, `/dict`, `/url`,
+  your own actions, `/note`), finding a named world among yours only. Anything
+  server-wide — `/reload`, `/update`, `/setup`, bans, logs, `/note <file>`, TinyFugue
+  scripting (the engine is one for every user) — is refused with a line.
 
 ```bash
 ./clay -D           # headless daemon, single account

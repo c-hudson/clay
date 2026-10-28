@@ -174,11 +174,14 @@ pub struct ListItem {
 }
 
 /// Styling hints for list items
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ListItemStyle {
     pub is_current: bool,
     pub is_connected: bool,
     pub is_disabled: bool,
+    /// Backgrounds for the row's first cells (the glow scheme picker, glow_scheme.rs): its
+    /// first column's first characters are drawn over these, with black or white text.
+    pub swatch: Option<[[u8; 3]; 4]>,
 }
 
 impl FieldKind {

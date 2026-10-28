@@ -94,7 +94,7 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             ListItem {
                 id: a.index.to_string(),
                 columns,
-                style: ListItemStyle {
+                style: ListItemStyle { swatch: None,
                     is_disabled: !a.enabled,
                     ..Default::default()
                 },

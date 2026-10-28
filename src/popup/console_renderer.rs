@@ -5,7 +5,7 @@
 use ratatui::{
     backend::Backend,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
@@ -1143,10 +1143,31 @@ fn render_list_field(
             Style::default().fg(theme.fg())
         };
 
-        let line = Line::from(Span::styled(
-            truncate_str(&padded_text, content_width),
-            style,
-        ));
+        let shown = truncate_str(&padded_text, content_width);
+        let line = match item.style.swatch {
+            // The glow scheme picker: the first column's first characters (after the
+            // two-cell prefix) each on its swatch colour, with black or white text.
+            Some(swatch) => {
+                let mut spans = Vec::new();
+                let mut rest = shown.as_str();
+                let prefix: String = rest.chars().take(prefix.chars().count()).collect();
+                rest = &rest[prefix.len()..];
+                spans.push(Span::styled(prefix, style));
+                for rgb in swatch {
+                    let Some(ch) = rest.chars().next() else { break };
+                    rest = &rest[ch.len_utf8()..];
+                    let bg = crate::reveal::Rgb::from_array(rgb);
+                    let fg = crate::newbg::text_on(bg);
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default().bg(Color::Rgb(bg.0, bg.1, bg.2)).fg(Color::Rgb(fg.0, fg.1, fg.2)).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                spans.push(Span::styled(rest.to_string(), style));
+                Line::from(spans)
+            }
+            None => Line::from(Span::styled(shown, style)),
+        };
 
         f.render_widget(Paragraph::new(line), row_area);
     }

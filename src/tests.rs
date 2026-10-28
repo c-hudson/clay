@@ -3643,7 +3643,7 @@
         app.current_world_index = 0;
         app.output_width = 80;
         app.output_height = 8; // visual_budget = output_height - 2 = 6
-        app.settings.new_line_indicator = true;
+        app.settings.new_indicator = NewIndicator::Character;
 
         // 79 columns: at the full 80-col width that's 1 row (visual_line_count's estimate),
         // but marked_new + NLI narrows the wrap width to 78, wrapping it to 2 rows
@@ -6198,7 +6198,7 @@
         // scroll_offset at the end
         world.scroll_offset = world.output_lines.len() - 1;
 
-        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let settings = Settings { new_indicator: NewIndicator::Character, ..Settings::default() };
 
         let display = build_display_lines(&world, &settings, 21, 80, false);
 
@@ -6232,7 +6232,7 @@
         }
         world.scroll_offset = world.output_lines.len() - 1;
 
-        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let settings = Settings { new_indicator: NewIndicator::Character, ..Settings::default() };
 
         let display = build_display_lines(&world, &settings, 21, 80, false);
 
@@ -6267,7 +6267,7 @@
         }
         world.scroll_offset = world.output_lines.len() - 1;
 
-        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let settings = Settings { new_indicator: NewIndicator::Character, ..Settings::default() };
 
         let display = build_display_lines(&world, &settings, 21, 80, false);
 
@@ -6343,7 +6343,7 @@
     /// then a couple are missing, and the next paragraph starts mid-sentence".
     #[test]
     fn test_build_display_all_old_buffer_is_contiguous_at_band_edges() {
-        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let settings = Settings { new_indicator: NewIndicator::Character, ..Settings::default() };
         let height = 21usize;
         let width = 80usize;
 
@@ -6376,7 +6376,7 @@
     /// including when the anchor sits mid-paragraph, which row-exact paging now produces.
     #[test]
     fn test_build_display_scrollback_is_contiguous() {
-        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let settings = Settings { new_indicator: NewIndicator::Character, ..Settings::default() };
         let height = 21usize;
         let width = 80usize;
 
@@ -6404,7 +6404,7 @@
     /// keeps two old rows pinned above it.
     #[test]
     fn test_build_display_composition_still_pins_old_context() {
-        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let settings = Settings { new_indicator: NewIndicator::Character, ..Settings::default() };
         let height = 21usize;
 
         let mut world = World::new("test");
@@ -6448,7 +6448,7 @@
         let mut app = App::new();
         app.output_height = height;
         app.output_width = width;
-        app.settings.new_line_indicator = nli;
+        app.settings.new_indicator = NewIndicator::from_legacy(nli);
         app.settings.wrapspace = wrapspace;
         app.settings.more_mode_enabled = false;
         if app.worlds.is_empty() {
@@ -6966,7 +6966,7 @@ stymied, corruption is rife, borders are uncontrolled, and who knows what's next
             for &nli in &[false, true] {
                 for &width in &[20usize, 40, 80] {
                     let settings = Settings {
-                        new_line_indicator: nli,
+                        new_indicator: NewIndicator::from_legacy(nli),
                         wrapspace: 2,
                         ..Settings::default()
                     };
@@ -7030,7 +7030,7 @@ stymied, corruption is rife, borders are uncontrolled, and who knows what's next
         }
         world.scroll_offset = world.output_lines.len() - 1;
 
-        let settings = Settings { new_line_indicator: false, ..Settings::default() };
+        let settings = Settings { new_indicator: NewIndicator::None, ..Settings::default() };
 
         let display = build_display_lines(&world, &settings, 21, 80, false);
 
@@ -7360,7 +7360,7 @@ if you're more curious.\"";
         // Still have 11 more in pending
         world.paused = true;
 
-        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let settings = Settings { new_indicator: NewIndicator::Character, ..Settings::default() };
 
         let display = build_display_lines(&world, &settings, 21, 80, false);
 
@@ -8021,6 +8021,26 @@ third
         let action = restored.settings.actions.iter().find(|a| a.name == "spam")
             .expect("action restored");
         assert!(action.suppress_blanks, "the flag must survive a full reload round trip");
+    }
+
+    /// The splash rides the reload state - the flag and its lines - so a reload redraws it
+    /// centred as it was; the start-up paths must not force the flag off (user report
+    /// 2026-10-28: the art came back at column 0 after every reload).
+    #[test]
+    fn test_showing_splash_survives_a_reload() {
+        let mut app = App::new();
+        app.worlds = vec![World::new_with_splash("clay", true)];
+        let lines = app.worlds[0].output_lines.len();
+        assert!(app.worlds[0].showing_splash && lines > 0, "precondition: a splash with its art");
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
+        assert!(restored.worlds[0].showing_splash, "the flag must survive the round trip");
+        assert_eq!(restored.worlds[0].output_lines.len(), lines, "and so must the art under it");
     }
 
     /// TF state - a trigger, a key binding, a hook, a variable - comes through /reload:
@@ -9435,6 +9455,47 @@ third
     /// drop it when the connection ends: it never runs clear_connection_state itself, so
     /// `WorldDisconnected` is its one signal, or it masks every key typed into the next
     /// connection as `*`.
+    /// `App::switch_world` hands the new world's unviewed lines to the console - when there
+    /// is one. A headless server switching for a client (handler B's typed `/worlds`) leaves
+    /// them for that client's claim (deferred bug G1).
+    #[test]
+    fn test_switch_world_claims_for_the_console_only_when_there_is_one() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        let mut bravo = World::new("bravo");
+        bravo.output_lines.push(OutputLine::new("new".into(), 1));
+        app.worlds.push(bravo);
+        app.switch_world(1);
+        assert!(!app.worlds[1].output_lines[0].viewed && app.worlds[1].output_lines[0].display_id.is_none(), "headless: untouched");
+        app.switch_world(0);
+        app.console_tui = true;
+        app.switch_world(1);
+        assert_eq!(app.worlds[1].output_lines[0].display_id, Some(CONSOLE_DISPLAY_ID), "the console's ▶");
+        app.switch_world(0);
+        assert_eq!(app.worlds[1].output_lines[0].display_id, None, "released on leaving");
+    }
+
+    /// The server moved this console's view (WorldSwitched): the console tells it which
+    /// world it left and which it shows, once, so the server's claims and releases follow.
+    #[test]
+    fn test_console_client_marks_a_world_switched_by_the_server_seen() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds.push(World::new("bravo"));
+        app.current_world_index = 0;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        app.ws_client_tx = Some(tx);
+        app.handle_remote_ws_message(WsMessage::WorldSwitched { new_index: 1 });
+        assert_eq!(app.current_world_index, 1);
+        assert!(matches!(rx.try_recv(), Ok(WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) })));
+        // The same switch again (the ExecuteLocalCommand that follows a typed /worlds lands
+        // on a view already there): nothing more to tell.
+        app.handle_remote_ws_message(WsMessage::WorldSwitched { new_index: 1 });
+        assert!(rx.try_recv().is_err(), "no second claim");
+    }
+
     #[test]
     fn test_console_client_clears_echo_mask_on_world_disconnected() {
         let mut app = App::new();
@@ -10425,7 +10486,7 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), ws_password.to_string(),
-            false, true, false,
+            false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
             "none".to_string(), "app_tablet".to_string(), None, None, None, None,
         );
@@ -10449,7 +10510,7 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), String::new(),
-            false, true, false,
+            false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
             "none".to_string(), "app_tablet".to_string(), None, None, profile("native-linux", "superfast"), None,
         );
@@ -10467,7 +10528,7 @@ third
             14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), String::new(),
-            false, true, false,
+            false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
             "none".to_string(), "app_tablet".to_string(), None, None, profile("bogus", "fast"), None,
         );
@@ -13779,6 +13840,7 @@ third
     #[test]
     fn test_console_release_claims_for_console_without_notifying() {
         let mut app = App::new();
+        app.console_tui = true; // the TUI's own release: a headless server claims for nobody
         world_with_unviewed_backlog(&mut app, 1, 3);
         app.current_world_index = 0; // console is now looking at the backlog world
         app.output_height = 24;
@@ -21609,6 +21671,62 @@ fn the_web_picture_host_options_are_picture_service_options() {
         .map(|(v, l)| (v.to_string(), l.to_string()))
         .collect();
     assert_eq!(options, expected);
+}
+
+/// The web page's New Indicator choices are `NewIndicator::OPTIONS`, as the console's and
+/// the native GUI's are.
+#[test]
+fn the_web_new_indicator_options_are_the_enums_options() {
+    let html = include_str!("web/index.html");
+    let start = html.find("id=\"setup-new-indicator-select\"").expect("the select");
+    let end = start + html[start..].find("</select>").unwrap();
+    let options: Vec<(String, String)> = html[start..end]
+        .split("<option value=\"")
+        .skip(1)
+        .map(|o| {
+            let (value, rest) = o.split_once("\">").unwrap();
+            (value.to_string(), rest.split("</option>").next().unwrap().to_string())
+        })
+        .collect();
+    let expected: Vec<(String, String)> =
+        crate::NewIndicator::OPTIONS.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect();
+    assert_eq!(options, expected);
+    // app.js mirrors newbg.rs's numbers for the glow it builds into --new-glow.
+    let js = include_str!("web/app.js");
+    assert!(js.contains(&format!("const NEW_GLOW_GREEN = [{}, {}, {}];", crate::newbg::GREEN.0, crate::newbg::GREEN.1, crate::newbg::GREEN.2)));
+    assert!(js.contains(&format!("const NEW_GLOW_CELLS = {};", crate::newbg::CELLS)));
+    assert!(js.contains(&format!("const NEW_GLOW_WORD = '{}';", crate::newbg::SAMPLE_WORD)));
+    let schemes: String = crate::newbg::SCHEMES
+        .iter()
+        .map(|s| format!("        ['{}', '{}', [{}, {}, {}]],\n", s.key, s.label, s.start.0, s.start.1, s.start.2))
+        .collect();
+    assert!(js.contains(&format!("const NEW_GLOW_SCHEMES = [\n{schemes}    ];")), "app.js NEW_GLOW_SCHEMES is newbg::SCHEMES");
+}
+
+/// Only the ▶ character takes columns off a new line's wrap width: the background glow is
+/// behind the text, so a line wraps exactly as with no indicator.
+#[test]
+fn the_background_indicator_reserves_no_columns() {
+    let now = CachedNow::new();
+    let line = OutputLine::new("x".repeat(100), 1);
+    // The first row's visible characters (a row may end in a reset escape).
+    let rows = |style: NewIndicator, marked_new: bool| {
+        let settings = Settings { new_indicator: style, ..Settings::default() };
+        crate::rendering::display_wrapped_as(&line, 40, marked_new, false, &settings, &now)[0].chars().filter(|c| *c == 'x').count()
+    };
+    assert_eq!(rows(NewIndicator::Character, true), 40 - crate::util::NLI_PREFIX_WIDTH);
+    assert_eq!(rows(NewIndicator::Character, false), 40);
+    assert_eq!(rows(NewIndicator::Background, true), 40);
+    assert_eq!(rows(NewIndicator::Custom(3), true), 40, "a Custom scheme is a glow too");
+    assert_eq!(rows(NewIndicator::None, true), 40);
+    // Which colour the glow starts with, and %textdiv turns every style off.
+    let mut s = Settings { new_indicator: NewIndicator::Custom(6), ..Settings::default() };
+    assert_eq!(s.nli_glow_start(), Some(crate::newbg::SCHEMES[6].start));
+    assert!(!s.nli_prefix() && s.nli_drawn());
+    s.new_indicator = NewIndicator::Background;
+    assert_eq!(s.nli_glow_start(), Some(crate::newbg::GREEN));
+    s.textdiv = "on".into();
+    assert_eq!(s.nli_glow_start(), None);
 }
 
 /// The web page's Separator Style choices are `SeparatorStyle::OPTIONS`, as the console's

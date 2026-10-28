@@ -2215,6 +2215,8 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         mouse_enabled: s.mouse_enabled,
         zwj_enabled: s.zwj_enabled,
         new_line_indicator: s.new_line_indicator,
+        // Empty: a server from before the indicator had styles (it reads the bool).
+        new_indicator: (!s.new_indicator.is_empty()).then(|| s.new_indicator.clone()),
         tts_mode: s.tts_mode.clone(),
         tts_speak_mode: s.tts_speak_mode.clone(),
         tts_voice: s.tts_voice.clone(),

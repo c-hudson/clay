@@ -143,6 +143,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
         match resolve_web_cert_files(&mut app) {
             Some((cert_file, key_file)) => {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
+                // A `-D` hot-reload successor waits for the port its predecessor held; a
+                // cold start binds once.
+                https_server.bind_retry = crate::http::port_released_by_predecessor(app.settings.http_port);
                 match start_https_server(
                     &mut https_server,
                     &cert_file,
@@ -158,7 +161,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         app.https_server = Some(https_server);
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                        eprintln!("{}", crate::http::start_warning("HTTPS", e.as_ref()));
                     }
                 }
             }
@@ -394,6 +397,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         crate::tfrun::drain_deferred_tf_daemon(&mut app, &event_tx).await;
                         if event != crate::tf::TfHookEvent::Sigusr2 {
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            crate::crashlog::exit_reason(if event == crate::tf::TfHookEvent::Sighup { "SIGHUP" } else { "SIGTERM" });
                             return Ok(());
                         }
                     }
@@ -464,6 +468,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                 // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE);
                 // piggybacking on this existing once-a-minute tick rather than a new timer.
                 app.reap_stale_ws_client_worlds();
+                app.note_crash_context();
                 for world in &mut app.worlds {
                     if world.connected && world.wants_keepalive() {
                         // Only check last_send_time: server kicks us when WE go idle.
@@ -1163,8 +1168,16 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 }
                 Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                        // The server's foreground world follows (TF's WORLD hook, media,
+                        // Esc-w's history), as a console's would; with no console it claims
+                        // no ▶ there (`switch_world`). The requesting client's view moves,
+                        // and it alone is told - as the console master does (handler A);
+                        // broadcasting put every attached SSH console onto this world too.
+                        // Its own `MarkWorldSeen` then claims the lines for it (deferred bug
+                        // G1: `switch_world`'s console claim used to take them first).
                         app.switch_world(idx);
-                        app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
+                        app.ws_client_view_world(client_id, idx);
+                        app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                         // Also send ExecuteLocalCommand so web clients can switch their local
                         // view: as `/world <name>`, the one form every client reads (TF's
                         // flags, `/world -q foo`, made them look for a world named "-q foo").
@@ -1286,7 +1299,10 @@ pub(crate) async fn handle_daemon_ws_message_impl(
             if world_index < app.worlds.len() {
                 let changed = app.current_world_index != world_index;
                 app.current_world_index = world_index;
-                app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
+                // The requester's view, and the requester alone is told (as handler A):
+                // every attached SSH console used to follow a switch any client made.
+                app.ws_client_view_world(client_id, world_index);
+                app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                 // TF's WORLD hook: the foreground world changed.
                 if changed {
                     let name = app.worlds[world_index].name.clone();
@@ -1307,7 +1323,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1316,7 +1332,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
-                zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
+                zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                 log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile,
             );
         }
@@ -1886,13 +1902,14 @@ keep_alive_type=Generic
                 return Ok(());
             };
             let mut https_server = HttpsServer::new(app.settings.http_port);
+            https_server.bind_retry = crate::http::port_released_by_predecessor(app.settings.http_port);
             match start_https_server(&mut https_server, &cert_file, &key_file, Some(ws_state.clone()), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), gate.clone()).await {
                 Ok(()) => {
                     println!("HTTPS+WSS: https://0.0.0.0:{}", app.settings.http_port);
                     app.https_server = Some(https_server);
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to start HTTPS+WSS server: {}", e);
+                    eprintln!("{}", crate::http::start_warning("HTTPS+WSS", e.as_ref()));
                     return Ok(());
                 }
             }
@@ -2129,6 +2146,11 @@ keep_alive_type=Generic
                     // through the per-user sibling of App::handle_telnet_event.
                     AppEvent::Telnet(TelnetTarget::Multiuser { world_index, ref username }, ref ev) => {
                         app.handle_multiuser_telnet_event(world_index, username.clone(), ev);
+                    }
+                    // A user's /dict, /urban, /translate or /url (multiuser_typed_line): the
+                    // answer goes to the client that asked.
+                    AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
+                        app.apply_api_lookup_result(client_id, world_index, result, cursor_start);
                     }
                     AppEvent::WsAuthKeyValidation(client_id, _msg, client_ip, _challenge) => {
                         // Auth-key login is a single per-install device key and doesn't map to
@@ -3230,19 +3252,10 @@ pub async fn handle_multiuser_ws_message(
             // seq support is tracked separately in PROTOCOL-ROADMAP.md.
         }
         WsMessage::SendCommand { world_index, command } => {
-            // Send command to user's own connection
+            // Parsed and run for this user (`multiuser_typed_line`, deferred task M1); it
+            // used to go to the user's MUD as text whatever it was.
             if let Some(ref uname) = username {
-                // /chat on a chat world is handled here, not sent as chat text.
-                let owns = app.worlds.get(world_index).map(|w| w.owner.as_deref() == Some(uname.as_str())).unwrap_or(false);
-                if owns && app.multiuser_chat_command(world_index, uname, &command) {
-                    return;
-                }
-                let key = (world_index, uname.clone());
-                if let Some(conn) = app.user_connections.get(&key) {
-                    if let Some(tx) = &conn.command_tx {
-                        let _ = tx.send(WriteCommand::Text(command)).await;
-                    }
-                }
+                multiuser_typed_line(app, client_id, world_index, uname, command, event_tx).await;
             }
         }
         WsMessage::ConnectWorld { world_index } => {
@@ -3459,7 +3472,9 @@ pub async fn handle_multiuser_ws_message(
                     world.settings.notes = notes;
                     let has_notes = !world.settings.notes.is_empty();
                     let owner = world.owner.clone();
-                    let _ = persistence::save_settings(app);
+                    // multiuser.dat: `save_settings` wrote them to settings.dat, where the
+                    // next start never looked.
+                    let _ = persistence::save_multiuser_settings(app);
                     if let Some(ws) = &app.ws_server {
                         ws.broadcast_to_owner(WsMessage::NotesChanged { world_index, has_notes }, owner.as_deref());
                     }
@@ -3477,7 +3492,9 @@ pub async fn handle_multiuser_ws_message(
                                 app.send_to_world(world_index, line);
                             }
                         }
-                        None => app.emit_client_text(world_index, "Could not send the edited text: the MCP session is no longer available.", true),
+                        // To the asker: `emit_client_text` stores into the shared World and
+                        // tells every user.
+                        None => app.ws_tell(client_id, world_index, "Could not send the edited text: the MCP session is no longer available."),
                     }
                 }
             }
@@ -3661,27 +3678,663 @@ pub async fn handle_multiuser_ws_message(
             crate::http::log_remote_event("CLIENT-LIFECYCLE", &ip, &format!("[{}] {}: {}", source, event, detail));
         }
         WsMessage::ToggleWorldGmcp { world_index } => {
-            if world_index < app.worlds.len() {
-                app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
-                if !app.worlds[world_index].gmcp_user_enabled {
-                    app.stop_world_media(world_index);
+            // The owner's own world, told to the owner's clients: it used to flip anyone's
+            // and tell every user.
+            if let Some(ref uname) = username {
+                if multiuser_owns(app, uname, world_index) {
+                    app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
+                    let enabled = app.worlds[world_index].gmcp_user_enabled;
+                    if !enabled {
+                        app.stop_world_media(world_index);
+                    }
+                    if let Some(ws) = &app.ws_server {
+                        ws.broadcast_to_owner(WsMessage::GmcpUserToggled { world_index, enabled }, Some(uname));
+                    }
                 }
-                app.needs_output_redraw = true;
-                app.ws_broadcast(WsMessage::GmcpUserToggled {
-                    world_index,
-                    enabled: app.worlds[world_index].gmcp_user_enabled,
-                });
             }
         }
-        // Plan Job 13 (Phase 4, 4.4): folded into one shared function - see
-        // commands::execute_send_gmcp/execute_send_msdp.
+        // On the user's own connection: the shared World has none, so the single-user
+        // helpers (`execute_send_gmcp`/`execute_send_msdp`, on `World::command_tx`) sent
+        // nothing here.
         WsMessage::SendGmcp { world_index, package, data } => {
-            execute_send_gmcp(app, world_index, &package, &data);
+            if let Some(ref uname) = username {
+                if let Some(tx) = multiuser_command_tx(app, uname, world_index) {
+                    let _ = tx.send(WriteCommand::Raw(telnet::build_gmcp_message(&package, &data))).await;
+                }
+            }
         }
         WsMessage::SendMsdp { world_index, variable, value } => {
-            execute_send_msdp(app, world_index, &variable, &value);
+            if let Some(ref uname) = username {
+                if let Some(tx) = multiuser_command_tx(app, uname, world_index) {
+                    let _ = tx.send(WriteCommand::Raw(telnet::build_msdp_set(&variable, &value))).await;
+                }
+            }
+        }
+        // `/l` and `/connections` (bounced to the client, which asks this): the user's
+        // own worlds and connections.
+        WsMessage::RequestConnectionsList => {
+            if let Some(ref uname) = username {
+                let current = app.ws_client_worlds.get(&client_id).map(|v| v.world_index);
+                let now = std::time::Instant::now();
+                let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate()
+                    .filter(|(_, w)| w.owner.as_deref() == Some(uname.as_str()))
+                    .map(|(idx, world)| {
+                        let conn = app.user_connections.get(&(idx, uname.clone()));
+                        util::WorldListInfo {
+                            name: world.name.clone(),
+                            connected: conn.is_some_and(|c| c.connected),
+                            is_current: current == Some(idx),
+                            is_ssl: world.settings.use_ssl,
+                            is_proxy: false,
+                            unseen_lines: conn.map(|c| c.unseen_lines).unwrap_or(0),
+                            last_send_secs: conn.and_then(|c| c.last_send_time).map(|t| now.duration_since(t).as_secs()),
+                            last_recv_secs: conn.and_then(|c| c.last_receive_time).map(|t| now.duration_since(t).as_secs()),
+                            last_nop_secs: None,
+                            next_nop_secs: None,
+                            buffer_size: conn.map(|c| c.output_lines.len()).unwrap_or(0),
+                        }
+                    })
+                    .collect();
+                let lines: Vec<String> = util::format_worlds_list(&worlds_info).lines().map(str::to_string).collect();
+                app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
+            }
+        }
+        // Esc-w: the console's rule (`calculate_oldest_pending_world_from`) over the user's
+        // own worlds and connections - the one with unseen activity, else the last world
+        // this client visited that is still connected.
+        WsMessage::CalculateOldestPending { current_index } => {
+            let index = username.as_deref().and_then(|uname| {
+                let owned = multiuser_owned_worlds(app, uname);
+                owned.iter().copied()
+                    .find(|&i| i != current_index && app.user_connections.get(&(i, uname.to_string())).is_some_and(|c| c.unseen_lines > 0))
+                    .or_else(|| {
+                        let history = app.ws_client_worlds.get(&client_id).map(|v| v.history.clone()).unwrap_or_default();
+                        history.iter()
+                            .filter_map(|name| multiuser_owned_world(app, uname, name))
+                            .find(|&i| i != current_index && multiuser_connected(app, uname, i))
+                    })
+            });
+            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index });
+        }
+        // Backgrounding (Android): the client stops counting as a viewer, as on the other
+        // servers (no ▶ claims here, which is all the single-user handler adds).
+        WsMessage::ClientVisibility { visible } => {
+            if let Some(state) = app.ws_client_worlds.get_mut(&client_id) {
+                state.visible = visible;
+            }
+        }
+        // Import Settings pulls one Clay's settings.dat into another's: not a user's to do
+        // here. Answered, so the client's dialog doesn't wait.
+        WsMessage::ImportSettings { .. } => {
+            app.ws_send_to_client(client_id, WsMessage::ImportResult {
+                success: false,
+                summary: "Import Settings is not available on a multiuser server.".to_string(),
+            });
         }
         _ => {} // Handle other messages as needed
+    }
+}
+
+/// The user owns world `idx`.
+fn multiuser_owns(app: &App, uname: &str, idx: usize) -> bool {
+    app.worlds.get(idx).is_some_and(|w| w.owner.as_deref() == Some(uname))
+}
+
+/// The user's world called `name` (case-insensitive), if any.
+fn multiuser_owned_world(app: &App, uname: &str, name: &str) -> Option<usize> {
+    app.worlds.iter().position(|w| w.owner.as_deref() == Some(uname) && w.name.eq_ignore_ascii_case(name))
+}
+
+/// Every world the user owns, in order.
+fn multiuser_owned_worlds(app: &App, uname: &str) -> Vec<usize> {
+    app.worlds.iter().enumerate().filter(|(_, w)| w.owner.as_deref() == Some(uname)).map(|(i, _)| i).collect()
+}
+
+/// The user's connection to world `idx` is up.
+fn multiuser_connected(app: &App, uname: &str, idx: usize) -> bool {
+    app.user_connections.get(&(idx, uname.to_string())).is_some_and(|c| c.connected)
+}
+
+/// The writer of the user's own connection to world `idx` - theirs, and up.
+fn multiuser_command_tx(app: &App, uname: &str, idx: usize) -> Option<mpsc::Sender<WriteCommand>> {
+    if !multiuser_owns(app, uname, idx) {
+        return None;
+    }
+    app.user_connections.get(&(idx, uname.to_string())).and_then(|c| c.command_tx.clone())
+}
+
+/// `text` to the user's MUD on `world_index`, or the console's "not connected" line to the
+/// client that typed it.
+async fn multiuser_send_text(app: &mut App, client_id: u64, world_index: usize, uname: &str, text: String) {
+    let key = (world_index, uname.to_string());
+    match app.user_connections.get(&key).and_then(|c| c.command_tx.clone()) {
+        Some(tx) => {
+            let _ = tx.send(WriteCommand::Text(text)).await;
+            if let Some(conn) = app.user_connections.get_mut(&key) {
+                conn.last_send_time = Some(std::time::Instant::now());
+            }
+        }
+        None => app.ws_tell(client_id, world_index, "Not connected. Use /worlds to connect."),
+    }
+}
+
+/// A multiuser user's typed line (deferred task M1, 2026-10-28). Until this, every line
+/// went to the user's MUD as text, `/help` and `/worlds` included, and a web client's
+/// `/update` waited 90 s for an answer that never came. Now the line is parsed as the other
+/// servers parse a client's (`handle_daemon_ws_message_impl`), scoped to the user:
+/// - text, `///x` (the text `/x`) and a line typed at a masked prompt go to the user's own
+///   connection; `//x` runs the command `/x`;
+/// - a command about the user's own worlds or client works (`/worlds`, `/connect`, `/dc`,
+///   `/send`, `/flush`, `/stats`, `/mssp`, `/msdp`, `/help`, `/version`, the lookups, the
+///   user's own actions, the client's windows), named worlds found among the user's only;
+/// - a server-wide one (reload, update, settings, bans, logs, `/note <file>`, TinyFugue
+///   scripting - the engine is one for every user) is refused with a line.
+///
+/// Every reply goes to the client that asked (`ws_tell`), never into the shared `World`:
+/// `emit_client_text` stores there and tells every user.
+async fn multiuser_typed_line(
+    app: &mut App,
+    client_id: u64,
+    world_index: usize,
+    uname: &str,
+    command: String,
+    event_tx: &mpsc::Sender<AppEvent>,
+) {
+    if !multiuser_owns(app, uname, world_index) {
+        app.ws_tell(client_id, world_index, "That world is not yours.");
+        return;
+    }
+    let key = (world_index, uname.to_string());
+    // The MUD's password prompt (ECHO off): the line goes as typed, whatever it starts with.
+    if app.user_connections.get(&key).is_some_and(|c| c.protocol.echo_masked) {
+        multiuser_send_text(app, client_id, world_index, uname, command).await;
+        return;
+    }
+    let line = match crate::tfrun::typed_slash_form(&command) {
+        crate::tfrun::TypedSlashForm::SendText(text) => {
+            multiuser_send_text(app, client_id, world_index, uname, text.to_string()).await;
+            return;
+        }
+        crate::tfrun::TypedSlashForm::Line(line) => line.to_string(),
+    };
+    if !line.starts_with('/') {
+        multiuser_send_text(app, client_id, world_index, uname, line).await;
+        return;
+    }
+    // /chat on a chat world: the one command multiuser handled before this.
+    if app.multiuser_chat_command(world_index, uname, &line) {
+        return;
+    }
+    let word = line.split_whitespace().next().unwrap_or("/").to_string();
+    let not_found = |app: &mut App, name: &str| app.ws_tell(client_id, world_index, &format!("World '{}' not found.", name));
+    // TinyFugue's `/connect [world]` (the Clay parser's `Connect` is the clients' internal
+    // `/__connect`; a typed `/connect` is TF's on the other servers): the current world,
+    // or one of the user's by name, brought forward as `/worlds <name>` does.
+    if word.eq_ignore_ascii_case("/connect") {
+        let rest = line[word.len()..].trim();
+        let target = if rest.is_empty() { Some(world_index) } else { multiuser_owned_world(app, uname, rest) };
+        match target {
+            None => not_found(app, rest),
+            Some(idx) => {
+                if idx != world_index {
+                    app.ws_client_view_world(client_id, idx);
+                    app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
+                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: format!("/world {}", app.worlds[idx].name) });
+                }
+                if multiuser_connected(app, uname, idx) {
+                    app.ws_tell(client_id, world_index, "Already connected. Use /disconnect first.");
+                } else {
+                    let _ = event_tx.send(AppEvent::ConnectWorldRequest(idx, uname.to_string())).await;
+                }
+            }
+        }
+        return;
+    }
+    let parsed = crate::parse_command(&line);
+    let no_login = matches!(parsed, Command::WorldConnectNoLogin { .. } | Command::WorldConnectBackground { no_login: true, .. });
+    match parsed {
+        Command::Help => app.handle_ws_help_via_tf(client_id, world_index, ""),
+        Command::HelpTopic { ref raw, .. } => app.handle_ws_help_via_tf(client_id, world_index, raw),
+        Command::Version => app.ws_tell(client_id, world_index, &get_version_string()),
+        Command::Say { text } => app.ws_say(client_id, world_index, &text),
+        Command::TestMusic => {
+            app.ws_send_to_client(client_id, WsMessage::AnsiMusic { world_index, notes: crate::generate_test_music_notes() });
+            app.ws_tell(client_id, world_index, "Playing test music (Super Mario Bros)...");
+        }
+        // The client's own windows (its worlds and notes are the ones it was sent), and
+        // its logout.
+        Command::Quit | Command::Edit { filename: None } | Command::EditList | Command::WorldSelector | Command::WorldsList => {
+            app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: line.clone() });
+        }
+        Command::Window { world } => {
+            let connect = match world.as_deref() {
+                Some(name) => match multiuser_owned_world(app, uname, name) {
+                    Some(idx) => Some(idx),
+                    None => {
+                        not_found(app, name);
+                        return;
+                    }
+                },
+                None => None,
+            };
+            app.ws_send_to_client(client_id, WsMessage::OpenWindow { world });
+            if let Some(idx) = connect {
+                if !multiuser_connected(app, uname, idx) {
+                    let _ = event_tx.send(AppEvent::ConnectWorldRequest(idx, uname.to_string())).await;
+                }
+            }
+        }
+        Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+            let Some(idx) = multiuser_owned_world(app, uname, name) else {
+                not_found(app, name);
+                return;
+            };
+            // This client's view (its MarkWorldSeen follows), as the other servers do.
+            app.ws_client_view_world(client_id, idx);
+            app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
+            app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: format!("/world {}", app.worlds[idx].name) });
+            if !multiuser_connected(app, uname, idx) {
+                if no_login {
+                    app.ws_tell(client_id, idx, "-l (no login) is not supported on a multiuser server; connecting as usual.");
+                }
+                let _ = event_tx.send(AppEvent::ConnectWorldRequest(idx, uname.to_string())).await;
+            }
+        }
+        Command::WorldConnectBackground { ref name, .. } => {
+            let Some(idx) = multiuser_owned_world(app, uname, name) else {
+                not_found(app, name);
+                return;
+            };
+            if multiuser_connected(app, uname, idx) {
+                let name = app.worlds[idx].name.clone();
+                app.ws_tell(client_id, world_index, &format!("World '{}' is already connected.", name));
+            } else {
+                if no_login {
+                    app.ws_tell(client_id, world_index, "-l (no login) is not supported on a multiuser server; connecting as usual.");
+                }
+                let _ = event_tx.send(AppEvent::ConnectWorldRequest(idx, uname.to_string())).await;
+            }
+        }
+        Command::Connect { host: None, .. } => {
+            if multiuser_connected(app, uname, world_index) {
+                app.ws_tell(client_id, world_index, "Already connected. Use /disconnect first.");
+            } else {
+                let _ = event_tx.send(AppEvent::ConnectWorldRequest(world_index, uname.to_string())).await;
+            }
+        }
+        Command::Disconnect { world } => {
+            let targets: Vec<usize> = match world.as_deref() {
+                None => vec![world_index],
+                Some(all) if all.eq_ignore_ascii_case("-all") => multiuser_owned_worlds(app, uname),
+                Some(name) => match multiuser_owned_world(app, uname, name) {
+                    Some(idx) => vec![idx],
+                    None => {
+                        not_found(app, name);
+                        return;
+                    }
+                },
+            };
+            let mut any = false;
+            for idx in targets {
+                if multiuser_connected(app, uname, idx) {
+                    handle_multiuser_disconnect(app, idx, uname);
+                    let name = app.worlds[idx].name.clone();
+                    app.ws_tell(client_id, world_index, &format!("Disconnected from {}.", name));
+                    any = true;
+                }
+            }
+            if !any {
+                app.ws_tell(client_id, world_index, "Not connected.");
+            }
+        }
+        Command::Send { text, all_worlds, target_world, no_newline, .. } => {
+            let targets: Vec<usize> = if all_worlds {
+                multiuser_owned_worlds(app, uname).into_iter().filter(|&i| multiuser_connected(app, uname, i)).collect()
+            } else if let Some(name) = target_world.as_deref() {
+                match multiuser_owned_world(app, uname, name) {
+                    Some(idx) => vec![idx],
+                    None => {
+                        not_found(app, name);
+                        return;
+                    }
+                }
+            } else {
+                vec![world_index]
+            };
+            for idx in targets {
+                match app.user_connections.get(&(idx, uname.to_string())).and_then(|c| c.command_tx.clone()) {
+                    Some(tx) => {
+                        let cmd = if no_newline { WriteCommand::Raw(text.as_bytes().to_vec()) } else { WriteCommand::Text(text.clone()) };
+                        let _ = tx.send(cmd).await;
+                    }
+                    None => {
+                        let name = app.worlds[idx].name.clone();
+                        app.ws_tell(client_id, world_index, &format!("{} is not connected.", name));
+                    }
+                }
+            }
+        }
+        Command::Flush => {
+            let mut count = 0;
+            if let Some(conn) = app.user_connections.get_mut(&key) {
+                count = conn.output_lines.len();
+                conn.output_lines.clear();
+                conn.scroll_offset = 0;
+                conn.lines_since_pause = 0;
+                conn.paused = false;
+            }
+            if let Some(ws) = &app.ws_server {
+                ws.broadcast_to_owner(WsMessage::WorldFlushed { world_index }, Some(uname));
+            }
+            app.ws_tell(client_id, world_index, &format!("Flushed {} lines from output buffer.", count));
+        }
+        // The user's own connection's data (the shared World's is nobody's here).
+        Command::Stats => {
+            let entries: Vec<stats::StatEntry> = app.user_connections.get(&key).map(|c| c.protocol.stats.entries().to_vec()).unwrap_or_default();
+            app.ws_tell(client_id, world_index, &crate::commands::stats_lines(&entries).join("\n"));
+        }
+        Command::Mssp => {
+            let pairs = app.user_connections.get(&key).map(|c| c.protocol.mssp_data.clone()).unwrap_or_default();
+            app.ws_tell(client_id, world_index, &crate::commands::mssp_lines(&pairs).join("\n"));
+        }
+        Command::Msdp { verb, target } => {
+            let conn = app.user_connections.get(&key);
+            let enabled = conn.is_some_and(|c| c.protocol.msdp_enabled);
+            let tx = conn.and_then(|c| c.command_tx.clone());
+            match (enabled, tx) {
+                (false, _) => app.ws_tell(client_id, world_index, "MSDP has not been negotiated on this connection - nothing sent."),
+                (true, None) => app.ws_tell(client_id, world_index, "Not connected."),
+                (true, Some(tx)) => {
+                    let (msg, shown) = match target.as_deref() {
+                        Some(t) => (telnet::build_msdp_set(&verb, t), format!("Sent MSDP {} {}", verb, t)),
+                        None => (telnet::build_msdp_request(&verb), format!("Sent MSDP {}", verb)),
+                    };
+                    let _ = tx.send(WriteCommand::Raw(msg)).await;
+                    app.ws_tell(client_id, world_index, &shown);
+                }
+            }
+        }
+        Command::MsdpUsage => app.ws_tell(client_id, world_index, &[
+            "Usage: /msdp <LIST|REPORT|UNREPORT|SEND> [target]",
+            "  LIST targets: COMMANDS, LISTS, CONFIGURABLE_VARIABLES,",
+            "                REPORTABLE_VARIABLES, SENDABLE_VARIABLES, REPORTED_VARIABLES",
+            "  Example: /msdp LIST REPORTABLE_VARIABLES",
+            "  Example: /msdp REPORT HEALTH",
+        ].join("\n")),
+        // The lookups answer the client that asked (AppEvent::ApiLookupResult, which the
+        // multiuser loop applies).
+        Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } | Command::TinyUrl { .. } => {
+            crate::commands::spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed, app.settings.url_shorteners.clone());
+        }
+        Command::DictUsage => app.ws_tell(client_id, world_index, "Usage: /dict <word>\n  Looks up <word> in the dictionary and places the definition in the input buffer.\n  Example: /dict hello"),
+        Command::UrbanUsage => app.ws_tell(client_id, world_index, "Usage: /urban <word>\n  Looks up <word> in Urban Dictionary and places the definition in the input buffer.\n  Example: /urban yeet"),
+        Command::TranslateUsage => app.ws_tell(client_id, world_index, "Usage: /translate <lang> <text>\n  Translates <text> to <lang> and places the result in the input buffer.\n  <lang> can be a code (es, fr, de) or name (spanish, french, german).\n  Example: /translate spanish Hello, how are you?\n  Example: /tr es Hello"),
+        Command::TinyUrlUsage => app.ws_tell(client_id, world_index, "Usage: /url <url>\n  Shortens <url> and places the result in the input buffer.\n  Example: /url https://github.com/c-hudson/clay"),
+        // The user's own actions; what they run comes back through here.
+        Command::ActionCommand { name, args } => {
+            let world_name = app.worlds[world_index].name.clone();
+            let mine: Vec<crate::actions::Action> = app.settings.actions.iter().filter(|a| a.owner.as_deref() == Some(uname)).cloned().collect();
+            match find_invocable_action(&mine, &name, &world_name) {
+                Some(action) if !action.enabled => {
+                    let name = action.name.clone();
+                    app.ws_tell(client_id, world_index, &format!("Action '{}' is disabled.", name));
+                }
+                Some(action) => {
+                    for cmd in action_commands_to_run(action, &args) {
+                        if cmd.starts_with('/') {
+                            Box::pin(multiuser_typed_line(app, client_id, world_index, uname, cmd, event_tx)).await;
+                        } else {
+                            multiuser_send_text(app, client_id, world_index, uname, cmd).await;
+                        }
+                    }
+                }
+                // No action of that name, and no TF engine to fall back to: it is one for
+                // every user.
+                None => app.ws_tell(client_id, world_index, &format!("Unknown command: {}", word)),
+            }
+        }
+        Command::NotACommand { text } => multiuser_send_text(app, client_id, world_index, uname, text).await,
+        Command::Unknown { cmd } => app.ws_tell(client_id, world_index, &format!("Unknown command: {}", cmd)),
+        Command::Chat { .. } => app.ws_tell(client_id, world_index, "/chat works in a Slack or Discord world."),
+        Command::Edit { filename: Some(_) } => app.ws_tell(client_id, world_index, "/note <file> edits a file on the server: not available on a multiuser server."),
+        _ => app.ws_tell(client_id, world_index, &format!("{} is not available on a multiuser server.", word)),
+    }
+}
+
+#[cfg(test)]
+mod multiuser_command_tests {
+    //! Deferred task M1: a multiuser user's typed line is parsed and run for that user
+    //! (`multiuser_typed_line`), scoped to the user's own worlds and client, and reaches
+    //! the MUD as text only when it is text. Before this every line went to the MUD.
+    use super::*;
+    use crate::websocket::{Outbound, WsClientInfo};
+
+    fn register_client(server: &WebSocketServer, client_id: u64, username: &str) -> mpsc::Receiver<Outbound> {
+        let (tx, rx) = mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let mut clients = server.clients.try_write().expect("clients lock should be uncontended in test setup");
+        clients.insert(client_id, WsClientInfo {
+            authenticated: true,
+            tx,
+            current_world: None,
+            username: Some(username.to_string()),
+            received_initial_state: true,
+            client_type: RemoteClientType::Web,
+            viewport_height: 24,
+            ip_address: "127.0.0.1".to_string(),
+            connected_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            paused: false,
+            acked_seq: std::collections::HashMap::new(),
+            audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
+            needs_resync: std::collections::HashSet::new(),
+        });
+        rx
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<Outbound>) -> Vec<WsMessage> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(match m {
+                Outbound::Shared(json) => serde_json::from_str(&json).expect("broadcast JSON must parse"),
+                Outbound::Message(msg) => *msg,
+            });
+        }
+        out
+    }
+
+    /// The lines told to a client (`ws_tell`: ServerData from the server itself).
+    fn told(rx: &mut mpsc::Receiver<Outbound>) -> Vec<String> {
+        drain(rx).into_iter().filter_map(|m| match m {
+            WsMessage::ServerData { data, from_server: false, .. } => Some(data),
+            _ => None,
+        }).collect()
+    }
+
+    fn mud_got(rx: &mut mpsc::Receiver<WriteCommand>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            out.push(match c {
+                WriteCommand::Text(s) => s,
+                WriteCommand::Raw(b) => String::from_utf8_lossy(&b).into_owned(),
+                other => format!("{other:?}"),
+            });
+        }
+        out
+    }
+
+    struct Users {
+        app: App,
+        alice: mpsc::Receiver<Outbound>,
+        bob: mpsc::Receiver<Outbound>,
+        mud: mpsc::Receiver<WriteCommand>,
+        tx: mpsc::Sender<AppEvent>,
+        events: mpsc::Receiver<AppEvent>,
+    }
+
+    /// alice (client 1, viewing world 0) owns alpha (0, connected, its MUD writes captured)
+    /// and alpha2 (2); bob (client 2) owns bravo (1).
+    fn two_users() -> Users {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+        for (name, owner) in [("alpha", "alice"), ("bravo", "bob"), ("alpha2", "alice")] {
+            let mut w = World::new(name);
+            w.owner = Some(owner.to_string());
+            w.settings.hostname = "mud.example".to_string();
+            w.settings.port = "4000".to_string();
+            app.worlds.push(w);
+        }
+        let mut conn = UserConnection::new();
+        conn.connected = true;
+        let (cmd_tx, mud) = mpsc::channel::<WriteCommand>(16);
+        conn.command_tx = Some(cmd_tx);
+        app.user_connections.insert((0, "alice".to_string()), conn);
+        let mut bobs = UserConnection::new();
+        bobs.connected = true;
+        app.user_connections.insert((1, "bob".to_string()), bobs);
+        let server = WebSocketServer::new("", 9000, "", None, true, BanList::new());
+        let alice = register_client(&server, 1, "alice");
+        let bob = register_client(&server, 2, "bob");
+        app.ws_server = Some(server);
+        app.ws_client_worlds.insert(1, ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        });
+        let (tx, events) = mpsc::channel::<AppEvent>(16);
+        Users { app, alice, bob, mud, tx, events }
+    }
+
+    async fn typed(u: &mut Users, line: &str) {
+        handle_multiuser_ws_message(&mut u.app, 1, WsMessage::SendCommand { world_index: 0, command: line.to_string() }, &u.tx).await;
+    }
+
+    #[tokio::test]
+    async fn text_goes_to_the_mud_and_commands_do_not() {
+        let mut u = two_users();
+        typed(&mut u, "say hi").await;
+        typed(&mut u, "///who").await;
+        assert_eq!(mud_got(&mut u.mud), ["say hi", "/who"], "text, and ///x as the text /x");
+        typed(&mut u, "/version").await;
+        typed(&mut u, "//help").await;
+        assert!(mud_got(&mut u.mud).is_empty(), "a command never reaches the MUD");
+        let lines = told(&mut u.alice);
+        assert!(lines.iter().any(|l| l.contains(crate::VERSION)), "/version answers the asker: {lines:?}");
+        assert!(lines.len() >= 2, "//help is the command /help: {lines:?}");
+        assert!(drain(&mut u.bob).is_empty(), "nothing of alice's reaches bob");
+    }
+
+    #[tokio::test]
+    async fn a_masked_line_goes_to_the_mud_as_typed() {
+        let mut u = two_users();
+        u.app.user_connections.get_mut(&(0, "alice".to_string())).unwrap().protocol.echo_masked = true;
+        typed(&mut u, "/secret").await;
+        assert_eq!(mud_got(&mut u.mud), ["/secret"]);
+    }
+
+    #[tokio::test]
+    async fn server_wide_commands_are_refused_with_a_line() {
+        let mut u = two_users();
+        for cmd in ["/reload", "/setup", "/update", "/ban", "/web", "/note /etc/passwd", "/tag"] {
+            typed(&mut u, cmd).await;
+            let lines = told(&mut u.alice);
+            assert!(lines.iter().any(|l| l.contains("not available on a multiuser server")), "{cmd}: {lines:?}");
+        }
+        typed(&mut u, "/frobnicate").await;
+        assert!(told(&mut u.alice).iter().any(|l| l.contains("Unknown command: /frobnicate")));
+        typed(&mut u, "/def x = /echo y").await;
+        assert!(told(&mut u.alice).iter().any(|l| l.contains("Unknown command: /def")), "TF scripting is the server's, one for every user");
+        assert!(mud_got(&mut u.mud).is_empty());
+        assert!(drain(&mut u.bob).is_empty());
+    }
+
+    #[tokio::test]
+    async fn worlds_switches_connects_and_stays_among_the_users_own() {
+        let mut u = two_users();
+        typed(&mut u, "/worlds bravo").await;
+        assert!(told(&mut u.alice).iter().any(|l| l == "World 'bravo' not found."), "bob's world is not alice's");
+        typed(&mut u, "/worlds ALPHA2").await;
+        let msgs = drain(&mut u.alice);
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::WorldSwitched { new_index: 2 })), "{msgs:?}");
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::ExecuteLocalCommand { command } if command == "/world alpha2")), "{msgs:?}");
+        assert_eq!(u.app.ws_client_worlds[&1].world_index, 2, "the client's view moved");
+        assert!(matches!(u.events.try_recv(), Ok(AppEvent::ConnectWorldRequest(2, ref who)) if who == "alice"), "connected for alice");
+        assert!(u.events.try_recv().is_err());
+        assert!(drain(&mut u.bob).is_empty());
+        // TF's /connect: the current world is connected already; a named one of the
+        // user's is brought forward and connected.
+        typed(&mut u, "/connect").await;
+        assert!(told(&mut u.alice).iter().any(|l| l.contains("Already connected")));
+        assert!(u.events.try_recv().is_err());
+        typed(&mut u, "/connect alpha2").await;
+        assert!(matches!(u.events.try_recv(), Ok(AppEvent::ConnectWorldRequest(2, _))));
+        typed(&mut u, "/connect bravo").await;
+        assert!(told(&mut u.alice).iter().any(|l| l == "World 'bravo' not found."));
+    }
+
+    #[tokio::test]
+    async fn send_flush_and_disconnect_act_on_the_users_connection() {
+        let mut u = two_users();
+        typed(&mut u, "/send hello there").await;
+        assert_eq!(mud_got(&mut u.mud), ["hello there"]);
+        {
+            let conn = u.app.user_connections.get_mut(&(0, "alice".to_string())).unwrap();
+            for i in 0..3 {
+                conn.output_lines.push(OutputLine::new(format!("line {i}"), i));
+            }
+        }
+        typed(&mut u, "/flush").await;
+        assert!(u.app.user_connections[&(0, "alice".to_string())].output_lines.is_empty());
+        let msgs = drain(&mut u.alice);
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::WorldFlushed { world_index: 0 })), "{msgs:?}");
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("Flushed 3 lines"))), "{msgs:?}");
+        typed(&mut u, "/stats").await;
+        assert!(told(&mut u.alice).iter().any(|l| l.contains("No status data")));
+        typed(&mut u, "/dc").await;
+        assert!(!u.app.user_connections[&(0, "alice".to_string())].connected);
+        let msgs = drain(&mut u.alice);
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::WorldDisconnected { world_index: 0 })), "{msgs:?}");
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data == "Disconnected from alpha.")), "{msgs:?}");
+        typed(&mut u, "look").await;
+        assert!(told(&mut u.alice).iter().any(|l| l.contains("Not connected")), "text with no connection is answered, not dropped");
+    }
+
+    #[tokio::test]
+    async fn the_connections_list_and_gmcp_toggle_are_the_users_own() {
+        let mut u = two_users();
+        handle_multiuser_ws_message(&mut u.app, 1, WsMessage::RequestConnectionsList, &u.tx).await;
+        let msgs = drain(&mut u.alice);
+        let lines = msgs.iter().find_map(|m| if let WsMessage::ConnectionsListResponse { lines } = m { Some(lines.join("\n")) } else { None }).expect("a list");
+        assert!(lines.contains("alpha") && !lines.contains("bravo"), "alice's connections, not bob's: {lines}");
+        let (bobs, alices) = (u.app.worlds[1].gmcp_user_enabled, u.app.worlds[0].gmcp_user_enabled);
+        handle_multiuser_ws_message(&mut u.app, 1, WsMessage::ToggleWorldGmcp { world_index: 1 }, &u.tx).await;
+        assert_eq!(u.app.worlds[1].gmcp_user_enabled, bobs, "bob's world is untouched by alice");
+        assert!(drain(&mut u.bob).is_empty());
+        handle_multiuser_ws_message(&mut u.app, 1, WsMessage::ToggleWorldGmcp { world_index: 0 }, &u.tx).await;
+        assert_eq!(u.app.worlds[0].gmcp_user_enabled, !alices);
+        assert!(drain(&mut u.alice).iter().any(|m| matches!(m, WsMessage::GmcpUserToggled { world_index: 0, enabled } if *enabled == !alices)));
+        assert!(drain(&mut u.bob).is_empty());
+        handle_multiuser_ws_message(&mut u.app, 1, WsMessage::SendGmcp { world_index: 0, package: "Core.Ping".into(), data: String::new() }, &u.tx).await;
+        assert!(mud_got(&mut u.mud).iter().any(|s| s.contains("Core.Ping")), "GMCP goes down alice's own connection");
+        handle_multiuser_ws_message(&mut u.app, 1, WsMessage::ImportSettings { addr: "x".into(), password: None, auth_key: None, allow_insecure: false }, &u.tx).await;
+        assert!(drain(&mut u.alice).iter().any(|m| matches!(m, WsMessage::ImportResult { success: false, .. })), "answered, not dropped");
+    }
+
+    /// The Note editor's save lands in multiuser.dat (it went to settings.dat).
+    #[test]
+    fn notes_are_written_to_multiuser_dat() {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+        let mut w = World::new("alpha");
+        w.owner = Some("alice".to_string());
+        w.settings.notes = "remember the troll\nand the key".to_string();
+        app.worlds.push(w);
+        persistence::save_multiuser_settings(&app).expect("saved");
+        let text = std::fs::read_to_string(crate::get_multiuser_settings_path()).expect("multiuser.dat");
+        assert!(text.contains("notes=remember the troll\\nand the key"), "{text}");
     }
 }
 
@@ -4870,6 +5523,36 @@ mod client_parity_tests {
         typed(&mut app, &tx, "/help send").await;
         assert_eq!(app.worlds[0].output_lines.len(), before, "help is not stored in the world");
         assert!(sent(&mut rx).iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if !data.is_empty())), "help to the asker");
+    }
+
+    /// A client's typed `/worlds` (deferred bug G1): the server has no console, so nothing
+    /// claims the world's unviewed lines before the client's own `MarkWorldSeen` does, the
+    /// requester alone is told, and the server's foreground world follows.
+    #[tokio::test]
+    async fn a_typed_worlds_leaves_the_new_lines_for_the_client_to_claim() {
+        let (mut app, mut rx, tx) = app_with_gui();
+        let mut bravo = World::new("Bravo");
+        bravo.output_lines.push(OutputLine::new("arrived while nobody looked".into(), 1));
+        bravo.output_lines.push(OutputLine::new("and this".into(), 2));
+        app.worlds.push(bravo);
+        app.ws_client_worlds.insert(0, crate::ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        });
+        assert!(!app.console_tui, "a headless server");
+        typed(&mut app, &tx, "/worlds Bravo").await;
+        assert_eq!(app.current_world_index, 1, "the foreground world follows");
+        assert_eq!(app.ws_client_worlds[&0].world_index, 1, "and the client's view");
+        let msgs = sent(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::WorldSwitched { new_index: 1 })), "{msgs:?}");
+        assert!(msgs.iter().any(|m| matches!(m, WsMessage::ExecuteLocalCommand { command } if command == "/world Bravo")), "{msgs:?}");
+        assert!(app.worlds[1].output_lines.iter().all(|l| !l.viewed && l.display_id.is_none()),
+            "no console took the lines: {:?}", app.worlds[1].output_lines.iter().map(|l| (l.viewed, l.display_id)).collect::<Vec<_>>());
+        // The client starts displaying Bravo: its claim is answered with every line.
+        handle_daemon_ws_message(&mut app, 0, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) }, &tx).await;
+        let me = app.display_owner_id(0);
+        assert!(app.worlds[1].output_lines.iter().all(|l| l.display_id == Some(me)), "the client owns them");
+        assert!(sent(&mut rx).iter().any(|m| matches!(m, WsMessage::ClaimedNew { world_index: 1, seqs } if seqs == &vec![1, 2])));
     }
 
     /// Backgrounding (Android) reaches this handler: the client stops counting as a viewer.

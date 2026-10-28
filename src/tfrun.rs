@@ -1369,7 +1369,7 @@ mod tests {
     #[test]
     fn test_textdiv_setting_and_unset() {
         let mut app = app_with_world();
-        app.settings.new_line_indicator = true;
+        app.settings.new_indicator = crate::NewIndicator::Character;
         app.apply_tf_textdiv();
         assert_eq!(app.settings.textdiv, "", "unset: Clay's own markers");
         assert!(app.settings.nli_drawn());

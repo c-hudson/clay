@@ -38,7 +38,7 @@ pub fn create_notes_list_popup(notes: &[NoteInfo], visible_height: usize) -> Pop
             ListItem {
                 id: n.world_name.clone(),
                 columns,
-                style: ListItemStyle {
+                style: ListItemStyle { swatch: None,
                     is_current: n.is_current,
                     is_connected: false,
                     is_disabled: false,

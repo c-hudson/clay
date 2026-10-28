@@ -33,6 +33,8 @@ pub enum Kind {
     RemoteAccess,
     /// The number the Settings' Text Reveal "Custom" asks for.
     RevealSpeed,
+    /// The colour scheme the Settings' New Indicator "New Background - Custom" asks for.
+    GlowScheme,
     /// The MUD's simpleedit text, over the whole window.
     McpEdit,
     /// A file on the main instance's machine (`/note <file>`), over the whole window.

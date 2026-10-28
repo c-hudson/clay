@@ -726,7 +726,7 @@
         setupSeparatorStyleSelect: document.getElementById('setup-separator-style-select'),
         setupTextRevealSelect: document.getElementById('setup-text-reveal-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
-        setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
+        setupNewIndicatorSelect: document.getElementById('setup-new-indicator-select'),
         setupKeyboardVisibleToggle: document.getElementById('setup-keyboard-visible-toggle'),
         setupDebugToggle: document.getElementById('setup-debug-toggle'),
         setupArchiveToggle: document.getElementById('setup-archive-toggle'),
@@ -1532,7 +1532,7 @@
     let setupPictureHost = 'catbox';
     let setupSeparatorStyle = 'web';
     let setupTlsProxy = false;
-    let setupNewLineIndicator = false;
+    let setupNewIndicator = 'none';
     let setupKeyboardAlwaysVisible = true;
     let setupArchive = false;
     let setupLogInput = false;
@@ -1817,7 +1817,9 @@
     let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'kokoro', 'edge')
     let ttsSpeakMode = 'all';  // 'all' or 'limit'
     let ttsVoice = 'af_heart';  // The Kokoro voice (src/kokoro.rs); the server's engine uses it, not this page
-    let newLineIndicator = false;  // Will be synced from server settings
+    // New Indicator's style (NewIndicator: 'none' | 'character' | 'background'), synced
+    // from the server's settings; an older server sends only the bool.
+    let newIndicator = 'none';
     // TF's %textdiv, once a script has set it ('off', 'on', 'always' or 'clear'): what a
     // world brought forward shows between text this client already showed and text that
     // arrived since, in place of the ▶ markers ('' = Clay's own markers). textdivStr is
@@ -1898,15 +1900,76 @@
     // colour is above 0.4. Decided from the colours, never from the theme's name, so a
     // custom light theme gets the light rules too. null when no colour can be read.
     function themeBgIsLight() {
+        const rgb = themeBgRgb();
+        if (!rgb) return null;
+        const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+        const lum = 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
+        return lum > 0.4;
+    }
+    // The theme's background as [r, g, b], from the `--theme-bg` variable; null when it
+    // can't be read.
+    function themeBgRgb() {
         const v = getComputedStyle(document.documentElement).getPropertyValue('--theme-bg').trim();
         const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(v);
         if (!m) return null;
         let h = m[1];
         if (h.length === 3) h = h.replace(/./g, c => c + c);
         const n = parseInt(h, 16);
-        const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
-        const lum = 0.2126 * lin((n >> 16) & 255) + 0.7152 * lin((n >> 8) & 255) + 0.0722 * lin(n & 255);
-        return lum > 0.4;
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    }
+    // New Indicator's background styles (src/newbg.rs, the one source of these numbers,
+    // pinned to it by a test): the glow's four cells as hard stops, its first colour fading
+    // to this theme's background, for `--new-glow` (style.css .new-glow). Rebuilt whenever
+    // the theme or the setting changes (applyNewGlow).
+    const NEW_GLOW_GREEN = [0, 100, 0];
+    const NEW_GLOW_CELLS = 4;
+    const NEW_GLOW_WORD = 'Clay';
+    // "New Background - Custom" (`custom:<key>`): [key, label, first colour].
+    const NEW_GLOW_SCHEMES = [
+        ['teal', 'Teal', [0, 95, 95]],
+        ['cyan', 'Cyan', [0, 105, 140]],
+        ['blue', 'Blue', [20, 60, 165]],
+        ['indigo', 'Indigo', [60, 40, 150]],
+        ['purple', 'Purple', [100, 30, 140]],
+        ['magenta', 'Magenta', [135, 0, 105]],
+        ['red', 'Red', [145, 20, 20]],
+        ['orange', 'Orange', [170, 75, 0]],
+        ['gold', 'Gold', [145, 115, 0]],
+        ['slate', 'Slate', [70, 85, 105]],
+    ];
+    // The scheme of a NewIndicator name (`custom:<key>`; bare `custom` or an unknown key is
+    // the first), as its index; -1 when the name isn't the Custom entry.
+    function newGlowSchemeIndex(name) {
+        if (name !== 'custom' && !String(name || '').startsWith('custom:')) return -1;
+        const key = String(name).slice(7).toLowerCase();
+        const i = NEW_GLOW_SCHEMES.findIndex(s => s[0] === key);
+        return i < 0 ? 0 : i;
+    }
+    // The glow's first colour for a NewIndicator name, or null for the styles without one.
+    function newGlowStart(name) {
+        if (name === 'background') return NEW_GLOW_GREEN;
+        const i = newGlowSchemeIndex(name);
+        return i < 0 ? null : NEW_GLOW_SCHEMES[i][2];
+    }
+    // The four cells from `start` to the theme's background (newbg::swatch).
+    function newGlowCells(start, bg) {
+        const cells = [];
+        for (let i = 0; i < NEW_GLOW_CELLS; i++) cells.push(revealLerp(start, bg, i / NEW_GLOW_CELLS));
+        return cells;
+    }
+    // Black or white text, whichever reads better on `c` (newbg::text_on).
+    function newGlowTextOn(c) {
+        return (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) > 140 ? '#000' : '#fff';
+    }
+    function newGlowGradient() {
+        const bg = themeBgRgb();
+        const start = newGlowStart(newIndicator);
+        if (!bg || !start) return 'none';
+        const stops = newGlowCells(start, bg).map((c, i) => `rgb(${c[0]},${c[1]},${c[2]}) ${i}ch ${i + 1}ch`);
+        return `linear-gradient(to right, ${stops.join(', ')}, transparent ${NEW_GLOW_CELLS}ch)`;
+    }
+    function applyNewGlow() {
+        document.documentElement.style.setProperty('--new-glow', newGlowGradient());
     }
 
     // The GUI theme's name on the page (`body[data-gui-theme]`), for the few rules that
@@ -1925,6 +1988,7 @@
     // Android app, to the system bars around it. Call it after the theme variables have
     // been written (applyThemeColors, ThemeCssVarsUpdated), since it reads them back.
     function applyThemeAppearance() {
+        applyNewGlow();
         const light = themeBgIsLight();
         if (light === null) return;
         document.body.classList.toggle('theme-light', light);
@@ -4230,7 +4294,8 @@
                         textReveal = (msg.settings.text_reveal_profiles && msg.settings.text_reveal_profiles[fontProfileKey]) || 'off';
                     }
                     if (msg.settings.new_line_indicator !== undefined) {
-                        newLineIndicator = msg.settings.new_line_indicator;
+                        newIndicator = newIndicatorOf(msg.settings);
+                        applyNewGlow();
                     }
                     if (msg.settings.keyboard_always_visible !== undefined) {
                         keyboardAlwaysVisible = msg.settings.keyboard_always_visible;
@@ -4584,6 +4649,7 @@
                     updateFlow = null;
                     proceedOwnUpdate(f);
                 }
+                showCrashNotices();
                 break;
 
             case 'ServerData':
@@ -4848,6 +4914,8 @@
                         if (appendedLineCount > 0) scheduleWorldCacheSave(msg.world_index);
                     }
                 }
+                // A crash notice waiting for the splash to end (showCrashNotices).
+                if (window.CLAY_CRASH_NOTICES) showCrashNotices();
                 break;
 
             case 'WorldConnected':
@@ -5128,9 +5196,10 @@
                         textReveal = (msg.settings.text_reveal_profiles && msg.settings.text_reveal_profiles[fontProfileKey]) || 'off';
                     }
                     if (msg.settings.new_line_indicator !== undefined) {
-                        const oldNli = newLineIndicator;
-                        newLineIndicator = msg.settings.new_line_indicator;
-                        if (oldNli !== newLineIndicator) {
+                        const oldNli = newIndicator;
+                        newIndicator = newIndicatorOf(msg.settings);
+                        if (oldNli !== newIndicator) {
+                            applyNewGlow();
                             renderOutput();
                         }
                     }
@@ -8134,10 +8203,22 @@
         }
     }
 
-    // Clay's ▶ new-text markers are drawn: the setting is on and TF's %textdiv, which takes
-    // their place, is not set (Settings::nli_drawn).
+    // Clay's new-text markers are drawn, in either style: the setting is on and TF's
+    // %textdiv, which takes their place, is not set (Settings::nli_drawn).
     function nliDrawn() {
-        return newLineIndicator && !textdivMode;
+        return newIndicator !== 'none' && !textdivMode;
+    }
+    // The style from a GlobalSettingsMsg: by name, or an older server's bool (on = the
+    // character), as NewIndicator::from_wire.
+    function newIndicatorOf(settings) {
+        if (settings.new_indicator) return settings.new_indicator;
+        return settings.new_line_indicator ? 'character' : 'none';
+    }
+    // New Indicator's background style on this line (src/newbg.rs): a line this client
+    // owns, unless a /highlight colour takes the whole line (as on the console).
+    function newGlow(o) {
+        return newGlowStart(newIndicator) !== null && nliDrawn() && !!o.markedNew
+            && (o.highlightColor === null || o.highlightColor === undefined);
     }
 
     // The divider element: TF's %textdiv_str, or for "clear" a blank as tall as the output
@@ -8174,6 +8255,7 @@
 
     function switchWorldLocal(index) {
         if (lockedWorld) return; // Don't switch worlds in locked windows
+        if (window.CLAY_CRASH_NOTICES) setTimeout(showCrashNotices, 0);
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
             const previousWorldIndex = currentWorldIndex;
@@ -8927,7 +9009,10 @@
             'More Mode: Pauses output when a full screen of text',
             '  arrives. Keeps you from missing important text.', '',
             'TLS Proxy: Keeps a proxy alive during hot reload', '  so TLS connections survive.', '',
-            'New Indicator: Show a marker on new lines arriving', '  while scrolled up in the output buffer.', '',
+            'New Indicator: How text that arrived while you were', '  in another world is marked. New Character: a green',
+            '  ▶ in front of each line. New Background: a green', '  glow behind its first 4 characters, fading to the',
+            '  theme\'s background. New Background - Custom: the', '  same glow in another colour, picked from ten.',
+            '  None: not marked. Leaving the world or Ctrl+L', '  clears the marks, in any style.', '',
             'Keyboard Visible (phones and tablets only): Force the',
             '  on-screen keyboard to stay up. Off lets the OS decide.',
             '  Always ignored (keyboard hidden) when a hardware',
@@ -10137,7 +10222,9 @@
         }
         // Skip Discord emoji conversion when showTags is enabled so users can see original text
         const processed = linkifyUrls(parseAnsi(ansiText));
-        const newLinePrefix = (nliDrawn() && o.markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
+        // The character style; the background style is the .new-glow class on the line's
+        // element (lineSpanHtml), so it adds no text and changes no wrapping.
+        const newLinePrefix = (newIndicator === 'character' && nliDrawn() && o.markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
         // Mirrors OutputLine::shows_archive_prefix(): both flags mean "text from scrollback.db".
         const archivePrefix = (o.fromArchive || o.archiveSourced) ? '🛢️ ' : '';
         let html = tsPrefix + newLinePrefix + archivePrefix + wrapEmoji(showTags ? processed : convertDiscordEmojis(processed));
@@ -10195,11 +10282,13 @@
         return id;
     }
 
-    function lineSpanHtml(html, idx, lineObj) {
+    // `glow`: New Indicator's background style on this line (newGlow): the class puts the
+    // green glow behind the first cells of every row of the block (style.css .new-glow).
+    function lineSpanHtml(html, idx, lineObj, glow) {
         const seq = lineObj && typeof lineObj === 'object' && typeof lineObj.seq === 'number'
             && lineObj._has_real_seq !== false ? lineObj.seq : null;
         const lid = lineId(lineObj);
-        return `<span class="line" data-line-idx="${idx}"${lid !== null ? ` data-lid="${lid}"` : ''}${seq !== null ? ` data-seq="${seq}"` : ''}>${html}</span>`;
+        return `<span class="line${glow ? ' new-glow' : ''}" data-line-idx="${idx}"${lid !== null ? ` data-lid="${lid}"` : ''}${seq !== null ? ` data-seq="${seq}"` : ''}>${html}</span>`;
     }
 
     // The line at the top of the view and how far its top sits from the view's, so a rebuild
@@ -10514,7 +10603,7 @@
                 htmlParts.push(textdivHtml(divider.mode));
                 dividerPlaced = true;
             }
-            htmlParts.push(lineSpanHtml(html, i, lineObj));
+            htmlParts.push(lineSpanHtml(html, i, lineObj, newGlow(o)));
         }
         if (divider && !dividerPlaced && divider.mode !== 'on' && !slid) {
             htmlParts.push(textdivHtml(divider.mode));
@@ -10561,6 +10650,20 @@
     // Append a client-generated message to output
     // style: 'info' (✨ prefix, applied at display time by appendNewLine) or
     // 'system' (yellow color, ✨ still applies since these are from_server: false)
+    // An earlier Clay on this machine that crashed (src/crashlog.rs, injected by
+    // webview_gui.rs as CLAY_CRASH_NOTICES): said once, in the world on screen, once the
+    // first InitialState has given it one (a line added before that is replaced with it)
+    // and it is off its splash (which shows no output lines, and whose end flushes them).
+    // Asked again as output arrives and on a switch, until it can be said.
+    function showCrashNotices() {
+        const notices = window.CLAY_CRASH_NOTICES;
+        if (!Array.isArray(notices) || !notices.length || noteMode) return;
+        const w = worlds[currentWorldIndex];
+        if (!w || w.showing_splash) return;
+        window.CLAY_CRASH_NOTICES = null;
+        for (const n of notices) appendClientLine(String(n));
+    }
+
     function appendClientLine(text, worldIndex = currentWorldIndex, style = 'info') {
         const prefixes = {
             info: '',
@@ -10621,7 +10724,7 @@
         // hanging-indent CSS work; see renderOutput()'s comment).
         // Defense-in-depth: strip any event handler attributes that slipped through
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
-        elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(lineSpanHtml(html, lineIndex, lineObj)));
+        elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(lineSpanHtml(html, lineIndex, lineObj, newGlow(o))));
         if (revealFrameNext !== null) revealTrack(elements.output.lastElementChild, cleanText, lineObj, o);
 
         scheduleScrollToBottom();
@@ -14274,7 +14377,7 @@
         setupSeparatorStyle = separatorStyle || 'web';
         setupTextReveal = textReveal || 'off';
         setupTlsProxy = tlsProxyEnabled;
-        setupNewLineIndicator = newLineIndicator;
+        setupNewIndicator = newIndicator;
         setupKeyboardAlwaysVisible = keyboardAlwaysVisible;
         setupDebug = debugEnabled;
         setupArchive = scrollbackEnabled;
@@ -14410,10 +14513,8 @@
         } else {
             elements.setupTlsProxyToggle.classList.remove('active');
         }
-        if (setupNewLineIndicator) {
-            elements.setupNewLineIndicatorToggle.classList.add('active');
-        } else {
-            elements.setupNewLineIndicatorToggle.classList.remove('active');
+        if (elements.setupNewIndicatorSelect) {
+            showNewIndicatorChoice(elements.setupNewIndicatorSelect, setupNewIndicator);
         }
         if (setupKeyboardAlwaysVisible) {
             elements.setupKeyboardVisibleToggle.classList.add('active');
@@ -14547,7 +14648,9 @@
             // This page's own Text Reveal under its key; null = unchanged (a server from
             // before the effect sent none).
             text_reveal_profile: textRevealSynced ? { key: fontProfileKey, value: textReveal } : null,
-            new_line_indicator: newLineIndicator,
+            // The style by name, and the bool an older server reads (on = any style).
+            new_line_indicator: newIndicator !== 'none',
+            new_indicator: newIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
             scrollback_enabled: scrollbackEnabled,
@@ -14689,7 +14792,8 @@
         if (separatorStyle) separatorStyle = setupSeparatorStyle;
         textReveal = setupTextReveal;
         tlsProxyEnabled = setupTlsProxy;
-        newLineIndicator = setupNewLineIndicator;
+        newIndicator = setupNewIndicator;
+        applyNewGlow();
         keyboardAlwaysVisible = setupKeyboardAlwaysVisible;
         applyKeyboardForceState();
         debugEnabled = setupDebug;
@@ -19548,10 +19652,29 @@
             setupTlsProxy = !setupTlsProxy;
             updateSetupPopupUI();
         };
-        elements.setupNewLineIndicatorToggle.onclick = function() {
-            setupNewLineIndicator = !setupNewLineIndicator;
-            updateSetupPopupUI();
-        };
+        if (elements.setupNewIndicatorSelect) {
+            // The Custom entry opens the scheme picker when picked, or on Enter after a key
+            // stepped onto it (a closed select fires change at every arrow step; the same
+            // rule as Text Reveal's Custom).
+            elements.setupNewIndicatorSelect.onkeydown = function(e) {
+                glowStepKey = REVEAL_STEP_KEYS.has(e.key) || (e.key.length === 1 && e.key !== ' ');
+                if (e.key === 'Enter') {
+                    const select = this;
+                    setTimeout(function() {
+                        if (newGlowSchemeIndex(select.value) >= 0 && !glowSchemeDialogOpen) showGlowSchemeDialog(select, setupNewIndicator);
+                    }, 0);
+                }
+            };
+            elements.setupNewIndicatorSelect.onkeyup = function() {
+                setTimeout(function() { glowStepKey = false; }, 0);
+            };
+            elements.setupNewIndicatorSelect.onchange = function() {
+                const stepped = glowStepKey;
+                glowStepKey = false;
+                if (newGlowSchemeIndex(this.value) < 0 || stepped) setupNewIndicator = this.value;
+                else showGlowSchemeDialog(this, setupNewIndicator);
+            };
+        }
         elements.setupKeyboardVisibleToggle.onclick = function() {
             setupKeyboardAlwaysVisible = !setupKeyboardAlwaysVisible;
             updateSetupPopupUI();
@@ -20469,6 +20592,102 @@
             else if (e.key === 'Escape') { e.preventDefault(); cancelRevealSpeedDialog(); }
             e.stopPropagation();
         };
+    }
+
+    // New Indicator's Custom entry: its value and label are the scheme it holds (or the
+    // first), as the console's and the native GUI's are (setup::new_indicator_options).
+    function showNewIndicatorChoice(select, name) {
+        const i = newGlowSchemeIndex(name);
+        const custom = Array.from(select.options).find(o => o.value === 'custom' || o.value.startsWith('custom:'));
+        if (custom) {
+            const s = NEW_GLOW_SCHEMES[i < 0 ? 0 : i];
+            custom.value = 'custom:' + s[0];
+            setSelectOptionText(select, custom.value, 'New Background - Custom (' + s[1] + ')');
+            if (select._customMenu) {
+                select._customMenu.querySelectorAll('.custom-dropdown-item').forEach(item => {
+                    if (item.dataset.value === 'custom' || item.dataset.value.startsWith('custom:')) item.dataset.value = custom.value;
+                });
+            }
+        }
+        select.value = i < 0 ? name : 'custom:' + NEW_GLOW_SCHEMES[i][0];
+        if (select.selectedIndex < 0) select.value = 'none';
+        updateCustomDropdown(select);
+    }
+
+    let glowStepKey = false;            // a key that steps the New Indicator select is down
+    let glowSchemeDialogOpen = false;
+    // "New Background - Custom" (the console's glow_scheme popup, the native GUI's
+    // GlowScheme dialog): each scheme drawn as NEW_GLOW_WORD over its four cells, fading to
+    // this theme's background. A click or Enter picks one and puts it on the select; Esc or
+    // Cancel puts back `previous`.
+    function showGlowSchemeDialog(select, previous) {
+        let dlg = document.getElementById('glow-scheme-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'glow-scheme-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            document.body.appendChild(dlg);
+        }
+        const bg = themeBgRgb() || [0, 0, 0];
+        let selected = Math.max(0, newGlowSchemeIndex(select.value));
+        const rows = NEW_GLOW_SCHEMES.map((s, i) => {
+            const cells = newGlowCells(s[2], bg).map((c, k) =>
+                `<span style="display:inline-block;width:1.6ch;padding:1px 0;text-align:center;background:rgb(${c[0]},${c[1]},${c[2]});color:${newGlowTextOn(c)};">${NEW_GLOW_WORD[k]}</span>`).join('');
+            return `<div class="glow-scheme-row" data-index="${i}" style="display:flex;align-items:center;gap:16px;padding:5px 12px;border-radius:4px;cursor:pointer;">
+                <span style="font-family:var(--mono, monospace);font-weight:bold;">${cells}</span><span>${escapeHtml(s[1])}</span></div>`;
+        }).join('');
+        dlg.innerHTML = sanitizeHtml(`
+            <div class="modal-content js-dialog" style="max-width:320px;width:90%;" tabindex="-1" id="glow-scheme-box">
+                <div class="js-dialog-title">New Background - Custom</div>
+                <div id="glow-scheme-rows" style="display:flex;flex-direction:column;gap:2px;margin-bottom:12px;">${rows}</div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;">
+                    <button id="glow-scheme-cancel" class="btn">Cancel</button>
+                    <button id="glow-scheme-ok" class="btn btn-primary">OK</button>
+                </div>
+            </div>
+        `);
+        dlg.style.display = 'flex';
+        glowSchemeDialogOpen = true;
+        const box = document.getElementById('glow-scheme-box');
+        const rowEls = Array.from(dlg.querySelectorAll('.glow-scheme-row'));
+        function mark() {
+            rowEls.forEach((r, i) => {
+                r.style.background = i === selected ? 'var(--theme-accent, #5ab0d8)' : '';
+                r.style.color = i === selected ? 'var(--theme-bg, #000)' : '';
+            });
+        }
+        function close() {
+            glowSchemeDialogOpen = false;
+            dlg.style.display = 'none';
+            if (select.offsetParent !== null) select.focus();
+        }
+        function choose(i) {
+            setupNewIndicator = 'custom:' + NEW_GLOW_SCHEMES[i][0];
+            showNewIndicatorChoice(select, setupNewIndicator);
+            close();
+        }
+        function cancel() {
+            setupNewIndicator = previous;
+            showNewIndicatorChoice(select, previous);
+            close();
+        }
+        rowEls.forEach((r, i) => {
+            r.onclick = function() { choose(i); };
+            r.onmouseenter = function() { selected = i; mark(); };
+        });
+        document.getElementById('glow-scheme-cancel').onclick = cancel;
+        document.getElementById('glow-scheme-ok').onclick = function() { choose(selected); };
+        box.onkeydown = function(e) {
+            if (e.key === 'ArrowDown') { selected = (selected + 1) % rowEls.length; mark(); }
+            else if (e.key === 'ArrowUp') { selected = (selected + rowEls.length - 1) % rowEls.length; mark(); }
+            else if (e.key === 'Enter') choose(selected);
+            else if (e.key === 'Escape') cancel();
+            else return;
+            e.preventDefault();
+            e.stopPropagation();
+        };
+        mark();
+        box.focus();
     }
 
     function cancelRevealSpeedDialog() {

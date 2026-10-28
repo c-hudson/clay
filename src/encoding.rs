@@ -606,6 +606,100 @@ impl SeparatorStyle {
     }
 }
 
+/// How a line this viewer owns - its ▶ new text, see `OutputLine::display_id` - is marked
+/// (`Settings::new_indicator`, Setup's "New Indicator"): a green `▶ ` in front of it, a green
+/// glow behind its first cells fading to the theme's background (src/newbg.rs), or not at
+/// all. One global setting, shown in every interface's Settings. The rules for *which* lines
+/// are marked, and when the marks go (leaving the world, Ctrl+L), are the same for both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum NewIndicator {
+    #[default]
+    None,
+    Character,
+    Background,
+    /// "New Background - Custom": the glow in one of `newbg::SCHEMES` (its index), picked
+    /// from a window of them (user request 2026-10-28). Named `custom:<key>`.
+    Custom(u8),
+}
+
+impl NewIndicator {
+    /// (value, label) as every Settings window lists them - the console's `/setup`, the
+    /// native GUI's Pick and the web page's select (a test pins index.html to this). The
+    /// last is the Custom entry, bare: each window shows it as the scheme set or the first
+    /// one (`setup::new_indicator_options`), and picking it opens the scheme picker.
+    pub const OPTIONS: &'static [(&'static str, &'static str)] =
+        &[("none", "None"), ("character", "New Character"), ("background", "New Background"), (Self::CUSTOM, "New Background - Custom")];
+
+    /// The Custom entry's bare value.
+    pub const CUSTOM: &'static str = "custom";
+
+    pub fn name(&self) -> String {
+        match self {
+            NewIndicator::None => "none".to_string(),
+            NewIndicator::Character => "character".to_string(),
+            NewIndicator::Background => "background".to_string(),
+            NewIndicator::Custom(i) => format!("custom:{}", Self::scheme(*i).key),
+        }
+    }
+
+    /// The label a Settings window shows for this value.
+    pub fn label(&self) -> String {
+        match self {
+            NewIndicator::Custom(i) => format!("New Background - Custom ({})", Self::scheme(*i).label),
+            other => Self::OPTIONS.iter().find(|(v, _)| *v == other.name()).map_or(String::new(), |(_, l)| l.to_string()),
+        }
+    }
+
+    fn scheme(i: u8) -> &'static crate::newbg::Scheme {
+        &crate::newbg::SCHEMES[(i as usize).min(crate::newbg::SCHEMES.len() - 1)]
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "character" => NewIndicator::Character,
+            "background" => NewIndicator::Background,
+            "none" => NewIndicator::None,
+            // The Custom entry: its scheme, or the first for the bare entry or one unknown.
+            custom if custom == Self::CUSTOM || custom.starts_with("custom:") => {
+                let key = custom.strip_prefix("custom:").unwrap_or("");
+                NewIndicator::Custom(crate::newbg::scheme_index(key).unwrap_or(0) as u8)
+            }
+            // Unrecognised (a hand-edited settings.dat) falls back to the default.
+            _ => Self::default(),
+        }
+    }
+
+    /// A value on the Custom entry (any scheme).
+    pub fn is_custom_name(name: &str) -> bool {
+        name == Self::CUSTOM || name.starts_with("custom:")
+    }
+
+    /// The glow's first colour, for the two background styles.
+    pub fn glow_start(&self) -> Option<crate::reveal::Rgb> {
+        match self {
+            NewIndicator::Background => Some(crate::newbg::GREEN),
+            NewIndicator::Custom(i) => Some(Self::scheme(*i).start),
+            _ => None,
+        }
+    }
+
+    /// The setting as it was before it had styles: a bool, on = the ▶ character.
+    pub fn from_legacy(on: bool) -> Self {
+        if on { NewIndicator::Character } else { NewIndicator::None }
+    }
+
+    /// From the wire: the style's name when the peer knows styles, else its bool
+    /// (`GlobalSettingsMsg.new_indicator` / `.new_line_indicator`).
+    pub fn from_wire(name: &str, legacy_on: bool) -> Self {
+        if name.is_empty() { Self::from_legacy(legacy_on) } else { Self::from_name(name) }
+    }
+
+    /// The bool an older peer reads: any style but None is "on".
+    pub fn is_on(&self) -> bool {
+        *self != NewIndicator::None
+    }
+}
+
 /// World switching mode for Up/Down arrow cycling
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum WorldSwitchMode {
@@ -1342,6 +1436,35 @@ fn emoji_name_to_unicode(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The new-text indicator's styles by name: every option round-trips, an unknown name is
+    /// the default (None), and the old bool maps onto the character.
+    #[test]
+    fn new_indicator_names_round_trip() {
+        for (name, _) in &NewIndicator::OPTIONS[..3] {
+            assert_eq!(NewIndicator::from_name(name).name(), *name);
+        }
+        for (i, s) in crate::newbg::SCHEMES.iter().enumerate() {
+            let name = format!("custom:{}", s.key);
+            assert_eq!(NewIndicator::from_name(&name), NewIndicator::Custom(i as u8));
+            assert_eq!(NewIndicator::from_name(&name).name(), name);
+            assert_eq!(NewIndicator::Custom(i as u8).glow_start(), Some(s.start));
+        }
+        assert_eq!(NewIndicator::from_name("custom"), NewIndicator::Custom(0), "the bare entry: the first scheme");
+        assert_eq!(NewIndicator::from_name("custom:plaid"), NewIndicator::Custom(0));
+        assert_eq!(NewIndicator::Custom(2).label(), "New Background - Custom (Blue)");
+        assert_eq!(NewIndicator::Background.label(), "New Background");
+        assert_eq!(NewIndicator::Background.glow_start(), Some(crate::newbg::GREEN));
+        assert_eq!(NewIndicator::Character.glow_start(), None);
+        assert!(NewIndicator::is_custom_name("custom") && NewIndicator::is_custom_name("custom:red") && !NewIndicator::is_custom_name("background"));
+        assert_eq!(NewIndicator::from_name("plaid"), NewIndicator::None);
+        assert_eq!(NewIndicator::default(), NewIndicator::None);
+        assert_eq!(NewIndicator::from_legacy(true), NewIndicator::Character);
+        assert_eq!(NewIndicator::from_legacy(false), NewIndicator::None);
+        assert_eq!(NewIndicator::from_wire("", true), NewIndicator::Character, "no name: the bool");
+        assert_eq!(NewIndicator::from_wire("background", false), NewIndicator::Background, "a name wins");
+        assert!(NewIndicator::Background.is_on() && NewIndicator::Character.is_on() && !NewIndicator::None.is_on());
+    }
 
     #[test]
     fn fansi_decodes_cp437_low_symbols() {
