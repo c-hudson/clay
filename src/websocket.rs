@@ -286,6 +286,13 @@ pub enum WsMessage {
         /// exactly as before.
         #[serde(default)]
         resume_epochs: Vec<(usize, u64)>,
+        /// Which interface this client is: its program on its OS, as its fonts are kept
+        /// (`font_profile::native_key()`, app.js's `fontProfileKey`, the SSH console's
+        /// `REMOTE_CONSOLE_REVEAL_KEY`). The server keeps text-to-speech per interface
+        /// (`Settings::tts_profiles`) and speaks to each client with its own. Empty from an
+        /// older client, or one that never speaks (the editor pages, `/import`).
+        #[serde(default)]
+        interface_key: String,
         /// The client build's version string, logged next to WS-AUTH so a single log pull
         /// answers "what is this peer running?".
         ///
@@ -885,6 +892,13 @@ pub enum WsMessage {
         /// older client, or one that never changed a font) = unchanged.
         #[serde(default)]
         font_profile: Option<crate::font_profile::FontProfileUpdate>,
+        /// This client's own text-to-speech, under its interface key (user request
+        /// 2026-10-28: each interface its own, set only there). `None` (an older client,
+        /// or one that didn't touch it) = unchanged. A client that names its interface at
+        /// login has its legacy `tts_mode`/`tts_speak_mode`/`tts_voice` ignored: those are
+        /// the console's own, which only an older client still edits.
+        #[serde(default)]
+        tts_profile: Option<TtsProfileUpdate>,
     },
 
     // Settings update confirmations (server -> client)
@@ -1900,6 +1914,64 @@ pub struct TextRevealProfile {
     pub value: String,
 }
 
+/// One interface's own text-to-speech (`GlobalSettingsMsg.tts_profiles`): `tts::TtsMode`,
+/// `tts::TtsSpeakMode` and the Kokoro voice, by name.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct TtsSetting {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub speak_mode: String,
+    #[serde(default)]
+    pub voice: String,
+}
+
+/// A client's own text-to-speech (`UpdateGlobalSettings.tts_profile`): its interface key
+/// and the setting it chose.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TtsProfileUpdate {
+    pub key: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub speak_mode: String,
+    #[serde(default)]
+    pub voice: String,
+}
+
+impl GlobalSettingsMsg {
+    /// The text-to-speech interface `key` speaks with: its own (`tts_profiles`, Off until it
+    /// chose one), or - from a server before the split - the one shared setting.
+    pub fn tts_for(&self, key: &str) -> crate::tts::TtsProfile {
+        match &self.tts_profiles {
+            Some(profiles) => profiles.get(key).map(crate::tts::TtsProfile::from_setting).unwrap_or_default(),
+            None => crate::tts::TtsProfile::from_names(&self.tts_mode, &self.tts_speak_mode, &self.tts_voice),
+        }
+    }
+
+    /// Set interface `key`'s own text-to-speech, as its Settings' Save does: under its key,
+    /// or in the shared fields for a server before the split.
+    pub fn set_tts_for(&mut self, key: &str, profile: &crate::tts::TtsProfile) {
+        match &mut self.tts_profiles {
+            Some(profiles) => {
+                profiles.insert(key.to_string(), profile.to_setting());
+            }
+            None => {
+                self.tts_mode = profile.mode.name().to_string();
+                self.tts_speak_mode = profile.speak_mode.name().to_string();
+                self.tts_voice = profile.voice.clone();
+            }
+        }
+    }
+
+    /// The `UpdateGlobalSettings.tts_profile` for interface `key`: its own, once the server
+    /// keeps them and it has one.
+    pub fn tts_profile_update(&self, key: &str) -> Option<TtsProfileUpdate> {
+        let s = self.tts_profiles.as_ref()?.get(key)?;
+        Some(TtsProfileUpdate { key: key.to_string(), mode: s.mode.clone(), speak_mode: s.speak_mode.clone(), voice: s.voice.clone() })
+    }
+}
+
 /// Global settings for WebSocket protocol
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GlobalSettingsMsg {
@@ -2002,6 +2074,8 @@ pub struct GlobalSettingsMsg {
     /// for an older client. Empty = a server from before the styles: use the bool.
     #[serde(default)]
     pub new_indicator: String,
+    /// The console's own text-to-speech (and, for an older client, the one shared
+    /// setting). A client that knows `tts_profiles` reads its own there instead.
     #[serde(default)]
     pub tts_mode: String,
     #[serde(default)]
@@ -2009,6 +2083,11 @@ pub struct GlobalSettingsMsg {
     /// The Kokoro voice (src/kokoro.rs); empty from a server before it existed.
     #[serde(default)]
     pub tts_voice: String,
+    /// Each interface's own text-to-speech, by its interface key (see
+    /// `AuthRequest.interface_key`) - a key without one is Off. `None` from a server
+    /// before the split: the client then shows and edits the shared fields above.
+    #[serde(default)]
+    pub tts_profiles: Option<std::collections::BTreeMap<String, TtsSetting>>,
     #[serde(default)]
     pub scrollback_enabled: bool,
     /// See `Settings::log_input_enabled`'s doc comment in main.rs.
@@ -3624,7 +3703,7 @@ where
         };
         try_send_local(&clients, client_id, &tx, &client_ip, response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new() }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new() }))).await;
     }
 
     // Combined receive/send/keepalive loop.

@@ -139,6 +139,8 @@ pub struct KeybindEditor {
     actions: Vec<ActionInfo>,
     saved: String,
     loaded: bool,
+    /// Save was pressed and its answer hasn't come: closing now keeps what was saved.
+    saving: bool,
     selected: Option<String>,
     capturing: bool,
     capture: Capture,
@@ -170,6 +172,8 @@ impl KeybindEditor {
             }));
         }
         let _ = main.update(cx, |v, cx| v.send_message(WsMessage::RequestKeybindEditorState, cx));
+        // Closed without Save (its title bar's close, as Cancel): what it changed goes.
+        subs.push(cx.on_release(|this, cx| this.discard(cx)));
         Self {
             main,
             focus: cx.focus_handle(),
@@ -178,6 +182,7 @@ impl KeybindEditor {
             actions: Vec::new(),
             saved: String::new(),
             loaded: false,
+            saving: false,
             selected: None,
             capturing: false,
             capture: Capture::default(),
@@ -202,6 +207,7 @@ impl KeybindEditor {
 
     /// Save's answer (`KeybindFileSaved`).
     pub fn saved(&mut self, success: bool, error: Option<&str>, cx: &mut Context<Self>) {
+        self.saving = false;
         if success {
             self.saved = self.snapshot();
             self.say("Saved", cx);
@@ -291,12 +297,29 @@ impl KeybindEditor {
         true
     }
 
+    /// Cancel (user request 2026-10-28): the window just closes, and keeps nothing it
+    /// changed - each change was applied on the server as it was made, so the saved
+    /// bindings go back to it first.
     fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.discard(cx);
+        cx.emit(DialogEvent::Close);
+    }
+
+    /// Put the saved bindings back on the server if this window changed them since they
+    /// were loaded or saved (not while a Save is on its way: that is what the user kept).
+    fn discard(&mut self, cx: &mut App) {
+        if !self.loaded || self.saving || self.snapshot() == self.saved {
+            return;
+        }
         if let Ok(b) = serde_json::from_str(&self.saved) {
             self.bindings = b;
         }
-        self.changed(cx);
-        self.say("Reverted", cx);
+        self.send(WsMessage::UpdateKeybindEditorBindings { bindings_json: self.saved.clone() }, cx);
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) {
+        self.saving = true;
+        self.send(WsMessage::SaveKeybindFile, cx);
     }
 
     fn reset_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -634,7 +657,7 @@ impl Render for KeybindEditor {
                 window.focus(&this.focus, cx);
                 cx.notify();
             })))).px(px(8.0)).py(px(3.0)))
-            .child(k.button("kb-save", "Save", Btn::Primary, Some(Box::new(cx.listener(|this, _, _w, cx| this.send(WsMessage::SaveKeybindFile, cx))))).px(px(10.0)).py(px(3.0)))
+            .child(k.button("kb-save", "Save", Btn::Primary, Some(Box::new(cx.listener(|this, _, _w, cx| this.save(cx))))).px(px(10.0)).py(px(3.0)))
             .child(k.button("kb-cancel", "Cancel", Btn::Plain, Some(Box::new(cx.listener(|this, _, _w, cx| this.cancel(cx))))).px(px(10.0)).py(px(3.0)))
             .child(k.button("kb-reset", "Reset Defaults", Btn::Danger, Some(Box::new(cx.listener(|this, _, w, cx| this.reset_defaults(w, cx))))).px(px(10.0)).py(px(3.0)))
             .children(status.map(|s| div().text_size(px(12.0)).text_color(t.success).child(s)));

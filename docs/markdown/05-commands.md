@@ -236,9 +236,10 @@ Speak text aloud.
 /say <text>
 ```
 
-Reads `<text>` with the text-to-speech engine chosen in `/setup` (TTS: Local, Kokoro or
-Edge - see the Settings chapter); a browser page or the Android app reads it with the
-device's own voice. With TTS off the console says nothing but still shows the line.
+Reads `<text>` aloud where it was typed, with that interface's own text-to-speech (TTS:
+Local, Kokoro or Edge - see the Settings chapter); a browser page or the Android app
+reads it with the device's own voice. With TTS off the console says nothing but still
+shows the line.
 
 ### /tts
 Text-to-speech status, and the Kokoro voice's files.
@@ -262,7 +263,8 @@ full-precision build (about 340 MB, 400 MB on disk) on an x86 CPU with only AVX2
 int8 runs up to four times slower and can fall behind real time. `/tts status` names the
 build installed, and `/tts install` on a machine that has the other switches it. The
 install runs in the background and reports as it goes; afterwards set TTS to Kokoro in
-`/setup`. Until
+`/setup` (or the GUI's Settings). `/tts status` and `/tts voice` are about the interface
+you type them in: each keeps its own text-to-speech. Until
 the files are there, Kokoro mode speaks with the Local engine, so nothing goes silent -
 and Clay says so: once when Kokoro is selected without them, and once more the first
 time a line is spoken that way, naming the command to run.

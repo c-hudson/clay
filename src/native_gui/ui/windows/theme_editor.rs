@@ -539,7 +539,7 @@ impl ThemeEditor {
         }
         // The console's separator bar: settings.dat, saved with the theme.
         list = list.child(div().px(px(10.0)).py(px(6.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(t.muted).child("SEPARATOR BAR"));
-        for (key, label, desc) in [("tinyfugue", "TinyFugue", "Underscore fill"), ("web", "Web Coloring", "Flat status_bar.bg")] {
+        for (key, label, desc) in [("tinyfugue", "TinyFugue", "Underscore fill"), ("web", "Clay", "Flat status_bar.bg")] {
             let checked = self.separator == key;
             list = list.child(
                 div()

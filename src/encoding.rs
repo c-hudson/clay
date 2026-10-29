@@ -578,7 +578,9 @@ impl SeparatorStyle {
     /// native GUI's Pick and the web page's select (a test pins index.html to this). One
     /// global setting shown in every interface (user ruling 2026-10-27), though only a
     /// console's bar changes.
-    pub const OPTIONS: &'static [(&'static str, &'static str)] = &[("web", "Web"), ("tinyfugue", "TinyFugue")];
+    /// Labelled Clay and TinyFugue (user request 2026-10-28: "Web" became "Clay"); the
+    /// value stays `web` in settings.dat and on the wire.
+    pub const OPTIONS: &'static [(&'static str, &'static str)] = &[("web", "Clay"), ("tinyfugue", "TinyFugue")];
 
     pub fn name(&self) -> &'static str {
         match self {

@@ -146,8 +146,10 @@ impl SettingsView {
         let port_mode = if !edit.http_enabled { "disabled" } else if edit.http_port == 9000 { "9000" } else { "custom" };
         // A custom cert the server has but whose paths it didn't send shows "Configured".
         let configured = |path: &str| if edit.tls_configured && path.is_empty() { "Configured" } else { "" };
+        // This GUI's own text-to-speech (the server keeps one per interface).
+        let tts = edit.tts_for(crate::font_profile::native_key());
         let fields = Fields {
-            voice: text(edit.tts_voice.clone(), crate::kokoro::DEFAULT_VOICE, window, cx),
+            voice: text(tts.voice.clone(), crate::kokoro::DEFAULT_VOICE, window, cx),
             custom_port: text(edit.http_port.to_string(), "", window, cx),
             web_path: text(edit.web_path.clone(), "clay", window, cx),
             remote_lines: text(edit.remote_initial_lines.to_string(), "", window, cx),
@@ -219,8 +221,8 @@ impl SettingsView {
         let v = Self {
             world_switch: Pick::new(&[("Unseen First", "Unseen First"), ("Alphabetical", "Alphabetical")], &edit.world_switch_mode, window, cx),
             theme: Pick::new(&crate::theme::BUILTIN_THEMES, &edit.gui_theme, window, cx),
-            tts: Pick::new(&crate::tts::TtsMode::OPTIONS, &edit.tts_mode, window, cx),
-            speak: Pick::new(&[("all", "All"), ("limit", "Limit")], &edit.tts_speak_mode, window, cx),
+            tts: Pick::new(&crate::tts::TtsMode::OPTIONS, tts.mode.name(), window, cx),
+            speak: Pick::new(&[("all", "All"), ("limit", "Limit")], tts.speak_mode.name(), window, cx),
             tabs: Pick::new(&[("none", "None"), ("top", "Show Top Ribbon"), ("bottom", "Show Bottom Ribbon")], &edit.tabs, window, cx),
             icon_bar: Pick::new(&[("none", "None"), ("app_tablet", "App/Tablet"), ("all", "All")], &edit.icon_bar, window, cx),
             picture_host: Pick::new(crate::picture::PictureService::OPTIONS, &edit.picture_host, window, cx),
@@ -405,9 +407,9 @@ impl SettingsView {
         }
         s.world_switch_mode = self.world_switch.value(cx);
         s.gui_theme = self.theme.value(cx);
-        s.tts_mode = self.tts.value(cx);
-        s.tts_speak_mode = self.speak.value(cx);
-        s.tts_voice = crate::kokoro::normalize_voice(&self.text(&self.fields.voice, cx));
+        // This GUI's own text-to-speech (each interface keeps its own).
+        let tts = crate::tts::TtsProfile::from_names(&self.tts.value(cx), &self.speak.value(cx), &self.text(&self.fields.voice, cx));
+        s.set_tts_for(crate::font_profile::native_key(), &tts);
         s.tabs = self.tabs.value(cx);
         s.icon_bar = self.icon_bar.value(cx);
         s.picture_host = self.picture_host.value(cx);

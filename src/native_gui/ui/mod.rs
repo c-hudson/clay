@@ -351,10 +351,9 @@ impl ClayView {
                         }
                     }
                     crate::websocket::WsMessage::ServerSpeak { text, .. } => {
-                        let settings = self.session.core.settings.as_ref();
-                        let mode = crate::tts::TtsMode::from_name(settings.map_or("", |s| s.tts_mode.as_str()));
-                        let voice = settings.map_or(crate::kokoro::DEFAULT_VOICE, |s| s.tts_voice.as_str()).to_string();
-                        let fell_back = self.media.as_mut().is_some_and(|m| m.speak(&text, mode, &voice));
+                        // With this GUI's own text-to-speech (each interface keeps its own).
+                        let tts = self.session.core.settings.as_ref().map(|s| s.tts_for(crate::font_profile::native_key())).unwrap_or_default();
+                        let fell_back = self.media.as_mut().is_some_and(|m| m.speak(&text, tts.mode, &tts.voice));
                         // Attached to another Clay, the voice is this machine's: say once
                         // when Kokoro was chosen but its files aren't here. (Running Clay
                         // itself, the server's own notice covers it - same files.)
@@ -839,7 +838,9 @@ impl ClayView {
             return;
         }
         let Some(s) = self.session.core.settings.as_ref() else { return };
-        if crate::tts::TtsMode::from_name(&s.tts_mode) != crate::tts::TtsMode::Kokoro {
+        // This GUI's own text-to-speech.
+        let tts = s.tts_for(crate::font_profile::native_key());
+        if tts.mode != crate::tts::TtsMode::Kokoro {
             // Switched away: let the model and the audio stream go (nothing without an
             // engine), and warm again should the setting come back.
             self.kokoro_warmed = None;
@@ -848,7 +849,7 @@ impl ClayView {
             }
             return;
         }
-        let voice = crate::kokoro::normalize_voice(&s.tts_voice);
+        let voice = tts.voice;
         if self.kokoro_warmed.as_deref().is_some_and(|w| w.is_empty() || w == voice) {
             return;
         }

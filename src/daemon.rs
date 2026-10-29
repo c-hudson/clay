@@ -314,8 +314,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         // resume-aware history skip and replay, the client's view state, and
                         // the activity count. `-D` used to build InitialState here itself and
                         // skipped the rest.
-                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, .. } = *msg {
+                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, interface_key, .. } = *msg {
                             app.set_display_owner_id(client_id, &client_uid);
+                            app.set_client_interface(client_id, &interface_key);
                             app.handle_ws_auth_initial_state(client_id, current_world, resume, resume_epochs);
                         } else {
                             handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
@@ -1323,7 +1324,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1333,7 +1334,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                 zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile,
+                log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile,
             );
         }
         WsMessage::ToggleWorldGmcp { world_index } => app.toggle_world_gmcp(world_index),
@@ -4613,7 +4614,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(1, 0)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+            resume: vec![(1, 0)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);
@@ -4669,7 +4670,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(0, 7)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+            resume: vec![(0, 7)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);

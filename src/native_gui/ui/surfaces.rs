@@ -355,15 +355,15 @@ impl ClayView {
     /// `/tts` on a GUI attached to another Clay. The voice plays on *this* machine, so
     /// status, install, remove and test are about this machine's files (`~/.clay/tts`
     /// here), as the server's `App::tts_command` is about its own. `voices` and `voice`
-    /// are the shared setting and go to the server: returns false for those (and for
-    /// anything else, which the server answers with its usage line).
+    /// go to the server, which keeps this GUI's own voice under its interface key: returns
+    /// false for those (and for anything else, which the server answers with its usage
+    /// line).
     pub(super) fn tts_command(&mut self, args: &[&str], cx: &mut Context<Self>) -> bool {
         use crate::kokoro;
         use crate::tts::TtsMode;
-        let (mode, speak_mode, voice) = match self.session.core.settings.as_ref() {
-            Some(s) => (s.tts_mode.clone(), s.tts_speak_mode.clone(), s.tts_voice.clone()),
-            None => (String::new(), String::new(), kokoro::DEFAULT_VOICE.to_string()),
-        };
+        // This GUI's own text-to-speech (each interface keeps its own).
+        let tts = self.session.core.settings.as_ref().map(|s| s.tts_for(crate::font_profile::native_key())).unwrap_or_default();
+        let (mode, speak_mode, voice) = (tts.mode.name(), tts.speak_mode.name(), tts.voice);
         let sub = args.first().map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "status".to_string());
         let lines: Vec<String> = match sub.as_str() {
             "status" => {
@@ -434,7 +434,7 @@ impl ClayView {
             }
             "test" => {
                 let installed = kokoro::install().complete();
-                let mode = match TtsMode::from_name(&mode) {
+                let mode = match TtsMode::from_name(mode) {
                     TtsMode::Off if installed => TtsMode::Kokoro,
                     TtsMode::Off => TtsMode::Local,
                     m => m,

@@ -494,6 +494,12 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "tts_voice={}", app.settings.tts_voice)?;
+    // Each other interface's own text-to-speech (`Settings::tts_profiles`).
+    for (key, p) in &app.settings.tts_profiles {
+        writeln!(file, "tts.{key}.mode={}", p.mode.name())?;
+        writeln!(file, "tts.{key}.speak_mode={}", p.speak_mode.name())?;
+        writeln!(file, "tts.{key}.voice={}", p.voice)?;
+    }
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "clear_input_on_send={}", app.settings.clear_input_on_send)?;
@@ -1387,6 +1393,18 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         // Legacy: convert bool to TtsMode
                         if value == "true" {
                             app.settings.tts_mode = crate::tts::TtsMode::Local;
+                        }
+                    }
+                    // One interface's own text-to-speech: tts.<key>.<field>.
+                    k if k.starts_with("tts.") => {
+                        if let Some((key, field)) = k["tts.".len()..].rsplit_once('.') {
+                            let p = app.settings.tts_profiles.entry(key.to_string()).or_default();
+                            match field {
+                                "mode" => p.mode = crate::tts::TtsMode::from_name(value),
+                                "speak_mode" => p.speak_mode = crate::tts::TtsSpeakMode::from_name(value),
+                                "voice" => p.voice = crate::kokoro::normalize_voice(value),
+                                _ => {}
+                            }
                         }
                     }
                     "scrollback_enabled" => {
@@ -2287,6 +2305,12 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "tts_voice={}", app.settings.tts_voice)?;
+    // Each other interface's own text-to-speech (`Settings::tts_profiles`).
+    for (key, p) in &app.settings.tts_profiles {
+        writeln!(file, "tts.{key}.mode={}", p.mode.name())?;
+        writeln!(file, "tts.{key}.speak_mode={}", p.speak_mode.name())?;
+        writeln!(file, "tts.{key}.voice={}", p.voice)?;
+    }
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "clear_input_on_send={}", app.settings.clear_input_on_send)?;
@@ -3364,6 +3388,18 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             app.settings.tts_mode = crate::tts::TtsMode::Local;
                         }
                     }
+                    // One interface's own text-to-speech: tts.<key>.<field>.
+                    k if k.starts_with("tts.") => {
+                        if let Some((key, field)) = k["tts.".len()..].rsplit_once('.') {
+                            let p = app.settings.tts_profiles.entry(key.to_string()).or_default();
+                            match field {
+                                "mode" => p.mode = crate::tts::TtsMode::from_name(value),
+                                "speak_mode" => p.speak_mode = crate::tts::TtsSpeakMode::from_name(value),
+                                "voice" => p.voice = crate::kokoro::normalize_voice(value),
+                                _ => {}
+                            }
+                        }
+                    }
                     "scrollback_enabled" => {
                         app.settings.scrollback_enabled = value == "true";
                     }
@@ -3955,6 +3991,13 @@ mod tests {
             tts_mode: crate::tts::TtsMode::Edge,  // default: Off
             tts_speak_mode: crate::tts::TtsSpeakMode::All, // default: All
             tts_voice: "am_michael".to_string(), // default: af_heart
+            tts_profiles: [
+                ("native-linux".to_string(), crate::tts::TtsProfile { mode: crate::tts::TtsMode::Kokoro, speak_mode: crate::tts::TtsSpeakMode::Limit, voice: "bf_emma".to_string() }),
+                ("app-android".to_string(), crate::tts::TtsProfile { mode: crate::tts::TtsMode::Local, speak_mode: crate::tts::TtsSpeakMode::All, voice: crate::kokoro::DEFAULT_VOICE.to_string() }),
+                ("console-remote".to_string(), crate::tts::TtsProfile { mode: crate::tts::TtsMode::Edge, speak_mode: crate::tts::TtsSpeakMode::All, voice: "am_michael".to_string() }),
+            ]
+            .into_iter()
+            .collect(),                        // default: empty
             tts_muted: true,                   // default: false
             web_font_letter_spacing: 1.5,      // default: 0.0
             web_font_line_height: 1.8,         // default: 1.2
@@ -4102,6 +4145,7 @@ mod tests {
         assert_eq!(a.picture_host, b.picture_host, "{context}: picture_host");
         assert_eq!(a.font_profiles, b.font_profiles, "{context}: font_profiles");
         assert_eq!(a.text_reveal_profiles, b.text_reveal_profiles, "{context}: text_reveal_profiles");
+        assert_eq!(a.tts_profiles, b.tts_profiles, "{context}: tts_profiles");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -5468,6 +5512,7 @@ pattern=foo
         assert_ne!(non_default.picture_host, default.picture_host, "picture_host should differ");
         assert_ne!(non_default.font_profiles, default.font_profiles, "font_profiles should differ");
         assert_ne!(non_default.text_reveal_profiles, default.text_reveal_profiles, "text_reveal_profiles should differ");
+        assert_ne!(non_default.tts_profiles, default.tts_profiles, "tts_profiles should differ");
     }
 
     #[test]

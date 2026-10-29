@@ -804,11 +804,14 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
                 app.settings.picture_host = crate::picture::PictureService::from_name(&settings.picture_host);
                 app.set_separator_style(SeparatorStyle::from_name(&settings.separator_style));
+                // The console's own text-to-speech (every other interface keeps its own).
                 let old_tts_mode = app.settings.tts_mode;
+                let was_kokoro = app.local_kokoro_voice().is_some();
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
-                app.note_kokoro_selected(old_tts_mode);
                 app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
                 app.settings.tts_voice = crate::kokoro::normalize_voice(&settings.tts_voice);
+                // After the voice, so a new voice is the one loaded.
+                app.note_kokoro_selected(was_kokoro);
                 // Auto-unmute when TTS is enabled from Off
                 if old_tts_mode == crate::tts::TtsMode::Off && app.settings.tts_mode != crate::tts::TtsMode::Off {
                     app.settings.tts_muted = false;

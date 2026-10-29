@@ -139,9 +139,22 @@ pub fn set_text_reveal_value(state: &mut crate::popup::PopupState, value: &str) 
     }
 }
 
-/// TTS mode options (the one list every UI shows, `TtsMode::OPTIONS`)
+/// TTS mode options (`TtsMode::OPTIONS`), less Kokoro in a build that can't load it (the
+/// static musl console: `kokoro::build_can_load`), which can't speak with it at all.
 pub fn tts_mode_options() -> Vec<SelectOption> {
-    crate::tts::TtsMode::OPTIONS.iter().map(|(v, l)| SelectOption::new(*v, *l)).collect()
+    crate::tts::TtsMode::OPTIONS
+        .iter()
+        .filter(|(v, _)| *v != "kokoro" || crate::kokoro::build_can_load())
+        .map(|(v, l)| SelectOption::new(*v, *l))
+        .collect()
+}
+
+/// Which of `tts_mode_options()` is `mode`. Kokoro in a build without it is shown as Local,
+/// the engine that spoke for it there.
+pub fn tts_mode_index(mode: &str) -> usize {
+    let options = tts_mode_options();
+    let at = |v: &str| options.iter().position(|o| o.value == v);
+    at(mode).or_else(|| if mode == "kokoro" { at("local") } else { None }).unwrap_or(0)
 }
 
 /// TTS speak mode options (which lines to speak)
@@ -257,7 +270,7 @@ pub fn create_setup_popup(
     let gui_theme_idx = crate::theme::BUILTIN_THEMES.iter().position(|(name, _)| *name == gui_theme).unwrap_or(0);
     let editor_side_idx = if editor_side == "right" { 1 } else { 0 };
     let text_reveal_idx = text_reveal_index(text_reveal);
-    let tts_mode_idx = crate::tts::TtsMode::OPTIONS.iter().position(|(v, _)| *v == tts_mode).unwrap_or(0);
+    let tts_mode_idx = tts_mode_index(tts_mode);
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
     let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
     let icon_bar_idx = icon_bar_options().iter().position(|o| o.value == icon_bar).unwrap_or(1);
@@ -454,6 +467,12 @@ fn update_setup_visibility_def(def: &mut PopupDefinition) {
             field.visible = false;
         }
     }
+    // Kokoro's voice, where this build can't speak with Kokoro (user request 2026-10-28).
+    if !crate::kokoro::build_can_load() {
+        if let Some(field) = def.get_field_mut(SETUP_FIELD_TTS_VOICE) {
+            field.visible = false;
+        }
+    }
 }
 
 /// Settings the console's `/setup` (and the SSH console's) doesn't show: they have no
@@ -525,12 +544,15 @@ fn setup_help_text() -> Vec<String> {
         "  Only how the console draws them: scrolling and paging",
         "  are unchanged. Each interface keeps its own.",
         "",
-        "TTS: Text-to-speech mode for MUD output.",
+        "TTS: This console's text-to-speech for MUD output.",
+        "  Each interface keeps its own, set in its Settings.",
         "  Off: disabled. Local: uses espeak/say subprocess.",
         "  Kokoro: the Kokoro neural voice, offline; needs",
-        "  /tts install once (230 MB in ~/.clay/tts).",
+        "  /tts install once (230 MB in ~/.clay/tts); not in",
+        "  the static Linux console build.",
         "  Edge: Microsoft Edge neural TTS (needs internet).",
-        "  Web/Android always use the browser's Speech API.",
+        "  The web page and the Android app speak with the",
+        "  device's own voice.",
         "  Use /say <text> to speak manually when TTS is off.",
         "",
         "Kokoro Voice: which of Kokoro's 54 voices speaks,",
@@ -562,7 +584,7 @@ fn setup_help_text() -> Vec<String> {
         "  turns picture uploads off.",
         "",
         "Separator Style: How the console draws the bar above",
-        "  the input. Web: gaps as spaces on the status bar",
+        "  the input. Clay: gaps as spaces on the status bar",
         "  colour, the look of the GUIs and the web page.",
         "  TinyFugue: gaps filled with underscores on the",
         "  terminal background. One setting for every",
@@ -780,7 +802,26 @@ mod tests {
         assert!(help.contains("Background:") && help.contains("Character:") && help.contains("Custom:"), "the help names every style");
     }
 
-    /// The Separator Style choices are `SeparatorStyle::OPTIONS`, Web first (the default),
+    /// Kokoro is offered, and its voice shown, only where the build can load it (not the
+    /// static musl console); a Kokoro setting there reads as Local, the engine that spoke.
+    #[test]
+    fn kokoro_is_offered_only_where_it_can_speak() {
+        let values: Vec<String> = tts_mode_options().iter().map(|o| o.value.clone()).collect();
+        assert_eq!(values.iter().any(|v| v == "kokoro"), crate::kokoro::build_can_load());
+        let local = values.iter().position(|v| v == "local").unwrap();
+        let kokoro_at = tts_mode_index("kokoro");
+        if crate::kokoro::build_can_load() {
+            assert_eq!(values[kokoro_at], "kokoro");
+        } else {
+            assert_eq!(kokoro_at, local);
+        }
+        assert_eq!(tts_mode_index("edge"), values.iter().position(|v| v == "edge").unwrap());
+        let def = create_setup_popup_for_test("off");
+        let voice = def.get_field(SETUP_FIELD_TTS_VOICE).unwrap();
+        assert_eq!(voice.visible, crate::kokoro::build_can_load());
+    }
+
+    /// The Separator Style choices are `SeparatorStyle::OPTIONS`, Clay first (the default),
     /// and an unknown saved value shows as Web.
     #[test]
     fn the_separator_style_choices_are_the_enums_options_web_first() {

@@ -399,7 +399,7 @@
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new() };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new() };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
@@ -1168,7 +1168,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
         };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
@@ -1238,7 +1238,7 @@
             username: Some("star".to_string()),
             current_world: None, auth_key: None, request_key: false,
             challenge_response: true,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
         match source.next().await {
@@ -1339,7 +1339,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
         };
         sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap())).await.unwrap();
         let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
@@ -1360,7 +1360,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
         };
         sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap())).await.unwrap();
         let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
@@ -1488,7 +1488,7 @@
             auth_key: Some("test_key".to_string()),
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
         };
         let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string(), "test_challenge".to_string());
 
@@ -1554,7 +1554,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
 
@@ -10488,7 +10488,7 @@ third
             String::new(), String::new(), ws_password.to_string(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, None, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None, None,
         );
     }
 
@@ -10512,7 +10512,7 @@ third
             String::new(), String::new(), String::new(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, profile("native-linux", "superfast"), None,
+            "none".to_string(), "app_tablet".to_string(), None, None, profile("native-linux", "superfast"), None, None,
         );
         assert_eq!(app.settings.text_reveal_for("native-linux"), TextReveal::SuperFast);
         assert_eq!(app.settings.text_reveal, TextReveal::Off, "the console's own is not a client's to set");
@@ -10530,7 +10530,7 @@ third
             String::new(), String::new(), String::new(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, profile("bogus", "fast"), None,
+            "none".to_string(), "app_tablet".to_string(), None, None, profile("bogus", "fast"), None, None,
         );
         assert!(!app.settings.text_reveal_profiles.contains_key("bogus"), "an unknown key is refused");
         assert_eq!(app.settings.text_reveal_for("app-android"), TextReveal::Off, "an interface that never chose is Off");
@@ -10544,6 +10544,135 @@ third
         msg.text_reveal_profiles.insert(REMOTE_CONSOLE_REVEAL_KEY.to_string(), "fast".to_string());
         remote.apply_global_settings(&msg);
         assert_eq!(remote.settings.text_reveal, TextReveal::Fast);
+    }
+
+    /// A settings save from `client_id`: its legacy text-to-speech mode (the console's,
+    /// which only an older client still edits) and its own profile.
+    fn save_tts_from(app: &mut App, client_id: u64, legacy_mode: &str, profile: Option<crate::websocket::TtsProfileUpdate>) {
+        app.update_global_settings(
+            client_id, true, true, true,
+            "unseen".to_string(), false, false, true,
+            "dark".to_string(), "dark".to_string(),
+            1.0, 0, 0, 500,
+            5, None, None, None, "monospace".to_string(), 14.0,
+            14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
+            String::new(), false, false, 9000, String::new(),
+            String::new(), String::new(), String::new(),
+            false, true, false, None,
+            legacy_mode.to_string(), "all".to_string(), String::new(), false, false, None, true,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None, profile,
+        );
+    }
+
+    /// Text-to-speech is kept per interface (user request 2026-10-28: "each interface can
+    /// have its own setting that can only be set while in that interface"): a client sets
+    /// its own and nobody else's, the console's own is not a client's to set, an interface
+    /// that never chose is Off - and an older client, which names no interface, still edits
+    /// and follows the console's, as it did the one shared setting.
+    #[test]
+    fn tts_settings_are_kept_per_interface() {
+        let mut app = App::new();
+        app.settings.tts_mode = tts::TtsMode::Edge; // the console's own
+        app.set_client_interface(7, "app-android");
+        let mine = |key: &str, mode: &str| {
+            Some(crate::websocket::TtsProfileUpdate { key: key.to_string(), mode: mode.to_string(), speak_mode: "limit".to_string(), voice: String::new() })
+        };
+        save_tts_from(&mut app, 7, "local", mine("app-android", "local"));
+        assert_eq!(app.settings.tts_mode, tts::TtsMode::Edge, "the phone's legacy fields don't touch the console's");
+        let phone = app.settings.tts_profile_for("app-android");
+        assert_eq!((phone.mode, phone.speak_mode), (tts::TtsMode::Local, tts::TtsSpeakMode::Limit));
+        assert_eq!(phone.voice, crate::kokoro::DEFAULT_VOICE, "an empty voice keeps the one it had");
+        save_tts_from(&mut app, 7, "local", mine("native-linux", "kokoro"));
+        assert!(!app.settings.tts_profiles.contains_key("native-linux"), "one interface can't set another's");
+        save_tts_from(&mut app, 7, "edge", None);
+        assert_eq!(app.settings.tts_profile_for("app-android").mode, tts::TtsMode::Local, "a save that leaves it out leaves it");
+        assert_eq!(app.settings.tts_profile_for("browser-linux").mode, tts::TtsMode::Off, "never chosen: Off");
+        let msg = app.build_global_settings_msg();
+        assert_eq!(msg.tts_for("app-android").mode, tts::TtsMode::Local);
+        assert_eq!(msg.tts_for("browser-linux").mode, tts::TtsMode::Off);
+        assert_eq!(msg.tts_mode, "edge", "the console's own, for an older client");
+        // An older client (no interface named at login).
+        save_tts_from(&mut app, 8, "off", None);
+        assert_eq!(app.settings.tts_mode, tts::TtsMode::Off, "an older client still edits the shared one");
+        assert_eq!(app.client_tts(8).mode, tts::TtsMode::Off);
+        assert_eq!(app.client_tts(7).mode, tts::TtsMode::Local, "the phone keeps its own");
+        // A server from before the split sends no map: the shared fields are what speaks.
+        let mut old = msg.clone();
+        old.tts_profiles = None;
+        assert_eq!(old.tts_for("app-android").mode, tts::TtsMode::Edge);
+        // The attached console mirrors its own (Off until it chose one), or the shared one
+        // from an older server.
+        let mut remote = App::new();
+        remote.apply_global_settings(&msg);
+        assert_eq!(remote.settings.tts_mode, tts::TtsMode::Off);
+        let mut with_mine = msg.clone();
+        with_mine.set_tts_for(REMOTE_CONSOLE_REVEAL_KEY, &tts::TtsProfile { mode: tts::TtsMode::Local, speak_mode: tts::TtsSpeakMode::Limit, voice: "bf_emma".to_string() });
+        remote.apply_global_settings(&with_mine);
+        assert_eq!((remote.settings.tts_mode, remote.settings.tts_speak_mode, remote.settings.tts_voice.as_str()), (tts::TtsMode::Local, tts::TtsSpeakMode::Limit, "bf_emma"));
+        remote.apply_global_settings(&old);
+        assert_eq!(remote.settings.tts_mode, tts::TtsMode::Edge);
+    }
+
+    fn tts_test_client(server: &WebSocketServer, client_id: u64) -> tokio::sync::mpsc::Receiver<crate::websocket::Outbound> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::websocket::Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        server.clients.write().unwrap().insert(client_id, WsClientInfo {
+            authenticated: true, tx, current_world: None, username: None,
+            received_initial_state: true, client_type: crate::websocket::RemoteClientType::Web,
+            viewport_height: 24, ip_address: "192.168.1.20".to_string(),
+            connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
+            paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(), audit_stall_ticks: std::collections::HashMap::new(),
+            push: None, needs_resync: std::collections::HashSet::new(),
+        });
+        rx
+    }
+
+    /// The `ServerSpeak` texts a client was sent.
+    fn spoken_to(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(out) = rx.try_recv() {
+            let msg = match out {
+                crate::websocket::Outbound::Message(m) => *m,
+                crate::websocket::Outbound::Shared(json) => serde_json::from_str(&json).unwrap(),
+            };
+            if let WsMessage::ServerSpeak { text, .. } = msg {
+                texts.push(text);
+            }
+        }
+        texts
+    }
+
+    /// Arriving lines are spoken to each client by its own interface's text-to-speech: all
+    /// of them, or in Limit only what is said; nothing to one whose TTS is off, or which
+    /// shows another world; and an older client (no interface) by the console's, as before.
+    #[test]
+    fn arriving_lines_are_spoken_to_each_interface_by_its_own_setting() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("mud"));
+        app.worlds.push(World::new("other"));
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let mut rx: Vec<_> = (1..=5u64).map(|id| tts_test_client(&server, id)).collect();
+        app.ws_server = Some(server);
+        let profile = |mode, speak_mode| tts::TtsProfile { mode, speak_mode, voice: crate::kokoro::DEFAULT_VOICE.to_string() };
+        app.settings.tts_profiles.insert("app-android".to_string(), profile(tts::TtsMode::Local, tts::TtsSpeakMode::All));
+        app.settings.tts_profiles.insert("browser-linux".to_string(), profile(tts::TtsMode::Local, tts::TtsSpeakMode::Limit));
+        app.settings.tts_mode = tts::TtsMode::Local; // the console's own: what an older client follows
+        for (id, key, world) in [(1, "app-android", 0), (2, "browser-linux", 0), (3, "native-linux", 0), (4, "app-android", 1), (5, "", 0)] {
+            app.set_client_interface(id, key);
+            app.ws_client_view_world(id, world);
+        }
+        app.speak_arrivals(0, &["Bob says, \"hello\"", "\x1b[31mThe wind blows.\x1b[0m"]);
+        let both = "Bob says, \"hello\" The wind blows.".to_string();
+        assert_eq!(spoken_to(&mut rx[0]), vec![both.clone()], "the phone: every line");
+        assert_eq!(spoken_to(&mut rx[1]), vec!["Bob says, \"hello\"".to_string()], "the browser in Limit: what is said");
+        assert!(spoken_to(&mut rx[2]).is_empty(), "a GUI that never turned it on: nothing");
+        assert!(spoken_to(&mut rx[3]).is_empty(), "a phone showing another world: nothing");
+        assert_eq!(spoken_to(&mut rx[4]), vec![both], "an older client: the console's setting");
+        // A client's /say is spoken by that client alone, with its own.
+        app.ws_say(3, 0, "hi");
+        assert_eq!(spoken_to(&mut rx[2]), vec!["hi".to_string()]);
+        assert!(spoken_to(&mut rx[0]).is_empty());
     }
 
     /// Clear Input on Send from a client that knows it is applied; a save from an older
@@ -10869,16 +10998,17 @@ third
         app.worlds.push(World::new("alpha"));
         assert!(!kokoro::install().complete(), "the test home has no Kokoro files");
         let notes = |app: &App| app.worlds[0].output_lines.iter().filter(|l| l.text.contains("Kokoro is not installed")).count();
+        app.console_tui = true; // the console's own text-to-speech speaks on this machine
         app.settings.tts_mode = tts::TtsMode::Kokoro; // as a settings.dat load would
         app.note_kokoro_missing(false);
         app.note_kokoro_missing(false);
         assert_eq!(notes(&app), 1, "a fallback is reported once");
-        app.note_kokoro_selected(tts::TtsMode::Local);
+        app.note_kokoro_selected(false);
         assert_eq!(notes(&app), 2, "selecting it afresh says so again");
-        app.note_kokoro_selected(tts::TtsMode::Kokoro);
+        app.note_kokoro_selected(true);
         assert_eq!(notes(&app), 2, "but not when it was Kokoro already");
         app.settings.tts_mode = tts::TtsMode::Local;
-        app.note_kokoro_selected(tts::TtsMode::Kokoro);
+        app.note_kokoro_selected(true);
         assert_eq!(notes(&app), 2, "nor when another engine is chosen");
     }
 
@@ -12871,8 +13001,10 @@ third
             resume_epochs: Vec::new(),
             client_version: "test".into(),
             client_uid: "device-with-key".into(),
+            interface_key: "app-android".into(),
         };
         app.handle_ws_auth_key_validation(client_id, request, "127.0.0.1", challenge);
+        assert_eq!(app.ws_client_interface.get(&client_id).map(String::as_str), Some("app-android"), "a key login records its interface too");
 
         let msgs = drain_ws_messages(&mut rx);
         assert!(msgs.iter().any(|m| matches!(m, WsMessage::AuthResponse { success: true, .. })));
@@ -21705,6 +21837,41 @@ fn the_web_new_indicator_options_are_the_enums_options() {
     let (custom_word, _) = crate::NewIndicator::Custom(0).label().split_once(" (").map(|(w, s)| (w.to_string(), s.to_string())).unwrap();
     assert!(js.contains(&format!("'{custom_word} (' + s[1] + ')'")), "app.js labels the Custom entry as NewIndicator::label");
     assert!(js.contains(&format!("<div class=\"js-dialog-title\">{}</div>", crate::NewIndicator::PICKER_TITLE)), "app.js titles the picker NewIndicator::PICKER_TITLE");
+}
+
+/// The keybind editor's Cancel (user request 2026-10-28): it closes the page and keeps nothing
+/// it changed - the saved bindings go back to the server first (not while a Save is on its
+/// way) - and says nothing about it; Back is the same. The native editor does the same in
+/// keybind_editor.rs (`cancel`, `discard`, and on release).
+#[test]
+fn the_keybind_editors_cancel_discards_and_closes() {
+    let html = include_str!("web/keybind-editor.html");
+    let start = html.find("function doCancel()").expect("doCancel");
+    let body = &html[start..start + html[start..].find("\n}\n").unwrap()];
+    assert!(body.contains("!saving") && body.contains("sendBindingsUpdate()") && body.contains("closeEditor()"), "{body}");
+    assert!(!html.contains("showSaveStatus('Reverted')"), "Cancel says nothing; the window closes");
+    assert!(html.contains("onclick=\"doCancel()\">&larr; Back</button>"), "Back discards the same way");
+    assert!(html.contains("saving = true;\n  wsSend({ type: 'SaveKeybindFile' });"));
+}
+
+/// The web page's side of per-interface text-to-speech: every AuthRequest names its
+/// interface (so the server speaks to it by its own), a save carries its own under that
+/// key once the server keeps them, and a page that speaks with the device's own voice
+/// offers Off and Local only - pruned before the phone's custom dropdowns copy the select.
+#[test]
+fn the_web_page_keeps_its_own_tts() {
+    let js = include_str!("web/app.js");
+    assert_eq!(js.matches("type: 'AuthRequest'").count(), js.matches("interface_key: fontProfileKey").count(), "every AuthRequest names the interface");
+    assert!(js.contains("tts_profile: ttsProfilesKept ? { key: fontProfileKey, mode: ttsMode, speak_mode: ttsSpeakMode, voice: ttsVoice } : null"));
+    assert!(js.contains("const ttsDeviceVoiceOnly = !window.WEBVIEW_MASTER;"));
+    let prune = js.find("pruneTtsChoices();").expect("pruned at start-up");
+    let dropdowns = js[prune..].find("initCustomDropdowns();");
+    assert!(dropdowns.is_some(), "the custom dropdowns are built after the prune");
+    let html = include_str!("web/index.html");
+    assert!(html.contains("id=\"setup-tts-voice-input\""), "the voice row app.js hides");
+    for value in ["Off", "Local", "Kokoro", "Edge"] {
+        assert!(html.contains(&format!("<option value=\"{value}\">{value}</option>")), "the TTS option app.js prunes: {value}");
+    }
 }
 
 /// Only the ▶ character takes columns off a new line's wrap width: the background glow is

@@ -150,9 +150,9 @@ Clay shows its own status bar until a script changes the status line (any of
 these commands, or setting a `status_*` variable). From then on TF's is drawn
 instead - in the console, the web/GUI/Android client (beside its menu, notes
 and font controls) and the SSH console, laid out to each one's width, in the
-look Settings > Separator Style chooses (Web: spaces on the bar's colour;
+look Settings > Separator Style chooses (Clay: spaces on the bar's colour;
 TinyFugue: `_` on the terminal background; a `%status_pad` or `%status_attr`
-the script set wins). Changing that setting from TinyFugue back to Web puts
+the script set wins). Changing that setting from TinyFugue back to Clay puts
 the status line back to Clay's, variables and all.
 `status_fields([row])` lists a row's fields; `/status_save` and
 `/status_restore` keep and bring back row 0.

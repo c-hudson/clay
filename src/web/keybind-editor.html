@@ -581,7 +581,7 @@ button.danger:hover { background: #5a3030; }
 <div id="editorMain" style="display:none; flex-direction:column; height:100%;">
   <!-- Toolbar -->
   <div class="toolbar">
-    <button class="back-btn" id="backBtn" style="display:none" onclick="window.close()">&larr; Back</button>
+    <button class="back-btn" id="backBtn" style="display:none" onclick="doCancel()">&larr; Back</button>
     <div class="toolbar-group">
       <span class="toolbar-title">Clay Keybind Editor</span>
       <span class="unsaved-dot" id="unsavedDot"></span>
@@ -628,6 +628,7 @@ let bindings = {};       // current: key -> action_id
 let defaults = {};       // TF defaults: key -> action_id
 let actions = [];         // [{id, name, category}]
 let savedSnapshot = '';   // JSON.stringify of bindings at last save
+let saving = false;       // Save was pressed and its answer hasn't come: Cancel keeps it
 let selectedAction = null;
 let capturing = false;
 let pendingCapture = null; // {key, conflictAction} awaiting confirmation
@@ -702,6 +703,7 @@ function handleWsMessage(msg) {
       break;
 
     case 'KeybindFileSaved':
+      saving = false;
       if (msg.success) {
         savedSnapshot = JSON.stringify(bindings);
         updateUnsaved();
@@ -1349,14 +1351,38 @@ function showSaveStatus(text) {
 
 // Toolbar actions
 function doSave() {
+  saving = true;
   wsSend({ type: 'SaveKeybindFile' });
 }
 
+// Cancel (and Back; user request 2026-10-28): the window just closes, and keeps nothing it
+// changed - each change went to the server as it was made, so the saved bindings go back
+// first (not while a Save is on its way: that is what the user kept).
 function doCancel() {
-  bindings = JSON.parse(savedSnapshot);
-  sendBindingsUpdate();
-  rebuildAll();
-  showSaveStatus('Reverted');
+  if (!saving && savedSnapshot && JSON.stringify(bindings) !== savedSnapshot) {
+    bindings = JSON.parse(savedSnapshot);
+    sendBindingsUpdate();
+  }
+  closeEditor();
+}
+
+// Close this page once what it sent has left. A browser lets a page close only a window a
+// script opened or a tab with nothing to go back to; failing that, go back to where the
+// tab came from, or say that the tab can be closed.
+function closeEditor() {
+  const started = Date.now();
+  (function close() {
+    if (ws && ws.bufferedAmount > 0 && Date.now() - started < 1000) {
+      setTimeout(close, 50);
+      return;
+    }
+    window.close();
+    setTimeout(function() {
+      if (window.closed) return;
+      if (history.length > 1) history.back();
+      else showSaveStatus('Changes discarded - you can close this tab');
+    }, 300);
+  })();
 }
 
 function doResetDefaults() {

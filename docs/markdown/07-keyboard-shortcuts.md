@@ -6,7 +6,10 @@ extras — see the "Differences from TinyFugue" section of
 `docs/markdown/06-tf-commands.md` and `TINYFUGUE-COMPAT.md`). Every binding
 below — including every chord — is stored in `~/.clay/keybindings.dat` and can
 be freely rebound there or from the browser-based keybind editor
-(`/keybind-editor`, when the HTTP server is enabled — see `/web`). Rebind a
+(`/keybind-editor`, when the HTTP server is enabled — see `/web`; the GUI's
+Settings opens the same editor). A change in the editor takes effect at once;
+**Save** keeps it, and **Cancel** (or closing the editor without saving) drops
+every change made since it was opened or last saved and closes it. Rebind a
 key to `UNBOUND` to remove a default without picking a replacement.
 
 **Chords.** A chord is two or more keystrokes typed in quick succession that

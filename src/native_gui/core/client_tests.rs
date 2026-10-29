@@ -158,9 +158,10 @@ fn logs_in_with_the_password_answering_the_challenge() {
     h.input(Input::Opened);
     h.msg(WsMessage::ServerHello { multiuser_mode: false, challenge: CHALLENGE.into() });
     let sent = h.sent();
-    let WsMessage::AuthRequest { password_hash, auth_key, challenge_response, client_uid, client_version, .. } = auth_request(&sent) else {
+    let WsMessage::AuthRequest { password_hash, auth_key, challenge_response, client_uid, client_version, interface_key, .. } = auth_request(&sent) else {
         unreachable!()
     };
+    assert_eq!(interface_key, crate::font_profile::native_key(), "the GUI names its interface (its text-to-speech is kept under it)");
     assert_eq!(password_hash, &hash_with_challenge(&hash_password("pw"), CHALLENGE));
     assert!(auth_key.is_none());
     assert!(challenge_response);
@@ -767,6 +768,34 @@ fn text_reveal_saves_from_the_native_settings_under_its_own_key() {
     assert_eq!(app.settings.text_reveal_for(key), crate::TextReveal::Fast);
     assert_eq!(app.settings.text_reveal, crate::TextReveal::Off, "the console's own is untouched");
     assert_eq!(app.build_global_settings_msg().text_reveal_profiles.get(key).map(String::as_str), Some("fast"));
+}
+
+/// This GUI's own text-to-speech round-trips through its Settings save under its key (user
+/// request 2026-10-28: each interface keeps its own): sent once it has one, applied only
+/// under its own name, the console's untouched; from a server before the split it edits
+/// the shared fields instead.
+#[test]
+fn tts_saves_from_the_native_settings_under_its_own_key() {
+    let key = crate::font_profile::native_key();
+    let mut app = crate::App::new();
+    app.settings.tts_mode = crate::tts::TtsMode::Edge;
+    app.set_client_interface(1, key);
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let mut s = app.build_global_settings_msg();
+    assert_eq!(s.tts_for(key).mode, crate::tts::TtsMode::Off, "never chosen: Off");
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { tts_profile: None, .. }));
+    let mine = crate::tts::TtsProfile { mode: crate::tts::TtsMode::Kokoro, speak_mode: crate::tts::TtsSpeakMode::Limit, voice: "bf_emma".to_string() };
+    s.set_tts_for(key, &mine);
+    assert_eq!(s.tts_mode, "edge", "the shared fields go back as sent");
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.tts_profile_for(key), mine);
+    assert_eq!(app.settings.tts_mode, crate::tts::TtsMode::Edge, "the console's own is untouched");
+    // A server from before the split: the one shared setting.
+    let mut old = app.build_global_settings_msg();
+    old.tts_profiles = None;
+    old.set_tts_for(key, &mine);
+    assert_eq!((old.tts_mode.as_str(), old.tts_voice.as_str()), ("kokoro", "bf_emma"));
+    assert!(matches!(settings_update(&old), WsMessage::UpdateGlobalSettings { tts_profile: None, .. }));
 }
 
 /// Clear Input on Send (TF's %cleardone) round-trips through this GUI's Settings save, as

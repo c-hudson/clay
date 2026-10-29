@@ -2694,9 +2694,9 @@ Fields: "" (padding, :<width>), @more @world @read @active @log @mail @clock
 %status_var_<name>, else its value), or a "literal". One field may have no
 width: it takes what the others leave; a negative width right-justifies.
 %status_pad fills fields out; %status_attr colors the whole line. Unset, the
-look of Settings > Separator Style decides: Web draws the fields with spaces
+look of Settings > Separator Style decides: Clay draws the fields with spaces
 between them on the bar's colour, TinyFugue with _ on the terminal
-background. Changing that setting from TinyFugue back to Web puts the status
+background. Changing that setting from TinyFugue back to Clay puts the status
 line back to Clay's (TF's layout and the status_* variables reset).
 
 Example: /status_add -A@world hp:4"#.to_string()

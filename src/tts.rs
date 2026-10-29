@@ -71,6 +71,51 @@ impl TtsSpeakMode {
     }
 }
 
+/// One interface's own text-to-speech (user request 2026-10-28: "each interface can have
+/// its own setting that can only be set while in that interface"): the engine, which
+/// lines, and Kokoro's voice. The console's own is `Settings::tts_mode`/`tts_speak_mode`/
+/// `tts_voice`; every other interface's is in `Settings::tts_profiles` under its interface
+/// key, Off until that interface chose one. Each client is sent speech by its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TtsProfile {
+    pub mode: TtsMode,
+    pub speak_mode: TtsSpeakMode,
+    pub voice: String,
+}
+
+impl Default for TtsProfile {
+    fn default() -> Self {
+        TtsProfile { mode: TtsMode::Off, speak_mode: TtsSpeakMode::All, voice: crate::kokoro::DEFAULT_VOICE.to_string() }
+    }
+}
+
+impl TtsProfile {
+    /// From the wire's names (an empty voice is the default one).
+    pub fn from_names(mode: &str, speak_mode: &str, voice: &str) -> Self {
+        TtsProfile {
+            mode: TtsMode::from_name(mode),
+            speak_mode: TtsSpeakMode::from_name(speak_mode),
+            voice: if voice.trim().is_empty() { crate::kokoro::DEFAULT_VOICE.to_string() } else { crate::kokoro::normalize_voice(voice) },
+        }
+    }
+
+    pub fn from_setting(s: &crate::websocket::TtsSetting) -> Self {
+        Self::from_names(&s.mode, &s.speak_mode, &s.voice)
+    }
+
+    pub fn to_setting(&self) -> crate::websocket::TtsSetting {
+        crate::websocket::TtsSetting {
+            mode: self.mode.name().to_string(),
+            speak_mode: self.speak_mode.name().to_string(),
+            voice: self.voice.clone(),
+        }
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.mode != TtsMode::Off
+    }
+}
+
 /// Check if a line should be spoken in Limit mode.
 /// Detects "X says, ..." patterns and builds a whitelist of speaker names.
 /// Lines starting with a whitelisted name are also spoken.

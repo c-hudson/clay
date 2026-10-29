@@ -1814,9 +1814,46 @@
     // Clear Input on Send (TF's %cleardone, Settings::clear_input_on_send): off, as in TF,
     // each line sent stays in the input area above the next (keepSentLine).
     let clearInputOnSend = false;
-    let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'kokoro', 'edge')
+    // This interface's own text-to-speech (user request 2026-10-28: each interface keeps
+    // its own, set only there), under fontProfileKey - which every AuthRequest names, so
+    // the server sends this page speech by it. From a server before the split, the one
+    // shared setting.
+    let ttsMode = 'off';  // 'off', 'local', 'kokoro', 'edge'
     let ttsSpeakMode = 'all';  // 'all' or 'limit'
     let ttsVoice = 'af_heart';  // The Kokoro voice (src/kokoro.rs); the server's engine uses it, not this page
+    let ttsProfilesKept = false;  // the server keeps TTS per interface (sent tts_profiles)
+    // This page speaks with the device's own voice (Android's text-to-speech, the browser's
+    // speech): the server's engines and Kokoro's voice never reach it, so its Settings offer
+    // Off and Local only and no Kokoro Voice. The WebView GUI running Clay itself is spoken
+    // by Clay on this machine, and has them all.
+    const ttsDeviceVoiceOnly = !window.WEBVIEW_MASTER;
+    function applyTtsSettings(settings) {
+        if (settings.tts_profiles) {
+            ttsProfilesKept = true;
+            const mine = settings.tts_profiles[fontProfileKey] || {};
+            ttsMode = mine.mode || 'off';
+            ttsSpeakMode = mine.speak_mode || 'all';
+            ttsVoice = mine.voice || 'af_heart';
+        } else {
+            ttsProfilesKept = false;
+            if (settings.tts_mode !== undefined) ttsMode = settings.tts_mode;
+            if (settings.tts_speak_mode !== undefined) ttsSpeakMode = settings.tts_speak_mode;
+            if (settings.tts_voice) ttsVoice = settings.tts_voice;
+        }
+    }
+    // Off and Local only where this page speaks with the device's own voice.
+    function pruneTtsChoices() {
+        if (!ttsDeviceVoiceOnly) return;
+        const select = document.getElementById('setup-tts-select');
+        if (select) {
+            Array.from(select.options).forEach(function(o) {
+                if (o.value === 'Kokoro' || o.value === 'Edge') o.remove();
+            });
+        }
+        const voice = document.getElementById('setup-tts-voice-input');
+        const row = voice && voice.closest('.setting-row');
+        if (row) row.style.display = 'none';
+    }
     // New Indicator's style (NewIndicator: 'none' | 'character' | 'background'), synced
     // from the server's settings; an older server sends only the bool.
     let newIndicator = 'none';
@@ -2734,6 +2771,8 @@
                 .observe(themeVarsEl, { childList: true, characterData: true, subtree: true });
         }
 
+        // The TTS choices this page has, before the custom dropdowns copy them.
+        pruneTtsChoices();
         // Create custom dropdowns on mobile
         if (device.mode === 'phone' || device.mode === 'tablet') {
             initCustomDropdowns();
@@ -2995,7 +3034,7 @@
         setTimeout(hideConnectionLog, 800);
 
         if (window.AUTO_PASSWORD) {
-            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid }));
+            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, interface_key: fontProfileKey }));
             return;
         }
 
@@ -4281,9 +4320,7 @@
                         clearInputOnSend = !!msg.settings.clear_input_on_send;
                         if (clearInputOnSend) clearSentLines();
                     }
-                    if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
-                    if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
-                    if (msg.settings.tts_voice) ttsVoice = msg.settings.tts_voice;
+                    applyTtsSettings(msg.settings);
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
@@ -5183,9 +5220,7 @@
                         clearInputOnSend = !!msg.settings.clear_input_on_send;
                         if (clearInputOnSend) clearSentLines();
                     }
-                    if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
-                    if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
-                    if (msg.settings.tts_voice) ttsVoice = msg.settings.tts_voice;
+                    applyTtsSettings(msg.settings);
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
@@ -7092,7 +7127,7 @@
             challenge_response: usesChallenge,
             request_key: false,
             resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(),
-            client_uid: clientUid
+            client_uid: clientUid, interface_key: fontProfileKey
         };
         if (currentWorldIndex !== undefined) {
             msg.current_world = currentWorldIndex;
@@ -7177,7 +7212,7 @@
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
             const challengeHash = await hashPassword(hash + serverChallenge);
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, interface_key: fontProfileKey };
             if (username) {
                 msg.username = username;
             }
@@ -7190,7 +7225,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             const challengeHash = sha256Fallback(hash + serverChallenge);
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, interface_key: fontProfileKey };
             if (username) {
                 msg.username = username;
             }
@@ -14371,6 +14406,8 @@
         setupZwj = zwjEnabled;
         setupClearInput = clearInputOnSend;
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'kokoro' ? 'Kokoro' : ttsMode === 'edge' ? 'Edge' : 'Off';
+        // Where only Local is offered, any engine reads as Local (the device's voice spoke).
+        if (ttsDeviceVoiceOnly && setupTtsMode !== 'Off') setupTtsMode = 'Local';
         setupTabsMode = tabsMode;
         setupIconBarMode = iconBarMode;
         setupPictureHost = pictureHost || 'catbox';
@@ -14635,9 +14672,13 @@
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
             clear_input_on_send: clearInputOnSend,
+            // The console's own for an older server (the one shared setting then); a
+            // server that keeps them per interface ignores these from this page and takes
+            // tts_profile.
             tts_mode: ttsMode,
             tts_speak_mode: ttsSpeakMode,
             tts_voice: ttsVoice,
+            tts_profile: ttsProfilesKept ? { key: fontProfileKey, mode: ttsMode, speak_mode: ttsSpeakMode, voice: ttsVoice } : null,
             tabs: tabsMode,
             icon_bar: iconBarMode,
             // null = unchanged (a server from before Import Picture sent none).

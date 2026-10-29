@@ -1530,15 +1530,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output(&format!("Notification sent: {}", message));
         }
         Command::Say { text } => {
-            // Speak text via TTS
-            // Console: use local TTS subprocess
-            app.speak_text(&text);
-            // Web/GUI: broadcast ServerSpeak to WebSocket clients
+            // Spoken by the console and for every client, each with its own text-to-speech.
             let world_index = app.current_world_index;
-            app.ws_broadcast(WsMessage::ServerSpeak {
-                text: crate::util::strip_ansi_codes(&text),
-                world_index,
-            });
+            app.say_everywhere(world_index, &text);
             app.add_output(&format!("TTS: {}", text));
         }
         // In the background (result: AppEvent::ApiLookupResult to client 0, the console)

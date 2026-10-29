@@ -618,6 +618,12 @@ pub const REMOTE_CONSOLE_REVEAL_KEY: &str = "console-remote";
 
 /// Whether a client may own a Text Reveal under `key`.
 pub fn valid_text_reveal_key(key: &str) -> bool {
+    valid_interface_key(key)
+}
+
+/// An interface's key, as its per-interface settings are kept (Text Reveal, text-to-speech):
+/// its program on its OS (`font_profile::valid_key`) or the attached console's.
+pub fn valid_interface_key(key: &str) -> bool {
     key == REMOTE_CONSOLE_REVEAL_KEY || font_profile::valid_key(key)
 }
 
@@ -2205,8 +2211,13 @@ pub struct Settings {
     /// How a line this viewer owns (its ▶ new text) is marked: `▶ ` in front, a green glow
     /// behind its first cells (src/newbg.rs), or not at all (the default).
     pub new_indicator: NewIndicator,
-    /// Text-to-speech mode: Off, Local (espeak/say), or Edge (MS neural TTS)
+    /// The console's own text-to-speech: Off, Local (espeak/say), Kokoro or Edge, with
+    /// `tts_speak_mode` and `tts_voice` below. Every other interface's is in
+    /// `tts_profiles` (user request 2026-10-28).
     pub tts_mode: tts::TtsMode,
+    /// Each interface's own text-to-speech, by its key (`valid_interface_key`; a client
+    /// names it in `AuthRequest.interface_key`). Off until that interface chose one.
+    pub tts_profiles: std::collections::BTreeMap<String, tts::TtsProfile>,
     /// World-tabs ribbon display mode (web/GUI/Android only, see TabsMode)
     pub tabs: TabsMode,
     /// Icon bar visibility mode (web/GUI/Android only, see IconBarMode)
@@ -2254,6 +2265,16 @@ impl Settings {
     /// One interface's own Text Reveal, by its key; Off until it chose one.
     pub fn text_reveal_for(&self, key: &str) -> TextReveal {
         self.text_reveal_profiles.get(key).copied().unwrap_or_default()
+    }
+
+    /// One interface's own text-to-speech, by its key; Off until it chose one.
+    pub fn tts_profile_for(&self, key: &str) -> tts::TtsProfile {
+        self.tts_profiles.get(key).cloned().unwrap_or_default()
+    }
+
+    /// The console's own text-to-speech (the legacy fields).
+    pub fn console_tts(&self) -> tts::TtsProfile {
+        tts::TtsProfile { mode: self.tts_mode, speak_mode: self.tts_speak_mode, voice: self.tts_voice.clone() }
     }
 
     /// Clay's new-text markers are drawn, in either style: the setting is on, and no script
@@ -2331,6 +2352,7 @@ impl Default for Settings {
             zwj_enabled: false,
             new_indicator: NewIndicator::None,
             tts_mode: tts::TtsMode::Off,
+            tts_profiles: std::collections::BTreeMap::new(),
             tabs: TabsMode::None,
             icon_bar: IconBarMode::AppTablet,
             picture_host: picture::PictureService::default(),
@@ -5993,6 +6015,9 @@ pub struct App {
     /// `App::display_owner_id`. Entries are dropped when the client's `ClientViewState` is
     /// reaped, so this stays bounded by the live client count.
     pub ws_client_owner_ids: std::collections::HashMap<u64, u64>,
+    /// Connection id -> the interface it named at login (`AuthRequest.interface_key`):
+    /// whose text-to-speech it is sent (`App::client_tts`). Absent for an older client.
+    pub ws_client_interface: std::collections::HashMap<u64, String>,
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     pub is_master: bool,
@@ -6336,6 +6361,7 @@ impl App {
             ws_client_worlds: std::collections::HashMap::new(),
             ws_client_other_views: std::collections::HashMap::new(),
             ws_client_owner_ids: std::collections::HashMap::new(),
+            ws_client_interface: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
             deferred_tf: std::collections::VecDeque::new(),
             last_temp_world: 0,
@@ -6604,6 +6630,7 @@ impl App {
             tts_mode: self.settings.tts_mode.name().to_string(),
             tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
             tts_voice: self.settings.tts_voice.clone(),
+            tts_profiles: Some(self.settings.tts_profiles.iter().map(|(k, p)| (k.clone(), p.to_setting())).collect()),
             scrollback_enabled: self.settings.scrollback_enabled,
             log_input_enabled: self.settings.log_input_enabled,
             clear_input_on_send: self.settings.clear_input_on_send,
@@ -6720,10 +6747,23 @@ impl App {
             self.settings.text_reveal = TextReveal::from_name(mine);
         }
         let old_tts_mode = self.settings.tts_mode;
-        self.settings.tts_mode = tts::TtsMode::from_name(&settings.tts_mode);
-        self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
-        if !settings.tts_voice.is_empty() {
-            self.settings.tts_voice = kokoro::normalize_voice(&settings.tts_voice);
+        match &settings.tts_profiles {
+            // This attached console's own text-to-speech, kept by the server under its key
+            // (Off until it chose one).
+            Some(profiles) => {
+                let mine = profiles.get(REMOTE_CONSOLE_REVEAL_KEY).map(tts::TtsProfile::from_setting).unwrap_or_default();
+                self.settings.tts_mode = mine.mode;
+                self.settings.tts_speak_mode = mine.speak_mode;
+                self.settings.tts_voice = mine.voice;
+            }
+            // A server from before the split: its one shared setting.
+            None => {
+                self.settings.tts_mode = tts::TtsMode::from_name(&settings.tts_mode);
+                self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
+                if !settings.tts_voice.is_empty() {
+                    self.settings.tts_voice = kokoro::normalize_voice(&settings.tts_voice);
+                }
+            }
         }
         // Auto-unmute when TTS is enabled
         if old_tts_mode == tts::TtsMode::Off && self.settings.tts_mode != tts::TtsMode::Off {
@@ -7384,20 +7424,12 @@ impl App {
 
     /// A client's `/say <text>` (both server handlers): spoken where it was typed - by that
     /// client (`ServerSpeak`, to it alone), not on this machine and not by every other
-    /// client too. A GUI master's own window is on this machine, so it is spoken here (the
-    /// WebView's speech can't be counted on) - but not the Android app's `--local-server`,
-    /// which has no voice of its own: the app speaks it.
+    /// client too - with that interface's own text-to-speech. A GUI master's own window is
+    /// on this machine, so it is spoken here (`own_gui_client`: the WebView's speech can't
+    /// be counted on) - but not the Android app's `--local-server`, which has no voice of
+    /// its own: the app speaks it.
     pub(crate) fn ws_say(&mut self, client_id: u64, world_index: usize, text: &str) {
-        let own_gui = self.gui_tx.is_some()
-            && !LOCAL_SERVER_LOOPBACK_ONLY.load(Ordering::SeqCst)
-            && (client_id == 0 || self.ws_server.as_ref()
-                .and_then(|s| s.get_client_ip(client_id))
-                .is_some_and(|ip| ip == "127.0.0.1" || ip == "::1"));
-        if own_gui {
-            self.speak_text(text);
-        } else {
-            self.ws_send_to_client(client_id, WsMessage::ServerSpeak { text: strip_ansi_codes(text), world_index });
-        }
+        self.speak_for_client(client_id, world_index, text);
         self.ws_tell(client_id, world_index, &format!("TTS: {}", text));
     }
 
@@ -11529,6 +11561,7 @@ impl App {
         separator_style: Option<String>,
         text_reveal_profile: Option<websocket::TextRevealProfile>,
         font_profile: Option<font_profile::FontProfileUpdate>,
+        tts_profile: Option<websocket::TtsProfileUpdate>,
     ) {
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
@@ -11638,14 +11671,31 @@ impl App {
                 self.settings.text_reveal_profiles.insert(profile.key, TextReveal::from_name(&profile.value));
             }
         }
-        let tts_was = self.settings.tts_mode;
-        self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
-        self.note_kokoro_selected(tts_was);
-        self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
-        // Empty = unchanged: a client from before the Kokoro voice existed.
-        if !tts_voice.is_empty() {
-            self.settings.tts_voice = kokoro::normalize_voice(&tts_voice);
+        // Text-to-speech is kept per interface (user request 2026-10-28): a client that
+        // named its interface at login sets only its own, and only under that name; the
+        // legacy fields are the console's, which only an older client (one that names no
+        // interface) still edits, as it did the one shared setting.
+        let was_kokoro = self.local_kokoro_voice().is_some();
+        match self.ws_client_interface.get(&client_id).cloned() {
+            Some(mine) => {
+                if let Some(p) = tts_profile.filter(|p| p.key == mine && valid_interface_key(&p.key)) {
+                    let mut profile = tts::TtsProfile::from_names(&p.mode, &p.speak_mode, &p.voice);
+                    if p.voice.trim().is_empty() {
+                        profile.voice = self.settings.tts_profile_for(&p.key).voice;
+                    }
+                    self.settings.tts_profiles.insert(p.key, profile);
+                }
+            }
+            None => {
+                self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
+                self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
+                // Empty = unchanged: a client from before the Kokoro voice existed.
+                if !tts_voice.is_empty() {
+                    self.settings.tts_voice = kokoro::normalize_voice(&tts_voice);
+                }
+            }
         }
+        self.note_kokoro_selected(was_kokoro);
         let scrollback_changed = self.settings.scrollback_enabled != scrollback_enabled;
         self.settings.scrollback_enabled = scrollback_enabled;
         if scrollback_changed {
@@ -12136,9 +12186,7 @@ impl App {
                 true
             }
             Command::Say { text } => {
-                self.speak_text(&text);
-                let clean_text = strip_ansi_codes(&text);
-                self.ws_broadcast(WsMessage::ServerSpeak { text: clean_text, world_index: world_idx });
+                self.say_everywhere(world_idx, &text);
                 true
             }
             _ => false,
@@ -13323,6 +13371,43 @@ impl App {
         self.ws_client_owner_ids.insert(client_id, id);
     }
 
+    /// Record which interface `client_id` is (`AuthRequest.interface_key`), so it is sent
+    /// speech by its own text-to-speech. Empty: an older client, which follows the
+    /// console's as the one shared setting did. The GUI this Clay runs for speaks on this
+    /// machine, so its Kokoro model is loaded now if it uses one.
+    pub(crate) fn set_client_interface(&mut self, client_id: u64, key: &str) {
+        if key.is_empty() {
+            self.ws_client_interface.remove(&client_id);
+            return;
+        }
+        let was_kokoro = self.local_kokoro_voice().is_some();
+        self.ws_client_interface.insert(client_id, key.to_string());
+        if self.own_gui_client(client_id) {
+            self.note_kokoro_selected(was_kokoro);
+        }
+    }
+
+    /// The text-to-speech `client_id` is sent speech by: its interface's own, or - for an
+    /// older client, which names none - the console's (the one shared setting it knew).
+    pub(crate) fn client_tts(&self, client_id: u64) -> tts::TtsProfile {
+        match self.ws_client_interface.get(&client_id) {
+            Some(key) => self.settings.tts_profile_for(key),
+            None => self.settings.console_tts(),
+        }
+    }
+
+    /// `client_id` is the window of the GUI this Clay runs for (the WebView or native GUI
+    /// master): its speech is spoken on this machine, by this process, since the WebView's
+    /// own can't be counted on. Never the Android app's bundled server's client: that
+    /// server has no voice, and the app speaks.
+    pub(crate) fn own_gui_client(&self, client_id: u64) -> bool {
+        self.gui_tx.is_some()
+            && !LOCAL_SERVER_LOOPBACK_ONLY.load(Ordering::SeqCst)
+            && (client_id == 0 || self.ws_server.as_ref()
+                .and_then(|s| s.get_client_ip(client_id))
+                .is_some_and(|ip| ip == "127.0.0.1" || ip == "::1"))
+    }
+
     pub(crate) fn ws_client_viewing(&self, world_index: usize) -> bool {
         self.ws_client_worlds.iter().any(|(id, v)| {
             let shown = v.world_index == world_index
@@ -13484,6 +13569,7 @@ impl App {
             self.ws_client_worlds.remove(&client_id);
             self.ws_client_other_views.remove(&client_id);
             self.ws_client_owner_ids.remove(&client_id);
+            self.ws_client_interface.remove(&client_id);
         }
     }
 
@@ -14198,44 +14284,9 @@ impl App {
         }
 
         if !non_gagged_lines.is_empty() {
-            // Text-to-speech: speak non-gagged MUD output when TTS is enabled and not muted
-            // Only speak output from the currently visible world
-            if self.settings.tts_mode != tts::TtsMode::Off && !self.settings.tts_muted
-                && (world_idx == self.current_world_index || self.ws_client_viewing(world_idx))
-            {
-                // Filter lines based on speak mode
-                let lines_to_speak: Vec<&str> = if self.settings.tts_speak_mode == tts::TtsSpeakMode::Limit {
-                    non_gagged_lines.iter()
-                        .filter(|(line, _)| {
-                            tts::should_speak(line, &mut self.worlds[world_idx].tts_speaker_whitelist)
-                        })
-                        .map(|(line, _)| *line)
-                        .collect()
-                } else {
-                    non_gagged_lines.iter()
-                        .map(|(line, _)| *line)
-                        .collect()
-                };
-                // Strip ANSI codes and MUD tags — only speak what's displayed on screen
-                let speak_text = lines_to_speak.iter()
-                    .map(|line| {
-                        let stripped = strip_ansi_codes(line);
-                        crate::util::strip_mud_tag(&stripped)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let clean_text = speak_text.trim();
-                if !clean_text.is_empty() {
-                    // Console: speak via local TTS subprocess (queued — waits for previous to finish)
-                    let clean_text = clean_text.to_string();
-                    self.speak_text(&clean_text);
-                    // Web/GUI: broadcast ServerSpeak to WebSocket clients
-                    self.ws_broadcast(WsMessage::ServerSpeak {
-                        text: clean_text.to_string(),
-                        world_index: world_idx,
-                    });
-                }
-            }
+            // Text-to-speech, for each interface showing this world with its own.
+            let lines: Vec<&str> = non_gagged_lines.iter().map(|(line, _)| *line).collect();
+            self.speak_arrivals(world_idx, &lines);
         }
 
         // Keep scroll at bottom if we were already there, even when paused.
@@ -15700,6 +15751,7 @@ impl App {
             resume_epochs,
             client_uid,
             client_version,
+            interface_key,
             ..
         } = msg
         {
@@ -15741,6 +15793,7 @@ impl App {
                 // InitialState directly, so a key login lost its ▶ markers on every
                 // reconnect and got no replay of what it missed.
                 self.set_display_owner_id(client_id, &client_uid);
+                self.set_client_interface(client_id, &interface_key);
                 self.handle_ws_auth_initial_state(client_id, current_world, resume, resume_epochs);
             } else {
                 crate::http::log_remote_event("WS-KEY-REJECT", client_ip, "no matching key");
@@ -15924,33 +15977,168 @@ impl App {
     /// A change away from Kokoro unloads its model and closes its audio stream: an
     /// engine that outlived the setting kept a few hundred megabytes, its threads and
     /// a running stream, which cost CPU with TTS off.
-    pub(crate) fn note_kokoro_selected(&mut self, was: tts::TtsMode) {
-        if self.settings.tts_mode != tts::TtsMode::Kokoro {
+    /// What speaks on this machine is the console's own text-to-speech and the window of
+    /// the GUI this Clay runs for (`own_gui_client`); `was_kokoro` is whether one of them
+    /// used Kokoro before the change (`local_kokoro_voice`).
+    pub(crate) fn note_kokoro_selected(&mut self, was_kokoro: bool) {
+        let Some(voice) = self.local_kokoro_voice() else {
             tts::release_kokoro(&self.tts_backend);
             return;
-        }
+        };
         if kokoro::install().complete() {
-            tts::warm_kokoro(&self.tts_backend, &self.settings.tts_voice);
-        } else if was != tts::TtsMode::Kokoro {
+            tts::warm_kokoro(&self.tts_backend, &voice);
+        } else if !was_kokoro {
             self.note_kokoro_missing(true);
         }
     }
 
-    /// Kokoro is the engine: load its model in the background now (at startup, after an
-    /// install), not on the first line spoken.
+    /// Kokoro is the engine here: load its model in the background now (at startup, after
+    /// an install, when the GUI's window logs in), not on the first line spoken.
     pub(crate) fn warm_kokoro(&mut self) {
-        if self.settings.tts_mode == tts::TtsMode::Kokoro {
-            tts::warm_kokoro(&self.tts_backend, &self.settings.tts_voice);
+        if let Some(voice) = self.local_kokoro_voice() {
+            tts::warm_kokoro(&self.tts_backend, &voice);
+        }
+    }
+
+    /// The Kokoro voice this machine speaks with, if anything here uses Kokoro: the
+    /// console's own text-to-speech, or the GUI window this Clay runs for. A client
+    /// elsewhere speaks with its own engine, on its own machine.
+    pub(crate) fn local_kokoro_voice(&self) -> Option<String> {
+        if self.console_tui && self.settings.tts_mode == tts::TtsMode::Kokoro {
+            return Some(self.settings.tts_voice.clone());
+        }
+        self.ws_client_interface
+            .keys()
+            .filter(|id| self.own_gui_client(**id))
+            .map(|id| self.client_tts(*id))
+            .find(|p| p.mode == tts::TtsMode::Kokoro)
+            .map(|p| p.voice)
+    }
+
+    /// Speak `text` on this machine with `profile` (the window's own, for the GUI this
+    /// Clay runs for). Off speaks with the local engine: only `/say` asks then.
+    fn speak_here_with(&mut self, text: &str, profile: &tts::TtsProfile) {
+        let mode = if profile.mode == tts::TtsMode::Off { tts::TtsMode::Local } else { profile.mode };
+        if tts::speak(&self.tts_backend, text, mode, &profile.voice) {
+            self.note_kokoro_missing(false);
+        }
+    }
+
+    /// Speak `text` for `client_id`, with its own text-to-speech: here, for the GUI this
+    /// Clay runs for (`own_gui_client`), else by the client itself (`ServerSpeak`, to it
+    /// alone), which speaks with its own engine and voice on its own machine.
+    pub(crate) fn speak_for_client(&mut self, client_id: u64, world_index: usize, text: &str) {
+        let text = strip_ansi_codes(text);
+        if self.own_gui_client(client_id) {
+            let profile = self.client_tts(client_id);
+            self.speak_here_with(&text, &profile);
+        } else {
+            self.ws_send_to_client(client_id, WsMessage::ServerSpeak { text, world_index });
+        }
+    }
+
+    /// The clients a broadcast reaches: logged in and sent their InitialState.
+    fn ws_ready_clients(&self) -> Vec<u64> {
+        let Some(server) = self.ws_server.as_ref() else { return Vec::new() };
+        let clients = server.clients.read().unwrap_or_else(|p| p.into_inner());
+        clients.iter().filter(|(_, c)| c.authenticated && c.received_initial_state).map(|(id, _)| *id).collect()
+    }
+
+    /// Newly arrived, displayed lines of `world_idx`, spoken wherever someone listens
+    /// (user request 2026-10-28: text-to-speech per interface): by the console with its
+    /// own when it shows the world (F9 mutes it), and for every client showing it - its
+    /// world, or one of its other windows' - with the client's own, whether or not it is
+    /// on screen (a phone in a pocket keeps talking). In Limit, a listener hears only
+    /// what is said (`tts::should_speak`, worked out once for all of them).
+    pub(crate) fn speak_arrivals(&mut self, world_idx: usize, lines: &[&str]) {
+        if lines.is_empty() || world_idx >= self.worlds.len() {
+            return;
+        }
+        let console = Some(self.settings.console_tts())
+            .filter(|p| p.is_on() && self.console_tui && world_idx == self.current_world_index && !self.settings.tts_muted);
+        let listeners: Vec<(u64, tts::TtsProfile)> = self
+            .ws_ready_clients()
+            .into_iter()
+            .filter(|id| {
+                self.ws_client_worlds.get(id).is_some_and(|v| {
+                    let shown = v.world_index == world_idx
+                        || self.ws_client_other_views.get(id).is_some_and(|o| o.contains(&world_idx));
+                    shown && !v.paused && v.disconnected_at.is_none()
+                })
+            })
+            .map(|id| (id, self.client_tts(id)))
+            .filter(|(_, p)| p.is_on())
+            .collect();
+        if console.is_none() && listeners.is_empty() {
+            return;
+        }
+        // Strip ANSI codes and MUD tags: only what's displayed on screen is spoken.
+        let spoken = |lines: &[&str]| -> String {
+            lines
+                .iter()
+                .map(|line| crate::util::strip_mud_tag(&strip_ansi_codes(line)))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string()
+        };
+        let all = spoken(lines);
+        let limit = console.iter().chain(listeners.iter().map(|(_, p)| p)).any(|p| p.speak_mode == tts::TtsSpeakMode::Limit);
+        let limited = if limit {
+            let whitelist = &mut self.worlds[world_idx].tts_speaker_whitelist;
+            let said: Vec<&str> = lines.iter().copied().filter(|line| tts::should_speak(line, whitelist)).collect();
+            spoken(&said)
+        } else {
+            String::new()
+        };
+        let text_for = |p: &tts::TtsProfile| if p.speak_mode == tts::TtsSpeakMode::Limit { limited.clone() } else { all.clone() };
+        if let Some(p) = &console {
+            let text = text_for(p);
+            if !text.is_empty() {
+                // Queued: waits for the previous line to finish.
+                self.speak_text(&text);
+            }
+        }
+        for (id, p) in &listeners {
+            let text = text_for(p);
+            if !text.is_empty() {
+                self.speak_for_client(*id, world_idx, &text);
+            }
+        }
+    }
+
+    /// `/say` typed in the console, or an action's: spoken by the console and for every
+    /// client, each with its own text-to-speech.
+    pub(crate) fn say_everywhere(&mut self, world_index: usize, text: &str) {
+        if self.console_tui {
+            self.speak_text(text);
+        }
+        for id in self.ws_ready_clients() {
+            self.speak_for_client(id, world_index, text);
         }
     }
 
     pub(crate) fn tts_command(&mut self, args: &[String], reply_to: Option<(u64, usize)>, event_tx: &mpsc::Sender<AppEvent>) {
         let sub = args.first().map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "status".to_string());
+        // A client asks about its own interface's text-to-speech (user request 2026-10-28:
+        // each interface its own); one elsewhere speaks with its own voice, on its machine.
+        let client = reply_to.map(|(id, _)| id).filter(|id| !self.own_gui_client(*id));
         let lines: Vec<String> = match sub.as_str() {
+            "status" if client.is_some() => {
+                let p = client.map(|id| self.client_tts(id)).unwrap_or_default();
+                vec![format!(
+                    "TTS for this interface: {} (speak mode {}) - spoken with this device's own voice, set in its Settings.",
+                    p.mode.name(), p.speak_mode.name()
+                )]
+            }
             "status" => {
+                let p = match reply_to {
+                    Some((id, _)) => self.client_tts(id),
+                    None => self.settings.console_tts(),
+                };
                 let mut v = vec![format!(
                     "TTS: {} (speak mode {}), Kokoro voice: {}",
-                    self.settings.tts_mode.name(), self.settings.tts_speak_mode.name(), self.settings.tts_voice
+                    p.mode.name(), p.speak_mode.name(), p.voice
                 )];
                 v.extend(kokoro::status_lines());
                 if let Some(engine) = tts::kokoro_engine(&self.tts_backend) {
@@ -15986,38 +16174,67 @@ impl App {
                 v.push("Pick one with /tts voice <name>, or in Settings.".to_string());
                 v
             }
-            "voice" => match args.get(1) {
-                None => vec![format!("Kokoro voice: {} (/tts voice <name> changes it; /tts voices lists them)", self.settings.tts_voice)],
-                Some(name) => match kokoro::voice_id(name) {
-                    None => vec![format!("Kokoro: no voice named {name}; /tts voices lists them.")],
-                    Some(_) => {
-                        self.settings.tts_voice = kokoro::normalize_voice(name);
-                        let _ = persistence::save_settings(self);
-                        let settings_msg = self.build_global_settings_msg();
-                        self.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: self.input_height });
-                        // Another accent or language means another model load: now, not
-                        // on the next line.
-                        self.warm_kokoro();
-                        vec![format!("Kokoro voice: {}", self.settings.tts_voice)]
-                    }
-                },
-            },
+            "voice" => {
+                // The asker's own voice: a client's interface's, the console's otherwise (and
+                // an older client's, which names no interface).
+                let key = reply_to.and_then(|(id, _)| self.ws_client_interface.get(&id).cloned());
+                let current = match &key {
+                    Some(k) => self.settings.tts_profile_for(k).voice,
+                    None => self.settings.tts_voice.clone(),
+                };
+                match args.get(1) {
+                    None => vec![format!("Kokoro voice: {current} (/tts voice <name> changes it; /tts voices lists them)")],
+                    Some(name) => match kokoro::voice_id(name) {
+                        None => vec![format!("Kokoro: no voice named {name}; /tts voices lists them.")],
+                        Some(_) => {
+                            let voice = kokoro::normalize_voice(name);
+                            match &key {
+                                Some(k) if valid_interface_key(k) => {
+                                    let mut p = self.settings.tts_profile_for(k);
+                                    p.voice = voice.clone();
+                                    self.settings.tts_profiles.insert(k.clone(), p);
+                                }
+                                Some(_) => {}
+                                None => self.settings.tts_voice = voice.clone(),
+                            }
+                            let _ = persistence::save_settings(self);
+                            let settings_msg = self.build_global_settings_msg();
+                            self.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: self.input_height });
+                            // Another accent or language means another model load: now, not
+                            // on the next line.
+                            self.warm_kokoro();
+                            vec![format!("Kokoro voice: {voice}")]
+                        }
+                    },
+                }
+            }
+            "test" if client.is_some() => {
+                let text = "Hello from Clay. The dragon's lair lies north of the Misty Falls; bring torches, 3 rations and 40 gold.";
+                if let Some((id, world)) = reply_to {
+                    self.speak_for_client(id, world, text);
+                }
+                vec!["Speaking a test line with this device's own voice.".to_string()]
+            }
             "test" => {
+                let p = match reply_to {
+                    Some((id, _)) => self.client_tts(id),
+                    None => self.settings.console_tts(),
+                };
                 let installed = kokoro::install().complete();
-                let mode = match self.settings.tts_mode {
+                let mode = match p.mode {
                     tts::TtsMode::Off if installed => tts::TtsMode::Kokoro,
                     tts::TtsMode::Off => tts::TtsMode::Local,
                     m => m,
                 };
                 let engine = match mode {
-                    tts::TtsMode::Kokoro if installed => format!("Kokoro voice {}", self.settings.tts_voice),
+                    tts::TtsMode::Kokoro if installed => format!("Kokoro voice {}", p.voice),
                     tts::TtsMode::Kokoro => "local engine (Kokoro is not installed yet - /tts install)".to_string(),
                     tts::TtsMode::Local => "local engine".to_string(),
                     tts::TtsMode::Edge => "Edge cloud voice".to_string(),
                     tts::TtsMode::Off => unreachable!(),
                 };
                 let text = "Hello from Clay. The dragon's lair lies north of the Misty Falls; bring torches, 3 rations and 40 gold.";
-                tts::speak(&self.tts_backend, text, mode, &self.settings.tts_voice);
+                tts::speak(&self.tts_backend, text, mode, &p.voice);
                 let loading = mode == tts::TtsMode::Kokoro && installed
                     && !tts::kokoro_engine(&self.tts_backend).is_some_and(|e| e.loaded());
                 vec![format!("Speaking a test line with the {engine}{}.", if loading { "; loading the model first" } else { "" })]
@@ -17472,11 +17689,17 @@ impl App {
         } else {
             String::new()
         };
+        let auth_interface_key = if let WsMessage::AuthRequest { ref interface_key, .. } = msg {
+            interface_key.clone()
+        } else {
+            String::new()
+        };
         match msg {
             WsMessage::AuthRequest { .. } => {
                 // Record the stable ownership id BEFORE building InitialState, so the
                 // your_display_id it reports matches what any claim will stamp on lines.
                 self.set_display_owner_id(client_id, &auth_client_uid);
+                self.set_client_interface(client_id, &auth_interface_key);
                 self.handle_ws_auth_initial_state(client_id, auth_current_world, auth_resume, auth_resume_epochs);
             }
             WsMessage::ClientVisibility { visible } => {
@@ -17701,7 +17924,7 @@ impl App {
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -17711,7 +17934,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                     zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile,
+                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -23433,11 +23656,12 @@ pub async fn run_app_headless(
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
-                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, .. } = &*msg {
+                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, interface_key, .. } = &*msg {
                             // The stable ownership id first, as the console master does: the
                             // InitialState's your_display_id must match what claims stamp,
                             // or a password login loses its ▶ markers on every reconnect.
                             app.set_display_owner_id(client_id, client_uid);
+                            app.set_client_interface(client_id, interface_key);
                             app.handle_ws_auth_initial_state(client_id, *current_world, resume.clone(), resume_epochs.clone());
                             if app.web_reconnect_needed {
                                 app.web_reconnect_needed = false;

@@ -1396,6 +1396,8 @@ impl ClientCore {
             resume_epochs: resume_epochs.clone(),
             client_version: self.client_version.clone(),
             client_uid: self.client_uid.clone(),
+            // This GUI's text-to-speech is kept under its key (its program on its OS).
+            interface_key: crate::font_profile::native_key().to_string(),
         };
         let key = self.creds.auth_key.clone().filter(|k| !k.is_empty());
         if let (Some(key), false, false) = (key, self.multiuser, self.key_failed) {
@@ -2237,6 +2239,8 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         }),
         // This GUI's own fonts on this OS, once it has them (src/font_profile.rs).
         font_profile: s.font_update_for(crate::font_profile::native_key()),
+        // This GUI's own text-to-speech, once the server keeps them and it has one.
+        tts_profile: s.tts_profile_update(crate::font_profile::native_key()),
     }
 }
 

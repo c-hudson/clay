@@ -190,6 +190,7 @@ pub(crate) async fn run_grep_client(
         // One-shot invocation: never renders output, so it owns no ▶ markers and needs no
         // stable identity.
         client_uid: String::new(),
+        interface_key: String::new(),
     });
 
     // Wait for auth response
@@ -600,6 +601,7 @@ pub(crate) async fn run_import_client(
             client_version: crate::VERSION.to_string(),
             // /import client: fetches settings only, renders nothing, owns no ▶ markers.
             client_uid: String::new(),
+            interface_key: String::new(),
         }
     } else {
         let password_hash = hash_password(password.unwrap_or_default());
@@ -615,6 +617,7 @@ pub(crate) async fn run_import_client(
             client_version: crate::VERSION.to_string(),
             // /import client: fetches settings only, renders nothing, owns no ▶ markers.
             client_uid: String::new(),
+            interface_key: String::new(),
         }
     };
     let _ = ws_tx.send(auth_request);
@@ -867,6 +870,8 @@ async fn reconnect_once(
             resume_epochs: Vec::new(),
             client_version: String::new(),
             client_uid: String::new(),
+            // This console's own text-to-speech is kept under this key.
+            interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string(),
         };
         let json = serde_json::to_string(&auth).map_err(|e| ConnectError::Failed(e.to_string()))?;
         write.send(Message::Text(json)).await.map_err(|e| ConnectError::Failed(e.to_string()))?;
@@ -1159,7 +1164,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             // for a connection that stays up is handled separately via
                             // `ResyncRequired` in `App::handle_remote_ws_message`
                             // (PROTOCOL-ROADMAP.md Step 6).
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username: username.clone(), current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new() });
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username: username.clone(), current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string() });
                             break;
                         }
                         KeyCode::Char(c) => {
@@ -2321,6 +2326,14 @@ pub(crate) fn handle_remote_client_key(
                         value: app.settings.text_reveal.name().to_string(),
                     }),
                     font_profile: None,
+                    // This console's own text-to-speech, kept by the server under its key
+                    // (an older server ignores it and takes the shared fields above).
+                    tts_profile: Some(crate::websocket::TtsProfileUpdate {
+                        key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string(),
+                        mode: app.settings.tts_mode.name().to_string(),
+                        speak_mode: app.settings.tts_speak_mode.name().to_string(),
+                        voice: app.settings.tts_voice.clone(),
+                    }),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -3539,6 +3552,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         separator_style: None,
         text_reveal_profile: None,
         font_profile: None,
+        tts_profile: None,
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
