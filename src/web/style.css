@@ -1602,16 +1602,19 @@ body.desktop-input #output-container::-webkit-scrollbar-thumb:active {
    ground, framed, rounded and softly shadowed. `.card-frame` is the same box without
    padding, for a list or table that fills it; `.card` never clips, because on a phone
    the custom dropdown menus open inside it. A sidebar is a column of icon+label
-   tiles; on a phone it is a horizontal strip of icons only (user ruling). */
+   tiles; on a phone it is a horizontal strip of icons only (user ruling). On a phone,
+   General's two columns are a card each (see "Two-column container" below). */
 .card,
-.card-frame {
+.card-frame,
+body.device-phone .settings-two-column > .settings-column {
     background: var(--theme-bg-surface, #1c1722);
     border: 1px solid var(--border-color);
     border-radius: 8px;
     box-shadow: var(--card-shadow);
 }
 
-.card {
+.card,
+body.device-phone .settings-two-column > .settings-column {
     padding: 10px 12px;
 }
 
@@ -3472,6 +3475,24 @@ html.popup-window .settings-content {
    choices' text (the native GUI's General card does the same). */
 .settings-two-column > .settings-column:first-child {
     flex: 0 0 auto;
+}
+
+/* A phone's General tab is one column (user request 2026-10-28: side by side, the
+   choices were squeezed off the screen): the switches, then the choices, each its own
+   full-width card (the columns share .card's look, above), and the box that held them
+   is no card itself. Tablets and desktops keep one card of two columns. */
+body.device-phone .settings-two-column {
+    flex-direction: column;
+    gap: 10px;
+    padding: 0;
+    background: none;
+    border: none;
+    box-shadow: none;
+}
+
+body.device-phone .settings-two-column > .settings-column,
+body.device-phone .settings-two-column > .settings-column:first-child {
+    flex: none;
 }
 
 .setting-label {

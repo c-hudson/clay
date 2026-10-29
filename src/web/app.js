@@ -1924,7 +1924,7 @@
     const NEW_GLOW_GREEN = [0, 100, 0];
     const NEW_GLOW_CELLS = 4;
     const NEW_GLOW_WORD = 'Clay';
-    // "New Background - Custom" (`custom:<key>`): [key, label, first colour].
+    // New Indicator's "Custom" (`custom:<key>`): [key, label, first colour].
     const NEW_GLOW_SCHEMES = [
         ['teal', 'Teal', [0, 95, 95]],
         ['cyan', 'Cyan', [0, 105, 140]],
@@ -9009,10 +9009,10 @@
             'More Mode: Pauses output when a full screen of text',
             '  arrives. Keeps you from missing important text.', '',
             'TLS Proxy: Keeps a proxy alive during hot reload', '  so TLS connections survive.', '',
-            'New Indicator: How text that arrived while you were', '  in another world is marked. New Character: a green',
-            '  ▶ in front of each line. New Background: a green', '  glow behind its first 4 characters, fading to the',
-            '  theme\'s background. New Background - Custom: the', '  same glow in another colour, picked from ten.',
-            '  None: not marked. Leaving the world or Ctrl+L', '  clears the marks, in any style.', '',
+            'New Indicator: How text that arrived while you were', '  in another world is marked. Character: a green ▶',
+            '  in front of each line. Background: a green glow', '  behind its first 4 characters, fading to the',
+            '  theme\'s background. Custom: the same glow in', '  another colour, picked from ten. None: not',
+            '  marked. Leaving the world or Ctrl+L clears the', '  marks, in any style.', '',
             'Keyboard Visible (phones and tablets only): Force the',
             '  on-screen keyboard to stay up. Off lets the OS decide.',
             '  Always ignored (keyboard hidden) when a hardware',
@@ -20602,12 +20602,13 @@
         if (custom) {
             const s = NEW_GLOW_SCHEMES[i < 0 ? 0 : i];
             custom.value = 'custom:' + s[0];
-            setSelectOptionText(select, custom.value, 'New Background - Custom (' + s[1] + ')');
+            // The phone's dropdown item takes the new value first, so the relabel finds it.
             if (select._customMenu) {
                 select._customMenu.querySelectorAll('.custom-dropdown-item').forEach(item => {
                     if (item.dataset.value === 'custom' || item.dataset.value.startsWith('custom:')) item.dataset.value = custom.value;
                 });
             }
+            setSelectOptionText(select, custom.value, 'Custom (' + s[1] + ')');
         }
         select.value = i < 0 ? name : 'custom:' + NEW_GLOW_SCHEMES[i][0];
         if (select.selectedIndex < 0) select.value = 'none';
@@ -20616,8 +20617,8 @@
 
     let glowStepKey = false;            // a key that steps the New Indicator select is down
     let glowSchemeDialogOpen = false;
-    // "New Background - Custom" (the console's glow_scheme popup, the native GUI's
-    // GlowScheme dialog): each scheme drawn as NEW_GLOW_WORD over its four cells, fading to
+    // "Custom Background" (NewIndicator::PICKER_TITLE; the console's glow_scheme popup, the
+    // native GUI's GlowScheme dialog): each scheme drawn as NEW_GLOW_WORD over its four cells, fading to
     // this theme's background. A click or Enter picks one and puts it on the select; Esc or
     // Cancel puts back `previous`.
     function showGlowSchemeDialog(select, previous) {
@@ -20638,7 +20639,7 @@
         }).join('');
         dlg.innerHTML = sanitizeHtml(`
             <div class="modal-content js-dialog" style="max-width:320px;width:90%;" tabindex="-1" id="glow-scheme-box">
-                <div class="js-dialog-title">New Background - Custom</div>
+                <div class="js-dialog-title">Custom Background</div>
                 <div id="glow-scheme-rows" style="display:flex;flex-direction:column;gap:2px;margin-bottom:12px;">${rows}</div>
                 <div style="display:flex;gap:10px;justify-content:flex-end;">
                     <button id="glow-scheme-cancel" class="btn">Cancel</button>

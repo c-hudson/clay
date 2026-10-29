@@ -177,7 +177,7 @@ pub fn picture_host_options() -> Vec<SelectOption> {
 
 /// New-text indicator style options (the one list every UI shows, `NewIndicator::OPTIONS`),
 /// the Custom entry shown as `current`'s scheme when it is one, else the first scheme
-/// ("New Background - Custom (Teal)"): picking it, or Enter on it, opens the scheme picker
+/// ("Custom (Teal)"): picking it, or Enter on it, opens the scheme picker
 /// (glow_scheme.rs). The native GUI's pick is built from this too.
 pub fn new_indicator_options(current: &str) -> Vec<SelectOption> {
     let custom = match crate::NewIndicator::from_name(current) {
@@ -506,13 +506,13 @@ fn setup_help_text() -> Vec<String> {
         "ANSI Music: Play ANSI music sequences from MUDs.",
         "",
         "New Indicator: How text that arrived while you were",
-        "  in another world is marked. New Character: a green",
-        "  ▶ in front of each line. New Background: a green",
-        "  glow behind its first 4 characters, fading to the",
-        "  theme's background. New Background - Custom: the",
-        "  same glow in another colour; press Enter on it to",
-        "  pick one of ten. None: not marked. Leaving the",
-        "  world or Ctrl+L clears the marks, in any style.",
+        "  in another world is marked. Character: a green ▶",
+        "  in front of each line. Background: a green glow",
+        "  behind its first 4 characters, fading to the",
+        "  theme's background. Custom: the same glow in",
+        "  another colour; press Enter on it to pick one of",
+        "  ten. None: not marked. Leaving the world or Ctrl+L",
+        "  clears the marks, in any style.",
         "",
         "Text Reveal: Type newly arrived lines, and the screen a",
         "  world switch shows, onto the screen behind a glitching",
@@ -755,7 +755,9 @@ mod tests {
         let values: Vec<String> = new_indicator_options("none").iter().map(|o| o.value.clone()).collect();
         assert_eq!(values, ["none", "character", "background", "custom:teal"]);
         let custom = new_indicator_options("custom:red");
-        assert_eq!((custom[3].value.as_str(), custom[3].label.as_str()), ("custom:red", "New Background - Custom (Red)"));
+        assert_eq!((custom[3].value.as_str(), custom[3].label.as_str()), ("custom:red", "Custom (Red)"));
+        let labels: Vec<String> = new_indicator_options("none").iter().map(|o| o.label.clone()).collect();
+        assert_eq!(labels, ["None", "Character", "Background", "Custom (Teal)"], "one word each (user request)");
         assert_eq!(new_indicator_index("custom:red"), 3);
         assert_eq!(crate::NewIndicator::default().name(), "none");
         let def = create_setup_popup_for_test("off");
@@ -775,7 +777,7 @@ mod tests {
         );
         assert_eq!(PopupState::new(def).get_selected(SETUP_FIELD_NEW_LINE_INDICATOR), Some("none"));
         let help = setup_help_text().join("\n");
-        assert!(help.contains("New Background:") && help.contains("New Character:"), "the help names both styles");
+        assert!(help.contains("Background:") && help.contains("Character:") && help.contains("Custom:"), "the help names every style");
     }
 
     /// The Separator Style choices are `SeparatorStyle::OPTIONS`, Web first (the default),

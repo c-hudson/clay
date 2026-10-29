@@ -21701,6 +21701,10 @@ fn the_web_new_indicator_options_are_the_enums_options() {
         .map(|s| format!("        ['{}', '{}', [{}, {}, {}]],\n", s.key, s.label, s.start.0, s.start.1, s.start.2))
         .collect();
     assert!(js.contains(&format!("const NEW_GLOW_SCHEMES = [\n{schemes}    ];")), "app.js NEW_GLOW_SCHEMES is newbg::SCHEMES");
+    // The Custom entry with its scheme, and the picker's title, as NewIndicator words them.
+    let (custom_word, _) = crate::NewIndicator::Custom(0).label().split_once(" (").map(|(w, s)| (w.to_string(), s.to_string())).unwrap();
+    assert!(js.contains(&format!("'{custom_word} (' + s[1] + ')'")), "app.js labels the Custom entry as NewIndicator::label");
+    assert!(js.contains(&format!("<div class=\"js-dialog-title\">{}</div>", crate::NewIndicator::PICKER_TITLE)), "app.js titles the picker NewIndicator::PICKER_TITLE");
 }
 
 /// Only the ▶ character takes columns off a new line's wrap width: the background glow is

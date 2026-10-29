@@ -1,5 +1,5 @@
-//! "New Background - Custom": the window of glow colour schemes the Setup popup's New
-//! Indicator opens (user request 2026-10-28: "a pop up window with 10 or so options to choose
+//! "Custom Background" (`NewIndicator::PICKER_TITLE`): the window of glow colour schemes the
+//! Setup popup's New Indicator opens from its Custom entry (user request 2026-10-28: "a pop up window with 10 or so options to choose
 //! from ... show a 4 letter word with the fading"). Each row draws `newbg::SAMPLE_WORD` over
 //! its scheme's four cells, fading to this console's black or white (`newbg::console_target`),
 //! beside the scheme's name. Pushed over /setup by Enter on the Custom entry; Enter (or OK)
@@ -31,7 +31,7 @@ pub fn create_glow_scheme_popup(current: usize, to: crate::reveal::Rgb) -> Popup
     if let FieldKind::List { selected_index, .. } = &mut list {
         *selected_index = current.min(crate::newbg::SCHEMES.len() - 1);
     }
-    PopupDefinition::new(PopupId("glow_scheme"), "New Background - Custom")
+    PopupDefinition::new(PopupId("glow_scheme"), crate::NewIndicator::PICKER_TITLE)
         .with_field(Field::new(GLOW_SCHEME_FIELD_LIST, "", list))
         .with_button(Button::new(GLOW_SCHEME_BTN_OK, "OK").primary().with_shortcut('O'))
         .with_button(Button::new(GLOW_SCHEME_BTN_CANCEL, "Cancel").with_shortcut('C'))

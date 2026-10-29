@@ -617,8 +617,8 @@ pub enum NewIndicator {
     None,
     Character,
     Background,
-    /// "New Background - Custom": the glow in one of `newbg::SCHEMES` (its index), picked
-    /// from a window of them (user request 2026-10-28). Named `custom:<key>`.
+    /// "Custom": the glow in one of `newbg::SCHEMES` (its index), picked from a window of
+    /// them (user request 2026-10-28). Named `custom:<key>`.
     Custom(u8),
 }
 
@@ -626,9 +626,15 @@ impl NewIndicator {
     /// (value, label) as every Settings window lists them - the console's `/setup`, the
     /// native GUI's Pick and the web page's select (a test pins index.html to this). The
     /// last is the Custom entry, bare: each window shows it as the scheme set or the first
-    /// one (`setup::new_indicator_options`), and picking it opens the scheme picker.
+    /// one (`setup::new_indicator_options`), and picking it opens the scheme picker. One
+    /// word each (user request 2026-10-28: "New Background - Custom (Teal)" was too wide
+    /// for a phone's Settings).
     pub const OPTIONS: &'static [(&'static str, &'static str)] =
-        &[("none", "None"), ("character", "New Character"), ("background", "New Background"), (Self::CUSTOM, "New Background - Custom")];
+        &[("none", "None"), ("character", "Character"), ("background", "Background"), (Self::CUSTOM, "Custom")];
+
+    /// The scheme picker's title, in every interface (the console's glow_scheme popup, the
+    /// web page's dialog, the native GUI's GlowScheme).
+    pub const PICKER_TITLE: &'static str = "Custom Background";
 
     /// The Custom entry's bare value.
     pub const CUSTOM: &'static str = "custom";
@@ -645,7 +651,7 @@ impl NewIndicator {
     /// The label a Settings window shows for this value.
     pub fn label(&self) -> String {
         match self {
-            NewIndicator::Custom(i) => format!("New Background - Custom ({})", Self::scheme(*i).label),
+            NewIndicator::Custom(i) => format!("Custom ({})", Self::scheme(*i).label),
             other => Self::OPTIONS.iter().find(|(v, _)| *v == other.name()).map_or(String::new(), |(_, l)| l.to_string()),
         }
     }
@@ -1452,8 +1458,8 @@ mod tests {
         }
         assert_eq!(NewIndicator::from_name("custom"), NewIndicator::Custom(0), "the bare entry: the first scheme");
         assert_eq!(NewIndicator::from_name("custom:plaid"), NewIndicator::Custom(0));
-        assert_eq!(NewIndicator::Custom(2).label(), "New Background - Custom (Blue)");
-        assert_eq!(NewIndicator::Background.label(), "New Background");
+        assert_eq!(NewIndicator::Custom(2).label(), "Custom (Blue)");
+        assert_eq!(NewIndicator::Background.label(), "Background");
         assert_eq!(NewIndicator::Background.glow_start(), Some(crate::newbg::GREEN));
         assert_eq!(NewIndicator::Character.glow_start(), None);
         assert!(NewIndicator::is_custom_name("custom") && NewIndicator::is_custom_name("custom:red") && !NewIndicator::is_custom_name("background"));

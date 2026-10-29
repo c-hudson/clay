@@ -20371,7 +20371,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             return NewPopupAction::None;
         }
 
-        // The New Background - Custom scheme picker over /setup (glow_scheme.rs): Enter or OK
+        // New Indicator's Custom scheme picker over /setup (glow_scheme.rs): Enter or OK
         // puts the highlighted scheme on the Setup select, Esc and Cancel change nothing.
         if is_glow_scheme {
             use popup::definitions::glow_scheme::{GLOW_SCHEME_BTN_CANCEL, GLOW_SCHEME_BTN_OK, GLOW_SCHEME_FIELD_LIST, picked_value};

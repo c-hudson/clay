@@ -832,12 +832,12 @@ impl Render for RecentWorlds {
     }
 }
 
-// ---- New Background - Custom ------------------------------------------------------------
+// ---- New Indicator's Custom background ------------------------------------------------
 
 /// The scheme picked: its index in `newbg::SCHEMES`.
 pub type OnScheme = Box<dyn Fn(usize, &mut Window, &mut App)>;
 
-/// "New Background - Custom" (the console's glow_scheme popup, app.js
+/// "Custom Background" (`NewIndicator::PICKER_TITLE`; the console's glow_scheme popup, app.js
 /// `showGlowSchemeDialog`): the schemes of `newbg::SCHEMES`, each drawn as
 /// `newbg::SAMPLE_WORD` over its four cells, fading to this window's background. A click or
 /// Enter picks one; Esc or Cancel leaves the choice as it was.
@@ -934,7 +934,7 @@ impl Render for GlowScheme {
                 }
                 cx.stop_propagation();
             }))
-            .child(k.heading("New Background - Custom"))
+            .child(k.heading(crate::NewIndicator::PICKER_TITLE))
             .child(div().flex().flex_col().gap(px(2.0)).py(px(4.0)).children(rows))
             .child(k.note("↑↓ select, Enter choose, Esc cancel"))
             .child(

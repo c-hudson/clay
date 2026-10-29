@@ -1,4 +1,4 @@
-//! The "New Background" style of the new-text indicator (`NewIndicator::Background`): a
+//! The "Background" style of the new-text indicator (`NewIndicator::Background`): a
 //! green glow behind the first cells of a line this viewer owns, fading to the theme's
 //! background over [`CELLS`] cells (user request 2026-10-28: "the fading should happen in 4
 //! characters"). Which lines are marked, and when the marks go, is exactly as for the `▶ `
@@ -24,7 +24,7 @@ pub const CELLS: usize = 4;
 /// keep white text readable).
 pub const GREEN: Rgb = Rgb(0, 100, 0);
 
-/// A colour scheme for "New Background - Custom" (`NewIndicator::Custom`): the colour of the
+/// A colour scheme for New Indicator's "Custom" (`NewIndicator::Custom`): the colour of the
 /// glow's first cell, which fades to the theme's background as the green does. User request
 /// 2026-10-28: "10 or so options to choose from", shown with a four-letter word. Each is about
 /// as dark as [`GREEN`], so white text stays readable on it.
