@@ -2142,6 +2142,11 @@
     // 'wrap', 'limit', 'unlimit', 'relimit', 'result', 'first', 'rest', 'last', 'nth',
     // 'ver', 'man', 'nogag' are TF-engine commands from Phase 1's missing-builtins/stdlib
     // work, listed in that test's tf_only_completion_commands allowlist.
+    // /reload's usage line, and its answer to --console/--gui in a window with neither (a
+    // browser, the phone app): main.rs RELOAD_USAGE / RELOAD_SWITCH_ELSEWHERE, word for word.
+    const RELOAD_USAGE = "Usage: /reload [--console|--gui]";
+    const RELOAD_SWITCH_ELSEWHERE = "/reload --console and --gui switch the Clay they're typed in, and this window has none to switch. /reload alone reloads the server.";
+
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'reach', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'server', 'import',
@@ -7481,13 +7486,29 @@
             // Not --grep: fall through to the default server-send path below.
         }
 
-        // Intercept /reload in remote WebView mode — restart the local GUI binary
-        // (master WebView passes through to server which handles exec_reload with state)
-        if (window.WEBVIEW_MODE && !window.AUTO_PASSWORD &&
-            (cmdTrimmed === '/reload' || cmdTrimmed.startsWith('/reload '))) {
-            elements.input.value = '';
-            sendIpc('reload');
-            return;
+        // /reload [--console|--gui] (platform::reload_options). A remote WebView restarts
+        // the local GUI binary, as a console attached to the same server for --console; the
+        // master WebView passes through to its server, which handles exec_reload with state
+        // (and the switch). A browser or the phone app has no console or GUI to switch:
+        // the options are answered here, and a plain /reload still reloads the server.
+        if (cmdTrimmed === '/reload' || cmdTrimmed.startsWith('/reload ')) {
+            var reloadArgs = cmdTrimmed.split(/\s+/).slice(1);
+            var reloadBad = reloadArgs.some(function(a) { return a !== '--console' && a !== '--gui'; });
+            var reloadUi = reloadArgs.filter(function(a) { return a === '--console' || a === '--gui'; }).pop();
+            if (window.WEBVIEW_MODE && !window.AUTO_PASSWORD) {
+                elements.input.value = '';
+                if (reloadBad) {
+                    appendClientLine(RELOAD_USAGE);
+                } else {
+                    sendIpc(reloadUi === '--console' ? 'reload:console' : 'reload');
+                }
+                return;
+            }
+            if (!window.WEBVIEW_MODE && reloadUi && !reloadBad) {
+                elements.input.value = '';
+                appendClientLine(RELOAD_SWITCH_ELSEWHERE);
+                return;
+            }
         }
 
         // Intercept /server in remote WebView mode — this client attaches to/detaches
@@ -8569,7 +8590,7 @@
             { heading: 'System' },
             { l: '/help [topic]', r: 'Show help (topic = command)' },
             { l: '/version', r: 'Show version info' },
-            { l: '/reload', r: 'Hot reload binary' },
+            { l: '/reload [--console|--gui]', r: 'Hot reload binary (switching interface)' },
             { l: '/update [-f]', r: 'Download and install update' },
             { l: '/testmusic', r: 'Test ANSI music playback' },
             { l: '/say &lt;text&gt;', r: 'Speak text aloud' },

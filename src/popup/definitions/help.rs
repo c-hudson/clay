@@ -247,9 +247,18 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         ],
         "reload" => vec![
             "/reload                    Hot reload binary",
+            "/reload --console          ... coming back as the console",
+            "/reload --gui              ... coming back as the GUI",
             "",
             "Saves state, exec()s new binary, restores state.",
             "TCP connections are preserved (TLS needs proxy).",
+            "A reload stays in the interface it was in; when",
+            "that can't run there (no display, no terminal),",
+            "it comes back in the other and says so.",
+            "--console/--gui switch it, if the other can run:",
+            "a GUI needs a display, the console a terminal.",
+            "An attached GUI or console switches itself and",
+            "stays attached to the same server.",
             "Also: Ctrl+R or kill -USR1 $(pgrep clay)",
         ],
         "quit" => vec![

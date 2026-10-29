@@ -146,6 +146,11 @@ cargo build --release --features webview-gui
 
 On first run, Clay creates a settings file at `~/.clay.dat` and displays a colorful splash screen with quick command hints.
 
+With no flag, a binary that has a GUI opens it wherever a window can be shown (a desktop
+session; on Linux, a display server listening), and the console otherwise - in a terminal
+reached over SSH, say. `--gui` and `--console` choose for you; see "With no flag" in the
+GUI chapter.
+
 ## Command-Line Options
 
 | Option | Description |

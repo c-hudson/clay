@@ -926,7 +926,10 @@ impl ClayView {
             self.editor.remember(&trimmed, false);
             self.editor.clear();
             if first.eq_ignore_ascii_case("/reload") {
-                self.relaunch(None, cx);
+                match crate::platform::reload_options(trimmed.split_whitespace().skip(1)) {
+                    (_, Some(_)) => self.client_line(crate::RELOAD_USAGE, cx),
+                    (ui, None) => self.reload_as(ui, cx),
+                }
             } else {
                 let args: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
                 self.server_command(&args, cx);

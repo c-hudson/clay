@@ -22143,3 +22143,80 @@ async fn a_clients_typed_line_keeps_its_spaces_in_both_handlers() {
         assert_eq!(app.tf_engine.get_var("kept_space_probe").map(|v| v.to_string_value()), Some("1".to_string()), "handler_b={handler_b}");
     }
 }
+
+/// `/reload [--console|--gui]` (user request 2026-10-29): the options, and a word it
+/// doesn't know kept for the usage line.
+#[test]
+fn reload_parses_its_interface_options() {
+    use crate::platform::UiKind::{Console, Gui};
+    assert!(matches!(parse_command("/reload"), Command::Reload { ui: None, bad: None }));
+    assert!(matches!(parse_command("/reload --gui"), Command::Reload { ui: Some(Gui), bad: None }));
+    assert!(matches!(parse_command("/reload --console"), Command::Reload { ui: Some(Console), bad: None }));
+    assert!(matches!(parse_command("/reload now"), Command::Reload { bad: Some(ref b), .. } if b == "now"));
+}
+
+/// No client of the console master is its interface: a client's `/reload --gui` is
+/// answered, not acted on, while a plain `/reload` still reloads it.
+#[test]
+fn a_clients_reload_switch_is_refused_by_the_console() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("test"));
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+    for line in ["/reload --gui", "/reload --console", "/reload soon"] {
+        let action = app.handle_ws_client_msg(1, WsMessage::SendCommand { world_index: 0, command: line.into() }, &event_tx);
+        assert!(matches!(action, WsAsyncAction::Done), "{line}");
+        assert_eq!(app.reload_ui, None, "{line}");
+    }
+    let action = app.handle_ws_client_msg(1, WsMessage::SendCommand { world_index: 0, command: "/reload".into() }, &event_tx);
+    assert!(matches!(action, WsAsyncAction::Reload));
+}
+
+/// The switch is judged against the interface this Clay runs: asking for the one it runs is
+/// a plain reload, and a server with neither (-D, the Android app's) says so.
+#[test]
+fn a_reload_switch_is_judged_against_what_this_clay_runs() {
+    use crate::platform::UiKind::{Console, Gui};
+    let app = App::new();
+    assert_eq!(app.reload_switch_problem_from(Some(Console), None), None);
+    assert_eq!(app.reload_switch_problem_from(Some(Console), Some(Console)), None);
+    assert_eq!(app.reload_switch_problem_from(Some(Gui), Some(Gui)), None);
+    assert!(app.reload_switch_problem_from(None, Some(Gui)).is_some_and(|m| m.contains("runs neither")));
+}
+
+/// A GUI reloading into the console gives back the GUI's own web password and switch: the
+/// user's from settings.dat return, and nothing marks the password as a session one any
+/// more - else the console would save the GUI's session password over the user's.
+#[test]
+fn a_gui_reloading_into_the_console_takes_the_users_web_password_back() {
+    let mut user = App::new();
+    user.settings.websocket_password = "mine".to_string();
+    user.settings.http_enabled = false;
+    let tmp = std::env::temp_dir().join(format!("clay_test_drop_override_{}.dat", std::process::id()));
+    persistence::save_settings_to_path(&user, &tmp).expect("save");
+    let settings_dat = std::fs::read_to_string(&tmp).expect("read");
+    let _ = std::fs::remove_file(&tmp);
+
+    let mut gui = App::new();
+    apply_ws_override(&mut gui, Some(WsOverride::Session("r4nd0m".to_string())));
+    assert!(gui.settings.http_enabled);
+    gui.drop_gui_web_override_from(&settings_dat);
+    assert_eq!(gui.settings.websocket_password, "mine");
+    assert!(!gui.settings.http_enabled);
+    assert_eq!(gui.session_ws_password, None);
+
+    // No settings.dat at all: the defaults, never the GUI's password.
+    let mut gui = App::new();
+    apply_ws_override(&mut gui, Some(WsOverride::Session("r4nd0m".to_string())));
+    gui.drop_gui_web_override_from("");
+    assert_eq!(gui.settings.websocket_password, "");
+}
+
+/// app.js answers `/reload --console|--gui` in a browser, and a word `/reload` doesn't know,
+/// in the server's words.
+#[test]
+fn app_js_answers_reload_options_in_the_servers_words() {
+    let js = include_str!("web/app.js");
+    assert!(js.contains(&format!("const RELOAD_USAGE = \"{RELOAD_USAGE}\";")), "app.js RELOAD_USAGE drifted from main.rs");
+    assert!(js.contains(&format!("const RELOAD_SWITCH_ELSEWHERE = \"{RELOAD_SWITCH_ELSEWHERE}\";")), "app.js RELOAD_SWITCH_ELSEWHERE drifted from main.rs");
+}

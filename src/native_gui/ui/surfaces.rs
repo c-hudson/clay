@@ -267,6 +267,34 @@ impl ClayView {
         self.after(rest, cx);
     }
 
+    /// `/reload --console|--gui`: as `relaunch`, in the interface asked for. Running Clay
+    /// itself, the server switches (and says why when it can't); attached, `--console` starts
+    /// this GUI again as a console attached to the same server, in the terminal it was
+    /// started from. `--gui` in a GUI is a plain `/reload`.
+    pub(super) fn reload_as(&mut self, ui: Option<crate::platform::UiKind>, cx: &mut Context<Self>) {
+        use crate::platform::UiKind;
+        if crate::native_gui::runs_clay() {
+            if let Some(kind) = ui {
+                self.stash_input_for_relaunch();
+                let world_index = self.session.core.current;
+                self.send_message(WsMessage::SendCommand { world_index, command: format!("/reload {}", kind.flag()) }, cx);
+                return;
+            }
+        } else if ui == Some(UiKind::Console) {
+            if let Some(why) = crate::platform::ui_switch_problem(UiKind::Console, None) {
+                self.client_line(&why, cx);
+                return;
+            }
+            self.stash_input_for_relaunch();
+            let args = crate::platform::attached_switch_args(std::env::args().skip(1).collect(), UiKind::Console);
+            if let Err(e) = crate::platform::exec_with_args(args) {
+                self.client_line(&format!("% Couldn't start again: {e}"), cx);
+            }
+            return;
+        }
+        self.relaunch(None, cx);
+    }
+
     /// `/reload`: this GUI starts again as it was started (the server's never restarted
     /// from here, app.js). `/server <addr>`: it starts again attached to `addr`.
     pub(super) fn relaunch(&mut self, target: Option<&str>, cx: &mut Context<Self>) {

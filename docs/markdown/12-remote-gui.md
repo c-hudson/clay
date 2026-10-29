@@ -16,17 +16,37 @@ Clay has two graphical clients, and the flags tell them apart:
   (the `native-gui` feature; it needs Rust 1.98 or newer to build and is in the release GUI
   binaries for Linux, Windows and macOS). Alone it runs Clay in this process; `--gui=host[:port]`
   attaches it to a Clay running elsewhere, and `--ssh` tunnels that connection. It is what
-  Windows and macOS start with no flag at all. A build without it (the Termux GUI binary, or a
+  Clay starts with no flag at all, wherever a window can be shown (see below). A build without it (the Termux GUI binary, or a
   `--features webview-gui` build of your own) opens the WebView GUI for `--gui` instead.
 - **`--web-gui`** is the WebView GUI this chapter describes: the web interface in a window. It
   stays available as the fallback, and for anything the native GUI does not do yet.
+
+### With no flag
+
+`clay` with none of `--gui`, `--web-gui` or `--console` opens the GUI wherever it can, and the
+console everywhere else:
+
+- The build must have a GUI. The static Linux console binary (`clay-linux-x86_64-musl`) and
+  the Termux no-GUI binaries always start the console.
+- A terminal reached over SSH gets the console (sshd's `SSH_CONNECTION`, `SSH_CLIENT` or
+  `SSH_TTY` is set), on every system: a window would open on the far machine's screen, or crawl
+  through X forwarding. `--gui` still opens one there if you want it.
+- On Linux (and Termux, where that means termux-x11) a display server must be listening: the one `WAYLAND_DISPLAY` names, or
+  else the one `DISPLAY` names. Clay only connects to it and lets go, which takes a
+  millisecond or two. A `DISPLAY` left behind in a tmux session after its X server ended, or
+  none at all (a text console, a server), gets the console.
+
+Naming an interface always wins: `--gui` and `--web-gui` open the window and `--console` the
+console whatever the check would say. A `/reload` or a crash restart keeps whichever
+interface Clay is in, and `/reload --console` / `/reload --gui` switch it (see the Hot
+Reload chapter).
 
 `--web-gui` runs in one of two modes:
 
 - **Master mode** (`--web-gui`, no address): runs the whole `App` headlessly in this same
   process and opens a WebView window connected to it over a local, loopback-only
-  WebSocket. This is what Windows and macOS start with no flag when the build has no
-  native GUI (see above) — Linux/Termux default to `--console`.
+  WebSocket. This is what Clay starts with no flag when the build has no native GUI (see
+  above) and a window can be shown.
 - **Remote mode** (`--web-gui=host[:port]`): opens a WebView window that connects to an
   *already-running* Clay instance elsewhere, exactly like the remote console in the next
   chapter, just rendered in a native window instead of a terminal. Default port: 9000.

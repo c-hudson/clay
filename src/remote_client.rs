@@ -1934,7 +1934,7 @@ fn relaunch_console(app: &mut App) {
         );
         let failure = if let Ok((exe, _)) = get_executable_path() {
             use std::os::unix::process::CommandExt;
-            let args: Vec<String> = std::env::args().skip(1).collect();
+            let args = relaunch_args(app.reload_ui);
             // The new process may start while the server is still coming back from
             // its own reload: let it wait for the port (run_console_client).
             std::env::set_var(CONNECT_RETRY_ENV, "1");
@@ -1954,13 +1954,14 @@ fn relaunch_console(app: &mut App) {
         );
         app.needs_terminal_clear = true;
         app.needs_output_redraw = true;
+        app.reload_ui = None;
         app.add_output(&failure);
     }
     // Windows can't replace a running process: the console's loop ends, and the new one
     // is started in the same window (relaunch_and_wait).
     #[cfg(windows)]
     {
-        let _ = app;
+        *RELAUNCH_ARGS.lock().unwrap_or_else(|p| p.into_inner()) = Some(relaunch_args(app.reload_ui));
         RELAUNCH_ON_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
@@ -1972,6 +1973,21 @@ fn relaunch_console(app: &mut App) {
 /// Set by `relaunch_console` on Windows: end the console's loop, then start it again.
 #[cfg(windows)]
 static RELAUNCH_ON_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The command line `relaunch_console` chose, for `relaunch_and_wait` (Windows).
+#[cfg(windows)]
+static RELAUNCH_ARGS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// This console's command line for its restart: as it was, or (`/reload --gui`) as a GUI
+/// attached to the same server.
+#[cfg(any(all(unix, not(target_os = "android")), windows))]
+fn relaunch_args(ui: Option<crate::platform::UiKind>) -> Vec<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match ui {
+        Some(kind) => crate::platform::attached_switch_args(args, kind),
+        None => args,
+    }
+}
 
 /// The Windows half of `relaunch_console`, once the TUI is torn down: the new console
 /// runs in this window with the same arguments, and this one waits for it and exits with
@@ -1988,7 +2004,24 @@ fn relaunch_and_wait() {
             return;
         }
     };
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = RELAUNCH_ARGS.lock().unwrap_or_else(|p| p.into_inner()).take()
+        .unwrap_or_else(|| std::env::args().skip(1).collect());
+    // `/reload --gui`: a GUI, which needs no console and isn't waited for in this one.
+    if args.iter().any(|a| a.starts_with("--gui=")) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        match std::process::Command::new(&exe).args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(_) => std::process::exit(0),
+            Err(e) => eprintln!("Clay could not start again ({e}, {}); start it again by hand.", exe.display()),
+        }
+        return;
+    }
     // The new console may start while the server is still coming back from its own
     // reload: let it wait for the port (run_console_client).
     match std::process::Command::new(&exe).args(&args).env(CONNECT_RETRY_ENV, "1").spawn() {
@@ -2958,8 +2991,18 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
                 to_server(app, (if force { "/update -f" } else { "/update" }).to_string());
             }
         }
-        // This console's own binary (the server's /reload is the server's).
-        Command::Reload if !from_server => app.pending_reload = true,
+        // This console's own binary (the server's /reload is the server's); `--gui` starts
+        // it again as a GUI attached to the same server, when one can open here.
+        Command::Reload { ui, bad } if !from_server => {
+            if bad.is_some() {
+                app.add_output(crate::RELOAD_USAGE);
+            } else if let Some(why) = ui.and_then(|kind| crate::platform::ui_switch_problem(kind, None)) {
+                app.add_output(&why);
+            } else {
+                app.reload_ui = ui;
+                app.pending_reload = true;
+            }
+        }
         Command::Connect { .. } if !from_server => {
             let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: app.current_world_index });
         }
@@ -3376,6 +3419,7 @@ pub(crate) fn dispatch_remote_action(
             app.needs_output_redraw = true;
         }
         "reload" => {
+            app.reload_ui = None;
             app.pending_reload = true;
         }
         "quit" => {

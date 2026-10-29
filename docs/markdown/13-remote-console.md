@@ -179,6 +179,10 @@ sent. Over `--ssh` it opens a new channel on the same SSH login. If the login is
 refused (the password changed) or the server's certificate changed, it stops trying
 and says so - start the console again to log in or to check the certificate.
 
+`/reload` typed in this console restarts this console (the main instance's reload is its
+own). `/reload --gui` restarts it as a GUI attached to the same server, where a window can
+open (a display, and a build with a GUI); otherwise it says why and stays.
+
 ## Popups
 
 All popup dialogs work in remote console mode:

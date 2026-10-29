@@ -156,8 +156,16 @@ See the **Actions** chapter for details.
 Hot reload the client with a new binary while preserving connections.
 
 ```
-/reload
+/reload              (stays in the console or the GUI it is in)
+/reload --console    (comes back as the console)
+/reload --gui        (comes back as the GUI)
 ```
+
+`--console` and `--gui` switch the interface at the reload, when the other one can run
+there: the GUI needs a display (and a build with a GUI; on Windows and macOS, not a session
+reached over SSH), the console a terminal in the foreground. Otherwise Clay says why and doesn't reload. Typed in a GUI or console attached
+to another Clay, they restart that program as the other kind, still attached to the same
+server; in a browser or the phone app, which have neither, they are answered with a line.
 
 Also triggered by:
 - `Ctrl+R` keyboard shortcut

@@ -103,7 +103,7 @@ cargo build --release --no-default-features --features rustls-backend,ssh-transp
 
 | Option | Description |
 |--------|-------------|
-| *(none)* | Console on Linux/Termux, GUI on Windows/macOS |
+| *(none)* | The GUI where a window can open (a GUI build, a desktop session, not over SSH), else the console |
 | `--console[=host[:port]]` | Console mode, or attach to a remote server (port 9000) |
 | `--gui[=host[:port]]` | Native GUI (a build without it opens the WebView one), or attach to a remote server (port 9000) |
 | `--web-gui[=host[:port]]` | WebView GUI, or attach to a remote server (port 9000) |
@@ -121,7 +121,7 @@ cargo build --release --no-default-features --features rustls-backend,ssh-transp
 
 Most-needed:
 ```bash
-./clay                              # console (or GUI on Windows/macOS)
+./clay                              # GUI at a desktop, console in a terminal over SSH or without a display
 ./clay --gui=hostname:port          # attach a GUI to a running Clay server
 ./clay -D                           # headless daemon
 ```

@@ -2844,8 +2844,9 @@ pub enum Command {
     Reach { refresh: bool, lookup: bool },
     /// /quit - exit application
     Quit,
-    /// /reload - hot reload binary
-    Reload,
+    /// /reload [--console|--gui] - hot reload binary, in the console or the GUI (`None`:
+    /// the one it runs). `bad`: an option it doesn't know, for the usage line.
+    Reload { ui: Option<platform::UiKind>, bad: Option<String> },
     /// /update - check for and install updates from GitHub
     Update { force: bool },
     /// /setup - show global settings popup
@@ -3074,7 +3075,10 @@ pub fn parse_command(input: &str) -> Command {
             lookup: args.iter().any(|a| *a == "--lookup" || *a == "-l"),
         },
         "/quit" => Command::Quit,
-        "/reload" => Command::Reload,
+        "/reload" => {
+            let (ui, bad) = platform::reload_options(args.iter().copied());
+            Command::Reload { ui, bad }
+        }
         "/update" => {
             let force = args.first().map(|a| *a == "-f" || *a == "--force").unwrap_or(false);
             Command::Update { force }
@@ -4035,6 +4039,14 @@ pub const INPUT_LINE_PREFIX: &str = "\u{00BB} "; // "» "
 /// allocated from a counter starting at 1, and 0 is the embedded GUI, so `u64::MAX` can never
 /// collide with a real client.
 pub const CONSOLE_DISPLAY_ID: u64 = u64::MAX;
+
+/// `/reload`'s usage line, for an option it doesn't know.
+pub(crate) const RELOAD_USAGE: &str = "Usage: /reload [--console|--gui]";
+
+/// `/reload --console|--gui` from a client that isn't the main Clay's own window (app.js
+/// says the same for a browser or the phone app before sending).
+pub(crate) const RELOAD_SWITCH_ELSEWHERE: &str =
+    "/reload --console and --gui switch the Clay they're typed in, and this window has none to switch. /reload alone reloads the server.";
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
 const MAX_LINE_LENGTH: usize = 10_000;
@@ -6097,6 +6109,10 @@ pub struct App {
     /// `write_settings_dat` never saves it while it is still the current password, so it
     /// can't overwrite the one the user set. `None` for the TUI, `-D` and multiuser.
     pub session_ws_password: Option<String>,
+    /// The interface the next reload starts in (`/reload --console|--gui`), `None` for the
+    /// one this Clay runs (`platform::restart_args`). Kept here because a reload can be put
+    /// off (MCCP2) and runs later from whichever loop holds the App.
+    pub reload_ui: Option<platform::UiKind>,
     /// The reload state carried the TF engine's state (`tf::snapshot`) and it was
     /// restored: the macros, bindings and variables startup would build are already here,
     /// so startup actions (and the TF rc) must not run again.
@@ -6393,6 +6409,7 @@ impl App {
             web_restart_needed: false,
             is_reload: false, // Set to true in run_app if started from hot reload
             session_ws_password: None,
+            reload_ui: None,
             tf_state_restored: false, // Set by the reload-state loader
             needs_output_redraw: true, // Start with true to ensure initial render
             needs_terminal_clear: false, // Set to true by Ctrl+L in --console mode
@@ -13396,6 +13413,57 @@ impl App {
         }
     }
 
+    /// A GUI reloading into the console (`platform::exec_reload`): the web password and
+    /// switch go back to the ones settings.dat holds, in place of the GUI's own
+    /// (`apply_ws_override`), so the console neither serves with nor saves the GUI's.
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn drop_gui_web_override(&mut self) {
+        let saved = std::fs::read_to_string(get_settings_path()).unwrap_or_default();
+        self.drop_gui_web_override_from(&saved);
+    }
+
+    /// `drop_gui_web_override` with settings.dat's text (none: the defaults - never the
+    /// GUI's password).
+    #[cfg(not(target_os = "android"))]
+    fn drop_gui_web_override_from(&mut self, settings_dat: &str) {
+        let mut saved = App::new();
+        persistence::load_settings_from_str(&mut saved, settings_dat);
+        self.settings.websocket_password = saved.settings.websocket_password;
+        self.settings.http_enabled = saved.settings.http_enabled;
+        self.session_ws_password = None;
+    }
+
+    /// Why this main Clay can't reload into `ui` (`/reload --console|--gui`), or `None` -
+    /// also when `ui` is the interface it already runs (a plain reload).
+    pub(crate) fn reload_switch_problem(&self, ui: Option<platform::UiKind>) -> Option<String> {
+        self.reload_switch_problem_from(platform::running_ui(), ui)
+    }
+
+    fn reload_switch_problem_from(&self, running: Option<platform::UiKind>, ui: Option<platform::UiKind>) -> Option<String> {
+        let kind = ui?;
+        match running {
+            None => Some("/reload --console and --gui need a console or GUI to switch, and this Clay runs neither.".to_string()),
+            Some(running) if running == kind => None,
+            Some(_) => {
+                // The GUI's server binds the settings' port: free if this Clay holds it (the
+                // reload lets it go), else it has to be bindable now.
+                let port = self.settings.http_port;
+                platform::ui_switch_problem(kind, Some((port, self.web_listener_port() == Some(port))))
+            }
+        }
+    }
+
+    /// Whether `/reload --console|--gui` may be taken from this client, and why not: only
+    /// the main Clay's own GUI window can switch the main Clay (a browser or a phone has no
+    /// interface to switch, and an attached GUI or console restarts itself instead).
+    pub(crate) fn reload_switch_refusal(&self, client_id: u64) -> Option<&'static str> {
+        if self.own_gui_client(client_id) {
+            None
+        } else {
+            Some(RELOAD_SWITCH_ELSEWHERE)
+        }
+    }
+
     /// `client_id` is the window of the GUI this Clay runs for (the WebView or native GUI
     /// master): its speech is spoken on this machine, by this process, since the WebView's
     /// own can't be counted on. Never the Android app's bundled server's client: that
@@ -17431,7 +17499,20 @@ impl App {
                 // forwarded to the server again: a silent ping-pong.)
                 self.start_server_update(force, Some((client_id, world_index)), event_tx);
             }
-            Command::Reload => {
+            Command::Reload { ui, bad } => {
+                // A client's /reload reloads the console it is attached to; `--console` and
+                // `--gui` switch only the Clay they're typed in, and no client of the console
+                // is that (an attached GUI or console restarts itself instead).
+                let refusal = if bad.is_some() {
+                    Some(RELOAD_USAGE)
+                } else {
+                    ui.and_then(|_| self.reload_switch_refusal(client_id))
+                };
+                if let Some(why) = refusal {
+                    self.ws_tell(client_id, world_index, why);
+                    return WsAsyncAction::Done;
+                }
+                self.reload_ui = None;
                 return WsAsyncAction::Reload;
             }
             Command::Help => {
@@ -22423,9 +22504,9 @@ async fn main() -> io::Result<()> {
         println!("    -n                   Accepted; Clay never connects at startup by itself");
         println!("    (TinyFugue's -v is Clay's version option; Clay's console is always visual)");
         println!();
-        println!("Defaults:");
-        println!("    Windows/macOS: --gui");
-        println!("    Linux/Termux:  --console");
+        println!("Without --gui, --web-gui or --console:");
+        println!("    The GUI, when this build has one and a window can open here (a desktop");
+        println!("    session, not a terminal reached over SSH); the console otherwise.");
         return Ok(());
     }
 
@@ -22453,12 +22534,53 @@ async fn main() -> io::Result<()> {
         set_custom_config_path(PathBuf::from(path));
     }
 
+    // Windows: a console a GUI's reload started in a window of its own takes that window up.
+    #[cfg(windows)]
+    platform::take_new_console();
+
+    // A restart (`--reload`, `--crash`) of the main Clay comes back in the interface it was
+    // in: the one the Clay it replaces named (platform::restart_args), or - from a Clay older
+    // than that, which named none - that one's default, the GUI on macOS and Windows and the
+    // console elsewhere. When that can't run here and the other can, the other
+    // (platform::restart_ui), said in the output. A server mode or an attached Clay restarts
+    // as it was.
+    let restarting_master = (is_reload_arg || is_crash_arg)
+        && !daemon_mode && !multiuser_mode && !local_server_mode
+        && ![&console_arg, &gui_arg, &web_gui_arg].iter().any(|a| matches!(a, Some(Some(_))));
+    if restarting_master {
+        use platform::UiKind;
+        let named = if console_arg.is_some() {
+            Some(UiKind::Console)
+        } else if gui_arg.is_some() || web_gui_arg.is_some() {
+            Some(UiKind::Gui)
+        } else {
+            None
+        };
+        let old_default = if cfg!(any(target_os = "macos", windows)) && platform::GUI_BUILT { UiKind::Gui } else { UiKind::Console };
+        let wanted = named.unwrap_or(old_default);
+        let gui_works = platform::GUI_BUILT && platform::display_can_open();
+        let chosen = platform::restart_ui(wanted, gui_works, platform::console_can_run());
+        if named != Some(chosen) {
+            console_arg = None;
+            gui_arg = None;
+            web_gui_arg = None;
+            match chosen {
+                UiKind::Console => console_arg = Some(None),
+                UiKind::Gui => gui_arg = Some(None),
+            }
+        }
+        if chosen != wanted {
+            platform::note_restart_fallback(chosen);
+        }
+    }
+
     // `--gui` is the native GUI (src/native_gui) when it is built in: alone it runs Clay
-    // in this process, with a host it attaches to that Clay. It is also what Windows and
-    // macOS start with no flag at all. A build without the native GUI opens the WebView
-    // one for `--gui` instead (Termux, a plain `--features webview-gui` build), so the
-    // platform default and old command lines keep working; `--web-gui` always means the
-    // WebView one.
+    // in this process, with a host it attaches to that Clay. It is also what a start that
+    // names no interface opens wherever a window can be shown (platform::gui_can_open:
+    // not over SSH, and on Linux a display server listening), the console otherwise. A
+    // build without the native GUI opens the WebView one for `--gui` instead (Termux, a
+    // plain `--features webview-gui` build), so the default and old command lines keep
+    // working; `--web-gui` always means the WebView one.
     if gui_arg.is_some() && (console_arg.is_some() || web_gui_arg.is_some()) {
         eprintln!("Error: --gui cannot be combined with --console or --web-gui.");
         std::process::exit(1);
@@ -22472,11 +22594,13 @@ async fn main() -> io::Result<()> {
         let other_mode = console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode
             || local_server_mode || ssh_proxy_mode || dump_mode || grep_arg.is_some() || grep_archive_mode
             || tls_proxy_config.is_some();
-        let platform_default = (cfg!(target_os = "macos") || cfg!(windows)) && !other_mode && !ssh_mode;
         let target = gui_arg.clone()
             .or_else(|| native_gui_verify.map(|_| None))
-            .or_else(|| platform_default.then_some(None));
+            .or_else(|| (!other_mode && !ssh_mode && platform::gui_can_open()).then_some(None));
         if let Some(target) = target {
+            if target.is_none() {
+                platform::note_running_ui("--gui");
+            }
             return native_gui::run(target, native_gui_snapshot, native_gui_verify, ssh_mode);
         }
     }
@@ -22760,14 +22884,18 @@ async fn main() -> io::Result<()> {
     } else if let Some(addr_opt) = console_arg {
         (false, addr_opt)
     } else {
-        // Default: Mac/Windows -> GUI (if feature available), others -> Console
-        let default_gui = (cfg!(target_os = "macos") || cfg!(windows))
-            && cfg!(feature = "webview-gui");
+        // No interface named: the GUI where a window can be shown, else the console. A
+        // build with the native GUI chose it above, so here it's the WebView one.
+        let default_gui = cfg!(feature = "webview-gui") && platform::gui_can_open();
         (default_gui, None)
     };
 
     // Exit immediately if the WebView GUI was asked for but the webview-gui feature is not compiled in
     let use_gui = use_gui && cfg!(feature = "webview-gui");
+    // The main Clay's interface, for its restarts (platform::restart_args).
+    if remote_addr.is_none() {
+        platform::note_running_ui(if use_gui { "--web-gui" } else { "--console" });
+    }
     if has_gui_flag && !use_gui {
         #[cfg(not(feature = "webview-gui"))]
         {
@@ -23391,6 +23519,9 @@ pub async fn run_app_headless(
             selfupdate::RELOADED.to_string()
         };
         app.add_output(&reload_msg);
+        if let Some(note) = platform::restart_fallback_note() {
+            app.add_output(note);
+        }
     }
 
     // In GUI master mode, enable the web interface with the GUI's password: the one the
@@ -24770,6 +24901,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             selfupdate::RELOADED.to_string()
         };
         app.add_output(&reload_msg);
+        if let Some(note) = platform::restart_fallback_note() {
+            app.add_output(note);
+        }
     }
 
     debug_log(is_debug_enabled(), "STARTUP: Keepalives sent, starting servers...");

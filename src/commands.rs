@@ -1347,16 +1347,30 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             let world_index = app.current_world_index;
             execute_log_command(app, &world, log_input, &action, world_index, false);
         }
-        Command::Reload => {
+        Command::Reload { ui, bad } => {
+            if bad.is_some() {
+                app.add_output(crate::RELOAD_USAGE);
+                return false;
+            }
             // Hot reload is not available on Android/Termux
             #[cfg(target_os = "android")]
             {
+                let _ = ui;
                 app.add_output("Hot reload is not available on this platform.");
                 app.add_output("Restart the app manually to apply changes.");
             }
 
             #[cfg(not(target_os = "android"))]
             {
+                // `/reload --console|--gui`: whether the other interface can run here is
+                // asked before anything is said or saved (a successor that can't start
+                // loses every connection).
+                if let Some(problem) = app.reload_switch_problem(ui) {
+                    app.add_output(&problem);
+                    return false;
+                }
+                app.reload_ui = ui;
+
                 // First check if we can find the executable (handling " (deleted)" suffix)
                 let exe_path = match get_executable_path() {
                     Ok((p, _)) => p,
@@ -1431,6 +1445,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         app.needs_terminal_clear = true;
                         app.add_output(&format!("Hot reload failed: {}", e));
                         app.add_output(&format!("Executable path: {}", exe_path.display()));
+                        app.reload_ui = None;
                     }
                 }
             }

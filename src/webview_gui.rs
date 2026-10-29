@@ -56,8 +56,9 @@ enum WvEvent {
     Quit,
     /// Show an update status message in the WebView
     UpdateStatus(String),
-    /// Hot reload: exec a new binary (remote GUI only)
-    Reload,
+    /// Hot reload: exec a new binary (remote GUI only); `to_console` (`/reload --console`)
+    /// starts it as a console attached to the same server instead.
+    Reload { to_console: bool },
     /// /server: relaunch attached to a different server, or (addr=None) detach and become
     /// an independent master (remote GUI only — master GUI handles /server server-side)
     RemoteRelaunch { addr: Option<String> },
@@ -1182,7 +1183,7 @@ fn self_update_thread(force: bool, proxy: EventLoopProxy<WvEvent>) {
     if crate::selfupdate::exe_replaced() {
         say(crate::selfupdate::replaced_on_disk(LABEL, &attached));
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let _ = proxy.send_event(WvEvent::Reload);
+        let _ = proxy.send_event(WvEvent::Reload { to_console: false });
         return;
     }
     #[cfg(target_os = "android")]
@@ -1211,7 +1212,7 @@ fn self_update_thread(force: bool, proxy: EventLoopProxy<WvEvent>) {
             say(line);
         }
         if outcome.is_ok() {
-            let _ = proxy.send_event(WvEvent::Reload);
+            let _ = proxy.send_event(WvEvent::Reload { to_console: false });
         }
     }
 }
@@ -1297,6 +1298,11 @@ fn dispatch_ipc_message(
             let proxy = proxy.clone();
             std::thread::spawn(move || self_update_thread(force, proxy));
         }
+    } else if body == "reload:console" {
+        // `/reload --console` in an attached WebView (app.js; the master's goes to its server).
+        if !is_master {
+            let _ = proxy.send_event(WvEvent::Reload { to_console: true });
+        }
     } else if body == "reload" {
         if is_master {
             crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1307,7 +1313,7 @@ fn dispatch_ipc_message(
                 });
             }
         } else {
-            let _ = proxy.send_event(WvEvent::Reload);
+            let _ = proxy.send_event(WvEvent::Reload { to_console: false });
         }
     } else if body == "connect-close" {
         // /server --close: only meaningful for a remote GUI (detach and become a master).
@@ -1677,16 +1683,38 @@ fn create_webview_window(
                     let _ = wv.evaluate_script(&script);
                 }
             }
-            Event::UserEvent(WvEvent::Reload) => {
+            Event::UserEvent(WvEvent::Reload { to_console }) => {
                 // Remote GUI reload: restart the binary (no state to save — state lives on server)
                 // Show error in first available webview if exec fails
                 let _first_wv = webviews.values().next();
+                let show = |text: &str| if let Some(wv) = _first_wv {
+                    let _ = wv.evaluate_script(&format!(
+                        "window.showUpdateStatus({})",
+                        serde_json::to_string(text).unwrap_or_default()
+                    ));
+                };
+                // `/reload --console`: a console attached to the same server, only where the
+                // console can run (platform::ui_switch_problem).
+                if let Some(why) = to_console
+                    .then(|| crate::platform::ui_switch_problem(crate::platform::UiKind::Console, None))
+                    .flatten()
+                {
+                    show(&why);
+                    return;
+                }
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                #[cfg_attr(not(any(all(unix, not(target_os = "android")), windows)), allow(unused_variables))]
+                let args = if to_console {
+                    crate::platform::attached_switch_args(args, crate::platform::UiKind::Console)
+                } else {
+                    args
+                };
                 #[cfg(all(unix, not(target_os = "android")))]
                 {
                     if let Ok((exe_path, _)) = crate::get_executable_path() {
-                        let args: Vec<String> = std::env::args().collect();
+                        let argv0 = std::env::args().next().unwrap_or_default();
                         let c_exe = std::ffi::CString::new(exe_path.to_string_lossy().as_bytes()).unwrap();
-                        let c_args: Vec<std::ffi::CString> = args.iter()
+                        let c_args: Vec<std::ffi::CString> = std::iter::once(&argv0).chain(args.iter())
                             .map(|a| std::ffi::CString::new(a.as_bytes()).unwrap())
                             .collect();
                         let c_arg_ptrs: Vec<*const libc::c_char> = c_args.iter()
@@ -1696,45 +1724,29 @@ fn create_webview_window(
                         crate::crashlog::replacing("reload");
                         unsafe { libc::execv(c_exe.as_ptr(), c_arg_ptrs.as_ptr()); }
                         // If exec fails, show error in WebView
-                        if let Some(wv) = _first_wv {
-                            let _ = wv.evaluate_script(
-                                "window.showUpdateStatus('Reload failed: exec error')"
-                            );
-                        }
-                    } else if let Some(wv) = _first_wv {
-                        let _ = wv.evaluate_script(
-                            "window.showUpdateStatus('Reload failed: cannot find binary')"
-                        );
+                        show("Reload failed: exec error");
+                    } else {
+                        show("Reload failed: cannot find binary");
                     }
                 }
                 #[cfg(windows)]
                 {
                     if let Ok((exe_path, _)) = crate::get_executable_path() {
-                        let args: Vec<String> = std::env::args().collect();
-                        match std::process::Command::new(&exe_path).args(&args[1..]).spawn() {
-                            Ok(_) => crate::crashlog::exit_process(0, "reload"),
-                            Err(_) => {
-                                if let Some(wv) = _first_wv {
-                                    let _ = wv.evaluate_script(
-                                        "window.showUpdateStatus('Reload failed: spawn error')"
-                                    );
-                                }
-                            }
+                        let started = if to_console {
+                            crate::platform::spawn_console_from_gui(&exe_path, &args).map(|_| ())
+                        } else {
+                            std::process::Command::new(&exe_path).args(&args).spawn().map(|_| ())
+                        };
+                        match started {
+                            Ok(()) => crate::crashlog::exit_process(0, "reload"),
+                            Err(_) => show("Reload failed: spawn error"),
                         }
-                    } else if let Some(wv) = _first_wv {
-                        let _ = wv.evaluate_script(
-                            "window.showUpdateStatus('Reload failed: cannot find binary')"
-                        );
+                    } else {
+                        show("Reload failed: cannot find binary");
                     }
                 }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    if let Some(wv) = _first_wv {
-                        let _ = wv.evaluate_script(
-                            "window.showUpdateStatus('Reload not supported on this platform')"
-                        );
-                    }
-                }
+                #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
+                show("Reload not supported on this platform");
             }
             Event::UserEvent(WvEvent::RemoteRelaunch { ref addr }) => {
                 // Remote GUI /server: relaunch attached elsewhere, or (addr=None) detach

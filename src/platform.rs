@@ -281,6 +281,408 @@ pub(crate) static CRASH_COUNT: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "linux")]
 pub(crate) static IS_GUI_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Console or GUI: what a restart keeps, and what `/reload --console|--gui` switches to.
+/// Which GUI is the command line's business: `--gui` is the native one when it is built in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiKind {
+    Console,
+    Gui,
+}
+
+impl UiKind {
+    /// The command-line flag that starts it.
+    #[cfg(any(not(target_os = "android"), feature = "webview-gui"))]
+    pub(crate) fn flag(self) -> &'static str {
+        match self {
+            UiKind::Console => "--console",
+            UiKind::Gui => "--gui",
+        }
+    }
+
+    /// The kind a command-line flag starts (`--web-gui` is a GUI).
+    pub(crate) fn of_flag(flag: &str) -> UiKind {
+        if flag == "--console" { UiKind::Console } else { UiKind::Gui }
+    }
+
+    /// Its name in a sentence.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            UiKind::Console => "the console",
+            UiKind::Gui => "the GUI",
+        }
+    }
+}
+
+// The interface this Clay runs (`--console`, `--gui` or `--web-gui`) when it is the main Clay,
+// the one holding the worlds - however it was chosen: named, by default, or by a restart's
+// fallback. A restart reuses the command line and names this in it, so the successor stays as
+// it is; a command line naming none would choose again, and a console reloaded at a desktop
+// came back as the GUI. Unset in a Clay attached to another.
+static RUNNING_UI: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Record the interface this main Clay runs (see `RUNNING_UI`).
+pub(crate) fn note_running_ui(flag: &'static str) {
+    let _ = RUNNING_UI.set(flag);
+}
+
+/// Windows: set for a console started in a console window of its own (a GUI's reload into the
+/// console), whose standard handles were given as none - `take_new_console` takes up the
+/// window's instead.
+#[cfg(windows)]
+pub(crate) const NEW_CONSOLE_ENV: &str = "CLAY_NEW_CONSOLE";
+
+/// Windows: start a console Clay from a GUI (a reload or `/reload --console`). The GUI let its
+/// console go at startup, so its standard handles are stale: the console gets a window of its
+/// own and none, and takes up the window's (`take_new_console`). Returns its pid.
+#[cfg(windows)]
+pub(crate) fn spawn_console_from_gui(exe: &std::path::Path, args: &[String]) -> io::Result<u32> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let child = std::process::Command::new(exe)
+        .args(args)
+        .env(NEW_CONSOLE_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()?;
+    debug_log(true, &format!("RELAUNCH: started pid {} in a console of its own", child.id()));
+    Ok(child.id())
+}
+
+/// Windows: a console started by a GUI's reload (`NEW_CONSOLE_ENV`) makes its window's input
+/// and screen its standard handles; until then its writes went nowhere.
+#[cfg(windows)]
+pub(crate) fn take_new_console() {
+    if std::env::var_os(NEW_CONSOLE_ENV).is_none() {
+        return;
+    }
+    std::env::remove_var(NEW_CONSOLE_ENV);
+    extern "system" {
+        fn CreateFileW(name: *const u16, access: u32, share: u32, security: *const std::ffi::c_void,
+            disposition: u32, flags: u32, template: isize) -> isize;
+        fn SetStdHandle(which: u32, handle: isize) -> i32;
+    }
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    let open = |name: &str| {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe {
+            CreateFileW(wide.as_ptr(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(), OPEN_EXISTING, 0, 0)
+        };
+        (handle != INVALID_HANDLE_VALUE).then_some(handle)
+    };
+    if let Some(input) = open("CONIN$") {
+        unsafe { SetStdHandle(STD_INPUT_HANDLE, input) };
+    }
+    if let Some(output) = open("CONOUT$") {
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, output);
+            SetStdHandle(STD_ERROR_HANDLE, output);
+        }
+    }
+}
+
+/// The interface this main Clay runs, `None` in an attached one.
+pub(crate) fn running_ui() -> Option<UiKind> {
+    RUNNING_UI.get().map(|flag| UiKind::of_flag(flag))
+}
+
+/// `args` for the Clay that takes this one's place: the interface named in them is the one
+/// `switch` asks for (`/reload --console|--gui`), else the one this Clay runs. An attached
+/// Clay's `--console=host` and the like are left as they are.
+#[cfg(not(target_os = "android"))]
+pub(crate) fn restart_args(args: Vec<String>, switch: Option<UiKind>) -> Vec<String> {
+    with_ui(args, successor_ui(RUNNING_UI.get().copied(), switch))
+}
+
+/// The interface the Clay that takes this one's place runs (see `restart_args`), `None` when
+/// this Clay is attached to another or is a server without one (`-D`).
+#[cfg(not(target_os = "android"))]
+pub(crate) fn successor_kind(switch: Option<UiKind>) -> Option<UiKind> {
+    successor_ui(RUNNING_UI.get().copied(), switch).map(UiKind::of_flag)
+}
+
+/// The flag the successor runs with: the switch's, unless this Clay already runs that kind
+/// (`/reload --gui` in the WebView GUI stays the WebView GUI).
+#[cfg(not(target_os = "android"))]
+fn successor_ui(running: Option<&'static str>, switch: Option<UiKind>) -> Option<&'static str> {
+    match switch {
+        Some(kind) if running.map(UiKind::of_flag) != Some(kind) => Some(kind.flag()),
+        _ => running,
+    }
+}
+
+/// A GUI reloading into the console: the GUI ran its server with a password and switch of
+/// its own (`apply_ws_override`), which the console would otherwise inherit through the
+/// reload state and save into settings.dat. The user's own come back instead.
+#[cfg(not(target_os = "android"))]
+fn leaving_gui_for_console(app: &mut App) {
+    if running_ui() == Some(UiKind::Gui) && successor_kind(app.reload_ui) == Some(UiKind::Console) {
+        app.drop_gui_web_override();
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn with_ui(args: Vec<String>, flag: Option<&str>) -> Vec<String> {
+    let Some(flag) = flag else { return args };
+    let mut args: Vec<String> = args.into_iter()
+        .filter(|a| !matches!(a.as_str(), "--console" | "--gui" | "--web-gui"))
+        .collect();
+    args.push(flag.to_string());
+    args
+}
+
+/// The interface a restart comes back in: the one it was in when that can work here, else the
+/// other when that can, else the one it was in (which then fails as it would have).
+pub(crate) fn restart_ui(wanted: UiKind, gui_works: bool, console_works: bool) -> UiKind {
+    match wanted {
+        UiKind::Gui if !gui_works && console_works => UiKind::Console,
+        UiKind::Console if !console_works && gui_works => UiKind::Gui,
+        _ => wanted,
+    }
+}
+
+/// `/reload`'s options, for every interface that reads them itself: the interface asked for
+/// (`--console`, `--gui`; the last one wins) and the first word it doesn't know.
+pub(crate) fn reload_options<'a>(args: impl IntoIterator<Item = &'a str>) -> (Option<UiKind>, Option<String>) {
+    let (mut ui, mut bad) = (None, None);
+    for arg in args {
+        match arg {
+            "--console" => ui = Some(UiKind::Console),
+            "--gui" => ui = Some(UiKind::Gui),
+            other => bad = bad.or_else(|| Some(other.to_string())),
+        }
+    }
+    (ui, bad)
+}
+
+/// An attached Clay's command line with its interface switched to `kind` (`/reload
+/// --console|--gui` in a GUI or console attached to another Clay): `--console=host` becomes
+/// `--gui=host` or the other way round; the address, `--ssh` and the rest stay as they are.
+#[cfg(any(not(target_os = "android"), feature = "webview-gui"))]
+pub(crate) fn attached_switch_args(args: Vec<String>, kind: UiKind) -> Vec<String> {
+    args.into_iter().map(|arg| {
+        for flag in ["--console", "--gui", "--web-gui"] {
+            if let Some(addr) = arg.strip_prefix(flag).and_then(|rest| rest.strip_prefix('=')) {
+                if UiKind::of_flag(flag) != kind {
+                    return format!("{}={addr}", kind.flag());
+                }
+            }
+        }
+        arg
+    }).collect()
+}
+
+// Set when a restart couldn't come back in the interface it was in (`restart_ui`): what the
+// reload message adds.
+static RESTART_NOTE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// A restart came back in `chosen` because the other couldn't run here.
+pub(crate) fn note_restart_fallback(chosen: UiKind) {
+    let _ = RESTART_NOTE.set(match chosen {
+        UiKind::Console => "The GUI can't open here (no display or desktop), so Clay came back in the console.",
+        UiKind::Gui => "There's no terminal here for the console, so Clay came back in the GUI.",
+    });
+}
+
+/// What `note_restart_fallback` recorded, if anything.
+pub(crate) fn restart_fallback_note() -> Option<&'static str> {
+    RESTART_NOTE.get().copied()
+}
+
+/// Whether this build has a GUI at all.
+pub(crate) const GUI_BUILT: bool = cfg!(any(feature = "native-gui", feature = "webview-gui"));
+
+/// A window can be shown here: on Linux and Termux the display server answers - a display
+/// forwarded over SSH counts, as `--gui` would use it - and on Windows and macOS this isn't a
+/// session reached over SSH, which has no desktop at all.
+pub(crate) fn display_can_open() -> bool {
+    display_reachable(|name: &str| std::env::var_os(name).filter(|v| !v.is_empty()))
+}
+
+/// The console can run here: this process has a terminal, and is in its foreground (a GUI
+/// started from a desktop has none, and one started with `&` would be stopped the moment the
+/// console took the terminal over).
+#[cfg(unix)]
+pub(crate) fn console_can_run() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+        && unsafe { libc::tcgetpgrp(0) == libc::getpgrp() }
+}
+
+/// Windows: always - a GUI's console successor is started in a console window of its own.
+#[cfg(windows)]
+pub(crate) fn console_can_run() -> bool {
+    true
+}
+
+/// Why `/reload --console|--gui` can't take this Clay to `kind`, or `None`. Asked before
+/// anything is saved or sent: a successor that can't start would lose every connection.
+/// `web_port`: for the main Clay switching to a GUI, the port that GUI's server binds, and
+/// whether this Clay holds it now (the restart frees it then).
+pub(crate) fn ui_switch_problem(kind: UiKind, web_port: Option<(u16, bool)>) -> Option<String> {
+    let why = match kind {
+        UiKind::Gui if !GUI_BUILT => "this build of Clay has no GUI".to_string(),
+        UiKind::Gui if !display_can_open() => if cfg!(any(target_os = "linux", target_os = "android")) {
+            "no display answers here (DISPLAY or WAYLAND_DISPLAY)".to_string()
+        } else {
+            "a session reached over SSH has no desktop to open it on".to_string()
+        },
+        UiKind::Gui => match web_port {
+            Some((port, false)) if ["127.0.0.1", "0.0.0.0"].iter()
+                .any(|host| std::net::TcpListener::bind((*host, port)).is_err()) =>
+                format!("port {port}, which the GUI's server needs, is in use"),
+            _ => return None,
+        },
+        UiKind::Console if !console_can_run() => "this GUI has no terminal to run the console in (it wasn't started from one, in the foreground)".to_string(),
+        UiKind::Console => return None,
+    };
+    Some(format!("Can't reload into {}: {why}.", kind.name()))
+}
+
+/// Whether a start that names no interface opens the GUI (when the build has one): a window
+/// can be shown here, and the user isn't at a terminal reached over SSH - a window would
+/// open on the far machine's screen, or crawl through X forwarding. On Linux and Termux the
+/// display server is asked whether it's listening (a connect and no more: a millisecond or
+/// two), since a DISPLAY outlives its X server inside tmux and GPUI ends the program when
+/// it can't connect. Never asked when `--gui`, `--web-gui` or `--console` was given.
+pub(crate) fn gui_can_open() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+        !over_ssh(var) && display_reachable(var)
+    })
+}
+
+/// sshd sets these (OpenSSH everywhere, Windows' included); a desktop session never does.
+fn over_ssh(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"].into_iter().any(|name| var(name).is_some())
+}
+
+/// Windows and macOS: a session started without SSH has the desktop, and one reached over
+/// SSH has none to show a window on (Windows runs it in a service session, where the GUI
+/// can't open its window; macOS keeps it from the window server).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn display_reachable(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    !over_ssh(var)
+}
+
+/// The display server the GUI would use is listening. As GPUI chooses (and doesn't fall
+/// back): Wayland when WAYLAND_DISPLAY names one, else X11 when DISPLAY does.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn display_reachable(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    use std::os::unix::net::UnixStream;
+    if let Some(wayland) = var("WAYLAND_DISPLAY") {
+        return wayland_socket(&wayland, var("XDG_RUNTIME_DIR").as_deref())
+            .is_some_and(|path| UnixStream::connect(path).is_ok());
+    }
+    let Some(display) = var("DISPLAY") else { return false };
+    x11_addresses(&display.to_string_lossy()).iter().any(|address| match address {
+        X11Address::Socket(number) => x11_socket_paths(*number, &var).iter().any(|path| {
+            x11_abstract_connect(path) || UnixStream::connect(path).is_ok()
+        }),
+        X11Address::Path(path) => UnixStream::connect(path).is_ok(),
+        X11Address::Tcp(host, port) => {
+            use std::net::ToSocketAddrs;
+            (host.as_str(), *port).to_socket_addrs().map(|mut addrs| addrs.any(|addr| {
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250)).is_ok()
+            })).unwrap_or(false)
+        }
+    })
+}
+
+/// WAYLAND_DISPLAY is a socket name in XDG_RUNTIME_DIR, or a path.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wayland_socket(display: &std::ffi::OsStr, runtime_dir: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let display = PathBuf::from(display);
+    if display.is_absolute() {
+        return Some(display);
+    }
+    runtime_dir.map(|dir| PathBuf::from(dir).join(display))
+}
+
+/// Where an X11 client connects for a DISPLAY, in x11rb's order (GPUI's X11 client).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Debug, PartialEq)]
+enum X11Address {
+    /// Display N's socket, /tmp/.X11-unix/XN.
+    Socket(u16),
+    /// A DISPLAY that is a socket's path.
+    Path(PathBuf),
+    Tcp(String, u16),
+}
+
+/// DISPLAY is `[protocol/][host]:number[.screen]`, or a socket's path (`unix:` before it
+/// optional).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn x11_addresses(display: &str) -> Vec<X11Address> {
+    let path = display.strip_prefix("unix:").unwrap_or(display);
+    if path.starts_with('/') {
+        let path = PathBuf::from(path);
+        // A path with the screen after it: `/path/to/socket.0`.
+        let unscreened = path.to_str().and_then(|p| p.rsplit_once('.')).map(|(p, _)| PathBuf::from(p));
+        return std::iter::once(path).chain(unscreened).map(X11Address::Path).collect();
+    }
+    let (protocol, rest) = match display.rsplit_once('/') {
+        Some((protocol, rest)) => (Some(protocol), rest),
+        None => (None, display),
+    };
+    let Some((host, number)) = rest.rsplit_once(':') else { return Vec::new() };
+    let Some(number) = number.split('.').next().and_then(|n| n.parse::<u16>().ok()) else { return Vec::new() };
+    let port = 6000u16.saturating_add(number);
+    let mut addresses = Vec::new();
+    if protocol != Some("unix") && !host.is_empty() && host != "unix" {
+        addresses.push(X11Address::Tcp(host.to_string(), port));
+    } else {
+        if protocol.is_none() || protocol == Some("unix") {
+            addresses.push(X11Address::Socket(number));
+        }
+        if protocol.is_none() && host.is_empty() {
+            addresses.push(X11Address::Tcp("localhost".to_string(), port));
+        }
+    }
+    addresses
+}
+
+/// Display N's socket: /tmp/.X11-unix/XN, and on Termux in its own tmp too (termux-x11's).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn x11_socket_paths(number: u16, var: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let name = format!(".X11-unix/X{number}");
+    let mut paths = vec![PathBuf::from("/tmp").join(&name)];
+    if cfg!(target_os = "android") {
+        if let Some(prefix) = var("PREFIX") {
+            paths.push(PathBuf::from(prefix).join("tmp").join(&name));
+        }
+        if let Some(tmp) = var("TMPDIR") {
+            paths.push(PathBuf::from(tmp).join(&name));
+        }
+    }
+    paths
+}
+
+/// The same name in the abstract namespace, where X servers on Linux listen too (and a
+/// sandbox may see only that one).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn x11_abstract_connect(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+    std::os::unix::net::SocketAddr::from_abstract_name(path.as_os_str().as_bytes())
+        .and_then(|addr| std::os::unix::net::UnixStream::connect_addr(&addr))
+        .is_ok()
+}
+
 /// Get the current crash count from environment variable
 pub(crate) fn get_crash_count() -> u32 {
     std::env::var(CRASH_COUNT_ENV)
@@ -375,10 +777,10 @@ pub(crate) fn crash_restart() {
         use std::os::unix::process::CommandExt;
         // Without TinyFugue's startup options: the restarted process must not load the
         // rc or connect again (tfstartup::clay_args_only).
-        let mut args: Vec<String> = crate::tfstartup::clay_args_only(std::env::args()
+        let mut args: Vec<String> = restart_args(crate::tfstartup::clay_args_only(std::env::args()
             .skip(1)
             .filter(|a| a != "--reload" && a != "--crash")
-            .collect());
+            .collect()), None);
         args.push("--crash".to_string());
 
         // This replaces the current process if successful
@@ -400,7 +802,7 @@ pub(crate) fn gui_software_fallback_restart() {
     std::env::set_var(GUI_SOFTWARE_FALLBACK_ENV, "1");
     if let Ok((exe, _)) = get_executable_path() {
         use std::os::unix::process::CommandExt;
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = restart_args(std::env::args().skip(1).collect(), None);
         // This replaces the current process if successful.
         let _ = std::process::Command::new(&exe).args(&args).exec();
     }
@@ -477,10 +879,10 @@ pub(crate) fn crash_restart() {
     if let Ok((exe, _)) = get_executable_path() {
         // Without TinyFugue's startup options: the restarted process must not load the
         // rc or connect again (tfstartup::clay_args_only).
-        let mut args: Vec<String> = crate::tfstartup::clay_args_only(std::env::args()
+        let mut args: Vec<String> = restart_args(crate::tfstartup::clay_args_only(std::env::args()
             .skip(1)
             .filter(|a| a != "--reload" && a != "--crash")
-            .collect());
+            .collect()), None);
         args.push("--crash".to_string());
 
         if std::process::Command::new(&exe).args(&args).spawn().is_ok() {
@@ -1866,6 +2268,8 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         }
     }
 
+    leaving_gui_for_console(app);
+
     // Save the current state
     debug_log(is_debug_enabled(), "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
@@ -1920,8 +2324,8 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
     // Without TinyFugue's startup options: a reload must not load the rc or connect again.
-    let mut args: Vec<String> = crate::tfstartup::clay_args_only(
-        std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect());
+    let mut args: Vec<String> = restart_args(crate::tfstartup::clay_args_only(
+        std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect()), app.reload_ui);
     args.push("--reload".to_string());
     debug_log(is_debug_enabled(), &format!("RELOAD: About to exec {} with args={:?} fds={}", exe.display(), args, fds_str));
     crate::crashlog::replacing("reload");
@@ -1981,6 +2385,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             let _ = tx.send(());
         }
     }
+    leaving_gui_for_console(app);
     debug_log(is_debug_enabled(), "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
     debug_log(is_debug_enabled(), "RELOAD: State saved successfully");
@@ -2017,11 +2422,16 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
     pass_web_port_to_successor(web_port);
 
-    // Detect GUI mode from App state (not args — GUI is default on Windows/macOS with no flag)
-    let is_headless = app.gui_tx.is_some() || std::env::args().any(|a| a == "-D");
+    // How the successor is started follows what it will be, not what this Clay is: a GUI (or
+    // -D) is started and left to run; a console from a console is waited for in this window;
+    // a console from a GUI, which let its console go at startup, gets a window of its own.
+    let successor = successor_kind(app.reload_ui);
+    let is_headless = successor == Some(UiKind::Gui)
+        || (successor.is_none() && (app.gui_tx.is_some() || std::env::args().any(|a| a == "-D")));
+    let console_from_gui = successor == Some(UiKind::Console) && app.gui_tx.is_some();
 
-    // Only create a sync event in console mode (not headless/GUI/daemon).
-    let sync_event = if !is_headless {
+    // Only create a sync event when this console waits for a console successor.
+    let sync_event = if !is_headless && !console_from_gui {
         let event_name = format!("ClayReloadSync-{}\0", std::process::id());
         let handle = unsafe {
             CreateEventA(std::ptr::null(), 1, 0, event_name.as_ptr())
@@ -2035,15 +2445,9 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     };
 
     // Without TinyFugue's startup options: a reload must not load the rc or connect again.
-    let mut args: Vec<String> = crate::tfstartup::clay_args_only(
-        std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect());
+    let mut args: Vec<String> = restart_args(crate::tfstartup::clay_args_only(
+        std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect()), app.reload_ui);
     args.push("--reload".to_string());
-    // On Windows/macOS, the GUI is the default mode (no flag in args). Make the reload
-    // child run the same GUI: the native one (`--gui`) when it is built in, else the
-    // WebView one (`--web-gui`).
-    if is_headless && !args.iter().any(|a| a == "--gui" || a.starts_with("--gui=") || a == "--web-gui" || a.starts_with("--web-gui=")) {
-        args.push(if cfg!(feature = "native-gui") { "--gui" } else { "--web-gui" }.to_string());
-    }
     debug_log(is_debug_enabled(), &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
     sync_crash_count_env();
 
@@ -2074,8 +2478,8 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         // else: inheriting them can make the spawn fail (as it did for the native GUI,
         // ending Clay with no word) or hand the child some unrelated object. The child
         // is a GUI too: no standard handles, and no console window flashing up before it
-        // frees its own.
-        if app.gui_tx.is_some() {
+        // frees its own (the console's window, from a console, is left to close).
+        if app.gui_tx.is_some() || successor == Some(UiKind::Gui) {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command
@@ -2097,6 +2501,13 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
                 return Err(io::Error::other(format!("Failed to spawn reload process: {}", e)));
             }
         }
+    }
+
+    if console_from_gui {
+        return match spawn_console_from_gui(&exe, &args) {
+            Ok(pid) => crate::crashlog::exit_process(0, &format!("reload: replaced by pid {pid}")),
+            Err(e) => Err(io::Error::other(format!("Failed to spawn reload process: {}", e))),
+        };
     }
 
     match std::process::Command::new(&exe).args(&args).spawn() {
@@ -2158,6 +2569,13 @@ pub fn exec_relaunch(connect_addr: Option<&str>, use_gui: bool) -> io::Result<()
 /// only if that failed.
 #[cfg(feature = "native-gui")]
 pub fn exec_with_args(args: Vec<String>) -> io::Result<()> {
+    // Windows: the GUI turning into a console (`/reload --console`) needs a window for it.
+    #[cfg(windows)]
+    if args.iter().any(|a| a.starts_with("--console=")) {
+        let (exe, _) = get_executable_path()?;
+        let pid = spawn_console_from_gui(&exe, &args)?;
+        crate::crashlog::exit_process(0, &format!("reload: replaced by pid {pid}"));
+    }
     exec_relaunch_with_args(args, true)
 }
 
@@ -2265,6 +2683,130 @@ impl Drop for StderrToLog {
 
 #[cfg(test)]
 mod tests {
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |name| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// A restart names the interface this Clay runs, however it was chosen, or the one
+    /// `/reload --console|--gui` asked for; an attached Clay's command line is its own.
+    #[test]
+    fn a_restart_names_the_interface_it_runs_or_switches_to() {
+        use super::UiKind::{Console, Gui};
+        let restart = |list: &[&str], running, switch| super::with_ui(args(list), super::successor_ui(running, switch));
+        // Chosen by default (named nowhere): named now, so the successor doesn't choose again.
+        assert_eq!(restart(&["--conf=x"], Some("--console"), None), args(&["--conf=x", "--console"]));
+        assert_eq!(restart(&["--conf=x", "--console"], Some("--console"), None), args(&["--conf=x", "--console"]));
+        // A switch replaces it.
+        assert_eq!(restart(&["--console", "--conf=x"], Some("--console"), Some(Gui)), args(&["--conf=x", "--gui"]));
+        assert_eq!(restart(&["--gui"], Some("--gui"), Some(Console)), args(&["--console"]));
+        // --gui in the WebView GUI stays the WebView GUI.
+        assert_eq!(restart(&["--web-gui"], Some("--web-gui"), Some(Gui)), args(&["--web-gui"]));
+        // A restart the fallback took to the console names the console, not the --gui it was given.
+        assert_eq!(restart(&["--gui"], Some("--console"), None), args(&["--console"]));
+        // Attached: untouched. Other flags that start alike: untouched.
+        assert_eq!(restart(&["--console=host:9000", "--ssh"], None, None), args(&["--console=host:9000", "--ssh"]));
+        assert_eq!(restart(&["--gui-snapshot=a"], Some("--gui"), None), args(&["--gui-snapshot=a", "--gui"]));
+    }
+
+    /// A restart comes back as it was where that can run, else as the other where that can.
+    #[test]
+    fn a_restart_falls_back_to_whatever_works() {
+        use super::UiKind::{Console, Gui};
+        use super::restart_ui;
+        assert_eq!(restart_ui(Console, true, true), Console, "a console stays a console at a desktop");
+        assert_eq!(restart_ui(Gui, true, true), Gui);
+        assert_eq!(restart_ui(Gui, false, true), Console, "no display: the console");
+        assert_eq!(restart_ui(Console, true, false), Gui, "no terminal: the GUI");
+        assert_eq!(restart_ui(Gui, false, false), Gui, "neither: as it was");
+        assert_eq!(restart_ui(Console, false, false), Console);
+    }
+
+    #[test]
+    fn reload_reads_its_options() {
+        use super::UiKind::{Console, Gui};
+        assert_eq!(super::reload_options([]), (None, None));
+        assert_eq!(super::reload_options(["--gui"]), (Some(Gui), None));
+        assert_eq!(super::reload_options(["--console"]), (Some(Console), None));
+        assert_eq!(super::reload_options(["--gui", "--console"]), (Some(Console), None), "the last one wins");
+        assert_eq!(super::reload_options(["-g", "--gui"]), (Some(Gui), Some("-g".to_string())));
+    }
+
+    /// An attached GUI's `/reload --console` keeps its server, its --ssh and the rest.
+    #[test]
+    fn an_attached_clay_switches_interface_and_keeps_its_server() {
+        use super::UiKind::{Console, Gui};
+        use super::attached_switch_args as switch;
+        assert_eq!(switch(args(&["--gui=mini:9000", "--ssh", "--conf=x"]), Console), args(&["--console=mini:9000", "--ssh", "--conf=x"]));
+        assert_eq!(switch(args(&["--console=h"]), Gui), args(&["--gui=h"]));
+        assert_eq!(switch(args(&["--web-gui=h/clay"]), Console), args(&["--console=h/clay"]));
+        assert_eq!(switch(args(&["--web-gui=h"]), Gui), args(&["--web-gui=h"]), "already a GUI");
+        assert_eq!(switch(args(&["--console=h"]), Console), args(&["--console=h"]));
+    }
+
+    #[test]
+    fn a_terminal_reached_over_ssh_gets_the_console() {
+        assert!(super::over_ssh(env(&[("SSH_CONNECTION", "10.0.0.2 5000 10.0.0.1 22")])));
+        assert!(super::over_ssh(env(&[("SSH_CLIENT", "10.0.0.2 5000 22")])));
+        assert!(super::over_ssh(env(&[("SSH_TTY", "/dev/pts/3")])));
+        // The agent's variables are set in desktop sessions too.
+        assert!(!super::over_ssh(env(&[("SSH_AUTH_SOCK", "/run/user/1000/keyring/ssh")])));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn display_names_become_the_places_an_x11_client_connects() {
+        use super::X11Address::{Path, Socket, Tcp};
+        use std::path::PathBuf;
+        let tcp = |host: &str, port| Tcp(host.to_string(), port);
+        assert_eq!(super::x11_addresses(":0"), vec![Socket(0), tcp("localhost", 6000)]);
+        assert_eq!(super::x11_addresses(":1.0"), vec![Socket(1), tcp("localhost", 6001)]);
+        assert_eq!(super::x11_addresses("unix:0"), vec![Socket(0)]);
+        assert_eq!(super::x11_addresses("unix/:2"), vec![Socket(2)]);
+        // X forwarding over SSH, and a display on another machine.
+        assert_eq!(super::x11_addresses("localhost:10.0"), vec![tcp("localhost", 6010)]);
+        assert_eq!(super::x11_addresses("tcp/xhost:3"), vec![tcp("xhost", 6003)]);
+        assert_eq!(super::x11_addresses("/run/x.sock"), vec![Path(PathBuf::from("/run/x.sock")), Path(PathBuf::from("/run/x"))]);
+        assert_eq!(super::x11_addresses("nonsense"), vec![]);
+        assert_eq!(super::x11_addresses(":x"), vec![]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_display_is_a_name_in_the_runtime_dir_or_a_path() {
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+        assert_eq!(super::wayland_socket(OsStr::new("wayland-0"), Some(OsStr::new("/run/user/1000"))), Some(PathBuf::from("/run/user/1000/wayland-0")));
+        assert_eq!(super::wayland_socket(OsStr::new("/tmp/w.sock"), None), Some(PathBuf::from("/tmp/w.sock")));
+        assert_eq!(super::wayland_socket(OsStr::new("wayland-0"), None), None);
+    }
+
+    /// A display counts only while something listens on it: a DISPLAY left behind in a
+    /// tmux session after its X server ended gets the console.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gui_opens_only_where_a_display_server_is_listening() {
+        let dir = std::env::temp_dir().join(format!("clay-display-probe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("display");
+        let _ = std::fs::remove_file(&sock);
+        let path = sock.to_str().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(super::display_reachable(env(&[("WAYLAND_DISPLAY", path)])));
+        assert!(super::display_reachable(env(&[("DISPLAY", path)])));
+        // Wayland named but gone: no falling back to X11 (GPUI doesn't).
+        assert!(!super::display_reachable(env(&[("WAYLAND_DISPLAY", "/nonexistent/wayland-9"), ("DISPLAY", path)])));
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        assert!(!super::display_reachable(env(&[("DISPLAY", path)])));
+        assert!(!super::display_reachable(env(&[])), "no display named");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_listener_on_a_port_is_found_in_netstat_whatever_the_language() {

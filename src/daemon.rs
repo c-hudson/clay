@@ -1030,15 +1030,28 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                         "  Example: /msdp REPORT HEALTH",
                     ], true);
                 }
-                Command::Reload => {
-                    // The Android app's server can't hot reload: say so rather than nothing.
-                    #[cfg(target_os = "android")]
-                    app.ws_tell(client_id, world_index, "Hot reload is not available on this platform. Restart the app to apply changes.");
-                    // Signal the event loop to perform reload
-                    #[cfg(not(target_os = "android"))]
-                    {
-                        crate::debug_log(is_debug_enabled(), "DAEMON: Received /reload command, sending Sigusr1Received event");
-                        let _ = event_tx.send(AppEvent::Sigusr1Received).await;
+                Command::Reload { ui, bad } => {
+                    // `--console` and `--gui` switch the main Clay only from its own window
+                    // (App::reload_switch_refusal), and only to an interface that can run here.
+                    let refusal = if bad.is_some() {
+                        Some(crate::RELOAD_USAGE.to_string())
+                    } else {
+                        ui.and_then(|_| app.reload_switch_refusal(client_id)).map(str::to_string)
+                            .or_else(|| app.reload_switch_problem(ui))
+                    };
+                    if let Some(why) = refusal {
+                        app.ws_tell(client_id, world_index, &why);
+                    } else {
+                        // The Android app's server can't hot reload: say so rather than nothing.
+                        #[cfg(target_os = "android")]
+                        app.ws_tell(client_id, world_index, "Hot reload is not available on this platform. Restart the app to apply changes.");
+                        // Signal the event loop to perform reload
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            app.reload_ui = ui;
+                            crate::debug_log(is_debug_enabled(), "DAEMON: Received /reload command, sending Sigusr1Received event");
+                            let _ = event_tx.send(AppEvent::Sigusr1Received).await;
+                        }
                     }
                 }
                 // The WebView GUI master's own window relaunches; a headless daemon (-D), or
@@ -5473,6 +5486,33 @@ mod client_parity_tests {
 
     async fn typed(app: &mut App, tx: &mpsc::Sender<AppEvent>, line: &str) {
         handle_daemon_ws_message(app, 0, WsMessage::SendCommand { world_index: 0, command: line.into() }, tx).await;
+    }
+
+    /// `/reload --console|--gui` switches the main Clay only from its own window, and only
+    /// to an interface it has to switch from; another client's is answered, not acted on.
+    #[tokio::test]
+    async fn a_reload_switch_is_taken_only_from_the_main_clays_own_window() {
+        let (mut app, mut rx, _) = app_with_gui();
+        let (tx, mut events) = mpsc::channel::<AppEvent>(100);
+        let line = |text: &str| WsMessage::SendCommand { world_index: 0, command: text.into() };
+        let says = |msgs: &[WsMessage], text: &str| msgs.iter()
+            .any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains(text)));
+        // Another client (not the GUI's channel, not on the loopback).
+        handle_daemon_ws_message(&mut app, 7, line("/reload --console"), &tx).await;
+        assert!(events.try_recv().is_err(), "nothing reloads");
+        // The main Clay's own window: judged against what this Clay runs (nothing, here).
+        typed(&mut app, &tx, "/reload --console").await;
+        assert!(events.try_recv().is_err());
+        let msgs = sent(&mut rx);
+        assert!(says(&msgs, "runs neither"), "{msgs:?}");
+        // A word it doesn't know: the usage line.
+        typed(&mut app, &tx, "/reload now").await;
+        assert!(says(&sent(&mut rx), crate::RELOAD_USAGE));
+        assert!(events.try_recv().is_err());
+        // A plain /reload, from anyone, reloads.
+        handle_daemon_ws_message(&mut app, 7, line("/reload"), &tx).await;
+        assert!(matches!(events.try_recv(), Ok(AppEvent::Sigusr1Received)));
+        assert_eq!(app.reload_ui, None);
     }
 
     /// TF's /input, /xtitle and /limit run by a client act on that client's input line,

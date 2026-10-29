@@ -38,7 +38,26 @@ The hot reload process:
 
 ```
 /reload
+/reload --console
+/reload --gui
 ```
+
+A reload comes back in the interface it was in, the console or the GUI, whatever the
+command line said (a Clay started with no flag is told which one it chose). Where that one
+can't run any more (the display has gone, or there is no terminal) it comes back in the other
+and says so after "Reload successful". A reload from a Clay older than v1.7.28, which never
+said, comes back as that version's default: the GUI on macOS and Windows, the console
+elsewhere.
+
+`--console` and `--gui` switch the interface at the reload. The GUI needs a build that has
+one and a display: on Linux one that answers (a display forwarded over SSH counts), on
+Windows and macOS a desktop session, never one reached over SSH; the console needs a terminal Clay is in the foreground of (a GUI started
+from a desktop menu has none; on Windows the console gets a window of its own). When the
+other one can't run, Clay says why and doesn't reload, so no connection is lost. The switch
+keeps every connection a plain reload keeps; the line being typed isn't carried across.
+In a GUI the server's Clay runs in, `/reload --console` switches the server's Clay; in a GUI
+or console attached to another Clay, it restarts that program as the other kind, attached to
+the same server.
 
 ### Keyboard Shortcut
 
