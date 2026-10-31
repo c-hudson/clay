@@ -439,6 +439,10 @@ pub fn wildcard_to_regex(pattern: &str) -> String {
     regex
 }
 
+/// `/recall -t` with no format of its own: the date and the time (user request
+/// 2026-10-30). TinyFugue's default is `%time_format` (`%H:%M`).
+pub const RECALL_TIME_FORMAT: &str = "%m/%d/%y %H:%M:%S";
+
 /// Execute recall command with options, returning the list of matching lines
 pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], show_tags: bool) -> Vec<String> {
     execute_recall_with_source(opts, output_lines, show_tags)
@@ -628,13 +632,14 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
             display_line = format!("{}{}", crate::INPUT_LINE_PREFIX, display_line);
         }
 
-        // Add timestamp if requested, honoring the optional -t[format] (default %H:%M:%S)
+        // Add timestamp if requested, honoring the optional -t[format] (default
+        // RECALL_TIME_FORMAT)
         if opts.show_timestamps {
             let epoch_secs = line.timestamp.duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0) as i64;
             let lt = crate::util::local_time_from_epoch(epoch_secs);
-            let fmt = opts.timestamp_format.as_deref().unwrap_or("%H:%M:%S");
+            let fmt = opts.timestamp_format.as_deref().unwrap_or(RECALL_TIME_FORMAT);
             let ts_str = crate::util::format_local_time(&lt, fmt);
             display_line = format!("[{}] {}", ts_str, display_line);
         }
@@ -825,6 +830,25 @@ pub fn line_matches_compiled_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- /recall -t ---
+
+    #[test]
+    fn test_recall_t_defaults_to_date_and_time() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_400_000);
+        let lines = vec![OutputLine::new_with_timestamp("hello there".to_string(), at, 1)];
+        let mut opts = tf::RecallOptions { show_timestamps: true, ..Default::default() };
+        let out = execute_recall(&opts, &lines, false);
+        let dated = regex::Regex::new(r"^\[\d\d/\d\d/\d\d \d\d:\d\d:\d\d\] hello there$").unwrap();
+        assert!(out.len() == 1 && dated.is_match(&out[0]), "{out:?}");
+        // The same moment as the local clock writes it.
+        let expected = crate::util::format_local_time(&crate::util::local_time_from_epoch(1_793_400_000), "%m/%d/%y %H:%M:%S");
+        assert_eq!(out[0], format!("[{expected}] hello there"));
+        // An explicit format still wins.
+        opts.timestamp_format = Some("%H:%M".to_string());
+        let out = execute_recall(&opts, &lines, false);
+        assert!(regex::Regex::new(r"^\[\d\d:\d\d\] hello there$").unwrap().is_match(&out[0]), "{out:?}");
+    }
 
     // --- split_action_commands ---
 

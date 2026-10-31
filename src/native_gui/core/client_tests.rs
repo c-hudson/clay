@@ -251,7 +251,7 @@ fn initial_state_lines_and_their_seqs_are_held_and_the_world_marked_seen() {
     assert_eq!(h.seqs(0), vec![0, 1, 2, 3, 4]);
     assert_eq!(h.core.worlds[0].seen.ranges(), &[(0, 4)]);
     assert_eq!(h.core.display_id, 7);
-    assert!(h.sent().iter().any(|m| matches!(m, WsMessage::MarkWorldSeen { world_index: 0, previous_world_index: None })));
+    assert!(h.sent().iter().any(|m| matches!(m, WsMessage::MarkWorldSeen { world_index: 0, previous_world_index: None, .. })));
 }
 
 #[test]
@@ -594,7 +594,7 @@ fn a_local_claim_is_reconciled_with_the_servers() {
     let e = h.core.switch_world(1, h.now);
     h.keep(e);
     let sent = h.sent();
-    assert!(sent.iter().any(|m| matches!(m, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) })));
+    assert!(sent.iter().any(|m| matches!(m, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0), .. })));
     assert!(sent.iter().any(|m| matches!(m, WsMessage::RequestWorldState { world_index: 1 })));
     let mine = |h: &H| h.core.worlds[1].lines.iter().filter(|l| l.display_id == Some(7)).filter_map(|l| l.seq).collect::<Vec<_>>();
     assert_eq!(mine(&h), vec![0, 1, 2], "guessed before the server answers");
@@ -1230,7 +1230,7 @@ fn a_switch_the_server_worked_out_tells_the_server_what_is_seen() {
         h.msg(answer);
         assert_eq!(h.core.current, 1);
         let sent = h.sent();
-        assert!(sent.iter().any(|m| matches!(m, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) })), "{sent:?}");
+        assert!(sent.iter().any(|m| matches!(m, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0), .. })), "{sent:?}");
         assert!(sent.iter().any(|m| matches!(m, WsMessage::RequestWorldState { world_index: 1 })), "{sent:?}");
     }
 }
@@ -1242,21 +1242,21 @@ fn a_switch_the_server_worked_out_tells_the_server_what_is_seen() {
 #[test]
 fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_login() {
     let other_views = |sent: &[WsMessage]| -> Vec<Vec<usize>> {
-        sent.iter().filter_map(|m| if let WsMessage::OtherViews { worlds } = m { Some(worlds.clone()) } else { None }).collect()
+        sent.iter().filter_map(|m| if let WsMessage::OtherViews { worlds, .. } = m { Some(worlds.clone()) } else { None }).collect()
     };
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..2, 9), world_msg(2, "C", 0..2, 9)]);
     h.effects.clear();
-    let e = h.core.set_other_views(vec![2, 1, 2]);
+    let e = h.core.set_other_views(vec![2, 1, 2], Vec::new());
     h.keep(e);
     assert_eq!(other_views(&h.sent()), vec![vec![1, 2]], "sorted, once each");
-    let e = h.core.set_other_views(vec![1, 2]);
+    let e = h.core.set_other_views(vec![1, 2], Vec::new());
     h.keep(e);
     assert!(other_views(&h.sent()).is_empty(), "unchanged: nothing sent");
     // Offline: remembered, said at the next login.
     h.input(Input::Closed("network".into()));
     h.drain();
-    let e = h.core.set_other_views(vec![2]);
+    let e = h.core.set_other_views(vec![2], Vec::new());
     h.keep(e);
     assert!(other_views(&h.sent()).is_empty(), "nothing goes out while offline");
     h.advance(Duration::from_secs(3));
@@ -1267,7 +1267,7 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
     h.initial(vec![world_msg(0, "A", 0..2, 9), world_msg(1, "B", 0..2, 9), world_msg(2, "C", 0..2, 9)]);
     assert_eq!(other_views(&h.sent()), vec![vec![2]], "the new connection is told");
     // The last window closed: an empty list says so.
-    let e = h.core.set_other_views(Vec::new());
+    let e = h.core.set_other_views(Vec::new(), Vec::new());
     h.keep(e);
     assert_eq!(other_views(&h.sent()), vec![Vec::<usize>::new()]);
 
@@ -1295,7 +1295,7 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
         tf_status: Vec::new(),
     });
     old.effects.clear();
-    let e = old.core.set_other_views(vec![1]);
+    let e = old.core.set_other_views(vec![1], Vec::new());
     old.keep(e);
     assert!(other_views(&old.sent()).is_empty(), "not to a server that doesn't take it");
 }

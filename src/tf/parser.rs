@@ -2435,7 +2435,7 @@ Clay:
   /reload  /version  /quit  /remote  /ban  /unban
   /flush  /dump  /note  /tag  /notify  /import  /window
   /font  /update  /dict  /urban  /translate  /url  /testmusic
-  /mssp  /msdp  /stats  /chat
+  /mssp  /msdp  /stats  /chat  /split  /unsplit
 Variables:
   /set  /unset  /let  /setenv  /listvar  /toggle  /export
 Expressions & Control Flow:
@@ -2826,7 +2826,7 @@ Options:
               /repeat/quote batches. Combine with -w<world> to scope to one
               world (-i alone uses the current world).
   -D          Search long-term archive (~/.clay/scrollback.db)
-  -t[format]  Show timestamps
+  -t[format]  Show timestamps (default %m/%d/%y %H:%M:%S)
   -v          Invert match (show non-matching)
   -q          Quiet (set %? but don't display)
   -mtype      Match type: simple, glob (default), regexp
@@ -4661,7 +4661,7 @@ mod tests {
         const CLAY_NATIVE_ONLY: &[&str] = &[
             "actions", "chat", "dict", "dump", "flush", "font", "import",
             "menu", "msdp", "mssp", "note", "notify", "reload", "remote", "server", "setup", "stats", "tag",
-            "testmusic", "tfgag", "tfhelp", "translate", "tts", "unban", "update",
+            "split", "testmusic", "tfgag", "tfhelp", "translate", "tts", "unban", "unsplit", "update",
             "urban", "url", "web", "window",
         ];
 

@@ -163,9 +163,11 @@ pub enum MenuKind {
     Worlds,
 }
 
-/// The hamburger menu (index.html `#menu-dropdown`): (action, label, shortcut). `None` is
-/// a separator.
-const MAIN_MENU: &[Option<(&str, &str, &str)>] = &[
+/// A menu item: (action, label, shortcut).
+pub(super) type MenuEntry = (&'static str, &'static str, &'static str);
+
+/// The hamburger menu (index.html `#menu-dropdown`). `None` is a separator.
+pub(super) const MAIN_MENU: &[Option<MenuEntry>] = &[
     Some(("help", "Help", "F1")),
     Some(("world-selector", "World Selector", "/worlds")),
     Some(("actions", "Actions", "/actions")),
@@ -183,6 +185,31 @@ const MAIN_MENU: &[Option<(&str, &str, &str)>] = &[
     None,
     Some(("logout", "Logout", "")),
 ];
+
+/// Whether the hamburger shows `action`: Change Password and Logout only on a multiuser
+/// server, Import Picture only where the server uploads pictures (as app.js hides it).
+pub(super) fn menu_shows(action: &str, multiuser: bool, picture_upload: bool) -> bool {
+    match action {
+        "change-password" | "logout" => multiuser,
+        "import-picture" => picture_upload,
+        _ => true,
+    }
+}
+
+/// The hamburger's items as they show, in the sections its separators make, none empty.
+/// The desktop's app menu (appmenu.rs) is the same.
+pub(super) fn menu_sections(multiuser: bool, picture_upload: bool) -> Vec<Vec<MenuEntry>> {
+    let mut sections: Vec<Vec<MenuEntry>> = vec![Vec::new()];
+    for entry in MAIN_MENU {
+        match entry {
+            None => sections.push(Vec::new()),
+            Some(e) if menu_shows(e.0, multiuser, picture_upload) => sections.last_mut().expect("one section").push(*e),
+            Some(_) => {}
+        }
+    }
+    sections.retain(|s| !s.is_empty());
+    sections
+}
 
 /// The chrome's own state.
 pub struct Chrome {
@@ -263,8 +290,62 @@ pub fn styled_text(line: &StyledLine, family: &SharedString) -> StyledText {
 }
 
 impl ClayView {
-    /// The status bar (index.html `#status-bar`), with the menus it opens.
-    pub(super) fn status_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The bar's colour: `t.bar`, or on the bar of a split's pane without the focus
+    /// (`/split`) a grey of the same lightness (`ThemeColor::grey_of_same_lightness`, the
+    /// one rule for every interface).
+    fn bar_colour(&self, focused: bool) -> Hsla {
+        if focused {
+            self.chrome.tokens.bar
+        } else {
+            let g = self.theme.status_bar_bg.grey_of_same_lightness();
+            hsla([g.r, g.g, g.b])
+        }
+    }
+
+    /// The bar between a split's panes (`/split`): the top pane's world - the current one
+    /// here, `in_other_pane` when that pane hasn't the focus - showing only its connection
+    /// ball and name (user request 2026-10-30), its dot under the full bar's. A press on it
+    /// moves the focus to that pane.
+    pub(super) fn pane_bar(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.chrome.tokens.clone();
+        let tinyfugue = self.session.core.settings.as_ref().is_some_and(|s| s.separator_style == "tinyfugue");
+        let world = self.session.core.current_world();
+        let mut row = div().flex().flex_1().items_center().px(px(12.0)).gap(px(10.0)).text_size(px(11.5)).font_family(self.fonts.ui.clone()).line_height(relative(SANS_LH));
+        // Where the full bar's menu button is.
+        row = row.child(div().w(px(25.0)).flex_shrink_0());
+        if let Some(w) = world {
+            let name_colour = if focused || !tinyfugue { t.fg } else { t.muted };
+            row = row.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(status_dot(t.dot(w)))
+                    .child(div().font_weight(FontWeight::BOLD).text_color(name_colour).whitespace_nowrap().child(w.name.clone())),
+            );
+        }
+        // TinyFugue's look has no colour of its own: its bar is the output's background.
+        let bg = if tinyfugue { hsla(self.palette.bg) } else { self.bar_colour(focused) };
+        div()
+            .id("pane-bar")
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .min_h(px(BAR_HEIGHT))
+            .bg(bg)
+            .child(div().h(px(1.0)).bg(t.border))
+            .child(div().flex().min_h(px(BAR_HEIGHT - 2.0)).child(row))
+            .child(div().h(px(1.0)).bg(t.border_subtle))
+            .when(!focused, |d| {
+                d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _w, cx| this.split_focus_swap(cx)))
+            })
+            .into_any_element()
+    }
+
+    /// The status bar (index.html `#status-bar`), with the menus it opens. `focused`: false
+    /// on a split's bottom pane while the top one has the focus (`/split`): the bar is grey,
+    /// and a press on it moves the focus to its pane first.
+    pub(super) fn status_bar(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.chrome.tokens.clone();
         let mono = self.fonts.primary.clone();
         let sans = self.fonts.ui.clone();
@@ -472,10 +553,13 @@ impl ClayView {
             .flex_col()
             .flex_shrink_0()
             .min_h(px(BAR_HEIGHT))
-            .bg(if tf_on_output_bg { hsla(self.palette.bg) } else { t.bar })
+            .bg(if tf_on_output_bg { hsla(self.palette.bg) } else { self.bar_colour(focused) })
             .child(div().h(px(1.0)).bg(t.border))
             .child(div().flex().min_h(px(BAR_HEIGHT - 2.0)).child(row))
             .child(div().h(px(1.0)).bg(t.border_subtle))
+            .when(!focused, |d| {
+                d.capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _w, cx| this.split_focus_swap(cx)))
+            })
             .into_any_element()
     }
 
@@ -587,37 +671,20 @@ impl ClayView {
     }
 
     fn main_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let multiuser = self.session.core.is_multiuser();
+        let core = &self.session.core;
         let t = &self.chrome.tokens;
         let mut items = Vec::new();
-        let mut last_sep = true;
-        for entry in MAIN_MENU {
-            match entry {
-                None if !last_sep => {
-                    items.push(div().h(px(1.0)).mx(px(8.0)).my(px(4.0)).bg(t.border).into_any_element());
-                    last_sep = true;
-                }
-                None => {}
-                Some((action, label, shortcut)) => {
-                    if matches!(*action, "change-password" | "logout") && !multiuser {
-                        continue;
-                    }
-                    // Import Picture needs a server that uploads pictures (as app.js hides it).
-                    if *action == "import-picture" && !self.session.core.server_picture_upload {
-                        continue;
-                    }
-                    let action: &'static str = action;
-                    items.push(
-                        self.menu_item(format!("menu-{action}").into(), None, label.to_string(), shortcut.to_string(), false)
-                            .on_click(cx.listener(move |this, _, w, cx| this.menu_action(action, w, cx)))
-                            .into_any_element(),
-                    );
-                    last_sep = false;
-                }
+        for (i, section) in menu_sections(core.is_multiuser(), core.server_picture_upload).into_iter().enumerate() {
+            if i > 0 {
+                items.push(div().h(px(1.0)).mx(px(8.0)).my(px(4.0)).bg(t.border).into_any_element());
             }
-        }
-        if last_sep {
-            items.pop();
+            for (action, label, shortcut) in section {
+                items.push(
+                    self.menu_item(format!("menu-{action}").into(), None, label.to_string(), shortcut.to_string(), false)
+                        .on_click(cx.listener(move |this, _, w, cx| this.menu_action(action, w, cx)))
+                        .into_any_element(),
+                );
+            }
         }
         self.dropdown(MenuKind::Main, items, cx)
     }
@@ -658,6 +725,8 @@ impl ClayView {
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
             }
+            // The desktop's app menu's last item (appmenu.rs).
+            "quit" => cx.quit(),
             other => self.open_surface(other, window, cx),
         }
         cx.notify();
@@ -788,7 +857,7 @@ impl ClayView {
 
 #[cfg(test)]
 mod tests {
-    use super::MAIN_MENU;
+    use super::{MAIN_MENU, menu_sections};
 
     /// The hamburger menu is index.html's `#menu-dropdown`, item for item and separator
     /// for separator (the web hides some per platform; this menu hides some per mode).
@@ -811,5 +880,29 @@ mod tests {
         let native: Vec<String> = MAIN_MENU.iter().map(|e| e.map_or("---".to_string(), |(action, _, _)| action.to_string())).collect();
         assert_eq!(native, web);
         assert!(!native.iter().any(|a| a == "reload" || a == "import"), "Reload and Import Settings left the menu");
+    }
+
+    /// The items each kind of server shows, between the separators, with no empty section.
+    #[test]
+    fn menu_sections_hide_what_the_server_lacks() {
+        let ids = |m: bool, p: bool| -> Vec<Vec<&str>> { menu_sections(m, p).iter().map(|s| s.iter().map(|e| e.0).collect()).collect() };
+        assert_eq!(
+            ids(false, false),
+            vec![
+                vec!["help", "world-selector", "actions", "setup", "emoji_picker"],
+                vec!["toggle-tags", "filter", "search"],
+                vec!["new-window", "resync"],
+            ],
+            "single-user without uploads: no Change Password, Import Picture or Logout, and no empty section after Resync"
+        );
+        assert_eq!(
+            ids(true, true),
+            vec![
+                vec!["help", "world-selector", "actions", "setup", "emoji_picker", "import-picture"],
+                vec!["toggle-tags", "filter", "search"],
+                vec!["change-password", "new-window", "resync"],
+                vec!["logout"],
+            ]
+        );
     }
 }

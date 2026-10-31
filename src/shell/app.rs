@@ -148,16 +148,23 @@ impl crate::App {
                 rows = Some(rows.map_or(h, |r| r.min(h)));
             }
         };
-        if self.console_tui && self.current_world_index == idx {
-            take(self.output_width, self.output_height);
+        // The console, in whichever pane shows it (`/split`).
+        if self.console_tui && self.console_shows(idx) {
+            take(self.output_width, self.console_rows_for(idx));
         }
-        for v in self.ws_client_worlds.values() {
-            if v.world_index != idx || !v.visible || v.paused {
+        for (id, v) in &self.ws_client_worlds {
+            if !v.visible || v.paused {
                 continue;
             }
-            match v.dimensions {
-                Some((w, h)) => take(w, h),
-                None => take(v.visible_columns as u16, v.visible_lines as u16),
+            if v.world_index == idx {
+                match v.dimensions {
+                    Some((w, h)) => take(w, h),
+                    None => take(v.visible_columns as u16, v.visible_lines as u16),
+                }
+            }
+            // A client's other views (a split's other pane), at the size it shows them.
+            for d in self.ws_client_other_view_dims.get(id).into_iter().flatten().filter(|d| d.world == idx) {
+                take(d.columns as u16, d.lines as u16);
             }
         }
         match (cols, rows) {

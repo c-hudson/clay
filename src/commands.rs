@@ -704,6 +704,28 @@ pub(crate) struct RemoteClientSnapshot {
     paused: bool,
 }
 
+/// The `/remote` table's columns.
+const REMOTE_COLUMNS: [&str; 8] = ["ID", "IP", "Type", "Conn", "Idle", "Live", "Paused", "World"];
+
+/// The `/remote` table's lines, each column as wide as its widest entry: fixed widths
+/// were overrun by a client type (`RemoteConsole`), an idle time (`45m12s`) or an IPv6
+/// address, and every column after it moved. The World column, last, isn't padded.
+fn remote_table(rows: &[[String; 8]]) -> Vec<String> {
+    let mut widths = [0usize; 8];
+    for row in rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let mut line: String = row[..7].iter().zip(widths).map(|(cell, w)| format!("{cell:<w$} ")).collect();
+            line.push_str(&row[7]);
+            line
+        })
+        .collect()
+}
+
 /// Start an async /remote ping check: send PingCheck to all clients, wait 2s, build output.
 /// `requesting_client_id` is 0 for console, or the WS client_id that invoked /remote.
 pub(crate) fn spawn_remote_ping_check(
@@ -761,16 +783,14 @@ pub(crate) fn spawn_remote_ping_check(
     let console_world = app.worlds.get(app.current_world_index)
         .map(|w| w.name.clone())
         .unwrap_or_else(|| "-".to_string());
+    let console_paused = if app.console_paused { "Yes" } else { "No" };
+    let header = REMOTE_COLUMNS.map(String::from);
+    let console_row = ["-", "localhost", "Console", "-", "-", "Yes", console_paused, &console_world].map(String::from);
 
     if snapshots.is_empty() {
         // No remote clients — still show console line
         app.remote_ping_responses = None;
-        let lines = vec![
-            format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
-                "ID", "IP", "Type", "Conn", "Idle", "Live", "Paused", "World"),
-            format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
-                "-", "localhost", "Console", "-", "-", "Yes", "No", console_world),
-        ];
+        let lines = remote_table(&[header, console_row]);
         let event_tx_clone = event_tx.clone();
         tokio::spawn(async move {
             let _ = event_tx_clone.send(AppEvent::RemoteListResult(requesting_client_id, world_index, lines)).await;
@@ -783,17 +803,14 @@ pub(crate) fn spawn_remote_ping_check(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let responded = responses.lock().unwrap().clone();
 
-        let mut lines = Vec::new();
-        lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
-            "ID", "IP", "Type", "Conn", "Idle", "Live", "Paused", "World"));
-        lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
-            "-", "localhost", "Console", "-", "-", "Yes", "No", console_world));
+        let mut rows = vec![header, console_row];
         for snap in &snapshots {
             let alive = if responded.contains(&snap.id) { "Yes" } else { "No" };
             let paused = if snap.paused { "Yes" } else { "No" };
-            lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
-                snap.id, snap.ip, snap.ctype, snap.connected, snap.idle, alive, paused, snap.world));
+            rows.push([snap.id.to_string(), snap.ip.clone(), snap.ctype.clone(), snap.connected.clone(),
+                snap.idle.clone(), alive.to_string(), paused.to_string(), snap.world.clone()]);
         }
+        let lines = remote_table(&rows);
 
         let _ = event_tx.send(AppEvent::RemoteListResult(requesting_client_id, world_index, lines)).await;
     });
@@ -837,6 +854,14 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::Menu => {
             app.open_menu_popup_new();
+        }
+        Command::Split { world } => {
+            let msg = app.split_open(world.as_deref());
+            app.add_output(&msg);
+        }
+        Command::Unsplit => {
+            let msg = app.split_close();
+            app.add_output(&msg);
         }
         Command::Font => {
             app.add_output("Font settings are available in the web and GUI interfaces.");
@@ -1491,6 +1516,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 }
                 None => format!("No client with ID {}.", client_id),
             };
+            app.add_output(&msg);
+        }
+        Command::RemotePauseConsole => {
+            let msg = app.toggle_console_pause();
             app.add_output(&msg);
         }
         Command::BanList => {
@@ -2796,6 +2825,25 @@ fn expand_tilde_path(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::encoding::UrlShortener;
+
+    /// Every entry starts under its column's heading, whatever the widths before it.
+    #[test]
+    fn test_remote_table_lines_up_long_entries() {
+        let rows = [
+            REMOTE_COLUMNS.map(String::from),
+            ["-", "localhost", "Console", "-", "-", "Yes", "No", "8bit"].map(String::from),
+            ["12", "::ffff:192.168.2.100", "RemoteConsole", "1h23m", "45m12s", "Yes", "No", "Other"].map(String::from),
+            ["3", "10.0.0.2", "Web", "5s", "5s", "No", "Yes", "-"].map(String::from),
+        ];
+        let lines = remote_table(&rows);
+        for (k, heading) in REMOTE_COLUMNS.iter().enumerate() {
+            let at = lines[0].find(heading).unwrap();
+            for (row, line) in rows.iter().zip(&lines).skip(1) {
+                assert_eq!(&line[at..at + row[k].len()], row[k], "{heading} in {line:?}");
+            }
+        }
+        assert!(lines[2].ends_with(" Other"));
+    }
 
     #[test]
     fn test_shortener_order_uses_configured_list_verbatim() {

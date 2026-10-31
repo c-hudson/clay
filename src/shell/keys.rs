@@ -71,13 +71,16 @@ pub fn key_from_crossterm(code: KeyCode, mods: KeyModifiers) -> Option<ShellKey>
 }
 
 /// Decide a keystroke in a live shell world. `esc_armed`: a bare Escape is waiting for a
-/// possible `Esc-<key>` world-switch chord, so this key may complete one.
-pub fn classify(code: KeyCode, mods: KeyModifiers, bindings: &KeyBindings, esc_armed: bool) -> Decision {
+/// possible `Esc-<key>` world-switch chord, so this key may complete one. `split`: the
+/// output is split (`/split`), so the key that moves between the panes (`split_focus`,
+/// Shift-Tab) is kept too; otherwise it goes to the shell like any other.
+pub fn classify(code: KeyCode, mods: KeyModifiers, bindings: &KeyBindings, esc_armed: bool, split: bool) -> Decision {
+    let keeps = |action: &str| is_world_switch(action) || (split && action == "split_focus");
     // An armed Escape: does this key complete a world-switch chord (Esc-} etc.)?
     if esc_armed {
         if let Some(name) = crate::keybindings::escape_key_to_name(code, mods) {
             if let Some(action) = bindings.get_action(&name) {
-                if is_world_switch(action) {
+                if keeps(action) {
                     return Decision::Switch(action.to_string());
                 }
             }
@@ -86,7 +89,7 @@ pub fn classify(code: KeyCode, mods: KeyModifiers, bindings: &KeyBindings, esc_a
     // A key bound to a world switch, resolved immediately (Alt-x == Esc-x, no buffering).
     if let Some(name) = crate::keybindings::key_event_to_name(code, mods) {
         if let Some(action) = bindings.get_action(&name) {
-            if is_world_switch(action) {
+            if keeps(action) {
                 return Decision::Switch(action.to_string());
             }
         }

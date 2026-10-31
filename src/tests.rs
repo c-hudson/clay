@@ -9489,7 +9489,7 @@ third
         app.ws_client_tx = Some(tx);
         app.handle_remote_ws_message(WsMessage::WorldSwitched { new_index: 1 });
         assert_eq!(app.current_world_index, 1);
-        assert!(matches!(rx.try_recv(), Ok(WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) })));
+        assert!(matches!(rx.try_recv(), Ok(WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0), .. })));
         // The same switch again (the ExecuteLocalCommand that follows a typed /worlds lands
         // on a view already there): nothing more to tell.
         app.handle_remote_ws_message(WsMessage::WorldSwitched { new_index: 1 });
@@ -10895,7 +10895,7 @@ third
         // No world has pending or unseen output - only the "previous world" tier can fire.
         let history = vec!["gamma".to_string()];
 
-        let result = app.calculate_oldest_pending_world_from(0, &history);
+        let result = app.calculate_oldest_pending_world_from(0, &history, &[]);
         assert_eq!(result, Some(2), "with no pending/unseen output anywhere, should fall back to the last world visited");
     }
 
@@ -10910,7 +10910,7 @@ third
         app.worlds[1].pending_since = Some(std::time::Instant::now());
         let history = vec!["alpha".to_string()];
 
-        let result = app.calculate_oldest_pending_world_from(0, &history);
+        let result = app.calculate_oldest_pending_world_from(0, &history, &[]);
         assert_eq!(result, Some(1), "a world with actual pending output should win over the previous-world fallback");
     }
 
@@ -10920,7 +10920,7 @@ third
         app.worlds.clear();
         app.worlds.push(World::new("alpha"));
 
-        let result = app.calculate_oldest_pending_world_from(0, &[]);
+        let result = app.calculate_oldest_pending_world_from(0, &[], &[]);
         assert_eq!(result, None);
     }
 
@@ -10936,9 +10936,9 @@ third
         }
         app.worlds[2].connected = true;
         let history = vec!["beta".to_string(), "gamma".to_string()];
-        assert_eq!(app.calculate_oldest_pending_world_from(0, &history), Some(2), "beta is disconnected: walk back to gamma");
+        assert_eq!(app.calculate_oldest_pending_world_from(0, &history, &[]), Some(2), "beta is disconnected: walk back to gamma");
         app.worlds[2].connected = false;
-        assert_eq!(app.calculate_oldest_pending_world_from(0, &history), None, "nothing connected in the history: stay");
+        assert_eq!(app.calculate_oldest_pending_world_from(0, &history, &[]), None, "nothing connected in the history: stay");
     }
 
     /// The console's history is by name and follows switch_world, so Esc-w toggles back
@@ -10980,13 +10980,13 @@ third
             w.connected = true;
             app.worlds.push(w);
         }
-        app.handle_mark_world_seen(7, 1, Some(0));
-        app.handle_mark_world_seen(7, 2, Some(1));
+        app.handle_mark_world_seen(7, 1, Some(0), None);
+        app.handle_mark_world_seen(7, 2, Some(1), None);
         let history = app.ws_client_worlds[&7].history.clone();
         assert_eq!(history, vec!["beta".to_string(), "alpha".to_string()]);
-        assert_eq!(app.calculate_oldest_pending_world_from(2, &history), Some(1));
+        assert_eq!(app.calculate_oldest_pending_world_from(2, &history, &[]), Some(1));
         assert!(app.world_history.is_empty(), "the console never moved");
-        assert_eq!(app.calculate_oldest_pending_world_from(2, &[]), None);
+        assert_eq!(app.calculate_oldest_pending_world_from(2, &[], &[]), None);
     }
 
     /// Kokoro chosen without its files: the Local engine speaks, and Clay says so - at
@@ -11025,7 +11025,7 @@ third
         app.worlds[1].first_unseen_at = Some(now);
         app.worlds[2].unseen_lines = 1;
         app.worlds[2].first_unseen_at = Some(now - std::time::Duration::from_secs(5));
-        assert_eq!(app.calculate_oldest_pending_world_from(0, &[]), Some(2), "gamma's activity began earlier than beta's");
+        assert_eq!(app.calculate_oldest_pending_world_from(0, &[], &[]), Some(2), "gamma's activity began earlier than beta's");
     }
 
     // --- App::handle_update_actions ---
@@ -11393,7 +11393,7 @@ third
         assert!(!app.ws_client_worlds.contains_key(&fresh_client_id),
             "precondition: this client_id must be unknown to the server, like after a reconnect");
 
-        app.handle_mark_world_seen(fresh_client_id, 1, Some(0));
+        app.handle_mark_world_seen(fresh_client_id, 1, Some(0), None);
 
         assert!(app.worlds[0].output_lines.iter().all(|l| l.display_id != Some(fresh_client_id)),
             "world 'a' (the world being left) must have THIS client's ▶ markers released via \
@@ -11437,7 +11437,7 @@ third
             disconnected_at: None,
         });
 
-        app.handle_mark_world_seen(client_id, 1, None);
+        app.handle_mark_world_seen(client_id, 1, None, None);
 
         assert!(app.worlds[0].output_lines.iter().all(|l| l.display_id != Some(client_id)),
             "world 'a' must still have this client's ▶ markers released via the ws_client_worlds fallback lookup");
@@ -11456,7 +11456,7 @@ third
 
         // Claim it for this client first, so there is a marker that could be wrongly cleared.
         app.worlds[0].claim_unviewed(1);
-        app.handle_mark_world_seen(1, 0, Some(0));
+        app.handle_mark_world_seen(1, 0, Some(0), None);
 
         assert_eq!(app.worlds[0].output_lines[0].display_id, Some(1),
             "marking the world you're already on as seen must not clear its own ▶ markers \
@@ -11516,23 +11516,23 @@ third
 
         // Without the connect-time MarkWorldSeen, the second press bounced back to alpha:
         // from bravo, alpha's stale hour-old first_unseen_at beat charlie's fresh activity.
-        assert_eq!(app.calculate_next_world_from(1), Some(0),
+        assert_eq!(app.calculate_next_world_from(1, &[]), Some(0),
             "scenario precondition: with alpha left unseen, cycling from bravo picks alpha \
              (the bug this fix removes)");
 
         // The fix: the client's InitialState handler now sends MarkWorldSeen for the world
         // it resolved to, with no previous_world_index.
-        app.handle_mark_world_seen(client_id, 0, None);
+        app.handle_mark_world_seen(client_id, 0, None, None);
         assert_eq!(app.worlds[0].unseen_lines, 0);
         assert!(app.worlds[0].first_unseen_at.is_none(),
             "mark_seen must also drop first_unseen_at, or alpha still outranks fresher worlds");
 
         // First press from alpha: bravo (oldest remaining unseen).
-        assert_eq!(app.calculate_next_world_from(0), Some(1));
-        app.handle_mark_world_seen(client_id, 1, Some(0));
+        assert_eq!(app.calculate_next_world_from(0, &[]), Some(1));
+        app.handle_mark_world_seen(client_id, 1, Some(0), None);
 
         // Second press from bravo: charlie - NOT back to already-displayed alpha.
-        assert_eq!(app.calculate_next_world_from(1), Some(2),
+        assert_eq!(app.calculate_next_world_from(1, &[]), Some(2),
             "cycling must move on to the world with real undisplayed output instead of \
              repeating the world that was on screen at reconnect");
     }
@@ -12577,7 +12577,7 @@ third
     /// console-or-any-WS-client `is_current`. `App::add_output_to_world` is deliberately not
     /// used here - it emits CLIENT-generated text (`from_server: false`), which is never ▶.
     fn push_server_line(app: &mut App, world_idx: usize, text: &str) {
-        let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
+        let is_current = app.world_watched(world_idx);
         let settings = app.settings.clone();
         app.worlds[world_idx].add_output(&format!("{text}\n"), is_current, &settings, 24, 80, false, true, false);
     }
@@ -12749,7 +12749,7 @@ third
         assert!(!app.ws_client_viewing(2), "precondition: nobody watches C");
 
         // A second window of this client brings up C.
-        app.handle_other_views(client_id, vec![2, 2, 7]);
+        app.handle_other_views(client_id, vec![2, 2, 7], Vec::new());
         assert_eq!(app.worlds[2].unseen_lines, 0, "C was seen there");
         assert_eq!(app.worlds[2].first_unseen_at, None);
         assert!(app.ws_client_viewing(2), "C is on screen");
@@ -12764,7 +12764,7 @@ third
         app.worlds[1].connected = true;
         app.worlds[2].connected = true;
         app.settings.world_switch_mode = WorldSwitchMode::UnseenFirst;
-        assert_eq!(app.calculate_next_world_from(0), Some(1), "B, the world with unseen output");
+        assert_eq!(app.calculate_next_world_from(0, &[]), Some(1), "B, the world with unseen output");
 
         // A hidden client watches nothing, in any window.
         app.ws_client_worlds.get_mut(&client_id).unwrap().visible = false;
@@ -12776,12 +12776,12 @@ third
         assert_eq!(app.ws_client_other_views[&client_id], vec![1]);
 
         // The window closed: C is no longer watched.
-        app.handle_other_views(client_id, Vec::new());
+        app.handle_other_views(client_id, Vec::new(), Vec::new());
         assert!(!app.ws_client_other_views.contains_key(&client_id));
         assert!(!app.ws_client_viewing(1));
 
         // Reaped with the client's view state.
-        app.handle_other_views(client_id, vec![1]);
+        app.handle_other_views(client_id, vec![1], Vec::new());
         app.ws_client_worlds.get_mut(&client_id).unwrap().disconnected_at =
             Some(std::time::Instant::now() - WS_VIEWER_GRACE - std::time::Duration::from_secs(1));
         app.reap_stale_ws_client_worlds();
@@ -12948,6 +12948,259 @@ third
             matches!(m, WsMessage::PausedState { paused: true }));
         assert!(reasserted,
             "an operator pause must be re-asserted on resync so the PAUSED badge survives");
+    }
+
+    /// `/remote --pause console`: the console stops counting as watching the world it
+    /// shows, so a line there is born unviewed and is activity for a client on another
+    /// world; resuming hands what arrived to the console (its ▶) and lets the redraw mark
+    /// the world seen.
+    #[test]
+    fn test_console_pause_makes_its_world_activity() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("8bit"));
+        app.worlds.push(World::new("Other"));
+        app.current_world_index = 0;
+        app.console_tui = true;
+
+        app.process_server_data(0, b"watched\n", 24, 80, false);
+        let last = app.worlds[0].output_lines.last().unwrap();
+        assert!(last.viewed, "the console is watching: born viewed");
+        assert_eq!(app.worlds[0].unseen_lines, 0);
+
+        let msg = app.toggle_console_pause();
+        assert!(msg.starts_with("Console paused"), "{msg}");
+        assert!(!app.world_watched(0));
+        app.process_server_data(0, b"while away\n", 24, 80, false);
+        let last = app.worlds[0].output_lines.last().unwrap();
+        assert!(!last.viewed, "nobody at the console: born unviewed");
+        assert_eq!(last.display_id, None);
+        assert_eq!(app.worlds[0].unseen_lines, 1);
+        assert_eq!(app.activity_count_excluding(&[1]), 1, "activity for a client showing Other");
+
+        app.needs_output_redraw = false;
+        assert_eq!(app.toggle_console_pause(), "Console resumed.");
+        assert!(!app.console_paused);
+        let last = app.worlds[0].output_lines.last().unwrap();
+        assert_eq!(last.display_id, Some(CONSOLE_DISPLAY_ID), "what arrived is the console's ▶ now");
+        assert!(app.needs_output_redraw, "the redraw marks the world seen");
+    }
+
+    /// A key at the console resumes it (and says so); a Clay with no console refuses; the
+    /// command parses; a console reload keeps the pause, a GUI successor drops it.
+    #[test]
+    fn test_console_pause_resume_by_key_refusal_parse_and_reload() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("8bit"));
+        app.current_world_index = 0;
+        app.console_tui = true;
+        let before = app.worlds[0].output_lines.len();
+        app.console_input();
+        assert_eq!(app.worlds[0].output_lines.len(), before, "not paused: a key says nothing");
+        app.toggle_console_pause();
+        app.console_input();
+        assert!(!app.console_paused);
+        assert!(app.worlds[0].output_lines.last().unwrap().text.contains("Console resumed"));
+
+        let mut gui = App::new();
+        assert_eq!(gui.toggle_console_pause(), "This Clay has no console to pause.");
+        assert!(!gui.console_paused);
+
+        assert!(matches!(parse_command("/remote --pause console"), Command::RemotePauseConsole));
+        assert!(matches!(parse_command("/remote --pause 3"), Command::RemotePause { client_id: 3 }));
+
+        app.toggle_console_pause();
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+        let mut console = App::new();
+        console.console_tui = true;
+        crate::persistence::load_reload_state_from_str(&mut console, &text).expect("parses");
+        assert!(console.console_paused, "a console reload keeps the pause");
+        let mut gui = App::new();
+        crate::persistence::load_reload_state_from_str(&mut gui, &text).expect("parses");
+        assert!(!gui.console_paused, "a GUI successor has no console to resume");
+    }
+
+    /// `/split` (user request 2026-10-30): the console's world stays below with the focus, the
+    /// next world in order opens above; the switch keys skip it; Shift+Tab moves the focus
+    /// without switching any world; `/unsplit` closes the pane without the focus.
+    #[test]
+    fn test_console_split_open_focus_switch_and_close() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["Alpha", "Charlie", "Bravo", "Delta"] {
+            let mut w = World::new(name);
+            w.connected = true;
+            app.worlds.push(w);
+        }
+        app.worlds[3].connected = false;
+        app.current_world_index = 0;
+        app.console_tui = true;
+
+        let msg = app.split_open(None);
+        assert!(msg.starts_with("Split: Bravo is shown above"), "{msg}");
+        assert_eq!(app.split, Some(ConsoleSplit { other: 2, focus_top: false }));
+        assert!(app.console_shows(2) && app.console_watching(2));
+        assert_eq!(app.split_open(None), "The output is already split; /unsplit closes the pane without the focus.");
+        assert_eq!(app.split_open(Some("nowhere")), "World 'nowhere' not found.");
+        assert_eq!(app.split_other(), Some(2), "a failed /split leaves the split as it was");
+
+        // The switch keys step over the other pane's world: Alpha -> (Bravo) -> Charlie.
+        app.next_world();
+        assert_eq!(app.current_world_index, 1, "Charlie, past Bravo");
+        app.prev_world();
+        assert_eq!(app.current_world_index, 0, "back to Alpha, past Bravo");
+
+        // Shift+Tab: the focus goes up to Bravo; the panes keep their worlds.
+        let history = app.world_history.clone();
+        assert!(app.split_swap_focus());
+        assert_eq!(app.current_world_index, 2);
+        assert_eq!(app.split, Some(ConsoleSplit { other: 0, focus_top: true }));
+        assert_eq!(app.split.unwrap().worlds(app.current_world_index), (2, 0), "Bravo still on top, Alpha below");
+        assert_eq!(app.world_history, history, "a focus change is no visit");
+        assert_eq!(app.split_exclude(), vec![0]);
+
+        // /world onto the other pane's world shows it in both.
+        app.switch_world(0);
+        assert_eq!(app.split_exclude(), Vec::<usize>::new(), "the same world twice: nothing to skip");
+        app.switch_world(2);
+
+        // /unsplit closes the pane without the focus (Alpha, below); Bravo keeps the output.
+        let msg = app.split_close();
+        assert_eq!(msg, "Closed the pane showing Alpha.");
+        assert_eq!(app.split, None);
+        assert_eq!(app.current_world_index, 2);
+        assert_eq!(app.split_close(), "The output isn't split.");
+        assert!(!app.split_swap_focus(), "not split: Shift+Tab does nothing");
+
+        // One world only: nothing to split with.
+        let mut lone = App::new();
+        lone.worlds.clear();
+        lone.worlds.push(World::new("only"));
+        lone.current_world_index = 0;
+        assert_eq!(lone.split_open(None), "There is no other world to show.");
+
+        assert!(matches!(parse_command("/split Big World"), Command::Split { world: Some(ref w) } if w == "Big World"));
+        assert!(matches!(parse_command("/split"), Command::Split { world: None }));
+        assert!(matches!(parse_command("/unsplit"), Command::Unsplit));
+    }
+
+    /// Both panes' worlds are watched: their lines are born viewed and they are no activity;
+    /// each is paged at its own pane's height; the other pane's world gets the console's ▶ for
+    /// what arrived before it was shown, and gives it back when the pane closes.
+    #[test]
+    fn test_console_split_watches_both_worlds() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["A", "B", "C"] {
+            app.worlds.push(World::new(name));
+        }
+        app.current_world_index = 0;
+        app.console_tui = true;
+        app.process_server_data(1, b"before the split\n", 24, 80, false);
+        assert_eq!(app.worlds[1].unseen_lines, 1);
+        assert_eq!(app.activity_count(), 1);
+
+        app.split_open(Some("B"));
+        assert_eq!(app.worlds[1].output_lines.last().unwrap().display_id, Some(CONSOLE_DISPLAY_ID), "▶ for what arrived unseen");
+        app.worlds[1].mark_seen(); // the redraw does this
+        app.process_server_data(1, b"while shown\n", 24, 80, false);
+        assert!(app.worlds[1].output_lines.last().unwrap().viewed, "on screen above: born viewed");
+        assert_eq!(app.worlds[1].unseen_lines, 0);
+        app.process_server_data(2, b"elsewhere\n", 24, 80, false);
+        assert_eq!(app.activity_count(), 1, "C only: both shown worlds are left out");
+
+        // Each pane pages its own world at its own height.
+        app.output_height = 11;
+        app.pane_rows = (5, 11);
+        assert_eq!(app.console_rows_for(1), 5, "the top pane's world");
+        assert_eq!(app.console_rows_for(0), 11, "the focused pane's");
+        assert_eq!(app.console_rows_for(2), 11, "a world not shown: where it would appear");
+
+        app.split_close();
+        assert_eq!(app.worlds[1].output_lines.iter().filter(|l| l.display_id == Some(CONSOLE_DISPLAY_ID)).count(), 0, "▶ given back");
+        assert!(!app.console_watching(1));
+    }
+
+    /// The split survives a console's reload by its world's name; a GUI successor has no
+    /// console to split; deleting a pane's world closes it, one before it moves it.
+    #[test]
+    fn test_console_split_reload_and_world_removal() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["A", "B", "C"] {
+            app.worlds.push(World::new(name));
+        }
+        app.current_world_index = 0;
+        app.console_tui = true;
+        app.split_open(Some("C"));
+        app.split_swap_focus();
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+        let mut console = App::new();
+        console.console_tui = true;
+        crate::persistence::load_reload_state_from_str(&mut console, &text).expect("parses");
+        assert_eq!(console.current_world_index, 2, "C has the focus");
+        assert_eq!(console.split, Some(ConsoleSplit { other: 0, focus_top: true }));
+        let mut gui = App::new();
+        crate::persistence::load_reload_state_from_str(&mut gui, &text).expect("parses");
+        assert_eq!(gui.split, None);
+
+        // Removing B (before C, after A) moves nothing out of place.
+        console.delete_world(1);
+        assert_eq!(console.current_world_index, 1, "C moved up");
+        assert_eq!(console.split, Some(ConsoleSplit { other: 0, focus_top: true }));
+        // Removing a pane's world closes the split.
+        console.delete_world(0);
+        assert_eq!(console.split, None);
+    }
+
+    /// A client's split: its other pane (`OtherViews`) is claimed for its ▶ and released when
+    /// it closes; a focus swap (`MarkWorldSeen` with the new other views) keeps both panes'
+    /// markers; its size pages the world; the switch keys skip it (`exclude`).
+    #[test]
+    fn test_client_split_views_markers_and_sizes() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["A", "B", "C"] {
+            let mut w = World::new(name);
+            w.connected = true;
+            app.worlds.push(w);
+        }
+        app.current_world_index = 9999; // the console watches none of them
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        app.handle_mark_world_seen(client_id, 0, None, None);
+        push_server_line(&mut app, 1, "unseen on B");
+        push_server_line(&mut app, 1, "more on B");
+        let owner = app.display_owner_id(client_id);
+        let owned = |app: &App, w: usize| app.worlds[w].output_lines.iter().filter(|l| l.display_id == Some(owner)).count();
+
+        app.handle_other_views(client_id, vec![1], vec![crate::websocket::ViewDims { world: 1, lines: 9, columns: 70 }]);
+        assert_eq!(owned(&app, 1), 2, "B's unseen lines are this client's ▶");
+        assert!(app.ws_client_viewing(1));
+        assert_eq!(app.min_viewer_lines(1), Some(9), "B pages at the pane's height");
+        assert_eq!(app.min_viewer_width(1), Some(70));
+
+        // Focus moves up to B: A stays on screen, so neither loses its markers.
+        push_server_line(&mut app, 2, "elsewhere");
+        app.handle_mark_world_seen(client_id, 1, Some(0), Some(vec![0]));
+        assert_eq!(owned(&app, 1), 2, "B kept");
+        assert_eq!(app.ws_client_worlds[&client_id].world_index, 1);
+        assert_eq!(app.ws_client_other_views[&client_id], vec![0]);
+        assert!(app.ws_client_viewing(0) && app.ws_client_viewing(1));
+
+        // The switch keys skip the other pane: from B, Next is C, not A.
+        app.settings.world_switch_mode = WorldSwitchMode::Alphabetical;
+        assert_eq!(app.calculate_next_world_from(1, &[0]), Some(2));
+        assert_eq!(app.calculate_oldest_pending_world_from(1, &[], &[2]), None, "C excluded: nowhere");
+
+        // /unsplit: A leaves the screen and its markers go.
+        app.handle_other_views(client_id, Vec::new(), Vec::new());
+        assert!(!app.ws_client_viewing(0));
+        assert_eq!(app.min_viewer_lines(0), None);
     }
 
     /// An auth-key login gets the same post-login treatment as a password login: its stable
@@ -13742,15 +13995,15 @@ third
         world_with_unviewed_backlog(&mut app, 3, 0);
         let (client_id, mut rx) = phase_c_register_client(&mut app);
 
-        app.handle_mark_world_seen(client_id, 0, None);
+        app.handle_mark_world_seen(client_id, 0, None, None);
         assert_eq!(claimed_new_seqs(&drain_ws_messages(&mut rx)), vec![vec![0, 1, 2]],
             "precondition: the first display claims the unviewed head");
 
         // Switch away and back. Everything is viewed now, so there is nothing left to claim -
         // but the client must still receive the (empty) answer.
-        app.handle_mark_world_seen(client_id, 1, Some(0));
+        app.handle_mark_world_seen(client_id, 1, Some(0), None);
         let _ = drain_ws_messages(&mut rx);
-        app.handle_mark_world_seen(client_id, 0, Some(1));
+        app.handle_mark_world_seen(client_id, 0, Some(1), None);
 
         let msgs = drain_ws_messages(&mut rx);
         assert_eq!(claimed_new_seqs(&msgs), vec![Vec::<u64>::new()],
@@ -13801,7 +14054,7 @@ third
         world_with_unviewed_backlog(&mut app, 3, 0);
         let (old, _old_rx) = phase_c_register_client(&mut app);
         app.set_display_owner_id(old, "phone");
-        app.handle_mark_world_seen(old, 0, None);
+        app.handle_mark_world_seen(old, 0, None, None);
         let owner = app.display_owner_id(old);
         assert_eq!(owners(&app, 0), vec![Some(owner); 3], "precondition: claimed");
 
@@ -13810,7 +14063,7 @@ third
         let new = 2;
         let mut new_rx = add_ws_connection(&mut app, new);
         app.set_display_owner_id(new, "phone");
-        app.handle_mark_world_seen(new, 0, None);
+        app.handle_mark_world_seen(new, 0, None, None);
         let _ = drain_ws_messages(&mut new_rx);
 
         // The old connection's grace runs out and the reaper gets to it.
@@ -13824,7 +14077,7 @@ third
         assert_eq!(owners(&app, 0), vec![Some(owner); 3],
             "the reconnected app still shows these markers, so the server must keep them");
         // ...and leaving the world clears them on the app, as it should.
-        app.handle_mark_world_seen(new, 1, Some(0));
+        app.handle_mark_world_seen(new, 1, Some(0), None);
         let msgs = drain_ws_messages(&mut new_rx);
         assert!(msgs.iter().any(|m| matches!(m, crate::websocket::WsMessage::ReleasedNew { world_index: 0 })),
             "leaving releases them: {msgs:#?}");
@@ -13838,7 +14091,7 @@ third
         world_with_unviewed_backlog(&mut app, 2, 0);
         let (old, _rx) = phase_c_register_client(&mut app);
         app.set_display_owner_id(old, "phone");
-        app.handle_mark_world_seen(old, 0, None);
+        app.handle_mark_world_seen(old, 0, None, None);
         app.handle_ws_client_disconnected(old);
         let long_ago = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(16 * 60))
@@ -13891,12 +14144,12 @@ third
         let mut window_rx = add_ws_connection(&mut app, window);
         app.set_display_owner_id(main, "phone");
         app.set_display_owner_id(window, "phone");
-        app.handle_mark_world_seen(window, 0, None);
-        app.handle_mark_world_seen(main, 0, None);
+        app.handle_mark_world_seen(window, 0, None, None);
+        app.handle_mark_world_seen(main, 0, None, None);
         let _ = drain_ws_messages(&mut main_rx);
         let _ = drain_ws_messages(&mut window_rx);
 
-        app.handle_mark_world_seen(main, 1, Some(0));
+        app.handle_mark_world_seen(main, 1, Some(0), None);
 
         let released = |msgs: &[WsMessage]| msgs.iter().any(|m| matches!(m, WsMessage::ReleasedNew { world_index: 0 }));
         assert!(released(&drain_ws_messages(&mut main_rx)), "the connection that left is told");
@@ -13918,7 +14171,7 @@ third
         let (client_id, mut rx) = phase_c_register_client(&mut app);
 
         // Client switches to world 0: claims the head, which already worked.
-        app.handle_mark_world_seen(client_id, 0, None);
+        app.handle_mark_world_seen(client_id, 0, None, None);
         let head_claims = claimed_new_seqs(&drain_ws_messages(&mut rx));
         assert_eq!(head_claims, vec![vec![0, 1, 2]],
             "precondition: switching in claims the visible head");
@@ -13950,7 +14203,7 @@ third
         let mut app = App::new();
         world_with_unviewed_backlog(&mut app, 1, 4);
         let (client_id, mut rx) = phase_c_register_client(&mut app);
-        app.handle_mark_world_seen(client_id, 0, None);
+        app.handle_mark_world_seen(client_id, 0, None, None);
         let _ = drain_ws_messages(&mut rx);
 
         app.release_pending_lines(client_id, 0, 0);
@@ -14030,8 +14283,8 @@ third
                 needs_resync: std::collections::HashSet::new(),
             });
         }
-        app.handle_mark_world_seen(client_a, 0, None);
-        app.handle_mark_world_seen(client_b, 0, None);
+        app.handle_mark_world_seen(client_a, 0, None, None);
+        app.handle_mark_world_seen(client_b, 0, None, None);
         let _ = drain_ws_messages(&mut rx_a);
         let _ = drain_ws_messages(&mut rx_b);
 

@@ -2893,6 +2893,11 @@ pub enum Command {
     Flush,
     /// /menu - show menu popup to select windows/popups
     Menu,
+    /// /split [world] - split the output: a second pane above showing `world` (else the
+    /// next world in order); each interface splits its own (user request 2026-10-30)
+    Split { world: Option<String> },
+    /// /unsplit - close the split pane without the focus
+    Unsplit,
     /// /font - show font settings popup (web/GUI only)
     Font,
     /// /send [-W] [-T<type>] [-w[<world>]] [-n] [-h] <text> - send text
@@ -2932,6 +2937,8 @@ pub enum Command {
     RemoteKill { client_id: u64 },
     /// /remote --pause <id> - toggle pause state on a remote client
     RemotePause { client_id: u64 },
+    /// /remote --pause console - toggle whether the console counts as watching its world
+    RemotePauseConsole,
     /// /ban - show banned hosts
     BanList,
     /// /unban <host> - remove ban for host
@@ -3118,6 +3125,8 @@ pub fn parse_command(input: &str) -> Command {
         }
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
+        "/split" => Command::Split { world: (!args.is_empty()).then(|| args.join(" ")) },
+        "/unsplit" => Command::Unsplit,
         "/font" => Command::Font,
         "/send" => parse_send_command(args, trimmed),
         "/log" => parse_log_command(args, trimmed),
@@ -3129,7 +3138,9 @@ pub fn parse_command(input: &str) -> Command {
                     Command::Unknown { cmd: trimmed.to_string() }
                 }
             } else if args.len() >= 2 && args[0] == "--pause" {
-                if let Ok(id) = args[1].parse::<u64>() {
+                if args[1].eq_ignore_ascii_case("console") {
+                    Command::RemotePauseConsole
+                } else if let Ok(id) = args[1].parse::<u64>() {
                     Command::RemotePause { client_id: id }
                 } else {
                     Command::Unknown { cmd: trimmed.to_string() }
@@ -5940,6 +5951,24 @@ pub(crate) enum ScrollbackRequestKind {
 /// the nested tuple is otherwise repeated at every boundary it crosses.
 type OutputRun<'a> = (bool, Vec<(&'a str, Option<String>)>);
 
+/// The console's split output (`/split`, user request 2026-10-30): a second pane above the
+/// usual one. The focused pane's world is `App::current_world_index`, so everything that
+/// acts on "the current world" - the typed line, actions, `/world`, paging, TF's
+/// foreground world - acts on the focused pane; `other` is the unfocused pane's world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsoleSplit {
+    pub(crate) other: usize,
+    /// The top pane has the focus (else the bottom one).
+    pub(crate) focus_top: bool,
+}
+
+impl ConsoleSplit {
+    /// (the top pane's world, the bottom pane's) when `current` has the focus.
+    pub(crate) fn worlds(&self, current: usize) -> (usize, usize) {
+        if self.focus_top { (current, self.other) } else { (self.other, current) }
+    }
+}
+
 pub struct App {
     pub worlds: Vec<World>,
     pub current_world_index: usize,
@@ -6023,6 +6052,12 @@ pub struct App {
     /// (`WsMessage::OtherViews`, the native GUI's `/window`s). They count as on screen
     /// while the client itself does (`ws_client_viewing`); reaped with its view state.
     pub ws_client_other_views: std::collections::HashMap<u64, Vec<usize>>,
+    /// Client id -> the size it shows each of its other views at (`OtherViews.dims`): they
+    /// page those worlds for it (`min_viewer_lines`) and size a shell world's PTY.
+    pub ws_client_other_view_dims: std::collections::HashMap<u64, Vec<websocket::ViewDims>>,
+    /// Clients that split their own output (`UpdateViewState.splits`): a `/split` the server
+    /// runs for one is sent back to it to do.
+    pub ws_client_splits: std::collections::HashSet<u64>,
     /// Connection id -> stable ▶ ownership id, seeded from `AuthRequest.client_uid`. See
     /// `App::display_owner_id`. Entries are dropped when the client's `ClientViewState` is
     /// reaped, so this stays bounded by the live client count.
@@ -6042,9 +6077,22 @@ pub struct App {
     pub(crate) tf_resize: Option<(u16, u16)>,
     /// This is Clay's own console (the TUI in `run_app`), which has a terminal to lend.
     pub(crate) console_tui: bool,
+    /// `/remote --pause console`: nobody is at the console, so the world it shows isn't
+    /// watched (`console_watching`) - its activity shows as new on other sessions, as a
+    /// paused client's does. A key at the console resumes it (`console_input`).
+    pub(crate) console_paused: bool,
+    /// `/split`: the console's second pane; None while the output is one area.
+    pub(crate) split: Option<ConsoleSplit>,
+    /// The rows of the top and bottom panes as last laid out by `ui()`, while split.
+    pub(crate) pane_rows: (u16, u16),
+    /// The rows of the whole output area (both panes and the bar between them).
+    pub(crate) output_area_rows: u16,
     /// The world the console drew last (by name), to tell a world switch as it is drawn
-    /// (`track_console_world`), however the switch happened.
+    /// (`track_console_world`), however the switch happened: the bottom pane's (the only
+    /// one while not split).
     pub(crate) console_drawn_world: Option<String>,
+    /// The world the split's top pane drew last (by name); None while not split.
+    pub(crate) console_drawn_top: Option<String>,
     /// The console's terminal size (columns, lines), as last drawn.
     pub(crate) screen_size: Option<(u16, u16)>,
     /// TF's status area per world, once a script has made it its own (`tf::status`):
@@ -6077,6 +6125,9 @@ pub struct App {
     /// `InitialState.history_on_demand`): Page Up past the oldest line asks for older ones,
     /// from the server's memory and then its archive.
     pub server_history_on_demand: bool,
+    /// Remote console only: the server takes `OtherViews` (its `InitialState.other_views`),
+    /// which is how it learns of this console's split pane (`/split`).
+    pub server_takes_other_views: bool,
     /// Remote console only: the last `RequestHistory.request_id` sent.
     pub next_history_request_id: u64,
     /// Remote console only: the server's build for `/version`'s `Remote` line (its
@@ -6376,6 +6427,8 @@ impl App {
             output_painted_by_crossterm: false,
             ws_client_worlds: std::collections::HashMap::new(),
             ws_client_other_views: std::collections::HashMap::new(),
+            ws_client_other_view_dims: std::collections::HashMap::new(),
+            ws_client_splits: std::collections::HashSet::new(),
             ws_client_owner_ids: std::collections::HashMap::new(),
             ws_client_interface: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
@@ -6383,7 +6436,12 @@ impl App {
             last_temp_world: 0,
             tf_resize: None,
             console_tui: false,
+            console_paused: false,
+            split: None,
+            pane_rows: (0, 0),
+            output_area_rows: 20,
             console_drawn_world: None,
+            console_drawn_top: None,
             screen_size: None,
             tf_status: std::collections::HashMap::new(),
             tf_status_at: None,
@@ -6396,6 +6454,7 @@ impl App {
             server_expands_line: false,
             server_picture_upload: false,
             server_history_on_demand: false,
+            server_takes_other_views: false,
             next_history_request_id: 0,
             server_version_detail: None,
             picture_uploads: picture::IncomingUploads::default(),
@@ -8246,7 +8305,7 @@ impl App {
                     let previous = self.current_world_index;
                     self.current_world_index = new_index;
                     if let Some(ref tx) = self.ws_client_tx {
-                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: new_index, previous_world_index: Some(previous) });
+                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: new_index, previous_world_index: Some(previous), other_views: None });
                     }
                 }
                 self.needs_output_redraw = true;
@@ -8411,7 +8470,7 @@ impl App {
                     // leaving so it can clear that world's marked_new indicators even
                     // across a reconnect (see MarkWorldSeen's previous_world_index doc).
                     if let Some(ref tx) = self.ws_client_tx {
-                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
+                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx), other_views: None });
                     }
                 }
             }
@@ -9487,37 +9546,64 @@ impl App {
     /// than in each way of switching worlds, which differ between the two consoles.
     /// Returns true when the console shows a different world than it drew last.
     pub(crate) fn track_console_world(&mut self) -> bool {
-        let Some(now) = self.worlds.get(self.current_world_index).map(|w| w.name.clone()) else { return false };
-        match self.console_drawn_world.as_deref() {
-            Some(prev) if prev == now => return false,
-            None => {
-                // The first draw since starting (or a reload): what's there counts as seen.
-                for world in &mut self.worlds {
-                    world.console_seen_seq = world.output_lines.last().map(|l| l.seq);
-                }
+        // Each pane by its place: the bottom one (the only one while not split) and a
+        // split's top one. A focus change moves neither pane's world, so it is no switch.
+        let (top, bottom) = match self.split {
+            Some(split) => {
+                let (t, b) = split.worlds(self.current_world_index);
+                (Some(t), b)
             }
-            Some(prev) => {
-                if let Some(left) = self.worlds.iter_mut().find(|w| w.name == prev) {
-                    if let Some(seq) = left.output_lines.last().map(|l| l.seq) {
-                        left.console_seen_seq = Some(seq);
-                    }
-                    left.console_textdiv = None;
+            None => (None, self.current_world_index),
+        };
+        let name = |app: &Self, i: usize| app.worlds.get(i).map(|w| w.name.clone());
+        let Some(bottom_now) = name(self, bottom) else { return false };
+        let top_now = top.and_then(|t| name(self, t));
+        if self.console_drawn_world.is_none() {
+            // The first draw since starting (or a reload): what's there counts as seen.
+            for world in &mut self.worlds {
+                world.console_seen_seq = world.output_lines.last().map(|l| l.seq);
+            }
+            self.console_drawn_world = Some(bottom_now);
+            self.console_drawn_top = top_now;
+            return true;
+        }
+        let drawn = [self.console_drawn_world.clone(), self.console_drawn_top.clone()];
+        let now = [Some(bottom_now.clone()), top_now.clone()];
+        if drawn == now {
+            return false;
+        }
+        // A world no pane shows any more has been seen up to its newest line...
+        for prev in drawn.iter().flatten() {
+            if now.iter().flatten().any(|n| n == prev) {
+                continue;
+            }
+            if let Some(left) = self.worlds.iter_mut().find(|w| &w.name == prev) {
+                if let Some(seq) = left.output_lines.last().map(|l| l.seq) {
+                    left.console_seen_seq = Some(seq);
                 }
-                let mode = TextDivMode::from_setting(&self.settings.textdiv);
-                let world = &mut self.worlds[self.current_world_index];
-                world.console_textdiv = mode.and_then(|mode| {
-                    let after_seq = world.console_seen_seq;
-                    let is_new = |l: &OutputLine| after_seq.is_none_or(|seen| l.seq > seen);
-                    let has_new = world.output_lines.last().is_some_and(is_new) || world.pending_lines.iter().any(is_new);
-                    (mode != TextDivMode::On || has_new).then_some(ConsoleTextDiv { after_seq, mode, forced: false })
-                });
-                // The text-reveal effect (src/reveal.rs) types the screen a switch shows on
-                // as if it had just arrived (user ruling 2026-10-24): a real switch only, so
-                // the first draw after a start or a reload leaves the screen as it was.
-                world.console_shown_at = Some(SystemTime::now());
+                left.console_textdiv = None;
             }
         }
-        self.console_drawn_world = Some(now);
+        // ...and one that wasn't on screen before has arrived.
+        let mode = TextDivMode::from_setting(&self.settings.textdiv);
+        for arrived in now.iter().flatten() {
+            if drawn.iter().flatten().any(|d| d == arrived) {
+                continue;
+            }
+            let Some(world) = self.worlds.iter_mut().find(|w| &w.name == arrived) else { continue };
+            world.console_textdiv = mode.and_then(|mode| {
+                let after_seq = world.console_seen_seq;
+                let is_new = |l: &OutputLine| after_seq.is_none_or(|seen| l.seq > seen);
+                let has_new = world.output_lines.last().is_some_and(is_new) || world.pending_lines.iter().any(is_new);
+                (mode != TextDivMode::On || has_new).then_some(ConsoleTextDiv { after_seq, mode, forced: false })
+            });
+            // The text-reveal effect (src/reveal.rs) types the screen a switch shows on
+            // as if it had just arrived (user ruling 2026-10-24): a real switch only, so
+            // the first draw after a start or a reload leaves the screen as it was.
+            world.console_shown_at = Some(SystemTime::now());
+        }
+        self.console_drawn_world = Some(bottom_now);
+        self.console_drawn_top = top_now;
         true
     }
 
@@ -9550,7 +9636,8 @@ impl App {
             // doesn't exist took the lines from that client, whose own claim then found
             // nothing (deferred bug G1, 2026-10-28).
             let console = self.console_tui;
-            if console {
+            // ...unless the other pane of a split still shows it.
+            if console && self.split_other() != Some(old_index) {
                 self.release_world_for(old_index, CONSOLE_DISPLAY_ID, None);
             }
             // The world we leave goes to the front of the visit history (Esc-w's last tier).
@@ -9579,12 +9666,115 @@ impl App {
         }
     }
 
+    /// `/split [world]` (user request 2026-10-30): a second pane opens above the output,
+    /// showing `world` - else the next world in order after the current one
+    /// (`util::split_next_world`) - and the focus stays on the current world below. Already
+    /// split, a named world goes into the pane without the focus. Nothing connects or
+    /// disconnects. Returns what to tell the user.
+    pub(crate) fn split_open(&mut self, world: Option<&str>) -> String {
+        let named = match world.map(str::trim).filter(|w| !w.is_empty()) {
+            Some(name) => match self.find_world_index(name) {
+                Some(i) => Some(i),
+                None => return format!("World '{}' not found.", name),
+            },
+            None => None,
+        };
+        let target = match (named, self.split) {
+            (Some(i), _) => i,
+            (None, Some(_)) => return "The output is already split; /unsplit closes the pane without the focus.".to_string(),
+            (None, None) => {
+                let worlds: Vec<(&str, bool)> = self.worlds.iter().map(|w| (w.name.as_str(), w.connected)).collect();
+                match crate::util::split_next_world(&worlds, self.current_world_index) {
+                    Some(i) => i,
+                    None => return "There is no other world to show.".to_string(),
+                }
+            }
+        };
+        let previous = self.split_other();
+        let focus_top = self.split.is_some_and(|s| s.focus_top);
+        self.split = Some(ConsoleSplit { other: target, focus_top });
+        if self.console_tui {
+            if let Some(old) = previous.filter(|&o| o != target && o != self.current_world_index) {
+                self.release_world_for(old, CONSOLE_DISPLAY_ID, None);
+            }
+            self.claim_world_for(target, CONSOLE_DISPLAY_ID, None);
+        }
+        self.needs_output_redraw = true;
+        self.needs_terminal_clear = true;
+        self.broadcast_activity();
+        let name = self.worlds[target].name.clone();
+        if previous.is_some() {
+            format!("The other pane shows {}.", name)
+        } else {
+            format!("Split: {} is shown above. Shift+Tab moves between the panes; /unsplit closes the one without the focus.", name)
+        }
+    }
+
+    /// `/unsplit`: the pane without the focus closes, and the focused one has the output
+    /// area again. Nothing disconnects.
+    pub(crate) fn split_close(&mut self) -> String {
+        let Some(split) = self.split.take() else { return "The output isn't split.".to_string() };
+        let closed = split.other;
+        if closed != self.current_world_index {
+            if self.console_tui {
+                self.release_world_for(closed, CONSOLE_DISPLAY_ID, None);
+            }
+            if let Some(world) = self.worlds.get_mut(closed) {
+                if world.pending_lines.is_empty() {
+                    world.lines_since_pause = 0;
+                }
+            }
+        }
+        self.needs_output_redraw = true;
+        self.needs_terminal_clear = true;
+        self.broadcast_activity();
+        let name = self.worlds.get(closed).map(|w| w.name.clone()).unwrap_or_default();
+        format!("Closed the pane showing {}.", name)
+    }
+
+    /// Shift+Tab (`split_focus`): the focus moves to the other pane, whose world becomes
+    /// the current one. Neither pane's world changes, so it is no world switch: no ▶ is
+    /// released or claimed and the visit history stays. TF's foreground world does change,
+    /// so its WORLD hook fires. False when not split.
+    pub(crate) fn split_swap_focus(&mut self) -> bool {
+        let current = self.current_world_index;
+        let Some(split) = self.split.as_mut() else { return false };
+        let other = split.other;
+        split.other = current;
+        split.focus_top = !split.focus_top;
+        // A half-entered chord or a shell world's armed Escape belongs to the pane left.
+        self.chord.cancel();
+        self.shell_esc_armed_at = None;
+        self.current_world_index = other;
+        self.needs_output_redraw = true;
+        if other != current && self.is_master {
+            let name = self.worlds[other].name.clone();
+            self.fire_tf_hook(Some(other), tf::TfHookEvent::World, &name, false);
+        }
+        true
+    }
+
+    /// The SSH console's split as the server should know it: `OtherViews` with the other
+    /// pane's world and size, when the server takes it (an empty list closes it there).
+    pub(crate) fn remote_other_views(&self) -> Option<WsMessage> {
+        if !self.server_takes_other_views {
+            return None;
+        }
+        let other = self.split_other().filter(|&o| o != self.current_world_index);
+        let dims = other.map(|world| websocket::ViewDims {
+            world,
+            lines: self.console_rows_for(world) as usize,
+            columns: self.output_width as usize,
+        });
+        Some(WsMessage::OtherViews { worlds: other.into_iter().collect(), dims: dims.into_iter().collect() })
+    }
+
     /// The console's Esc-w: switch to the world with activity, else back to the last world
     /// visited that is still connected (`calculate_oldest_pending_world_from`, with the
     /// console's own visit history). Returns true if switched, false if nowhere to switch.
     fn switch_to_oldest_pending(&mut self) -> bool {
         let history = self.world_history.clone();
-        match self.calculate_oldest_pending_world_from(self.current_world_index, &history) {
+        match self.calculate_oldest_pending_world_from(self.current_world_index, &history, &self.split_exclude()) {
             Some(idx) => {
                 self.switch_world(idx);
                 true
@@ -9701,31 +9891,22 @@ impl App {
         }
     }
 
+    /// The switch keys never land on the world in the console's other pane (`/split`).
     fn next_world(&mut self) {
-        // Build world info for shared function
-        let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
-            .map(|w| crate::util::WorldSwitchInfo {
-                name: w.name.clone(),
-                connected: w.connected,
-                unseen_lines: w.unseen_lines,
-                pending_lines: w.pending_lines.len(),
-                is_reconnecting: w.is_reconnecting(),
-                first_unseen_at: w.first_unseen_at,
-            })
-            .collect();
-
-        if let Some(next_idx) = crate::util::calculate_next_world(
-            &world_info,
-            self.current_world_index,
-            self.settings.world_switch_mode,
-        ) {
+        if let Some(next_idx) = self.calculate_next_world_from(self.current_world_index, &self.split_exclude()) {
             self.switch_world(next_idx);
         }
     }
 
     fn prev_world(&mut self) {
-        // Build world info for shared function
-        let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+        if let Some(prev_idx) = self.calculate_prev_world_from(self.current_world_index, &self.split_exclude()) {
+            self.switch_world(prev_idx);
+        }
+    }
+
+    /// Every world as the shared switch rule (`util::calculate_world_switch`) sees it.
+    fn world_switch_info(&self) -> Vec<crate::util::WorldSwitchInfo> {
+        self.worlds.iter()
             .map(|w| crate::util::WorldSwitchInfo {
                 name: w.name.clone(),
                 connected: w.connected,
@@ -9734,15 +9915,7 @@ impl App {
                 is_reconnecting: w.is_reconnecting(),
                 first_unseen_at: w.first_unseen_at,
             })
-            .collect();
-
-        if let Some(prev_idx) = crate::util::calculate_prev_world(
-            &world_info,
-            self.current_world_index,
-            self.settings.world_switch_mode,
-        ) {
-            self.switch_world(prev_idx);
-        }
+            .collect()
     }
 
     /// Cycle to the previous (`direction < 0`) or next (`direction > 0`) CONNECTED world, in
@@ -9757,8 +9930,9 @@ impl App {
     /// cycle to - no connected worlds at all, or only the current one - mirroring
     /// `util::calculate_world_switch`'s own "no-op switch" convention.
     fn cycle_connected_world(&mut self, direction: i32) -> Option<usize> {
+        let skip = self.split_exclude();
         let connected: Vec<usize> = self.worlds.iter().enumerate()
-            .filter(|(_, w)| w.connected)
+            .filter(|(i, w)| w.connected && !skip.contains(i))
             .map(|(i, _)| i)
             .collect();
         if connected.is_empty() {
@@ -9794,34 +9968,15 @@ impl App {
         }
     }
 
-    /// Calculate the next world index from a given starting point (without switching)
-    fn calculate_next_world_from(&self, from_index: usize) -> Option<usize> {
-        let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
-            .map(|w| crate::util::WorldSwitchInfo {
-                name: w.name.clone(),
-                connected: w.connected,
-                unseen_lines: w.unseen_lines,
-                pending_lines: w.pending_lines.len(),
-                is_reconnecting: w.is_reconnecting(),
-                first_unseen_at: w.first_unseen_at,
-            })
-            .collect();
-        crate::util::calculate_next_world(&world_info, from_index, self.settings.world_switch_mode)
+    /// Calculate the next world index from a given starting point (without switching),
+    /// never landing on `exclude` (a split's other pane).
+    fn calculate_next_world_from(&self, from_index: usize, exclude: &[usize]) -> Option<usize> {
+        crate::util::calculate_world_switch(&self.world_switch_info(), from_index, self.settings.world_switch_mode, crate::util::SwitchDirection::Next, exclude)
     }
 
     /// Calculate the previous world index from a given starting point (without switching)
-    fn calculate_prev_world_from(&self, from_index: usize) -> Option<usize> {
-        let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
-            .map(|w| crate::util::WorldSwitchInfo {
-                name: w.name.clone(),
-                connected: w.connected,
-                unseen_lines: w.unseen_lines,
-                pending_lines: w.pending_lines.len(),
-                is_reconnecting: w.is_reconnecting(),
-                first_unseen_at: w.first_unseen_at,
-            })
-            .collect();
-        crate::util::calculate_prev_world(&world_info, from_index, self.settings.world_switch_mode)
+    fn calculate_prev_world_from(&self, from_index: usize, exclude: &[usize]) -> Option<usize> {
+        crate::util::calculate_world_switch(&self.world_switch_info(), from_index, self.settings.world_switch_mode, crate::util::SwitchDirection::Previous, exclude)
     }
 
     /// Where Esc-w goes from `current_index` - the console's (`switch_to_oldest_pending`)
@@ -9833,10 +9988,12 @@ impl App {
     /// world whose held (more-mode) output is oldest, then the world whose unseen output
     /// arrived first (a world left paused with hidden rows counts too), and last the most
     /// recent world in `history` that is connected and not the current one. None: stay.
-    fn calculate_oldest_pending_world_from(&self, current_index: usize, history: &[String]) -> Option<usize> {
+    /// Never `exclude` (a split's other pane, already on screen).
+    fn calculate_oldest_pending_world_from(&self, current_index: usize, history: &[String], exclude: &[usize]) -> Option<usize> {
+        let elsewhere = |idx: usize| idx != current_index && !exclude.contains(&idx);
         // 1) Oldest held output.
         let oldest_pending = self.worlds.iter().enumerate()
-            .filter(|(idx, w)| *idx != current_index && !w.pending_lines.is_empty())
+            .filter(|(idx, w)| elsewhere(*idx) && !w.pending_lines.is_empty())
             .filter_map(|(idx, w)| w.pending_since.map(|t| (t, idx)))
             .min_by_key(|(t, _)| *t)
             .map(|(_, idx)| idx);
@@ -9846,7 +10003,7 @@ impl App {
         // 2) Oldest unseen output (a world with no timestamp - left paused with hidden
         // VLO-truncated rows and nothing pending - comes after those that have one).
         let oldest_unseen = self.worlds.iter().enumerate()
-            .filter(|(idx, w)| *idx != current_index && (w.unseen_lines > 0 || (w.paused && w.visual_line_offset > 0)))
+            .filter(|(idx, w)| elsewhere(*idx) && (w.unseen_lines > 0 || (w.paused && w.visual_line_offset > 0)))
             .min_by_key(|(idx, w)| (w.first_unseen_at.is_none(), w.first_unseen_at, *idx))
             .map(|(idx, _)| idx);
         if oldest_unseen.is_some() {
@@ -9855,7 +10012,7 @@ impl App {
         // 3) The last world visited that is still connected.
         history.iter()
             .filter_map(|name| self.find_world_index(name))
-            .find(|&idx| idx != current_index && self.worlds[idx].connected)
+            .find(|&idx| elsewhere(idx) && self.worlds[idx].connected)
     }
 
     /// `WsMessage::CycleWorld` handling — shared by master-WS and daemon (T39). Confirmed
@@ -9866,10 +10023,11 @@ impl App {
             .map(|s| s.world_index)
             .unwrap_or(self.current_world_index);
 
+        let skip = self.ws_client_other_views.get(&client_id).cloned().unwrap_or_default();
         let new_index = if direction == "up" {
-            self.calculate_prev_world_from(current)
+            self.calculate_prev_world_from(current, &skip)
         } else {
-            self.calculate_next_world_from(current)
+            self.calculate_next_world_from(current, &skip)
         };
 
         let Some(idx) = new_index else { return; };
@@ -10401,7 +10559,7 @@ impl App {
     /// a reconnect: a new `client_id` has no entry, so without the client-supplied hint the
     /// previous world's `marked_new` indicators never get cleared (they'd otherwise only
     /// clear once the client happens to revisit that world with an unbroken connection).
-    pub(crate) fn handle_mark_world_seen(&mut self, client_id: u64, world_index: usize, previous_world_index: Option<usize>) {
+    pub(crate) fn handle_mark_world_seen(&mut self, client_id: u64, world_index: usize, previous_world_index: Option<usize>, other_views: Option<Vec<usize>>) {
         if world_index >= self.worlds.len() {
             return;
         }
@@ -10409,11 +10567,18 @@ impl App {
         let old_world_idx = previous_world_index
             .or_else(|| self.ws_client_worlds.get(&client_id).map(|s| s.world_index));
         let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
+        // A split's focus moving to the other pane: the other views change with the switch,
+        // and first, so the world left (still on screen in the other pane) keeps its markers.
+        if let Some(others) = other_views {
+            self.set_client_other_views(client_id, others, world_index);
+        }
+        let still_shown = |app: &Self, w: usize| app.ws_client_other_views.get(&client_id).is_some_and(|o| o.contains(&w));
         // When switching away from the old world, drop THIS client's ▶ markers there
         // and reset lines_since_pause if more-mode hasn't triggered. Other clients'
-        // markers on the same lines are untouched.
+        // markers on the same lines are untouched. Not while the client still shows it
+        // in another view (a split's other pane).
         if let Some(old_idx) = old_world_idx {
-            if old_idx != world_index && old_idx < self.worlds.len() {
+            if old_idx != world_index && old_idx < self.worlds.len() && !still_shown(self, old_idx) {
                 let owner = self.display_owner_id(client_id);
                 self.release_world_for(old_idx, owner, Some(client_id));
                 if self.worlds[old_idx].pending_lines.is_empty() {
@@ -10456,28 +10621,55 @@ impl App {
     }
 
     /// `WsMessage::OtherViews` handling — shared by master-WS and daemon single-user: the
-    /// worlds `client_id` also shows in other windows of its own (the native GUI's
-    /// `/window`s, which share its connection and say nothing for themselves). They count
-    /// as on screen from now on (`ws_client_viewing`), and one that wasn't listed before
-    /// has been seen: its unseen output and activity are cleared, as `MarkWorldSeen` does,
-    /// but this client's own world, history and ▶ markers stay where they are. Without
-    /// it, a world brought up in a second window kept its unseen output, so Unseen First
-    /// sent that window back to it from every other world.
-    pub(crate) fn handle_other_views(&mut self, client_id: u64, worlds: Vec<usize>) {
+    /// worlds `client_id` also shows besides its own (the native GUI's `/window`s, which
+    /// share its connection and say nothing for themselves; a split's other pane,
+    /// `/split`). They count as on screen from now on (`ws_client_viewing`), and one that
+    /// wasn't listed before has been seen: its unseen output and activity are cleared and
+    /// its unviewed lines become this client's ▶, as `MarkWorldSeen` does, but this
+    /// client's own world and history stay where they are. Without it, a world brought up
+    /// in a second window kept its unseen output, so Unseen First sent that window back to
+    /// it from every other world. `dims` (an older client sends none): the size each is
+    /// shown at, for paging it and sizing a shell world's PTY.
+    pub(crate) fn handle_other_views(&mut self, client_id: u64, worlds: Vec<usize>, dims: Vec<websocket::ViewDims>) {
+        let main = self.ws_client_worlds.get(&client_id).map(|v| v.world_index).unwrap_or(usize::MAX);
+        self.set_client_other_views(client_id, worlds, main);
+        let dims: Vec<websocket::ViewDims> = dims.into_iter().filter(|d| d.world < self.worlds.len()).collect();
+        let changed = self.ws_client_other_view_dims.get(&client_id).map_or(!dims.is_empty(), |old| *old != dims);
+        if dims.is_empty() {
+            self.ws_client_other_view_dims.remove(&client_id);
+        } else {
+            self.ws_client_other_view_dims.insert(client_id, dims);
+        }
+        if changed {
+            // A shell world in the other pane is sized by it now.
+            self.resize_shell_worlds();
+        }
+    }
+
+    /// Set `client_id`'s other views to `worlds`, its own world being `main`: a world newly
+    /// listed is seen and claimed for it (▶), one no longer listed has its markers released
+    /// - never `main`, which `MarkWorldSeen` claims and releases.
+    pub(crate) fn set_client_other_views(&mut self, client_id: u64, worlds: Vec<usize>, main: usize) {
         let mut worlds: Vec<usize> = worlds.into_iter().filter(|&w| w < self.worlds.len()).collect();
         worlds.sort_unstable();
         worlds.dedup();
         let before = self.ws_client_other_views.get(&client_id).cloned().unwrap_or_default();
-        let arrived: Vec<usize> = worlds.iter().copied().filter(|w| !before.contains(w)).collect();
+        let arrived: Vec<usize> = worlds.iter().copied().filter(|w| !before.contains(w) && *w != main).collect();
+        let left: Vec<usize> = before.iter().copied().filter(|w| !worlds.contains(w) && *w != main).collect();
         if worlds.is_empty() {
             self.ws_client_other_views.remove(&client_id);
         } else {
             self.ws_client_other_views.insert(client_id, worlds);
         }
+        let owner = self.display_owner_id(client_id);
+        for &w in &left {
+            self.release_world_for(w, owner, Some(client_id));
+        }
         if arrived.is_empty() {
             return;
         }
         for &w in &arrived {
+            self.claim_world_for(w, owner, Some(client_id));
             self.worlds[w].mark_seen();
             self.ws_broadcast(WsMessage::UnseenCleared { world_index: w });
         }
@@ -10505,17 +10697,20 @@ impl App {
         self.ws_broadcast(WsMessage::ActionsUpdated { actions });
     }
 
-    /// Activity count excluding a specific world (for per-client counts)
-    fn activity_count_excluding(&self, exclude_world: Option<usize>) -> usize {
+    /// Activity count leaving out the worlds a viewer has on screen (for per-client counts)
+    fn activity_count_excluding(&self, exclude: &[usize]) -> usize {
         self.worlds
             .iter()
             .enumerate()
-            .filter(|(i, w)| Some(*i) != exclude_world && w.has_activity())
+            .filter(|(i, w)| !exclude.contains(i) && w.has_activity())
             .count()
     }
 
+    /// The console's: both panes' worlds left out while split (`/split`).
     pub fn activity_count(&self) -> usize {
-        self.activity_count_excluding(Some(self.current_world_index))
+        let mut shown = vec![self.current_world_index];
+        shown.extend(self.split_other());
+        self.activity_count_excluding(&shown)
     }
 
     /// Send per-client activity counts to all WebSocket clients
@@ -10539,9 +10734,17 @@ impl App {
                 let clients_guard = server.clients.read().unwrap();
                 for (&id, client) in clients_guard.iter() {
                     if client.authenticated {
-                        // Paused clients get full activity count (their world is no longer excluded)
-                        let exclude = if client.paused { None } else { client.current_world };
-                        let count = self.activity_count_excluding(exclude);
+                        // Paused clients get full activity count (their world is no longer
+                        // excluded); otherwise every world it shows, its other views (a
+                        // split's other pane, a native /window) included.
+                        let exclude: Vec<usize> = if client.paused {
+                            Vec::new()
+                        } else {
+                            client.current_world.into_iter()
+                                .chain(self.ws_client_other_views.get(&id).into_iter().flatten().copied())
+                                .collect()
+                        };
+                        let count = self.activity_count_excluding(&exclude);
                         // Genuinely per-client content (count excludes a different world
                         // per client), so Outbound::Message not Shared (PROTOCOL-ROADMAP.md
                         // Step 8) - there's nothing to share across recipients here.
@@ -10722,7 +10925,7 @@ impl App {
         if world_idx >= self.worlds.len() {
             return;
         }
-        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let is_current = self.world_watched(world_idx);
         let settings = self.settings.clone();
         let output_height = self.output_height;
         let console_width = self.output_width;
@@ -10937,7 +11140,7 @@ impl App {
         if world_idx >= self.worlds.len() || lines.is_empty() {
             return;
         }
-        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let is_current = self.world_watched(world_idx);
         let settings = self.settings.clone();
         let console_height = self.output_height;
         let console_width = self.output_width;
@@ -11246,6 +11449,16 @@ impl App {
     /// drifting the way the mirror used to (it never called this at all, see
     /// `handle_remote_ws_message`). The visit history is by name and needs nothing here.
     fn fixup_indices_after_remove(&mut self, world_index: usize) {
+        // A split whose pane showed the world removed closes; otherwise its other pane moves
+        // with the worlds after it.
+        if let Some(split) = self.split.as_mut() {
+            if split.other == world_index || self.current_world_index == world_index {
+                self.split = None;
+                self.needs_terminal_clear = true;
+            } else if split.other > world_index {
+                split.other -= 1;
+            }
+        }
         if self.current_world_index >= self.worlds.len() {
             self.current_world_index = self.worlds.len().saturating_sub(1);
         } else if self.current_world_index > world_index {
@@ -11288,6 +11501,12 @@ impl App {
             views.retain(|&w| w != world_index);
             for w in views.iter_mut().filter(|w| **w > world_index) {
                 *w -= 1;
+            }
+        }
+        for dims in self.ws_client_other_view_dims.values_mut() {
+            dims.retain(|d| d.world != world_index);
+            for d in dims.iter_mut().filter(|d| d.world > world_index) {
+                d.world -= 1;
             }
         }
     }
@@ -12097,7 +12316,7 @@ impl App {
             self.worlds[world_idx].login_capture_guard = 6;
             return;
         }
-        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let is_current = self.world_watched(world_idx);
         for part in text.split('\n') {
             if part.is_empty() {
                 continue;
@@ -12111,7 +12330,7 @@ impl App {
     /// input, a /recordline. Broadcast like every line in `output_lines`, as gagged, so
     /// clients keep it too and skip it unless F2 shows gagged lines.
     pub(crate) fn push_hidden_line(&mut self, world_idx: usize, mut line: OutputLine) {
-        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let is_current = self.world_watched(world_idx);
         let was_at_bottom = self.worlds[world_idx].is_at_bottom();
         line.gagged = true;
         let ws_data = line.text.replace('\r', "") + "\n";
@@ -13035,6 +13254,26 @@ impl App {
     }
 
     /// `/menu` from a web or GUI client: the menu is the console's (theirs is the menu bar).
+    /// A `/split` or `/unsplit` the server runs for a client (an action, a macro, a TF key
+    /// binding - a typed one never leaves the client): the split is the client's own, so it
+    /// goes back to it to do. A client too old to split (it never said `splits`) would send
+    /// it straight back, so it is told instead.
+    pub(crate) fn ws_split_is_the_clients(&self, client_id: u64, world_index: usize, command: &str) {
+        if self.ws_client_splits.contains(&client_id) {
+            self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.trim().to_string() });
+            return;
+        }
+        self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
+            world_index,
+            data: "This interface is too old to split its output: update it (/update).".to_string(),
+            is_viewed: false,
+            ts: current_timestamp_secs(),
+            from_server: false,
+            seq: 0, end_seq: None,
+            flush: false, gagged: false, highlight_colors: Vec::new(),
+        });
+    }
+
     pub(crate) fn ws_menu_is_console_only(&self, client_id: u64, world_index: usize) {
         // A remote console has the console's menu: it opens it (a server-run /menu, from
         // an action or a macro; a typed one never leaves the console).
@@ -13165,6 +13404,39 @@ impl App {
     /// Toggle the paused state for a WebSocket client.
     /// Updates both WsClientInfo (in ws_server) and ClientViewState (in ws_client_worlds).
     /// Returns (new_paused, ip_address) if the client was found.
+    /// `/remote --pause console`, from any interface: the console stops (or starts again)
+    /// counting as watching the world it shows. The reply, for whoever asked.
+    pub(crate) fn toggle_console_pause(&mut self) -> String {
+        if !self.console_tui {
+            return "This Clay has no console to pause.".to_string();
+        }
+        if self.console_paused {
+            self.resume_console();
+            "Console resumed.".to_string()
+        } else {
+            self.console_paused = true;
+            self.needs_output_redraw = true;
+            "Console paused: activity on its world now shows as new on other sessions. Any key at the console resumes it.".to_string()
+        }
+    }
+
+    /// Somebody is at the console again: what arrived on its world while it was paused is
+    /// the console's to show as new (as a switch to the world would claim it), and the next
+    /// redraw marks the world seen, telling the clients.
+    pub(crate) fn resume_console(&mut self) {
+        self.console_paused = false;
+        self.claim_world_for(self.current_world_index, CONSOLE_DISPLAY_ID, None);
+        self.needs_output_redraw = true;
+    }
+
+    /// A key (or a paste) at the console: a paused console resumes.
+    pub(crate) fn console_input(&mut self) {
+        if self.console_paused {
+            self.resume_console();
+            self.add_output("Console resumed (a key was pressed here).");
+        }
+    }
+
     fn ws_toggle_client_paused(&mut self, client_id: u64) -> Option<(bool, String)> {
         let (was_paused, ip, current_world) = {
             let server = self.ws_server.as_ref()?;
@@ -13341,7 +13613,12 @@ impl App {
         state.visible = visible;
         let world_idx = state.world_index;
         let owner = self.display_owner_id(client_id);
+        // A split's other pane (or a native /window) comes and goes with it.
+        let others: Vec<usize> = self.ws_client_other_views.get(&client_id).cloned().unwrap_or_default();
         if visible {
+            for &w in others.iter().filter(|&&w| w != world_idx) {
+                self.claim_world_for(w, owner, Some(client_id));
+            }
             // Always claim AND answer, even when this client already counted as visible.
             // The claim is a no-op in that case (everything is already viewed), but the
             // ClaimedNew it sends is not: the client claims optimistically the instant it
@@ -13355,6 +13632,9 @@ impl App {
             // The socket is still open when backgrounding, so the client can and should drop
             // its markers immediately rather than discovering it on the next render.
             self.release_world_for(world_idx, owner, Some(client_id));
+            for &w in others.iter().filter(|&&w| w != world_idx) {
+                self.release_world_for(w, owner, Some(client_id));
+            }
         }
     }
 
@@ -13476,6 +13756,55 @@ impl App {
                 .is_some_and(|ip| ip == "127.0.0.1" || ip == "::1"))
     }
 
+    /// The console shows this world, in either pane, and somebody is at it (not
+    /// `/remote --pause console`).
+    pub(crate) fn console_watching(&self, world_index: usize) -> bool {
+        self.console_shows(world_index) && !self.console_paused
+    }
+
+    /// The console shows this world: the focused pane's, or the other pane's while split.
+    pub(crate) fn console_shows(&self, world_index: usize) -> bool {
+        world_index == self.current_world_index || self.split_other() == Some(world_index)
+    }
+
+    /// Record whether `client_id` splits its own output (`UpdateViewState.splits`).
+    pub(crate) fn note_client_splits(&mut self, client_id: u64, splits: bool) {
+        if splits {
+            self.ws_client_splits.insert(client_id);
+        } else {
+            self.ws_client_splits.remove(&client_id);
+        }
+    }
+
+    /// The world in the console's other pane, while split (`/split`).
+    pub(crate) fn split_other(&self) -> Option<usize> {
+        self.split.map(|s| s.other)
+    }
+
+    /// The worlds the switch keys never land on: the other pane's (`/split`), unless it
+    /// shows the focused pane's world too.
+    pub(crate) fn split_exclude(&self) -> Vec<usize> {
+        self.split_other().filter(|&o| o != self.current_world_index).into_iter().collect()
+    }
+
+    /// The rows the console shows `world_index` in: its pane's while split, else the
+    /// focused pane's (the output area's when not split) - where a world not on screen
+    /// would appear, so more-mode pages it for then.
+    pub(crate) fn console_rows_for(&self, world_index: usize) -> u16 {
+        match self.split {
+            Some(split) if world_index == split.other && world_index != self.current_world_index => {
+                if split.focus_top { self.pane_rows.1 } else { self.pane_rows.0 }
+            }
+            _ => self.output_height,
+        }
+    }
+
+    /// Somebody - the console or a client - is watching this world: a line arriving now
+    /// is born viewed and is no activity for anyone.
+    pub(crate) fn world_watched(&self, world_index: usize) -> bool {
+        self.console_watching(world_index) || self.ws_client_viewing(world_index)
+    }
+
     pub(crate) fn ws_client_viewing(&self, world_index: usize) -> bool {
         self.ws_client_worlds.iter().any(|(id, v)| {
             let shown = v.world_index == world_index
@@ -13589,8 +13918,18 @@ impl App {
             .values()
             .filter(|v| v.world_index == world_index && v.visible_lines > 0 && v.disconnected_at.is_none())
             .map(|v| v.visible_lines)
+            .chain(self.other_view_dims(world_index).map(|d| d.lines).filter(|&l| l > 0))
             .min();
         ws_min
+    }
+
+    /// The sizes clients show `world_index` at in their other views (a split's other pane,
+    /// a native `/window`), connected clients only, as `min_viewer_lines` counts them.
+    fn other_view_dims(&self, world_index: usize) -> impl Iterator<Item = &websocket::ViewDims> {
+        self.ws_client_other_view_dims.iter()
+            .filter(|(id, _)| self.ws_client_worlds.get(id).is_some_and(|v| v.disconnected_at.is_none()))
+            .flat_map(|(_, dims)| dims.iter())
+            .filter(move |d| d.world == world_index)
     }
 
     /// Get the minimum visible columns among WS clients viewing a world (for wrap width)
@@ -13601,6 +13940,7 @@ impl App {
             .values()
             .filter(|v| v.world_index == world_index && v.visible_columns > 0 && v.disconnected_at.is_none())
             .map(|v| v.visible_columns)
+            .chain(self.other_view_dims(world_index).map(|d| d.columns).filter(|&c| c > 0))
             .min()
     }
 
@@ -13619,7 +13959,7 @@ impl App {
             .filter(|(_, v)| v.disconnected_at.map(|t| t.elapsed() >= WS_VIEWER_GRACE).unwrap_or(false))
             .map(|(&id, v)| (id, v.world_index))
             .collect();
-        for &(client_id, world_idx) in &expired {
+        for &(client_id, main_world) in &expired {
             let owner = self.display_owner_id(client_id);
             // Unless the owner is back: a reconnect is a new connection under the same owner
             // id, and the markers are the ones it holds now (kept, or claimed afresh).
@@ -13629,13 +13969,19 @@ impl App {
                 !expired.iter().any(|&(gone, _)| gone == id) && self.display_owner_id(id) == owner
             });
             if !owner_is_back {
-                // notify: None — the socket is long gone, there is nobody to tell.
-                self.release_world_for(world_idx, owner, None);
+                // notify: None — the socket is long gone, there is nobody to tell. Its other
+                // views (a split's other pane) held markers too.
+                let others = self.ws_client_other_views.get(&client_id).cloned().unwrap_or_default();
+                for world_idx in std::iter::once(main_world).chain(others) {
+                    self.release_world_for(world_idx, owner, None);
+                }
             }
         }
         for (client_id, _) in expired {
             self.ws_client_worlds.remove(&client_id);
             self.ws_client_other_views.remove(&client_id);
+            self.ws_client_other_view_dims.remove(&client_id);
+            self.ws_client_splits.remove(&client_id);
             self.ws_client_owner_ids.remove(&client_id);
             self.ws_client_interface.remove(&client_id);
         }
@@ -13657,7 +14003,9 @@ impl App {
     ) -> (u16, u16) {
         // Calculate minimum visible lines among all viewers for synchronized more-mode
         // Console counts as a viewer if it's viewing this world (unless daemon mode)
-        let console_viewing = !is_daemon_mode && world_idx == self.current_world_index;
+        let console_viewing = !is_daemon_mode && self.console_shows(world_idx);
+        // While split, each pane pages its own world at its own height.
+        let console_height = if self.split.is_some() { self.console_rows_for(world_idx) } else { console_height };
         let ws_min = self.min_viewer_lines(world_idx);
         let output_height = match (console_viewing, ws_min) {
             (true, Some(ws)) => console_height.min(ws as u16),
@@ -13979,7 +14327,7 @@ impl App {
         }
 
         // Consider "current" if console OR any web/GUI client is viewing this world
-        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let is_current = self.world_watched(world_idx);
         let decoded_data = if is_mud {
             self.worlds[world_idx].effective_encoding().decode(bytes)
         } else {
@@ -14409,7 +14757,7 @@ impl App {
             let prompt_text = self.worlds[world_idx].prompt.trim().to_string();
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
-            let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+            let is_current = self.world_watched(world_idx);
             let mut prompt_line = OutputLine::new(prompt_text, seq);
             prompt_line.viewed = is_current;
             // Was a bare push with no broadcast: the TUI showed this final prompt and no
@@ -15550,7 +15898,7 @@ impl App {
         if !self.worlds[world_idx].connected {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
-            let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+            let is_current = self.world_watched(world_idx);
             let more_mode = self.settings.more_mode_enabled;
             // Route through push_line_respecting_pending instead of a raw output_lines.push -
             // a raw push here could plant a fresh, high seq into output_lines while older
@@ -17423,6 +17771,10 @@ impl App {
                 };
                 self.emit_client_text(world_index, &msg, false);
             }
+            Command::RemotePauseConsole => {
+                let msg = self.toggle_console_pause();
+                self.emit_client_text(world_index, &msg, false);
+            }
             Command::BanList => self.ws_ban_list(client_id, world_index),
             Command::Unban { host } => self.ws_unban(client_id, world_index, host),
             Command::TestMusic => {
@@ -17519,6 +17871,7 @@ impl App {
                 self.handle_ws_help_via_tf(client_id, world_index, "");
             }
             Command::Menu => self.ws_menu_is_console_only(client_id, world_index),
+            Command::Split { .. } | Command::Unsplit => self.ws_split_is_the_clients(client_id, world_index, command),
             // UI popup commands - send back to client for local handling
             Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
             Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
@@ -17946,13 +18299,14 @@ impl App {
             WsMessage::DeleteWorld { world_index } => {
                 self.delete_world(world_index);
             }
-            WsMessage::MarkWorldSeen { world_index, previous_world_index } => {
-                self.handle_mark_world_seen(client_id, world_index, previous_world_index);
+            WsMessage::MarkWorldSeen { world_index, previous_world_index, other_views } => {
+                self.handle_mark_world_seen(client_id, world_index, previous_world_index, other_views);
             }
-            WsMessage::OtherViews { worlds } => {
-                self.handle_other_views(client_id, worlds);
+            WsMessage::OtherViews { worlds, dims } => {
+                self.handle_other_views(client_id, worlds, dims);
             }
-            WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
+            WsMessage::UpdateViewState { world_index, visible_lines, visible_columns, splits } => {
+                self.note_client_splits(client_id, splits);
                 // A remote client is reporting its view state (for more-mode threshold calculation)
                 if world_index < self.worlds.len() {
                     // Preserve existing dimensions and paused state when updating view state
@@ -18021,18 +18375,18 @@ impl App {
             WsMessage::UpdateActions { actions } => {
                 self.handle_update_actions(actions);
             }
-            WsMessage::CalculateNextWorld { current_index } => {
-                let next_idx = self.calculate_next_world_from(current_index);
+            WsMessage::CalculateNextWorld { current_index, exclude } => {
+                let next_idx = self.calculate_next_world_from(current_index, &exclude);
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
             }
-            WsMessage::CalculatePrevWorld { current_index } => {
-                let prev_idx = self.calculate_prev_world_from(current_index);
+            WsMessage::CalculatePrevWorld { current_index, exclude } => {
+                let prev_idx = self.calculate_prev_world_from(current_index, &exclude);
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
             }
-            WsMessage::CalculateOldestPending { current_index } => {
+            WsMessage::CalculateOldestPending { current_index, exclude } => {
                 // The fallback world is this client's own last visit, not the console's.
                 let history = self.ws_client_worlds.get(&client_id).map(|v| v.history.clone()).unwrap_or_default();
-                let oldest_idx = self.calculate_oldest_pending_world_from(current_index, &history);
+                let oldest_idx = self.calculate_oldest_pending_world_from(current_index, &history, &exclude);
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
             }
             WsMessage::RequestState => {
@@ -18856,9 +19210,20 @@ impl App {
     /// Is terminal row `row` (0-based) on the separator bar, the input's top edge? A
     /// mouse drag from there resizes the input.
     pub(crate) fn on_separator_row(&self, row: u16) -> bool {
-        let stats = u16::from(self.current_world().stats_line_shown);
-        let top = self.output_height + stats;
+        // Below the whole output area (both panes of a split) and the bottom pane's status line.
+        let bottom = rendering::console_bottom_world(self);
+        let stats = u16::from(self.worlds.get(bottom).is_some_and(|w| w.stats_line_shown));
+        let top = self.output_area_rows + stats;
         row >= top && row < top + self.separator_rows()
+    }
+
+    /// A mouse row on the console, as the shell forwarding takes it (one-based), as a row
+    /// of the focused pane's grid, or None when it is outside that pane - a split's other
+    /// pane or the bar between them.
+    pub(crate) fn shell_grid_row(&self, mouse_row: u16) -> Option<u16> {
+        let pane = rendering::console_panes(self).into_iter().find(|p| p.focused)?;
+        let row = mouse_row.checked_sub(1)?.checked_sub(pane.y)?;
+        (row < pane.rows).then_some(row)
     }
 
     /// The mouse, dragging the separator bar, is on `row` now: the input is a row taller
@@ -25248,8 +25613,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             MouseEventKind::Moved => ("move", 0),
                             _ => { continue; }
                         };
-                        if row >= 1 {
-                            app.shell_mouse(idx, kind, button, col, row - 1, ctrl, alt, shift);
+                        if let Some(grid_row) = app.shell_grid_row(row) {
+                            app.shell_mouse(idx, kind, button, col, grid_row, ctrl, alt, shift);
                         }
                         continue;
                     } else {
@@ -25261,6 +25626,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     // Route it to whichever widget has focus (editor, popup, filter,
                     // search, or the input area) - same ladder handle_key_event uses.
                     app.drop_sniffer.reset();
+                    app.console_input();
                     handle_paste(&mut app, text);
                     // Fall through to the draw at the end of the loop
                 } else if matches!(event, Event::Key(key) if key.kind != KeyEventKind::Press) {
@@ -25268,6 +25634,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     // ends a typed burst - then fall through to the draw at the end of the loop.
                     if !app.release_ends_typed_burst() { continue; }
                 } else if let Event::Key(key) = event {
+                    app.console_input();
                     match handle_key_event(key, &mut app) {
                         KeyAction::Quit => {
                             app.unmap_on_quit().await;
@@ -26603,12 +26970,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     reveal_sleep.as_mut().reset(tokio::time::Instant::now() + next_frame);
                 }
                 app.needs_output_redraw = false;
-                // Mark current world as seen since its output was just displayed
-                let has_unseen = app.current_world().unseen_lines > 0;
-                if has_unseen {
-                    app.current_world_mut().mark_seen();
+                // Mark the worlds on screen (both panes while split) as seen since their
+                // output was just displayed - unless nobody is at the console (`/remote
+                // --pause console`).
+                let shown = std::iter::once(app.current_world_index).chain(app.split_other());
+                let unseen: Vec<usize> = shown.filter(|&i| !app.console_paused && app.worlds.get(i).is_some_and(|w| w.unseen_lines > 0)).collect();
+                for &i in &unseen {
+                    app.worlds[i].mark_seen();
                     // Broadcast to WebSocket clients
-                    app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
+                    app.ws_broadcast(WsMessage::UnseenCleared { world_index: i });
+                }
+                if !unseen.is_empty() {
                     // Broadcast activity count since a world was just marked as seen
                     app.broadcast_activity();
                 }

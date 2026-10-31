@@ -25,6 +25,20 @@ Exit Clay and disconnect all worlds.
 
 You can also press `Ctrl+C` twice within 15 seconds to quit.
 
+### /split and /unsplit
+Split the output in two, one pane above the other, to watch two worlds at once (see
+**Split Output** in the Interface chapter).
+
+```
+/split            # the next world in order opens above; the focus stays below
+/split <world>    # that world above (or, already split, in the pane without the focus)
+/unsplit          # close the pane without the focus
+```
+
+Shift+Tab moves the focus between the panes; in the GUI and the web client a click on a
+pane does too. Neither command connects or disconnects anything. From an action, a macro
+or a TF key binding, `/split` splits the interface that ran it.
+
 ## World Management
 
 ### /worlds

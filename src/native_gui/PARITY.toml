@@ -1202,6 +1202,14 @@ feature = "action world_socket_next"
 note = "ui/actions.rs"
 
 [[item]]
+id = "action:split_focus"
+section = "navigation"
+phase = 2
+status = "done"
+feature = "action split_focus (/split: Shift+Tab moves the focus to the other pane)"
+note = "ui/actions.rs, ui/split.rs"
+
+[[item]]
 id = "action:world_socket_prev"
 section = "navigation"
 phase = 2

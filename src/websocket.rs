@@ -644,16 +644,30 @@ pub enum WsMessage {
     /// server's `ws_client_worlds` tracking of the client's prior world. Optional/defaulted
     /// for wire compat with older clients that don't send it (falls back to the
     /// `ws_client_worlds` lookup).
-    MarkWorldSeen { world_index: usize, #[serde(default)] previous_world_index: Option<usize> },
+    MarkWorldSeen {
+        world_index: usize,
+        #[serde(default)] previous_world_index: Option<usize>,
+        /// The client's other views as of this switch, when they change with it - a split's
+        /// focus moving between panes (`/split`), whose world just left is still on screen:
+        /// applied before the world left is released, so neither pane's ▶ markers go.
+        /// `None` (an older client, or no change): as they were.
+        #[serde(default)] other_views: Option<Vec<usize>>,
+    },
     /// The worlds this client also shows, in other windows on this one connection (the
     /// native GUI's `/window`s, which send nothing of their own): each counts as on screen
     /// (`App::ws_client_viewing`), and one newly listed is marked seen, as `MarkWorldSeen`
     /// would - without moving this client's own world. The whole list each time. Only to a
     /// server whose `InitialState.other_views` says it takes it: an older one logs
-    /// `WS-BAD-MESSAGE` and closes the connection.
-    OtherViews { worlds: Vec<usize> },
+    /// `WS-BAD-MESSAGE` and closes the connection. Also a split's other pane (`/split`):
+    /// the server claims ▶ for a world newly listed and releases one that leaves the list.
+    /// `dims`: the size each listed world is shown at, which pages it for this client
+    /// (`App::min_viewer_lines`) and sizes a shell world's PTY; empty from an older client.
+    OtherViews { worlds: Vec<usize>, #[serde(default)] dims: Vec<ViewDims> },
     /// Update client's view state (world index and visible lines for more-mode calculation)
-    UpdateViewState { world_index: usize, visible_lines: usize, #[serde(default)] visible_columns: Option<usize> },
+    /// `splits`: this client splits its own output (`/split`), so a `/split` the server runs
+    /// for it (an action, a macro, a TF key binding) is sent back to it to do
+    /// (`ExecuteLocalCommand`); an older client sends false.
+    UpdateViewState { world_index: usize, visible_lines: usize, #[serde(default)] visible_columns: Option<usize>, #[serde(default)] splits: bool },
     /// Update client's output dimensions (for NAWS - report smallest across all instances)
     UpdateDimensions { width: u16, height: u16 },
     RequestState,  // Request full state resync
@@ -920,11 +934,12 @@ pub enum WsMessage {
     /// Result of unban request (server -> client)
     UnbanResult { success: bool, host: String, error: Option<String> },
 
-    // World switching calculation (client -> server)
-    CalculateNextWorld { current_index: usize },
-    CalculatePrevWorld { current_index: usize },
+    // World switching calculation (client -> server). `exclude`: worlds never to land on -
+    // the other pane of the client's split (`/split`); an older server ignores it.
+    CalculateNextWorld { current_index: usize, #[serde(default)] exclude: Vec<usize> },
+    CalculatePrevWorld { current_index: usize, #[serde(default)] exclude: Vec<usize> },
     /// Find world with oldest pending output (for Escape+w)
-    CalculateOldestPending { current_index: usize },
+    CalculateOldestPending { current_index: usize, #[serde(default)] exclude: Vec<usize> },
     // World switching response (server -> client)
     CalculatedWorld { index: Option<usize> },
 
@@ -1904,6 +1919,15 @@ pub struct WorldSettingsMsg {
     pub has_slack_token: bool,
     #[serde(default)]
     pub has_slack_app_token: bool,
+}
+
+/// The size a client shows one of its other views at (`WsMessage::OtherViews.dims`): a
+/// split's other pane, or a native `/window`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ViewDims {
+    pub world: usize,
+    pub lines: usize,
+    pub columns: usize,
 }
 
 /// One interface's own Text Reveal (`UpdateGlobalSettings.text_reveal_profile`): its key

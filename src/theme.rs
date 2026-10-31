@@ -67,6 +67,15 @@ impl ThemeColor {
     pub fn to_tuple(&self) -> (u8, u8, u8) {
         (self.r, self.g, self.b)
     }
+
+    /// This colour as a grey of the same lightness: the bar of a split's pane without the
+    /// focus (`/split`, user request 2026-10-30), so its text stays as readable as on the
+    /// coloured bar in every theme. The one rule for every interface (app.js
+    /// `greyOfSameLightness` is a port).
+    pub fn grey_of_same_lightness(&self) -> Self {
+        let y = (0.2126 * self.r as f32 + 0.7152 * self.g as f32 + 0.0722 * self.b as f32).round().clamp(0.0, 255.0) as u8;
+        Self { r: y, g: y, b: y }
+    }
 }
 
 /// All theme color variables for a single theme

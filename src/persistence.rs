@@ -2232,6 +2232,16 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "show_tags={}", app.show_tags)?;
+    if app.console_paused {
+        writeln!(file, "console_paused=true")?;
+    }
+    // A split (`/split`): the other pane's world by name, and which pane has the focus.
+    if let Some(split) = app.split {
+        if let Some(world) = app.worlds.get(split.other) {
+            writeln!(file, "split_other={}", world.name)?;
+            writeln!(file, "split_focus_top={}", split.focus_top)?;
+        }
+    }
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "separator_style={}", app.settings.separator_style.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme)?;
@@ -2809,6 +2819,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
     let mut output_world_idx: Option<usize> = None;
     let mut pending_world_idx: Option<usize> = None;
     let mut current_action_idx: Option<usize> = None;
+    // A split's other pane (by name) and focus, put back once the worlds are loaded.
+    let mut split_other: Option<String> = None;
+    let mut split_focus_top = false;
 
     // Temporary storage for world data
     struct TempWorld {
@@ -3164,6 +3177,12 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "show_tags" => {
                         app.show_tags = value == "true";
                     }
+                    // Only a console keeps it: a GUI successor has no console to resume.
+                    "console_paused" => {
+                        app.console_paused = value == "true" && app.console_tui;
+                    }
+                    "split_other" => split_other = Some(value.to_string()),
+                    "split_focus_top" => split_focus_top = value == "true",
                     "theme" => {
                         app.settings.theme = Theme::from_name(value);
                     }
@@ -3828,6 +3847,13 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
     // Validate current_world_index
     if app.current_world_index >= app.worlds.len() {
         app.current_world_index = 0;
+    }
+
+    // Only a console keeps its split: a GUI successor keeps its own (its relaunch stash).
+    if app.console_tui {
+        if let Some(other) = split_other.and_then(|name| app.worlds.iter().position(|w| w.name == name)) {
+            app.split = Some(crate::ConsoleSplit { other, focus_top: split_focus_top });
+        }
     }
 
     // Load auth key from ~/.clay/settings.dat (it's not in the reload state file)

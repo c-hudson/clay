@@ -59,6 +59,44 @@ The input area is where you type commands:
 - **Cursor**: Standard text cursor with left/right movement
 - **Spell checking**: Misspelled words highlighted in red
 
+### Split Output
+
+`/split` splits the output area in two, one above the other, so you can watch two worlds
+at once. It works the same in every interface: the console, the SSH console, the GUI, the
+web page and the Android app.
+
+    Rome: the forum is busy today...
+    __________ ● Rome________________________________________________
+    You are standing in the HeartOfGold's galley...
+    __________ ● HeartOfGold     (Activity: 2)                   14:30
+    > _
+
+- **`/split`** opens a pane above the output. The world you are in stays in the bottom
+  pane and keeps the focus; the new top pane shows the next world in order (the next
+  connected one alphabetically, else the next of all worlds). **`/split <world>`** shows
+  that world instead (an unknown name is an error); while already split, it puts that
+  world in the pane without the focus.
+- **`/unsplit`** closes the pane that does *not* have the focus.
+- Neither command connects or disconnects anything.
+- **The focus** is the pane that gets what you type, your commands and your keys: `/world
+  X` switches the focused pane, Page Up scrolls it. Move it with **Shift+Tab** in every
+  interface, or, in the GUI, the web page and the Android app, by clicking (tapping) the
+  other pane, as long as the click doesn't select text or follow a link.
+- **The bars.** The bar between the panes belongs to the top pane and shows only its world's
+  name and connection ball. The usual bar under the bottom pane belongs to the bottom one,
+  with everything it always shows; its activity count leaves out both worlds on screen. The
+  focused pane's bar keeps the bar colour, the other one turns grey.
+- **Both panes stay live.** Each takes its world's output under the usual rules: more-mode
+  pauses each at its own height, ▶ marks what arrived unseen, and neither counts as activity
+  while it is on screen.
+- **The switch keys** (`Esc-{`, `Esc-}`, `Esc-w`, `Esc-Left`/`Right` and the rest) skip the
+  world in the other pane, so the two never show the same world by accident. `/world X`
+  (or `/split X`) may show one world in both: in the GUI and the web page each pane then
+  scrolls on its own; in the console the pane without the focus keeps showing the newest
+  lines while the focused one is scrolled back.
+- A split survives `/reload` and `/update`, and a GUI restart. Deleting a world shown in a
+  pane closes the split.
+
 ## Status Display
 
 Above the separator bar, Clay can show a single line summarizing the current world's GMCP

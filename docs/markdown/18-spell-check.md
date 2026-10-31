@@ -82,10 +82,20 @@ Misspelling state is cached between keystrokes:
 
 Press `Ctrl+Q` to get spell suggestions:
 
-1. Place cursor on or after a misspelled word
-2. Press `Ctrl+Q`
-3. First suggestion replaces the word
-4. Press `Ctrl+Q` again to cycle through suggestions
+1. Place the cursor on, at the end of, or after a misspelled word
+2. Press `Ctrl+Q`: the suggestions are listed in the output
+3. Press `Ctrl+Q` again: the first suggestion replaces the word
+4. Keep pressing to cycle through the rest; the word as you typed it comes back last,
+   then the first suggestion again
+
+Typing anything, or moving the cursor away from the word, ends the round; the next
+`Ctrl+Q` starts over with whatever word is at the cursor then. A word spelled right, or
+one with no suggestions, does nothing.
+
+This works the same in every interface. The native GUI takes the suggestions from the
+checker it underlines with (the system's own on Windows and macOS), and also lists them
+when you right-click a misspelled word. The web page and the WebView GUI ask the
+server's checker.
 
 ### Suggestion Algorithm
 
@@ -123,6 +133,9 @@ Type: "recieve "
       Red (misspelled)
 
 Press Ctrl+Q:
+      Suggestions for 'recieve': receive, relieve, ...
+
+Press Ctrl+Q again:
       "receive "
       ^^^^^^^
       Normal (replaced with suggestion)
@@ -132,10 +145,13 @@ Press Ctrl+Q:
 
 ```
 Word: "teh"
+Ctrl+Q → Suggestions for 'teh': the, tea, ten, ...
 Ctrl+Q → "the"
 Ctrl+Q → "tea"
 Ctrl+Q → "ten"
 ...
+Ctrl+Q → "teh" (the word as typed)
+Ctrl+Q → "the"
 ```
 
 ## Limitations

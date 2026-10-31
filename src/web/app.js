@@ -2026,6 +2026,7 @@
     // been written (applyThemeColors, ThemeCssVarsUpdated), since it reads them back.
     function applyThemeAppearance() {
         applyNewGlow();
+        if (splitPane) applyPaneGrey();
         const light = themeBgIsLight();
         if (light === null) return;
         document.body.classList.toggle('theme-light', light);
@@ -2150,7 +2151,7 @@
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'reach', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'server', 'import',
-        'flush', 'menu', 'send', 'remote', 'ban', 'unban',
+        'flush', 'menu', 'split', 'unsplit', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say', 'tts',
         'log', 'unworld', 'chat', 'discord', 'slack',
@@ -2895,7 +2896,9 @@
                 type: 'UpdateViewState',
                 world_index: currentWorldIndex,
                 visible_lines: visibleLines,
-                visible_columns: visibleColumns
+                visible_columns: visibleColumns,
+                // This page splits its own output (/split): a server-run /split comes back.
+                splits: true
             })) {
                 lastSentViewState = newState;
             }
@@ -3681,6 +3684,15 @@
 
     // Handle incoming messages
     function handleMessage(msg) {
+        handleMessageImpl(msg);
+        // A split's other pane is drawn afresh (once a frame) when its world changed.
+        if (splitPane && msg && (msg.world_index === splitWorldIndex() || msg.type === 'InitialState'
+            || msg.type === 'GlobalSettingsUpdated' || msg.type === 'WorldRemoved' || msg.type === 'WorldAdded')) {
+            scheduleSplitRender();
+        }
+    }
+
+    function handleMessageImpl(msg) {
         switch (msg.type) {
             case 'ServerHello':
                 // Store challenge for challenge-response auth
@@ -3868,6 +3880,9 @@
                 serverPictureUpload = !!msg.picture_upload;
                 // The server answers RequestHistory (older lines on demand, then its archive).
                 serverHistoryOnDemand = !!msg.history_on_demand;
+                // The server takes OtherViews (a split's other pane).
+                serverTakesOtherViews = !!msg.other_views;
+                lastOtherViewsSent = null;
                 // The server's build, for /version's Remote line; from a server before
                 // that field, its version number alone.
                 serverVersionDetail = msg.server_version_detail ||
@@ -4684,6 +4699,17 @@
                     }
                 } catch (e) {
                     console.error('Clay: error sending connect-time MarkWorldSeen', e);
+                }
+                // A split: as it was before a page load, and the server told of it again
+                // (a new connection is a new client to it).
+                try {
+                    restoreSplitState();
+                    if (splitPane) {
+                        if (splitWorldIndex() < 0) splitClose();
+                        else sendOtherViews(true);
+                    }
+                } catch (e) {
+                    console.error('Clay: error restoring the split', e);
                 }
                 // Connected again after the server's /update reload: our own half now.
                 if (updateFlow && updateFlow.stage === 'reconnect') {
@@ -6297,7 +6323,11 @@
     function handleIncomingLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null, archiveSourced = false) {
         if (text === undefined || text === null) return;
 
-        const visibleLines = getVisibleLineCount();
+        // A world on screen in a split's other pane pages at that pane's height (/split).
+        let visibleLines = getVisibleLineCount();
+        if (worldIndex !== currentWorldIndex && splitShows(worldIndex)) {
+            withSplitPane(() => { visibleLines = getVisibleLineCount(); });
+        }
         const threshold = Math.max(1, visibleLines - 2);
         // The line object itself (already in world.output_lines), so a full renderOutput()
         // while it is held can recognise and skip it - see renderOutput's `held` set. An
@@ -6324,6 +6354,10 @@
             if (onScreen) {
                 // Scroll to bottom to show what we have so far
                 scrollToBottom();
+                updateStatusBar();
+            } else if (splitShows(worldIndex)) {
+                // The other pane shows what it has so far, from its bottom.
+                splitPane.followBottom = true;
                 updateStatusBar();
             }
         } else {
@@ -7438,6 +7472,13 @@
             stashInputForRelaunch('', sentLineFor(cmd).text);
         }
 
+        // /split and /unsplit: this page's own output.
+        if (/^\/(split|unsplit)(\s|$)/i.test(cmdTrimmed)) {
+            elements.input.value = '';
+            splitCommand(cmdTrimmed);
+            return;
+        }
+
         // Intercept /window --grep locally only — this opens a client-side filtered
         // view that the server has no concept of (parse_command's Command::Window
         // only knows a plain world-name argument, so a --grep string would be
@@ -8027,6 +8068,12 @@
                 openActionsListPopup(args.join(' ') || null);
                 break;
 
+            // A /split an action or macro ran on the server: this page's own.
+            case '/split':
+            case '/unsplit':
+                splitCommand(trimmed);
+                break;
+
             case '/web':
                 openSettingsPopup('web');
                 break;
@@ -8298,7 +8345,8 @@
     // MarkWorldSeen/RequestWorldState send, which achieves the same server-side effect).
     function cycleConnectedWorldLocal(direction) {
         const connected = [];
-        worlds.forEach((w, i) => { if (w.connected) connected.push(i); });
+        const skip = splitExclude();
+        worlds.forEach((w, i) => { if (w.connected && !skip.includes(i)) connected.push(i); });
         if (connected.length === 0) return null;
         const len = connected.length;
         const currentPos = connected.indexOf(currentWorldIndex);
@@ -8315,8 +8363,9 @@
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
             const previousWorldIndex = currentWorldIndex;
-            // Clear new line indicators on the world we're LEAVING (matches console behavior)
-            clearLeavingWorldState(previousWorldIndex);
+            // Clear new line indicators on the world we're LEAVING (matches console behavior),
+            // unless a split's other pane still shows it.
+            if (!splitShows(previousWorldIndex)) clearLeavingWorldState(previousWorldIndex);
             currentWorldIndex = index;
             // Clear splash on world switch, but only for a world that has actually
             // connected before - a fresh/never-connected world's output_lines is
@@ -8360,6 +8409,365 @@
             // Update view state for synchronized more-mode
             sendViewStateIfChanged();
         }
+    }
+
+    // ─── /split (user request 2026-10-30) ───
+    // The output in two panes, one above the other, each showing a world, with a bar
+    // between them for the top pane (its dot and name). The focused pane is always
+    // #output-container: every listener, the render family, more-mode's view and the keys
+    // act on it through currentWorldIndex as before. The other pane is a second container
+    // that renderOutput itself draws, with that pane's world, elements and scroll state
+    // swapped in (withSplitPane), at most once a frame whenever its world changed. Moving
+    // the focus (Shift+Tab, a plain click in the other pane) trades the two panes' worlds
+    // and DOM places, so neither pane moves on screen. The server hears of the other pane
+    // as an OtherViews (its world and size) and of a focus change as one MarkWorldSeen
+    // carrying the new other views, so neither pane loses its ▶.
+    let splitPane = null; // { name, onTop, container, output, bar, followBottom, lastRenderedWorld, userScrollAt, observer }
+    let drawingSplit = false;
+    let serverTakesOtherViews = false;
+    let splitRenderPending = false;
+    let lastOtherViewsSent = null;
+
+    function splitWorldIndex() {
+        if (!splitPane) return -1;
+        return worlds.findIndex(w => w && w.name === splitPane.name);
+    }
+    function splitShows(i) { return splitPane !== null && i >= 0 && i === splitWorldIndex(); }
+    // The world in the bottom pane (the only one while not split): the status bar's.
+    function bottomPaneWorld() {
+        if (!splitPane || splitPane.onTop) return currentWorldIndex;
+        const i = splitWorldIndex();
+        return i >= 0 ? i : currentWorldIndex;
+    }
+    // The worlds the switch keys never land on: the other pane's, unless it shows this one.
+    function splitExclude() {
+        const i = splitWorldIndex();
+        return (i >= 0 && i !== currentWorldIndex) ? [i] : [];
+    }
+
+    // util::split_next_world (the console's /split rule), ported: the next connected world
+    // after `current` in alphabetical order (case-insensitive, wrapping), else the next of
+    // all worlds; -1 when there is no other world.
+    function splitNextWorld(current) {
+        const order = [];
+        worlds.forEach((w, i) => { if (w) order.push(i); });
+        order.sort((a, b) => {
+            const x = (worlds[a].name || '').toLowerCase(), y = (worlds[b].name || '').toLowerCase();
+            return x < y ? -1 : x > y ? 1 : a - b;
+        });
+        const at = order.indexOf(current);
+        if (at < 0) return -1;
+        const after = [];
+        for (let k = 1; k < order.length; k++) after.push(order[(at + k) % order.length]);
+        const connected = after.find(i => worlds[i].connected);
+        return connected !== undefined ? connected : (after.length ? after[0] : -1);
+    }
+
+    // ThemeColor::grey_of_same_lightness (theme.rs), ported: the bar of a pane without the
+    // focus is the bar's colour as a grey of the same lightness, so its text stays readable.
+    function greyOfSameLightness(r, g, b) {
+        const y = Math.max(0, Math.min(255, Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b)));
+        return 'rgb(' + y + ', ' + y + ', ' + y + ')';
+    }
+    function applyPaneGrey() {
+        try {
+            const probe = document.createElement('div');
+            probe.style.cssText = 'position:absolute;visibility:hidden;width:1px;height:1px;background:var(--theme-status-bar-bg, var(--theme-bg-surface, #1c1722))';
+            document.body.appendChild(probe);
+            const m = getComputedStyle(probe).backgroundColor.match(/[\d.]+/g);
+            probe.remove();
+            if (m && m.length >= 3) {
+                document.documentElement.style.setProperty('--pane-unfocused-bg', greyOfSameLightness(+m[0], +m[1], +m[2]));
+            }
+        } catch (e) { /* style.css's fallback grey */ }
+    }
+
+    // Run `f` as if the other pane had the focus - its world current, its elements and
+    // scroll state in the globals - and put everything back after.
+    function withSplitPane(f) {
+        const i = splitWorldIndex();
+        if (!splitPane || i < 0) return;
+        const saved = { cur: currentWorldIndex, out: elements.output, cont: elements.outputContainer, follow: followBottom, last: lastRenderedWorld };
+        currentWorldIndex = i;
+        elements.output = splitPane.output;
+        elements.outputContainer = splitPane.container;
+        followBottom = splitPane.followBottom;
+        lastRenderedWorld = splitPane.lastRenderedWorld;
+        drawingSplit = true;
+        try {
+            f();
+        } finally {
+            drawingSplit = false;
+            splitPane.followBottom = followBottom;
+            splitPane.lastRenderedWorld = lastRenderedWorld;
+            currentWorldIndex = saved.cur;
+            elements.output = saved.out;
+            elements.outputContainer = saved.cont;
+            followBottom = saved.follow;
+            lastRenderedWorld = saved.last;
+        }
+    }
+
+    function scheduleSplitRender() {
+        if (!splitPane || splitRenderPending) return;
+        splitRenderPending = true;
+        requestAnimationFrame(() => {
+            splitRenderPending = false;
+            renderSplitPane();
+        });
+    }
+    function renderSplitPane() {
+        if (!splitPane) return;
+        if (splitWorldIndex() < 0) {
+            // Its world was removed: the split closes.
+            splitClose();
+            return;
+        }
+        withSplitPane(() => renderOutput());
+        updatePaneBars();
+    }
+
+    // The bar between the panes (the top pane's world) and the full bar's grey.
+    function updatePaneBars() {
+        if (!splitPane) {
+            elements.statusBar.classList.remove('pane-unfocused');
+            return;
+        }
+        const topFocused = !splitPane.onTop;
+        const w = worlds[splitPane.onTop ? splitWorldIndex() : currentWorldIndex];
+        const dot = splitPane.bar.querySelector('.status-dot');
+        const name = splitPane.bar.querySelector('.status-world');
+        if (w) {
+            dot.className = 'status-dot' + (w.connected ? '' : (isWorldReconnecting(w) ? ' reconnecting' : ' off'));
+            name.textContent = w.name;
+        }
+        splitPane.bar.classList.toggle('pane-unfocused', !topFocused);
+        elements.statusBar.classList.toggle('pane-unfocused', topFocused);
+    }
+
+    // The top pane, the bar between, the bottom pane: #output-container keeps its place in
+    // the page and the other pane goes before or after it.
+    function splitPlace() {
+        const main = elements.outputContainer;
+        const parent = main.parentNode;
+        if (splitPane.onTop) {
+            parent.insertBefore(splitPane.container, main);
+            parent.insertBefore(splitPane.bar, main);
+        } else {
+            parent.insertBefore(splitPane.bar, main.nextSibling);
+            parent.insertBefore(splitPane.container, splitPane.bar.nextSibling);
+        }
+    }
+
+    function splitBuild() {
+        const container = document.createElement('div');
+        container.id = 'split-output-container';
+        const output = document.createElement('div');
+        output.id = 'split-output';
+        container.appendChild(output);
+        const bar = document.createElement('div');
+        bar.className = 'pane-bar';
+        bar.innerHTML = '<div class="status-btn pane-bar-spacer"><svg width="16" height="16" viewBox="0 0 16 16"></svg></div>' +
+            '<div class="status-item"><div class="status-dot"></div><span class="status-world"></span></div>';
+        const pane = { container, output, bar, followBottom: true, lastRenderedWorld: null, userScrollAt: 0, observer: null };
+        // Only the user un-pins a pane from its newest lines (followBottom's rule).
+        const intent = () => { pane.userScrollAt = Date.now(); };
+        container.addEventListener('wheel', intent, { passive: true });
+        container.addEventListener('touchmove', intent, { passive: true });
+        container.addEventListener('pointerdown', intent);
+        container.addEventListener('keydown', intent);
+        container.addEventListener('scroll', () => {
+            if (splitPane !== pane) return;
+            const c = pane.container;
+            const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 4;
+            if (atBottom) {
+                pane.followBottom = true;
+            } else if (Date.now() - pane.userScrollAt < USER_SCROLL_WINDOW_MS) {
+                pane.followBottom = false;
+                // Near the top of what's drawn: draw older lines too (the render window).
+                const w = worlds[splitWorldIndex()];
+                if (w && c.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && (w._renderWindow || RENDER_WINDOW_INITIAL) < RENDER_WINDOW_MAX
+                    && (w.output_lines || []).length > (w._renderWindow || RENDER_WINDOW_INITIAL)) {
+                    w._renderWindow = Math.min(RENDER_WINDOW_MAX, (w._renderWindow || RENDER_WINDOW_INITIAL) + RENDER_WINDOW_STEP);
+                    withSplitPane(() => renderOutput({ preserveScroll: true }));
+                }
+            }
+        });
+        // A plain click - no text selected, not on a link - moves the focus to this pane.
+        container.addEventListener('click', (e) => {
+            if (splitPane !== pane) return;
+            const sel = window.getSelection();
+            if (sel && sel.toString().length > 0) return;
+            if (e.target.closest && e.target.closest('a')) return;
+            splitFocusSwap();
+        });
+        bar.addEventListener('click', () => {
+            if (splitPane === pane && splitPane.onTop) splitFocusSwap();
+        });
+        // Its size goes to the server (paging, a shell world's PTY); following, it stays
+        // at the bottom as it grows or shrinks.
+        if (typeof ResizeObserver !== 'undefined') {
+            pane.observer = new ResizeObserver(() => {
+                if (splitPane !== pane) return;
+                if (pane.followBottom) pane.container.scrollTop = pane.container.scrollHeight;
+                sendOtherViews();
+            });
+            pane.observer.observe(container);
+        }
+        return pane;
+    }
+
+    // The server's view of the other pane: its world and size (OtherViews), once the
+    // server takes it (InitialState.other_views), whenever either changes.
+    function sendOtherViews(force) {
+        if (!serverTakesOtherViews) return;
+        const i = splitWorldIndex();
+        const list = (i >= 0 && i !== currentWorldIndex) ? [i] : [];
+        let dims = [];
+        if (list.length) {
+            withSplitPane(() => { dims = [{ world: i, lines: getVisibleLineCount(), columns: getVisibleColumnCount() }]; });
+        }
+        const key = JSON.stringify([list, dims]);
+        if (!force && key === lastOtherViewsSent) return;
+        if (send({ type: 'OtherViews', worlds: list, dims: dims })) lastOtherViewsSent = key;
+    }
+
+    function splitStorageKey() {
+        return 'clay_split_' + getServerIdentity();
+    }
+    function saveSplitState() {
+        try {
+            if (splitPane) {
+                localStorage.setItem(splitStorageKey(), JSON.stringify({ world: splitPane.name, on_top: splitPane.onTop }));
+            } else {
+                localStorage.removeItem(splitStorageKey());
+            }
+        } catch (e) { /* storage unavailable - non-critical */ }
+    }
+    // After a page load (a GUI relaunch, the app's cold start, a refresh): the split as it
+    // was, once the worlds have arrived.
+    function restoreSplitState() {
+        if (splitPane || popupWindowMode || noteMode || grepRegex) return;
+        let kept = null;
+        try { kept = JSON.parse(localStorage.getItem(splitStorageKey()) || 'null'); } catch (e) { kept = null; }
+        if (!kept || !kept.world || worlds.findIndex(w => w && w.name === kept.world) < 0) return;
+        splitOpen(kept.world, true);
+        if (splitPane && splitPane.onTop !== !!kept.on_top) {
+            splitPane.onTop = !!kept.on_top;
+            splitPlace();
+            updateStatusBar();
+        }
+    }
+
+    // `/split [world]`: a pane opens above showing `world` - else the next world in order
+    // after the current one - and the focus stays below. Already split, a named world goes
+    // into the pane without the focus. Returns what to tell the user.
+    function splitOpen(name, quiet) {
+        let target;
+        if (name) {
+            const lower = name.toLowerCase();
+            target = worlds.findIndex(w => w && (w.name || '').toLowerCase() === lower);
+            if (target < 0) return "World '" + name + "' not found.";
+        } else if (splitPane) {
+            return 'The output is already split; /unsplit closes the pane without the focus.';
+        } else {
+            target = splitNextWorld(currentWorldIndex);
+            if (target < 0) return 'There is no other world to show.';
+        }
+        const worldName = worlds[target].name;
+        if (splitPane) {
+            splitPane.name = worldName;
+            splitPane.followBottom = true;
+            splitPane.lastRenderedWorld = null;
+            renderSplitPane();
+            updateStatusBar();
+            sendOtherViews();
+            saveSplitState();
+            return 'The other pane shows ' + worldName + '.';
+        }
+        splitPane = Object.assign(splitBuild(), { name: worldName, onTop: true });
+        splitPlace();
+        applyPaneGrey();
+        renderSplitPane();
+        updateStatusBar();
+        if (followBottom) scrollToBottom();
+        sendViewStateIfChanged();
+        sendOtherViews();
+        if (!quiet) saveSplitState();
+        return 'Split: ' + worldName + ' is shown above. Shift+Tab moves between the panes; /unsplit closes the one without the focus.';
+    }
+
+    // `/unsplit`: the pane without the focus closes.
+    function splitClose() {
+        if (!splitPane) return "The output isn't split.";
+        const pane = splitPane;
+        const i = splitWorldIndex();
+        if (pane.observer) pane.observer.disconnect();
+        pane.container.remove();
+        pane.bar.remove();
+        splitPane = null;
+        // The world closed counts afresh if it holds nothing, as a world left does.
+        if (i >= 0 && i !== currentWorldIndex) {
+            const m = moreOf(i);
+            if (m.held.length === 0) {
+                m.paused = false;
+                m.rowsSincePause = 0;
+            }
+        }
+        updateStatusBar();
+        if (followBottom) scrollToBottom();
+        sendViewStateIfChanged();
+        sendOtherViews();
+        saveSplitState();
+        return 'Closed the pane showing ' + pane.name + '.';
+    }
+
+    function splitCommand(cmd) {
+        const parts = cmd.trim().split(/\s+/);
+        const reply = parts[0].toLowerCase() === '/unsplit' ? splitClose() : splitOpen(parts.slice(1).join(' '));
+        appendClientLine(reply);
+    }
+
+    // Shift+Tab (split_focus), or a plain click in the other pane: the focus moves there.
+    // Its world becomes the current one; neither pane's world changes, so it is no switch.
+    function splitFocusSwap() {
+        const other = splitWorldIndex();
+        if (!splitPane || other < 0 || lockedWorld) return;
+        const left = currentWorldIndex;
+        // Each pane's place in its scrollback goes with its world.
+        const mainFollow = followBottom;
+        const mainAnchor = followBottom ? null : viewAnchor();
+        let splitAnchor = null;
+        withSplitPane(() => { if (!followBottom) splitAnchor = viewAnchor(); });
+        const splitFollow = splitPane.followBottom;
+        currentWorldIndex = other;
+        splitPane.name = worlds[left].name;
+        splitPane.onTop = !splitPane.onTop;
+        splitPlace();
+        followBottom = true;
+        renderOutput({ toBottom: true });
+        if (!splitFollow && splitAnchor && restoreViewAnchor(splitAnchor)) followBottom = false;
+        splitPane.followBottom = true;
+        splitPane.lastRenderedWorld = null;
+        withSplitPane(() => {
+            renderOutput({ toBottom: true });
+            if (!mainFollow && mainAnchor && restoreViewAnchor(mainAnchor)) followBottom = false;
+        });
+        updateStatusBar();
+        const world = worlds[currentWorldIndex];
+        if (world && world.prompt) {
+            elements.prompt.innerHTML = sanitizeHtml(parseAnsi(world.prompt));
+        } else {
+            elements.prompt.textContent = '';
+        }
+        // One message for both: this world is ours now and the one left stays on screen,
+        // so the server releases neither pane's ▶ (an older server can't be told).
+        const msg = { type: 'MarkWorldSeen', world_index: other, previous_world_index: left };
+        if (serverTakesOtherViews) msg.other_views = [left];
+        send(msg);
+        sendViewStateIfChanged();
+        sendOtherViews();
+        saveSplitState();
     }
 
     // Render output - render all lines as text with line breaks
@@ -8587,6 +8995,8 @@
             { l: '/note [file]', r: 'Open split-screen editor' },
             { l: '/window [world]', r: 'Open new browser window/tab' },
             { l: '/window --grep [pattern]', r: 'Open grep/filter window' },
+            { l: '/split [world]', r: 'Split the output: a second world above (Shift+Tab moves between them)' },
+            { l: '/unsplit', r: 'Close the pane without the focus' },
             { heading: 'System' },
             { l: '/help [topic]', r: 'Show help (topic = command)' },
             { l: '/version', r: 'Show version info' },
@@ -8602,6 +9012,7 @@
             { l: '/remote', r: 'List connected WebSocket clients' },
             { l: '/remote --kill &lt;id&gt;', r: 'Disconnect a client' },
             { l: '/remote --pause &lt;id&gt;', r: 'Toggle pause on a client' },
+            { l: '/remote --pause console', r: 'Toggle pause on the console' },
         ]},
         { heading: 'TF Commands', rows: [
             { l: 'For TinyFugue commands (triggers, macros,', r: '' },
@@ -9445,8 +9856,9 @@
     // `lineIndices`: the selected lines' data-line-idx numbers, or {idx, seq, lid} objects. A
     // lid (lineId) or a seq names its line for good; an index goes stale once history is
     // prepended above it, and an archive line has no seq.
-    window.getDebugSelectionText = function(lineIndices) {
-        var world = worlds[currentWorldIndex];
+    // `inSplit`: the selection is in a split's other pane (/split), whose world it reads.
+    window.getDebugSelectionText = function(lineIndices, inSplit) {
+        var world = worlds[inSplit && splitPane ? splitWorldIndex() : currentWorldIndex];
         if (!world) return '';
         var lines = world.output_lines || [];
         var parts = [];
@@ -9761,7 +10173,8 @@
         if (gagged && !showTags) return false;
         if (isFillerLine(cleanLine)) return false;
         // Filter (F4, with * and ?) and grep: match the displayed text (no ANSI, no MUD tag for grep)
-        if (filterPopupOpen && filterText.length > 0 && !matchesFilter(stripAnsiForFilter(cleanLine), filterText)) return false;
+        // F4's filter is the focused pane's (/split).
+        if (!drawingSplit && filterPopupOpen && filterText.length > 0 && !matchesFilter(stripAnsiForFilter(cleanLine), filterText)) return false;
         if (grepRegex && !grepRegex.test(stripMudTag(stripAnsiForFilter(cleanLine)))) return false;
         return true;
     }
@@ -10484,11 +10897,12 @@
         if (armed) {
             const inner = escapeKeyToToken(e);
             const action = inner && lookupBinding('Esc-' + inner);
-            if (action && SHELL_SWITCH_ACTIONS.has(action)) { e.preventDefault(); dispatchAction(action); return true; }
+            if (action && (SHELL_SWITCH_ACTIONS.has(action) || (action === 'split_focus' && splitPane))) { e.preventDefault(); dispatchAction(action); return true; }
         }
         const name = keyEventToToken(e);
         const bound = name && lookupBinding(name);
-        if (bound && SHELL_SWITCH_ACTIONS.has(bound)) { e.preventDefault(); dispatchAction(bound); return true; }
+        // While split, Shift+Tab moves between the panes from a shell world too.
+        if (bound && (SHELL_SWITCH_ACTIONS.has(bound) || (bound === 'split_focus' && splitPane))) { e.preventDefault(); dispatchAction(bound); return true; }
         // A non-text key goes to the PTY; a plain character waits for the `input` event.
         const sk = shellKeyFromEvent(e);
         if (sk) { e.preventDefault(); send({ type: 'ShellInput', world_index: currentWorldIndex, key: sk }); return true; }
@@ -10561,8 +10975,9 @@
             return;
         }
 
-        // A shell world (src/shell): the output area is a terminal grid, not MUD lines.
-        setShellInputMode(!!(world.shell && world.shell.live));
+        // A shell world (src/shell): the output area is a terminal grid, not MUD lines. The
+        // input's mode is the focused pane's.
+        if (!drawingSplit) setShellInputMode(!!(world.shell && world.shell.live));
         if (world.shell) {
             renderShellScreen(world);
             return;
@@ -10574,7 +10989,7 @@
         // has scrolled up back to the bottom, or re-pin them: only the user does that. A
         // different world, or a search match to show, still starts at the bottom.
         const keepView = !preserveScroll && !followBottom && !(opts && opts.toBottom)
-            && world === lastRenderedWorld && !searchCutOff();
+            && world === lastRenderedWorld && (drawingSplit || !searchCutOff());
         const anchor = keepView ? viewAnchor() : null;
 
         // A rebuild that puts the view at the bottom shows the tail: the window stops
@@ -10586,7 +11001,7 @@
         // so the matched line appears at the bottom of the output area. Otherwise the
         // window ends at the tail, or where it has slid to.
         let searchEndIdx = renderEndIdx(world);
-        if (searchPopupOpen && searchCurrentPos >= 0 && searchCurrentPos < searchMatchIndices.length) {
+        if (!drawingSplit && searchPopupOpen && searchCurrentPos >= 0 && searchCurrentPos < searchMatchIndices.length) {
             const k = lines.indexOf(searchMatchIndices[searchCurrentPos]);
             searchEndIdx = k >= 0 ? k + 1 : lines.length;
         }
@@ -10618,7 +11033,8 @@
         // a frame here (the rest are above it and drawn whole); each ".line" element drawn
         // mid-reveal is tracked for its next frames once the DOM exists (one entry per
         // lineSpanHtml, in order, null when drawn whole).
-        const revealFrom = slid ? Infinity : searchEndIdx - (getVisibleLineCount() * 2 + 10);
+        // (Not in a split's other pane, which is drawn whole.)
+        const revealFrom = (slid || drawingSplit) ? Infinity : searchEndIdx - (getVisibleLineCount() * 2 + 10);
         const revealTracked = [];
         let revealAny = false;
 
@@ -10701,6 +11117,8 @@
 
         // Clear unseen for current world
         world.unseen_lines = 0;
+        // The focused pane drawn afresh (a setting, a font): the other pane too.
+        if (!drawingSplit) scheduleSplitRender();
     }
 
     // Append a client-generated message to output
@@ -12537,15 +12955,22 @@
         // still holds the real typed text; see style.css's .echo-masked rule.
         elements.input.classList.toggle('echo-masked', !!(world && world.echo_masked));
 
+        // The bar is the bottom pane's (/split): while the top pane has the focus it shows
+        // the other pane's world, grey (updatePaneBars).
+        const barIdx = bottomPaneWorld();
+        const barFocused = barIdx === currentWorldIndex && !(splitPane && !splitPane.onTop);
+        const barWorld = barFocused ? world : worlds[barIdx];
+        updatePaneBars();
+
         // Connection dot and world name
-        if (world && world.name && world.was_connected) {
+        if (barWorld && barWorld.name && barWorld.was_connected) {
             elements.statusDot.className = 'status-dot' +
-                (world.connected ? '' : (isWorldReconnecting(world) ? ' reconnecting' : ' off'));
-            const gmcpInd = (world && world.gmcp_user_enabled) ? ' [g]' : '';
+                (barWorld.connected ? '' : (isWorldReconnecting(barWorld) ? ' reconnecting' : ' off'));
+            const gmcpInd = (barWorld && barWorld.gmcp_user_enabled) ? ' [g]' : '';
             // TF-parity plan Job 22b/P2.7: show a pending numeric prefix next to the
             // world name, mirroring the console's own separator-bar "[N]" (rendering.rs).
             const kbnumInd = (kbnum !== null) ? ' [' + kbnum + ']' : '';
-            elements.worldName.textContent = world.name + gmcpInd + kbnumInd;
+            elements.worldName.textContent = barWorld.name + gmcpInd + kbnumInd;
             elements.statusDot.style.display = '';
             elements.worldName.style.display = '';
         } else {
@@ -12556,7 +12981,22 @@
         // More/Hist badge
         const serverPending = world ? (world.pending_count || 0) : 0;
         const totalPending = pendingTotal();
-        if (!isAtBottom() && !scrollRafPending) {
+        if (!barFocused) {
+            // The other pane's world: its own scroll and holds.
+            const held = moreOf(barIdx).held.length + ((barWorld && barWorld.pending_count) || 0);
+            if (!splitPane.followBottom) {
+                const c = splitPane.container;
+                elements.moreLabel.textContent = 'History';
+                elements.moreCount.textContent = formatCount(Math.max(0, Math.floor((c.scrollHeight - c.scrollTop - c.clientHeight) / lineHeightPx())));
+                elements.statusMore.style.display = '';
+            } else if (held > 0) {
+                elements.moreLabel.textContent = 'More';
+                elements.moreCount.textContent = formatCount(held);
+                elements.statusMore.style.display = '';
+            } else {
+                elements.statusMore.style.display = 'none';
+            }
+        } else if (!isAtBottom() && !scrollRafPending) {
             const container = elements.outputContainer;
             let linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeightPx());
             // Slid up into history: the lines below the page count too.
@@ -12578,7 +13018,7 @@
             elements.activityIndicator.style.display = '';
             // Build tooltip listing worlds with activity
             const activeWorlds = worlds
-                .filter((w, i) => i !== currentWorldIndex && worldHasActivity(w))
+                .filter((w, i) => i !== currentWorldIndex && !splitShows(i) && worldHasActivity(w))
                 .map(w => w.name);
             elements.activityIndicator.title = activeWorlds.length > 0
                 ? 'Unseen: ' + activeWorlds.join(', ')
@@ -16211,7 +16651,8 @@
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'CalculateNextWorld',
-                current_index: currentWorldIndex
+                current_index: currentWorldIndex,
+                exclude: splitExclude()
             }));
         }
     }
@@ -16221,7 +16662,8 @@
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'CalculatePrevWorld',
-                current_index: currentWorldIndex
+                current_index: currentWorldIndex,
+                exclude: splitExclude()
             }));
         }
     }
@@ -16231,7 +16673,8 @@
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'CalculateOldestPending',
-                current_index: currentWorldIndex
+                current_index: currentWorldIndex,
+                exclude: splitExclude()
             }));
         }
     }
@@ -17285,10 +17728,19 @@
                 noteUserScrollIntent();
                 // Try command completion first
                 if (performCompletion()) return true;
-                if (pendingTotal() > 0) {
+                // Then down through what's scrolled back, and only at the bottom release
+                // what's held, as the console's Tab does. Releasing first put the lines
+                // below a view scrolled back, out of sight: Tab after Page Up seemed to do
+                // nothing until everything that had arrived meanwhile was out.
+                if (!followBottom) {
+                    elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
+                    userScrolled(false);
+                } else if (pendingTotal() > 0) {
                     releaseScreenful();
                 } else {
-                    elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
+                    moreNow().paused = false;
+                    moreNow().rowsSincePause = 0;
+                    updateStatusBar();
                 }
                 return true;
             }
@@ -17340,6 +17792,10 @@
                 if (target !== null) switchWorldLocal(target);
                 return true;
             }
+            // Shift+Tab: the focus moves to the split's other pane (/split).
+            case 'split_focus':
+                splitFocusSwap();
+                return true;
             // TF /bg (= /fg -n): background every world / no foreground - a no-op, same
             // as the console (Clay always shows one world per client).
             case 'bg_all_worlds':
@@ -18571,6 +19027,12 @@
         }
 
         // Click anywhere to focus input and close menu
+        // A press on the grey bar of a split's bottom pane (/split) moves the focus there
+        // first, so its controls act on the pane they describe.
+        elements.statusBar.addEventListener('pointerdown', () => {
+            if (splitPane && !splitPane.onTop) splitFocusSwap();
+        }, true);
+
         document.body.onclick = function(e) {
             // Close menu if open
             if (menuOpen) {
@@ -19356,6 +19818,29 @@
             const text = (e.clipboardData || window.clipboardData).getData('text');
             shellSendText(text, true);
         });
+
+        // Paste from the WebView GUI's output menu (webview_gui.rs): into the input, as the
+        // input's own Paste does. wry lets the page read the clipboard on Linux and Windows:
+        // execCommand pastes through the input's paste event (a shell world's included);
+        // where it can't (WebView2, macOS), the async clipboard API.
+        window.clayPasteIntoInput = function() {
+            const input = elements.input;
+            input.focus();
+            try {
+                if (document.execCommand('paste')) return;
+            } catch (e) { /* not supported here */ }
+            if (!navigator.clipboard || !navigator.clipboard.readText) return;
+            navigator.clipboard.readText().then(function(text) {
+                if (!text) return;
+                if (shellActive()) {
+                    shellSendText(text, true);
+                    return;
+                }
+                input.focus();
+                input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end');
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            }).catch(function() { /* refused */ });
+        };
 
         // A live shell world: send each insertion/deletion/newline to the PTY as it
         // happens. `beforeinput` carries the inputType and data even for a soft keyboard

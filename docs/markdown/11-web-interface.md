@@ -202,7 +202,8 @@ and the Android app since all three run the same interface code.
 | `Esc-{` / `Esc-}` | Switch between active worlds |
 | `Esc-Left` / `Esc-Right` | Switch between connected worlds |
 | `PageUp/PageDown` | Scroll output (or drag the scroll bar on the output's right edge; see the Interface chapter) |
-| `Tab` | Release screenful when paused; scroll down otherwise |
+| `Tab` | Scroll down a page when scrolled back; at the bottom, release a screenful when paused |
+| `Shift+Tab` | Split output (`/split`): move the focus to the other pane (a click on it does too) |
 | `Escape+j` | Jump to end |
 | `Ctrl+P/N` | Command history |
 | `Ctrl+U` | Delete from the cursor back to the start of the line |

@@ -184,19 +184,34 @@ impl ClayView {
             return;
         }
         self.link.followers.retain(|(f, _)| f.upgrade().is_some());
-        let worlds: Vec<usize> = self
-            .link
-            .followers
-            .iter()
-            .filter_map(|(f, _)| f.upgrade())
-            .map(|f| &f.read(cx).session.core)
-            .filter(|core| !core.worlds.is_empty())
-            .map(|core| core.current)
-            .collect();
-        let fx = self.session.set_other_views(worlds);
+        let (worlds, dims) = self.other_views_now(cx);
+        let fx = self.session.set_other_views(worlds, dims);
         if !fx.is_empty() {
             self.after(fx, cx);
         }
+    }
+
+    /// The worlds on screen besides this window's focused one - its split's other pane
+    /// (`/split`), each window following it and their split panes - with the size each is
+    /// shown at (`OtherViews.dims`).
+    pub(super) fn other_views_now(&self, cx: &Context<Self>) -> (Vec<usize>, Vec<crate::websocket::ViewDims>) {
+        let mut worlds: Vec<usize> = self.split_other().into_iter().collect();
+        let mut dims: Vec<crate::websocket::ViewDims> = self.split_other_dims().into_iter().collect();
+        for f in self.link.followers.iter().filter_map(|(f, _)| f.upgrade()) {
+            let view = f.read(cx);
+            let core = &view.session.core;
+            if core.worlds.is_empty() {
+                continue;
+            }
+            worlds.push(core.current);
+            let s = view.scroll.borrow();
+            if s.view_rows > 0 {
+                dims.push(crate::websocket::ViewDims { world: core.current, lines: s.view_rows, columns: s.view_cols });
+            }
+            worlds.extend(view.split_other());
+            dims.extend(view.split_other_dims());
+        }
+        (worlds, dims)
     }
 
     /// Open a window on this connection (the main window's, whichever window asks).

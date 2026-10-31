@@ -1613,7 +1613,7 @@ fn shell_key_intercept(key: KeyEvent, app: &mut App) -> Option<KeyAction> {
         .map(|t| t.elapsed() < app.chord_window)
         .unwrap_or(false);
     app.shell_esc_armed_at = None;
-    match crate::shell::keys::classify(key.code, key.modifiers, &app.keybindings, esc_armed) {
+    match crate::shell::keys::classify(key.code, key.modifiers, &app.keybindings, esc_armed, app.split.is_some()) {
         crate::shell::keys::Decision::Switch(action) => Some(dispatch_action(&action, app)),
         crate::shell::keys::Decision::Forward(k) => {
             app.shell_input(idx, Some(k), None, false);
@@ -1704,7 +1704,7 @@ pub(crate) fn perform_completion(app: &mut App) -> bool {
                 // Clay-specific commands
                 "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections", "/server",
                 "/setup", "/web", "/actions", "/reload", "/update", "/quit", "/gag",
-                "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify",
+                "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify", "/split", "/unsplit",
                 // TF commands (now available with / prefix)
                 "/set", "/unset", "/let", "/echo", "/send", "/beep", "/quote",
                 "/expr", "/test", "/eval", "/if", "/elseif", "/else", "/endif",
@@ -2402,6 +2402,11 @@ fn dispatch_action_impl(action: &str, app: &mut App) -> Option<KeyAction> {
         // TF /bg (= /fg -n): background every world / no foreground - a no-op in Clay's
         // single-pane console, exactly like cmd_fg's own -n handling (tf/parser.rs).
         "bg_all_worlds" => KeyAction::None,
+        // Shift+Tab: the focus moves to the split's other pane (`/split`).
+        "split_focus" => {
+            app.split_swap_focus();
+            KeyAction::None
+        }
 
         // System: TF REFRESH (plain repaint) vs. Clay's historical filtering ^L. Both
         // trigger the same terminal teardown/rebuild at the call site; only `Redraw` also

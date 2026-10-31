@@ -903,12 +903,15 @@ async fn reconnect_once(
 /// console's worlds, settings and view become the server's again. What belongs to the
 /// console - the input line, its history, an open editor - stays.
 fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSender<WsMessage>, version_mismatch_shown: &mut bool) {
-    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, .. } = msg else {
+    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, other_views, .. } = msg else {
         return;
     };
     app.server_expands_line = expand_line;
     app.server_picture_upload = picture_upload;
     app.server_history_on_demand = history_on_demand;
+    app.server_takes_other_views = other_views;
+    // A split's other pane is kept by its world's name, as the editor's is.
+    let split_world = app.split.and_then(|s| app.worlds.get(s.other)).map(|w| w.name.clone());
     app.server_version_detail = crate::server_version_detail(&server_version_detail, &server_version);
     // An open editor is kept by its world's name: the world list is the server's again.
     let notes_world = app.editor.world_index.and_then(|i| app.worlds.get(i)).map(|w| w.name.clone());
@@ -925,6 +928,15 @@ fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSen
     app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
     app.tf_status = tf_status.into_iter().map(|e| (e.world_index, e.view)).collect();
     let find = |app: &App, name: &str| app.worlds.iter().position(|w| w.name == name);
+    if let Some(name) = split_world {
+        match (find(app, &name), app.split.as_mut()) {
+            (Some(i), Some(split)) => split.other = i,
+            _ => {
+                app.split = None;
+                app.needs_terminal_clear = true;
+            }
+        }
+    }
     if let Some(name) = notes_world {
         match find(app, &name) {
             Some(i) => app.editor.world_index = Some(i),
@@ -977,6 +989,7 @@ fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSen
         world_index: current_world_index,
         visible_lines,
         visible_columns: Some(width as usize),
+        splits: true,
     });
     // Mark the world we're displaying as seen. Only a world *switch* ever sends
     // MarkWorldSeen otherwise, so the world on screen at connect would keep its
@@ -986,6 +999,7 @@ fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSen
     let _ = ws_tx.send(WsMessage::MarkWorldSeen {
         world_index: current_world_index,
         previous_world_index: None,
+        other_views: None,
     });
     // An earlier Clay on this machine that crashed (src/crashlog.rs): said once, now that
     // there is a world to say it in (taken, so a reconnect doesn't repeat it).
@@ -1326,7 +1340,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     let mut notes_list_armed = false;
 
     // The output area's size as last reported to the server (UpdateViewState).
-    let mut reported_view: Option<(u16, u16)> = None;
+    // The view last reported: the focused pane's size, and the split's other pane.
+    let mut reported_view: Option<ReportedView> = None;
 
     // Reconnecting (the server reloaded, or the connection dropped): the attempt count,
     // the timer for the next attempt, and the attempt's answer. While disconnected,
@@ -1408,14 +1423,23 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             // the rest - since the server sizes more-mode and a shell world's PTY by it: a
             // PTY taller than this area has its bottom rows drawn off the screen. Sent on
             // any change (a terminal resize, the input area, a status line).
-            let view = (app.output_height, app.output_width);
+            // A split (/split) is reported the same way: its other pane's world and size.
+            let other = app.split_other().map(|o| (o, app.console_rows_for(o)));
+            let view = (app.output_height, app.output_width, other);
             if reported_view != Some(view) {
+                let split_changed = reported_view.is_none_or(|r| r.2 != other);
                 reported_view = Some(view);
                 let _ = ws_tx.send(WsMessage::UpdateViewState {
                     world_index: app.current_world_index,
                     visible_lines: view.0 as usize,
                     visible_columns: Some(view.1 as usize),
+                    splits: true,
                 });
+                if split_changed || other.is_some() {
+                    if let Some(msg) = app.remote_other_views() {
+                        let _ = ws_tx.send(msg);
+                    }
+                }
             }
         }
 
@@ -1473,13 +1497,13 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 MouseEventKind::Moved => Some(("move", 0)),
                                 _ => None,
                             };
-                            if let (Some((kind, button)), true) = (kind, mouse.row >= 1) {
+                            if let (Some((kind, button)), Some(grid_row)) = (kind, app.shell_grid_row(mouse.row)) {
                                 let _ = ws_tx.send(WsMessage::ShellMouse {
                                     world_index: app.current_world_index,
                                     kind: kind.to_string(),
                                     button,
                                     col: mouse.column.saturating_sub(1),
-                                    row: mouse.row - 1,
+                                    row: grid_row,
                                     ctrl: mouse.modifiers.contains(KeyModifiers::CONTROL),
                                     alt: mouse.modifiers.contains(KeyModifiers::ALT),
                                     shift: mouse.modifiers.contains(KeyModifiers::SHIFT),
@@ -2220,7 +2244,7 @@ pub(crate) fn handle_remote_client_key(
                     if let Some(idx) = app.find_world(&name) {
                         let previous_idx = app.current_world_index;
                         app.current_world_index = idx;
-                        let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
+                        let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx), other_views: None });
                         if !app.worlds[idx].connected {
                             if app.worlds[idx].settings.has_connection_settings() {
                                 let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
@@ -2761,7 +2785,7 @@ pub(crate) fn handle_remote_client_key(
         }
         let esc_armed = app.shell_esc_armed_at.map(|t| t.elapsed() < app.chord_window).unwrap_or(false);
         app.shell_esc_armed_at = None;
-        match crate::shell::keys::classify(key.code, key.modifiers, &app.keybindings, esc_armed) {
+        match crate::shell::keys::classify(key.code, key.modifiers, &app.keybindings, esc_armed, app.split.is_some()) {
             crate::shell::keys::Decision::Switch(action) => return dispatch_remote_action(&action, app, ws_tx),
             crate::shell::keys::Decision::Forward(k) => {
                 let _ = ws_tx.send(WsMessage::ShellInput { world_index: shell_idx, key: Some(k), text: None, paste: false });
@@ -2889,6 +2913,10 @@ pub(crate) fn handle_remote_client_key(
     }
     false
 }
+/// The view the SSH console last reported to the server: the focused pane's rows and
+/// columns, and a split's other pane (`/split`) - its world and rows.
+type ReportedView = (u16, u16, Option<(usize, u16)>);
+
 /// A command line in the remote console, wherever it came from: typed (Enter), the menu,
 /// or the server (`ExecuteLocalCommand`: an action or a macro ran a command whose window is
 /// this console's). One dispatcher, as `App::run_note_command` is for `/note`: three copies
@@ -2923,6 +2951,15 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
         }
         Command::Version => version_command(app),
         Command::Menu => app.open_menu_popup_new(),
+        // The split is this console's own, typed or sent back by the server (an action).
+        Command::Split { world } => {
+            let msg = app.split_open(world.as_deref());
+            app.add_output(&msg);
+        }
+        Command::Unsplit => {
+            let msg = app.split_close();
+            app.add_output(&msg);
+        }
         Command::Font => app.add_output("Font settings are available in the web and GUI interfaces."),
         Command::Setup => app.open_setup_popup_new(),
         Command::Web => app.open_web_popup_new(),
@@ -2940,7 +2977,7 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
                 // Already shown (the server's WorldSwitched moved this console and marked
                 // it seen): no second claim for the same world.
                 if previous_idx != idx {
-                    let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
+                    let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx), other_views: None });
                 }
                 // From the server, it has connected the world already if it could.
                 if !from_server && !app.worlds[idx].connected {
@@ -3055,8 +3092,9 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
 /// sending `SwitchWorld` to the caller. `None` if there are no connected worlds, or if the
 /// computed target is the world already current (nothing to do).
 fn cycle_connected_world_target(app: &App, direction: i32) -> Option<usize> {
+    let skip = app.split_exclude();
     let connected: Vec<usize> = app.worlds.iter().enumerate()
-        .filter(|(_, w)| w.connected)
+        .filter(|(i, w)| w.connected && !skip.contains(i))
         .map(|(i, _)| i)
         .collect();
     if connected.is_empty() {
@@ -3328,18 +3366,20 @@ pub(crate) fn dispatch_remote_action(
             });
         }
         "tab_key" => {
+            // Down through what's scrolled back first, as the console's Tab: a release
+            // while scrolled back lands below the view, out of sight.
             let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
-            if app.current_world().paused && has_pending {
+            if !app.current_world().is_at_bottom() {
+                let scroll_amount = app.output_height.saturating_sub(2) as usize;
+                let max_offset = app.current_world().output_lines.len().saturating_sub(1);
+                app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
+                app.needs_output_redraw = true;
+            } else if app.current_world().paused && has_pending {
                 let release_count = app.output_height.saturating_sub(2) as usize;
                 let _ = ws_tx.send(WsMessage::ReleasePending {
                     world_index: app.current_world_index,
                     count: release_count,
                 });
-            } else if !app.current_world().is_at_bottom() {
-                let scroll_amount = app.output_height.saturating_sub(2) as usize;
-                let max_offset = app.current_world().output_lines.len().saturating_sub(1);
-                app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
-                app.needs_output_redraw = true;
             } else if app.input.buffer.starts_with('/') {
                 // Nothing to page: a command is completed, as by the local console's Tab.
                 perform_completion(app);
@@ -3348,28 +3388,28 @@ pub(crate) fn dispatch_remote_action(
 
         // World (remote: send WS messages to server for world calculations)
         "world_next" => {
-            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index, exclude: app.split_exclude() });
         }
         "world_prev" => {
-            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index, exclude: app.split_exclude() });
         }
         "world_all_next" => {
-            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index, exclude: app.split_exclude() });
         }
         "world_all_prev" => {
-            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index, exclude: app.split_exclude() });
         }
         "world_activity" => {
-            let _ = ws_tx.send(WsMessage::CalculateOldestPending { current_index: app.current_world_index });
+            let _ = ws_tx.send(WsMessage::CalculateOldestPending { current_index: app.current_world_index, exclude: app.split_exclude() });
         }
         "recent_worlds" => {
             app.open_recent_worlds_popup();
         }
         "world_previous" => {
-            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index, exclude: app.split_exclude() });
         }
         "world_forward" => {
-            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index, exclude: app.split_exclude() });
         }
         // TF /bg (= /fg -n): no-op in Clay's single-pane console (Job 19; see
         // dispatch_action's own version for the full rationale).
@@ -3381,6 +3421,16 @@ pub(crate) fn dispatch_remote_action(
         // the target can be computed locally exactly like the master console's own
         // `App::cycle_connected_world` - no new WsMessage needed, just the existing
         // `SwitchWorld` once the target index is known.
+        // Shift+Tab: the focus moves to the split's other pane. Its world becomes this
+        // console's, and the world left stays on screen: the server hears both at once, so
+        // neither pane's ▶ markers are released.
+        "split_focus" => {
+            let left = app.current_world_index;
+            if app.split_swap_focus() && app.current_world_index != left {
+                let others = app.server_takes_other_views.then(|| vec![left]);
+                let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: app.current_world_index, previous_world_index: Some(left), other_views: others });
+            }
+        }
         "world_socket_prev" => {
             let n = app.input.take_kbnum() as i32;
             if let Some(idx) = cycle_connected_world_target(app, -n) {
@@ -4107,6 +4157,26 @@ mod tests {
         assert_eq!(app.filter_popup.filter_text, "orc");
         app.handle_remote_ws_message(WsMessage::LimitOp { action: "clear".into(), pattern: String::new(), invert: false, attrs_only: false, style: String::new() });
         assert!(!app.filter_popup.visible);
+    }
+
+    /// Tab scrolled back pages down first, as the console's: a release asked for then
+    /// lands below the view, out of sight. Only at the bottom does it release.
+    #[test]
+    fn tab_scrolls_back_down_before_releasing() {
+        let (mut app, tx, mut rx) = remote_note_app(1);
+        for i in 0..60 {
+            app.worlds[0].output_lines.push(crate::OutputLine::new(format!("line {i}"), i));
+        }
+        app.worlds[0].paused = true;
+        app.worlds[0].pending_count = 6;
+        app.worlds[0].scroll_offset = 20;
+        dispatch_remote_action("tab_key", &mut app, &tx);
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(app.worlds[0].scroll_offset, 42);
+        dispatch_remote_action("tab_key", &mut app, &tx);
+        assert!(app.worlds[0].is_at_bottom());
+        dispatch_remote_action("tab_key", &mut app, &tx);
+        assert!(matches!(drain(&mut rx).as_slice(), [WsMessage::ReleasePending { world_index: 0, count: 22 }]));
     }
 
     /// The expand_line key asks a server that takes ExpandLine; an older one's line is

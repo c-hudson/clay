@@ -107,12 +107,24 @@ different about running it as a native window instead of a browser tab:
 
 - No browser chrome — no URL bar, tabs, or bookmarks; just the app's own toolbar.
 - No browser autoplay restrictions on ANSI music/audio.
-- Right-click in the output area opens a **Debug Selection** context menu item (see
-  below) that the plain browser client doesn't have.
+- Right-click in the output area opens Clay's own menu, which the plain browser client
+  doesn't have. The native GUI's output menu is the same.
+  - **Open Link**, on a link only: opens it in your browser, as clicking it does.
+  - **Copy**: on a link, its address; otherwise, or when you right-click on selected
+    text, the selection.
+  - **Paste**: the clipboard into the input line, exactly as the input's own Paste does.
+    On macOS the WebView may ask you to confirm it.
+  - **Debug Selection** (see below).
 - Menu > Import Picture opens a file dialog, and a picture dragged onto the window is
   uploaded too (see **Importing a Picture** in the Interface chapter). The native GUI does
   the same; on Linux its file dialog needs xdg-desktop-portal, and without it a drag
   still works.
+- The native GUI's hamburger menu is also the desktop's own menu, where the desktop has
+  one: the macOS menu bar, and on Linux an app-menu applet on the panel (xfce4's AppMenu
+  plugin, MATE's and Budgie's). Its Clay menu lists the hamburger's items, then Quit, and
+  each choice acts on the window it was made for. Nothing is added to the window, and
+  without such an applet nothing changes. On Linux it needs an X11 session (Wayland has no
+  way to say where a window's menu is). The WebView GUI doesn't do this.
 
 ## Keyboard Shortcuts
 

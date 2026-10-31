@@ -345,7 +345,13 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                         let describe = |v: &ClayView| {
                             let core = &v.session.core;
                             let unseen: Vec<String> = core.worlds.iter().filter(|w| w.unseen > 0).map(|w| format!("{}={}", w.name, w.unseen)).collect();
-                            format!("{} (unseen: {})", core.current_world().map_or("-", |w| w.name.as_str()), unseen.join(" "))
+                            // A split (`/split`): the other pane's world, where it is, and
+                            // its more-mode hold.
+                            let split = v.split.as_ref().map_or(String::new(), |p| {
+                                let held = v.more.get(&p.world).map_or(0, |m| m.held());
+                                format!(" split[other={} {} held={}]", p.world, if p.on_top { "top" } else { "bottom" }, held)
+                            });
+                            format!("{} (unseen: {}){split} activity={}", core.current_world().map_or("-", |w| w.name.as_str()), unseen.join(" "), core.activity)
                         };
                         let main = view.read(app);
                         let mut line = format!("snapshot-worlds: {arg} main={}", describe(main));

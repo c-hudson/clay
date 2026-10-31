@@ -622,7 +622,8 @@ impl App {
     /// The rows between the output and the input area: TF's status area when a script has
     /// it (%status_height of them), else Clay's one-row bar.
     pub(crate) fn separator_rows(&self) -> u16 {
-        self.tf_status.get(&self.current_world_index).map_or(1, |view| view.rows.len() as u16)
+        // The bar is the bottom pane's (`/split`), the only pane while not split.
+        self.tf_status.get(&crate::rendering::console_bottom_world(self)).map_or(1, |view| view.rows.len() as u16)
     }
 
     /// TF's status area (`tf::status`), once a script has made it its own: evaluated for
@@ -654,7 +655,7 @@ impl App {
             if self.tf_status.get(&idx) != Some(&view) {
                 self.tf_status.insert(idx, view.clone());
                 self.ws_broadcast(WsMessage::TfStatus { world_index: idx, view: Some(view) });
-                if idx == self.current_world_index {
+                if idx == crate::rendering::console_bottom_world(self) {
                     self.needs_output_redraw = true;
                 }
             }

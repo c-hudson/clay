@@ -485,12 +485,13 @@ impl ClayView {
         self.speller().is_none_or(|sp| sp.is_valid(word))
     }
 
-    /// What a misspelled word might have been, from whichever checker is in use.
-    fn suggest(&self, word: &str) -> Option<Vec<String>> {
+    /// What a misspelled word might have been (up to `count`), from whichever checker is
+    /// in use.
+    fn suggest(&self, word: &str, count: usize) -> Option<Vec<String>> {
         if let Some(n) = &self.input.native {
-            return Some(n.suggestions(word, 5));
+            return Some(n.suggestions(word, count));
         }
-        self.speller().map(|sp| sp.suggestions(word, 5))
+        self.speller().map(|sp| sp.suggestions(word, count))
     }
 
     /// The input line: the prompt, then the text.
@@ -722,25 +723,32 @@ impl ClayView {
         self.input_touched(cx);
     }
 
-    /// ^Q (`spell_check`): a misspelled word at the cursor gets its suggestions, in the
-    /// input's menu at the caret. The console prints them and cycles them in; the web's
-    /// ^Q does nothing (B25). A word spelled right, or with none, does nothing either.
-    pub(super) fn spell_suggest(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let at = self.editor.cursor;
-        let Some(w) = crate::native_gui::core::spell::word_at(&self.editor.text, at) else { return };
-        let word = self.editor.text[w.clone()].to_string();
+    /// ^Q (`spell_check`), as the console's (`App::handle_spell_check`) and app.js's: on
+    /// a misspelled word at or before the cursor, the first press lists its suggestions in
+    /// the output; each press after that puts the next one in its place, the word as typed
+    /// last, and round again. A word spelled right, or with none, does nothing. The
+    /// suggestions are this GUI's own checker's, as the underline's and the right-click
+    /// menu's are.
+    pub(super) fn spell_suggest(&mut self, cx: &mut Context<Self>) {
+        use crate::native_gui::core::spell;
+        let (text, cursor) = (&self.editor.text, self.editor.cursor);
+        if let Some(round) = self.input.spell_round.as_mut().filter(|r| r.applies(text, cursor)) {
+            let (range, word) = round.advance();
+            self.editor.set_cursor(range.start, false);
+            self.editor.set_cursor(range.end, true);
+            self.editor.insert(&word);
+            self.input_touched(cx);
+            return;
+        }
+        self.input.spell_round = None;
+        let Some(range) = spell::word_at(&self.editor.text, self.editor.cursor) else { return };
+        let word = self.editor.text[range.clone()].to_string();
         if self.word_is_valid(&word) {
             return;
         }
-        let Some(list) = self.suggest(&word).filter(|l| !l.is_empty()) else { return };
-        let layout = self.input.layout.borrow();
-        let Some(row) = layout.row_of(at) else { return };
-        let x = layout.x_of(at).unwrap_or(f32::from(layout.bounds.origin.x));
-        let y = layout.rows[row].top + layout.row_h;
-        drop(layout);
-        self.input.menu = Some((point(px(x), px(y)), Some((w, list))));
-        self.select.menu = None;
-        cx.notify();
+        let Some(list) = self.suggest(&word, 6).filter(|l| !l.is_empty()) else { return };
+        self.client_line(&format!("Suggestions for '{word}': {} (Ctrl+Q again to cycle)", list.join(", ")), cx);
+        self.input.spell_round = Some(spell::Round::new(range, word, list));
     }
 
     /// Right-click in the input: Cut, Copy, Paste, Select All, and for a misspelled word
@@ -748,7 +756,7 @@ impl ClayView {
     fn input_menu_at(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
         let at = self.input.layout.borrow().hit(f32::from(ev.position.x), f32::from(ev.position.y));
         let word = at.and_then(|at| self.input.misspelled.iter().find(|w| w.start <= at && at <= w.end).cloned());
-        let suggest = word.and_then(|w| Some((w.clone(), self.suggest(&self.editor.text[w])?)));
+        let suggest = word.and_then(|w| Some((w.clone(), self.suggest(&self.editor.text[w], 5)?)));
         // A right-click outside the selection moves the cursor there.
         if let Some(at) = at {
             if !self.editor.selection().is_some_and(|s| s.contains(&at)) {
@@ -842,6 +850,8 @@ impl ClayView {
     pub(super) fn typed(&mut self, cx: &mut Context<Self>) {
         self.kbnum = None;
         self.kbnum_sign = 1;
+        // The user's own edit ends a ^Q round, as on the console.
+        self.input.spell_round = None;
         if self.session.core.settings.as_ref().is_some_and(|s| s.temp_convert_enabled) {
             self.editor.convert_temperature();
         }
@@ -877,6 +887,7 @@ impl ClayView {
     /// next one (TF's %cleardone off) whenever sending took it out of the input - the lines
     /// this GUI answers itself included, as TF leaves any line entered.
     pub(super) fn send_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.spell_round = None;
         let entry = self.sent_entry_now();
         // /reload stashes the input area for the relaunch (surfaces.rs): the line goes
         // above first, so it is there afterwards as it is on the console.
@@ -922,6 +933,13 @@ impl ClayView {
         // `/server` and `/reload` are this GUI's own, connected or not (app.js sendCommand
         // in a remote GUI): never the server's.
         let first = trimmed.split_whitespace().next().unwrap_or("");
+        // `/split` and `/unsplit`: this window's own output (split.rs).
+        if first.eq_ignore_ascii_case("/split") || first.eq_ignore_ascii_case("/unsplit") {
+            self.editor.remember(&trimmed, false);
+            self.editor.clear();
+            self.split_command(&trimmed, cx);
+            return;
+        }
         if first.eq_ignore_ascii_case("/server") || first.eq_ignore_ascii_case("/reload") {
             self.editor.remember(&trimmed, false);
             self.editor.clear();
@@ -1062,6 +1080,8 @@ impl ClayView {
             // The console's menu (this window has its menu button). A server from before
             // /menu went console-only still sends it here: answer it, don't return it.
             "/menu" => self.client_line("/menu is the console's menu; here, use the menu button (\u{2630}).", cx),
+            // A /split an action or macro ran on the server: this window's own.
+            "/split" | "/unsplit" => self.split_command(command, cx),
             "/help" => self.later(|v, window, cx| v.open_surface("help", window, cx), cx),
             "/note" => match command.split_whitespace().nth(1) {
                 None => self.open_notes(cx),
@@ -1211,6 +1231,8 @@ pub struct InputState {
     native: Option<super::native_spell::Native>,
     /// The input's right-click menu: where, and the word it's for (with suggestions).
     pub menu: Option<(Point<Pixels>, Option<Suggestions>)>,
+    /// A ^Q round in progress (`spell_suggest`).
+    pub spell_round: Option<crate::native_gui::core::spell::Round>,
     /// The lines sent from this window still on screen above the one being typed (TF's
     /// `%cleardone` off, `Settings::clear_input_on_send`), oldest first, and how many of
     /// their rows show; `input_bar` fits them in, and a row the typed line takes is gone
@@ -1240,6 +1262,7 @@ impl Default for InputState {
             speller_on: false,
             native: None,
             menu: None,
+            spell_round: None,
             sent: VecDeque::new(),
             sent_rows: 0,
             clear_on_send: false,

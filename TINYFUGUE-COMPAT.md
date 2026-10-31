@@ -341,6 +341,8 @@ From the drop-in work (user rulings, or what Clay's design allows):
   the native-tls backend, which don't expose it.
 - `/recall -a` can take a line's own attributes off only while Clay is running: after a
   hot reload the line keeps them, drawn in.
+- `/recall -t` with no format shows the date and time, `%m/%d/%y %H:%M:%S` (user request
+  2026-10-30); TF's default is `%time_format` (`%H:%M`). `-t<format>` is TF's.
 - `%cleardone` off (the default) leaves sent lines in the input area as TF does, checked
   against tf in a pty (rows, rows scrolled off for good, `^L` clearing them), except that
   TF leaves the prompt on each done row (and a masked line's bare prompt) while Clay keeps
@@ -512,6 +514,7 @@ only checked on a machine that has it. Changing a default means changing all thr
 | `PageUp` | `scroll_page_up` |
 | `Right` | `cursor_right` |
 | `Shift-Down` | `world_all_prev` |
+| `Shift-Tab` | `split_focus` |
 | `Shift-Up` | `world_all_next` |
 | `Tab` | `tab_key` |
 | `Up` | `cursor_up` |

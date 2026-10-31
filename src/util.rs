@@ -790,12 +790,15 @@ pub enum SwitchDirection {
 }
 
 /// Get the next or previous world index to switch to
-/// Returns None if no world to switch to, or Some(index) of the target world
+/// Returns None if no world to switch to, or Some(index) of the target world.
+/// `exclude`: worlds never to land on - the other pane of a split (`/split`) - which are
+/// stepped over while the current world still marks the place in the cycle.
 pub fn calculate_world_switch(
     worlds: &[WorldSwitchInfo],
     current_index: usize,
     world_switch_mode: WorldSwitchMode,
     direction: SwitchDirection,
+    exclude: &[usize],
 ) -> Option<usize> {
     // Get list of worlds that should be included in cycling
     let cycleable: Vec<usize> = worlds.iter()
@@ -811,7 +814,7 @@ pub fn calculate_world_switch(
     // If world switching is set to "Unseen First", check for OTHER worlds with unseen output first
     if world_switch_mode == WorldSwitchMode::UnseenFirst {
         let mut unseen_worlds: Vec<usize> = cycleable.iter()
-            .filter(|&&i| i != current_index && world_has_pending(&worlds[i]))
+            .filter(|&&i| i != current_index && !exclude.contains(&i) && world_has_pending(&worlds[i]))
             .copied()
             .collect();
 
@@ -849,26 +852,45 @@ pub fn calculate_world_switch(
     // Find current position in the sorted cycleable list
     let current_pos = sorted.iter().position(|&i| i == current_index);
 
+    let len = sorted.len();
+    let step = |pos: usize| match direction {
+        SwitchDirection::Next => (pos + 1) % len,
+        SwitchDirection::Previous => if pos > 0 { pos - 1 } else { len - 1 },
+    };
+    let usable = |i: usize| i != current_index && !exclude.contains(&i);
     match current_pos {
         Some(pos) => {
-            let target_pos = match direction {
-                SwitchDirection::Next => (pos + 1) % sorted.len(),
-                SwitchDirection::Previous => if pos > 0 { pos - 1 } else { sorted.len() - 1 },
-            };
-            if sorted[target_pos] != current_index {
-                Some(sorted[target_pos])
-            } else {
-                None
+            // Step on past excluded worlds; back at the current world means nowhere to go.
+            let mut at = step(pos);
+            while at != pos {
+                if usable(sorted[at]) {
+                    return Some(sorted[at]);
+                }
+                at = step(at);
             }
+            None
         }
         None => {
             // Current world isn't in cycleable list, go to first or last cycleable world
             match direction {
-                SwitchDirection::Next => Some(sorted[0]),
-                SwitchDirection::Previous => Some(sorted[sorted.len() - 1]),
+                SwitchDirection::Next => sorted.iter().copied().find(|&i| usable(i)),
+                SwitchDirection::Previous => sorted.iter().rev().copied().find(|&i| usable(i)),
             }
         }
     }
+}
+
+/// The world a bare `/split` opens beside `current` (user ruling 2026-10-30: "the next in
+/// order"): the next connected world after it in alphabetical order (case-insensitive,
+/// wrapping), else the next of all worlds; None when there is no other world. `worlds` is
+/// each world's (name, connected). The one rule for every interface: the console and the
+/// native GUI call this, app.js `splitNextWorld` is a port of it.
+pub fn split_next_world(worlds: &[(&str, bool)], current: usize) -> Option<usize> {
+    let mut order: Vec<usize> = (0..worlds.len()).collect();
+    order.sort_by_key(|&i| (worlds[i].0.to_lowercase(), i));
+    let at = order.iter().position(|&i| i == current)?;
+    let after = || (1..order.len()).map(|k| order[(at + k) % order.len()]);
+    after().find(|&i| worlds[i].1).or_else(|| after().next())
 }
 
 /// Get the next world index to switch to (convenience wrapper)
@@ -877,7 +899,7 @@ pub fn calculate_next_world(
     current_index: usize,
     world_switch_mode: WorldSwitchMode,
 ) -> Option<usize> {
-    calculate_world_switch(worlds, current_index, world_switch_mode, SwitchDirection::Next)
+    calculate_world_switch(worlds, current_index, world_switch_mode, SwitchDirection::Next, &[])
 }
 
 /// Get the previous world index to switch to (convenience wrapper)
@@ -886,7 +908,7 @@ pub fn calculate_prev_world(
     current_index: usize,
     world_switch_mode: WorldSwitchMode,
 ) -> Option<usize> {
-    calculate_world_switch(worlds, current_index, world_switch_mode, SwitchDirection::Previous)
+    calculate_world_switch(worlds, current_index, world_switch_mode, SwitchDirection::Previous, &[])
 }
 
 // ============================================================================
@@ -1693,6 +1715,36 @@ mod tests {
         ];
         // From Alpha, should go to Charlie (oldest unseen)
         assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::UnseenFirst), Some(2));
+    }
+
+    #[test]
+    fn test_split_next_world() {
+        let w = [("Charlie", true), ("alpha", true), ("Bravo", false), ("delta", true)];
+        // From alpha: Bravo isn't connected, so Charlie; from delta, round to alpha.
+        assert_eq!(split_next_world(&w, 1), Some(0));
+        assert_eq!(split_next_world(&w, 3), Some(1));
+        // Nothing else connected: the next of all worlds.
+        let quiet = [("alpha", true), ("Bravo", false), ("Charlie", false)];
+        assert_eq!(split_next_world(&quiet, 0), Some(1));
+        assert_eq!(split_next_world(&[("only", true)], 0), None);
+    }
+
+    #[test]
+    fn test_world_switch_skips_excluded_worlds() {
+        let w = |name: &str, unseen: usize| WorldSwitchInfo { name: name.into(), connected: true, unseen_lines: unseen, pending_lines: 0, is_reconnecting: false, first_unseen_at: None };
+        let worlds = vec![w("Alpha", 0), w("Bravo", 0), w("Charlie", 0), w("Delta", 0)];
+        let next = |cur, ex: &[usize]| calculate_world_switch(&worlds, cur, WorldSwitchMode::Alphabetical, SwitchDirection::Next, ex);
+        let prev = |cur, ex: &[usize]| calculate_world_switch(&worlds, cur, WorldSwitchMode::Alphabetical, SwitchDirection::Previous, ex);
+        // Alpha with Bravo in the other pane: Next goes to Charlie, Prev to Delta.
+        assert_eq!(next(0, &[1]), Some(2));
+        assert_eq!(prev(0, &[3]), Some(2));
+        assert_eq!(prev(2, &[1]), Some(0));
+        // Only the excluded world left: nowhere to go.
+        let two = vec![w("Alpha", 0), w("Bravo", 0)];
+        assert_eq!(calculate_world_switch(&two, 0, WorldSwitchMode::Alphabetical, SwitchDirection::Next, &[1]), None);
+        // Unseen First never picks the excluded world, however much it has.
+        let busy = vec![w("Alpha", 0), w("Bravo", 9), w("Charlie", 2)];
+        assert_eq!(calculate_world_switch(&busy, 0, WorldSwitchMode::UnseenFirst, SwitchDirection::Next, &[1]), Some(2));
     }
 
     #[test]

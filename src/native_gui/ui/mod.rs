@@ -1,6 +1,7 @@
 //! The GPUI side of the native GUI.
 
 mod actions;
+mod appmenu;
 pub mod assets;
 mod bars;
 mod chrome;
@@ -19,6 +20,7 @@ mod more;
 pub mod output;
 mod picture;
 mod select;
+mod split;
 mod surfaces;
 mod textdiv;
 mod theme_bridge;
@@ -210,8 +212,15 @@ pub struct ClayView {
     opacity: opacity::Opacity,
     /// The title bar's dark or light, as set for this window (Windows).
     titlebar: titlebar::TitleBar,
+    /// The hamburger as the desktop's app menu (a Linux panel applet, the macOS menu bar).
+    app_menu: appmenu::AppMenu,
     /// Import Picture: this window's pictures going to the server (ui/picture.rs).
     pictures: crate::picture::ClientUploads,
+    /// `/split`: the pane without the focus (split.rs); None while the output is one.
+    split: Option<split::OtherPane>,
+    /// The other pane is being drawn or handled (`in_other_pane`): the focused pane's Find
+    /// filter isn't applied to it.
+    drawing_other_pane: bool,
 }
 
 impl ClayView {
@@ -295,7 +304,10 @@ impl ClayView {
             media_gate: None,
             opacity: Default::default(),
             titlebar: Default::default(),
+            app_menu: Default::default(),
             pictures: Default::default(),
+            split: None,
+            drawing_other_pane: false,
         };
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
@@ -458,6 +470,8 @@ impl ClayView {
     /// After any change: a world switch starts the output over; new lines at the tail go
     /// through more-mode.
     fn follow_world(&mut self) {
+        // A split's other pane: its world switched or went (split.rs).
+        self.follow_other_pane();
         let current = self.session.core.current_world().map(|_| self.session.core.current);
         self.textdiv.note_worlds(&self.session.core.worlds);
         if current != self.shown_world {
@@ -498,18 +512,23 @@ impl ClayView {
         }
         // More-mode counts rows, as the output will wrap the lines: they're measured
         // before they're laid out, since a held line never is.
-        let (threshold, cols) = {
-            let s = self.scroll.borrow();
-            let cols = if self.wrap_columns > 0 { s.view_cols.min(self.wrap_columns) } else { s.view_cols };
-            (s.view_rows.saturating_sub(2), cols)
+        // Each world counts against the pane that shows it (`/split`), else the focused one.
+        let wrap_columns = self.wrap_columns;
+        let budget = |(rows, cols): (usize, usize)| {
+            let cols = if wrap_columns > 0 { cols.min(wrap_columns) } else { cols };
+            (rows.saturating_sub(2), cols)
         };
+        let budgets: Vec<(usize, usize)> = self.session.core.worlds.iter().map(|w| budget(self.pane_view_for(&w.name))).collect();
         let (indent, show_tags) = (self.wrapspace, self.show_tags);
         let enabled = self.more_mode_enabled();
         // Every world's arrivals count for its own more-mode, on screen or not, as the
         // console pages every world; only the shown world's pause moves the view.
         let shown = self.session.core.current;
+        let other = self.split.as_ref().map(|p| p.world.clone());
+        let mut other_paused = false;
         let mut arrived_all: Vec<u64> = Vec::new();
         for (i, world) in self.session.core.worlds.iter().enumerate() {
+            let (threshold, cols) = budgets[i];
             let mut styler = Styler {
                 styled: &mut self.styled,
                 palette: &self.palette,
@@ -531,6 +550,13 @@ impl ClayView {
             arrived_all.extend(m.take_arrived());
             if paused_now && i == shown {
                 self.scroll.borrow_mut().follow_bottom();
+            } else if paused_now && other.as_deref() == Some(world.name.as_str()) {
+                other_paused = true;
+            }
+        }
+        if other_paused {
+            if let Some(name) = other {
+                self.other_pane_paused(&name);
             }
         }
         // Shown at once: the text-reveal effect types them on from now.
@@ -685,7 +711,7 @@ impl ClayView {
             }
             let esc_armed = self.shell_esc_armed.map(|t| t.elapsed() < std::time::Duration::from_millis(500)).unwrap_or(false);
             self.shell_esc_armed = None;
-            match crate::shell::keys::classify(code, mods, self.keys.bindings(), esc_armed) {
+            match crate::shell::keys::classify(code, mods, self.keys.bindings(), esc_armed, self.split.is_some()) {
                 crate::shell::keys::Decision::Switch(action) => {
                     self.run_action(&action, window, cx);
                     return true;
@@ -982,8 +1008,9 @@ impl ClayView {
         };
         let mut out = Vec::with_capacity(world.lines.len());
         let mut seqs = Vec::with_capacity(world.lines.len());
-        let filter = self.find.filtering().map(str::to_string);
-        let cut = self.find.search_cut();
+        // Find's filter and search are the focused pane's (`/split`).
+        let filter = self.find.filtering().map(str::to_string).filter(|_| !self.drawing_other_pane);
+        let cut = self.find.search_cut().filter(|_| !self.drawing_other_pane);
         let mut styler = Styler {
             styled: &mut self.styled,
             palette: &self.palette,
@@ -1043,6 +1070,111 @@ impl ClayView {
         }
         self.note_visible(out.iter().map(|(id, _)| *id).collect());
         out
+    }
+
+    /// The output area: the one pane, or a split's two with the bar between them (the top
+    /// pane's), each drawn by `pane_body` - the other pane with its state swapped in.
+    fn panes_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let focused = self.pane_body(false, cx);
+        let Some(other_on_top) = self.split.as_ref().map(|p| p.on_top) else { return focused };
+        let Some(other) = self.in_other_pane(|this| this.pane_body(true, cx)) else { return focused };
+        // The bar between them is the top pane's: grey while the bottom one has the focus.
+        let bar = if other_on_top {
+            self.in_other_pane(|this| this.pane_bar(false, cx)).unwrap_or_else(|| div().into_any_element())
+        } else {
+            self.pane_bar(true, cx)
+        };
+        let _ = window;
+        let (top, bottom) = if other_on_top { (other, focused) } else { (focused, other) };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h_0().child(top))
+            .child(bar)
+            .child(div().flex_1().min_h_0().child(bottom))
+            .into_any_element()
+    }
+
+    /// One pane's output: the current world's (the other pane's while `in_other_pane`).
+    /// `other`: the pane without the focus, whose mouse is its own (split.rs).
+    fn pane_body(&mut self, other: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.session.core.current_world().is_some_and(|w| w.showing_splash) {
+            return self.splash().into_any_element();
+        }
+        // A shell world draws its grid with no wrapping and the real cursor; an
+        // ordinary world draws its (wrapped, selectable) lines.
+        let shell = self.shell_output();
+        let (lines, shell_cursor) = match shell {
+            Some((lines, cursor)) => (lines, cursor),
+            None => (self.visible_lines(), None),
+        };
+        let is_shell = shell_cursor.is_some() || self.session.core.current_world().is_some_and(|w| w.shell.is_some());
+        let reveal = self.reveal_snapshot(&lines, is_shell);
+        let snapshot = OutputSnapshot {
+            lines,
+            background: self.palette.bg,
+            font_size: self.font_size,
+            fonts: self.fonts.clone(),
+            wrapspace: if is_shell { 0 } else { self.wrapspace },
+            wrap_columns: if is_shell { 0 } else { self.wrap_columns },
+            letter_spacing: self.letter_spacing,
+            word_spacing: self.word_spacing,
+            style_epoch: self.style_epoch,
+            // The glow's first colour (New Background, or its Custom scheme).
+            new_glow_start: self
+                .session
+                .core
+                .settings
+                .as_ref()
+                .and_then(|s| crate::NewIndicator::from_wire(&s.new_indicator, s.new_line_indicator).glow_start())
+                .unwrap_or(crate::newbg::GREEN)
+                .array(),
+            scroll: self.scroll.clone(),
+            selection: self.selection_ranges(),
+            selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],
+            hover_link: self.select.hover_link.clone(),
+            bar_thumb: self.chrome.tokens.muted,
+            bar_thumb_hot: self.chrome.tokens.fg2,
+            bar_hot: self.select.bar_hot(),
+            shell_cursor,
+            reveal,
+        };
+        let link = self.select.hover_link.is_some();
+        let bar = self.select.bar_hot();
+        div()
+            .id(if other { "output-other" } else { "output" })
+            .size_full()
+            .map(|d| if bar { d.cursor_default() } else if link { d.cursor_pointer() } else { d.cursor_text() })
+            // Off the output (the bar is on its edge): the bar is no longer lit.
+            .on_hover(cx.listener(|this, hovered: &bool, _w, cx| {
+                if !*hovered && this.select.bar_hover {
+                    this.select.bar_hover = false;
+                    cx.notify();
+                }
+            }))
+            .when(!other, |d| {
+                d.on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.output_mouse_down(ev, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.output_mouse_down(ev, cx)))
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| this.output_mouse_move(ev, cx)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
+                        this.output_mouse_up(ev, cx);
+                    }))
+            })
+            // The other pane of a split: its own selection, links and wheel; a plain click
+            // moves the focus there (split.rs).
+            .when(other, |d| {
+                d.on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.other_pane_mouse_down(ev, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.other_pane_mouse_down(ev, cx)))
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| this.other_pane_mouse_move(ev, cx)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _w, cx| this.other_pane_mouse_up(ev, cx)))
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+                        this.other_pane_wheel(ev, cx);
+                        cx.stop_propagation();
+                    }))
+            })
+            .child(output_view(snapshot))
+            .into_any_element()
     }
 
     /// The connection's state, while it isn't simply online (the status bar shows it
@@ -1215,6 +1347,9 @@ impl Render for ClayView {
         let alpha = self.link.leader.as_ref().and_then(|l| l.upgrade()).map_or_else(|| self.transparency(), |l| l.read(cx).transparency());
         self.opacity.apply(window, alpha);
         self.titlebar.apply(window, !self.chrome.tokens.light);
+        let shown = appmenu::Shown { multiuser: self.session.core.is_multiuser(), picture_upload: self.session.core.server_picture_upload };
+        let owns_connection = self.link.leader.is_none();
+        self.app_menu.apply(window, shown, owns_connection, cx);
         let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
         if need_login && !self.login_focused {
             // The cursor goes where typing starts: the name in multiuser mode, else the password.
@@ -1231,66 +1366,7 @@ impl Render for ClayView {
             Status::NeedLogin { .. } | Status::CertMismatch(_) if self.is_follower() => self.leader_screen().into_any_element(),
             Status::NeedLogin { multiuser, error } => self.login_screen(multiuser, error, cx).into_any_element(),
             Status::CertMismatch(m) => self.mismatch_screen(&m.host, &m.old_fingerprint, &m.new_fingerprint, cx).into_any_element(),
-            _ if self.session.core.current_world().is_some_and(|w| w.showing_splash) => self.splash().into_any_element(),
-            _ => {
-                // A shell world draws its grid with no wrapping and the real cursor; an
-                // ordinary world draws its (wrapped, selectable) lines.
-                let shell = self.shell_output();
-                let (lines, shell_cursor) = match shell {
-                    Some((lines, cursor)) => (lines, cursor),
-                    None => (self.visible_lines(), None),
-                };
-                let is_shell = shell_cursor.is_some() || self.session.core.current_world().is_some_and(|w| w.shell.is_some());
-                let reveal = self.reveal_snapshot(&lines, is_shell);
-                let snapshot = OutputSnapshot {
-                    lines,
-                    background: self.palette.bg,
-                    font_size: self.font_size,
-                    fonts: self.fonts.clone(),
-                    wrapspace: if is_shell { 0 } else { self.wrapspace },
-                    wrap_columns: if is_shell { 0 } else { self.wrap_columns },
-                    letter_spacing: self.letter_spacing,
-                    word_spacing: self.word_spacing,
-                    style_epoch: self.style_epoch,
-                    // The glow's first colour (New Background, or its Custom scheme).
-                    new_glow_start: self
-                        .session
-                        .core
-                        .settings
-                        .as_ref()
-                        .and_then(|s| crate::NewIndicator::from_wire(&s.new_indicator, s.new_line_indicator).glow_start())
-                        .unwrap_or(crate::newbg::GREEN)
-                        .array(),
-                    scroll: self.scroll.clone(),
-                    selection: self.selection_ranges(),
-                    selection_bg: [self.theme.selection_bg.r, self.theme.selection_bg.g, self.theme.selection_bg.b],
-                    hover_link: self.select.hover_link.clone(),
-                    bar_thumb: self.chrome.tokens.muted,
-                    bar_thumb_hot: self.chrome.tokens.fg2,
-                    bar_hot: self.select.bar_hot(),
-                    shell_cursor,
-                    reveal,
-                };
-                let link = self.select.hover_link.is_some();
-                let bar = self.select.bar_hot();
-                div()
-                    .id("output")
-                    .size_full()
-                    .map(|d| if bar { d.cursor_default() } else if link { d.cursor_pointer() } else { d.cursor_text() })
-                    // Off the output (the bar is on its edge): the bar is no longer lit.
-                    .on_hover(cx.listener(|this, hovered: &bool, _w, cx| {
-                        if !*hovered && this.select.bar_hover {
-                            this.select.bar_hover = false;
-                            cx.notify();
-                        }
-                    }))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.output_mouse_down(ev, cx)))
-                    .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.output_mouse_down(ev, cx)))
-                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| this.output_mouse_move(ev, cx)))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _w, cx| this.output_mouse_up(ev, cx)))
-                    .child(output_view(snapshot))
-                    .into_any_element()
-            }
+            _ => self.panes_body(window, cx),
         };
         // A grep window shows its matches and nothing else (app.js GREP_MODE).
         let grep = self.mode.grep.is_some();
@@ -1303,7 +1379,12 @@ impl Render for ClayView {
         let tabs_top = self.tabs_mode() == "top";
         let mut tabs = if grep { None } else { self.tabs_ribbon(cx) };
         let stats = if grep { None } else { self.stats_panel(cx) };
-        let status_bar = (!grep).then(|| self.status_bar(window, cx));
+        // The status bar is the bottom pane's: the other pane's while a split's top pane has
+        // the focus, grey then.
+        let status_bar = (!grep).then(|| match self.split.as_ref().map(|p| p.on_top) {
+            Some(false) => self.in_other_pane(|this| this.status_bar(false, window, cx)).unwrap_or_else(|| self.status_bar(true, window, cx)),
+            _ => self.status_bar(true, window, cx),
+        });
         let show_input = !grep && !matches!(self.session.core.status(), Status::NeedLogin { .. } | Status::CertMismatch(_));
         let input_bar = show_input.then(|| self.input_bar(window, cx));
         let context_menu = self.context_menu(cx);
@@ -1317,6 +1398,7 @@ impl Render for ClayView {
             .on_action(cx.listener(|this, _: &MainTabPrev, window, cx| this.main_key("shift-tab", window, cx)))
             .on_action(cx.listener(|this, _: &MainCopyCtrl, window, cx| this.main_key("ctrl-c", window, cx)))
             .on_action(cx.listener(|this, _: &MainCopyCmd, window, cx| this.main_key("cmd-c", window, cx)))
+            .map(|root| appmenu::listen(root, cx))
             .size_full()
             .flex()
             .flex_col()
@@ -1330,29 +1412,7 @@ impl Render for ClayView {
                     cx.stop_propagation();
                 }
             }))
-            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _window, cx| {
-                // Positive is towards the user (down the page in GPUI: content moves up).
-                let dy = -f32::from(ev.delta.pixel_delta(px(this.font_size)).y);
-                let at_bottom = this.scroll.borrow().at_bottom();
-                if dy > 0.0 && at_bottom && this.pending_total() > 0 {
-                    // Wheel past the bottom feeds held output in a row at a time.
-                    let font_size = this.font_size;
-                    let more = this.more_mut();
-                    more.wheel_px += dy;
-                    let rows = (more.wheel_px / font_size).floor() as usize;
-                    if rows > 0 {
-                        more.wheel_px -= rows as f32 * font_size;
-                        this.release_rows(rows, cx);
-                    }
-                } else {
-                    this.more_mut().wheel_px = 0.0;
-                    let rows = (dy / this.font_size).round() as isize;
-                    if rows != 0 {
-                        this.user_scroll(rows);
-                    }
-                }
-                cx.notify();
-            }))
+            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _window, cx| this.wheel_scroll(ev, cx)))
             // Dragging the font slider, the input's top edge or the scroll bar's thumb, and
             // the end of a press.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
@@ -1462,6 +1522,9 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
             })
             .detach();
         }
+        // macOS's menu bar: the hamburger's items (a Linux panel's app menu is per window).
+        #[cfg(target_os = "macos")]
+        appmenu::mac::install(main.clone(), main_window, cx);
         // The other windows are this one's: closing it closes Clay.
         let main_id = main_window.window_id();
         cx.on_window_closed(move |cx, id| {

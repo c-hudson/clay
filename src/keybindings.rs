@@ -126,6 +126,8 @@ pub const ACTIONS: &[ActionInfo] = &[
     // or with unseen/pending output) using world_switch_mode's alphabetical/unseen-first rules.
     ActionInfo { id: "world_socket_prev", name: "Previous Connected World", category: "World" },
     ActionInfo { id: "world_socket_next", name: "Next Connected World", category: "World" },
+    // `/split`: the focus moves to the other pane (Shift-Tab); nothing when not split.
+    ActionInfo { id: "split_focus", name: "Switch Split Pane", category: "World" },
     // TF /bg (= /fg -n): background every world / no foreground. A no-op in Clay's
     // single-pane console (see `App::cycle_connected_world`'s doc comment and `cmd_fg`'s own
     // -n handling in tf/parser.rs) - kept as a real action id for binding/scripting parity.
@@ -298,6 +300,7 @@ impl KeyBindings {
         b.insert("Esc-J".into(), "selective_flush".into());
         b.insert("Esc-h".into(), "scroll_half_page".into());
         b.insert("Tab".into(), "tab_key".into());
+        b.insert("Shift-Tab".into(), "split_focus".into());
         b.insert("Ctrl-PageDown".into(), "flush_output".into());
         // TF LINE/LINEBACK, CLEAR, PAUSE.
         b.insert("Esc-^N".into(), "scroll_line_forward".into());
@@ -938,6 +941,7 @@ mod tests {
         ("Esc-J", "selective_flush"),
         ("Esc-h", "scroll_half_page"),
         ("Tab", "tab_key"),
+        ("Shift-Tab", "split_focus"),
         ("Ctrl-PageDown", "flush_output"),
         ("Esc-^N", "scroll_line_forward"),
         ("Esc-^P", "scroll_line_back"),

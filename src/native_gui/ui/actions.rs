@@ -34,15 +34,7 @@ impl ClayView {
             }
             "scroll_page_down" => {
                 let n = self.take_kbnum();
-                if self.scroll.borrow().at_bottom() {
-                    if self.pending_total() > 0 {
-                        self.release_screenful(cx);
-                    } else {
-                        self.more_mut().paused = false;
-                    }
-                } else {
-                    self.user_scroll(page * n);
-                }
+                self.page_forward(page * n, cx);
             }
             "scroll_half_page" => {
                 let n = self.take_kbnum();
@@ -66,13 +58,11 @@ impl ClayView {
                 self.user_scroll(-n);
             }
             "tab_key" => {
-                // Completing a /command comes first.
+                // Completing a /command comes first; otherwise Tab is Page Down.
                 if self.complete_input() {
                     self.input_touched(cx);
-                } else if self.pending_total() > 0 {
-                    self.release_screenful(cx);
                 } else {
-                    self.user_scroll(page);
+                    self.page_forward(page, cx);
                 }
             }
             "flush_output" => {
@@ -117,6 +107,8 @@ impl ClayView {
             "world_next" | "world_all_next" | "world_forward" => self.world_request(WorldRequest::Next, cx),
             "world_prev" | "world_all_prev" | "world_previous" => self.world_request(WorldRequest::Prev, cx),
             "world_activity" => self.world_request(WorldRequest::OldestPending, cx),
+            // Shift+Tab: the focus moves to the split's other pane (split.rs).
+            "split_focus" => self.split_focus_swap(cx),
             "world_socket_next" | "world_socket_prev" if self.mode.lock.is_none() => {
                 let n = self.take_kbnum();
                 let n = if action == "world_socket_next" { n } else { -n };
@@ -328,6 +320,23 @@ impl ClayView {
         }
         if rows < 0 && self.more_mode_enabled() && !self.more_paused() {
             self.more_mut().pause();
+        }
+    }
+
+    /// Page Down and Tab, as the console's: down through what's scrolled back first; at
+    /// the bottom, a screenful of held output, or with nothing held, output flowing again.
+    /// Tab used to release before it scrolled, and the lines it released went below a view
+    /// scrolled back, out of sight: after Page Up (which pauses), Tab seemed to do nothing
+    /// until everything that had arrived meanwhile was out.
+    fn page_forward(&mut self, rows: isize, cx: &mut Context<Self>) {
+        if self.scroll.borrow().at_bottom() {
+            if self.pending_total() > 0 {
+                self.release_screenful(cx);
+            } else {
+                self.more_mut().paused = false;
+            }
+        } else {
+            self.user_scroll(rows);
         }
     }
 

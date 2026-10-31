@@ -1,5 +1,6 @@
 //! Selecting and copying output, following links, and the output's right-click menu
-//! (the GUI's own, webview_gui.rs: Copy and Debug Selection).
+//! (the GUI's own, as webview_gui.rs's: Open Link on a link, Copy, Paste, Debug
+//! Selection).
 //!
 //! A selection is two places in the displayed text (line id, byte), so it stays on the
 //! same text while lines arrive below or history is prepended above. What's copied is
@@ -51,6 +52,11 @@ pub struct SelectState {
     press_link: Option<(u64, Range<usize>)>,
     /// The right-click menu, at this window point.
     pub menu: Option<Point<Pixels>>,
+    /// The link the right-click was on: the menu's Open Link goes there, and its Copy
+    /// copies it unless the click was on the selection.
+    menu_link: Option<String>,
+    /// The right-click was on the selection: Copy copies that.
+    menu_on_selection: bool,
     /// The Debug Selection dialog's text.
     pub debug: Option<String>,
     copied_at: Option<Instant>,
@@ -201,7 +207,13 @@ impl ClayView {
     pub(super) fn output_mouse_down(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
         let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
         if ev.button == MouseButton::Right {
+            let on = self.scroll.borrow().byte_at(x, y);
             self.select.menu = Some(ev.position);
+            self.select.menu_link = on.and_then(|p| {
+                let s = self.styled_text(p.id)?;
+                link_at(&s, p.byte).map(|r| href(&s.text[r]))
+            });
+            self.select.menu_on_selection = on.is_some_and(|p| self.selection_ranges().get(&p.id).is_some_and(|r| r.contains(&p.byte)));
             cx.notify();
             return;
         }
@@ -314,30 +326,37 @@ impl ClayView {
         }
     }
 
-    pub(super) fn output_mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
+    /// The button let go over the output. True when it ended a plain click - not a drag,
+    /// not on a link, not on the scroll bar - which in a split's other pane moves the focus
+    /// there (split.rs).
+    pub(super) fn output_mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) -> bool {
         if self.select.bar_grab.take().is_some() {
             // Let go: lit while the mouse is still on the bar.
             let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
             self.select.bar_hover = self.scroll.borrow().bar_at(x, y).is_some();
             cx.notify();
-            return;
+            return false;
         }
-        let Some(mut sel) = self.select.sel else { return };
+        // Pressed on no text at all (below the last line): a plain click.
+        let Some(mut sel) = self.select.sel else { return true };
         if !sel.dragging {
-            return;
+            return false;
         }
         sel.dragging = false;
         self.select.sel = Some(sel);
         self.select.drag_at = None;
+        let mut plain = false;
         if sel.unit == Unit::Char && sel.anchor.0 == sel.head {
             // A click, not a drag: no selection; on a link, follow it.
             self.select.sel = None;
+            plain = true;
             let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
             let on = self.scroll.borrow().byte_at(x, y);
             if let (Some((id, r)), Some(p)) = (self.select.press_link.take(), on) {
                 if p.id == id && r.contains(&p.byte) {
                     if let Some(s) = self.styled_text(id) {
                         cx.open_url(&href(&s.text[r]));
+                        plain = false;
                     }
                 }
             }
@@ -352,6 +371,7 @@ impl ClayView {
             }
         }
         cx.notify();
+        plain
     }
 
     /// While dragging past the top or bottom, the view scrolls along (from the clock).
@@ -375,12 +395,16 @@ impl ClayView {
         cx.notify();
     }
 
-    /// The right-click menu: Copy, Debug Selection.
+    /// The right-click menu: Open Link (on a link), Copy (the link, or the selection when
+    /// the click was on it), Paste (into the input, as the input's own menu pastes), Debug
+    /// Selection.
     pub(super) fn context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let at = self.select.menu?;
         let t = &self.chrome.tokens;
-        let enabled = self.has_selection();
-        let item = |id: &'static str, label: &'static str| {
+        let selected = self.has_selection();
+        let link = self.select.menu_link.clone();
+        let copy_link = link.clone().filter(|_| !self.select.menu_on_selection);
+        let item = |id: &'static str, label: &'static str, enabled: bool| {
             let (hover, fg) = (t.hover, t.fg);
             let d = div()
                 .id(id)
@@ -391,7 +415,7 @@ impl ClayView {
                 .child(label);
             if enabled { d.text_color(t.fg2).cursor_pointer().hover(move |s| s.bg(hover).text_color(fg)) } else { d.text_color(t.dim) }
         };
-        let panel = div()
+        let mut panel = div()
             .id("output-context-menu")
             .occlude()
             .flex()
@@ -411,13 +435,32 @@ impl ClayView {
             }])
             .font_family(self.fonts.ui.clone())
             .line_height(relative(SANS_LH))
-            .text_size(px(12.5))
-            .child(item("ctx-copy", "Copy").on_click(cx.listener(|this, _, _w, cx| {
+            .text_size(px(12.5));
+        if let Some(url) = link {
+            panel = panel.child(item("ctx-open", "Open Link", true).on_click(cx.listener(move |this, _, _w, cx| {
                 this.select.menu = None;
-                this.copy_selection(cx);
+                cx.open_url(&url);
+                cx.notify();
+            })));
+        }
+        let can_copy = selected || copy_link.is_some();
+        panel = panel
+            .child(item("ctx-copy", "Copy", can_copy).on_click(cx.listener(move |this, _, _w, cx| {
+                this.select.menu = None;
+                match &copy_link {
+                    Some(url) => cx.write_to_clipboard(ClipboardItem::new_string(url.clone())),
+                    None => {
+                        this.copy_selection(cx);
+                    }
+                }
                 cx.notify();
             })))
-            .child(item("ctx-debug", "Debug Selection").on_click(cx.listener(|this, _, _w, cx| {
+            .child(item("ctx-paste", "Paste", true).on_click(cx.listener(|this, _, _w, cx| {
+                this.select.menu = None;
+                this.paste(cx);
+                cx.notify();
+            })))
+            .child(item("ctx-debug", "Debug Selection", selected).on_click(cx.listener(|this, _, _w, cx| {
                 this.select.menu = None;
                 if this.has_selection() {
                     this.select.debug = Some(this.raw_selection());

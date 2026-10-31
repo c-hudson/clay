@@ -979,6 +979,10 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     };
                     app.emit_client_text(world_index, &msg, true);
                 }
+                Command::RemotePauseConsole => {
+                    let msg = app.toggle_console_pause();
+                    app.emit_client_text(world_index, &msg, true);
+                }
                 Command::BanList => app.ws_ban_list(client_id, world_index),
                 Command::Unban { host } => app.ws_unban(client_id, world_index, host),
                 Command::TestMusic => {
@@ -1069,6 +1073,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 Command::Update { force } => app.start_server_update(force, Some((client_id, world_index)), event_tx),
                 Command::Tts { args } => app.tts_command(&args, Some((client_id, world_index)), event_tx),
                 Command::Menu => app.ws_menu_is_console_only(client_id, world_index),
+                Command::Split { .. } | Command::Unsplit => app.ws_split_is_the_clients(client_id, world_index, &command),
                 // UI popup commands - send back to client for local handling
                 Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
@@ -1621,7 +1626,8 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::Ping => {
             app.ws_send_to_client(client_id, WsMessage::Pong);
         }
-        WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
+        WsMessage::UpdateViewState { world_index, visible_lines, visible_columns, splits } => {
+            app.note_client_splits(client_id, splits);
             // Track client's view state for more-mode threshold calculation
             if world_index < app.worlds.len() {
                 let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
@@ -1646,11 +1652,11 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 }
             }
         }
-        WsMessage::MarkWorldSeen { world_index, previous_world_index } => {
-            app.handle_mark_world_seen(client_id, world_index, previous_world_index);
+        WsMessage::MarkWorldSeen { world_index, previous_world_index, other_views } => {
+            app.handle_mark_world_seen(client_id, world_index, previous_world_index, other_views);
         }
-        WsMessage::OtherViews { worlds } => {
-            app.handle_other_views(client_id, worlds);
+        WsMessage::OtherViews { worlds, dims } => {
+            app.handle_other_views(client_id, worlds, dims);
         }
         WsMessage::ReleasePending { world_index, count } => {
             app.release_pending_lines(client_id, world_index, count);
@@ -1733,18 +1739,18 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 discord_token, discord_guild, discord_channel, discord_dm_user, chat,
             );
         }
-        WsMessage::CalculateNextWorld { current_index } => {
-            let next_idx = app.calculate_next_world_from(current_index);
+        WsMessage::CalculateNextWorld { current_index, exclude } => {
+            let next_idx = app.calculate_next_world_from(current_index, &exclude);
             app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
         }
-        WsMessage::CalculatePrevWorld { current_index } => {
-            let prev_idx = app.calculate_prev_world_from(current_index);
+        WsMessage::CalculatePrevWorld { current_index, exclude } => {
+            let prev_idx = app.calculate_prev_world_from(current_index, &exclude);
             app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
         }
-        WsMessage::CalculateOldestPending { current_index } => {
+        WsMessage::CalculateOldestPending { current_index, exclude } => {
             // The fallback world is this client's own last visit, not the console's.
             let history = app.ws_client_worlds.get(&client_id).map(|v| v.history.clone()).unwrap_or_default();
-            let oldest_idx = app.calculate_oldest_pending_world_from(current_index, &history);
+            let oldest_idx = app.calculate_oldest_pending_world_from(current_index, &history, &exclude);
             app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
         }
         // /import export side: mirrors the handler in main.rs's App::handle_ws_message —
@@ -3441,7 +3447,7 @@ pub async fn handle_multiuser_ws_message(
         // App::user_min_dimensions's doc comment. Mirrors the single-user `-D` daemon
         // handler's UpdateViewState/UpdateDimensions arms (handle_daemon_ws_message
         // above), owner-gated per CLAUDE.md's rule since world_index is client-supplied.
-        WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
+        WsMessage::UpdateViewState { world_index, visible_lines, visible_columns, .. } => {
             let is_owner = app.worlds.get(world_index)
                 .map(|w| w.owner.as_ref() == username.as_ref())
                 .unwrap_or(false);
@@ -3513,7 +3519,7 @@ pub async fn handle_multiuser_ws_message(
                 }
             }
         }
-        WsMessage::MarkWorldSeen { world_index, previous_world_index } => {
+        WsMessage::MarkWorldSeen { world_index, previous_world_index, .. } => {
             // Verify the client owns this world
             if let Some(world) = app.worlds.get_mut(world_index) {
                 if world.owner.as_ref() == username.as_ref() {
@@ -3622,11 +3628,12 @@ pub async fn handle_multiuser_ws_message(
                 }
             }
         }
-        WsMessage::CalculateNextWorld { current_index } | WsMessage::CalculatePrevWorld { current_index } => {
-            // Calculate next/prev world owned by this user
+        WsMessage::CalculateNextWorld { current_index, ref exclude } | WsMessage::CalculatePrevWorld { current_index, ref exclude } => {
+            // Calculate next/prev world owned by this user, never the other pane of its
+            // split (`exclude`)
             if let Some(ref uname) = username {
                 let user_worlds: Vec<usize> = app.worlds.iter().enumerate()
-                    .filter(|(_, w)| w.owner.as_deref() == Some(uname))
+                    .filter(|(idx, w)| w.owner.as_deref() == Some(uname) && (*idx == current_index || !exclude.contains(idx)))
                     .map(|(idx, _)| idx)
                     .collect();
 
@@ -3756,16 +3763,17 @@ pub async fn handle_multiuser_ws_message(
         // Esc-w: the console's rule (`calculate_oldest_pending_world_from`) over the user's
         // own worlds and connections - the one with unseen activity, else the last world
         // this client visited that is still connected.
-        WsMessage::CalculateOldestPending { current_index } => {
+        WsMessage::CalculateOldestPending { current_index, ref exclude } => {
+            let elsewhere = |i: usize| i != current_index && !exclude.contains(&i);
             let index = username.as_deref().and_then(|uname| {
                 let owned = multiuser_owned_worlds(app, uname);
                 owned.iter().copied()
-                    .find(|&i| i != current_index && app.user_connections.get(&(i, uname.to_string())).is_some_and(|c| c.unseen_lines > 0))
+                    .find(|&i| elsewhere(i) && app.user_connections.get(&(i, uname.to_string())).is_some_and(|c| c.unseen_lines > 0))
                     .or_else(|| {
                         let history = app.ws_client_worlds.get(&client_id).map(|v| v.history.clone()).unwrap_or_default();
                         history.iter()
                             .filter_map(|name| multiuser_owned_world(app, uname, name))
-                            .find(|&i| i != current_index && multiuser_connected(app, uname, i))
+                            .find(|&i| elsewhere(i) && multiuser_connected(app, uname, i))
                     })
             });
             app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index });
@@ -5590,7 +5598,7 @@ mod client_parity_tests {
         assert!(app.worlds[1].output_lines.iter().all(|l| !l.viewed && l.display_id.is_none()),
             "no console took the lines: {:?}", app.worlds[1].output_lines.iter().map(|l| (l.viewed, l.display_id)).collect::<Vec<_>>());
         // The client starts displaying Bravo: its claim is answered with every line.
-        handle_daemon_ws_message(&mut app, 0, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) }, &tx).await;
+        handle_daemon_ws_message(&mut app, 0, WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0), other_views: None }, &tx).await;
         let me = app.display_owner_id(0);
         assert!(app.worlds[1].output_lines.iter().all(|l| l.display_id == Some(me)), "the client owns them");
         assert!(sent(&mut rx).iter().any(|m| matches!(m, WsMessage::ClaimedNew { world_index: 1, seqs } if seqs == &vec![1, 2])));

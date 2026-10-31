@@ -343,6 +343,10 @@ pub struct ClientCore {
     resume_sent: HashMap<String, usize>,
     /// The worlds this connection's other windows show (`set_other_views`).
     other_views: Vec<usize>,
+    /// The size each other view is shown at (`OtherViews.dims`), sent with the list.
+    other_view_dims: Vec<crate::websocket::ViewDims>,
+    /// The world in a split's other pane (`/split`): the switch keys never land on it.
+    pub split_skip: Option<usize>,
     /// The server takes `OtherViews` (its `InitialState` says so); an older one would
     /// close the connection on it.
     server_takes_other_views: bool,
@@ -407,6 +411,8 @@ impl ClientCore {
             view: None,
             resume_sent: HashMap::new(),
             other_views: Vec::new(),
+            other_view_dims: Vec::new(),
+            split_skip: None,
             server_takes_other_views: false,
             server_expands_line: false,
             server_picture_upload: false,
@@ -720,8 +726,14 @@ impl ClientCore {
 
     fn send_view_state(&mut self) {
         if let Some((rows, cols)) = self.view {
-            self.send(WsMessage::UpdateViewState { world_index: self.current, visible_lines: rows, visible_columns: Some(cols) });
+            // `splits`: this GUI splits its own output, so a server-run /split comes back.
+            self.send(WsMessage::UpdateViewState { world_index: self.current, visible_lines: rows, visible_columns: Some(cols), splits: true });
         }
+    }
+
+    /// The worlds the switch keys skip: a split's other pane, unless it shows this one.
+    fn skip(&self) -> Vec<usize> {
+        self.split_skip.filter(|&w| w != self.current).into_iter().collect()
     }
 
     /// The worlds this connection's other windows (`/window`) show, for the server
@@ -729,14 +741,41 @@ impl ClientCore {
     /// on screen in one of them was unseen to the server, and Unseen First sent that
     /// window back to it from everywhere. Sent when the set changes, and again at each
     /// login (a new connection is a new client to the server).
-    pub fn set_other_views(&mut self, mut worlds: Vec<usize>) -> Vec<Effect> {
+    /// Also a split's other pane (`/split`); `dims` the size each is shown at.
+    pub fn set_other_views(&mut self, mut worlds: Vec<usize>, dims: Vec<crate::websocket::ViewDims>) -> Vec<Effect> {
         worlds.sort_unstable();
         worlds.dedup();
-        if worlds != self.other_views {
+        if worlds != self.other_views || dims != self.other_view_dims {
             self.other_views = worlds;
+            self.other_view_dims = dims;
             if self.is_online() && self.server_takes_other_views {
-                self.send(WsMessage::OtherViews { worlds: self.other_views.clone() });
+                self.send_other_views();
             }
+        }
+        self.take()
+    }
+
+    fn send_other_views(&mut self) {
+        self.send(WsMessage::OtherViews { worlds: self.other_views.clone(), dims: self.other_view_dims.clone() });
+    }
+
+    /// A split's focus moving to the other pane (`/split`): `index` becomes this window's
+    /// world while the one left stays on screen there, so the server hears both at once -
+    /// `MarkWorldSeen` with the other views as they are now (`others`) - and neither pane
+    /// loses its ▶ markers. No world switch: nothing is claimed or asked for afresh.
+    pub fn focus_world(&mut self, index: usize, mut others: Vec<usize>) -> Vec<Effect> {
+        if index < self.worlds.len() && index != self.current {
+            let previous = self.current;
+            self.current = index;
+            others.sort_unstable();
+            others.dedup();
+            self.other_views = others.clone();
+            if self.is_online() {
+                let other_views = self.server_takes_other_views.then_some(others);
+                self.send(WsMessage::MarkWorldSeen { world_index: index, previous_world_index: Some(previous), other_views });
+                self.send_view_state();
+            }
+            self.changed();
         }
         self.take()
     }
@@ -795,7 +834,7 @@ impl ClientCore {
             }
             self.claim_locally(index, now);
             if self.is_online() {
-                self.send(WsMessage::MarkWorldSeen { world_index: index, previous_world_index: Some(previous) });
+                self.send(WsMessage::MarkWorldSeen { world_index: index, previous_world_index: Some(previous), other_views: None });
                 self.send(WsMessage::RequestWorldState { world_index: index });
                 self.send_view_state();
             }
@@ -808,10 +847,12 @@ impl ClientCore {
     /// switches.
     pub fn request_world(&mut self, which: WorldRequest) -> Vec<Effect> {
         let current_index = self.current;
+        // Never onto the world in a split's other pane.
+        let exclude = self.skip();
         let msg = match which {
-            WorldRequest::Next => WsMessage::CalculateNextWorld { current_index },
-            WorldRequest::Prev => WsMessage::CalculatePrevWorld { current_index },
-            WorldRequest::OldestPending => WsMessage::CalculateOldestPending { current_index },
+            WorldRequest::Next => WsMessage::CalculateNextWorld { current_index, exclude },
+            WorldRequest::Prev => WsMessage::CalculatePrevWorld { current_index, exclude },
+            WorldRequest::OldestPending => WsMessage::CalculateOldestPending { current_index, exclude },
         };
         if self.is_online() {
             self.send(msg);
@@ -822,7 +863,8 @@ impl ClientCore {
     /// Step through the connected worlds in list order, `n` at a time (app.js
     /// `cycleConnectedWorldLocal`); negative goes back.
     pub fn cycle_connected(&mut self, n: isize, now: Instant) -> Vec<Effect> {
-        let connected: Vec<usize> = (0..self.worlds.len()).filter(|&i| self.worlds[i].connected).collect();
+        let skip = self.skip();
+        let connected: Vec<usize> = (0..self.worlds.len()).filter(|&i| self.worlds[i].connected && !skip.contains(&i)).collect();
         if !connected.is_empty() {
             let pos = connected.iter().position(|&i| i == self.current);
             let len = connected.len() as isize;
@@ -1652,10 +1694,10 @@ impl ClientCore {
         if !self.worlds.is_empty() {
             self.send_view_state();
             if !self.other_views.is_empty() && self.server_takes_other_views {
-                self.send(WsMessage::OtherViews { worlds: self.other_views.clone() });
+                self.send_other_views();
             }
             if self.visible {
-                self.send(WsMessage::MarkWorldSeen { world_index: self.current, previous_world_index: None });
+                self.send(WsMessage::MarkWorldSeen { world_index: self.current, previous_world_index: None, other_views: None });
             } else {
                 // app.js only says so when it changes; a window that starts minimised must
                 // say so too, or text arriving meanwhile is born "viewed".

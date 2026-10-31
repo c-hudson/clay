@@ -75,7 +75,7 @@ fn every_web_message_action_and_wire_variant_has_a_row() {
     let items = items();
     let ids: BTreeMap<&str, &Item> = items.iter().map(|i| (i.id.as_str(), i)).collect();
     assert_eq!(ids.len(), items.len(), "duplicate ids in PARITY.toml");
-    let expected: BTreeSet<String> = js_cases("handleMessage")
+    let expected: BTreeSet<String> = js_cases("handleMessageImpl")
         .into_iter()
         .map(|m| format!("msg:{m}"))
         .chain(js_cases("dispatchActionImpl").into_iter().map(|a| format!("action:{a}")))

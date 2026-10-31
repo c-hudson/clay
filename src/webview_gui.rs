@@ -986,10 +986,10 @@ fn build_html(params: &WebViewParams) -> String {
     // Inject WebView-specific CSS and JS overrides
     let webview_overrides = r#"<style>
 /* WebView overrides - native app, not mobile browser */
-#output-container { padding: 2px 4px; -webkit-user-select: text; user-select: text; cursor: text; }
+#output-container, #split-output-container { padding: 2px 4px; -webkit-user-select: text; user-select: text; cursor: text; }
 #input-container { padding: 2px 4px; }
-#output { -webkit-user-select: text; user-select: text; }
-#output * { -webkit-user-select: text; user-select: text; }
+#output, #split-output { -webkit-user-select: text; user-select: text; }
+#output *, #split-output * { -webkit-user-select: text; user-select: text; }
 #nav-bar { display: none !important; }
 .wv-sel-overlay { position: absolute; background: rgba(50,120,220,0.35); pointer-events: none; z-index: 999; }
 .wv-ctx-menu {
@@ -1016,10 +1016,15 @@ document.addEventListener('DOMContentLoaded', function() {
         for (var i = 0; i < overlays.length; i++) overlays[i].remove();
         overlays = [];
     }
+    /* The output pane a node is in: the output, or a split's other pane (/split). */
+    function paneOf(node) {
+        var el = node && (node.nodeType === 1 ? node : node.parentElement);
+        return el ? el.closest('#output-container, #split-output-container') : null;
+    }
     function addOverlays() {
         var sel = window.getSelection();
         if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
-        var oc = document.getElementById('output-container');
+        var oc = paneOf(sel.anchorNode) || document.getElementById('output-container');
         if (!oc) return;
         var range = sel.getRangeAt(0);
         var rects = range.getClientRects();
@@ -1048,7 +1053,8 @@ document.addEventListener('DOMContentLoaded', function() {
         var sel = window.getSelection();
         if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return [];
         var range = sel.getRangeAt(0);
-        var output = document.getElementById('output');
+        var pane = paneOf(sel.anchorNode);
+        var output = pane ? pane.firstElementChild : document.getElementById('output');
         if (!output) return [];
         var spans = output.querySelectorAll('span[data-line-idx]');
         var indices = [];
@@ -1110,7 +1116,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     document.addEventListener('contextmenu', function(e) {
         /* Only override context menu in the output area; use browser default elsewhere (input, etc.) */
-        if (!e.target.closest('#output-container')) return;
+        if (!e.target.closest('#output-container, #split-output-container')) return;
         e.preventDefault();
         closeCtxMenu();
         var sel = window.getSelection();
@@ -1120,15 +1126,52 @@ document.addEventListener('DOMContentLoaded', function() {
         if (hasSelection) addOverlays();
         ctxMenu = document.createElement('div');
         ctxMenu.className = 'wv-ctx-menu';
+        /* On a link (app.js linkifyUrls): Open Link, and Copy copies its address unless
+           the click was on the selection (as the native GUI's menu, select.rs). */
+        var link = e.target.closest('a.output-link[href]');
+        if (link && !/^https?:$/i.test(link.protocol)) link = null;
+        var copyLink = link && !(hasSelection && sel.containsNode(link, true)) ? link.href : null;
+        if (link) {
+            var openItem = document.createElement('div');
+            openItem.textContent = 'Open Link';
+            openItem.addEventListener('mousedown', function(ev) {
+                ev.stopPropagation();
+                closeCtxMenu();
+                /* Where a left-click on it goes: the system's browser. */
+                var msg = 'open-url:' + link.href;
+                if (window.ipc) { window.ipc.postMessage(msg); }
+                else { fetch('clay://localhost/ipc', { method: 'POST', body: msg }).catch(function() {}); }
+            });
+            ctxMenu.appendChild(openItem);
+        }
         var copyItem = document.createElement('div');
         copyItem.textContent = 'Copy';
-        if (!hasSelection) copyItem.className = 'disabled';
+        if (!hasSelection && !copyLink) copyItem.className = 'disabled';
         copyItem.addEventListener('mousedown', function(ev) {
             ev.stopPropagation();
-            if (hasSelection) document.execCommand('copy');
+            if (copyLink) {
+                var had = document.activeElement;
+                var ta = document.createElement('textarea');
+                ta.value = copyLink; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+                document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+                ta.remove();
+                if (had && had.focus) had.focus();
+            } else if (hasSelection) {
+                document.execCommand('copy');
+            }
             closeCtxMenu();
         });
         ctxMenu.appendChild(copyItem);
+        /* Paste - into the input, as the input's own Paste (app.js clayPasteIntoInput) */
+        var pasteItem = document.createElement('div');
+        pasteItem.textContent = 'Paste';
+        pasteItem.addEventListener('mousedown', function(ev) {
+            ev.stopPropagation();
+            ev.preventDefault(); /* keep the focus where the paste puts it */
+            closeCtxMenu();
+            if (window.clayPasteIntoInput) window.clayPasteIntoInput();
+        });
+        ctxMenu.appendChild(pasteItem);
         /* Debug Selection - show raw ANSI codes */
         var debugItem = document.createElement('div');
         debugItem.textContent = 'Debug Selection';
@@ -1137,7 +1180,7 @@ document.addEventListener('DOMContentLoaded', function() {
             ev.stopPropagation();
             closeCtxMenu();
             if (hasSelection && lineIndices.length > 0 && window.getDebugSelectionText) {
-                var rawText = window.getDebugSelectionText(lineIndices);
+                var rawText = window.getDebugSelectionText(lineIndices, !!(paneOf(sel.anchorNode) && paneOf(sel.anchorNode).id === 'split-output-container'));
                 showDebugModal(rawText);
             }
         });

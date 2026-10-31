@@ -288,13 +288,15 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     // directly into the layout would let a `Char.Vitals` update that briefly adds or drops
     // a field re-trigger the resize storm dimensions_changed causes on every occurrence,
     // exactly what D3 says this line must never do.
+    // The status line is the bottom pane's world's (the only pane while not split).
+    let bottom_world = console_bottom_world(app);
     {
-        let world = app.current_world_mut();
+        let world = &mut app.worlds[bottom_world];
         if !world.stats_line_shown && !world.current_stat_entries().is_empty() {
             world.stats_line_shown = true;
         }
     }
-    let stats_line_height: u16 = if app.current_world().stats_line_shown { 1 } else { 0 };
+    let stats_line_height: u16 = if app.worlds[bottom_world].stats_line_shown { 1 } else { 0 };
 
     // Layout: output area, status line (0 or 1), separator bar (1 line - or TF's status
     // area, when a script has it), input area
@@ -302,12 +304,32 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let input_total_height = app.input_height;
     let output_height = total_height.saturating_sub(separator_height + input_total_height + stats_line_height);
 
+    // Split (`/split`): the output area is the top pane, the bar between the panes (one
+    // row) and the bottom pane, the bottom one taking any odd row. `output_height` is the
+    // focused pane's rows from here on: paging, more-mode and the rest act on the focused
+    // pane, as they act on the current world.
+    let area_rows = output_height.max(1);
+    let pane_rows = match app.split {
+        Some(_) => {
+            let top = (area_rows.saturating_sub(1) / 2).max(1);
+            (top, area_rows.saturating_sub(top + 1).max(1))
+        }
+        None => (0, area_rows),
+    };
+    let focused_rows = match app.split {
+        Some(split) if split.focus_top => pane_rows.0,
+        _ => pane_rows.1,
+    };
+
     // Store output dimensions for scrolling and more-mode calculations
     // Use max(1) to prevent any division by zero elsewhere
-    let new_output_height = output_height.max(1);
+    let new_output_height = focused_rows.max(1);
     let new_output_width = f.size().width.max(1);
-    // Mark output for redraw if dimensions changed (terminal resize)
-    let dimensions_changed = new_output_height != app.output_height || new_output_width != app.output_width;
+    // Mark output for redraw if dimensions changed (terminal resize, a split)
+    let dimensions_changed = new_output_height != app.output_height || new_output_width != app.output_width
+        || pane_rows != app.pane_rows || area_rows != app.output_area_rows;
+    app.pane_rows = pane_rows;
+    app.output_area_rows = area_rows;
     if dimensions_changed {
         app.needs_output_redraw = true;
         // Width/height change invalidates visual_line_offset (wrap counts differ);
@@ -357,7 +379,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     // split editor went), crossterm must repaint all of it: ratatui no longer blanks it
     // (`mark_painted_by_crossterm`), so what ratatui drew there last would otherwise stay.
     // These are `render_output_crossterm`'s own conditions for drawing.
-    let crossterm_paints = !app.current_world().showing_splash && !app.editor.visible
+    let crossterm_paints = console_panes(app).iter().any(|p| !app.worlds[p.world].showing_splash) && !app.editor.visible
         && !app.confirm_dialog.visible && !app.has_new_popup();
     if crossterm_paints && !app.output_painted_by_crossterm {
         app.needs_output_redraw = true;
@@ -404,11 +426,21 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         // Render editor panel
         render_editor_panel(f, app, editor_area);
 
-        // Render world output on the other half
-        render_output_area(f, app, world_area);
+        // Render world output on the other half: the focused pane's world (a split's other
+        // pane waits until the editor closes).
+        render_output_area(f, app, world_area, app.current_world_index, false);
     } else {
-        // Normal full-width output area
-        render_output_area(f, app, output_area);
+        // Each pane (one, or a split's two with the bar between them)
+        for pane in console_panes(app) {
+            let area = Rect { x: output_area.x, y: output_area.y + pane.y, width: output_area.width, height: pane.rows.min(output_area.height.saturating_sub(pane.y)) };
+            render_output_area(f, app, area, pane.world, pane.live_end);
+        }
+        if let Some(split) = app.split {
+            let bar = Rect { x: output_area.x, y: output_area.y + pane_rows.0, width: output_area.width, height: 1 };
+            if bar.y < output_area.bottom() {
+                render_pane_bar(f, app, bar, split.worlds(app.current_world_index).0, split.focus_top);
+            }
+        }
     }
 
     // Render the status display line (plan Job 4/D3) - a no-op when stats_line_area has
@@ -1093,20 +1125,122 @@ pub fn build_display_lines(
     }).collect()
 }
 
+/// One pane of the console's output area: the only one, or one of a split's two
+/// (`/split`), as `console_panes` lays them out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsolePane {
+    pub world: usize,
+    /// The first row it is drawn on, and how many.
+    pub y: u16,
+    pub rows: u16,
+    pub focused: bool,
+    /// Show the world's newest lines whatever its scroll position: the pane without the
+    /// focus showing the focused pane's world too, so one can be scrolled back while the
+    /// other follows.
+    pub live_end: bool,
+}
+
+/// The console's output panes, top to bottom: one, or a split's two with the bar between
+/// them on row `pane_rows.0` (`ui()` lays them out).
+pub(crate) fn console_panes(app: &App) -> Vec<ConsolePane> {
+    let current = app.current_world_index;
+    match app.split {
+        Some(split) => {
+            let (top_rows, bottom_rows) = app.pane_rows;
+            let (top, bottom) = split.worlds(current);
+            let twice = split.other == current;
+            vec![
+                ConsolePane { world: top, y: 0, rows: top_rows.max(1), focused: split.focus_top, live_end: twice && !split.focus_top },
+                ConsolePane { world: bottom, y: top_rows + 1, rows: bottom_rows.max(1), focused: !split.focus_top, live_end: twice && split.focus_top },
+            ]
+        }
+        None => vec![ConsolePane { world: current, y: 0, rows: app.output_height.max(1), focused: true, live_end: false }],
+    }
+}
+
+/// The world in the bottom pane - the only one while not split - which the separator bar
+/// and the status line belong to.
+pub(crate) fn console_bottom_world(app: &App) -> usize {
+    match app.split {
+        Some(split) => split.worlds(app.current_world_index).1,
+        None => app.current_world_index,
+    }
+}
+
+/// One output row as composed for drawing: (text, F8 highlight, /highlight colour, ▶ new,
+/// from the archive).
+type PaneRow = (String, bool, Option<String>, bool, bool);
+
+/// Calculate visible width of a string (excluding ANSI escape sequences including OSC 8)
+fn crossterm_visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut in_csi = false;   // CSI sequence: \x1b[...
+    let mut in_osc = false;   // OSC sequence: \x1b]...
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Handle CSI/OSC continuations first, before checking for new ESC
+        if in_csi {
+            if c.is_alphabetic() || c == '~' {
+                in_csi = false;
+            }
+            i += 1;
+            continue;
+        } else if in_osc {
+            // OSC ends with BEL or ST (\x1b\\)
+            if c == '\x07' {
+                in_osc = false;
+                i += 1;
+                continue;
+            } else if c == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                in_osc = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        } else if c == '\x1b' {
+            // Start of new escape sequence
+            if i + 1 < chars.len() {
+                let next = chars[i + 1];
+                if next == '[' {
+                    in_csi = true;
+                    i += 2;
+                    continue;
+                } else if next == ']' {
+                    in_osc = true;
+                    i += 2;
+                    continue;
+                } else if next == '\\' {
+                    // ST terminator (standalone)
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        } else {
+            width += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            i += 1;
+        }
+    }
+    width
+}
+
 /// Render output area using raw crossterm (bypasses ratatui's buggy rendering)
-/// Returns early if splash screen, popup, or editor is visible (let ratatui handle those)
-/// Paint the output area with raw crossterm. Returns the delay until the text-reveal
-/// effect's next frame (src/reveal.rs) when a line on screen is still being revealed, so
-/// the loop can repaint then; `None` when nothing animates (the setting is off, every
-/// line has settled, or the user scrolled the revealing lines away), and the loop's frame
-/// timer stays parked.
+/// Returns early if a popup or the editor is visible (let ratatui handle those)
+/// Paint the output area with raw crossterm, each pane on its own rows (`/split`); a pane
+/// on its world's splash is ratatui's. Returns the delay until the text-reveal effect's next
+/// frame (src/reveal.rs) when a line on screen is still being revealed, so the loop can
+/// repaint then; `None` when nothing animates (the setting is off, every line has settled,
+/// or the user scrolled the revealing lines away), and the loop's frame timer stays parked.
 pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> {
     use std::io::Write;
     use crossterm::{style::Print, QueueableCommand};
 
-    // Skip if showing splash screen or editor is visible
     // When editor is visible, ratatui handles all rendering for the split-screen layout
-    if app.current_world().showing_splash || app.editor.visible {
+    if app.editor.visible {
         return None;
     }
 
@@ -1115,93 +1249,234 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
         return None;
     }
 
-    // A shell world: the output area is a live terminal, drawn row for row with the real
-    // cursor parked in the grid (src/shell). Nothing else about the frame changes.
-    if app.current_world().shell_screen.is_some() {
-        render_shell_crossterm(app);
+    let panes = console_panes(app);
+    // Every pane on its splash: ratatui drew the whole frame.
+    if panes.iter().all(|p| app.worlds[p.world].showing_splash) {
         return None;
     }
 
     // The text-reveal effect: applied to the wrapped row strings only, inside
-    // expand_and_wrap below, after the wrap and before anything counts or prints them. It
-    // never changes a row's width or a line's row count, so paging is untouched.
+    // compose_pane, after the wrap and before anything counts or prints them. It never
+    // changes a row's width or a line's row count, so paging is untouched.
     let reveal = match app.settings.text_reveal.chars_per_second() {
         cps if cps > 0.0 => Some(crate::reveal::Reveal::for_console(cps, app.settings.theme)),
         _ => None,
     };
-    let reveal_new_only = app.settings.text_reveal.new_only();
-    let reveal_now = std::time::SystemTime::now();
     let mut next_frame: Option<std::time::Duration> = None;
+    // Cache "now" for timestamp formatting - compute once per frame, not per line
+    let cached_now = CachedNow::new();
+    let mut composed: Vec<(ConsolePane, Vec<PaneRow>)> = Vec::new();
+    for &pane in &panes {
+        let world = &app.worlds[pane.world];
+        if world.showing_splash || world.shell_screen.is_some() {
+            continue;
+        }
+        let (rows, frame) = compose_pane(app, pane, reveal.as_ref(), &cached_now);
+        if let Some(due) = frame {
+            next_frame = Some(next_frame.map_or(due, |d| d.min(due)));
+        }
+        composed.push((pane, rows));
+    }
 
     let mut stdout = std::io::stdout();
-    // Undo any shell-world cursor shape (a prior frame on a shell world) now that an
-    // ordinary world is drawn again.
+    // Undo any shell-world cursor shape (a prior frame on a shell world) unless a shell
+    // pane has the focus, which sets its own below.
     let _ = stdout.queue(crossterm::cursor::SetCursorStyle::DefaultUserShape);
-
-    let world = app.current_world();
-    let visible_height = (app.output_height as usize).max(1);
     let term_width = (app.output_width as usize).max(1);
+    // Which style: the ▶ in front of a new row, or the glow behind its first cells.
+    let new_prefix = app.settings.nli_prefix();
+    let new_glow = app.settings.nli_glow_start().map(|start| (start, crate::newbg::console_target(app.settings.theme)));
 
-    // Calculate visible width of a string (excluding ANSI escape sequences including OSC 8)
-    fn visible_width(s: &str) -> usize {
-        let mut width = 0;
-        let mut in_csi = false;   // CSI sequence: \x1b[...
-        let mut in_osc = false;   // OSC sequence: \x1b]...
-        let chars: Vec<char> = s.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            // Handle CSI/OSC continuations first, before checking for new ESC
-            if in_csi {
-                if c.is_alphabetic() || c == '~' {
-                    in_csi = false;
-                }
-                i += 1;
-                continue;
-            } else if in_osc {
-                // OSC ends with BEL or ST (\x1b\\)
-                if c == '\x07' {
-                    in_osc = false;
-                    i += 1;
-                    continue;
-                } else if c == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
-                    in_osc = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            } else if c == '\x1b' {
-                // Start of new escape sequence
-                if i + 1 < chars.len() {
-                    let next = chars[i + 1];
-                    if next == '[' {
-                        in_csi = true;
-                        i += 2;
-                        continue;
-                    } else if next == ']' {
-                        in_osc = true;
-                        i += 2;
-                        continue;
-                    } else if next == '\\' {
-                        // ST terminator (standalone)
-                        i += 2;
-                        continue;
-                    }
-                }
-                i += 1;
-                continue;
-            } else {
-                width += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                i += 1;
-            }
-        }
-        width
+    // A reveal frame rewrites every row a few times a second: ask a terminal that knows
+    // synchronized output (DEC private mode 2026) to paint the frame in one go, so the
+    // glitching cursor never tears. Any other terminal ignores the private mode.
+    let synchronized = next_frame.is_some();
+    if synchronized {
+        let _ = stdout.queue(Print("\x1b[?2026h"));
     }
+
+    for (pane, rows) in &composed {
+        let pane = *pane;
+    for (row_idx, (wrapped, highlight_f8, hl_color, marked_new, from_archive)) in rows.iter().enumerate() {
+        let row_y = pane.y + row_idx as u16;
+
+        let _ = stdout.queue(cursor::MoveTo(0, row_y));
+
+        // New line indicator, the character style: green triangle prefix for unseen lines
+        if new_prefix && *marked_new {
+            let _ = stdout.queue(Print("\x1b[32m▶\x1b[0m "));
+        }
+
+        // Archive indicator: barrel emoji prefix for lines loaded from scrollback.db
+        // Printed separately (not baked into `wrapped`) so that all width measurements
+        // on `wrapped` remain accurate — `unicode_width` undercounts VS16 emoji width.
+        if *from_archive {
+            let _ = stdout.queue(Print("🛢️ "));
+        }
+
+        // Determine background color: /highlight color takes priority, then F8 highlight
+        let bg_code = if let Some(color) = hl_color {
+            Some(color_name_to_ansi_bg(color))
+        } else if *highlight_f8 {
+            // Dark yellow/brown background for F8 action-matched lines
+            Some("\x1b[48;5;58m".to_string())
+        } else {
+            None
+        };
+
+        if let Some(ref bg) = bg_code {
+            let _ = stdout.queue(Print(bg));
+            // Replace \x1b[0m with \x1b[0m<bg_code> to preserve background
+            let highlighted = wrapped.replace("\x1b[0m", &format!("\x1b[0m{}", bg));
+            let _ = stdout.queue(Print(&highlighted));
+            // Pad with spaces so the highlight background extends to end of line
+            let line_visible_width = crossterm_visible_width(wrapped);
+            if line_visible_width < term_width {
+                let padding = " ".repeat(term_width - line_visible_width);
+                let _ = stdout.queue(Print(padding));
+            }
+        } else if let Some((start, to)) = new_glow.filter(|_| *marked_new) {
+            // New line indicator, the background style: the glow behind the row's first
+            // cells (src/newbg.rs). A /highlight or F8 colour above takes the row instead.
+            let _ = stdout.queue(Print(crate::newbg::glow_row(wrapped, start, to)));
+        } else {
+            let _ = stdout.queue(Print(wrapped));
+        }
+
+        // Reset colors and erase to end of line - more robust than space padding
+        // for preventing background color bleed on macOS terminals
+        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
+    }
+
+    for row_idx in rows.len()..pane.rows as usize {
+        let row_y = pane.y + row_idx as u16;
+        let _ = stdout.queue(cursor::MoveTo(0, row_y));
+        let _ = stdout.queue(Print("\x1b[K"));
+    }
+    }
+    // A shell world's pane: a live terminal, drawn row for row (src/shell).
+    for pane in panes.iter().filter(|p| !app.worlds[p.world].showing_splash && app.worlds[p.world].shell_screen.is_some()) {
+        render_shell_pane(app, *pane, &mut stdout);
+    }
+
+    // Status display line (mud-status-display.md Job 4, plan D3): repainted here,
+    // unconditionally, rather than trusted to `render_stats_line`'s ratatui Paragraph
+    // (drawn moments earlier in the same `terminal.draw()` call). The reason is the
+    // exact hazard this row is uniquely exposed to: it can be a row that, until
+    // `World::stats_line_shown` last flipped from false to true, WAS an ordinary
+    // output row painted by this same bypass loop above. `render_output_area` used to
+    // make ratatui BELIEVE every output-area cell was blank (a `Clear`) — this bypass
+    // is what actually puts pixels there, entirely outside ratatui's own buffer
+    // tracking — so on the very frame this row became the stats line, ratatui's diff
+    // saw "new blank space == remembered blank" for every inter-field gap in the new
+    // text and skipped writing them, leaving whatever MUD text was physically sitting
+    // there a moment ago bleeding through the gaps — verified against the real binary
+    // in a pty (see the plan's job-4 pty harness): "HEALTH963/1000" instead of
+    // "HEALTH 963/1000" on the exact frame the line appeared. `mark_painted_by_crossterm`
+    // now fixes that at the source (for the input area too); the repaint stays because
+    // it keeps this row correct on every subsequent update (hp ticking every combat
+    // round included) as long as something marks `needs_output_redraw` when stats
+    // change — see `App::handle_gmcp_received`/`handle_msdp_received`.
+    // The bottom pane's world's, under the whole output area (both panes while split).
+    let bottom = &app.worlds[console_bottom_world(app)];
+    if bottom.stats_line_shown {
+        let stats_row_y = app.output_area_rows;
+        let entries = bottom.current_stat_entries();
+        let text = build_stats_line_text(&entries, term_width).unwrap_or_default();
+        let _ = stdout.queue(cursor::MoveTo(0, stats_row_y));
+        let _ = stdout.queue(Print(text));
+        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
+    }
+
+    // The Find and History popups sit at the top of the focused pane.
+    let focus_y = panes.iter().find(|p| p.focused).map_or(0, |p| p.y);
+    // Render filter popup if visible (must be after output so it's on top)
+    if app.filter_popup.visible {
+        let popup_width = 40usize.min(term_width);
+        let x = term_width.saturating_sub(popup_width) as u16;
+        let title = " Find [Esc to close] ";
+        let dashes_needed = popup_width.saturating_sub(title.len() + 2); // +2 for corners
+
+        // Draw border top
+        let _ = stdout.queue(cursor::MoveTo(x, focus_y));
+        let border_top = format!("\x1b[36m┌{}{}{}\x1b[0m", title, "─".repeat(dashes_needed), "┐");
+        let _ = stdout.queue(Print(border_top));
+
+        // Draw content line
+        let _ = stdout.queue(cursor::MoveTo(x, focus_y + 1));
+        let mut display_text = app.filter_popup.filter_text.clone();
+        display_text.insert(app.filter_popup.cursor, '▏');
+        let label = "Filter: ";
+        let content_width = label.len() + display_text.chars().count();
+        let inner_width = popup_width.saturating_sub(2); // -2 for side borders
+        let padding = inner_width.saturating_sub(content_width);
+        let _ = stdout.queue(Print(format!("\x1b[36m│\x1b[0m{}{}{}\x1b[36m│\x1b[0m", label, display_text, " ".repeat(padding))));
+
+        // Draw border bottom
+        let _ = stdout.queue(cursor::MoveTo(x, focus_y + 2));
+        let border_bottom = format!("\x1b[36m└{}┘\x1b[0m", "─".repeat(popup_width.saturating_sub(2)));
+        let _ = stdout.queue(Print(border_bottom));
+    }
+
+    // Render search popup if visible (must be after output so it's on top)
+    if app.search_popup.visible {
+        let popup_width = 44usize.min(term_width);
+        let x = term_width.saturating_sub(popup_width) as u16;
+        let title = " History [Enter=older, Esc] ";
+        let dashes_needed = popup_width.saturating_sub(title.len() + 2);
+
+        let _ = stdout.queue(cursor::MoveTo(x, focus_y));
+        let border_top = format!("\x1b[36m┌{}{}{}\x1b[0m", title, "─".repeat(dashes_needed), "┐");
+        let _ = stdout.queue(Print(border_top));
+
+        let _ = stdout.queue(cursor::MoveTo(x, focus_y + 1));
+        let mut display_text = app.search_popup.search_text.clone();
+        display_text.insert(app.search_popup.cursor, '▏');
+        let match_info = if app.search_popup.search_text.is_empty() {
+            String::new()
+        } else if app.search_popup.match_indices.is_empty() {
+            " (no matches)".to_string()
+        } else {
+            format!(" ({}/{})", app.search_popup.current_pos + 1, app.search_popup.match_indices.len())
+        };
+        let label = "Search: ";
+        let content_width = label.len() + display_text.chars().count() + match_info.len();
+        let inner_width = popup_width.saturating_sub(2);
+        let padding = inner_width.saturating_sub(content_width);
+        let _ = stdout.queue(Print(format!(
+            "\x1b[36m│\x1b[0m{}{}\x1b[2m{}\x1b[0m{}\x1b[36m│\x1b[0m",
+            label, display_text, match_info, " ".repeat(padding)
+        )));
+
+        let _ = stdout.queue(cursor::MoveTo(x, focus_y + 2));
+        let border_bottom = format!("\x1b[36m└{}┘\x1b[0m", "─".repeat(popup_width.saturating_sub(2)));
+        let _ = stdout.queue(Print(border_bottom));
+    }
+
+    // The cursor: in the grid of a live shell world with the focus, else in the input.
+    park_cursor(app, &mut stdout);
+
+    if synchronized {
+        let _ = stdout.queue(Print("\x1b[?2026l"));
+    }
+    let _ = stdout.flush();
+    next_frame
+}
+
+/// One pane's rows, as drawn: the world's lines at its scroll position (the newest for a
+/// `live_end` pane), wrapped, revealed and ▶-composed to fill `pane.rows`. Also the delay to
+/// the text-reveal effect's next frame while a line on it is still revealing.
+fn compose_pane(app: &App, pane: ConsolePane, reveal: Option<&crate::reveal::Reveal>, cached_now: &CachedNow) -> (Vec<PaneRow>, Option<std::time::Duration>) {
+    let world = &app.worlds[pane.world];
+    let visible_height = (pane.rows as usize).max(1);
+    let term_width = (app.output_width as usize).max(1);
+    let reveal_new_only = app.settings.text_reveal.new_only();
+    let reveal_now = std::time::SystemTime::now();
+    let mut frame: Option<std::time::Duration> = None;
 
     // Collect wrapped lines centered around scroll_offset to fill the screen
     // Each entry is (line_text, should_highlight_f8, highlight_color_from_action, marked_new, from_archive)
-    let mut visual_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::new();
+    let mut visual_lines: Vec<PaneRow> = Vec::new();
     let mut first_line_idx: usize = 0;
 
     let show_tags = app.show_tags;
@@ -1214,18 +1489,13 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
         Vec::new()
     };
 
-    // Cache "now" for timestamp formatting - compute once per frame, not per line
-    let cached_now = CachedNow::new();
 
     let new_line_indicator = app.settings.nli_drawn();
-    // Which style: the ▶ in front of a new row, or the glow behind its first cells.
-    let new_prefix = app.settings.nli_prefix();
-    let new_glow = app.settings.nli_glow_start().map(|start| (start, crate::newbg::console_target(app.settings.theme)));
     // Minimum old (non-new) context rows to pin at the top when new text has arrived.
     // Zero while the user is scrolled back: there is no new text to give context to, and
     // composing would discard rows out of the middle of the screen (see visible_row_ranges).
-    let min_old_context: usize = if new_line_indicator && world.is_at_bottom() { 2 } else { 0 };
-    let mut expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool, bool)> {
+    let min_old_context: usize = if new_line_indicator && (pane.live_end || world.is_at_bottom()) { 2 } else { 0 };
+    let mut expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<PaneRow> {
         // display_wrapped applies the same prefix-width reservations the draw loop below
         // relies on (▶ and 🛢️ are printed separately, not baked into the wrapped text).
         let mut rows = display_wrapped(line, term_width, show_tags, &app.settings, cached_now);
@@ -1233,13 +1503,13 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
             // Blank line: one empty row, drawn without any prefix.
             return vec![(String::new(), false, None, false, false)];
         }
-        if let Some(reveal) = reveal.as_ref() {
+        if let Some(reveal) = reveal {
             // A line reveals from its arrival, the console's switch to this world or
             // more-mode's release of it, whichever came last (`World::console_reveal_anchor`;
             // in New Only, the switch only for a line the console hadn't shown).
             let anchor = world.console_reveal_anchor(line, reveal_new_only);
             if let Some(due) = reveal.apply(line.seq, anchor, reveal_now, &mut rows) {
-                next_frame = Some(next_frame.map_or(due, |d| d.min(due)));
+                frame = Some(frame.map_or(due, |d| d.min(due)));
             }
         }
         let hl_color = line.highlight_color.clone();
@@ -1259,7 +1529,8 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
     // an attrs-only filter with no pattern at all - either way `filtered_indices` is
     // meaningful and must be used instead of falling through to normal rendering.
     // If filter is active but no matches, show nothing (don't fall through to normal rendering)
-    if app.filter_popup.visible && (!app.filter_popup.filter_text.is_empty() || app.filter_popup.attrs_only) {
+    // F4's filter is the focused pane's.
+    if pane.focused && app.filter_popup.visible && (!app.filter_popup.filter_text.is_empty() || app.filter_popup.attrs_only) {
         // If no matches, visual_lines stays empty - that's correct behavior
         if !app.filter_popup.filtered_indices.is_empty() {
             // Use filtered indices
@@ -1268,13 +1539,13 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
 
             // Work backwards from scroll_offset to fill the screen
             // Collect in reverse, then reverse once (avoids O(n²) insert(0, ...))
-            let mut rev_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::with_capacity(visible_height + 8);
+            let mut rev_lines: Vec<PaneRow> = Vec::with_capacity(visible_height + 8);
             for pos in (0..=end_pos).rev() {
                 let line_idx = filtered[pos];
                 if line_idx < world.output_lines.len() {
                     let line = &world.output_lines[line_idx];
                     let highlight = should_highlight(line);
-                    let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+                    let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, cached_now);
 
                     for w in wrapped.into_iter().rev() {
                         rev_lines.push(w);
@@ -1294,7 +1565,7 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
                     if line_idx < world.output_lines.len() {
                         let line = &world.output_lines[line_idx];
                         let highlight = should_highlight(line);
-                        let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+                        let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, cached_now);
 
                         for w in wrapped {
                             visual_lines.push(w);
@@ -1309,12 +1580,15 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
         }
     } else if !world.output_lines.is_empty() {
         // Normal unfiltered rendering
-        let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
+        // The pane without the focus that shows the focused pane's world too follows its
+        // newest lines, whatever the focused one has scrolled back to.
+        let scroll_offset = if pane.live_end { world.output_lines.len().saturating_sub(1) } else { world.scroll_offset };
+        let end_line = scroll_offset.min(world.output_lines.len().saturating_sub(1));
         // TF's %textdiv rows, as RowMetrics::for_console counts them.
         let divider = console_divider(world, &app.settings, show_tags, visible_height);
 
         // Collect lines in reverse order, then reverse once (avoids O(n²) insert(0, ...))
-        let mut rev_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::with_capacity(visible_height + 8);
+        let mut rev_lines: Vec<PaneRow> = Vec::with_capacity(visible_height + 8);
         first_line_idx = end_line;
         let mut old_visual_count: usize = 0;
         let mut applied_vlo = false;
@@ -1322,7 +1596,7 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
             first_line_idx = line_idx;
             let line = &world.output_lines[line_idx];
             let highlight = should_highlight(line);
-            let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+            let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, cached_now);
             splice_divider(&mut wrapped, line, divider.as_ref(), &app.settings, term_width);
 
             // Partial line display: truncate the first visible line encountered from the end.
@@ -1362,7 +1636,7 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
             for line_idx in (end_line + 1)..world.output_lines.len() {
                 let line = &world.output_lines[line_idx];
                 let highlight = should_highlight(line);
-                let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+                let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, cached_now);
                 splice_divider(&mut wrapped, line, divider.as_ref(), &app.settings, term_width);
 
                 for w in wrapped {
@@ -1391,7 +1665,7 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
                     if let Some(ref tx) = app.ws_client_tx {
                         // Remote console: report to master via WebSocket
                         let _ = tx.send(WsMessage::ReportSeqMismatch {
-                            world_index: app.current_world_index,
+                            world_index: pane.world,
                             expected_seq_gt: prev_seq,
                             actual_seq: line.seq,
                             line_text: line.text.chars().take(80).collect::<String>(),
@@ -1415,174 +1689,11 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
     // copies row data.
     let old_prefix = old_row_prefix(&visual_lines, |(_, _, _, mn, _)| *mn);
     let (head, tail) = visible_row_ranges(visual_lines.len(), visible_height, min_old_context, old_prefix);
-    let mut lines_to_show: Vec<&(String, bool, Option<String>, bool, bool)> =
-        visual_lines[head].iter().collect();
+    let mut lines_to_show: Vec<PaneRow> = visual_lines[head].to_vec();
     if let Some(tail) = tail {
-        lines_to_show.extend(visual_lines[tail].iter());
+        lines_to_show.extend_from_slice(&visual_lines[tail]);
     }
-
-    // A reveal frame rewrites every row a few times a second: ask a terminal that knows
-    // synchronized output (DEC private mode 2026) to paint the frame in one go, so the
-    // glitching cursor never tears. Any other terminal ignores the private mode.
-    let synchronized = next_frame.is_some();
-    if synchronized {
-        let _ = stdout.queue(Print("\x1b[?2026h"));
-    }
-
-    for (row_idx, (wrapped, highlight_f8, hl_color, marked_new, from_archive)) in lines_to_show.iter().enumerate() {
-        let row_y = row_idx as u16;
-
-        let _ = stdout.queue(cursor::MoveTo(0, row_y));
-
-        // New line indicator, the character style: green triangle prefix for unseen lines
-        if new_prefix && *marked_new {
-            let _ = stdout.queue(Print("\x1b[32m▶\x1b[0m "));
-        }
-
-        // Archive indicator: barrel emoji prefix for lines loaded from scrollback.db
-        // Printed separately (not baked into `wrapped`) so that all width measurements
-        // on `wrapped` remain accurate — `unicode_width` undercounts VS16 emoji width.
-        if *from_archive {
-            let _ = stdout.queue(Print("🛢️ "));
-        }
-
-        // Determine background color: /highlight color takes priority, then F8 highlight
-        let bg_code = if let Some(color) = hl_color {
-            Some(color_name_to_ansi_bg(color))
-        } else if *highlight_f8 {
-            // Dark yellow/brown background for F8 action-matched lines
-            Some("\x1b[48;5;58m".to_string())
-        } else {
-            None
-        };
-
-        if let Some(ref bg) = bg_code {
-            let _ = stdout.queue(Print(bg));
-            // Replace \x1b[0m with \x1b[0m<bg_code> to preserve background
-            let highlighted = wrapped.replace("\x1b[0m", &format!("\x1b[0m{}", bg));
-            let _ = stdout.queue(Print(&highlighted));
-            // Pad with spaces so the highlight background extends to end of line
-            let line_visible_width = visible_width(wrapped);
-            if line_visible_width < term_width {
-                let padding = " ".repeat(term_width - line_visible_width);
-                let _ = stdout.queue(Print(padding));
-            }
-        } else if let Some((start, to)) = new_glow.filter(|_| *marked_new) {
-            // New line indicator, the background style: the glow behind the row's first
-            // cells (src/newbg.rs). A /highlight or F8 colour above takes the row instead.
-            let _ = stdout.queue(Print(crate::newbg::glow_row(wrapped, start, to)));
-        } else {
-            let _ = stdout.queue(Print(wrapped));
-        }
-
-        // Reset colors and erase to end of line - more robust than space padding
-        // for preventing background color bleed on macOS terminals
-        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
-    }
-
-    for row_idx in lines_to_show.len()..visible_height {
-        let row_y = row_idx as u16;
-        let _ = stdout.queue(cursor::MoveTo(0, row_y));
-        let _ = stdout.queue(Print("\x1b[K"));
-    }
-
-    // Status display line (mud-status-display.md Job 4, plan D3): repainted here,
-    // unconditionally, rather than trusted to `render_stats_line`'s ratatui Paragraph
-    // (drawn moments earlier in the same `terminal.draw()` call). The reason is the
-    // exact hazard this row is uniquely exposed to: it can be a row that, until
-    // `World::stats_line_shown` last flipped from false to true, WAS an ordinary
-    // output row painted by this same bypass loop above. `render_output_area` used to
-    // make ratatui BELIEVE every output-area cell was blank (a `Clear`) — this bypass
-    // is what actually puts pixels there, entirely outside ratatui's own buffer
-    // tracking — so on the very frame this row became the stats line, ratatui's diff
-    // saw "new blank space == remembered blank" for every inter-field gap in the new
-    // text and skipped writing them, leaving whatever MUD text was physically sitting
-    // there a moment ago bleeding through the gaps — verified against the real binary
-    // in a pty (see the plan's job-4 pty harness): "HEALTH963/1000" instead of
-    // "HEALTH 963/1000" on the exact frame the line appeared. `mark_painted_by_crossterm`
-    // now fixes that at the source (for the input area too); the repaint stays because
-    // it keeps this row correct on every subsequent update (hp ticking every combat
-    // round included) as long as something marks `needs_output_redraw` when stats
-    // change — see `App::handle_gmcp_received`/`handle_msdp_received`.
-    if app.current_world().stats_line_shown {
-        let stats_row_y = visible_height as u16;
-        let entries = app.current_world().current_stat_entries();
-        let text = build_stats_line_text(&entries, term_width).unwrap_or_default();
-        let _ = stdout.queue(cursor::MoveTo(0, stats_row_y));
-        let _ = stdout.queue(Print(text));
-        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
-    }
-
-    // Render filter popup if visible (must be after output so it's on top)
-    if app.filter_popup.visible {
-        let popup_width = 40usize.min(term_width);
-        let x = term_width.saturating_sub(popup_width) as u16;
-        let title = " Find [Esc to close] ";
-        let dashes_needed = popup_width.saturating_sub(title.len() + 2); // +2 for corners
-
-        // Draw border top
-        let _ = stdout.queue(cursor::MoveTo(x, 0));
-        let border_top = format!("\x1b[36m┌{}{}{}\x1b[0m", title, "─".repeat(dashes_needed), "┐");
-        let _ = stdout.queue(Print(border_top));
-
-        // Draw content line
-        let _ = stdout.queue(cursor::MoveTo(x, 1));
-        let mut display_text = app.filter_popup.filter_text.clone();
-        display_text.insert(app.filter_popup.cursor, '▏');
-        let label = "Filter: ";
-        let content_width = label.len() + display_text.chars().count();
-        let inner_width = popup_width.saturating_sub(2); // -2 for side borders
-        let padding = inner_width.saturating_sub(content_width);
-        let _ = stdout.queue(Print(format!("\x1b[36m│\x1b[0m{}{}{}\x1b[36m│\x1b[0m", label, display_text, " ".repeat(padding))));
-
-        // Draw border bottom
-        let _ = stdout.queue(cursor::MoveTo(x, 2));
-        let border_bottom = format!("\x1b[36m└{}┘\x1b[0m", "─".repeat(popup_width.saturating_sub(2)));
-        let _ = stdout.queue(Print(border_bottom));
-    }
-
-    // Render search popup if visible (must be after output so it's on top)
-    if app.search_popup.visible {
-        let popup_width = 44usize.min(term_width);
-        let x = term_width.saturating_sub(popup_width) as u16;
-        let title = " History [Enter=older, Esc] ";
-        let dashes_needed = popup_width.saturating_sub(title.len() + 2);
-
-        let _ = stdout.queue(cursor::MoveTo(x, 0));
-        let border_top = format!("\x1b[36m┌{}{}{}\x1b[0m", title, "─".repeat(dashes_needed), "┐");
-        let _ = stdout.queue(Print(border_top));
-
-        let _ = stdout.queue(cursor::MoveTo(x, 1));
-        let mut display_text = app.search_popup.search_text.clone();
-        display_text.insert(app.search_popup.cursor, '▏');
-        let match_info = if app.search_popup.search_text.is_empty() {
-            String::new()
-        } else if app.search_popup.match_indices.is_empty() {
-            " (no matches)".to_string()
-        } else {
-            format!(" ({}/{})", app.search_popup.current_pos + 1, app.search_popup.match_indices.len())
-        };
-        let label = "Search: ";
-        let content_width = label.len() + display_text.chars().count() + match_info.len();
-        let inner_width = popup_width.saturating_sub(2);
-        let padding = inner_width.saturating_sub(content_width);
-        let _ = stdout.queue(Print(format!(
-            "\x1b[36m│\x1b[0m{}{}\x1b[2m{}\x1b[0m{}\x1b[36m│\x1b[0m",
-            label, display_text, match_info, " ".repeat(padding)
-        )));
-
-        let _ = stdout.queue(cursor::MoveTo(x, 2));
-        let border_bottom = format!("\x1b[36m└{}┘\x1b[0m", "─".repeat(popup_width.saturating_sub(2)));
-        let _ = stdout.queue(Print(border_bottom));
-    }
-
-    queue_input_cursor(app, &mut stdout);
-
-    if synchronized {
-        let _ = stdout.queue(Print("\x1b[?2026l"));
-    }
-    let _ = stdout.flush();
-    next_frame
+    (lines_to_show, frame)
 }
 
 /// Queue the real cursor's move to its spot in the input area, for the crossterm pass
@@ -1610,8 +1721,10 @@ fn queue_input_cursor(app: &App, stdout: &mut std::io::Stdout) {
     // in agreement with the actual rendered layout even on the one frame where the
     // latch just flipped (ui() already updated app.output_height by the time this
     // crossterm pass runs after it).
-    let stats_line_height: u16 = if app.current_world().stats_line_shown { 1 } else { 0 };
-    let input_area_y = app.output_height + stats_line_height + app.separator_rows();
+    // The output area is both panes and the bar between them while split
+    // (`output_area_rows`), and the status line is the bottom pane's world's.
+    let stats_line_height: u16 = if app.worlds[console_bottom_world(app)].stats_line_shown { 1 } else { 0 };
+    let input_area_y = app.output_area_rows + stats_line_height + app.separator_rows();
     let input_area_width = term_width.max(1);
     let (sent_rows, live_height) = input_rows_split(app);
 
@@ -1657,33 +1770,12 @@ fn queue_input_cursor(app: &App, stdout: &mut std::io::Stdout) {
     }
 }
 
-/// Draw a shell world's screen into the output area: each row as it stands, the real
-/// cursor parked in the grid (src/shell). The separator bar and input area are still drawn
-/// by ratatui in the same frame; this just owns the output rows and the cursor.
-fn render_shell_crossterm(app: &App) {
-    use std::io::Write;
-    use crossterm::cursor::{Hide, MoveTo, SetCursorStyle, Show};
-    use crossterm::style::Print;
+/// Leave the real cursor where typing goes: in the grid of a live shell world in the
+/// focused pane, with its shape (unless off-screen or hidden), else in the input area.
+fn park_cursor(app: &App, stdout: &mut std::io::Stdout) {
+    use crossterm::cursor::{MoveTo, SetCursorStyle, Show};
     use crossterm::QueueableCommand;
-
-    let mut stdout = std::io::stdout();
-    let visible_height = app.output_height.max(1);
-    let Some(screen) = app.current_world().shell_screen.as_ref() else { return };
-
-    // Hidden while the rows are written, so it doesn't sweep across them.
-    let _ = stdout.queue(Hide);
-    for y in 0..visible_height {
-        let _ = stdout.queue(MoveTo(0, y));
-        if let Some(line) = screen.lines.get(y as usize) {
-            // The row carries its own SGR; reset + clear to end so nothing bleeds.
-            let _ = stdout.queue(Print("\x1b[0m"));
-            let _ = stdout.queue(Print(line));
-        }
-        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
-    }
-
-    if app.shell_live(app.current_world_index) {
-        // The cursor, in the grid, with its shape - unless it is off-screen or hidden.
+    if let Some(screen) = app.current_world().shell_screen.as_ref().filter(|_| app.shell_live(app.current_world_index)) {
         if let Some((col, row)) = shell_grid_cursor(app) {
             let c = &screen.cursor;
             let style = match (c.shape, c.blink) {
@@ -1698,26 +1790,49 @@ fn render_shell_crossterm(app: &App) {
             let _ = stdout.queue(MoveTo(col, row));
             let _ = stdout.queue(Show);
         }
-    } else {
-        // The shell has exited: typing goes to the input area again (to /connect), so the
-        // cursor goes back there too, with its normal shape.
-        let _ = stdout.queue(SetCursorStyle::DefaultUserShape);
-        queue_input_cursor(app, &mut stdout);
-        let _ = stdout.queue(Show);
+        return;
     }
-    let _ = stdout.flush();
+    // Not a live shell (or it exited): typing goes to the input area (to /connect), so the
+    // cursor goes back there too, with its normal shape.
+    let _ = stdout.queue(SetCursorStyle::DefaultUserShape);
+    queue_input_cursor(app, stdout);
+    let _ = stdout.queue(Show);
 }
 
-/// Where the cursor of the shell world on screen sits, while that shell is live: the
-/// terminal's own cursor cell, or `None` when the program has hidden it (or it is below
-/// the output area). The ratatui frame and the crossterm pass both place the cursor from
-/// this, so a draw that doesn't repaint the grid can't move it anywhere else.
+/// Draw a shell world's screen into its pane: each row as it stands (src/shell). The
+/// separator bar and input area are still drawn by ratatui in the same frame; the cursor is
+/// `park_cursor`'s.
+fn render_shell_pane(app: &App, pane: ConsolePane, stdout: &mut std::io::Stdout) {
+    use crossterm::cursor::{Hide, MoveTo};
+    use crossterm::style::Print;
+    use crossterm::QueueableCommand;
+
+    let Some(screen) = app.worlds[pane.world].shell_screen.as_ref() else { return };
+    // Hidden while the rows are written, so it doesn't sweep across them.
+    let _ = stdout.queue(Hide);
+    for y in 0..pane.rows {
+        let _ = stdout.queue(MoveTo(0, pane.y + y));
+        if let Some(line) = screen.lines.get(y as usize) {
+            // The row carries its own SGR; reset + clear to end so nothing bleeds.
+            let _ = stdout.queue(Print("\x1b[0m"));
+            let _ = stdout.queue(Print(line));
+        }
+        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
+    }
+}
+
+/// Where the cursor of the shell world in the focused pane sits, while that shell is live:
+/// the terminal's own cursor cell, on the screen (the pane's rows offset), or `None` when
+/// the program has hidden it (or it is below the pane). The ratatui frame and the crossterm
+/// pass both place the cursor from this, so a draw that doesn't repaint the grid can't move
+/// it anywhere else.
 fn shell_grid_cursor(app: &App) -> Option<(u16, u16)> {
     if !app.shell_live(app.current_world_index) {
         return None;
     }
+    let pane = console_panes(app).into_iter().find(|p| p.focused)?;
     let c = &app.current_world().shell_screen.as_ref()?.cursor;
-    (c.visible && c.row < app.output_height.max(1)).then_some((c.col, c.row))
+    (c.visible && c.row < pane.rows.max(1)).then_some((c.col, pane.y + c.row))
 }
 
 /// Write an ANSI-colored string directly to a ratatui buffer at (x, y).
@@ -1884,8 +1999,12 @@ fn mark_painted_by_crossterm(f: &mut Frame, area: Rect) {
     }
 }
 
-pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
-    let world = app.current_world();
+/// One pane's output area, `world` in `area` (the whole output area while not split).
+/// `live_end`: the pane without the focus showing the focused pane's world too, which
+/// crossterm draws at its newest lines; behind a popup it is drawn as the focused one is.
+pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect, world: usize, live_end: bool) {
+    let _ = live_end;
+    let world = &app.worlds[world];
     let visible_height = area.height as usize;
     let area_width = area.width as usize;
 
@@ -2447,13 +2566,79 @@ pub(crate) fn render_stats_line(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
+/// A separator bar's background: TinyFugue style's is the terminal's own, Web style's the
+/// console theme's status_bar.bg - turned to a grey of the same lightness on the bar of a
+/// split's pane without the focus (`/split`).
+fn bar_background(app: &App, focused: bool) -> ratatui::style::Color {
+    match app.settings.separator_style {
+        crate::SeparatorStyle::TinyFugue => app.settings.theme.bg(),
+        crate::SeparatorStyle::Web => {
+            let bg = app.theme_colors().status_bar_bg;
+            if focused { bg.to_ratatui() } else { bg.grey_of_same_lightness().to_ratatui() }
+        }
+    }
+}
+
+/// A bar of a split's pane without the focus in TinyFugue style, which has no colour of its
+/// own to turn grey: its text goes grey instead, the status ball excepted.
+fn grey_bar_text<'a>(spans: Vec<Span<'a>>, app: &App) -> Vec<Span<'a>> {
+    let dim = app.settings.theme.fg_dim();
+    spans.into_iter()
+        .map(|s| if s.content == "● " { s } else { s.patch_style(Style::default().fg(dim)) })
+        .collect()
+}
+
+/// The ball showing a world's connection: green when connected, amber while auto-reconnect
+/// is actively retrying (`World::is_reconnecting` - distinct from a plain disconnect so
+/// "still trying" reads differently from "gave up"), red when disconnected outright.
+fn connection_ball(world: &World, theme: crate::Theme) -> Span<'static> {
+    let dot_color = if world.connected {
+        theme.fg_success()
+    } else if world.is_reconnecting() {
+        theme.fg_highlight()
+    } else {
+        theme.fg_error()
+    };
+    Span::styled("● ", Style::default().fg(dot_color))
+}
+
+/// The bar between a split's two panes (`/split`): the top pane's world - its connection
+/// ball and its name, nothing else (user request 2026-10-30) - lined up with the full bar
+/// below, in the current Separator Style, grey when the top pane hasn't the focus.
+pub(crate) fn render_pane_bar(f: &mut Frame, app: &App, area: Rect, world_index: usize, focused: bool) {
+    let Some(world) = app.worlds.get(world_index) else { return };
+    let theme = app.settings.theme;
+    let sep_style = app.settings.separator_style;
+    let fill = sep_style.fill_char().to_string();
+    // The full bar's 9-column More/Hist indicator comes first there: the ball goes under
+    // the same column here.
+    const STATUS_INDICATOR_LEN: usize = 9;
+    let name_width = crate::input::display_width(&world.name);
+    let mut spans = vec![
+        Span::styled(fill.repeat(STATUS_INDICATOR_LEN), Style::default().fg(theme.fg_dim())),
+        connection_ball(world, theme),
+        Span::styled(world.name.clone(), Style::default().fg(theme.fg())),
+    ];
+    let used = STATUS_INDICATOR_LEN + 2 + name_width;
+    spans.push(Span::styled(fill.repeat((area.width as usize).saturating_sub(used)), Style::default().fg(theme.fg_dim())));
+    if !focused && sep_style == crate::SeparatorStyle::TinyFugue {
+        spans = grey_bar_text(spans, app);
+    }
+    let paragraph = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_background(app, focused)));
+    f.render_widget(paragraph, area);
+}
+
 pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
-    if let Some(view) = app.tf_status.get(&app.current_world_index) {
+    // The bottom pane's world (the only pane while not split), grey while a split's top
+    // pane has the focus.
+    let world_index = console_bottom_world(app);
+    let focused = !app.split.is_some_and(|s| s.focus_top);
+    if let Some(view) = app.tf_status.get(&world_index) {
         render_tf_status(f, app, view, area);
         return;
     }
     let width = area.width as usize;
-    let world = app.current_world();
+    let world = &app.worlds[world_index];
     let theme = app.settings.theme;
     // TinyFugue style fills every gap with '_' over the terminal background; Web style
     // uses plain spaces over the console theme's status_bar.bg (the web/GUI status bar
@@ -2461,10 +2646,7 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let sep_style = app.settings.separator_style;
     let fill = sep_style.fill_char();
     let fill_str = |n: usize| -> String { fill.to_string().repeat(n) };
-    let bar_bg = match sep_style {
-        crate::SeparatorStyle::TinyFugue => theme.bg(),
-        crate::SeparatorStyle::Web => app.theme_colors().status_bar_bg.to_ratatui(),
-    };
+    let bar_bg = bar_background(app, focused);
 
     // Build bar components
     // Clay's 12-hour clock, or TF's %clock_format once a script has set one.
@@ -2480,7 +2662,12 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // A shell world (src/shell) has no scrollback and no pending output, so it never shows
     // a Hist/More indicator - its screen is always "the whole thing, now".
     let is_shell = world.settings.world_type.is_shell();
-    let more = if is_shell { None } else { more_indicator_count(world, &RowMetrics::for_console(app)) };
+    let metrics = if world_index == app.current_world_index {
+        RowMetrics::for_console(app)
+    } else {
+        RowMetrics::new(&app.settings, app.show_tags, (app.output_width as usize).max(1))
+    };
+    let more = if is_shell { None } else { more_indicator_count(world, &metrics) };
     let (status_str, status_active) = if !is_shell && !world.is_at_bottom() {
         // Show History indicator when scrolled back (takes precedence over More)
         let lines_back = world.lines_from_bottom(app.show_tags);
@@ -2502,6 +2689,9 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // GMCP indicator (only shown when F9 toggled to enable GMCP processing)
     let gmcp_indicator = if world.gmcp_user_enabled { " [g]" } else { "" };
+
+    // `/remote --pause console`: the console doesn't count as watching its world.
+    let paused_indicator = if app.console_paused { " [paused]" } else { "" };
 
     // Numeric prefix indicator (TF-parity plan Job 20/P2.4): shown only while a kbnum
     // prefix is pending (Esc-0..9/Esc--), mirroring real TF's own status-line kbnum
@@ -2562,26 +2752,12 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Only show connection ball, world name, and tag indicator if world has ever connected
     // Use world.was_connected flag (set to true on first connection)
-    let is_connected = world.connected;
     let was_connected = world.was_connected;
 
     let current_pos = if was_connected {
-        // Connection status ball: green when connected, amber while auto-reconnect is
-        // actively retrying (World::is_reconnecting - distinct from a plain disconnect so
-        // "still trying" reads differently from "gave up"), red when disconnected outright.
-        // Reused for the SSH remote console for free - it renders through this same
-        // function on its mirrored worlds.
-        let dot_color = if is_connected {
-            theme.fg_success()
-        } else if world.is_reconnecting() {
-            theme.fg_highlight()
-        } else {
-            theme.fg_error()
-        };
-        spans.push(Span::styled(
-            "● ",
-            Style::default().fg(dot_color),
-        ));
+        // Connection status ball (`connection_ball`). Reused for the SSH remote console for
+        // free - it renders through this same function on its mirrored worlds.
+        spans.push(connection_ball(world, theme));
 
         // World name
         spans.push(Span::styled(
@@ -2605,6 +2781,10 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
+        if !paused_indicator.is_empty() {
+            spans.push(Span::styled(paused_indicator, Style::default().fg(theme.fg_highlight())));
+        }
+
         // Numeric prefix indicator (bold, like a real TF status line's kbnum display)
         if !kbnum_indicator.is_empty() {
             spans.push(Span::styled(
@@ -2613,18 +2793,21 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // Calculate position: status + ball (2 chars) + world name + tag/gmcp/kbnum indicators
+        // Calculate position: status + ball (2 chars) + world name + tag/gmcp/paused/kbnum indicators
         status_str.len() + 2 + world_display.len() + tag_indicator.len() + gmcp_indicator.len()
-            + kbnum_indicator.len()
+            + paused_indicator.len() + kbnum_indicator.len()
     } else {
-        // World never connected - don't show ball or name (still show kbnum, if pending)
+        // World never connected - don't show ball or name (still show paused and kbnum)
+        if !paused_indicator.is_empty() {
+            spans.push(Span::styled(paused_indicator, Style::default().fg(theme.fg_highlight())));
+        }
         if !kbnum_indicator.is_empty() {
             spans.push(Span::styled(
                 kbnum_indicator.clone(),
                 Style::default().fg(theme.fg_highlight()).add_modifier(Modifier::BOLD),
             ));
         }
-        status_str.len() + kbnum_indicator.len()
+        status_str.len() + paused_indicator.len() + kbnum_indicator.len()
     };
 
     // Pad to reach position 24 (or as close as possible)
@@ -2670,6 +2853,9 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // Time on the right (no spaces around it)
     spans.push(Span::styled(time_display, Style::default().fg(theme.fg())));
 
+    if !focused && sep_style == crate::SeparatorStyle::TinyFugue {
+        spans = grey_bar_text(spans, app);
+    }
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line).style(Style::default().bg(bar_bg));
 

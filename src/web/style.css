@@ -115,7 +115,7 @@ body {
 }
 
 /* ─── Output Area ─── */
-#output-container {
+#output-container, #split-output-container {
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
@@ -130,7 +130,7 @@ body {
     scrollbar-color: var(--theme-fg-muted, #52525b) transparent;
 }
 
-#output {
+#output, #split-output {
     white-space: pre-wrap;
     word-wrap: break-word;
     line-height: 1.0;
@@ -145,7 +145,7 @@ body {
 /* No letter-spacing reset here: the font setting's letter-spacing (set on #output by
    applyAdvancedFontSettings) must reach coloured runs, links and prefixes too, not only
    plain text. Block cells keep exact columns (.blk). */
-#output span {
+#output span, #split-output span {
     margin: 0;
     padding: 0;
     border: 0;
@@ -173,7 +173,7 @@ body {
 
 /* An emoji cluster (app.js wrapEmoji): the colour emoji fonts first, ahead of any
    monospace font with a black-and-white glyph of its own for it (Cascadia Code's ⬛⬜). */
-#output .emoji {
+#output .emoji, #split-output .emoji {
     font-family: 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', 'Twemoji Mozilla', 'EmojiOne Color', sans-serif;
 }
 
@@ -199,7 +199,7 @@ body {
 
 /* A symbol in its text form (app.js wrapEmoji: ✌ ♥ ☺︎): the output's font, then the
    symbol fonts, rather than the colour emoji font the browser falls back to. */
-#output .emoji-text {
+#output .emoji-text, #split-output .emoji-text {
     font-family: var(--mono-override, var(--mono)), 'Noto Sans Symbols 2', 'Noto Sans Symbols2', 'Segoe UI Symbol', 'Apple Symbols', 'DejaVu Sans', 'Symbola', sans-serif;
     font-variant-emoji: text;
     /* A symbol font is taller than the output's: on the baseline still, but its row stays
@@ -211,7 +211,7 @@ body {
    glyphFitStyle: FANSI's ■ and ☼ from a fallback font): a box exactly one cell wide, its
    width (and, for a wider glyph, a smaller font) set on the element, the glyph centred.
    An ANSI underline is the parent span's, which a box would otherwise not get. */
-#output .gfit {
+#output .gfit, #split-output .gfit {
     display: inline-block;
     text-align: center;
     white-space: pre;
@@ -239,7 +239,7 @@ body {
     pointer-events: none;
 }
 
-#output .line {
+#output .line, #split-output .line {
     line-height: 1.0;
     margin: 0;
     padding-top: 0;
@@ -262,14 +262,14 @@ body {
    by newGlowGradient() in app.js from the theme's background; on the block, so each wrapped
    row's column 0 gets it, and the text's own backgrounds and a /highlight's block paint over
    it. The ▶ style adds text instead (lineHtml). */
-#output .line.new-glow {
+#output .line.new-glow, #split-output .line.new-glow {
     background: var(--new-glow, none);
 }
 
 /* TF's %textdiv (textdivHtml() in app.js): the divider between text already shown and text
    that arrived since, and for "clear" a blank as tall as the output area. Not selectable:
    copying output must not pick them up. */
-#output .tf-textdiv {
+#output .tf-textdiv, #split-output .tf-textdiv {
     line-height: 1.0;
     min-height: 1em;
     white-space: pre;
@@ -278,7 +278,7 @@ body {
     -webkit-user-select: none;
 }
 
-#output .tf-textdiv-clear {
+#output .tf-textdiv-clear, #split-output .tf-textdiv-clear {
     user-select: none;
     -webkit-user-select: none;
 }
@@ -287,7 +287,7 @@ body {
    many columns instead of the window's edge. The first row starts --wrapspace columns
    left of the content box, so the box is that much narrower and every row, indented or
    not, is --wrap-columns wide. */
-#output.wrap-capped .line {
+#output.wrap-capped .line, #split-output.wrap-capped .line {
     max-width: calc((var(--wrap-columns, 80) - var(--wrapspace, 0)) * 1ch);
 }
 
@@ -540,6 +540,36 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
     color: var(--text-color);
     letter-spacing: 0.2px;
     white-space: nowrap;
+}
+
+/* /split (user request 2026-10-30): the bar between the two panes - the top pane's world,
+   its dot and name only - on the status bar's colour. It and the full #status-bar below
+   turn grey (--pane-unfocused-bg: the bar's colour as a grey of the same lightness, set by
+   app.js applyPaneGrey) while their pane hasn't the focus; a press on a grey bar moves the
+   focus to its pane. The spacer is the menu button's twin, so the dot sits under the full
+   bar's. */
+.pane-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: var(--status-height);
+    padding: 0 12px;
+    background: var(--theme-status-bar-bg, var(--theme-bg-surface, #1c1722));
+    border-top: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--theme-border-subtle, #221c2b);
+    font-size: 11.5px;
+    flex-shrink: 0;
+    user-select: none;
+    position: relative;
+    z-index: 2;
+}
+.pane-bar .pane-bar-spacer { visibility: hidden; }
+body.device-phone .pane-bar .pane-bar-spacer { display: none; }
+.pane-bar .status-item { cursor: default; }
+.pane-bar.pane-unfocused,
+#status-bar.pane-unfocused {
+    background: var(--pane-unfocused-bg, #555);
+    cursor: pointer;
 }
 
 /* ─── World-Tabs Ribbon (Tabs setting: none/top/bottom) ─── */
@@ -1384,7 +1414,7 @@ body.device-phone[data-gui-theme="dark-new"] #input-container {
     background-color: #1c1722;
     border-top-color: #2e2738;
 }
-body.device-phone #output-container { padding: 6px 10px; }
+body.device-phone #output-container, body.device-phone #split-output-container { padding: 6px 10px; }
 
 /* ─── The Android app with a keyboard and a mouse: the desktop GUI's chrome ─── */
 /* app.js desktopInputAttached(), on a phone or a tablet alike: the separator bar carries the
@@ -1464,7 +1494,7 @@ body.desktop-input #menu-dropdown .menu-item[data-action="emoji_picker"] { displ
 ::-webkit-scrollbar {
     display: none;
 }
-#output-container {
+#output-container, #split-output-container {
     -ms-overflow-style: none;  /* IE/Edge */
 }
 
@@ -1480,27 +1510,37 @@ body.desktop-input #menu-dropdown .menu-item[data-action="emoji_picker"] { displ
    otherwise remove the pseudo-element bar. Phones and tablets keep the platform's own
    overlay bar, unless the Android app has a keyboard and a mouse (body.desktop-input). */
 body.device-desktop #output-container,
-body.desktop-input #output-container {
+body.desktop-input #output-container,
+body.device-desktop #split-output-container,
+body.desktop-input #split-output-container {
     scrollbar-gutter: stable;
 }
 @supports selector(::-webkit-scrollbar) {
     body.device-desktop #output-container,
-    body.desktop-input #output-container {
+    body.desktop-input #output-container,
+    body.device-desktop #split-output-container,
+    body.desktop-input #split-output-container {
         scrollbar-width: auto;
         scrollbar-color: auto;
     }
 }
 body.device-desktop #output-container::-webkit-scrollbar,
-body.desktop-input #output-container::-webkit-scrollbar {
+body.desktop-input #output-container::-webkit-scrollbar,
+body.device-desktop #split-output-container::-webkit-scrollbar,
+body.desktop-input #split-output-container::-webkit-scrollbar {
     display: block;
     width: 9px;
 }
 body.device-desktop #output-container::-webkit-scrollbar-track,
-body.desktop-input #output-container::-webkit-scrollbar-track {
+body.desktop-input #output-container::-webkit-scrollbar-track,
+body.device-desktop #split-output-container::-webkit-scrollbar-track,
+body.desktop-input #split-output-container::-webkit-scrollbar-track {
     background: transparent;
 }
 body.device-desktop #output-container::-webkit-scrollbar-thumb,
-body.desktop-input #output-container::-webkit-scrollbar-thumb {
+body.desktop-input #output-container::-webkit-scrollbar-thumb,
+body.device-desktop #split-output-container::-webkit-scrollbar-thumb,
+body.desktop-input #split-output-container::-webkit-scrollbar-thumb {
     background-color: var(--theme-fg-muted, #52525b);
     border-right: 1px solid transparent;
     background-clip: padding-box;
@@ -1509,7 +1549,11 @@ body.desktop-input #output-container::-webkit-scrollbar-thumb {
 body.device-desktop #output-container::-webkit-scrollbar-thumb:hover,
 body.desktop-input #output-container::-webkit-scrollbar-thumb:hover,
 body.device-desktop #output-container::-webkit-scrollbar-thumb:active,
-body.desktop-input #output-container::-webkit-scrollbar-thumb:active {
+body.desktop-input #output-container::-webkit-scrollbar-thumb:active,
+body.device-desktop #split-output-container::-webkit-scrollbar-thumb:hover,
+body.desktop-input #split-output-container::-webkit-scrollbar-thumb:hover,
+body.device-desktop #split-output-container::-webkit-scrollbar-thumb:active,
+body.desktop-input #split-output-container::-webkit-scrollbar-thumb:active {
     background-color: var(--theme-fg-secondary, #a1a1aa);
 }
 

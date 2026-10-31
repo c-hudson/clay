@@ -211,8 +211,8 @@ impl Session {
     }
 
     /// The worlds the windows following this one show (`ClientCore::set_other_views`).
-    pub fn set_other_views(&mut self, worlds: Vec<usize>) -> Vec<Effect> {
-        let e = self.core.set_other_views(worlds);
+    pub fn set_other_views(&mut self, worlds: Vec<usize>, dims: Vec<crate::websocket::ViewDims>) -> Vec<Effect> {
+        let e = self.core.set_other_views(worlds, dims);
         self.apply(e)
     }
 
@@ -248,7 +248,7 @@ mod tests {
             Effect::Connect,
             send(WsMessage::Ping),
             send(WsMessage::SendCommand { world_index: 0, command: "look".into() }),
-            send(WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0) }),
+            send(WsMessage::MarkWorldSeen { world_index: 1, previous_world_index: Some(0), other_views: None }),
             send(WsMessage::ReleasePending { world_index: 0, count: 5 }),
             Effect::Disconnect,
             Effect::Changed,

@@ -43,6 +43,7 @@ sequences like `^[[1;5A`) — see `/help bind`.
 | `Shift-Down` | Previous world, cycling through all worlds |
 | `Esc-w` | Switch to the world with activity, oldest first (held output, then unseen output); with none left, back to the last world you visited that is still connected — TinyFugue's `world-q.tf` ESC-w |
 | `^]` | Background all worlds (TF `/bg`) — a no-op in Clay's single-pane console, kept for scripting parity |
+| `Shift-Tab` | Split output (`/split`): move the focus to the other pane — the one that gets what you type, the commands and the keys. Nothing when the output isn't split; in a shell world, Shift-Tab goes to the shell then |
 
 `Alt-<key>` is a synonym for `Esc-<key>` on every named key, matching TF's own
 `key_meta_<x>` = `key_esc_<x>` aliases. Which one your terminal actually sends
@@ -58,6 +59,10 @@ alphabetical-or-unseen-first behavior set by the "World Switching" setting in
 to its own cycling so neither style loses a default key. The
 `world_previous`/`world_forward`/`recent_worlds` actions still have no default
 key — bind them in `keybindings.dat` or the keybind editor.
+
+While the output is split (`/split`), every switch key above steps over the world shown
+in the other pane, so the two panes never end up on the same world by accident; only
+`/world <name>` (or `/split <name>`) shows one world in both.
 
 ## Input Editing
 
@@ -182,7 +187,7 @@ the full list of changed defaults.
 | `PageDown` | Scroll forward (unpauses at the bottom) |
 | `Alt-PageUp` / `Esc-PageUp` | Scroll back half a page |
 | `Alt-PageDown` / `Esc-PageDown` | Scroll forward half a page, or release half a screenful of pending output |
-| `Tab` | Release one screenful of pending output when paused; command completion when the input starts with `/`; otherwise pages like `PageDown` |
+| `Tab` | Pages like `PageDown`: scrolled back, it scrolls down a page; at the bottom, it releases one screenful of pending output when paused. Command completion when the input starts with `/` |
 | `Esc-j` | Jump to end, release all pending output |
 | `Esc-J` | Selective flush: keep highlighted pending lines, discard the rest |
 | `Esc-h` | Half-page scroll forward, or release half a screenful of pending output |
@@ -435,6 +440,7 @@ you change a default, update both.
 | `PageUp` | `scroll_page_up` |
 | `Right` | `cursor_right` |
 | `Shift-Down` | `world_all_prev` |
+| `Shift-Tab` | `split_focus` |
 | `Shift-Up` | `world_all_next` |
 | `Tab` | `tab_key` |
 | `Up` | `cursor_up` |

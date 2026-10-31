@@ -135,7 +135,7 @@ impl ClayView {
                 let v = cx.new(|cx| Password::new(main, window, cx));
                 dialogs::open(self, Kind::Password, v, window, cx);
             }
-            "spell_check" => self.spell_suggest(window, cx),
+            "spell_check" => self.spell_suggest(cx),
             "recent_worlds" => {
                 let v = cx.new(|cx| super::dialogs::small::RecentWorlds::new(main, cx));
                 dialogs::open(self, Kind::RecentWorlds, v, window, cx);
@@ -510,7 +510,8 @@ impl ClayView {
     /// interface keeps it). Nothing to keep clears a stale stash.
     pub(super) fn stash_input_for_relaunch(&self) {
         let key = saved_input_key(&self.session.target.key());
-        if self.editor.text.is_empty() && self.input.sent.is_empty() {
+        let split = self.split_to_keep();
+        if self.editor.text.is_empty() && self.input.sent.is_empty() && split.is_none() {
             crate::native_gui::core::store::set_pref(&key, "");
             return;
         }
@@ -520,6 +521,7 @@ impl ClayView {
             cursor: self.editor.cursor,
             sent: self.input.sent.iter().map(|e| e.text.clone()).collect(),
             sent_rows: self.input.sent_rows,
+            split,
         };
         if let Ok(json) = serde_json::to_string(&saved) {
             crate::native_gui::core::store::set_pref(&key, &json);
@@ -541,6 +543,9 @@ impl ClayView {
         self.editor.cursor = cursor;
         self.input.sent = saved.sent.into_iter().map(crate::input::SentEntry::new).collect();
         self.input.sent_rows = saved.sent_rows;
+        if let Some(split) = saved.split {
+            self.split_restore(split);
+        }
     }
 
     /// `/server ...` (app.js sendCommand's remote-GUI branch): attach to another Clay,
@@ -1138,6 +1143,9 @@ struct SavedInput {
     cursor: usize,
     sent: Vec<String>,
     sent_rows: usize,
+    /// The split (`/split`), kept across the relaunch as every interface keeps it.
+    #[serde(default)]
+    split: Option<super::split::KeptSplit>,
 }
 
 /// How long a stash is taken back: a relaunch is seconds, a later start is not.
@@ -1170,10 +1178,15 @@ mod relaunch_tests {
     /// A relaunch's stash is taken back only while it is fresh, and round-trips as made.
     #[test]
     fn a_stashed_input_is_taken_back_only_while_fresh() {
-        let saved = SavedInput { at: 1000, text: "half typed".into(), cursor: 4, sent: vec!["look".into(), String::new()], sent_rows: 2 };
+        let split = Some(super::super::split::KeptSplit { world: "Rome".into(), on_top: true });
+        let saved = SavedInput { at: 1000, text: "half typed".into(), cursor: 4, sent: vec!["look".into(), String::new()], sent_rows: 2, split: split.clone() };
         let json = serde_json::to_string(&saved).unwrap();
         let back = saved_input_from(&json, 1000 + RELAUNCH_INPUT_SECS).expect("fresh");
         assert_eq!((back.text.as_str(), back.cursor, back.sent.len(), back.sent_rows), ("half typed", 4, 2, 2));
+        assert_eq!(back.split, split, "the split comes back");
+        // A stash from before splits had none.
+        let older = r#"{"at":1000,"text":"x","cursor":1,"sent":[],"sent_rows":0}"#;
+        assert_eq!(saved_input_from(older, 1000).expect("parses").split, None);
         assert!(saved_input_from(&json, 1000 + RELAUNCH_INPUT_SECS + 1).is_none(), "stale");
         assert!(saved_input_from("not json", 1000).is_none());
     }
