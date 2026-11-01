@@ -149,7 +149,8 @@ topic.`). For those, tick **Gag Text** (the box comes before its name) and type
 text from the reply: within 30 seconds of a Custom keepalive going out, a line holding
 that text is gagged too. Case and colour codes are ignored. The 30 seconds keep the same
 words from anything else later showing as normal. The marker is still gagged at any time
-when the command has `##rand##`.
+when the command has `##rand##`. A gagged reply is kept like any other gagged line: F2
+(Show Tags) shows it, in every interface.
 
 ### Other Settings
 

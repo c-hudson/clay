@@ -386,12 +386,13 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     Vec::new()
                 }
                 // A capture of the main window now, as well as the one at the end.
+                // The target window (`win:`; the main one until then) as a PNG.
                 "shot" => {
                     cx.run_until_parked();
-                    let _ = cx.update_window(window.into(), |_, w, app| {
+                    let _ = cx.update_window(target, |_, w, app| {
                         let _ = w.draw(app);
                     });
-                    match cx.capture_screenshot(window.into()) {
+                    match cx.capture_screenshot(target) {
                         Ok(image) => match image.save(arg) {
                             Ok(()) => println!("snapshot: {arg} ({}x{})", image.width(), image.height()),
                             Err(e) => fail(&format!("can't write {arg}: {e}")),

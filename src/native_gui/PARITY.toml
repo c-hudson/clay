@@ -2916,6 +2916,14 @@ feature = "Custom keepalive: the ##rand## warning under Keep Alive Cmd while it 
 note = "app.js updateKeepAliveWarning; telnet.rs KEEP_ALIVE_RAND_WARNING"
 
 [[item]]
+id = "ui:output.keep_alive_reply_under_f2"
+section = "output"
+phase = 4
+status = "done"
+feature = "The keepalive's gagged reply (the ###_idler_message_ marker) is kept and shown under F2 like any gagged line, as on the console"
+note = "client.rs on_server_data/line_from_ts set gagged on the marker, hidden_line hides escape-only lines only; app.js isKeepAliveMarker/lineGagged"
+
+[[item]]
 id = "ui:dialog.world_confirm"
 section = "dialogs"
 phase = 4

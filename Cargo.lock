@@ -1263,6 +1263,7 @@ dependencies = [
  "core-foundation-sys",
  "crossterm",
  "flate2",
+ "fontdb",
  "futures",
  "gdk",
  "getrandom 0.2.17",

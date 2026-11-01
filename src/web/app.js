@@ -1624,6 +1624,8 @@
     let fontEditSizeDesktop = 18;
     let webFontWeight = 400;
     let fontEditWeight = 400;
+    // The weights the font being edited comes in (measureFontWeights), [] until measured.
+    let fontEditWeights = [];
     let webFontLineHeight = 1.2;
     let webFontLetterSpacing = 0;
     let webFontWordSpacing = 0;
@@ -2104,6 +2106,112 @@
     }
 
     // Apply font family to the interface
+    // The standard weights and their names (font_profile.rs WEIGHT_NAMES): what the Weight
+    // stepper shows in place of the number.
+    const WEIGHT_NAMES = [[100, 'Thin'], [200, 'Extra Light'], [300, 'Light'], [400, 'Normal'], [500, 'Medium'], [600, 'Semi Bold'], [700, 'Bold'], [800, 'Extra Bold'], [900, 'Black']];
+    // What a font comes in when nothing says otherwise: regular and bold.
+    const DEFAULT_WEIGHTS = [400, 700];
+    function weightName(w) {
+        let best = WEIGHT_NAMES[3];
+        WEIGHT_NAMES.forEach(function(e) { if (Math.abs(e[0] - w) < Math.abs(best[0] - w)) best = e; });
+        return best[1];
+    }
+    // The face the browser draws for `wanted` from faces of `weights` (CSS Fonts 4 font
+    // matching; font_profile.rs css_weight_match).
+    function cssWeightMatch(wanted, weights) {
+        if (weights.indexOf(wanted) >= 0) return wanted;
+        const min = function(a) { return a.length ? Math.min.apply(null, a) : NaN; };
+        const max = function(a) { return a.length ? Math.max.apply(null, a) : NaN; };
+        const below = function() { return max(weights.filter(function(w) { return w < wanted; })); };
+        const above = function(from) { return min(weights.filter(function(w) { return w >= from; })); };
+        let found;
+        if (wanted >= 400 && wanted <= 500) {
+            found = min(weights.filter(function(w) { return w > wanted && w <= 500; }));
+            if (isNaN(found)) found = below();
+            if (isNaN(found)) found = above(wanted);
+        } else if (wanted < 400) {
+            found = below();
+            if (isNaN(found)) found = above(wanted);
+        } else {
+            found = above(wanted);
+            if (isNaN(found)) found = below();
+        }
+        return isNaN(found) ? wanted : found;
+    }
+    // The stepper's text: the name of the weight `w` draws among `available`, with the
+    // number only when two of the font's weights share a name (font_profile.rs weight_label).
+    function weightLabel(w, available) {
+        const avail = available.length ? available : DEFAULT_WEIGHTS;
+        const shown = cssWeightMatch(w, avail);
+        const name = weightName(shown);
+        return avail.filter(function(x) { return weightName(x) === name; }).length > 1 ? name + ' (' + shown + ')' : name;
+    }
+    // − and +: the previous or next weight of `available` after the one `w` draws
+    // (font_profile.rs step_weight); the ends stay put.
+    function stepWeight(w, available, up) {
+        const avail = available.length ? available : DEFAULT_WEIGHTS;
+        const i = Math.max(0, avail.indexOf(cssWeightMatch(w, avail)));
+        return avail[up ? Math.min(i + 1, avail.length - 1) : Math.max(i - 1, 0)];
+    }
+    // fontFamilyCss with var(--mono) resolved, for a canvas (which reads no CSS variables).
+    function resolvedFontFamily(name) {
+        const mono = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim() || 'monospace';
+        const css = fontFamilyCss(name);
+        return css ? css.replace('var(--mono)', mono) : mono;
+    }
+    // The weights a font draws differently here, found by drawing: a browser can't list a
+    // font's faces. The standard weights are drawn one by one and grouped by identical
+    // render; each group (one face, or one step of a variable font) is named by the weight
+    // in it nearest Normal or Bold. Cached per font; the bundled JetBrains Mono's faces load
+    // first, so the measure is of the font and not of the fallback drawn before it loads.
+    const fontWeightsCache = {};
+    function measureFontWeights(name) {
+        const key = name || '';
+        if (fontWeightsCache[key]) return Promise.resolve(fontWeightsCache[key]);
+        const family = resolvedFontFamily(name);
+        const sample = 'Hamburgefonstiv 0123';
+        const loads = WEIGHT_NAMES.map(function(e) {
+            try { return document.fonts.load(e[0] + ' 32px ' + family, sample).catch(function() { return []; }); } catch (err) { return Promise.resolve([]); }
+        });
+        return Promise.all(loads).then(function() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 480; canvas.height = 48;
+            const ctx = canvas.getContext('2d');
+            const renders = WEIGHT_NAMES.map(function(e) {
+                ctx.clearRect(0, 0, 480, 48);
+                ctx.font = e[0] + ' 32px ' + family;
+                ctx.fillStyle = '#000';
+                ctx.fillText(sample, 4, 36);
+                const d = ctx.getImageData(0, 0, 480, 48).data;
+                let h = 0, ink = 0;
+                for (let i = 3; i < d.length; i += 4) { h = (h * 31 + d[i]) | 0; ink += d[i]; }
+                return h + ':' + ink;
+            });
+            const groups = [];
+            WEIGHT_NAMES.forEach(function(e, i) {
+                if (i > 0 && renders[i] === renders[i - 1]) groups[groups.length - 1].push(e[0]);
+                else groups.push([e[0]]);
+            });
+            const list = groups.map(function(g) {
+                if (g.indexOf(400) >= 0) return 400;
+                if (g.indexOf(700) >= 0) return 700;
+                return g.reduce(function(a, b) { return Math.abs(b - 400) < Math.abs(a - 400) ? b : a; });
+            });
+            fontWeightsCache[key] = list;
+            return list;
+        }).catch(function() { return DEFAULT_WEIGHTS; });
+    }
+    // The Font tab's font changed: its weights, then the stepper's label once they are known.
+    function refreshFontWeights() {
+        fontEditWeights = fontWeightsCache[fontEditName || ''] || [];
+        measureFontWeights(fontEditName).then(function(list) {
+            if (list !== fontEditWeights) {
+                fontEditWeights = list;
+                updateFontPopupUI();
+            }
+        });
+    }
+
     function applyFontFamily(name) {
         fontName = name;
         const monoStyle = fontFamilyCss(name);
@@ -3946,6 +4054,9 @@
                 // capture and world-focus preservation below on every reconnect).
                 var priorWorldsByName = {};
                 var priorCurrentWorldName = (worlds[currentWorldIndex] && worlds[currentWorldIndex].name) || null;
+                // Looking at a world that hadn't connected either: a resync stays there
+                // (startWorldIndex).
+                var priorCurrentUnconnected = !!(worlds[currentWorldIndex] && !worlds[currentWorldIndex].was_connected);
                 var isResync = worlds.length > 0;
                 if (isResync) {
                     worlds.forEach((w) => {
@@ -3981,8 +4092,10 @@
                 // The URL-lock mechanism (lockedWorldName, checked further down) still
                 // force-switches after this and takes final precedence regardless.
                 var resolvedWorldIndex = -1;
+                var keepUnconnected = false;
                 if (isResync && priorCurrentWorldName) {
                     resolvedWorldIndex = worlds.findIndex((w) => w.name === priorCurrentWorldName);
+                    keepUnconnected = resolvedWorldIndex >= 0 && priorCurrentUnconnected;
                 }
                 if (resolvedWorldIndex < 0) {
                     var persistedWorldName = null;
@@ -4007,7 +4120,7 @@
                 if (resolvedWorldIndex < 0 || resolvedWorldIndex >= worlds.length) {
                     resolvedWorldIndex = 0;
                 }
-                currentWorldIndex = resolvedWorldIndex;
+                currentWorldIndex = startWorldIndex(worlds, resolvedWorldIndex, msg.current_world_index, keepUnconnected);
 
                 actions = msg.actions || [];
                 // Emoji picker dataset (EMOJI-PICKER-ROADMAP.md Step 6/7): sent once as
@@ -4886,10 +4999,10 @@
                             if (line.length > 0 && line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0) {
                                 return;
                             }
-                            // Filter out keep-alive idler message lines
-                            if (line.includes('###_idler_message_') && line.includes('_###')) {
-                                return;
-                            }
+                            // The keepalive's reply is a gagged line (the server sends it so;
+                            // an older one might not): kept, drawn only under F2, as on the
+                            // console. It used to be dropped here, so F2 never showed it.
+                            const lineGagged = !!msg.gagged || isKeepAliveMarker(line);
                             // Grep mode: skip non-matching lines
                             // Match against displayed text (strip ANSI codes AND MUD tags)
                             if (grepRegex) {
@@ -4924,7 +5037,7 @@
                             // instead of guessing every line is unviewed - without it, lines
                             // that arrived while the console (or another client) was watching
                             // would be optimistically marked ▶ and then taken back.
-                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false, highlight_color: lineHighlight, viewed: !!msg.is_viewed, archive_sourced: !!msg.archive_sourced };
+                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: lineGagged, highlight_color: lineHighlight, viewed: !!msg.is_viewed, archive_sourced: !!msg.archive_sourced };
 
                             if (isGapFill) {
                                 // This batch fills a historical hole, not the tail — collect it
@@ -4964,7 +5077,7 @@
                             const lineMarkedNew = onScreen && lineIsNew(lineObj, world);
                             // Gagged lines are stored but not rendered (only visible with F2)
                             // They bypass more-mode entirely
-                            if (msg.gagged) {
+                            if (lineGagged) {
                                 // Not counted for more-mode; drawn only with F2 (as a full render does)
                                 if (onScreen && showTags) appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
                             } else if (!hasRealSeq && isFromServer) {
@@ -7008,6 +7121,18 @@
     // still wrapped in try/catch since storage can be unavailable or full and that
     // must never break the app.
     let lastPersistedWorldName = null;
+    // The world InitialState opens on: `picked`, unless it hasn't connected since the Clay
+    // this page talks to started (nothing to show, no name for the bar - it looked like a
+    // broken page, user report 2026-11-01: a browser came back to its last world after Clay
+    // had restarted without it) and `keepUnconnected` is false; then the server's current
+    // world, else the first one that has connected. client.rs start_world is the same rule.
+    function startWorldIndex(list, picked, serverCurrent, keepUnconnected) {
+        const connected = (i) => !!(list[i] && list[i].was_connected);
+        if (connected(picked) || keepUnconnected) return picked;
+        if (connected(serverCurrent)) return serverCurrent;
+        const any = list.findIndex((w) => w && w.was_connected);
+        return any >= 0 ? any : picked;
+    }
     function lastWorldStorageKey() {
         return 'clay_last_world_' + getServerIdentity();
     }
@@ -9616,8 +9741,10 @@
             '  Only fonts on this device are listed. System Default',
             '  is the JetBrains Mono that comes with Clay, then the',
             '  system monospace font for anything it lacks.', '',
-            'Weight: from thin to bold, in steps of 50 (400 is',
-            '  normal).', '',
+            'Weight: the weights the chosen font comes in, by name',
+            '  (Thin to Black). The JetBrains Mono that comes with',
+            '  Clay has Thin to Extra Bold; most system fonts,',
+            '  monospace among them, have only Normal and Bold.', '',
             'Phone / Tablet / Desktop: the font size (7-20) on',
             '  each kind of device. The one in use follows the',
             '  device; in the web client, hold the menu button for',
@@ -10223,10 +10350,17 @@
     // keep-alive marker: never drawn, on any path. The live path drops these on arrival; one
     // that comes back through InitialState, a scrollback load or a resync is kept (its seq is
     // real) and hidden here instead, rather than drawn as a blank row.
+    // A line never drawn, F2 or not: one that is only escape codes. The keepalive's reply is
+    // not one of these: it is a gagged line, shown under F2 like any other (it used to be
+    // hidden here for good).
     function isFillerLine(text) {
         const line = String(text).replace(/[\r\n]+/g, '');
-        if (line.length > 0 && line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0) return true;
-        return line.includes('###_idler_message_') && line.includes('_###');
+        return line.length > 0 && line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0;
+    }
+
+    // The MUD's reply to a keepalive holding its marker (telnet.rs has_keep_alive_marker).
+    function isKeepAliveMarker(text) {
+        return text.includes('###_idler_message_') && text.includes('_###');
     }
 
     // Whether a stored line is drawn right now. One decision for a full render and a live
@@ -14969,6 +15103,7 @@
                 : 'Fonts for ' + fontProfileLabel(fontProfileKey) + ' (each program keeps its own on each OS).';
         }
         fontEditName = fontName;
+        refreshFontWeights();
         fontEditSizePhone = Math.round(webFontSizePhone);
         fontEditSizeTablet = Math.round(webFontSizeTablet);
         fontEditSizeDesktop = Math.round(webFontSizeDesktop);
@@ -15588,7 +15723,8 @@
                     el.classList.remove('selected');
                 });
                 item.classList.add('selected');
-                previewFontEdit();
+                refreshFontWeights();
+                updateFontPopupUI();
             });
             list.appendChild(item);
         });
@@ -15603,7 +15739,7 @@
         elements.fontPhoneValue.textContent = fontEditSizePhone;
         elements.fontTabletValue.textContent = fontEditSizeTablet;
         elements.fontDesktopValue.textContent = fontEditSizeDesktop;
-        elements.fontWeightValue.textContent = fontEditWeight;
+        elements.fontWeightValue.textContent = weightLabel(fontEditWeight, fontEditWeights);
         if (elements.fontLineheightValue) elements.fontLineheightValue.textContent = fontEditLineHeight.toFixed(1);
         if (elements.fontLetterspacingValue) elements.fontLetterspacingValue.textContent = fontEditLetterSpacing.toFixed(1);
         if (elements.fontWordspacingValue) elements.fontWordspacingValue.textContent = fontEditWordSpacing.toFixed(1);
@@ -20559,11 +20695,11 @@
         // Font popup
         // Font close/cancel/save handled by unified settings buttons
         elements.fontWeightMinus.onclick = function() {
-            fontEditWeight = Math.max(1, fontEditWeight - 50);
+            fontEditWeight = stepWeight(fontEditWeight, fontEditWeights, false);
             updateFontPopupUI();
         };
         elements.fontWeightPlus.onclick = function() {
-            fontEditWeight = Math.min(900, fontEditWeight + 50);
+            fontEditWeight = stepWeight(fontEditWeight, fontEditWeights, true);
             updateFontPopupUI();
         };
         elements.fontPhoneMinus.onclick = function() {

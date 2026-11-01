@@ -33,7 +33,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::emoji::{self, Look};
-use super::fonts::{FontClass, Fonts, bundled_index, class_of};
+use super::fonts::{FontClass, Fonts, class_of};
 use super::ink;
 use crate::native_gui::core::style::{Cell, DiscordEmoji, GlyphFit, Rgb, Run, StyledLine, glyph_fit, glyph_fit_candidate};
 use crate::native_gui::core::wrap::{rows_in_columns, wrap_rows};
@@ -358,9 +358,10 @@ pub struct Prepared {
     content: Bounds<Pixels>,
     /// Each laid-out line's id, parallel to `lines`.
     ids: Vec<u64>,
-    /// The bundled faces' font ids, by [`bundled_index`]: glyphs whose outlines `ink` can
+    /// The primary font's ids, regular, bold, italic and bold italic, each with the
+    /// [`BUNDLED`](super::fonts::BUNDLED) face it draws: glyphs whose outlines `ink` can
     /// read.
-    bundled: [FontId; 4],
+    bundled: [(FontId, usize); 4],
     /// The scroll bar's thumb: top and height, when there's anything to scroll.
     thumb: Option<(f32, f32)>,
 }
@@ -878,9 +879,10 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         .collect();
 
     let ts = window.text_system();
-    let bundled = [(false, false), (true, false), (false, true), (true, true)]
-        .map(|(b, i)| ts.resolve_font(&snapshot.fonts.font(FontClass::Primary, b, i)));
-    debug_assert!((0..4).all(|k| bundled_index(k & 1 == 1, k & 2 == 2) == k));
+    let bundled = [(false, false), (true, false), (false, true), (true, true)].map(|(b, i)| {
+        let fonts = &snapshot.fonts;
+        (ts.resolve_font(&fonts.font(FontClass::Primary, b, i)), fonts.bundled_face(b, i))
+    });
     Prepared { snapshot, metrics, lines, rows, content, ids, bundled, thumb, frames, reveal_next }
 }
 
@@ -1098,7 +1100,7 @@ fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App
                             window.paint_glyph(origin, run.font_id, g.id, size, hsla(color_at(i)))
                         };
                         if !g.is_emoji && style_at(i).1 {
-                            if let Some(face) = p.bundled.iter().position(|f| *f == run.font_id) {
+                            if let Some(&(_, face)) = p.bundled.iter().find(|(f, _)| *f == run.font_id) {
                                 underline_gaps(&mut gaps, &ul, face, g.id.0, f32::from(origin.x), f32::from(g.position.y));
                             }
                         }

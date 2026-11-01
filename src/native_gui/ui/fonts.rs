@@ -39,6 +39,8 @@ pub struct Fonts {
     pub user: Option<SharedString>,
     /// `web_font_weight`: the weight of text that isn't bold.
     pub weight: u16,
+    /// The weights the user's font comes in (`weights_of`), empty without one.
+    pub user_weights: Vec<u16>,
     /// The fonts installed here, to check `font_name` against.
     installed: std::sync::Arc<Vec<String>>,
 }
@@ -73,25 +75,46 @@ impl Fonts {
             n => self.installed.iter().find(|i| i.eq_ignore_ascii_case(n)).map(|i| i.clone().into()),
         };
         let changed = user != self.user || weight != self.weight;
+        self.user_weights = if user.is_some() { weights_of(name) } else { Vec::new() };
         self.user = user;
         self.weight = weight;
         changed
     }
 
     pub fn font(&self, class: FontClass, bold: bool, italic: bool) -> Font {
-        let family = match class {
-            FontClass::Primary => self.primary.clone(),
-            FontClass::Text => self.fallback.clone(),
-            FontClass::Emoji => return font(self.emoji.clone()),
-            FontClass::User => self.user.clone().unwrap_or_else(|| self.primary.clone()),
+        let (family, bundled) = match (class, &self.user) {
+            (FontClass::Emoji, _) => return font(self.emoji.clone()),
+            (FontClass::Text, _) => (self.fallback.clone(), false),
+            (FontClass::User, Some(user)) => (user.clone(), false),
+            (FontClass::Primary | FontClass::User, _) => (self.primary.clone(), true),
         };
         let mut f = font(family);
         // `.ansi-bold` is `font-weight: bold`, 700 whatever the base weight.
-        f.weight = if bold { FontWeight::BOLD } else { FontWeight(self.weight as f32) };
+        let weight = if bold {
+            700
+        } else if bundled {
+            self.primary_weight()
+        } else if class == FontClass::User && !self.user_weights.is_empty() {
+            // A weight the font has, so the matcher picks the face the picker named.
+            crate::font_profile::css_weight_match(self.weight, &self.user_weights)
+        } else {
+            self.weight
+        };
+        f.weight = FontWeight(weight as f32);
         if italic {
             f.style = FontStyle::Italic;
         }
         f
+    }
+
+    /// The bundled face's weight that draws text of `weight` (one it has).
+    fn primary_weight(&self) -> u16 {
+        crate::font_profile::css_weight_match(self.weight, &BUNDLED_WEIGHTS)
+    }
+
+    /// Which of [`BUNDLED`] draws the primary font, for reading its outlines.
+    pub fn bundled_face(&self, bold: bool, italic: bool) -> usize {
+        bundled_index(if bold { 700 } else { self.primary_weight() }, italic)
     }
 }
 
@@ -136,13 +159,35 @@ fn presents_as_emoji(cluster: &str) -> bool {
     )
 }
 
-/// Register the bundled fonts and work out the fallback, once at startup.
-/// The bundled JetBrains Mono NL faces, indexed by [`bundled_index`].
-pub const BUNDLED: [&[u8]; 4] = [
-    include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Regular.ttf"),
-    include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Bold.ttf"),
-    include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-Italic.ttf"),
-    include_bytes!("../../../assets/native-gui/fonts/JetBrainsMonoNL-BoldItalic.ttf"),
+/// The weights JetBrains Mono NL comes in. The web's JetBrains Mono is one variable font
+/// covering 100-800; GPUI draws no variation axis, so here each weight is a face of its own.
+pub const BUNDLED_WEIGHTS: [u16; 8] = [100, 200, 300, 400, 500, 600, 700, 800];
+
+macro_rules! jetbrains {
+    ($face:literal) => {
+        include_bytes!(concat!("../../../assets/native-gui/fonts/JetBrainsMonoNL-", $face, ".ttf"))
+    };
+}
+
+/// The bundled JetBrains Mono NL faces, upright then italic for each of
+/// [`BUNDLED_WEIGHTS`], indexed by [`bundled_index`].
+pub const BUNDLED: [&[u8]; 16] = [
+    jetbrains!("Thin"),
+    jetbrains!("ThinItalic"),
+    jetbrains!("ExtraLight"),
+    jetbrains!("ExtraLightItalic"),
+    jetbrains!("Light"),
+    jetbrains!("LightItalic"),
+    jetbrains!("Regular"),
+    jetbrains!("Italic"),
+    jetbrains!("Medium"),
+    jetbrains!("MediumItalic"),
+    jetbrains!("SemiBold"),
+    jetbrains!("SemiBoldItalic"),
+    jetbrains!("Bold"),
+    jetbrains!("BoldItalic"),
+    jetbrains!("ExtraBold"),
+    jetbrains!("ExtraBoldItalic"),
 ];
 
 /// Nunito Regular and Bold (the web bundles it as a variable font; the weights it uses
@@ -152,12 +197,16 @@ const UI_FONTS: [&[u8]; 2] = [
     include_bytes!("../../../assets/native-gui/fonts/Nunito-Bold.ttf"),
 ];
 
-/// Which of [`BUNDLED`] is the primary font in this weight and style.
-pub fn bundled_index(bold: bool, italic: bool) -> usize {
-    bold as usize + 2 * italic as usize
+/// Which of [`BUNDLED`] draws the primary font at this weight (one of
+/// [`BUNDLED_WEIGHTS`]) and style.
+pub fn bundled_index(weight: u16, italic: bool) -> usize {
+    let step = BUNDLED_WEIGHTS.iter().position(|w| *w == weight).unwrap_or(3);
+    2 * step + italic as usize
 }
 
+/// Register the bundled fonts and work out the fallback, once at startup.
 pub fn load(cx: &mut App) -> Fonts {
+    warm_font_db();
     let bundled: Vec<Cow<'static, [u8]>> = BUNDLED.iter().chain(UI_FONTS.iter()).map(|b| Cow::Borrowed(*b)).collect();
     if let Err(e) = cx.text_system().add_fonts(bundled) {
         crate::debug_log(true, &format!("native-gui: bundled fonts failed to load: {e}"));
@@ -175,8 +224,49 @@ pub fn load(cx: &mut App) -> Fonts {
         ui: UI_FAMILY.into(),
         user: None,
         weight: 400,
+        user_weights: Vec::new(),
         installed: std::sync::Arc::new(installed),
     }
+}
+
+/// The system's fonts, by face: which weights each family comes in. Loaded once, on a
+/// thread at start (`warm_font_db`) or at first use; a few hundred name tables, well under
+/// a second.
+fn font_db() -> &'static fontdb::Database {
+    static DB: std::sync::OnceLock<fontdb::Database> = std::sync::OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        db
+    })
+}
+
+fn warm_font_db() {
+    std::thread::spawn(|| {
+        let _ = font_db();
+    });
+}
+
+/// The weights the `font_name` setting's font comes in here, upright, in order: the
+/// bundled JetBrains Mono's for the default, else the faces the system has for the family
+/// (a variable font is one face, drawn at its default: GPUI applies no weight axis), else
+/// `font_profile::DEFAULT_WEIGHTS` (regular and bold, what most fonts have). The Weight
+/// picker steps through these and names them.
+pub fn weights_of(name: &str) -> Vec<u16> {
+    let family = match name.trim() {
+        "" => return BUNDLED_WEIGHTS.to_vec(),
+        n if n.eq_ignore_ascii_case("JetBrains Mono") => return BUNDLED_WEIGHTS.to_vec(),
+        n if n.eq_ignore_ascii_case("monospace") || n.eq_ignore_ascii_case("ui-monospace") => system_monospace(),
+        n => n.to_string(),
+    };
+    let mut weights: Vec<u16> = font_db()
+        .faces()
+        .filter(|f| f.style == fontdb::Style::Normal && f.families.iter().any(|(fam, _)| fam.eq_ignore_ascii_case(&family)))
+        .map(|f| f.weight.0)
+        .collect();
+    weights.sort_unstable();
+    weights.dedup();
+    if weights.is_empty() { crate::font_profile::DEFAULT_WEIGHTS.to_vec() } else { weights }
 }
 
 /// The colour emoji font browsers use on this platform.
@@ -253,6 +343,32 @@ mod tests {
         assert_eq!(class_of("🟥"), FontClass::Emoji);
         assert_eq!(class_of("a"), FontClass::Primary);
         assert_eq!(class_of("─"), FontClass::Text);
+    }
+
+    #[test]
+    fn the_weights_a_font_comes_in() {
+        assert_eq!(weights_of(""), BUNDLED_WEIGHTS.to_vec());
+        assert_eq!(weights_of("jetbrains mono"), BUNDLED_WEIGHTS.to_vec());
+        assert_eq!(weights_of("No Such Font Zzz"), crate::font_profile::DEFAULT_WEIGHTS.to_vec());
+        // A system font with regular and bold faces, where this machine has it.
+        if font_db().faces().any(|f| f.families.iter().any(|(n, _)| n == "DejaVu Sans Mono")) {
+            assert_eq!(weights_of("DejaVu Sans Mono"), vec![400, 700]);
+        }
+    }
+
+    #[test]
+    fn each_bundled_face_has_its_weight_and_style() {
+        for (k, data) in BUNDLED.iter().enumerate() {
+            let face = ttf_parser::Face::parse(data, 0).unwrap();
+            let weight = BUNDLED_WEIGHTS[k / 2];
+            assert_eq!(face.weight().to_number(), weight, "face {k}");
+            assert_eq!(face.is_italic(), k % 2 == 1, "face {k}");
+            assert_eq!(bundled_index(weight, k % 2 == 1), k);
+            // One family, so a font asked for by name reaches every weight.
+            let name = |id| face.names().into_iter().filter(|n| n.name_id == id).find_map(|n| n.to_string());
+            let family = name(ttf_parser::name_id::TYPOGRAPHIC_FAMILY).or_else(|| name(ttf_parser::name_id::FAMILY));
+            assert_eq!(family.as_deref(), Some(PRIMARY_FAMILY), "face {k}");
+        }
     }
 
     #[test]

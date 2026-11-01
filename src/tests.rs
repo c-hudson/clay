@@ -22126,6 +22126,46 @@ fn the_web_settings_show_only_this_interfaces_rows() {
     assert!(html.contains("id=\"setup-taskbar-alert-toggle\""));
 }
 
+/// The web page opens on a world that has connected (app.js startWorldIndex, the native
+/// core's start_world): its remembered world otherwise came back blank and unnamed.
+#[test]
+fn the_web_page_opens_on_a_connected_world() {
+    let js = include_str!("web/app.js");
+    assert!(js.contains("currentWorldIndex = startWorldIndex(worlds, resolvedWorldIndex, msg.current_world_index, keepUnconnected);"));
+    assert!(js.contains("if (connected(picked) || keepUnconnected) return picked;"));
+    assert!(js.contains("if (connected(serverCurrent)) return serverCurrent;"));
+    assert!(js.contains("keepUnconnected = resolvedWorldIndex >= 0 && priorCurrentUnconnected;"));
+}
+
+/// The web page's Weight stepper names the standard weights as font_profile.rs does.
+#[test]
+fn the_web_page_names_font_weights_as_the_server_does() {
+    let js = include_str!("web/app.js");
+    let names: Vec<String> = crate::font_profile::WEIGHT_NAMES.iter().map(|(w, n)| format!("[{w}, '{n}']")).collect();
+    assert!(js.contains(&format!("const WEIGHT_NAMES = [{}];", names.join(", "))));
+    let defaults: Vec<String> = crate::font_profile::DEFAULT_WEIGHTS.iter().map(|w| w.to_string()).collect();
+    assert!(js.contains(&format!("const DEFAULT_WEIGHTS = [{}];", defaults.join(", "))));
+    assert!(js.contains("fontEditWeight = stepWeight(fontEditWeight, fontEditWeights, true);"));
+    assert!(js.contains("elements.fontWeightValue.textContent = weightLabel(fontEditWeight, fontEditWeights);"));
+}
+
+/// The web page keeps the keepalive's reply as a gagged line (shown under F2, as on the
+/// console) rather than dropping it on arrival as it used to; its marker test is
+/// `telnet::has_keep_alive_marker`'s.
+#[test]
+fn the_web_page_keeps_the_keepalives_reply_as_a_gagged_line() {
+    let js = include_str!("web/app.js");
+    let marker = crate::telnet::keep_alive_marker(7);
+    assert!(crate::telnet::has_keep_alive_marker(&marker));
+    assert!(js.contains("function isKeepAliveMarker(text) {\n        return text.includes('###_idler_message_') && text.includes('_###');\n    }"));
+    assert!(js.contains("const lineGagged = !!msg.gagged || isKeepAliveMarker(line);"));
+    assert!(js.contains("gagged: lineGagged,"));
+    assert!(js.contains("if (lineGagged) {"));
+    assert!(!js.contains("Filter out keep-alive idler message lines"), "the reply is no longer dropped on arrival");
+    // The one filler rule left: escape-only lines.
+    assert!(!js.contains("return line.includes('###_idler_message_')"), "isFillerLine no longer hides the reply");
+}
+
 /// The web world editor's Keep Alive rows: the warning's text is the console's and native
 /// GUI's, it follows the command as it is typed, and Save sends the Gag fields.
 #[test]

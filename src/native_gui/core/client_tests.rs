@@ -266,15 +266,41 @@ fn a_repeated_batch_is_dropped_and_reported() {
 
 #[test]
 fn every_line_is_kept_and_the_unshown_ones_are_marked_for_display() {
-    // An escape-only line and an idler marker are never shown, but they are kept (so the
-    // buffer matches the server's) and their seqs are recorded like any other.
+    // An escape-only line is never shown, and the keepalive's reply is gagged (shown under
+    // F2 only), but both are kept (so the buffer matches the server's) and their seqs are
+    // recorded like any other.
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
     h.msg(data(0, 1, "a\n\x1b[0m\n###_idler_message_x_###\n\nb\n"));
     assert_eq!(h.texts(0), vec!["line 0", "a", "\x1b[0m", "###_idler_message_x_###", "", "b"]);
-    let shown: Vec<String> = h.texts(0).into_iter().filter(|t| !hidden_line(t)).collect();
+    let shown: Vec<String> = h.core.worlds[0].lines.iter().filter(|l| !l.gagged && !hidden_line(&l.text)).map(|l| l.text.clone()).collect();
     assert_eq!(shown, vec!["line 0", "a", "", "b"], "blank lines show");
+    let gagged: Vec<String> = h.core.worlds[0].lines.iter().filter(|l| l.gagged).map(|l| l.text.clone()).collect();
+    assert_eq!(gagged, vec!["###_idler_message_x_###"], "the reply is gagged, not hidden for good");
+    assert!(!hidden_line("###_idler_message_x_###"), "F2 shows it");
     assert_eq!(h.core.worlds[0].seen.ranges(), &[(0, 5)]);
+}
+
+#[test]
+fn the_keepalives_gagged_reply_is_kept_from_a_connect_and_live() {
+    // The server sends the reply gagged, in InitialState and as it arrives; the GUI keeps
+    // both as gagged lines, so only F2 decides whether they show (user report 2026-11-01:
+    // the GUI never showed them).
+    let mut h = H::password();
+    let mut w = world_msg(0, "A", 0..3, 9);
+    w.output_lines_ts[1].text = "No help on '###_idler_message_4_###'.".into();
+    w.output_lines_ts[1].gagged = true;
+    h.connect_and_login().initial(vec![w]);
+    let mut live = data(0, 3, "Huh? '###_idler_message_5_###'\n");
+    if let WsMessage::ServerData { gagged, .. } = &mut live {
+        *gagged = true;
+    }
+    h.msg(live);
+    h.msg(data(0, 4, "after\n"));
+    let lines = &h.core.worlds[0].lines;
+    let flags: Vec<(u64, bool)> = lines.iter().map(|l| (l.seq.unwrap(), l.gagged)).collect();
+    assert_eq!(flags, vec![(0, false), (1, true), (2, false), (3, true), (4, false)]);
+    assert!(lines.iter().all(|l| !hidden_line(&l.text)), "nothing is hidden for good");
 }
 
 #[test]
@@ -1015,6 +1041,48 @@ fn the_world_last_shown_wins_over_the_servers_current_one() {
     h.core.prefer_world(Some("Gone".into()));
     h.connect_and_login();
     h.initial(vec![world_msg(0, "A", 0..2, 1), world_msg(1, "B", 0..2, 2)]);
+    assert_eq!(h.core.current, 0);
+}
+
+/// A remembered world that hasn't connected since the server started is blank and has no
+/// name for the bar: a cold start opens on one that has connected instead (user report
+/// 2026-11-01). A resync stays on an unconnected world the window was already showing, but
+/// leaves one that has stopped being connected since (the server restarted without it).
+#[test]
+fn a_remembered_world_that_never_connected_is_not_where_a_start_opens() {
+    let connected = |i: usize, name: &str| {
+        let mut w = world_msg(i, name, 0..2, i as u64 + 1);
+        w.was_connected = true;
+        w
+    };
+    // Cold start: B remembered but never connected; the server's current world (A) has.
+    let mut h = H::password();
+    h.core.prefer_world(Some("B".into()));
+    h.connect_and_login();
+    h.initial(vec![connected(0, "A"), world_msg(1, "B", 0..2, 2)]);
+    assert_eq!(h.core.current, 0, "the server's current world");
+    // Neither has: the first world that has connected.
+    let mut h = H::password();
+    h.core.prefer_world(Some("B".into()));
+    h.connect_and_login();
+    h.initial(vec![world_msg(0, "A", 0..2, 1), world_msg(1, "B", 0..2, 2), connected(2, "C")]);
+    assert_eq!(h.core.current, 2, "the first one that has connected");
+    // Nothing has connected: the remembered world stands.
+    let mut h = H::password();
+    h.core.prefer_world(Some("B".into()));
+    h.connect_and_login();
+    h.initial(vec![world_msg(0, "A", 0..2, 1), world_msg(1, "B", 0..2, 2)]);
+    assert_eq!(h.core.current, 1);
+    // A resync while showing an unconnected world stays on it.
+    h.initial(vec![connected(0, "A"), world_msg(1, "B", 0..2, 2)]);
+    assert_eq!(h.core.current, 1, "the window was already showing it");
+    // Showing a connected world that the server no longer has connected (it restarted
+    // without it): another that has.
+    let mut h = H::password();
+    h.connect_and_login();
+    h.initial(vec![world_msg(0, "A", 0..2, 1), connected(1, "B")]);
+    h.core.current = 1;
+    h.initial(vec![connected(0, "A"), world_msg(1, "B", 0..2, 2)]);
     assert_eq!(h.core.current, 0);
 }
 

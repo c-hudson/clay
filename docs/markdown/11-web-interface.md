@@ -76,8 +76,10 @@ Emoji Picker again. Unplug either one and the phone or tablet layout comes back.
 phone or tablet font size and input height stay as they were, and dialogs keep the
 layout that fits the screen.
 
-Settings → Font sets the font, its size per device type and its weight. Under
-**Advanced**: **Input Ht** is the line height of the input line (the output's rows stay
+Settings → Font sets the font, its size per device type and its weight. **Weight** steps
+through the weights the chosen font comes in, by name: the JetBrains Mono that comes with
+Clay goes from Thin to Extra Bold, while most system fonts, `monospace` among them, have
+only Normal and Bold. Under **Advanced**: **Input Ht** is the line height of the input line (the output's rows stay
 at 1.0, so ANSI and box-drawing art joins up), **Letter** and **Word** add spacing to the
 output and the input. The desktop GUI's Settings window has the same controls.
 

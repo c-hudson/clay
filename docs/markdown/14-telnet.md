@@ -290,7 +290,8 @@ help ##rand##
 reply holding it is gagged. Without `##rand##` the command is sent as typed and nothing is
 gagged; the world editor warns about it. For a MUD whose reply doesn't repeat the command,
 tick **Gag Text** and give text from the reply: a line holding it within 30 seconds
-of the keepalive is gagged as well (case and colour codes ignored). See
+of the keepalive is gagged as well (case and colour codes ignored). A gagged reply is
+kept, not dropped: F2 (Show Tags) shows it, in every interface. See
 [Settings](08-settings.md#keep-alive-settings).
 
 The generic option sends a command that:

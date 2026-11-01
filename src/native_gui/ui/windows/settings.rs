@@ -382,6 +382,12 @@ impl SettingsView {
     }
 
     /// Show the font and Transparency as edited.
+    /// Weight's − and +: the previous or next weight the chosen font comes in.
+    fn step_weight(&mut self, up: bool) {
+        let weights = crate::native_gui::ui::fonts::weights_of(&self.edit.font_name);
+        self.edit.web_font_weight = crate::font_profile::step_weight(self.edit.web_font_weight, &weights, up);
+    }
+
     fn preview(&self, cx: &mut Context<Self>) {
         let mut edit = self.edit.clone();
         let font = edit.shared_font();
@@ -523,7 +529,9 @@ impl SettingsView {
             .items_center()
             .gap(px(10.0))
             .child(btn((id, 0), "−", minus, cx))
-            .child(div().min_w(px(28.0)).h(px(20.0)).px(px(4.0)).flex().items_center().justify_center().rounded(px(3.0)).bg(k.field_bg).text_size(px(12.0)).child(value))
+            // A word (the weight's name) gets room for the longest, so + stays put as the
+            // word changes; a number keeps the narrow box.
+            .child(div().min_w(px(if value.parse::<f64>().is_ok() { 28.0 } else { 84.0 })).h(px(20.0)).px(px(4.0)).flex().items_center().justify_center().rounded(px(3.0)).bg(k.field_bg).text_size(px(12.0)).child(value))
             .child(btn((id, 1), "+", plus, cx))
             .into_any_element()
     }
@@ -666,6 +674,8 @@ impl SettingsView {
         });
         let num = |v: f32| format!("{v:.1}");
         let advanced = self.advanced;
+        // The weight by name, among the weights this font comes in (the stepper walks them).
+        let weight_label = crate::font_profile::weight_label(e.web_font_weight, &crate::native_gui::ui::fonts::weights_of(&e.font_name));
         // Whose fonts these are, then three cards: the family, the sizes, the advanced spacing.
         div()
             .flex()
@@ -685,7 +695,7 @@ impl SettingsView {
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
-                    .child(row(k, "Weight", self.stepper(k, "font-weight", e.web_font_weight.to_string(), |v| v.edit.web_font_weight = v.edit.web_font_weight.saturating_sub(50).max(1), |v| v.edit.web_font_weight = (v.edit.web_font_weight + 50).min(900), cx)))
+                    .child(row(k, "Weight", self.stepper(k, "font-weight", weight_label, |v| v.step_weight(false), |v| v.step_weight(true), cx)))
                     // This GUI is a desktop: the phone and tablet sizes are the web page's.
                     .child(row(k, "Desktop", self.stepper(k, "font-desktop", (e.web_font_size_desktop.round() as i32).to_string(), |v| v.edit.web_font_size_desktop = (v.edit.web_font_size_desktop.round() - 1.0).max(7.0), |v| v.edit.web_font_size_desktop = (v.edit.web_font_size_desktop.round() + 1.0).min(20.0), cx))),
             )

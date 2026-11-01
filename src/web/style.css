@@ -1,12 +1,12 @@
 /* Clay MUD Client Web Interface - Redesign */
 
-/* Bundled fonts — latin subset only, variable weight 400-700 */
+/* Bundled fonts — latin subset only; JetBrains Mono is variable, weight 100-800 */
 @font-face {
     font-family: 'JetBrains Mono';
     font-style: normal;
-    font-weight: 100 700;
+    font-weight: 100 800;
     font-display: swap;
-    src: url('fonts/jetbrains-mono-latin-400.woff2') format('woff2');
+    src: url('fonts/jetbrains-mono-latin-wght.woff2') format('woff2');
     unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
@@ -3755,6 +3755,14 @@ body.device-phone .settings-two-column > .settings-column:first-child {
     color: var(--text-color);
     font-size: 12px;
 }
+/* The weight's name (Thin ... Extra Bold): room for the longest, so + stays put. */
+#font-weight-value {
+    width: auto;
+    min-width: 84px;
+    padding: 0 4px;
+    white-space: nowrap;
+}
+
 
 /* Slider container */
 .slider-container {

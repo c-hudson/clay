@@ -149,7 +149,7 @@ pub(crate) fn internal_command_names() -> &'static [String] {
 
 /// Bundled fonts (latin subset, variable weight)
 /// (also served by the desktop GUI's clay:// handler, webview_gui.rs)
-pub(crate) const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("web/fonts/jetbrains-mono-latin-400.woff2");
+pub(crate) const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("web/fonts/jetbrains-mono-latin-wght.woff2");
 pub(crate) const FONT_NUNITO: &[u8] = include_bytes!("web/fonts/nunito-latin-400.woff2");
 
 /// Clay logo image. Same source `webview_gui.rs` embeds for the native desktop GUI's
@@ -362,7 +362,7 @@ enum RouteDecision {
 const KNOWN_ASSET_PATHS: &[&str] = &[
     "/", "/index.html", "/style.css", "/app.js", "/theme-editor",
     "/keybind-editor", "/action-editor",
-    "/fonts/jetbrains-mono-latin-400.woff2", "/fonts/nunito-latin-400.woff2",
+    "/fonts/jetbrains-mono-latin-wght.woff2", "/fonts/nunito-latin-400.woff2",
     "/favicon.ico", "/clay2.png",
 ];
 
@@ -601,7 +601,7 @@ fn handle_http_routes(
                 .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
             RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
         }
-        "/fonts/jetbrains-mono-latin-400.woff2" => {
+        "/fonts/jetbrains-mono-latin-wght.woff2" => {
             RouteResult::Ok(build_binary_http_response(200, "OK", "font/woff2", FONT_JETBRAINS_MONO, is_https))
         }
         "/fonts/nunito-latin-400.woff2" => {

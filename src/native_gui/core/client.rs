@@ -1561,7 +1561,7 @@ impl ClientCore {
     fn line_from_ts(&mut self, t: &TimestampedLine) -> Line {
         let mut l = self.new_line(&t.text, t.ts, Some(t.seq));
         l.from_server = t.from_server;
-        l.gagged = t.gagged;
+        l.gagged = t.gagged || crate::telnet::has_keep_alive_marker(&t.text);
         l.highlight = t.highlight_color.clone();
         l.viewed = t.viewed;
         l.display_id = t.display_id;
@@ -1630,7 +1630,11 @@ impl ClientCore {
         now: Instant,
     ) {
         self.display_id = your_display_id;
-        let shown_name = self.worlds.get(self.current).map(|w| w.name.clone()).or_else(|| self.preferred_world.clone());
+        // The world shown a moment ago (a reconnect), else the one remembered from last time.
+        let shown = self.worlds.get(self.current).map(|w| (w.name.clone(), w.was_connected));
+        // Looking at a world that hadn't connected either: a resync stays there.
+        let keep_unconnected = shown.as_ref().is_some_and(|(_, connected)| !connected);
+        let shown_name = shown.map(|(name, _)| name).or_else(|| self.preferred_world.clone());
         let mut prior: HashMap<String, World> =
             std::mem::take(&mut self.worlds).into_iter().filter(|w| !w.lines.is_empty()).map(|w| (w.name.clone(), w)).collect();
         // A cold start: the disk cache stands in for the buffers a reconnect would keep
@@ -1690,10 +1694,11 @@ impl ClientCore {
             out.push(w);
         }
         self.worlds = out;
-        self.current = shown_name
+        let picked = shown_name
             .and_then(|n| self.worlds.iter().position(|w| w.name == n))
             .unwrap_or(current_world_index)
             .min(self.worlds.len().saturating_sub(1));
+        self.current = start_world(&self.worlds, picked, current_world_index, keep_unconnected);
         self.settings = Some(settings);
         self.settings_rev = self.settings_rev.wrapping_add(1);
         if let Some(key) = self.settings.as_ref().map(|s| s.auth_key.clone()) {
@@ -1783,7 +1788,8 @@ impl ClientCore {
             }
             let mut line = self.new_line(text, ts, seq);
             line.from_server = d.from_server;
-            line.gagged = d.gagged;
+            // The keepalive's reply is a gagged line, F2 or not, as on the console.
+            line.gagged = d.gagged || crate::telnet::has_keep_alive_marker(text);
             line.highlight = d.highlight_colors.get(k).cloned().flatten();
             line.viewed = d.is_viewed;
             line.archive_sourced = d.archive_sourced;
@@ -2304,8 +2310,12 @@ fn is_update_command(command: &str) -> bool {
     command.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/update"))
 }
 
+/// A line never drawn, F2 or not: one that is only escape codes (the console's
+/// `is_ansi_only_line`). The keepalive's reply is not one of these: it is a gagged line
+/// (`Line::gagged`, set on arrival), shown under F2 as the console shows it - the GUI used
+/// to hide it for good (user report 2026-11-01).
 pub fn hidden_line(text: &str) -> bool {
-    is_ansi_only(text) || (text.contains("###_idler_message_") && text.contains("_###"))
+    is_ansi_only(text)
 }
 
 fn is_ansi_only(line: &str) -> bool {
@@ -2437,6 +2447,21 @@ fn rebuild_seen(w: &mut World, carried: Option<&SeenRanges>) {
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The world an InitialState opens on: `picked`, unless it hasn't connected since the Clay it
+/// talks to started (nothing to show, no name for the bar - it looked like a broken window,
+/// user report 2026-11-01) and `keep_unconnected` is false; then the server's current world,
+/// else the first one that has connected. app.js `startWorldIndex` is the same rule.
+pub(crate) fn start_world(worlds: &[World], picked: usize, server_current: usize, keep_unconnected: bool) -> usize {
+    let connected = |i: usize| worlds.get(i).is_some_and(|w| w.was_connected);
+    if connected(picked) || keep_unconnected {
+        picked
+    } else if connected(server_current) {
+        server_current
+    } else {
+        worlds.iter().position(|w| w.was_connected).unwrap_or(picked)
+    }
 }
 
 #[cfg(test)]

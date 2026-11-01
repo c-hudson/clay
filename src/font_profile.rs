@@ -264,6 +264,71 @@ impl crate::websocket::GlobalSettingsMsg {
     }
 }
 
+/// The standard weights and their names (CSS's and OpenType's): what every Weight picker
+/// shows in place of the number. A font comes in some of these (its faces), or, a variable
+/// font in a browser, in every value between two of them.
+pub const WEIGHT_NAMES: [(u16, &str); 9] = [
+    (100, "Thin"),
+    (200, "Extra Light"),
+    (300, "Light"),
+    (400, "Normal"),
+    (500, "Medium"),
+    (600, "Semi Bold"),
+    (700, "Bold"),
+    (800, "Extra Bold"),
+    (900, "Black"),
+];
+
+/// What a font comes in when nothing says otherwise: regular and bold, as most system
+/// fonts do.
+pub const DEFAULT_WEIGHTS: [u16; 2] = [400, 700];
+
+/// The name of the standard weight nearest `weight`.
+pub fn weight_name(weight: u16) -> &'static str {
+    WEIGHT_NAMES.iter().min_by_key(|(w, _)| (*w as i32 - weight as i32).abs()).map_or("Normal", |(_, n)| n)
+}
+
+/// The face a browser draws for `wanted` from a family with faces of `weights` (CSS Fonts
+/// 4, font matching): 400-500 tries upward to 500 first, lighter wanted tries lighter
+/// first, heavier tries heavier first. The native GUI asks for a weight the family has, so
+/// every platform's matcher agrees with the browser and with the picker's label.
+pub fn css_weight_match(wanted: u16, weights: &[u16]) -> u16 {
+    let below = || weights.iter().copied().filter(|w| *w < wanted).max();
+    let above = |from: u16| weights.iter().copied().filter(|w| *w >= from).min();
+    let found = if weights.contains(&wanted) {
+        Some(wanted)
+    } else if (400..=500).contains(&wanted) {
+        weights.iter().copied().filter(|w| *w > wanted && *w <= 500).min().or_else(below).or_else(|| above(wanted))
+    } else if wanted < 400 {
+        below().or_else(|| above(wanted))
+    } else {
+        above(wanted).or_else(below)
+    };
+    found.unwrap_or(wanted)
+}
+
+fn weights_or_default(available: &[u16]) -> &[u16] {
+    if available.is_empty() { &DEFAULT_WEIGHTS } else { available }
+}
+
+/// The Weight picker's text for `weight` in a font that comes in `available`: the name of
+/// the weight it draws (`css_weight_match`), with the number after it only when two of the
+/// font's weights share a name (350 and 400, say).
+pub fn weight_label(weight: u16, available: &[u16]) -> String {
+    let avail = weights_or_default(available);
+    let shown = css_weight_match(weight, avail);
+    let name = weight_name(shown);
+    if avail.iter().filter(|w| weight_name(**w) == name).count() > 1 { format!("{name} ({shown})") } else { name.to_string() }
+}
+
+/// The Weight picker's − and +: the previous or next (`up`) weight of `available` after
+/// the one `weight` draws; the ends stay put.
+pub fn step_weight(weight: u16, available: &[u16], up: bool) -> u16 {
+    let avail = weights_or_default(available);
+    let i = avail.iter().position(|w| *w == css_weight_match(weight, avail)).unwrap_or(0);
+    avail[if up { (i + 1).min(avail.len() - 1) } else { i.saturating_sub(1) }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +436,44 @@ mod tests {
         assert!(settings.font_profiles.is_empty());
         settings.set_font_profile(FontProfileUpdate { key: "webview-linux".into(), profile: sample() });
         assert_eq!(settings.font_profiles["webview-linux"], sample());
+    }
+
+    #[test]
+    fn a_weight_is_matched_as_a_browser_matches_it() {
+        let two = [400, 700];
+        // A font with only regular and bold (DejaVu Sans Mono, Consolas, Courier).
+        for (wanted, got) in [(1, 400), (101, 400), (451, 400), (500, 400), (501, 700), (900, 700)] {
+            assert_eq!(css_weight_match(wanted, &two), got, "{wanted}");
+        }
+        let eight = [100, 200, 300, 400, 500, 600, 700, 800];
+        for (wanted, got) in [(1, 100), (101, 100), (250, 200), (400, 400), (401, 500), (451, 500), (551, 600), (650, 700), (900, 800)] {
+            assert_eq!(css_weight_match(wanted, &eight), got, "{wanted}");
+        }
+    }
+
+    #[test]
+    fn weights_are_named_and_stepped_through_what_the_font_has() {
+        assert_eq!(weight_name(400), "Normal");
+        assert_eq!(weight_name(451), "Medium");
+        assert_eq!(weight_name(1), "Thin");
+        assert_eq!(weight_name(950), "Black");
+        let two = [400, 700];
+        assert_eq!(weight_label(451, &two), "Normal");
+        assert_eq!(weight_label(600, &two), "Bold");
+        assert_eq!(weight_label(400, &[]), "Normal", "no list: regular and bold");
+        assert_eq!(step_weight(451, &two, true), 700);
+        assert_eq!(step_weight(451, &two, false), 400);
+        assert_eq!(step_weight(400, &two, false), 400, "the ends stay put");
+        assert_eq!(step_weight(700, &two, true), 700);
+        let eight = [100, 200, 300, 400, 500, 600, 700, 800];
+        assert_eq!(step_weight(451, &eight, true), 600, "from Medium, the weight 451 draws");
+        assert_eq!(step_weight(451, &eight, false), 400);
+        assert_eq!(step_weight(850, &eight, true), 800);
+        // Two faces with one name are told apart by the number.
+        assert_eq!(weight_label(380, &[380, 400, 700]), "Normal (380)");
+        assert_eq!(weight_label(400, &[380, 400, 700]), "Normal (400)");
+        assert_eq!(weight_label(700, &[380, 400, 700]), "Bold");
+        // One face only (a variable font the native GUI draws at its default).
+        assert_eq!(step_weight(400, &[400], true), 400);
     }
 }

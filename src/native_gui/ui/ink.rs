@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 
-use super::fonts::BUNDLED;
+use super::fonts::{BUNDLED, bundled_index};
 
 /// Horizontal scan lines across the band: the band is about a stroke's width tall, so
 /// this many lines can't step over any of a glyph's ink.
@@ -37,7 +37,7 @@ pub fn units_per_em(face: usize) -> Option<f32> {
 /// The regular face's x-height, in ems (`vertical-align: middle` centres on half of it).
 pub fn x_height_em() -> f32 {
     FACES.with(|f| {
-        f.first()
+        f.get(bundled_index(400, false))
             .and_then(|f| f.as_ref())
             .and_then(|f| Some(f.x_height()? as f32 / f.units_per_em() as f32))
             .unwrap_or(0.5)
