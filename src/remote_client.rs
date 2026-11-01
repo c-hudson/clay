@@ -2958,13 +2958,16 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
         Command::Version => version_command(app),
         Command::Menu => app.open_menu_popup_new(),
         // The split is this console's own, typed or sent back by the server (an action).
+        // Quiet when it works (the panes show it); only an error is said.
         Command::Split { world } => {
-            let msg = app.split_open(world.as_deref());
-            app.add_output(&msg);
+            if let Err(msg) = app.split_open(world.as_deref()) {
+                app.add_output(&msg);
+            }
         }
         Command::Unsplit => {
-            let msg = app.split_close();
-            app.add_output(&msg);
+            if let Err(msg) = app.split_close() {
+                app.add_output(&msg);
+            }
         }
         Command::Font => app.add_output("Font settings are available in the web and GUI interfaces."),
         Command::Setup => app.open_setup_popup_new(),

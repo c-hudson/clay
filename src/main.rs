@@ -9706,23 +9706,23 @@ impl App {
     /// showing `world` - else the next world in order after the current one
     /// (`util::split_next_world`) - and the focus stays on the current world below. Already
     /// split, a named world goes into the pane without the focus. Nothing connects or
-    /// disconnects. Returns what to tell the user.
-    pub(crate) fn split_open(&mut self, world: Option<&str>) -> String {
+    /// disconnects. Says nothing when it works (the pane shows it); the error otherwise.
+    pub(crate) fn split_open(&mut self, world: Option<&str>) -> Result<(), String> {
         let named = match world.map(str::trim).filter(|w| !w.is_empty()) {
             Some(name) => match self.find_world_index(name) {
                 Some(i) => Some(i),
-                None => return format!("World '{}' not found.", name),
+                None => return Err(format!("World '{}' not found.", name)),
             },
             None => None,
         };
         let target = match (named, self.split) {
             (Some(i), _) => i,
-            (None, Some(_)) => return "The output is already split; /unsplit closes the pane without the focus.".to_string(),
+            (None, Some(_)) => return Err("The output is already split; /unsplit closes the pane without the focus.".to_string()),
             (None, None) => {
                 let worlds: Vec<(&str, bool)> = self.worlds.iter().map(|w| (w.name.as_str(), w.connected)).collect();
                 match crate::util::split_next_world(&worlds, self.current_world_index) {
                     Some(i) => i,
-                    None => return "There is no other world to show.".to_string(),
+                    None => return Err("There is no other world to show.".to_string()),
                 }
             }
         };
@@ -9738,18 +9738,13 @@ impl App {
         self.needs_output_redraw = true;
         self.needs_terminal_clear = true;
         self.broadcast_activity();
-        let name = self.worlds[target].name.clone();
-        if previous.is_some() {
-            format!("The other pane shows {}.", name)
-        } else {
-            format!("Split: {} is shown above. Shift+Tab moves between the panes; /unsplit closes the one without the focus.", name)
-        }
+        Ok(())
     }
 
     /// `/unsplit`: the pane without the focus closes, and the focused one has the output
-    /// area again. Nothing disconnects.
-    pub(crate) fn split_close(&mut self) -> String {
-        let Some(split) = self.split.take() else { return "The output isn't split.".to_string() };
+    /// area again. Nothing disconnects. Says nothing when it works; the error otherwise.
+    pub(crate) fn split_close(&mut self) -> Result<(), String> {
+        let Some(split) = self.split.take() else { return Err("The output isn't split.".to_string()) };
         let closed = split.other;
         if closed != self.current_world_index {
             if self.console_tui {
@@ -9764,8 +9759,7 @@ impl App {
         self.needs_output_redraw = true;
         self.needs_terminal_clear = true;
         self.broadcast_activity();
-        let name = self.worlds.get(closed).map(|w| w.name.clone()).unwrap_or_default();
-        format!("Closed the pane showing {}.", name)
+        Ok(())
     }
 
     /// Shift+Tab (`split_focus`): the focus moves to the other pane, whose world becomes

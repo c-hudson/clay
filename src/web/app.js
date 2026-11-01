@@ -8708,7 +8708,8 @@
 
     // `/split [world]`: a pane opens above showing `world` - else the next world in order
     // after the current one - and the focus stays below. Already split, a named world goes
-    // into the pane without the focus. Returns what to tell the user.
+    // into the pane without the focus. Returns an error to tell the user, or '' when it
+    // worked (the pane shows it).
     function splitOpen(name, quiet) {
         let target;
         if (name) {
@@ -8730,7 +8731,7 @@
             updateStatusBar();
             sendOtherViews();
             saveSplitState();
-            return 'The other pane shows ' + worldName + '.';
+            return '';
         }
         splitPane = Object.assign(splitBuild(), { name: worldName, onTop: true });
         splitPlace();
@@ -8741,10 +8742,10 @@
         sendViewStateIfChanged();
         sendOtherViews();
         if (!quiet) saveSplitState();
-        return 'Split: ' + worldName + ' is shown above. Shift+Tab moves between the panes; /unsplit closes the one without the focus.';
+        return '';
     }
 
-    // `/unsplit`: the pane without the focus closes.
+    // `/unsplit`: the pane without the focus closes. Returns an error, or '' when it worked.
     function splitClose() {
         if (!splitPane) return "The output isn't split.";
         const pane = splitPane;
@@ -8766,13 +8767,14 @@
         sendViewStateIfChanged();
         sendOtherViews();
         saveSplitState();
-        return 'Closed the pane showing ' + pane.name + '.';
+        return '';
     }
 
+    // Quiet when it works (the panes show it); only an error is said.
     function splitCommand(cmd) {
         const parts = cmd.trim().split(/\s+/);
         const reply = parts[0].toLowerCase() === '/unsplit' ? splitClose() : splitOpen(parts.slice(1).join(' '));
-        appendClientLine(reply);
+        if (reply) appendClientLine(reply);
     }
 
     // Shift+Tab (split_focus), or a plain click in the other pane: the focus moves there.

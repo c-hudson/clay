@@ -855,13 +855,16 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         Command::Menu => {
             app.open_menu_popup_new();
         }
+        // Quiet when it works (the panes show it); only an error is said.
         Command::Split { world } => {
-            let msg = app.split_open(world.as_deref());
-            app.add_output(&msg);
+            if let Err(msg) = app.split_open(world.as_deref()) {
+                app.add_output(&msg);
+            }
         }
         Command::Unsplit => {
-            let msg = app.split_close();
-            app.add_output(&msg);
+            if let Err(msg) = app.split_close() {
+                app.add_output(&msg);
+            }
         }
         Command::Font => {
             app.add_output("Font settings are available in the web and GUI interfaces.");

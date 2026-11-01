@@ -53,68 +53,66 @@ impl ClayView {
     /// `/split [world]`: a pane opens above showing `world` - else the next world in order
     /// after the current one (`util::split_next_world`, the console's rule) - and the focus
     /// stays below. Already split, a named world goes into the pane without the focus.
-    /// Returns what to tell the user.
-    pub(super) fn split_open(&mut self, world: Option<&str>) -> String {
+    /// Says nothing when it works (the pane shows it); the error otherwise.
+    pub(super) fn split_open(&mut self, world: Option<&str>) -> Result<(), String> {
         let core = &self.session.core;
         let named = match world.map(str::trim).filter(|w| !w.is_empty()) {
             Some(name) => match core.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                 Some(i) => Some(i),
-                None => return format!("World '{name}' not found."),
+                None => return Err(format!("World '{name}' not found.")),
             },
             None => None,
         };
         let target = match (named, self.split.is_some()) {
             (Some(i), _) => i,
-            (None, true) => return "The output is already split; /unsplit closes the pane without the focus.".to_string(),
+            (None, true) => return Err("The output is already split; /unsplit closes the pane without the focus.".to_string()),
             (None, false) => {
                 let worlds: Vec<(&str, bool)> = core.worlds.iter().map(|w| (w.name.as_str(), w.connected)).collect();
                 match crate::util::split_next_world(&worlds, core.current) {
                     Some(i) => i,
-                    None => return "There is no other world to show.".to_string(),
+                    None => return Err("There is no other world to show.".to_string()),
                 }
             }
         };
         let name = core.worlds[target].name.clone();
-        let reply = match self.split.as_mut() {
+        match self.split.as_mut() {
             Some(pane) => {
-                pane.world = name.clone();
+                pane.world = name;
                 pane.shown_world = None;
-                format!("The other pane shows {name}.")
             }
-            None => {
-                self.split = Some(OtherPane { world: name.clone(), on_top: true, ..Default::default() });
-                format!("Split: {name} is shown above. Shift+Tab moves between the panes; /unsplit closes the one without the focus.")
-            }
-        };
+            None => self.split = Some(OtherPane { world: name, on_top: true, ..Default::default() }),
+        }
         self.split_changed();
-        reply
+        Ok(())
     }
 
     /// `/split [world]` or `/unsplit`, typed here or sent back by the server (an action):
-    /// what it says goes in the output.
+    /// only an error is said in the output.
     pub(super) fn split_command(&mut self, command: &str, cx: &mut Context<Self>) {
         let mut words = command.split_whitespace();
         let first = words.next().unwrap_or("").to_lowercase();
         let rest: Vec<&str> = words.collect();
-        let reply = if first == "/unsplit" {
+        let done = if first == "/unsplit" {
             self.split_close()
         } else {
             let world = (!rest.is_empty()).then(|| rest.join(" "));
             self.split_open(world.as_deref())
         };
-        self.client_line(&reply, cx);
+        if let Err(reply) = done {
+            self.client_line(&reply, cx);
+        }
         self.report_other_views(cx);
         cx.notify();
     }
 
     /// `/unsplit`: the pane without the focus closes.
-    pub(super) fn split_close(&mut self) -> String {
-        let Some(pane) = self.split.take() else { return "The output isn't split.".to_string() };
+    pub(super) fn split_close(&mut self) -> Result<(), String> {
+        let Some(pane) = self.split.take() else { return Err("The output isn't split.".to_string()) };
         if let Some(m) = self.more.get_mut(&pane.world).filter(|_| self.session.core.current_world().is_none_or(|w| w.name != pane.world)) {
             m.left();
         }
         self.split_changed();
-        format!("Closed the pane showing {}.", pane.world)
+        Ok(())
     }
 
     /// The split changed: the core skips the other pane's world when switching, and the

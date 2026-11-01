@@ -13170,12 +13170,11 @@ third
         app.current_world_index = 0;
         app.console_tui = true;
 
-        let msg = app.split_open(None);
-        assert!(msg.starts_with("Split: Bravo is shown above"), "{msg}");
+        assert_eq!(app.split_open(None), Ok(()), "quiet when it works");
         assert_eq!(app.split, Some(ConsoleSplit { other: 2, focus_top: false }));
         assert!(app.console_shows(2) && app.console_watching(2));
-        assert_eq!(app.split_open(None), "The output is already split; /unsplit closes the pane without the focus.");
-        assert_eq!(app.split_open(Some("nowhere")), "World 'nowhere' not found.");
+        assert_eq!(app.split_open(None), Err("The output is already split; /unsplit closes the pane without the focus.".to_string()));
+        assert_eq!(app.split_open(Some("nowhere")), Err("World 'nowhere' not found.".to_string()));
         assert_eq!(app.split_other(), Some(2), "a failed /split leaves the split as it was");
 
         // The switch keys step over the other pane's world: Alpha -> (Bravo) -> Charlie.
@@ -13199,11 +13198,10 @@ third
         app.switch_world(2);
 
         // /unsplit closes the pane without the focus (Alpha, below); Bravo keeps the output.
-        let msg = app.split_close();
-        assert_eq!(msg, "Closed the pane showing Alpha.");
+        assert_eq!(app.split_close(), Ok(()), "quiet when it works");
         assert_eq!(app.split, None);
         assert_eq!(app.current_world_index, 2);
-        assert_eq!(app.split_close(), "The output isn't split.");
+        assert_eq!(app.split_close(), Err("The output isn't split.".to_string()));
         assert!(!app.split_swap_focus(), "not split: Shift+Tab does nothing");
 
         // One world only: nothing to split with.
@@ -13211,7 +13209,7 @@ third
         lone.worlds.clear();
         lone.worlds.push(World::new("only"));
         lone.current_world_index = 0;
-        assert_eq!(lone.split_open(None), "There is no other world to show.");
+        assert_eq!(lone.split_open(None), Err("There is no other world to show.".to_string()));
 
         assert!(matches!(parse_command("/split Big World"), Command::Split { world: Some(ref w) } if w == "Big World"));
         assert!(matches!(parse_command("/split"), Command::Split { world: None }));
@@ -13234,7 +13232,7 @@ third
         assert_eq!(app.worlds[1].unseen_lines, 1);
         assert_eq!(app.activity_count(), 1);
 
-        app.split_open(Some("B"));
+        app.split_open(Some("B")).unwrap();
         assert_eq!(app.worlds[1].output_lines.last().unwrap().display_id, Some(CONSOLE_DISPLAY_ID), "▶ for what arrived unseen");
         app.worlds[1].mark_seen(); // the redraw does this
         app.process_server_data(1, b"while shown\n", 24, 80, false);
@@ -13250,7 +13248,7 @@ third
         assert_eq!(app.console_rows_for(0), 11, "the focused pane's");
         assert_eq!(app.console_rows_for(2), 11, "a world not shown: where it would appear");
 
-        app.split_close();
+        app.split_close().unwrap();
         assert_eq!(app.worlds[1].output_lines.iter().filter(|l| l.display_id == Some(CONSOLE_DISPLAY_ID)).count(), 0, "▶ given back");
         assert!(!app.console_watching(1));
     }
@@ -13266,7 +13264,7 @@ third
         }
         app.current_world_index = 0;
         app.console_tui = true;
-        app.split_open(Some("C"));
+        app.split_open(Some("C")).unwrap();
         app.split_swap_focus();
         let mut buf: Vec<u8> = Vec::new();
         crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
