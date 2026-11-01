@@ -328,6 +328,9 @@ pub struct ClientCore {
     pub actions: Vec<Action>,
     /// Worlds with activity, as the server counts them (`ActivityUpdate`).
     pub activity: usize,
+    /// The MUD sent text that shows (live, not history, not gagged) since `take_live_text`
+    /// last looked: Taskbar Alert's cue (ui/taskbar.rs).
+    live_text: bool,
     /// An operator paused this client (`/remote pause`).
     pub paused: bool,
     pub visible: bool,
@@ -403,6 +406,7 @@ impl ClientCore {
             settings: None,
             actions: Vec::new(),
             activity: 0,
+            live_text: false,
             paused: false,
             splash_lines: Vec::new(),
             cached: HashMap::new(),
@@ -436,6 +440,11 @@ impl ClientCore {
 
     pub fn is_online(&self) -> bool {
         self.phase == Phase::Online
+    }
+
+    /// Whether the MUD sent text that shows since the last call (`live_text`).
+    pub fn take_live_text(&mut self) -> bool {
+        std::mem::take(&mut self.live_text)
     }
 
     pub fn is_multiuser(&self) -> bool {
@@ -1251,6 +1260,8 @@ impl ClientCore {
             }
             WsMessage::PendingLinesUpdate { world_index, count } | WsMessage::PendingCountUpdate { world_index, count } => {
                 if let Some(w) = self.worlds.get_mut(world_index) {
+                    // Text held by the server's more-mode came from the MUD all the same.
+                    self.live_text |= count > w.pending_count;
                     w.pending_count = count;
                     self.changed();
                 }
@@ -1745,6 +1756,7 @@ impl ClientCore {
         if d.from_server && !gap_fill {
             // Output from the MUD now, not a refill of history.
             self.worlds[d.world_index].last_activity = Some(Instant::now());
+            self.live_text |= !d.gagged && !data.is_empty();
         }
         if d.from_server {
             let held = std::mem::take(&mut self.worlds[d.world_index].partial);
@@ -2267,6 +2279,7 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         scrollback_enabled: s.scrollback_enabled,
         log_input_enabled: s.log_input_enabled,
         clear_input_on_send: Some(s.clear_input_on_send),
+        taskbar_alert: Some(s.taskbar_alert),
         keyboard_always_visible: s.keyboard_always_visible,
         tabs: s.tabs.clone(),
         icon_bar: s.icon_bar.clone(),

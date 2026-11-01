@@ -2726,7 +2726,7 @@ pub enum KeepAliveType {
     #[default]
     Nop,     // Send telnet NOP character (default)
     Custom,  // Send user-defined command
-    Generic, // Send "help commands ##_idler_message_<rand>_###"
+    Generic, // Send "help commands ###_idler_message_<rand>_###"
 }
 
 impl KeepAliveType {
@@ -2765,6 +2765,42 @@ impl KeepAliveType {
             _ => KeepAliveType::Nop,
         }
     }
+}
+
+/// What a Custom keepalive's command contains where Clay is to put its marker
+/// (`keep_alive_marker`); the reply that carries the marker back is gagged.
+pub const KEEP_ALIVE_RAND: &str = "##rand##";
+
+/// The world editors' warning under a Custom keepalive's command without `##rand##`
+/// (console, native GUI, and app.js's `KEEP_ALIVE_RAND_WARNING`, pinned to this).
+pub const KEEP_ALIVE_RAND_WARNING: &str =
+    "Keep alive message does not contain ##rand## and is not /gagged automatically";
+
+/// How long after a Custom keepalive goes out its Gag text still gags a line, so the
+/// same words from anything else later still show.
+pub const KEEP_ALIVE_GAG_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What `##rand##` becomes in the text sent (the Generic keepalive sends it too).
+pub fn keep_alive_marker(rand_num: u32) -> String {
+    format!("###_idler_message_{}_###", rand_num)
+}
+
+/// Whether `line` carries a keepalive's marker back.
+pub fn has_keep_alive_marker(line: &str) -> bool {
+    line.contains("###_idler_message_") && line.contains("_###")
+}
+
+/// Whether the world editor warns about this keepalive: a Custom one (by type name, as
+/// the editors hold it) whose command has no `##rand##`.
+pub fn keep_alive_rand_missing(keep_alive_type: &str, cmd: &str) -> bool {
+    keep_alive_type.eq_ignore_ascii_case("custom") && !cmd.contains(KEEP_ALIVE_RAND)
+}
+
+/// Whether `line` holds a Custom keepalive's Gag text: escape codes ignored, case
+/// ignored. An empty or all-blank Gag text matches nothing.
+pub fn keep_alive_gag_matches(gag: &str, line: &str) -> bool {
+    let gag = gag.trim();
+    !gag.is_empty() && crate::util::strip_ansi_codes(line).to_lowercase().contains(&gag.to_lowercase())
 }
 
 #[cfg(test)]

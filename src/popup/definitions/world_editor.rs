@@ -31,6 +31,12 @@ pub const WORLD_FIELD_MSP_ENABLED: FieldId = FieldId(23);
 pub const WORLD_FIELD_MCP_ENABLED: FieldId = FieldId(24);
 pub const WORLD_FIELD_MCCP2_ENABLED: FieldId = FieldId(25);
 pub const WORLD_FIELD_TF_TYPE: FieldId = FieldId(26);
+/// Under KA Command: `telnet::KEEP_ALIVE_RAND_WARNING`, while a Custom keepalive's
+/// command has no `##rand##` (`refresh_keep_alive_rows`).
+pub const WORLD_FIELD_KEEP_ALIVE_WARNING: FieldId = FieldId(27);
+/// A Custom keepalive's own reply to gag. Its checkbox is the label's `[✓]`/`[ ]`
+/// (Space flips it, `toggle_keep_alive_gag`), held in `custom_data`.
+pub const WORLD_FIELD_KEEP_ALIVE_GAG: FieldId = FieldId(28);
 // Field IDs - Slack
 pub const WORLD_FIELD_SLACK_TOKEN: FieldId = FieldId(30);
 pub const WORLD_FIELD_SLACK_CHANNEL: FieldId = FieldId(31);
@@ -159,6 +165,8 @@ pub struct WorldSettings {
     pub auto_connect: String,
     pub keep_alive: String,
     pub keep_alive_cmd: String,
+    pub keep_alive_gag_enabled: bool,
+    pub keep_alive_gag: String,
     pub gmcp_packages: String,
     pub auto_reconnect_secs: String,
     pub msp_enabled: bool,
@@ -293,6 +301,17 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             FieldKind::text(&settings.keep_alive_cmd),
         ))
         .with_field(Field::new(
+            WORLD_FIELD_KEEP_ALIVE_WARNING,
+            "",
+            // Two lines, to fit the popup's narrowest width.
+            FieldKind::ErrorText { text: crate::telnet::KEEP_ALIVE_RAND_WARNING.replacen(" and ", "\nand ", 1) },
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_KEEP_ALIVE_GAG,
+            keep_alive_gag_label(settings.keep_alive_gag_enabled),
+            FieldKind::text(&settings.keep_alive_gag),
+        ))
+        .with_field(Field::new(
             WORLD_FIELD_GMCP_PACKAGES,
             "GMCP",
             FieldKind::text(&settings.gmcp_packages),
@@ -416,6 +435,8 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             anchor_x: 0,
         });
 
+    def.custom_data.insert(KEEP_ALIVE_GAG_KEY.to_string(), if settings.keep_alive_gag_enabled { "1" } else { "0" }.to_string());
+
     // Set field visibility based on world type
     update_field_visibility(&mut def, world_type, show_keep_alive_cmd);
 
@@ -502,8 +523,20 @@ fn world_editor_help_text() -> Vec<String> {
         "",
         "Keep Alive: Prevents idle disconnects.",
         "  NOP: Sends a telnet NOP (invisible to server).",
-        "  Custom: Sends a custom command you specify.",
-        "  Generic: Sends a generic keep-alive packet.",
+        "  Custom: Sends KA Command, the command you specify.",
+        "  Generic: Sends help commands with a marker.",
+        "",
+        "KA Command: Custom only. Write ##rand## where Clay",
+        "  should put a marker (###_idler_message_<n>_###);",
+        "  the MUD's reply that repeats it is /gagged.",
+        "  Example: help ##rand##. Without ##rand## nothing",
+        "  is gagged, and the editor warns you.",
+        "",
+        "KA Gag: Custom only. Space ticks its box. Ticked,",
+        "  a line holding this text (any case, colours",
+        "  ignored) within 30 seconds of a keepalive is",
+        "  gagged too, for a MUD whose reply doesn't",
+        "  repeat the command, such as Huh?.",
         "",
         "GMCP: Space-separated GMCP packages to request from",
         "  the server (e.g. Char.Items Room.Info).",
@@ -573,10 +606,13 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         }
     }
 
-    // Keep-alive command only visible for MUD with custom keep-alive
-    if let Some(field) = def.get_field_mut(WORLD_FIELD_KEEP_ALIVE_CMD) {
-        field.visible = world_type.is_mud() && show_keep_alive_cmd;
+    // Keep-alive command and gag only visible for MUD with custom keep-alive
+    for id in [WORLD_FIELD_KEEP_ALIVE_CMD, WORLD_FIELD_KEEP_ALIVE_GAG] {
+        if let Some(field) = def.get_field_mut(id) {
+            field.visible = world_type.is_mud() && show_keep_alive_cmd;
+        }
     }
+    refresh_keep_alive_rows(def);
 
     // Prompt Wait only applies to Timed Prompt worlds - a plain MUD world never infers
     // a prompt from silence at all, so the setting would be meaningless there (unlike
@@ -612,6 +648,42 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         b.enabled = is_chat;
     }
     set_pick_visibility(def, world_type);
+}
+
+/// `custom_data` key: the KA Gag checkbox, "1" when ticked.
+const KEEP_ALIVE_GAG_KEY: &str = "keep_alive_gag_enabled";
+
+/// KA Gag's label: its checkbox, then its name (the console's own toggle marks).
+fn keep_alive_gag_label(on: bool) -> String {
+    #[cfg(not(windows))]
+    let mark = if on { "[✓]" } else { "[ ]" };
+    #[cfg(windows)]
+    let mark = if on { "[x]" } else { "[ ]" };
+    format!("{} KA Gag", mark)
+}
+
+/// Whether the KA Gag checkbox is ticked.
+pub fn keep_alive_gag_enabled(def: &PopupDefinition) -> bool {
+    def.custom_data.get(KEEP_ALIVE_GAG_KEY).is_some_and(|v| v == "1")
+}
+
+/// Tick or untick the KA Gag checkbox.
+pub fn toggle_keep_alive_gag(def: &mut PopupDefinition) {
+    let on = !keep_alive_gag_enabled(def);
+    def.custom_data.insert(KEEP_ALIVE_GAG_KEY.to_string(), if on { "1" } else { "0" }.to_string());
+    if let Some(field) = def.get_field_mut(WORLD_FIELD_KEEP_ALIVE_GAG) {
+        field.label = keep_alive_gag_label(on);
+    }
+}
+
+/// Show the `##rand##` warning while KA Command is shown and lacks it. Run after a
+/// change to either Keep Alive field.
+pub fn refresh_keep_alive_rows(def: &mut PopupDefinition) {
+    let shown = def.get_field(WORLD_FIELD_KEEP_ALIVE_CMD).is_some_and(|f| f.visible);
+    let cmd = def.get_field(WORLD_FIELD_KEEP_ALIVE_CMD).and_then(|f| f.kind.get_text()).unwrap_or("").to_string();
+    if let Some(field) = def.get_field_mut(WORLD_FIELD_KEEP_ALIVE_WARNING) {
+        field.visible = shown && crate::telnet::keep_alive_rand_missing("custom", &cmd);
+    }
 }
 
 fn has_picks(def: &PopupDefinition, id: FieldId) -> bool {
@@ -764,6 +836,77 @@ pub fn apply_pick(state: &mut PopupState, changed: FieldId) -> bool {
 mod tests {
     use super::*;
     use crate::popup::PopupState;
+
+    /// The ##rand## warning shows under a Custom keepalive's command without it, and KA
+    /// Gag's checkbox is its label, flipped in place.
+    #[test]
+    fn test_world_editor_keep_alive_warning_and_gag() {
+        let settings = WorldSettings {
+            world_type: "mud".to_string(),
+            keep_alive: "custom".to_string(),
+            keep_alive_cmd: "help thisistheidlemessage".to_string(),
+            keep_alive_gag: "thisistheidlemessage".to_string(),
+            ..Default::default()
+        };
+        let mut def = create_world_editor_popup(&settings);
+        assert!(def.get_field(WORLD_FIELD_KEEP_ALIVE_WARNING).unwrap().visible);
+        assert_eq!(def.get_field(WORLD_FIELD_KEEP_ALIVE_WARNING).unwrap().kind.get_text().unwrap().replace('\n', " "),
+            crate::telnet::KEEP_ALIVE_RAND_WARNING);
+        assert!(def.get_field(WORLD_FIELD_KEEP_ALIVE_GAG).unwrap().visible);
+        assert!(!keep_alive_gag_enabled(&def));
+        assert!(def.get_field(WORLD_FIELD_KEEP_ALIVE_GAG).unwrap().label.starts_with("[ ] "));
+
+        toggle_keep_alive_gag(&mut def);
+        assert!(keep_alive_gag_enabled(&def));
+        assert!(!def.get_field(WORLD_FIELD_KEEP_ALIVE_GAG).unwrap().label.starts_with("[ ] "));
+        assert!(def.get_field(WORLD_FIELD_KEEP_ALIVE_GAG).unwrap().label.ends_with(" KA Gag"));
+
+        if let Some(FieldKind::Text { value, .. }) = def.get_field_mut(WORLD_FIELD_KEEP_ALIVE_CMD).map(|f| &mut f.kind) {
+            *value = "help ##rand##".to_string();
+        }
+        refresh_keep_alive_rows(&mut def);
+        assert!(!def.get_field(WORLD_FIELD_KEEP_ALIVE_WARNING).unwrap().visible);
+
+        // Not Custom: neither row.
+        update_field_visibility(&mut def, WorldType::Mud, false);
+        assert!(!def.get_field(WORLD_FIELD_KEEP_ALIVE_GAG).unwrap().visible);
+        assert!(!def.get_field(WORLD_FIELD_KEEP_ALIVE_WARNING).unwrap().visible);
+
+        // Opened ticked.
+        let def = create_world_editor_popup(&WorldSettings { keep_alive_gag_enabled: true, ..settings });
+        assert!(keep_alive_gag_enabled(&def));
+    }
+
+    /// Drawn: the warning's two lines under KA Command, and KA Gag's checkbox before its
+    /// name, the field lined up with the others.
+    #[test]
+    fn test_world_editor_keep_alive_rows_drawn() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let settings = WorldSettings {
+            world_type: "mud".to_string(),
+            keep_alive: "custom".to_string(),
+            keep_alive_cmd: "help thisistheidlemessage".to_string(),
+            keep_alive_gag_enabled: true,
+            keep_alive_gag: "thisistheidlemessage".to_string(),
+            ..Default::default()
+        };
+        let mut state = PopupState::new(create_world_editor_popup(&settings));
+        state.visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 50)).unwrap();
+        terminal.draw(|f| crate::popup::console_renderer::render_popup(f, &mut state, &crate::Theme::Dark)).unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf.get(x, y).symbol().to_string()).collect::<String>())
+            .collect();
+        let find = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap_or_else(|| panic!("no {needle:?} in\n{}", rows.join("\n")));
+        let cmd = find("KA Command: ");
+        assert!(rows[cmd + 1].contains("Keep alive message does not contain ##rand##"), "{}", rows.join("\n"));
+        assert!(rows[cmd + 2].contains("and is not /gagged automatically"), "{}", rows.join("\n"));
+        let gag = find(" KA Gag: thisistheidlemessage");
+        let col = |r: &str, s: &str| r.find(s).map(|b| r[..b].chars().count());
+        assert_eq!(col(&rows[gag], "thisistheidlemessage"), col(&rows[cmd], "help"), "the two fields line up:\n{}", rows.join("\n"));
+        assert!(rows[gag].contains("] KA Gag") && rows[gag].contains('['), "{}", rows[gag]);
+    }
 
     #[test]
     fn test_world_editor_mud() {

@@ -124,6 +124,12 @@ impl ClayView {
         let copy = (shared && !self.link.followers.is_empty()).then(|| input.clone());
         let fx = self.session.handle(input);
         self.after(fx, cx);
+        // Text with no Clay window focused: Taskbar Alert. Here, once for every window, as
+        // each follower's core sees the same text.
+        let alert = self.session.core.take_live_text() && self.session.core.settings.as_ref().is_some_and(|s| s.taskbar_alert);
+        if let (true, Some(own)) = (alert, self.link.own_window) {
+            super::taskbar::alert(own, cx);
+        }
         if let Some(input) = copy {
             let to = self.link.followers.iter().map(|(f, _)| f.clone()).collect();
             self.forward(input, request, to, cx);

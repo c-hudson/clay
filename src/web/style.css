@@ -3089,6 +3089,33 @@ body.device-phone .side-tile-label {
     display: flex;
 }
 
+/* Under Keep Alive Cmd: a Custom keepalive without ##rand## isn't gagged. */
+.world-editor-modal-content .we-warning {
+    display: block;
+    color: var(--theme-error, #f87171);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+/* Gag Text (a Custom keepalive's): its checkbox comes before its name, on one line. */
+.world-editor-modal-content .we-check-label {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 5px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.world-editor-modal-content .we-check-label input[type="checkbox"] {
+    flex: none;
+    width: auto;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    accent-color: var(--accent-color);
+    cursor: pointer;
+}
+
 /* World editor Type-based row visibility (investigate-differences-between-tinyfugu-
    fluffy-stallman.md Job B): every MUD/Timed-only, Slack-only, and Discord-only row
    shares this one rule instead of a dedicated block per row - same

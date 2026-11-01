@@ -119,12 +119,46 @@ different about running it as a native window instead of a browser tab:
   uploaded too (see **Importing a Picture** in the Interface chapter). The native GUI does
   the same; on Linux its file dialog needs xdg-desktop-portal, and without it a drag
   still works.
-- The native GUI's hamburger menu is also the desktop's own menu, where the desktop has
-  one: the macOS menu bar, and on Linux an app-menu applet on the panel (xfce4's AppMenu
-  plugin, MATE's and Budgie's). Its Clay menu lists the hamburger's items, then Quit, and
-  each choice acts on the window it was made for. Nothing is added to the window, and
-  without such an applet nothing changes. On Linux it needs an X11 session (Wayland has no
-  way to say where a window's menu is). The WebView GUI doesn't do this.
+
+## On the Desktop
+
+Both desktop GUIs reach a little past their own windows. None of it adds anything to the
+window itself.
+
+- **The hamburger's items, outside the window** (the native GUI only; the WebView GUI
+  doesn't do this). Each choice acts on the window it was made for.
+  - **Linux:** an app-menu applet on the panel (xfce4's AppMenu plugin, MATE's and
+    Budgie's) shows a Clay menu with the hamburger's items, then Quit. KDE Plasma's Global
+    Menu reads the same window properties. It needs an X11 session: Wayland has no way to
+    say where a window's menu is. Without such an applet nothing changes.
+  - **macOS:** the menu bar's Clay menu, and the Dock icon's right-click menu (without
+    Quit, which the Dock has).
+  - **Windows:** the top of the window's own menu: right-click the title bar, or
+    Shift+right-click the taskbar button. Alt+Space doesn't open it, because Clay uses
+    that key (`collapse_spaces`). There is no Quit, since that menu has Close.
+- **Taskbar Alert** (Settings > General, off by default): when the MUD sends text while
+  no Clay window has focus, the taskbar button flashes (X11, Windows) or the Dock icon
+  bounces (macOS). It happens once until a Clay window has the focus again. GPUI can't do
+  it on Wayland.
+- **The activity count** (the status bar's ACT number) shows on the taskbar button or the
+  Dock icon:
+  - Windows: a red badge on the button;
+  - macOS: the Dock's own badge;
+  - Linux: KDE Plasma's task manager, Ubuntu Dock / Dash to Dock and Plank, through
+    Unity's launcher API. xfce's panel tasklist shows none.
+- **`/notify`** shows as a desktop notification titled with the world's name:
+  - Linux: the desktop's notification service.
+  - Windows: a toast from Clay. The first one registers the name `Clay` for toasts, one
+    key under `HKCU\Software\Classes\AppUserModelId\Clay`.
+  - macOS: through `osascript`, because `clay-macos-universal` isn't an .app bundle. The
+    notification shows as Script Editor's, and clicking it opens Script Editor.
+- **Linux launcher entry:** docks match a window to an application by its `.desktop`
+  file, so at start either GUI writes `~/.local/share/applications/clay.desktop` (and
+  Clay's icon into `~/.local/share/icons/hicolor/`), naming the program it was started
+  from. This also puts Clay in the desktop's application menu. The file is written only
+  when it is missing, or when it is Clay's own and names another program. A
+  `clay.desktop` without the line `X-Clay-Generated=true` is yours and is never
+  touched, and a build run from a cargo `target` directory never writes one.
 
 ## Keyboard Shortcuts
 

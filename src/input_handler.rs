@@ -1126,6 +1126,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         _ => KeepAliveType::Nop,
                     };
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd;
+                    app.worlds[idx].settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
+                    app.worlds[idx].settings.keep_alive_gag = settings.keep_alive_gag;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages;
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
                     app.worlds[idx].settings.auto_reconnect_secs = ar_secs;

@@ -50,6 +50,8 @@ pub mod tfrun;
 mod tfstartup;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
+#[cfg(any(feature = "webview-gui", feature = "native-gui"))]
+pub mod desktop;
 pub mod selfupdate;
 #[cfg(feature = "native-gui")]
 pub mod native_gui;
@@ -2244,6 +2246,10 @@ pub struct Settings {
     /// line sent stays in the input area above the next until it scrolls off the top
     /// (`InputArea::sent`, and each client's own copy). Phone clients always clear.
     pub clear_input_on_send: bool,
+    /// The desktop GUIs' Taskbar Alert: flash the taskbar button (bounce the Dock icon)
+    /// when the MUD sends text while no Clay window has focus (`src/desktop.rs`). Shown
+    /// only in the native and WebView GUIs' Settings, the only places it acts.
+    pub taskbar_alert: bool,
     // Number of visible (non-gagged) lines of scrollback sent to a remote/web/GUI
     // client per world on initial connect. Older history is backfilled on demand
     // via RequestScrollback. See build_initial_state().
@@ -2362,6 +2368,7 @@ impl Default for Settings {
             scrollback_enabled: false,
             log_input_enabled: false,
             clear_input_on_send: false,
+            taskbar_alert: false,
             remote_initial_lines: 100,
             keyboard_always_visible: true,
             url_shorteners: encoding::UrlShortener::default_order(),
@@ -2464,6 +2471,10 @@ pub struct WorldSettings {
     pub auto_connect_type: AutoConnectType,
     pub keep_alive_type: KeepAliveType,
     pub keep_alive_cmd: String,
+    /// A Custom keepalive's own reply to gag: the world editor's checkbox and the text
+    /// beside it. Gagged as well as `##rand##`'s marker, never instead of it.
+    pub keep_alive_gag_enabled: bool,
+    pub keep_alive_gag: String,
     // Slack settings (see src/chat/). `slack_token` is the bot token (xoxb-),
     // `slack_app_token` the app-level Socket Mode token (xapp-). `slack_channel` is the
     // Send To spec, `slack_channels` the comma-separated "Show Only" filter (empty =
@@ -2548,6 +2559,8 @@ impl Default for WorldSettings {
             auto_connect_type: AutoConnectType::Connect,
             keep_alive_type: KeepAliveType::Nop,
             keep_alive_cmd: String::new(),
+            keep_alive_gag_enabled: false,
+            keep_alive_gag: String::new(),
             slack_token: String::new(),
             slack_app_token: String::new(),
             slack_channel: String::new(),
@@ -5142,6 +5155,24 @@ impl World {
         self.broadcast_ledger.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Whether `line` is this world's keepalive coming back, to be gagged: the marker that
+    /// a Custom keepalive's `##rand##` and the Generic one send (always), or a Custom
+    /// keepalive's Gag text, in a line arriving within `KEEP_ALIVE_GAG_WINDOW` of one going
+    /// out (`last_nop_time`).
+    pub(crate) fn is_keepalive_reply(&self, line: &str) -> bool {
+        let s = &self.settings;
+        match s.keep_alive_type {
+            KeepAliveType::Generic => telnet::has_keep_alive_marker(line),
+            KeepAliveType::Custom => {
+                telnet::has_keep_alive_marker(line)
+                    || (s.keep_alive_gag_enabled
+                        && self.last_nop_time.is_some_and(|t| t.elapsed() < telnet::KEEP_ALIVE_GAG_WINDOW)
+                        && telnet::keep_alive_gag_matches(&s.keep_alive_gag, line))
+            }
+            KeepAliveType::None | KeepAliveType::Nop => false,
+        }
+    }
+
     /// Has `seq` been broadcast? Exact membership, O(log n).
     pub(crate) fn was_broadcast(&self, seq: u64) -> bool {
         self.ledger_guard()
@@ -5262,7 +5293,8 @@ impl World {
         let start_idx = if had_partial {
             let completed_line = lines[0];
             // Check if the completed line should be filtered
-            let should_filter = (completed_line.contains("###_idler_message_") && completed_line.contains("_###"))
+            let should_filter = telnet::has_keep_alive_marker(completed_line)
+                || self.is_keepalive_reply(completed_line)
                 || is_visually_empty(completed_line);
 
             // The line being replaced/removed was counted into lines_since_pause
@@ -5392,12 +5424,8 @@ impl World {
             // tell which archive rows the live buffer already covers.
             let mut archive_seq: Option<i64> = None;
 
-            // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
-            let uses_idler_keepalive = matches!(
-                self.settings.keep_alive_type,
-                KeepAliveType::Custom | KeepAliveType::Generic
-            );
-            if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
+            // Filter out the keepalive's reply (only for Custom/Generic keep-alive types)
+            if self.is_keepalive_reply(line) {
                 continue;
             }
 
@@ -6710,6 +6738,7 @@ impl App {
             scrollback_enabled: self.settings.scrollback_enabled,
             log_input_enabled: self.settings.log_input_enabled,
             clear_input_on_send: self.settings.clear_input_on_send,
+            taskbar_alert: self.settings.taskbar_alert,
             keyboard_always_visible: self.settings.keyboard_always_visible,
             tabs: self.settings.tabs.name().to_string(),
             icon_bar: self.settings.icon_bar.name().to_string(),
@@ -6848,6 +6877,7 @@ impl App {
         self.settings.scrollback_enabled = settings.scrollback_enabled;
         self.settings.log_input_enabled = settings.log_input_enabled;
         self.settings.clear_input_on_send = settings.clear_input_on_send;
+        self.settings.taskbar_alert = settings.taskbar_alert;
         self.settings.keyboard_always_visible = settings.keyboard_always_visible;
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
@@ -7918,6 +7948,8 @@ impl App {
             auto_connect: auto_connect.to_string(),
             keep_alive: keep_alive.to_string(),
             keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+            keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
+            keep_alive_gag: world.settings.keep_alive_gag.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
             auto_reconnect_secs: world.settings.auto_reconnect_display(),
             msp_enabled: world.settings.msp_enabled,
@@ -8884,6 +8916,8 @@ impl App {
                     w.settings.auto_connect_type = AutoConnectType::from_name(&settings.auto_connect_type);
                     w.settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive_type);
                     w.settings.keep_alive_cmd = settings.keep_alive_cmd;
+                    w.settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
+                    w.settings.keep_alive_gag = settings.keep_alive_gag;
                     w.settings.msp_enabled = settings.msp_enabled;
                     w.settings.mcp_enabled = settings.mcp_enabled;
                     w.settings.mccp2_enabled = settings.mccp2_enabled;
@@ -9228,6 +9262,8 @@ impl App {
             auto_connect_type: AutoConnectType::from_name(&w.settings.auto_connect_type),
             keep_alive_type: KeepAliveType::from_name(&w.settings.keep_alive_type),
             keep_alive_cmd: w.settings.keep_alive_cmd,
+            keep_alive_gag_enabled: w.settings.keep_alive_gag_enabled,
+            keep_alive_gag: w.settings.keep_alive_gag,
             msp_enabled: w.settings.msp_enabled,
             mcp_enabled: w.settings.mcp_enabled,
             mccp2_enabled: w.settings.mccp2_enabled,
@@ -11367,6 +11403,8 @@ impl App {
             auto_connect_type: world.settings.auto_connect_type.name().to_string(),
             keep_alive_type: world.settings.keep_alive_type.name().to_string(),
             keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+            keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
+            keep_alive_gag: world.settings.keep_alive_gag.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
             auto_reconnect_secs: world.settings.auto_reconnect_display(),
             has_notes: !world.settings.notes.is_empty(),
@@ -11572,6 +11610,8 @@ impl App {
         discord_channel: String,
         discord_dm_user: String,
         chat: Option<crate::websocket::ChatSettingsUpdate>,
+        keep_alive_gag_enabled: Option<bool>,
+        keep_alive_gag: Option<String>,
     ) {
         if world_index >= self.worlds.len() {
             return;
@@ -11602,6 +11642,13 @@ impl App {
         self.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
         self.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
         self.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
+        // None: a client that predates the Gag fields - leave them.
+        if let Some(on) = keep_alive_gag_enabled {
+            self.worlds[world_index].settings.keep_alive_gag_enabled = on;
+        }
+        if let Some(gag) = keep_alive_gag {
+            self.worlds[world_index].settings.keep_alive_gag = gag;
+        }
         self.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
         let (ar_secs, ar_on_web) = WorldSettings::parse_auto_reconnect(&auto_reconnect_secs);
         self.worlds[world_index].settings.auto_reconnect_secs = ar_secs;
@@ -11678,6 +11725,8 @@ impl App {
             use_ssl, log_enabled, encoding,
             auto_connect_type: auto_login,
             keep_alive_type, keep_alive_cmd, gmcp_packages,
+            keep_alive_gag_enabled: self.worlds[world_index].settings.keep_alive_gag_enabled,
+            keep_alive_gag: self.worlds[world_index].settings.keep_alive_gag.clone(),
             auto_reconnect_secs,
             has_notes,
             msp_enabled,
@@ -11798,6 +11847,7 @@ impl App {
         text_reveal_profile: Option<websocket::TextRevealProfile>,
         font_profile: Option<font_profile::FontProfileUpdate>,
         tts_profile: Option<websocket::TtsProfileUpdate>,
+        taskbar_alert: Option<bool>,
     ) {
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
@@ -11940,6 +11990,9 @@ impl App {
         self.settings.log_input_enabled = log_input_enabled;
         if let Some(clear) = clear_input_on_send {
             self.settings.clear_input_on_send = clear;
+        }
+        if let Some(alert) = taskbar_alert {
+            self.settings.taskbar_alert = alert;
         }
         self.settings.keyboard_always_visible = keyboard_always_visible;
         // Save settings to persist changes. Tag the (debug-mode-only) audit log
@@ -14408,12 +14461,8 @@ impl App {
             let is_last = i == line_count - 1;
             let is_partial = is_last && !ends_with_newline;
 
-            // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
-            let uses_idler_keepalive = is_mud && matches!(
-                self.worlds[world_idx].settings.keep_alive_type,
-                KeepAliveType::Custom | KeepAliveType::Generic
-            );
-            if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
+            // Gag the keepalive's reply (Custom/Generic keep-alive types)
+            if is_mud && self.worlds[world_idx].is_keepalive_reply(line) {
                 just_filtered_idler = true;
                 // Don't drop the idler echo — gag it so F2 (show_tags) can reveal it like
                 // any other gagged line, on console/web/GUI.
@@ -18350,16 +18399,17 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                     msp_enabled, mcp_enabled, mccp2_enabled,
                     world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
+                    keep_alive_gag_enabled, keep_alive_gag,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -18369,7 +18419,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                     zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile,
+                    log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -19060,6 +19110,8 @@ impl App {
                     auto_connect_type: world.settings.auto_connect_type.name().to_string(),
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                    keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
+                    keep_alive_gag: world.settings.keep_alive_gag.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
                     has_notes: !world.settings.notes.is_empty(),
@@ -20399,6 +20451,8 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) auto_connect: String,
     pub(crate) keep_alive: String,
     pub(crate) keep_alive_cmd: String,
+    pub(crate) keep_alive_gag_enabled: bool,
+    pub(crate) keep_alive_gag: String,
     pub(crate) gmcp_packages: String,
     pub(crate) auto_reconnect_secs: String,
     pub(crate) msp_enabled: bool,
@@ -20499,6 +20553,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
+        WORLD_FIELD_KEEP_ALIVE_GAG,
         WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_PROMPT_WAIT_MS,
         WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_TF_TYPE,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
@@ -22282,6 +22337,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     auto_connect: state.get_selected(WORLD_FIELD_AUTO_CONNECT).unwrap_or("connect").to_string(),
                     keep_alive: state.get_selected(WORLD_FIELD_KEEP_ALIVE).unwrap_or("nop").to_string(),
                     keep_alive_cmd: state.get_text(WORLD_FIELD_KEEP_ALIVE_CMD).unwrap_or("").to_string(),
+                    keep_alive_gag_enabled: popup::definitions::world_editor::keep_alive_gag_enabled(&state.definition),
+                    keep_alive_gag: state.get_text(WORLD_FIELD_KEEP_ALIVE_GAG).unwrap_or("").to_string(),
                     gmcp_packages: state.get_text(WORLD_FIELD_GMCP_PACKAGES).unwrap_or(DEFAULT_GMCP_PACKAGES).to_string(),
                     auto_reconnect_secs: state.get_text(WORLD_FIELD_AUTO_RECONNECT).unwrap_or("0").to_string(),
                     msp_enabled: state.get_bool(WORLD_FIELD_MSP_ENABLED).unwrap_or(true),
@@ -22410,6 +22467,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     } else if is_select {
                         state.toggle_current();
                         update_visibility!(state);
+                    } else if state.selected_field().is_some_and(|f| f.id == WORLD_FIELD_KEEP_ALIVE_GAG) {
+                        // KA Gag's checkbox is its label's [✓]
+                        popup::definitions::world_editor::toggle_keep_alive_gag(&mut state.definition);
                     }
                 }
                 Tab => {
@@ -22504,6 +22564,12 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     }
                 }
                 _ => {}
+            }
+            // A committed KA Command shows or hides the ##rand## warning.
+            if let Some(state) = app.popup_manager.current_mut() {
+                if state.definition.id == popup::PopupId("world_editor") {
+                    popup::definitions::world_editor::refresh_keep_alive_rows(&mut state.definition);
+                }
             }
             return NewPopupAction::None;
         }
@@ -24387,9 +24453,9 @@ pub async fn run_app_headless(
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_nanos() % 1000 + 1) as u32;
-                                        let idler_tag = format!("###_idler_message_{}_###", rand_num);
+                                        let idler_tag = crate::telnet::keep_alive_marker(rand_num);
                                         let cmd = world.settings.keep_alive_cmd
-                                            .replace("##rand##", &idler_tag);
+                                            .replace(crate::telnet::KEEP_ALIVE_RAND, &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
@@ -24399,7 +24465,7 @@ pub async fn run_app_headless(
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_nanos() % 1000 + 1) as u32;
-                                        let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
+                                        let cmd = format!("help commands {}", crate::telnet::keep_alive_marker(rand_num));
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
@@ -25234,9 +25300,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos() % 1000 + 1) as u32;
-                            let idler_tag = format!("###_idler_message_{}_###", rand_num);
+                            let idler_tag = crate::telnet::keep_alive_marker(rand_num);
                             let cmd = world.settings.keep_alive_cmd
-                                .replace("##rand##", &idler_tag);
+                                .replace(crate::telnet::KEEP_ALIVE_RAND, &idler_tag);
                             let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
@@ -25246,7 +25312,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos() % 1000 + 1) as u32;
-                            let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
+                            let cmd = format!("help commands {}", crate::telnet::keep_alive_marker(rand_num));
                             let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
@@ -26270,9 +26336,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_nanos() % 1000 + 1) as u32;
-                                        let idler_tag = format!("###_idler_message_{}_###", rand_num);
+                                        let idler_tag = crate::telnet::keep_alive_marker(rand_num);
                                         let cmd = world.settings.keep_alive_cmd
-                                            .replace("##rand##", &idler_tag);
+                                            .replace(crate::telnet::KEEP_ALIVE_RAND, &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
@@ -26283,7 +26349,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_nanos() % 1000 + 1) as u32;
-                                        let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
+                                        let cmd = format!("help commands {}", crate::telnet::keep_alive_marker(rand_num));
                                         let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);

@@ -98,6 +98,7 @@ Click the hamburger icon for:
 |--------|-------------|
 | Help | Keyboard shortcuts and commands (F1) |
 | World Selector | Open the world selector (`/worlds`) |
+| Edit World | Edit the current world's settings (`/worlds -e`; not on a multiuser server) |
 | Actions | Open the actions editor (`/actions`) |
 | Settings | Open Settings (`/setup`) |
 | Emoji Picker | Insert an emoji (not on a phone or tablet, whose keyboard has its own, unless the Android app has a keyboard and mouse; `Esc-e` still opens it) |

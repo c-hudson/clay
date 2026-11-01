@@ -223,7 +223,7 @@ section = "media"
 phase = 5
 status = "done"
 feature = "handle Notification"
-note = "nothing on the desktop, as the web client (it passes these to Android's notifications only)"
+note = "a desktop notification (src/desktop.rs: org.freedesktop.Notifications, a Windows toast, osascript on macOS), once - not in a /window; app.js does the same through its host in the WebView GUI and passes it to Android's notifications"
 
 [[item]]
 id = "msg:OpenWindow"
@@ -2908,6 +2908,14 @@ feature = "the world editor: Server/Login(Channels)/Options sections with a side
 note = "app.js openWorldEditorPopup"
 
 [[item]]
+id = "ui:dialog.world_editor.keep_alive_gag"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "Custom keepalive: the ##rand## warning under Keep Alive Cmd while it lacks ##rand##, and Gag Text (checkbox before its name, then the text)"
+note = "app.js updateKeepAliveWarning; telnet.rs KEEP_ALIVE_RAND_WARNING"
+
+[[item]]
 id = "ui:dialog.world_confirm"
 section = "dialogs"
 phase = 4
@@ -2978,6 +2986,38 @@ phase = 5
 status = "done"
 feature = "the Transparency slider: every window (text and all) at that opacity on X11 (_NET_WM_WINDOW_OPACITY, what GTK set_opacity sets there), its preview live; kept but not applied on Wayland, Windows and macOS, as in the WebView GUI"
 note = "app.js applyTransparency"
+
+[[item]]
+id = "ui:settings.taskbar_alert"
+section = "dialogs"
+phase = 5
+status = "done"
+feature = "Taskbar Alert switch (General): off by default; shown only in the desktop GUIs"
+note = "app.js showOnlyThisInterfacesSettings (WEBVIEW_MODE); not in the console's /setup"
+
+[[item]]
+id = "ui:desktop.app_menu"
+section = "status"
+phase = 5
+status = "done"
+feature = "the hamburger's items outside the window: a Linux panel's app menu, the macOS menu bar and Dock menu, the Windows window menu (title-bar right-click)"
+note = "ui/appmenu.rs; the WebView GUI has none (user ruling 2026-10-31)"
+
+[[item]]
+id = "ui:desktop.taskbar_alert"
+section = "status"
+phase = 5
+status = "done"
+feature = "Taskbar Alert: text from the MUD with no Clay window focused flashes the taskbar button / bounces the Dock icon, once until focus returns"
+note = "ui/taskbar.rs, desktop.rs alert_once; app.js noteTaskbarAlert through the WebView GUI's host"
+
+[[item]]
+id = "ui:desktop.badge"
+section = "status"
+phase = 5
+status = "done"
+feature = "the ACT count on the taskbar button (Windows overlay, Unity LauncherEntry on Linux) or the Dock icon"
+note = "ui/taskbar.rs Badge, desktop.rs set_badge; app.js reportBadge through the WebView GUI's host"
 
 [[item]]
 id = "ui:window.notes"

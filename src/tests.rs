@@ -751,6 +751,85 @@
     }
 
     #[test]
+    fn test_keep_alive_marker_and_gag_helpers() {
+        use crate::telnet::{has_keep_alive_marker, keep_alive_gag_matches, keep_alive_marker, keep_alive_rand_missing};
+        assert_eq!(keep_alive_marker(42), "###_idler_message_42_###");
+        assert!(has_keep_alive_marker("No help on '###_idler_message_42_###'."));
+        assert!(!has_keep_alive_marker("help thisistheidlemessage"));
+
+        // The editors' warning: a Custom command without ##rand## only.
+        assert!(keep_alive_rand_missing("Custom", "help thisistheidlemessage"));
+        assert!(keep_alive_rand_missing("custom", ""));
+        assert!(!keep_alive_rand_missing("Custom", "help ##rand##"));
+        assert!(!keep_alive_rand_missing("NOP", "help thisistheidlemessage"));
+        assert!(!keep_alive_rand_missing("Generic", ""));
+
+        // The Gag text: escape codes and case ignored; empty matches nothing.
+        assert!(keep_alive_gag_matches("thisistheidlemessage", "\x1b[1;31mNo help on THISISTHEIDLEMESSAGE.\x1b[0m"));
+        assert!(keep_alive_gag_matches("Huh?", "Huh?"));
+        // A code inside the text doesn't break it.
+        assert!(keep_alive_gag_matches("idlemessage", "this is the idle\x1b[32mmessage"));
+        assert!(!keep_alive_gag_matches("thisistheidlemessage", "You say hello."));
+        assert!(!keep_alive_gag_matches("", "anything"));
+        assert!(!keep_alive_gag_matches("   ", "anything at all"));
+    }
+
+    /// The marker is gagged whenever the type sends one; the Gag text only when ticked,
+    /// for a Custom keepalive, within KEEP_ALIVE_GAG_WINDOW of one going out.
+    #[test]
+    fn test_is_keepalive_reply() {
+        let mut w = World::new("w");
+        w.settings.keep_alive_type = KeepAliveType::Custom;
+        w.settings.keep_alive_gag = "thisistheidlemessage".to_string();
+        let reply = "No help available on thisistheidlemessage.";
+        assert!(w.is_keepalive_reply("###_idler_message_7_###"), "the marker, box unticked");
+        assert!(!w.is_keepalive_reply(reply), "unticked");
+
+        w.settings.keep_alive_gag_enabled = true;
+        assert!(!w.is_keepalive_reply(reply), "no keepalive sent yet");
+        w.last_nop_time = Some(std::time::Instant::now());
+        assert!(w.is_keepalive_reply(reply));
+        assert!(!w.is_keepalive_reply("You say hello."));
+        w.last_nop_time = std::time::Instant::now().checked_sub(crate::telnet::KEEP_ALIVE_GAG_WINDOW + std::time::Duration::from_secs(1));
+        if w.last_nop_time.is_some() {
+            assert!(!w.is_keepalive_reply(reply), "too long after the keepalive");
+            assert!(w.is_keepalive_reply("###_idler_message_7_###"), "the marker has no window");
+        }
+
+        w.last_nop_time = Some(std::time::Instant::now());
+        w.settings.keep_alive_type = KeepAliveType::Generic;
+        assert!(!w.is_keepalive_reply(reply), "the Gag text is a Custom keepalive's");
+        assert!(w.is_keepalive_reply("###_idler_message_7_###"));
+        w.settings.keep_alive_type = KeepAliveType::Nop;
+        assert!(!w.is_keepalive_reply("###_idler_message_7_###"));
+    }
+
+    /// The reply named by the Gag text is gagged in the real arrival path, with the blank
+    /// line after it, and the next line shows.
+    #[test]
+    fn test_custom_keepalive_gag_text_is_gagged_on_arrival() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("test");
+        world.settings.keep_alive_type = KeepAliveType::Custom;
+        world.settings.keep_alive_cmd = "help thisistheidlemessage".to_string();
+        world.settings.keep_alive_gag_enabled = true;
+        world.settings.keep_alive_gag = "thisistheidlemessage".to_string();
+        world.last_nop_time = Some(std::time::Instant::now());
+        world.showing_splash = false;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = false;
+
+        app.process_server_data(0, b"\x1b[33mNo help on thisistheidlemessage.\x1b[0m\r\n\r\nThe wind blows.\r\n", 24, 80, false);
+
+        let lines: Vec<(String, bool)> = app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.gagged)).collect();
+        assert!(lines.iter().any(|(t, g)| t.contains("thisistheidlemessage") && *g), "the reply is kept, gagged: {lines:?}");
+        assert!(lines.iter().any(|(t, g)| t.contains("The wind blows.") && !*g), "{lines:?}");
+        assert!(!lines.iter().any(|(t, g)| t.is_empty() && !*g), "the blank line after it is dropped: {lines:?}");
+    }
+
+    #[test]
     fn test_is_visually_empty() {
         use super::is_visually_empty;
 
@@ -9900,6 +9979,8 @@ third
             auto_connect_type: "none".to_string(),
             keep_alive_type: "none".to_string(),
             keep_alive_cmd: String::new(),
+            keep_alive_gag_enabled: true,
+            keep_alive_gag: "Huh?".to_string(),
             gmcp_packages: String::new(),
             auto_reconnect_secs: "0".to_string(),
             has_notes: true,
@@ -9941,6 +10022,8 @@ third
         assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt,
             "world_type must be hydrated - this mirror used to never touch it at all");
         assert_eq!(app.worlds[0].settings.prompt_wait_ms, 2500);
+        assert!(app.worlds[0].settings.keep_alive_gag_enabled);
+        assert_eq!(app.worlds[0].settings.keep_alive_gag, "Huh?");
         assert_eq!(app.worlds[0].settings.slack_token, "xoxb-token");
         assert_eq!(app.worlds[0].settings.slack_channel, "#general");
         assert_eq!(app.worlds[0].settings.slack_workspace, "acme");
@@ -10074,13 +10157,46 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Slack,
             "an empty incoming world_type must be treated as 'field not touched', not 'convert to MUD'");
         assert_eq!(app.worlds[0].settings.slack_token, "xoxb-existing",
             "an empty incoming slack_token must likewise be treated as 'field not touched'");
+    }
+
+    /// A client that predates Gag Text sends None and leaves it; one that knows it
+    /// sets both, and the broadcast carries what is stored.
+    #[test]
+    fn test_update_world_settings_keep_alive_gag() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].settings.keep_alive_gag_enabled = true;
+        app.worlds[0].settings.keep_alive_gag = "Huh?".to_string();
+        let save = |app: &mut App, on: Option<bool>, gag: Option<String>| {
+            app.update_world_settings(
+                0, "alpha".to_string(), String::new(), String::new(), String::new(),
+                String::new(), false, false,
+                "utf8".to_string(), "connect".to_string(), "Custom".to_string(), "help x".to_string(),
+                String::new(), "0".to_string(), true, true, true,
+                String::new(), 1000, None, String::new(), String::new(), String::new(),
+                String::new(), String::new(), String::new(), String::new(),
+                None, on, gag,
+            );
+        };
+        save(&mut app, None, None);
+        assert!(app.worlds[0].settings.keep_alive_gag_enabled);
+        assert_eq!(app.worlds[0].settings.keep_alive_gag, "Huh?");
+
+        app.ws_broadcast_log.lock().unwrap().clear();
+        save(&mut app, Some(false), Some("thisistheidlemessage".to_string()));
+        assert!(!app.worlds[0].settings.keep_alive_gag_enabled);
+        assert_eq!(app.worlds[0].settings.keep_alive_gag, "thisistheidlemessage");
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(log.iter().any(|m| matches!(m, WsMessage::WorldSettingsUpdated { settings, .. }
+            if !settings.keep_alive_gag_enabled && settings.keep_alive_gag == "thisistheidlemessage")), "{log:?}");
     }
 
     /// A save that DOES send a real `world_type`/`prompt_wait_ms`/token must apply all
@@ -10098,7 +10214,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud_timed_prompt".to_string(), 2500, None, "xoxb-new".to_string(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt);
@@ -10122,7 +10238,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "shell".to_string(), 0, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Shell);
@@ -10151,7 +10267,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Mud);
@@ -10322,7 +10438,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10343,7 +10459,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10364,7 +10480,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -10443,7 +10559,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
         assert!(!app.worlds[0].settings.mccp2_enabled);
         match rx.try_recv() {
@@ -10462,7 +10578,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None,
+            None, None, None,
         );
         assert!(rx.try_recv().is_err(), "an unchanged save must not re-send the toggle");
     }
@@ -10472,11 +10588,11 @@ third
     // skip entirely (T37).
 
     fn call_update_global_settings(app: &mut App, gui_transparency: f32, color_offset_percent: u8, input_height: u16, font_size: f32, ws_password: &str) {
-        call_update_global_settings_clearing(app, gui_transparency, color_offset_percent, input_height, font_size, ws_password, None);
+        call_update_global_settings_clearing(app, gui_transparency, color_offset_percent, input_height, font_size, ws_password, None, None);
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn call_update_global_settings_clearing(app: &mut App, gui_transparency: f32, color_offset_percent: u8, input_height: u16, font_size: f32, ws_password: &str, clear_input_on_send: Option<bool>) {
+    fn call_update_global_settings_clearing(app: &mut App, gui_transparency: f32, color_offset_percent: u8, input_height: u16, font_size: f32, ws_password: &str, clear_input_on_send: Option<bool>, taskbar_alert: Option<bool>) {
         app.update_global_settings(
             0, true, true, true,
             "unseen".to_string(), false, false, true,
@@ -10488,7 +10604,7 @@ third
             String::new(), String::new(), ws_password.to_string(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, None, None, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None, None, taskbar_alert,
         );
     }
 
@@ -10512,7 +10628,7 @@ third
             String::new(), String::new(), String::new(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, profile("native-linux", "superfast"), None, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, profile("native-linux", "superfast"), None, None, None,
         );
         assert_eq!(app.settings.text_reveal_for("native-linux"), TextReveal::SuperFast);
         assert_eq!(app.settings.text_reveal, TextReveal::Off, "the console's own is not a client's to set");
@@ -10530,7 +10646,7 @@ third
             String::new(), String::new(), String::new(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, profile("bogus", "fast"), None, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, profile("bogus", "fast"), None, None, None,
         );
         assert!(!app.settings.text_reveal_profiles.contains_key("bogus"), "an unknown key is refused");
         assert_eq!(app.settings.text_reveal_for("app-android"), TextReveal::Off, "an interface that never chose is Off");
@@ -10560,7 +10676,7 @@ third
             String::new(), String::new(), String::new(),
             false, true, false, None,
             legacy_mode.to_string(), "all".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, None, None, profile,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None, profile, None,
         );
     }
 
@@ -10680,13 +10796,28 @@ third
     #[test]
     fn test_update_global_settings_clear_input_on_send_none_is_unchanged() {
         let mut app = App::new();
-        call_update_global_settings_clearing(&mut app, 1.0, 0, 5, 14.0, "", Some(true));
+        call_update_global_settings_clearing(&mut app, 1.0, 0, 5, 14.0, "", Some(true), None);
         assert!(app.settings.clear_input_on_send);
         call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "");
         assert!(app.settings.clear_input_on_send, "an older client's save must not reset it");
-        call_update_global_settings_clearing(&mut app, 1.0, 0, 5, 14.0, "", Some(false));
+        call_update_global_settings_clearing(&mut app, 1.0, 0, 5, 14.0, "", Some(false), None);
         assert!(!app.settings.clear_input_on_send);
         assert!(!app.build_global_settings_msg().clear_input_on_send);
+    }
+
+    /// Taskbar Alert is set only by the GUIs that show it; every other save (an older
+    /// client, the console's, a browser's) sends `None` and leaves it alone.
+    #[test]
+    fn test_update_global_settings_taskbar_alert_none_is_unchanged() {
+        let mut app = App::new();
+        assert!(!app.settings.taskbar_alert, "off by default");
+        call_update_global_settings_clearing(&mut app, 1.0, 0, 5, 14.0, "", None, Some(true));
+        assert!(app.settings.taskbar_alert);
+        assert!(app.build_global_settings_msg().taskbar_alert);
+        call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "");
+        assert!(app.settings.taskbar_alert, "a save without it must not reset it");
+        call_update_global_settings_clearing(&mut app, 1.0, 0, 5, 14.0, "", None, Some(false));
+        assert!(!app.settings.taskbar_alert);
     }
 
     #[test]
@@ -21984,6 +22115,7 @@ fn the_web_settings_show_only_this_interfaces_rows() {
         "['setup-zwj-toggle', false]",
         "['setup-keyboard-visible-toggle', touch]",
         "['setup-clear-input-toggle', deviceMode !== 'phone']",
+        "['setup-taskbar-alert-toggle', !!window.WEBVIEW_MODE]",
         "['font-phone-minus', !window.WEBVIEW_MODE]",
         "['font-tablet-minus', !window.WEBVIEW_MODE]",
     ] {
@@ -21991,6 +22123,41 @@ fn the_web_settings_show_only_this_interfaces_rows() {
     }
     assert!(js.contains("        showOnlyThisInterfacesSettings();\n    }"), "asked at every opening (end of updateSetupPopupUI)");
     assert!(js.contains("zwj_enabled: zwjEnabled,") && js.contains("keyboard_always_visible: keyboardAlwaysVisible"), "Save still sends the hidden values");
+    assert!(js.contains("taskbar_alert: taskbarAlert,"), "a browser sends back the Taskbar Alert it was sent");
+    let html = include_str!("web/index.html");
+    assert!(html.contains("id=\"setup-taskbar-alert-toggle\""));
+}
+
+/// The web world editor's Keep Alive rows: the warning's text is the console's and native
+/// GUI's, it follows the command as it is typed, and Save sends the Gag fields.
+#[test]
+fn the_web_world_editor_warns_and_sends_keep_alive_gag() {
+    let js = include_str!("web/app.js");
+    assert!(js.contains(&format!("const KEEP_ALIVE_RAND_WARNING = '{}';", crate::telnet::KEEP_ALIVE_RAND_WARNING)));
+    assert!(js.contains(&format!("!elements.worldEditKeepAliveCmd.value.includes('{}')", crate::telnet::KEEP_ALIVE_RAND)));
+    assert!(js.contains("elements.worldEditKeepAliveCmd.addEventListener('input', updateKeepAliveWarning);"));
+    assert!(js.contains("keep_alive_gag_enabled: elements.worldEditKeepAliveGagEnabled.checked,"));
+    assert!(js.contains("keep_alive_gag: elements.worldEditKeepAliveGag.value,"));
+    let html = include_str!("web/index.html");
+    // The checkbox comes before the field's name.
+    assert!(html.contains("<input type=\"checkbox\" id=\"world-edit-keep-alive-gag-enabled\"> Gag Text</label>"));
+}
+
+/// The WebView GUI's taskbar and notifications (src/desktop.rs): the page asks its host,
+/// and only from a window of output - never a popup, grep or notes window, a browser or the
+/// Android app; the host's IPC names match.
+#[test]
+fn the_webview_page_asks_its_host_for_the_taskbar_and_notifications() {
+    let js = include_str!("web/app.js");
+    assert!(js.contains("if (!window.WEBVIEW_MODE || popupWindowMode || grepMode || noteMode) return;"));
+    assert!(js.contains("if (isFromServer && !isGapFill && !msg.gagged && msg.data) noteTaskbarAlert();"), "live, shown text only");
+    assert!(js.contains("if (!taskbarAlert || taskbarAlertSent || document.hasFocus()) return;"));
+    assert!(js.contains("desktopHostSend('badge:' + serverActivityCount);"));
+    assert!(js.contains("desktopHostSend('notify:' + JSON.stringify({ title: msg.title || 'Clay', message: msg.message || '' }));"));
+    let host = include_str!("webview_gui.rs");
+    for ipc in ["body == \"alert\"", "strip_prefix(\"badge:\")", "strip_prefix(\"notify:\")"] {
+        assert!(host.contains(ipc), "the host reads {ipc}");
+    }
 }
 
 /// New Only's seen marks in the web page: taken after the buffer is hydrated (the message's

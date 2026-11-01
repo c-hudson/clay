@@ -325,7 +325,8 @@ Play a test ANSI music sequence (C-D-E-F-G) to verify audio.
 Requires ANSI Music enabled in `/setup` and a connected web/GUI client.
 
 ### /notify
-Send a notification to the Android app.
+Send a notification: the Android app's, and the desktop's in the native and WebView GUIs
+(see **On the Desktop** in the GUI chapter). It is titled with the world's name.
 
 ```
 /notify <message>

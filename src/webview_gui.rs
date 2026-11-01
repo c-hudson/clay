@@ -84,6 +84,12 @@ enum WvEvent {
     /// Relay the Settings window's live font preview to every other window
     /// (payload: the JSON argument for app.js's `__clayFontPreview`).
     FontPreview { payload: String, from: tao::window::WindowId },
+    /// Taskbar Alert: the MUD sent text while the page had no focus (src/desktop.rs).
+    Alert,
+    /// The activity count for the taskbar or Dock, from the page whose it is.
+    Badge { count: usize, from: tao::window::WindowId },
+    /// `/notify`, from the page that got it (every window's page does).
+    Notify { title: String, message: String, from: tao::window::WindowId },
 }
 
 use crate::theme::ThemeFile;
@@ -1372,6 +1378,18 @@ fn dispatch_ipc_message(
         if let Ok(opacity) = rest.parse::<f64>() {
             let _ = proxy.send_event(WvEvent::SetOpacity(opacity));
         }
+    } else if body == "alert" {
+        let _ = proxy.send_event(WvEvent::Alert);
+    } else if let Some(rest) = body.strip_prefix("badge:") {
+        if let Ok(count) = rest.parse::<usize>() {
+            let _ = proxy.send_event(WvEvent::Badge { count, from: window_id });
+        }
+    } else if let Some(json_str) = body.strip_prefix("notify:") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let title = v["title"].as_str().unwrap_or("Clay").to_string();
+            let message = v["message"].as_str().unwrap_or("").to_string();
+            let _ = proxy.send_event(WvEvent::Notify { title, message, from: window_id });
+        }
     }
 }
 
@@ -1577,8 +1595,17 @@ fn create_webview_window(
     params: &WebViewParams,
     reload_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
 ) -> io::Result<()> {
+    // The windows' class (X11's WM_CLASS, Wayland's app id) is `clay`, whatever the binary
+    // is called: docks match a window to clay.desktop by it, for the activity badge.
+    #[cfg(target_os = "linux")]
+    glib::set_prgname(Some("clay"));
     let event_loop = EventLoopBuilder::<WvEvent>::with_user_event().build();
     let proxy: EventLoopProxy<WvEvent> = event_loop.create_proxy();
+    #[cfg(target_os = "linux")]
+    {
+        gdk::set_program_class("clay");
+        crate::desktop::ensure_desktop_file();
+    }
 
     let window_theme = if load_user_theme().is_light() {
         Some(tao::window::Theme::Light)
@@ -1949,9 +1976,47 @@ fn create_webview_window(
                     }
                 }
             }
+            // Taskbar Alert (src/desktop.rs): any window's page may ask; the main window's
+            // taskbar button flashes, once until a Clay window has focus again.
+            Event::UserEvent(WvEvent::Alert) => {
+                if !windows.values().any(|w| w.is_focused()) && crate::desktop::alert_once() {
+                    if let Some(w) = windows.get(&main_window_id) {
+                        w.request_user_attention(Some(tao::window::UserAttentionType::Informational));
+                    }
+                }
+            }
+            Event::WindowEvent { event: WindowEvent::Focused(true), .. } => {
+                crate::desktop::alert_reset();
+                // GTK's urgency hint stays until it is taken back.
+                if let Some(w) = windows.get(&main_window_id) {
+                    w.request_user_attention(None);
+                }
+            }
+            // The badge and `/notify` are the main window's: every window's page has its own
+            // connection, its own count and its own copy of a notification.
+            Event::UserEvent(WvEvent::Badge { count, from }) if from == main_window_id => {
+                crate::desktop::set_badge(count, windows.get(&main_window_id).and_then(native_window_handle));
+            }
+            Event::UserEvent(WvEvent::Notify { ref title, ref message, from }) if from == main_window_id => {
+                crate::desktop::notify(title, message);
+            }
             _ => {}
         }
     });
+}
+
+/// The window's HWND, for its taskbar button's badge (Windows; nothing elsewhere).
+fn native_window_handle(window: &tao::window::Window) -> Option<isize> {
+    #[cfg(windows)]
+    {
+        use tao::platform::windows::WindowExtWindows;
+        Some(window.hwnd())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
+    }
 }
 
 #[cfg(all(test, unix, not(target_os = "macos")))]

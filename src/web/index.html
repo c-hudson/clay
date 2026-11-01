@@ -214,6 +214,7 @@
         <div id="menu-dropdown" class="menu-dropdown">
             <div class="menu-item" data-action="help">Help<span class="shortcut">F1</span></div>
             <div class="menu-item" data-action="world-selector">World Selector<span class="shortcut">/worlds</span></div>
+            <div class="menu-item menu-edit-world" data-action="edit-world">Edit World<span class="shortcut">/worlds -e</span></div>
             <div class="menu-item" data-action="actions">Actions<span class="shortcut">/actions</span></div>
             <div class="menu-item" data-action="setup">Settings<span class="shortcut">/setup</span></div>
             <div class="menu-item" data-action="emoji_picker">Emoji Picker</div>
@@ -742,7 +743,19 @@
                             <div class="setting-row" id="world-edit-keep-alive-cmd-field">
                                 <span class="setting-label">Keep Alive Cmd</span>
                                 <div class="setting-value">
-                                    <input type="text" id="world-edit-keep-alive-cmd" class="editor-input" autocomplete="off">
+                                    <input type="text" id="world-edit-keep-alive-cmd" class="editor-input" autocomplete="off" placeholder="help ##rand##">
+                                </div>
+                            </div>
+                            <div class="setting-row type-gated" id="world-edit-keep-alive-warning-field">
+                                <span class="setting-label"></span>
+                                <div class="setting-value">
+                                    <span class="we-warning" id="world-edit-keep-alive-warning"></span>
+                                </div>
+                            </div>
+                            <div class="setting-row type-gated" id="world-edit-keep-alive-gag-field">
+                                <label class="setting-label we-check-label"><input type="checkbox" id="world-edit-keep-alive-gag-enabled"> Gag Text</label>
+                                <div class="setting-value">
+                                    <input type="text" id="world-edit-keep-alive-gag" class="editor-input" autocomplete="off" placeholder="text in the MUD's reply">
                                 </div>
                             </div>
                             <div class="setting-row type-gated" id="world-edit-encoding-field">
@@ -952,6 +965,12 @@
                                             <span class="setting-label">Clear Input on Send</span>
                                             <div class="setting-value">
                                                 <div id="setup-clear-input-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row" title="Flash the taskbar button (bounce the Dock icon on macOS) when the MUD sends text while no Clay window has focus.">
+                                            <span class="setting-label">Taskbar Alert</span>
+                                            <div class="setting-value">
+                                                <div id="setup-taskbar-alert-toggle" class="toggle"></div>
                                             </div>
                                         </div>
                                         <div class="setting-row" title="Keep the on-screen keyboard visible on phones/tablets. Ignored (soft keyboard hidden) whenever a hardware keyboard is attached.">

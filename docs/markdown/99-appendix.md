@@ -133,6 +133,9 @@ keep_alive_type=nop
 keep_alive_cmd=
 ```
 
+A Custom keepalive's Gag is `keep_alive_gag_enabled=true` (written only when ticked) and
+`keep_alive_gag=<text>`.
+
 Slack/Discord worlds use `discord_token`, `discord_guild` (Server), `discord_channel`
 (Send To), `discord_channels` (Show Only), `slack_token` (bot, `xoxb-`), `slack_app_token`
 (`xapp-`), `slack_workspace`, `slack_channel` and `slack_channels`; tokens are stored
@@ -203,7 +206,7 @@ the optional command to run instead of the login shell (see
 | `/testmusic` | Test ANSI music |
 | `/say <text>` | Speak text aloud |
 | `/tts [install\|voices\|...]` | Text-to-speech status and the Kokoro voice files |
-| `/notify <msg>` | Send notification (Android) |
+| `/notify <msg>` | Send notification (Android, desktop GUIs) |
 | `/gag` | In actions: hide matched line |
 
 ### TF Commands (#)

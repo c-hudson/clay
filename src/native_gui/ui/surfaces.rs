@@ -153,6 +153,11 @@ impl ClayView {
             }
             "actions" => self.open_actions(None, cx),
             "world-selector" => self.open_worlds(super::windows::worlds::Show::Selector, cx),
+            // This window's world (`/worlds -e`).
+            "edit-world" => {
+                let current = self.session.core.current;
+                self.open_worlds(super::windows::worlds::Show::Edit(current), cx);
+            }
             "setup" | "web" | "font" => self.open_settings(super::windows::settings::Tab::from_name(name), cx),
             "notes" => self.open_notes(cx),
             "notes-list" => self.open_notes_list(cx),
@@ -1126,6 +1131,8 @@ impl ClayView {
                     let d = cx.new(|cx| ConnectionLog::new(main, cx));
                     dialogs::open_quietly(self, Kind::ConnectionLog, d, window, cx);
                 }
+                // The first world's editor.
+                "world-editor" => self.open_worlds(super::windows::worlds::Show::Edit(0), cx),
                 other => self.open_surface(other, window, cx),
             },
         }

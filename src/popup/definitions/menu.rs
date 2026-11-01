@@ -14,7 +14,8 @@ pub const MENU_FIELD_LIST: FieldId = FieldId(1);
 pub const MENU_BTN_CANCEL: ButtonId = ButtonId(1);
 
 /// What a menu item opens. `/menu` is the console's: every window or popup the console
-/// can open without being told anything more (`/worlds`, but not `/worlds -e <name>`).
+/// can open without being told anything more (`/worlds`, `/worlds -e` for the current
+/// world, but not `/worlds -e <name>`).
 /// The web and GUI clients have their menu bar instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MenuItem {
@@ -23,6 +24,7 @@ pub enum MenuItem {
     WebSettings,
     Actions,
     WorldSelector,
+    EditWorld,
     RecentWorlds,
     Notes,
     NotesList,
@@ -37,7 +39,7 @@ impl MenuItem {
     /// notes too (the server's, fetched and saved over the connection - App::run_note_command).
     pub fn all(is_master: bool) -> Vec<MenuItem> {
         use MenuItem::*;
-        [Help, Setup, WebSettings, Actions, WorldSelector, RecentWorlds, Notes, NotesList, ImportSettings, EmojiPicker, FilterOutput, SearchOutput]
+        [Help, Setup, WebSettings, Actions, WorldSelector, EditWorld, RecentWorlds, Notes, NotesList, ImportSettings, EmojiPicker, FilterOutput, SearchOutput]
             .into_iter()
             .filter(|i| is_master || !matches!(i, ImportSettings))
             .collect()
@@ -50,6 +52,7 @@ impl MenuItem {
             MenuItem::WebSettings => "Web Settings",
             MenuItem::Actions => "Actions",
             MenuItem::WorldSelector => "World Selector",
+            MenuItem::EditWorld => "Edit World",
             MenuItem::RecentWorlds => "Recent Worlds",
             MenuItem::Notes => "Notes",
             MenuItem::NotesList => "Notes List",
@@ -69,6 +72,7 @@ impl MenuItem {
             MenuItem::WebSettings => "/web",
             MenuItem::Actions => "/actions",
             MenuItem::WorldSelector => "/worlds",
+            MenuItem::EditWorld => "/worlds -e",
             MenuItem::RecentWorlds => "action:recent_worlds",
             MenuItem::Notes => "/note",
             MenuItem::NotesList => "/note -l",
@@ -134,6 +138,7 @@ fn menu_help_text() -> Vec<String> {
         "  Web Settings     - Web server and remote access     (/web)",
         "  Actions          - Triggers and automation          (/actions)",
         "  World Selector   - Browse and connect to worlds     (/worlds)",
+        "  Edit World       - This world's settings            (/worlds -e)",
         "  Recent Worlds    - Worlds you were in lately        (key)",
         "  Notes            - This world's notes               (/note)",
         "  Notes List       - Every world's notes              (/note -l)",
@@ -162,7 +167,8 @@ mod tests {
 
     #[test]
     fn test_menu_items() {
-        assert_eq!(MenuItem::all(true).len(), 12);
+        assert_eq!(MenuItem::all(true).len(), 13);
+        assert_eq!(MenuItem::EditWorld.command(), "/worlds -e");
         assert_eq!(MenuItem::Help.label(), "Help");
         assert_eq!(MenuItem::Help.command(), "/help");
         // The remote console has the notes editor and its list, but not Import.

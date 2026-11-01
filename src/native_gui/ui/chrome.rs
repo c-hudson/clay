@@ -170,6 +170,7 @@ pub(super) type MenuEntry = (&'static str, &'static str, &'static str);
 pub(super) const MAIN_MENU: &[Option<MenuEntry>] = &[
     Some(("help", "Help", "F1")),
     Some(("world-selector", "World Selector", "/worlds")),
+    Some(("edit-world", "Edit World", "/worlds -e")),
     Some(("actions", "Actions", "/actions")),
     Some(("setup", "Settings", "/setup")),
     Some(("emoji_picker", "Emoji Picker", "")),
@@ -187,23 +188,42 @@ pub(super) const MAIN_MENU: &[Option<MenuEntry>] = &[
 ];
 
 /// Whether the hamburger shows `action`: Change Password and Logout only on a multiuser
-/// server, Import Picture only where the server uploads pictures (as app.js hides it).
+/// server, Edit World only on a single-user one (multiuser has no world editing), Import
+/// Picture only where the server uploads pictures (as app.js hides them).
 pub(super) fn menu_shows(action: &str, multiuser: bool, picture_upload: bool) -> bool {
     match action {
         "change-password" | "logout" => multiuser,
+        "edit-world" => !multiuser,
         "import-picture" => picture_upload,
         _ => true,
     }
 }
 
+/// Whether every kind of server shows `action` (the desktop menus hide the rest while a
+/// server lacks them).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(super) fn menu_always_shows(action: &str) -> bool {
+    [false, true].into_iter().all(|m| [false, true].into_iter().all(|p| menu_shows(action, m, p)))
+}
+
 /// The hamburger's items as they show, in the sections its separators make, none empty.
 /// The desktop's app menu (appmenu.rs) is the same.
 pub(super) fn menu_sections(multiuser: bool, picture_upload: bool) -> Vec<Vec<MenuEntry>> {
+    sections_of(|action| menu_shows(action, multiuser, picture_upload))
+}
+
+/// Every item the hamburger can show, whatever the server, in its sections.
+#[cfg_attr(not(any(target_os = "linux", windows, test)), allow(dead_code))]
+pub(super) fn every_menu_section() -> Vec<Vec<MenuEntry>> {
+    sections_of(|_| true)
+}
+
+fn sections_of(shows: impl Fn(&str) -> bool) -> Vec<Vec<MenuEntry>> {
     let mut sections: Vec<Vec<MenuEntry>> = vec![Vec::new()];
     for entry in MAIN_MENU {
         match entry {
             None => sections.push(Vec::new()),
-            Some(e) if menu_shows(e.0, multiuser, picture_upload) => sections.last_mut().expect("one section").push(*e),
+            Some(e) if shows(e.0) => sections.last_mut().expect("one section").push(*e),
             Some(_) => {}
         }
     }
@@ -857,7 +877,7 @@ impl ClayView {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAIN_MENU, menu_sections};
+    use super::{MAIN_MENU, every_menu_section, menu_always_shows, menu_sections};
 
     /// The hamburger menu is index.html's `#menu-dropdown`, item for item and separator
     /// for separator (the web hides some per platform; this menu hides some per mode).
@@ -889,7 +909,7 @@ mod tests {
         assert_eq!(
             ids(false, false),
             vec![
-                vec!["help", "world-selector", "actions", "setup", "emoji_picker"],
+                vec!["help", "world-selector", "edit-world", "actions", "setup", "emoji_picker"],
                 vec!["toggle-tags", "filter", "search"],
                 vec!["new-window", "resync"],
             ],
@@ -902,7 +922,12 @@ mod tests {
                 vec!["toggle-tags", "filter", "search"],
                 vec!["change-password", "new-window", "resync"],
                 vec!["logout"],
-            ]
+            ],
+            "multiuser: no Edit World (no world editing there)"
         );
+        let every: Vec<&str> = every_menu_section().into_iter().flatten().map(|e| e.0).collect();
+        assert_eq!(every.len(), MAIN_MENU.iter().flatten().count(), "every item, whatever the server");
+        let sometimes: Vec<&str> = every.iter().copied().filter(|a| !menu_always_shows(a)).collect();
+        assert_eq!(sometimes, ["edit-world", "import-picture", "change-password", "logout"]);
     }
 }

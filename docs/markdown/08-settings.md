@@ -19,6 +19,7 @@ Open with `/setup` command:
 | Show tags | Show MUD tags at line start | Off |
 | Input height | Input area height in lines (1-15), kept per interface: the console's here, and one each for phone, tablet and desktop clients (the GUIs and a desktop browser are desktops), each set from that interface's own Settings, `Alt-Up/Down` or, in the GUI and web client, a drag of the input's top edge. In `settings.dat`: `input_height` (console), `input_height_phone`, `input_height_tablet`, `input_height_desktop`; a file from before the split starts all three at the console's | 3 |
 | Clear Input on Send | TinyFugue's `%cleardone`. Off: each line you send stays in the input area above the next one until it scrolls off the top (see **Input Area**); `Ctrl+L` clears them. On: Enter clears the input area. Phones always clear. In `settings.dat`: `clear_input_on_send` | Off |
+| Taskbar Alert | Flash the taskbar button (bounce the Dock icon on macOS) when the MUD sends text while no Clay window has focus, once until a Clay window has the focus again (see **On the Desktop** in the GUI chapter). In `settings.dat`: `taskbar_alert` | Off |
 | Text Reveal | A newly arrived line is typed onto the screen left to right behind a glitching cursor, the way tfr's terminal reveal draws it. Kept per interface: the console's here, and one each for the native GUI, the WebView GUI, a browser and the Android app (per OS, as fonts are) and for a console attached to another Clay, each set from that interface's own Settings and Off until it is: Slow 30, Normal 60, Fast 120 or Super Fast 240 characters a second (200 in the native GUI and the Android app), or Custom, which asks for the number (1 to 10000) in a popup and then shows it as "Custom (n)", or New Only, which asks for a number the same way ("New Only (n)") but types on only text this interface hasn't shown yet (each line a little faster or slower than the last; a wrapped line's rows are typed on together, so it takes as long as its longest row; a long line is sped up so none takes over 10 s). Stepping through the choices with the keys never asks, nor does moving on to the next setting, so you can go past Custom to New Only: press Enter on Custom or New Only to type its number (or to change it), and Save asks for it if you haven't. Picture rows (FANSI) reveal cell by cell like text. The screen you switch to is typed on the same way, as if its text had just arrived; with New Only, only the lines that arrived since you last looked at that world are, and the rest is drawn whole at once, so new text stands out and a switch draws faster. A page held by more-mode is typed on when Tab or Page Down lets it through. Only the drawing changes: wrapping, scrolling, paging and more-mode are what they were, and a line restored by `/reload` or read from the archive is shown whole. In `settings.dat`: `text_reveal` (the console), `text_reveal.<interface key>` (the others); a custom speed is `custom:<n>`, a New Only one `new:<n>` | Off |
 | Console Theme | Terminal color scheme | Dark |
 | GUI Theme | Colour scheme of the GUI, the web page and the Android app: Dark, Light, Dark - New, Light - New or a custom theme from `theme.dat` | Dark |
@@ -42,6 +43,7 @@ shown keeps its value; saving from there never changes it.
 | Keyboard Visible | the web page on a phone or tablet layout (the Android app, a mobile browser) |
 | ZWJ Sequence | the console's `/setup` only |
 | Clear Input on Send | everywhere but a phone, which always clears |
+| Taskbar Alert | the native and WebView GUIs only, the interfaces that have a taskbar button |
 | Font sizes: Phone and Tablet | a browser and the Android app; the GUIs are desktops and show only Desktop |
 | Separator Style | everywhere: one global setting, the look of Clay's bar in the console and of TF's status line in every interface |
 | TTS, Speak Mode | everywhere, but each interface's own: the console's `/setup` sets the console's, a phone's Settings the phone's (the Android app's), a GUI's that GUI's, kept per program and OS like fonts |
@@ -67,7 +69,8 @@ Useful for international MUD players.
 
 ## Per-World Settings (/worlds -e)
 
-Open with `/worlds -e` or edit from World Selector:
+Open with `/worlds -e`, the menu's **Edit World** (web, WebView and native GUIs, the
+Android app, and the desktop menus the native GUI fills), or edit from World Selector:
 
 ![World Editor](images/tui/world-editor.png)
 
@@ -122,7 +125,8 @@ unmarked-prompt detection introduced in v1.6.5, set its type to **MUD - Timed Pr
 | Setting | Description |
 |---------|-------------|
 | Keep alive | Keepalive type (NOP, Custom, Generic) |
-| Keep alive cmd | Custom command (when type is Custom) |
+| Keep alive cmd | Custom command (when type is Custom); put `##rand##` in it to have the reply gagged |
+| Gag text | Custom only: tick its box to also gag a reply line holding this text (the console calls it KA Gag) |
 
 **Keepalive types:**
 
@@ -130,7 +134,22 @@ unmarked-prompt detection introduced in v1.6.5, set its type to **MUD - Timed Pr
 |------|----------|
 | NOP | Sends telnet NOP command (IAC NOP) every 5 minutes |
 | Custom | Sends your custom command |
-| Generic | Sends `help commands ##_idler_message_<rand>_###` |
+| Generic | Sends `help commands ###_idler_message_<rand>_###` |
+
+**Gagging the reply.** Clay replaces `##rand##` in a Custom command with a marker,
+`###_idler_message_<rand>_###`, a new number each time; a line from the MUD that holds the
+marker is `/gag`ged, as the Generic keepalive's is, along with one blank line after it.
+For example `help ##rand##` sends `help ###_idler_message_42_###`, and a reply such as
+`No help on '###_idler_message_42_###'.` is gagged. A command without `##rand##` is sent
+as it is and nothing is gagged; the world editor says so under the field: *Keep alive
+message does not contain ##rand## and is not /gagged automatically*.
+
+Some MUDs answer without repeating what was typed (`Huh?`, `There is no help on that
+topic.`). For those, tick **Gag Text** (the box comes before its name) and type
+text from the reply: within 30 seconds of a Custom keepalive going out, a line holding
+that text is gagged too. Case and colour codes are ignored. The 30 seconds keep the same
+words from anything else later showing as normal. The marker is still gagged at any time
+when the command has `##rand##`.
 
 ### Other Settings
 

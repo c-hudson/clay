@@ -775,6 +775,12 @@ pub enum WsMessage {
         /// fields. Absent (older client): the legacy fields apply as before.
         #[serde(default)]
         chat: Option<ChatSettingsUpdate>,
+        /// A Custom keepalive's Gag checkbox and text (`WorldSettings::keep_alive_gag_enabled`,
+        /// `keep_alive_gag`). None - an older client that doesn't know them - leaves them.
+        #[serde(default)]
+        keep_alive_gag_enabled: Option<bool>,
+        #[serde(default)]
+        keep_alive_gag: Option<String>,
     },
     /// World editor "Fetch": look up a chat world's servers/channels with the given
     /// (possibly unsaved) tokens. Empty token = use the stored one. Reply:
@@ -881,6 +887,10 @@ pub enum WsMessage {
         /// which doesn't know it) = unchanged: a save from it must not reset the setting.
         #[serde(default)]
         clear_input_on_send: Option<bool>,
+        /// `Settings::taskbar_alert`. `None` (an older client, the console, a browser that
+        /// was never sent it) = unchanged.
+        #[serde(default)]
+        taskbar_alert: Option<bool>,
         #[serde(default = "default_keyboard_always_visible")]
         keyboard_always_visible: bool,
         #[serde(default)]
@@ -1887,6 +1897,11 @@ pub struct WorldSettingsMsg {
     /// Mirrors `WorldSettings::tf_type` (TinyFugue world type; empty = untyped).
     #[serde(default)]
     pub tf_type: String,
+    /// Mirror `WorldSettings::keep_alive_gag_enabled`/`keep_alive_gag`.
+    #[serde(default)]
+    pub keep_alive_gag_enabled: bool,
+    #[serde(default)]
+    pub keep_alive_gag: String,
     /// Mirror of `WorldSettings::slack_token`/`slack_channel`/`slack_workspace` and
     /// `discord_token`/`discord_guild`/`discord_channel`/`discord_dm_user`. Tokens
     /// follow the password precedent above: sent plaintext to authenticated clients,
@@ -2121,6 +2136,9 @@ pub struct GlobalSettingsMsg {
     /// existed, which keeps sent lines in the input area as TF does by default.
     #[serde(default)]
     pub clear_input_on_send: bool,
+    /// `Settings::taskbar_alert`; false (off) from a server before it existed.
+    #[serde(default)]
+    pub taskbar_alert: bool,
     /// Force the on-screen keyboard visible on phone/tablet web clients (Android
     /// app included); ignored when a hardware keyboard is attached.
     #[serde(default = "default_keyboard_always_visible")]

@@ -493,9 +493,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_nanos() % 1000 + 1) as u32;
-                                        let idler_tag = format!("###_idler_message_{}_###", rand_num);
+                                        let idler_tag = crate::telnet::keep_alive_marker(rand_num);
                                         let cmd = world.settings.keep_alive_cmd
-                                            .replace("##rand##", &idler_tag);
+                                            .replace(crate::telnet::KEEP_ALIVE_RAND, &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
@@ -505,7 +505,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_nanos() % 1000 + 1) as u32;
-                                        let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
+                                        let cmd = format!("help commands {}", crate::telnet::keep_alive_marker(rand_num));
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
@@ -1342,7 +1342,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1352,7 +1352,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                 zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
-                log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile,
+                log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert,
             );
         }
         WsMessage::ToggleWorldGmcp { world_index } => app.toggle_world_gmcp(world_index),
@@ -1730,13 +1730,14 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag } => {
             app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 msp_enabled, mcp_enabled, mccp2_enabled,
                 world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                 discord_token, discord_guild, discord_channel, discord_dm_user, chat,
+                keep_alive_gag_enabled, keep_alive_gag,
             );
         }
         WsMessage::CalculateNextWorld { current_index, exclude } => {
@@ -2968,6 +2969,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     auto_connect_type: world.settings.auto_connect_type.name().to_string(),
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: if is_owner { world.settings.keep_alive_cmd.clone() } else { String::new() },
+                    keep_alive_gag_enabled: is_owner && world.settings.keep_alive_gag_enabled,
+                    keep_alive_gag: if is_owner { world.settings.keep_alive_gag.clone() } else { String::new() },
                     gmcp_packages: if is_owner { world.settings.gmcp_packages.clone() } else { String::new() },
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
                     has_notes: is_owner && !world.settings.notes.is_empty(),

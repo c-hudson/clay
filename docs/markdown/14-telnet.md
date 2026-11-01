@@ -275,16 +275,23 @@ Configure in World Settings:
 |------|----------|
 | NOP | Sends telnet NOP command (IAC NOP) |
 | Custom | Sends your custom command |
-| Generic | Sends `help commands ##_idler_message_<rand>_###` |
+| Generic | Sends `help commands ###_idler_message_<rand>_###` |
 
 ### Custom Keepalive
 
 Set "Keep alive" to "Custom" and configure "Keep alive cmd":
 
 ```
-# Example custom keepalive
-look
+# Example custom keepalive: the reply is gagged
+help ##rand##
 ```
+
+`##rand##` becomes `###_idler_message_<rand>_###` (a new number each time), and the MUD's
+reply holding it is gagged. Without `##rand##` the command is sent as typed and nothing is
+gagged; the world editor warns about it. For a MUD whose reply doesn't repeat the command,
+tick **Gag Text** and give text from the reply: a line holding it within 30 seconds
+of the keepalive is gagged as well (case and colour codes ignored). See
+[Settings](08-settings.md#keep-alive-settings).
 
 The generic option sends a command that:
 - Works on most MUDs (help commands)

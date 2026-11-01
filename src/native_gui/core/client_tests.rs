@@ -813,6 +813,45 @@ fn clear_input_on_send_saves_from_the_native_settings() {
     assert!(app.build_global_settings_msg().clear_input_on_send);
 }
 
+/// Taskbar Alert is the native GUI's to set: its Settings save sends it as a value.
+#[test]
+fn taskbar_alert_saves_from_the_native_settings() {
+    let mut app = crate::App::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let mut s = app.build_global_settings_msg();
+    assert!(!s.taskbar_alert, "off by default");
+    s.taskbar_alert = true;
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { taskbar_alert: Some(true), .. }));
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert!(app.settings.taskbar_alert);
+}
+
+/// Taskbar Alert's cue: text the MUD sends now - never what a connect hands over, a
+/// refill of a gap, or a gagged line.
+#[test]
+fn live_text_is_what_the_mud_sends_now() {
+    let mut t = H::password();
+    t.connect_and_login();
+    t.initial(vec![world_msg(0, "w", 0..10, 7)]);
+    assert!(!t.core.take_live_text(), "what a connect hands over isn't news");
+    t.msg(data(0, 20, "hello\n"));
+    assert!(t.core.take_live_text());
+    assert!(!t.core.take_live_text(), "taken");
+    t.msg(data(0, 12, "a refill\n"));
+    assert!(!t.core.take_live_text(), "a gap filled below what was seen");
+    let mut gagged = data(0, 21, "hidden\n");
+    if let WsMessage::ServerData { gagged: g, .. } = &mut gagged {
+        *g = true;
+    }
+    t.msg(gagged);
+    assert!(!t.core.take_live_text(), "a gagged line doesn't show");
+    // Held by the server's more-mode: it came all the same; a release isn't news.
+    t.msg(WsMessage::PendingLinesUpdate { world_index: 0, count: 5 });
+    assert!(t.core.take_live_text());
+    t.msg(WsMessage::PendingLinesUpdate { world_index: 0, count: 0 });
+    assert!(!t.core.take_live_text());
+}
+
 #[test]
 fn the_scrollback_badge_counts_down_to_done() {
     let mut t = H::password();

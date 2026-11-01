@@ -25,6 +25,7 @@ mod surfaces;
 mod textdiv;
 mod theme_bridge;
 mod titlebar;
+mod taskbar;
 mod viewmode;
 mod windows;
 #[cfg(feature = "native-gui-snapshot")]
@@ -214,6 +215,8 @@ pub struct ClayView {
     titlebar: titlebar::TitleBar,
     /// The hamburger as the desktop's app menu (a Linux panel applet, the macOS menu bar).
     app_menu: appmenu::AppMenu,
+    /// The activity count on the taskbar or the Dock (the window with the connection's).
+    badge: taskbar::Badge,
     /// Import Picture: this window's pictures going to the server (ui/picture.rs).
     pictures: crate::picture::ClientUploads,
     /// `/split`: the pane without the focus (split.rs); None while the output is one.
@@ -247,6 +250,8 @@ impl ClayView {
         // The system's light/dark changed: GPUI has just put the title bar back to the
         // system's choice, so draw again to put the theme's back (titlebar.rs).
         cx.observe_window_appearance(window, |_, _window, cx| cx.notify()).detach();
+        // Focus back on Clay: Taskbar Alert's flash stops, and may come again.
+        taskbar::watch(window, cx);
         let mut session = session;
         let _ = session.core.set_visible(window.is_visible(), Instant::now());
         let theme = ThemeColors::dark_default();
@@ -305,6 +310,7 @@ impl ClayView {
             opacity: Default::default(),
             titlebar: Default::default(),
             app_menu: Default::default(),
+            badge: Default::default(),
             pictures: Default::default(),
             split: None,
             drawing_other_pane: false,
@@ -374,8 +380,12 @@ impl ClayView {
                             self.client_line(Self::KOKORO_MISSING_HERE, cx);
                         }
                     }
-                    // The web client passes these to Android's notifications only.
-                    crate::websocket::WsMessage::Notification { .. } => {}
+                    // `/notify`: a desktop notification, once - every `/window` gets a copy.
+                    crate::websocket::WsMessage::Notification { title, message } => {
+                        if !self.is_follower() {
+                            crate::desktop::notify(&title, &message);
+                        }
+                    }
                     // What a TF command this window ran does to its input line (/input, /grab,
                     // /dokey, kb*), in order.
                     crate::websocket::WsMessage::InputOps { ops } => {
@@ -1350,6 +1360,9 @@ impl Render for ClayView {
         let shown = appmenu::Shown { multiuser: self.session.core.is_multiuser(), picture_upload: self.session.core.server_picture_upload };
         let owns_connection = self.link.leader.is_none();
         self.app_menu.apply(window, shown, owns_connection, cx);
+        if owns_connection {
+            self.badge.apply(window, self.session.core.activity);
+        }
         let need_login = matches!(self.session.core.status(), Status::NeedLogin { .. });
         if need_login && !self.login_focused {
             // The cursor goes where typing starts: the name in multiuser mode, else the password.
@@ -1509,6 +1522,8 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         #[cfg(not(target_os = "windows"))]
         cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale);
         let fonts = fonts::load(cx);
+        // The launcher entry docks attach the activity badge to (Linux).
+        crate::desktop::ensure_desktop_file();
         let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true, leader: None, origin: None };
         let Some((main, main_window)) = open_view_window(cx, fonts, session, Some(events), viewmode::ViewMode::default(), how) else {
             panic!("open the main window");
@@ -1585,9 +1600,13 @@ pub(super) fn open_view_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions { title: Some(title), ..Default::default() }),
+                // Wayland's app id; X11 takes `set_app_id` (below). Docks match the window
+                // to clay.desktop by it (src/desktop.rs).
+                app_id: Some("clay".into()),
                 ..Default::default()
             },
             |window, cx| {
+                window.set_app_id("clay");
                 let v = cx.new(|cx| {
                     let mut v = ClayView::new(fonts, session, window, cx);
                     // Only the main window keeps the disk cache.

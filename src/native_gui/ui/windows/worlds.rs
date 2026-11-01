@@ -12,6 +12,7 @@ use gpui::{
     Render, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative,
 };
 use gpui_component::IndexPath;
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 
@@ -93,6 +94,8 @@ struct Editor {
     msp: bool,
     mcp: bool,
     mccp2: bool,
+    /// The Gag Text checkbox.
+    ka_gag: bool,
     chat: ChatPicker,
 }
 
@@ -237,7 +240,8 @@ impl WorldsView {
         field("discord_channels", &s.discord_channels, "blank = all channels, or #general,#dev", cx);
         field("discord_dm_user", &s.discord_dm_user, "", cx);
         field("auto_reconnect", if s.auto_reconnect_secs.is_empty() { "0" } else { &s.auto_reconnect_secs }, "0, 30, web, web,30", cx);
-        field("keep_alive_cmd", &s.keep_alive_cmd, "", cx);
+        field("keep_alive_cmd", &s.keep_alive_cmd, "help ##rand##", cx);
+        field("keep_alive_gag", &s.keep_alive_gag, "text in the MUD's reply", cx);
         field("gmcp", &s.gmcp_packages, "", cx);
         let editor = Editor {
             index,
@@ -252,9 +256,19 @@ impl WorldsView {
             msp: s.msp_enabled,
             mcp: s.mcp_enabled,
             mccp2: s.mccp2_enabled,
+            ka_gag: s.keep_alive_gag_enabled,
             chat: ChatPicker::default(),
             fields,
         };
+        // The ##rand## warning follows the command as it is typed.
+        if let Some(cmd) = editor.fields.get("keep_alive_cmd") {
+            cx.subscribe(cmd, |_, _, ev: &InputEvent, cx| {
+                if let InputEvent::Change = ev {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
         // A new type starts the Fetch picker over.
         cx.subscribe(&editor.world_type.state, |this, _, _: &SelectEvent<Vec<SharedString>>, cx| {
             if let Some(ed) = &mut this.editor {
@@ -318,6 +332,8 @@ impl WorldsView {
             discord_guild: t("discord_guild"),
             discord_channel: t("discord_channel"),
             discord_dm_user: t("discord_dm_user"),
+            keep_alive_gag_enabled: Some(ed.ka_gag),
+            keep_alive_gag: Some(t("keep_alive_gag")),
             chat: Some(ChatSettingsUpdate {
                 discord_guild: t("discord_guild").trim().to_string(),
                 discord_channel: t("discord_channel").trim().to_string(),
@@ -724,6 +740,23 @@ impl WorldsView {
             options = options.child(row("Keep Alive", select(&ed.keep_alive)));
             if custom_keep_alive {
                 options = options.child(row("Keep Alive Cmd", input("keep_alive_cmd")));
+                if crate::telnet::keep_alive_rand_missing("custom", &ed.text("keep_alive_cmd", cx)) {
+                    options = options.child(row("", div().text_size(px(12.0)).text_color(t.error).child(crate::telnet::KEEP_ALIVE_RAND_WARNING).into_any_element()));
+                }
+                // The checkbox comes before the field's name.
+                let gag_check = Checkbox::new("world-ka-gag").label("Gag Text").checked(ed.ka_gag).on_click(cx.listener(|this, on: &bool, _w, cx| {
+                    if let Some(ed) = &mut this.editor {
+                        ed.ka_gag = *on;
+                    }
+                    cx.notify();
+                }));
+                options = options.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(div().w(px(120.0)).flex_shrink_0().pr(px(5.0)).flex().justify_end().text_color(t.fg2).child(gag_check))
+                        .child(div().flex_1().min_w_0().child(input("keep_alive_gag"))),
+                );
             }
             options = options.child(row("Encoding", select(&ed.encoding))).child(row("GMCP", input("gmcp")));
         }

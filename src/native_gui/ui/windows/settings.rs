@@ -541,6 +541,7 @@ impl SettingsView {
             ("More mode", e.more_mode_enabled, |s| s.more_mode_enabled = !s.more_mode_enabled),
             ("TLS Proxy", e.tls_proxy_enabled, |s| s.tls_proxy_enabled = !s.tls_proxy_enabled),
             ("Clear Input on Send", e.clear_input_on_send, |s| s.clear_input_on_send = !s.clear_input_on_send),
+            ("Taskbar Alert", e.taskbar_alert, |s| s.taskbar_alert = !s.taskbar_alert),
             ("Debug", e.debug_enabled, |s| s.debug_enabled = !s.debug_enabled),
             ("Archive Input/Output", e.scrollback_enabled, |s| s.scrollback_enabled = !s.scrollback_enabled),
         ];

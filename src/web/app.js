@@ -68,6 +68,33 @@
         }
     }
 
+    // The WebView GUI's taskbar and desktop notifications (src/desktop.rs), from its windows
+    // of output only - never a popup (Settings, Help...), grep or notes window; a browser or
+    // the Android app has no host to ask. The host takes the badge and a notification from
+    // its main window alone, since every window's page has its own connection.
+    function desktopHostSend(msg) {
+        if (!window.WEBVIEW_MODE || popupWindowMode || grepMode || noteMode) return;
+        sendIpc(msg);
+    }
+
+    // Taskbar Alert: the MUD sent text while no window had focus - asked once until this
+    // page has focus again (the host keeps the same rule across its windows).
+    let taskbarAlertSent = false;
+    window.addEventListener('focus', function() { taskbarAlertSent = false; });
+    function noteTaskbarAlert() {
+        if (!taskbarAlert || taskbarAlertSent || document.hasFocus()) return;
+        taskbarAlertSent = true;
+        desktopHostSend('alert');
+    }
+
+    // The activity count (the ACT badge's) for the taskbar or the Dock, when it changes.
+    let badgeSent = null;
+    function reportBadge() {
+        if (serverActivityCount === badgeSent) return;
+        badgeSent = serverActivityCount;
+        desktopHostSend('badge:' + serverActivityCount);
+    }
+
     // Maximum line length to prevent performance issues with extremely long lines
     const MAX_LINE_LENGTH = 10000;
 
@@ -640,6 +667,11 @@
         worldEditKeepAliveSelect: document.getElementById('world-edit-keep-alive-select'),
         worldEditKeepAliveCmdField: document.getElementById('world-edit-keep-alive-cmd-field'),
         worldEditKeepAliveCmd: document.getElementById('world-edit-keep-alive-cmd'),
+        worldEditKeepAliveWarningField: document.getElementById('world-edit-keep-alive-warning-field'),
+        worldEditKeepAliveWarning: document.getElementById('world-edit-keep-alive-warning'),
+        worldEditKeepAliveGagField: document.getElementById('world-edit-keep-alive-gag-field'),
+        worldEditKeepAliveGagEnabled: document.getElementById('world-edit-keep-alive-gag-enabled'),
+        worldEditKeepAliveGag: document.getElementById('world-edit-keep-alive-gag'),
         worldEditEncodingField: document.getElementById('world-edit-encoding-field'),
         worldEditEncodingSelect: document.getElementById('world-edit-encoding-select'),
         worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
@@ -717,6 +749,7 @@
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
         setupClearInputToggle: document.getElementById('setup-clear-input-toggle'),
+        setupTaskbarAlertToggle: document.getElementById('setup-taskbar-alert-toggle'),
         setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
         setupTtsVoiceInput: document.getElementById('setup-tts-voice-input'),
@@ -1526,6 +1559,7 @@
     let setupAnsiMusic = true;
     let setupZwj = false;
     let setupClearInput = false;
+    let setupTaskbarAlert = false;
     let setupTtsMode = 'Off';
     let setupTabsMode = 'none';
     let setupIconBarMode = 'app_tablet';
@@ -1814,6 +1848,9 @@
     // Clear Input on Send (TF's %cleardone, Settings::clear_input_on_send): off, as in TF,
     // each line sent stays in the input area above the next (keepSentLine).
     let clearInputOnSend = false;
+    // Taskbar Alert (Settings::taskbar_alert): the WebView GUI's taskbar button flashes when
+    // the MUD sends text while no Clay window has focus (desktopHostSend 'alert').
+    let taskbarAlert = false;
     // This interface's own text-to-speech (user request 2026-10-28: each interface keeps
     // its own, set only there), under fontProfileKey - which every AuthRequest names, so
     // the server sends this page speech by it. From a server before the split, the one
@@ -4340,6 +4377,7 @@
                         clearInputOnSend = !!msg.settings.clear_input_on_send;
                         if (clearInputOnSend) clearSentLines();
                     }
+                    taskbarAlert = !!msg.settings.taskbar_alert;
                     applyTtsSettings(msg.settings);
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
@@ -4804,6 +4842,7 @@
                         const isFromServer = msg.from_server !== false;
                         // Output from the MUD now (not a refill of history): Recent Worlds.
                         if (isFromServer && !isGapFill) noteWorldActivity(msg.world_index);
+                        if (isFromServer && !isGapFill && !msg.gagged && msg.data) noteTaskbarAlert();
 
                         // Prepend any partial line from previous read (only for server data)
                         let data = msg.data;
@@ -5251,6 +5290,7 @@
                         clearInputOnSend = !!msg.settings.clear_input_on_send;
                         if (clearInputOnSend) clearSentLines();
                     }
+                    taskbarAlert = !!msg.settings.taskbar_alert;
                     applyTtsSettings(msg.settings);
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
@@ -5721,6 +5761,8 @@
             case 'PendingLinesUpdate':
                 // Update pending count for a world (used for activity indicator)
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    // Text held by the server's more-mode came from the MUD all the same.
+                    if ((msg.count || 0) > (worlds[msg.world_index].pending_count || 0)) noteTaskbarAlert();
                     worlds[msg.world_index].pending_count = msg.count || 0;
                     updateStatusBar();
                 }
@@ -5899,9 +5941,12 @@
                 break;
 
             case 'Notification':
-                // Send notification to Android app if available
+                // `/notify`: the Android app's notifications, or the WebView GUI's desktop
+                // ones (src/desktop.rs; only the main window's copy is shown).
                 if (window.Android && window.Android.showNotification) {
                     window.Android.showNotification(msg.title || 'Clay', msg.message || '');
+                } else {
+                    desktopHostSend('notify:' + JSON.stringify({ title: msg.title || 'Clay', message: msg.message || '' }));
                 }
                 break;
 
@@ -5979,6 +6024,8 @@
             case 'PendingCountUpdate':
                 // Periodic pending count update from server
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    // Text held by the server's more-mode came from the MUD all the same.
+                    if ((msg.count || 0) > (worlds[msg.world_index].pending_count || 0)) noteTaskbarAlert();
                     worlds[msg.world_index].pending_count = msg.count || 0;
                     updateStatusBar();
                 }
@@ -9473,6 +9520,9 @@
             '  next one until it scrolls off the top; Ctrl+L',
             '  clears them. On, Enter clears the input area.',
             '  Phones always clear. TF\'s %cleardone.', '',
+            'Taskbar Alert (desktop GUIs): flash the taskbar',
+            '  button, or bounce the Dock icon on macOS, when the',
+            '  MUD sends text while no Clay window has focus.', '',
             'More Mode: Pauses output when a full screen of text',
             '  arrives. Keeps you from missing important text.', '',
             'TLS Proxy: Keeps a proxy alive during hot reload', '  so TLS connections survive.', '',
@@ -9592,7 +9642,17 @@
             '  None: Don\'t auto-login.', '',
             'Keep Alive: Prevents idle disconnects.',
             '  NOP: Sends a telnet NOP (invisible to server).',
-            '  Custom: Sends a custom command you specify.', '',
+            '  Custom: Sends Keep Alive Cmd, the command you specify.',
+            '  Generic: Sends help commands with a marker.', '',
+            'Keep Alive Cmd: Write ##rand## where Clay should put a',
+            '  marker (###_idler_message_<n>_###); the MUD\'s reply',
+            '  that repeats it is /gagged. Example: help ##rand##.',
+            '  Without ##rand## nothing is gagged, and the editor',
+            '  warns you.', '',
+            'Gag Text: Tick its box to gag, as well, a line',
+            '  holding this text (any case, colours ignored) within',
+            '  30 seconds of a keepalive - for a MUD whose reply',
+            '  doesn\'t repeat the command, such as Huh?.', '',
             'Encoding: UTF-8 (modern), Latin-1 (older MUDs), FANSI.', '',
             'GMCP: Space-separated GMCP packages to request.', '',
             'MCCP2: Accept the MUD\'s offer to compress output.',
@@ -12939,6 +12999,7 @@
 
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
+        reportBadge();
 
         // Remember the focused world so a cold start can restore it (see
         // persistLastActiveWorld() / the InitialState handler). This is the single
@@ -13813,6 +13874,10 @@
         // Show/hide change password menu item
         document.querySelectorAll('.menu-change-password').forEach(el => {
             el.style.display = multiuserMode ? '' : 'none';
+        });
+        // Edit World: multiuser has no world editing
+        document.querySelectorAll('.menu-edit-world').forEach(el => {
+            el.style.display = multiuserMode ? 'none' : '';
         });
 
         // Show/hide logout menu item and its divider
@@ -14866,6 +14931,7 @@
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
         setupClearInput = clearInputOnSend;
+        setupTaskbarAlert = taskbarAlert;
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'kokoro' ? 'Kokoro' : ttsMode === 'edge' ? 'Edge' : 'Off';
         // Where only Local is offered, any engine reads as Local (the device's voice spoke).
         if (ttsDeviceVoiceOnly && setupTtsMode !== 'Off') setupTtsMode = 'Local';
@@ -14978,6 +15044,9 @@
         if (elements.setupClearInputToggle) {
             elements.setupClearInputToggle.classList.toggle('active', setupClearInput);
         }
+        if (elements.setupTaskbarAlertToggle) {
+            elements.setupTaskbarAlertToggle.classList.toggle('active', setupTaskbarAlert);
+        }
         elements.setupTtsSelect.value = setupTtsMode;
         updateCustomDropdown(elements.setupTtsSelect);
         if (elements.setupTtsSpeakModeSelect) {
@@ -15067,7 +15136,8 @@
     // Settings show only what acts in this page (Save still sends the others' values back
     // as it was given them): ZWJ Sequence is the console's; Keyboard Visible acts only on a
     // phone/tablet layout, which is also where Clear Input on Send can't (phones always
-    // clear); the WebView GUI is a desktop, so its Font tab has no Phone or Tablet size.
+    // clear); the WebView GUI is a desktop, so its Font tab has no Phone or Tablet size, and
+    // only it reaches a taskbar (Taskbar Alert).
     // Asked again at every opening, since the device mode can change.
     function showOnlyThisInterfacesSettings() {
         const touch = deviceMode === 'phone' || deviceMode === 'tablet';
@@ -15075,6 +15145,7 @@
             ['setup-zwj-toggle', false],
             ['setup-keyboard-visible-toggle', touch],
             ['setup-clear-input-toggle', deviceMode !== 'phone'],
+            ['setup-taskbar-alert-toggle', !!window.WEBVIEW_MODE],
             ['font-phone-minus', !window.WEBVIEW_MODE],
             ['font-tablet-minus', !window.WEBVIEW_MODE],
         ];
@@ -15133,6 +15204,7 @@
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
             clear_input_on_send: clearInputOnSend,
+            taskbar_alert: taskbarAlert,
             // The console's own for an older server (the one shared setting then); a
             // server that keeps them per interface ignores these from this page and takes
             // tts_profile.
@@ -15283,6 +15355,7 @@
         zwjEnabled = setupZwj;
         clearInputOnSend = setupClearInput;
         if (clearInputOnSend) clearSentLines();
+        taskbarAlert = setupTaskbarAlert;
         ttsMode = setupTtsMode.toLowerCase();
         if (elements.setupTtsVoiceInput) {
             var typedVoice = elements.setupTtsVoiceInput.value.trim().toLowerCase();
@@ -16249,6 +16322,8 @@
             elements.worldEditMccp2EnabledToggle.classList.remove('active');
         }
         elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
+        elements.worldEditKeepAliveGagEnabled.checked = !!world.settings?.keep_alive_gag_enabled;
+        elements.worldEditKeepAliveGag.value = world.settings?.keep_alive_gag || '';
         if (elements.worldEditGmcpPackages) {
             elements.worldEditGmcpPackages.value = world.settings?.gmcp_packages || '';
         }
@@ -16408,6 +16483,18 @@
         // `world_type.is_mud() && show_keep_alive_cmd`).
         const keepAliveCustom = elements.worldEditKeepAliveSelect.value === 'Custom';
         elements.worldEditKeepAliveCmdField.classList.toggle('visible', isMud && keepAliveCustom);
+        elements.worldEditKeepAliveGagField.classList.toggle('visible', isMud && keepAliveCustom);
+        updateKeepAliveWarning();
+    }
+
+    // The world editor's warning under a Custom keepalive's command without ##rand##
+    // (telnet.rs KEEP_ALIVE_RAND_WARNING, pinned to this by a test).
+    const KEEP_ALIVE_RAND_WARNING = 'Keep alive message does not contain ##rand## and is not /gagged automatically';
+    function updateKeepAliveWarning() {
+        const shown = elements.worldEditKeepAliveCmdField.classList.contains('visible')
+            && !elements.worldEditKeepAliveCmd.value.includes('##rand##');
+        elements.worldEditKeepAliveWarning.textContent = KEEP_ALIVE_RAND_WARNING;
+        elements.worldEditKeepAliveWarningField.classList.toggle('visible', shown);
     }
 
     function saveWorldEditor() {
@@ -16446,6 +16533,8 @@
             auto_login: elements.worldEditAutoLoginSelect.value,
             keep_alive_type: elements.worldEditKeepAliveSelect.value,
             keep_alive_cmd: elements.worldEditKeepAliveCmd.value,
+            keep_alive_gag_enabled: elements.worldEditKeepAliveGagEnabled.checked,
+            keep_alive_gag: elements.worldEditKeepAliveGag.value,
             gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : '',
             auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0',
             msp_enabled: elements.worldEditMspEnabledToggle.classList.contains('active'),
@@ -16488,6 +16577,8 @@
         world.settings.auto_connect_type = elements.worldEditAutoLoginSelect.value;
         world.settings.keep_alive_type = elements.worldEditKeepAliveSelect.value;
         world.settings.keep_alive_cmd = elements.worldEditKeepAliveCmd.value;
+        world.settings.keep_alive_gag_enabled = elements.worldEditKeepAliveGagEnabled.checked;
+        world.settings.keep_alive_gag = elements.worldEditKeepAliveGag.value;
         if (elements.worldEditGmcpPackages) {
             world.settings.gmcp_packages = elements.worldEditGmcpPackages.value;
         }
@@ -18238,6 +18329,10 @@
                 break;
             case 'world-selector':
                 openWorldSelectorPopup();
+                break;
+            case 'edit-world':
+                // The current world's editor (`/worlds -e`).
+                openWorldEditorPopup(currentWorldIndex);
                 break;
             case 'actions':
                 openActionsPopup();
@@ -20073,6 +20168,7 @@
         elements.worldEditKeepAliveSelect.onchange = function() {
             updateWorldEditorTypeVisibility();
         };
+        elements.worldEditKeepAliveCmd.addEventListener('input', updateKeepAliveWarning);
         elements.worldEditTypeSelect.onchange = function() {
             updateWorldEditorTypeVisibility();
             resetChatPicker();
@@ -20137,6 +20233,12 @@
         if (elements.setupClearInputToggle) {
             elements.setupClearInputToggle.onclick = function() {
                 setupClearInput = !setupClearInput;
+                updateSetupPopupUI();
+            };
+        }
+        if (elements.setupTaskbarAlertToggle) {
+            elements.setupTaskbarAlertToggle.onclick = function() {
+                setupTaskbarAlert = !setupTaskbarAlert;
                 updateSetupPopupUI();
             };
         }

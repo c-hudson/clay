@@ -139,6 +139,7 @@ more from you. Pick one with the arrow keys and Enter.
 | Web Settings | Web server and remote access (`/web`) |
 | Actions | Triggers and automation (`/actions`) |
 | World Selector | Browse and connect to worlds (`/worlds`) |
+| Edit World | This world's settings (`/worlds -e`) |
 | Recent Worlds | Worlds you were in lately |
 | Notes | This world's notes (`/note`) |
 | Notes List | Every world's notes (`/note -l`) |

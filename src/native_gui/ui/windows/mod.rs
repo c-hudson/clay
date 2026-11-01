@@ -93,6 +93,8 @@ impl PopupWindow {
         }
         // The system's light/dark changed: draw again to put the theme's title bar back.
         subs.push(cx.observe_window_appearance(window, |_, _window, cx| cx.notify()));
+        // Focus on any Clay window stops Taskbar Alert's flash.
+        super::taskbar::watch(window, cx);
         let content_focus = content.focus_handle(cx);
         window.focus(&content_focus, cx);
         Self { main, content: content.into(), content_focus, stack: Default::default(), opacity: Default::default(), titlebar: Default::default(), _subs: subs }
@@ -222,9 +224,11 @@ impl ClayView {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions { title: Some(title.into()), ..Default::default() }),
                     kind: popup_kind(),
+                    app_id: Some("clay".into()),
                     ..Default::default()
                 },
                 |window, cx| {
+                    window.set_app_id("clay");
                     let content = build(main.clone(), window, cx);
                     let f = cx.new(|cx| PopupWindow::new(main.clone(), content, window, cx));
                     frame = Some(f.downgrade());

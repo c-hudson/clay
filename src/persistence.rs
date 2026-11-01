@@ -503,6 +503,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "clear_input_on_send={}", app.settings.clear_input_on_send)?;
+    writeln!(file, "taskbar_alert={}", app.settings.taskbar_alert)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
     writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
@@ -553,6 +554,12 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
         if !world.settings.keep_alive_cmd.is_empty() {
             writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
+        }
+        if world.settings.keep_alive_gag_enabled {
+            writeln!(file, "keep_alive_gag_enabled=true")?;
+        }
+        if !world.settings.keep_alive_gag.is_empty() {
+            writeln!(file, "keep_alive_gag={}", world.settings.keep_alive_gag)?;
         }
         if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
@@ -1416,6 +1423,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "clear_input_on_send" => {
                         app.settings.clear_input_on_send = value == "true";
                     }
+                    "taskbar_alert" => {
+                        app.settings.taskbar_alert = value == "true";
+                    }
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
                     }
@@ -1470,6 +1480,12 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         }
                         "keep_alive_cmd" => {
                             world.settings.keep_alive_cmd = value.to_string();
+                        }
+                        "keep_alive_gag_enabled" => {
+                            world.settings.keep_alive_gag_enabled = value == "true";
+                        }
+                        "keep_alive_gag" => {
+                            world.settings.keep_alive_gag = value.to_string();
                         }
                         "gmcp_packages" => {
                             world.settings.gmcp_packages = migrate_gmcp_packages(value);
@@ -1913,6 +1929,12 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "keep_alive_cmd" => {
                             world.settings.keep_alive_cmd = value.to_string();
                         }
+                        "keep_alive_gag_enabled" => {
+                            world.settings.keep_alive_gag_enabled = value == "true";
+                        }
+                        "keep_alive_gag" => {
+                            world.settings.keep_alive_gag = value.to_string();
+                        }
                         "gmcp_packages" => {
                             world.settings.gmcp_packages = migrate_gmcp_packages(value);
                         }
@@ -2077,6 +2099,12 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
             if !world.settings.keep_alive_cmd.is_empty() {
                 writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
+            }
+            if world.settings.keep_alive_gag_enabled {
+                writeln!(file, "keep_alive_gag_enabled=true")?;
+            }
+            if !world.settings.keep_alive_gag.is_empty() {
+                writeln!(file, "keep_alive_gag={}", world.settings.keep_alive_gag)?;
             }
             if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
                 writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
@@ -2324,6 +2352,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "clear_input_on_send={}", app.settings.clear_input_on_send)?;
+    writeln!(file, "taskbar_alert={}", app.settings.taskbar_alert)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
     writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
@@ -2501,6 +2530,12 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
         if !world.settings.keep_alive_cmd.is_empty() {
             writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd.replace('=', "\\e"))?;
+        }
+        if world.settings.keep_alive_gag_enabled {
+            writeln!(file, "keep_alive_gag_enabled=true")?;
+        }
+        if !world.settings.keep_alive_gag.is_empty() {
+            writeln!(file, "keep_alive_gag={}", world.settings.keep_alive_gag.replace('=', "\\e"))?;
         }
         if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages.replace('=', "\\e"))?;
@@ -3428,6 +3463,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "clear_input_on_send" => {
                         app.settings.clear_input_on_send = value == "true";
                     }
+                    "taskbar_alert" => {
+                        app.settings.taskbar_alert = value == "true";
+                    }
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
                     }
@@ -3572,6 +3610,12 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             }
                             "keep_alive_cmd" => {
                                 tw.settings.keep_alive_cmd = value.replace("\\e", "=");
+                            }
+                            "keep_alive_gag_enabled" => {
+                                tw.settings.keep_alive_gag_enabled = value == "true";
+                            }
+                            "keep_alive_gag" => {
+                                tw.settings.keep_alive_gag = value.replace("\\e", "=");
                             }
                             "gmcp_packages" => {
                                 tw.settings.gmcp_packages = migrate_gmcp_packages(&unescape_string(value));
@@ -4031,6 +4075,7 @@ mod tests {
             scrollback_enabled: true,          // default: false
             log_input_enabled: true,           // default: false
             clear_input_on_send: true,         // default: false
+            taskbar_alert: true,               // default: false
             keyboard_always_visible: false,    // default: true
             tabs: TabsMode::Top,               // default: None
             icon_bar: IconBarMode::All,        // default: AppTablet
@@ -4075,6 +4120,8 @@ mod tests {
             auto_connect_type: AutoConnectType::Prompt, // default: Connect
             keep_alive_type: KeepAliveType::Custom,    // default: Nop
             keep_alive_cmd: "keepalive_cmd".to_string(), // default: ""
+            keep_alive_gag_enabled: true,              // default: false
+            keep_alive_gag: "keepalive gag".to_string(), // default: ""
             slack_token: "slack_tok".to_string(),
             slack_channel: "slack_chan".to_string(),
             slack_workspace: "slack_ws".to_string(),
@@ -4165,6 +4212,7 @@ mod tests {
         assert_eq!(a.scrollback_enabled, b.scrollback_enabled, "{context}: scrollback_enabled");
         assert_eq!(a.log_input_enabled, b.log_input_enabled, "{context}: log_input_enabled");
         assert_eq!(a.clear_input_on_send, b.clear_input_on_send, "{context}: clear_input_on_send");
+        assert_eq!(a.taskbar_alert, b.taskbar_alert, "{context}: taskbar_alert");
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
         assert_eq!(a.tabs, b.tabs, "{context}: tabs");
         assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
@@ -4187,6 +4235,8 @@ mod tests {
         assert_eq!(a.auto_connect_type.name(), b.auto_connect_type.name(), "{context}: auto_connect_type");
         assert_eq!(a.keep_alive_type.name(), b.keep_alive_type.name(), "{context}: keep_alive_type");
         assert_eq!(a.keep_alive_cmd, b.keep_alive_cmd, "{context}: keep_alive_cmd");
+        assert_eq!(a.keep_alive_gag_enabled, b.keep_alive_gag_enabled, "{context}: keep_alive_gag_enabled");
+        assert_eq!(a.keep_alive_gag, b.keep_alive_gag, "{context}: keep_alive_gag");
         assert_eq!(a.slack_token, b.slack_token, "{context}: slack_token");
         assert_eq!(a.slack_channel, b.slack_channel, "{context}: slack_channel");
         assert_eq!(a.slack_workspace, b.slack_workspace, "{context}: slack_workspace");
@@ -4871,7 +4921,7 @@ mod tests {
             String::new(), "0".to_string(), true, true, true,
             "discord".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), "Guild".to_string(), "#dev".to_string(), String::new(),
-            Some(chat),
+            Some(chat), None, None,
         );
         let s = &app.worlds[0].settings;
         assert_eq!(s.discord_channel, "#dev");
@@ -4908,6 +4958,45 @@ mod tests {
         let bogus = app.worlds.iter().find(|w| w.name == "Bogus").expect("Bogus world restored");
         assert!(matches!(bogus.settings.world_type, WorldType::Mud),
             "an unrecognized world_type value must fall back to WorldType::Mud");
+    }
+
+    /// A Custom keepalive's Gag (checkbox and text) survives settings.dat and a reload.
+    #[test]
+    fn test_keep_alive_gag_round_trips_in_settings_dat_and_reload_state() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = crate::World::new("Gagged");
+        w.settings.keep_alive_type = KeepAliveType::Custom;
+        w.settings.keep_alive_cmd = "help thisistheidlemessage".to_string();
+        w.settings.keep_alive_gag_enabled = true;
+        w.settings.keep_alive_gag = "a=b thisistheidlemessage".to_string();
+        app.worlds.push(w);
+
+        let mut buf = Vec::new();
+        write_settings_dat(&app, &mut buf, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let mut fresh = App::new();
+        load_settings_from_str(&mut fresh, &text);
+        let w = fresh.worlds.iter().find(|w| w.name == "Gagged").expect("world loaded");
+        assert!(w.settings.keep_alive_gag_enabled, "{text}");
+        assert_eq!(w.settings.keep_alive_gag, "a=b thisistheidlemessage");
+
+        let mut buf = Vec::new();
+        save_reload_state_to(&app, &mut buf).unwrap();
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &String::from_utf8(buf).unwrap()).unwrap();
+        let w = reloaded.worlds.iter().find(|w| w.name == "Gagged").expect("world restored");
+        assert!(w.settings.keep_alive_gag_enabled);
+        assert_eq!(w.settings.keep_alive_gag, "a=b thisistheidlemessage");
+
+        // Unticked and empty: nothing written, and both load as off/empty.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(crate::World::new("Plain"));
+        let mut buf = Vec::new();
+        write_settings_dat(&app, &mut buf, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(!text.contains("keep_alive_gag"), "{text}");
     }
 
     #[test]
@@ -5532,6 +5621,7 @@ pattern=foo
         assert_ne!(non_default.scrollback_enabled, default.scrollback_enabled, "scrollback_enabled should differ");
         assert_ne!(non_default.log_input_enabled, default.log_input_enabled, "log_input_enabled should differ");
         assert_ne!(non_default.clear_input_on_send, default.clear_input_on_send, "clear_input_on_send should differ");
+        assert_ne!(non_default.taskbar_alert, default.taskbar_alert, "taskbar_alert should differ");
         assert_ne!(non_default.keyboard_always_visible, default.keyboard_always_visible, "keyboard_always_visible should differ");
         assert_ne!(non_default.tabs, default.tabs, "tabs should differ");
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");
@@ -5564,6 +5654,8 @@ pattern=foo
         assert_ne!(non_default.auto_connect_type.name(), default.auto_connect_type.name(), "auto_connect_type should differ");
         assert_ne!(non_default.keep_alive_type.name(), default.keep_alive_type.name(), "keep_alive_type should differ");
         assert_ne!(non_default.keep_alive_cmd, default.keep_alive_cmd, "keep_alive_cmd should differ");
+        assert_ne!(non_default.keep_alive_gag_enabled, default.keep_alive_gag_enabled, "keep_alive_gag_enabled should differ");
+        assert_ne!(non_default.keep_alive_gag, default.keep_alive_gag, "keep_alive_gag should differ");
         assert_ne!(non_default.slack_token, default.slack_token, "slack_token should differ");
         assert_ne!(non_default.slack_channel, default.slack_channel, "slack_channel should differ");
         assert_ne!(non_default.slack_workspace, default.slack_workspace, "slack_workspace should differ");

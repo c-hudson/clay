@@ -2372,6 +2372,8 @@ pub(crate) fn handle_remote_client_key(
                     scrollback_enabled: app.settings.scrollback_enabled,
                     log_input_enabled: app.settings.log_input_enabled,
                     clear_input_on_send: Some(app.settings.clear_input_on_send),
+                    // The console has no Taskbar Alert; its save leaves the GUIs' alone.
+                    taskbar_alert: None,
                     keyboard_always_visible: app.settings.keyboard_always_visible,
                     tabs: app.settings.tabs.name().to_string(),
                     icon_bar: app.settings.icon_bar.name().to_string(),
@@ -2639,6 +2641,8 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.auto_connect_type = AutoConnectType::from_name(&settings.auto_connect);
                     app.worlds[idx].settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive);
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd.clone();
+                    app.worlds[idx].settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
+                    app.worlds[idx].settings.keep_alive_gag = settings.keep_alive_gag.clone();
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages.clone();
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
                     app.worlds[idx].settings.auto_reconnect_secs = ar_secs;
@@ -2682,6 +2686,8 @@ pub(crate) fn handle_remote_client_key(
                         }),
                         discord_channel: settings.discord_channel,
                         discord_dm_user: settings.discord_dm_user,
+                        keep_alive_gag_enabled: Some(settings.keep_alive_gag_enabled),
+                        keep_alive_gag: Some(settings.keep_alive_gag),
                     });
                 }
             }
@@ -3639,6 +3645,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         scrollback_enabled: app.settings.scrollback_enabled,
         log_input_enabled: app.settings.log_input_enabled,  // unchanged — this function only touches web settings
         clear_input_on_send: None,
+        taskbar_alert: None,
         keyboard_always_visible: app.settings.keyboard_always_visible,
         tabs: app.settings.tabs.name().to_string(),  // unchanged — this function only touches web settings
         icon_bar: app.settings.icon_bar.name().to_string(),  // unchanged — this function only touches web settings
@@ -4200,13 +4207,30 @@ mod tests {
         app.handle_remote_ws_message(WsMessage::ExecuteLocalCommand { command: "/note".into() });
         assert!(matches!(drain(&mut rx).as_slice(), [WsMessage::RequestNoteEditorState { world_index: 0 }]));
         app.open_menu_popup_new();
-        // Down to Notes (Help, Settings, Web, Actions, World Selector, Recent Worlds, Notes).
-        for _ in 0..6 {
+        // Down to Notes (Help, Settings, Web, Actions, World Selector, Edit World, Recent
+        // Worlds, Notes).
+        for _ in 0..7 {
             handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
         }
         handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         let sent = drain(&mut rx);
         assert!(matches!(sent.as_slice(), [WsMessage::RequestNoteEditorState { world_index: 0 }]), "{sent:?}");
+    }
+
+    /// The menu's Edit World opens the current world's editor, as `/worlds -e` does.
+    #[test]
+    fn edit_world_from_the_menu_opens_the_current_worlds_editor() {
+        let (mut app, tx, _rx) = remote_note_app(2);
+        app.current_world_index = 1;
+        app.open_menu_popup_new();
+        // Down to Edit World (Help, Settings, Web, Actions, World Selector, Edit World).
+        for _ in 0..5 {
+            handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        }
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let state = app.popup_manager.current().expect("a popup is open");
+        assert_eq!(state.definition.id, crate::popup::PopupId("world_editor"));
+        assert_eq!(state.get_custom("world_index"), Some("1"));
     }
 
     /// The editor's world is an index, and `UpdateNote` goes by index: removing a world
