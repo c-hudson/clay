@@ -3,7 +3,7 @@
 //! ribbon (`#tabs-ribbon`) and the MUD's status panel (`#stats-panel`).
 
 use gpui::{
-    AnyElement, Context, FontWeight, IntoElement, ParentElement, Styled, Visibility, div, point, prelude::*, px, relative, svg,
+    AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Visibility, div, point, prelude::*, px, relative, svg,
 };
 use gpui_component::tooltip::Tooltip;
 
@@ -15,6 +15,8 @@ use crate::websocket::WsMessage;
 
 /// How far an arrow scrolls the tabs or the shortcuts.
 const ARROW_STEP: f32 = 120.0;
+/// The width of the world tabs when they sit beside the output (Tabs: Left/Right).
+const TABS_COLUMN_WIDTH: f32 = 150.0;
 
 /// The built-in tiles: (menu action, icon, label, title).
 const TILES: &[(&str, &str, &str, &str)] = &[
@@ -86,6 +88,8 @@ impl ClayView {
         let (hover_bg, hover_fg) = (t.tile_hover_bg, t.tile_hover_fg);
         div()
             .id(id.clone())
+            .role(gpui::accesskit::Role::Button)
+            .aria_label(title.clone())
             .group(id.clone())
             .flex()
             .flex_col()
@@ -205,20 +209,26 @@ impl ClayView {
         )
     }
 
-    /// Where the tabs go: "top", "bottom", or nowhere.
-    pub(super) fn tabs_mode(&self) -> &str {
-        self.session.core.settings.as_ref().map_or("none", |s| s.tabs.as_str())
+    /// Where this window's tabs go: "top", "bottom", "left", "right" or nowhere - its own
+    /// choice (user ruling 2026-11-01), else the shared setting.
+    pub(super) fn tabs_mode(&self) -> String {
+        self.session.core.settings.as_ref().map_or_else(|| "none".to_string(), |s| s.tabs_for(crate::font_profile::native_key()))
     }
 
-    /// The world tabs: one per connected world.
+    /// The world tabs: one per connected world, in a strip above or below the output, or
+    /// a column beside it.
     pub(super) fn tabs_ribbon(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !matches!(self.tabs_mode(), "top" | "bottom") {
+        let mode = self.tabs_mode();
+        if !matches!(mode.as_str(), "top" | "bottom" | "left" | "right") {
             return None;
         }
         let core = &self.session.core;
         let connected: Vec<(usize, String)> = core.worlds.iter().enumerate().filter(|(_, w)| w.connected).map(|(i, w)| (i, w.name.clone())).collect();
         if connected.is_empty() {
             return None;
+        }
+        if matches!(mode.as_str(), "left" | "right") {
+            return Some(self.tabs_column(connected, mode == "left", cx));
         }
         let t = &self.chrome.tokens;
         let handle = self.chrome.tabs_scroll.clone();
@@ -232,6 +242,9 @@ impl ClayView {
             // the border as theirs - so the ribbon needs no line of its own above them.
             let mut tab = div()
                 .id(format!("tab-{i}"))
+                .role(gpui::accesskit::Role::Tab)
+                .aria_label(name.clone())
+                .aria_selected(active)
                 .flex()
                 .items_center()
                 .flex_shrink_0()
@@ -300,16 +313,80 @@ impl ClayView {
         )
     }
 
-    /// The MUD's status display (GMCP/MSDP vitals), when the world has any.
+    /// The world tabs as a column beside the output (Tabs: Left or Right; user request
+    /// 2026-11-01): one row per connected world, the current one lifted onto the elevated
+    /// colour with the accent on its outer edge - the strip's tab shape turned on its side -
+    /// the names cut short with an ellipsis, the column scrolling when the worlds don't fit.
+    fn tabs_column(&self, connected: Vec<(usize, String)>, left: bool, cx: &mut Context<Self>) -> AnyElement {
+        let t = &self.chrome.tokens;
+        let core = &self.session.core;
+        let mut list = div()
+            .id("tabs-column")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(3.0))
+            .py(px(6.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.chrome.tabs_scroll);
+        for (i, name) in connected {
+            let active = i == core.current;
+            let (hover, fg) = (t.hover, t.fg);
+            let mut tab = div()
+                .id(format!("tab-{i}"))
+                .role(gpui::accesskit::Role::Tab)
+                .aria_label(name.clone())
+                .aria_selected(active)
+                .flex()
+                .items_center()
+                .flex_shrink_0()
+                .px(px(10.0))
+                .py(px(5.0))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .cursor_pointer()
+                .font_family(self.fonts.ui.clone()).line_height(relative(SANS_LH))
+                .text_size(px(11.5))
+                .child(name);
+            tab = if left {
+                tab.border_l_2().rounded_tr(px(6.0)).rounded_br(px(6.0)).mr(px(6.0))
+            } else {
+                tab.border_r_2().rounded_tl(px(6.0)).rounded_bl(px(6.0)).ml(px(6.0))
+            };
+            tab = if active {
+                tab.bg(t.elevated).border_color(t.accent).text_color(t.fg).font_weight(FontWeight::BOLD)
+            } else {
+                tab.bg(gpui::Hsla { a: 0.07, ..t.fg }).border_color(t.border).text_color(t.fg2).hover(move |s| s.bg(hover).text_color(fg))
+            };
+            list = list.child(tab.on_click(cx.listener(move |this, _, _w, cx| this.switch_to(i, cx))));
+        }
+        // The line between the column and the output, on the output's side.
+        let line = div().w(px(1.0)).h_full().bg(t.border_subtle);
+        let column = div().flex().flex_col().w(px(TABS_COLUMN_WIDTH)).h_full().flex_shrink_0().bg(t.bar).child(list);
+        let row = div().flex().flex_row().h_full().flex_shrink_0();
+        if left { row.child(column).child(line) } else { row.child(line).child(column) }.into_any_element()
+    }
+
+    /// The MUD's status display (GMCP/MSDP vitals), when the world has any and neither
+    /// Status Panel switch (Settings', for the instance, or the world's own) is off.
     pub(super) fn stats_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let world = self.session.core.current_world()?;
+        let core = &self.session.core;
+        let world = core.current_world()?;
         if world.stats.is_empty() {
+            return None;
+        }
+        // None: a server from before the switches - shown, and no × to hide it.
+        let world_switch = world.settings.as_ref().and_then(|s| s.status_panel);
+        if world_switch == Some(false) || core.settings.as_ref().and_then(|s| s.status_panel) == Some(false) {
             return None;
         }
         let t = &self.chrome.tokens;
         let collapsed = self.chrome.stats_collapsed;
         let header = div()
             .id("stats-panel-header")
+            .flex_1()
             .flex()
             .items_center()
             .gap(px(6.0))
@@ -325,7 +402,34 @@ impl ClayView {
                 crate::native_gui::core::store::set_pref("stats_collapsed", if this.chrome.stats_collapsed { "1" } else { "0" });
                 cx.notify();
             }));
-        let mut panel = div().flex().flex_col().flex_shrink_0().font_family(self.fonts.ui.clone()).line_height(relative(SANS_LH)).text_size(px(11.0)).child(header);
+        let mut top = div().flex().items_center().child(header);
+        // × hides it for this world: the world's own switch, through `/stats hide` (a
+        // multiuser server's worlds are its operator's).
+        if world_switch.is_some() && !core.is_multiuser() {
+            let label: SharedString = format!("Hide for {}", world.name).into();
+            let tip = label.clone();
+            let world_index = core.current;
+            let hover = t.hover;
+            top = top.child(
+                div()
+                    .id("stats-panel-hide")
+                    .role(gpui::accesskit::Role::Button)
+                    .aria_label(label)
+                    .mr(px(6.0))
+                    .px(px(4.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(t.fg2)
+                    .hover(move |s| s.bg(hover))
+                    .child("×")
+                    .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                    .on_click(cx.listener(move |this, _, _w, cx| {
+                        this.send_message(WsMessage::SendCommand { world_index, command: "/stats hide".into() }, cx);
+                    })),
+            );
+        }
+        let mut panel = div().flex().flex_col().flex_shrink_0().font_family(self.fonts.ui.clone()).line_height(relative(SANS_LH)).text_size(px(11.0)).child(top);
         if !collapsed {
             let mut body = div().flex().flex_wrap().items_center().gap_x(px(16.0)).gap_y(px(3.0)).px(px(10.0)).pt(px(2.0)).pb(px(6.0));
             for entry in &world.stats {

@@ -4,10 +4,6 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
-#[cfg(feature = "native-tls-backend")]
-use tokio_native_tls::TlsStream;
-
-#[cfg(feature = "rustls-backend")]
 use tokio_rustls::client::TlsStream;
 
 // Telnet protocol constants
@@ -1143,6 +1139,36 @@ pub struct TelnetConfig {
     /// `DONT` instead of `DO`), so compression is never turned on for this
     /// session at all — see `support_him`'s doc comment.
     pub mccp2_enabled: bool,
+    /// The MTTS screen-reader bit: the user asked MUDs to be told a screen reader is in use
+    /// (Settings > "MUDs: Screen Reader"; `set_announce_screen_reader`).
+    pub screen_reader: bool,
+}
+
+/// Settings > "MUDs: Screen Reader" (`Settings::announce_screen_reader`): one process-wide
+/// flag, set whenever the setting is loaded or changed, that every connection's
+/// `TelnetConfig::default()` picks up - each connect site builds its config with
+/// `..TelnetConfig::default()`, so none can miss it.
+#[cfg(not(test))]
+static ANNOUNCE_SCREEN_READER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Tests run side by side in one process, and several load settings: per thread there.
+#[cfg(test)]
+thread_local! {
+    static ANNOUNCE_SCREEN_READER_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tell MUDs (from the next connect) that a screen reader is in use.
+pub fn set_announce_screen_reader(on: bool) {
+    #[cfg(not(test))]
+    ANNOUNCE_SCREEN_READER.store(on, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    ANNOUNCE_SCREEN_READER_TEST.with(|c| c.set(on));
+}
+
+fn announce_screen_reader() -> bool {
+    #[cfg(not(test))]
+    return ANNOUNCE_SCREEN_READER.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    return ANNOUNCE_SCREEN_READER_TEST.with(|c| c.get());
 }
 
 impl Default for TelnetConfig {
@@ -1155,6 +1181,7 @@ impl Default for TelnetConfig {
             is_tls: false,
             msp_enabled: true,
             mccp2_enabled: true,
+            screen_reader: announce_screen_reader(),
         }
     }
 }
@@ -1163,7 +1190,7 @@ impl Default for TelnetConfig {
 ///
 /// Deliberately covers more than any one job needs at the time it's added —
 /// every variant here (including `CompressionEnded`, wired up by Job 3, and
-/// `OptionEnabled`/`OptionDisabled`/`WontEchoPromptHint`, wired up by Job 4.5)
+/// `OptionEnabled`/`OptionDisabled`, wired up by Job 4.5)
 /// is reachable today, so that Design commitment 2's exhaustive `match` in
 /// the future reader's event mapper does not need a new variant added at the
 /// same moment as its first real producer.
@@ -1173,8 +1200,15 @@ pub enum TelnetEvent {
     /// — the first time it happens — not once per `feed` call that happens
     /// to contain one (see `TelnetSession::telnet_seen`).
     TelnetDetected,
-    /// Prompt text carved out of the emitted text stream at a GA/EOR or a
-    /// WONT-ECHO boundary. Mirrors `TelnetResult::prompt`.
+    /// Prompt text carved out of the emitted text stream at a GA/EOR
+    /// boundary: the server marked it as a prompt. Mirrors
+    /// `TelnetResult::prompt`, except at a `WONT ECHO`, which marks nothing
+    /// (user report 2026-11-03: thechattingzone.uk sends one at the top of
+    /// its banner, and the tail of whatever line a read ended in became the
+    /// prompt). Empty when the line in front of the GA/EOR already went out
+    /// as text in an earlier read (longer than `MAX_TEXT_HOLDBACK`, released
+    /// by the idle flush, or the marker in a packet of its own): the App's
+    /// line still waiting for its newline is then the prompt.
     Prompt(Vec<u8>),
     /// Server sent `DO NAWS`; we already answered `WILL NAWS` (in `wire`).
     NawsRequested,
@@ -1268,25 +1302,6 @@ pub enum TelnetEvent {
     /// (state already `No`) is the RFC 1143 steady state and fires nothing,
     /// same as before.
     OptionDisabled(u8),
-    /// `IAC WONT ECHO` was seen. Mirrors `TelnetResult::wont_echo_seen`
-    /// exactly: fires every time this sequence is seen, independent of
-    /// whether a `Prompt` event also fires in the same call (see
-    /// `extract_prompt`'s use below).
-    ///
-    /// Named for what this codebase actually *does* with it today, not for
-    /// what the telnet option means in general: there is no echo-state
-    /// tracking or input masking yet, so this is not "echo is off." It is a
-    /// prompt-boundary hint — the sole existing consumer is
-    /// `World::uses_wont_echo_prompt`, which arms the 150ms timeout-prompt
-    /// path (servers that mark a prompt by refusing to echo it, instead of
-    /// sending GA/EOR). `EchoOff`/`EchoOn` below carry the different, real
-    /// meaning ECHO gets as of Job 10b (plan Phase 3, step 3.4): reusing
-    /// either name here would have collided with that and meant two
-    /// different things at different times in the codebase's history, so
-    /// this heuristic keeps firing exactly as before, unconditionally
-    /// alongside whichever of the two real events also fires for the same
-    /// `WONT ECHO`.
-    WontEchoPromptHint,
     /// `IAC WILL ECHO` was seen and answered `IAC DO ECHO` (finding 7): the
     /// standard way a server says "I will echo for you," which is how a MUD
     /// asks a client to stop echoing locally so a typed password isn't
@@ -1306,10 +1321,7 @@ pub enum TelnetEvent {
     /// `IAC WONT ECHO` was seen and answered `IAC DONT ECHO`, the real
     /// counterpart to `EchoOff`: the peer is no longer offering to echo for
     /// us, so any masking `EchoOff` armed should stop. Fires every time
-    /// `IAC WONT ECHO` is seen, in addition to (never instead of)
-    /// `WontEchoPromptHint` above — the two are independent consumers of the
-    /// same wire event, one driving `World::echo_masked` and the other the
-    /// unrelated prompt-boundary heuristic.
+    /// `IAC WONT ECHO` is seen. Not a prompt boundary (see `Prompt`).
     EchoOn,
     /// A complete `!!SOUND(...)`/`!!MUSIC(...)` trigger was recognised and
     /// stripped out of the emitted text (Job 14, plan Phase 4). See
@@ -1621,7 +1633,7 @@ fn msp_holdback_start(text: &[u8], min_prefix: usize) -> Option<usize> {
 /// with neither seen, which is the split case above.
 ///
 /// Deliberately does not scan text already carved into a `TelnetEvent::Prompt`
-/// by a GA/EOR/WONT-ECHO boundary (see `feed`'s call site) — a trigger placed
+/// by a GA/EOR boundary (see `feed`'s call site) — a trigger placed
 /// on the same line as such a prompt is not recognised. MSP triggers seen in
 /// the wild are asynchronous room/event triggers on ordinary output lines,
 /// not short status-line prompts, so this is a deliberate scope limit rather
@@ -1772,7 +1784,7 @@ fn idle_release_len(text: &[u8]) -> usize {
 ///
 /// `pending_text` holds whatever plain text has been scanned but not yet
 /// released in an `outcome.text`. At the end of every `feed` call (and,
-/// separately, at every GA/EOR/WONT-ECHO prompt boundary, which flushes
+/// separately, at every GA/EOR prompt boundary, which flushes
 /// unconditionally instead) the *tail since the last newline* decides what
 /// actually gets flushed: if that tail is empty, everything flushes; if it's
 /// non-empty and no longer than `MAX_TEXT_HOLDBACK` (32 bytes), only the part
@@ -1786,7 +1798,7 @@ fn idle_release_len(text: &[u8]) -> usize {
 /// (Design commitment 4), which is what stops a `0x1B` byte inside a GMCP
 /// payload from being mistaken for one (that byte never reaches `text` at
 /// all — it is consumed as subnegotiation payload). It is *also* what makes
-/// GA/EOR and WONT-ECHO prompt extraction give the same answer no matter
+/// GA/EOR prompt extraction give the same answer no matter
 /// where a read happens to split the bytes in front of the prompt marker: a
 /// short trailing line with no newline yet is exactly as "not known to be
 /// complete" as an incomplete escape sequence is, and the split-invariance
@@ -1861,15 +1873,14 @@ pub struct TelnetSession {
     /// held back in `pending_text` before poisoning is still real, undecoded plaintext and
     /// must still reach the caller when the reader's fatal sequence flushes it.
     poisoned: bool,
-    /// True from the moment a GA/EOR/WONT-ECHO prompt extraction fires until
-    /// the next literal `\n` is scanned. Suppresses a *second* WONT-ECHO
-    /// extraction for the same still-open line. `process_telnet` has the
-    /// same rule (`prompt.is_none()`), but only ever needs a local variable
-    /// because a whole call's `cleaned` buffer never survives past its
-    /// `return`; a session has to carry the equivalent state across calls so
-    /// it gives the identical answer even when the WONT ECHO and the GA that
-    /// already claimed the line land in different `feed` calls.
+    /// True from the moment a GA/EOR prompt extraction fires until the next
+    /// literal `\n` is scanned: the open line has been claimed as a prompt,
+    /// so a second marker on it (a GA after an EOR) claims nothing more.
     prompt_open: bool,
+    /// The last text released (`feed`'s output or the idle flush) ended
+    /// mid-line, so a GA/EOR with nothing new in front of it marks that line
+    /// as the prompt (an empty `TelnetEvent::Prompt`).
+    released_mid_line: bool,
     /// Set the first time an IAC byte is ever seen, so `TelnetEvent::TelnetDetected`
     /// is emitted exactly once per session lifetime rather than once per
     /// `feed` call whose chunk happens to contain the (possibly carried-over)
@@ -1897,6 +1908,7 @@ impl TelnetSession {
             pending_compressed: Vec::new(),
             poisoned: false,
             prompt_open: false,
+            released_mid_line: false,
             telnet_seen: false,
             options_him: Box::new([OptionState::default(); 256]),
             options_us: Box::new([OptionState::default(); 256]),
@@ -2026,9 +2038,12 @@ impl TelnetSession {
     ///   rendering paths, not aspirational.
     /// - `MTTS_SSL`: from `cfg.is_tls`, the one bit that depends on the
     ///   specific connection rather than being universally true of Clay.
+    /// - `MTTS_SCREEN_READER`: from `cfg.screen_reader`, the user's "MUDs: Screen
+    ///   Reader" setting (2026-11-01: Clay has a Screen Reader mode in every interface,
+    ///   docs/markdown/24-accessibility.md), so a game can send simpler text.
     /// - Never set: `MTTS_VT100` (Clay does no VT100 line-drawing character
     ///   remapping - it passes UTF-8 through, it doesn't translate for a
-    ///   dumber terminal), `MTTS_MOUSE_TRACKING`/`MTTS_SCREEN_READER`/
+    ///   dumber terminal), `MTTS_MOUSE_TRACKING`/
     ///   `MTTS_PROXY`/`MTTS_MNES` (no such feature exists),
     ///   `MTTS_OSC_COLOR_PALETTE` (Clay never emits an OSC 4/104 palette
     ///   remap — its own OSC8 hyperlink support is an unrelated OSC code).
@@ -2059,6 +2074,9 @@ impl TelnetSession {
         let mut bits = MTTS_ANSI | MTTS_UTF8 | MTTS_256_COLOR | MTTS_TRUECOLOR;
         if self.cfg.is_tls {
             bits |= MTTS_SSL;
+        }
+        if self.cfg.screen_reader {
+            bits |= MTTS_SCREEN_READER;
         }
         bits
     }
@@ -2322,7 +2340,6 @@ impl TelnetSession {
         // Seed with whatever was held back last call; see the struct doc
         // comment's "Text hold-back" section.
         let mut text = std::mem::take(&mut self.pending_text);
-        let mut wont_echo_seen = false;
 
         let mut i = 0usize;
         while i < buf.len() {
@@ -2368,23 +2385,18 @@ impl TelnetSession {
                                 self.q_receive_will_wont(option, true, &mut wire, &mut events);
                             }
                             TELNET_WONT if option == TELNET_OPT_ECHO => {
-                                // Mirrors process_telnet's wont_echo_seen
-                                // exactly - fires every time, independent of
-                                // whether a Prompt event also fires below
-                                // (see WontEchoPromptHint's doc comment).
+                                // Unlike process_telnet's wont_echo_seen, not
+                                // a prompt boundary (see `TelnetEvent::Prompt`).
                                 // ECHO is not tracked by the Q method here
                                 // (see EchoOff's doc comment); this stays its
                                 // own special case exactly as before. Job
                                 // 10b adds the real DONT ECHO reply and
-                                // EchoOn signal alongside the pre-existing
-                                // prompt-boundary hint - process_telnet (the
+                                // EchoOn signal - process_telnet (the
                                 // frozen characterization oracle) never sent
                                 // either, so the differential test
                                 // special-cases these fixtures the same way
                                 // it does the MCCP2 activation fixture.
                                 wire.extend_from_slice(&[TELNET_IAC, TELNET_DONT, TELNET_OPT_ECHO]);
-                                wont_echo_seen = true;
-                                events.push(TelnetEvent::WontEchoPromptHint);
                                 events.push(TelnetEvent::EchoOn);
                             }
                             TELNET_WONT => {
@@ -2466,7 +2478,16 @@ impl TelnetSession {
                         }
                     }
                     TELNET_GA | TELNET_EOR => {
+                        let before = events.len();
                         extract_prompt(&mut text, &mut out_text, &mut events, &mut self.prompt_open);
+                        // Nothing new in front of the marker, but the last text that
+                        // went out ended mid-line: that line is the prompt.
+                        if events.len() == before && text.is_empty()
+                            && self.released_mid_line && !self.prompt_open
+                        {
+                            events.push(TelnetEvent::Prompt(Vec::new()));
+                            self.prompt_open = true;
+                        }
                         i += 2;
                     }
                     TELNET_NOP | TELNET_SE => {
@@ -2489,19 +2510,11 @@ impl TelnetSession {
         // Whatever this call didn't consume stays for the next feed().
         self.inbuf = buf[i..].to_vec();
 
-        // WONT ECHO's trailing-partial-line fallback, mirroring process_telnet
-        // exactly (see `prompt_open`'s doc comment for why this needs to
-        // survive across calls where process_telnet's single-call
-        // `prompt.is_none()` did not).
-        if wont_echo_seen && !self.prompt_open {
-            extract_prompt(&mut text, &mut out_text, &mut events, &mut self.prompt_open);
-        }
-
         // Job 14 (plan Phase 4): strip `!!SOUND(...)`/`!!MUSIC(...)` triggers
         // out of `text` and turn each into a TelnetEvent::MspTrigger, before
         // the hold-back decision below - see `extract_msp_triggers`'s doc
         // comment for why this runs on `text` (not `out_text`, which may
-        // already hold GA/EOR/WONT-ECHO-extracted prompt bytes) and what
+        // already hold GA/EOR-extracted prompt bytes) and what
         // "malformed" means here. Gated on `cfg.msp_enabled`: off means a
         // `!!SOUND(...)` trigger is never even looked at, let alone stripped.
         let msp_incomplete_from = if self.cfg.msp_enabled {
@@ -2574,6 +2587,7 @@ impl TelnetSession {
         // flushed everything below), or the tail is too long and both caps
         // say to give up and flush it anyway rather than hold forever.
         out_text.append(&mut text);
+        self.note_released(&out_text);
 
         TelnetOutcome { text: out_text, wire, events }
     }
@@ -2629,7 +2643,16 @@ impl TelnetSession {
     /// release, which stays right where it was.
     pub fn take_idle_flushable_text(&mut self) -> Vec<u8> {
         let release_len = idle_release_len(&self.pending_text);
-        self.pending_text.drain(..release_len).collect()
+        let released: Vec<u8> = self.pending_text.drain(..release_len).collect();
+        self.note_released(&released);
+        released
+    }
+
+    /// Text just went out: does it leave a line open (see `released_mid_line`)?
+    fn note_released(&mut self, text: &[u8]) {
+        if let Some(&last) = text.last() {
+            self.released_mid_line = last != b'\n';
+        }
     }
 
     /// Test-only: current length of `pending_compressed` (T1.1's bound test). Before the
@@ -3389,7 +3412,7 @@ mod tests {
 
     /// Compare a TelnetSession's emitted events against process_telnet's
     /// output fields for the same input. Job 4.5 added `OptionEnabled`/
-    /// `WontEchoPromptHint`, so `gmcp_negotiated`/`msdp_negotiated`/
+    /// `EchoOn`, so `gmcp_negotiated`/`msdp_negotiated`/
     /// `wont_echo_seen` are now checked here too (previously they weren't:
     /// Phase 1's `TelnetEvent` had no variant for "an option was just turned
     /// on" - the WILL/DO reply itself was already pinned via the `wire`
@@ -3413,9 +3436,9 @@ mod tests {
             "case {name}: OptionEnabled(MSDP) vs msdp_negotiated"
         );
         assert_eq!(
-            events.contains(&TelnetEvent::WontEchoPromptHint),
+            events.contains(&TelnetEvent::EchoOn),
             expected.wont_echo_seen,
-            "case {name}: WontEchoPromptHint vs wont_echo_seen"
+            "case {name}: EchoOn vs wont_echo_seen"
         );
         match &expected.prompt {
             Some(p) => assert!(
@@ -3515,9 +3538,6 @@ mod tests {
                 // reply here at all (see the `TELNET_WONT if option == TELNET_OPT_ECHO`
                 // arm near the top of this file) and predates `EchoOn` entirely, so
                 // `expected.responses`/`expected` have nothing to compare either against.
-                // Text and the WontEchoPromptHint/prompt-extraction behaviour these
-                // fixtures actually exist to pin are unaffected and still checked exactly.
-                assert_eq!(outcome.text, expected.cleaned, "case {name}: text");
                 assert_eq!(
                     outcome.wire,
                     vec![TELNET_IAC, TELNET_DONT, TELNET_OPT_ECHO],
@@ -3528,7 +3548,22 @@ mod tests {
                     "case {name}: expected EchoOn, got {:?}",
                     outcome.events
                 );
-                assert_events_equivalent(name, &outcome.events, &expected);
+                // A second deliberate divergence (user report 2026-11-03): the oracle
+                // carves the line in front of a WONT ECHO out as a prompt; the session
+                // leaves it as text - only GA/EOR mark a prompt.
+                match &expected.prompt {
+                    Some(p) if !outcome.events.contains(&TelnetEvent::Prompt(p.clone())) => {
+                        let mut kept = expected.cleaned.clone();
+                        kept.extend_from_slice(p);
+                        assert_eq!(outcome.text, kept, "case {name}: the WONT-ECHO 'prompt' stays text");
+                        assert!(!outcome.events.iter().any(|e| matches!(e, TelnetEvent::Prompt(_))),
+                            "case {name}: no prompt at a WONT ECHO, got {:?}", outcome.events);
+                    }
+                    _ => {
+                        assert_eq!(outcome.text, expected.cleaned, "case {name}: text");
+                        assert_events_equivalent(name, &outcome.events, &expected);
+                    }
+                }
                 continue;
             }
 
@@ -4032,9 +4067,9 @@ mod tests {
     // a server asks a client to stop echoing locally for a password prompt)
     // used to fall through to the WILL match's generic refusal (`IAC DONT
     // ECHO`), so Clay never masked anything and passwords rendered in the
-    // clear. `IAC WONT ECHO` already had its own special case
-    // (`WontEchoPromptHint`, Job 4.5) but replied to nothing and carried no
-    // real echo-state signal. ECHO deliberately stays outside the Q
+    // clear. `IAC WONT ECHO` already had its own special case (a prompt
+    // boundary, Job 4.5) but replied to nothing and carried no real
+    // echo-state signal. ECHO deliberately stays outside the Q
     // method's `support_him`/`support_us` tables (Job 9's note): both
     // directions are answered unconditionally every time they're seen,
     // exactly like the pre-existing WONT ECHO special case, never
@@ -4051,10 +4086,9 @@ mod tests {
     }
 
     #[test]
-    fn test_wont_echo_replies_dont_echo_and_emits_echo_on_and_prompt_hint() {
-        // The real echo-state signal (EchoOn) and the pre-existing prompt-boundary
-        // heuristic (WontEchoPromptHint) are independent consumers of the same wire
-        // event - both must fire, per EchoOn's doc comment.
+    fn test_wont_echo_replies_dont_echo_and_emits_echo_on_and_no_prompt() {
+        // The real echo-state signal (EchoOn); the text before it is not a prompt
+        // (user report 2026-11-03: only GA/EOR mark one).
         let mut session = TelnetSession::new(TelnetConfig::default());
         let mut data = b"Login: ".to_vec();
         data.extend_from_slice(&[TELNET_IAC, TELNET_WONT, TELNET_OPT_ECHO]);
@@ -4065,10 +4099,52 @@ mod tests {
             "expected EchoOn, got {:?}", outcome.events
         );
         assert!(
-            outcome.events.contains(&TelnetEvent::WontEchoPromptHint),
-            "WONT ECHO must still produce the pre-existing prompt-boundary hint \
-             (Job 4.5) alongside the new real-echo signal, got {:?}", outcome.events
+            !outcome.events.iter().any(|e| matches!(e, TelnetEvent::Prompt(_))),
+            "WONT ECHO is not a prompt marker, got {:?}", outcome.events
         );
+    }
+
+    /// The report (2026-11-03, a screenshot): thechattingzone.uk's banner starts with
+    /// `IAC WONT ECHO`, and when a read ended mid-line the tail of that line became the
+    /// prompt. Every split of that banner now gives the same text and no prompt; the
+    /// name prompt (33 bytes, over the hold-back) goes out as text, and the EOR the
+    /// server sends in a packet of its own marks it - an empty `Prompt`.
+    #[test]
+    fn test_wont_echo_banner_split_anywhere_is_text_and_a_late_eor_marks_the_prompt() {
+        let mut banner = vec![TELNET_IAC, TELNET_WONT, TELNET_OPT_ECHO];
+        banner.extend_from_slice(b"If you already have an existing character, please enter their name at the\n\r\
+            prompt below.  If you are a new user, and do not have a character yet, you will\n\r\
+            need to create one.\n\r\n\rPlease enter your name (Or NEW): ");
+        let whole: Vec<u8> = banner[3..].to_vec();
+        for k in 0..=banner.len() {
+            let mut session = TelnetSession::new(TelnetConfig::default());
+            let mut a = session.feed(&banner[..k]);
+            let b = session.feed(&banner[k..]);
+            a.text.extend_from_slice(&b.text);
+            a.events.extend(b.events);
+            a.text.extend_from_slice(&session.take_idle_flushable_text());
+            assert_eq!(a.text, whole, "split at {k}: the banner is text, whole");
+            assert!(!a.events.iter().any(|e| matches!(e, TelnetEvent::Prompt(_))),
+                "split at {k}: WONT ECHO is no prompt marker, got {:?}", a.events);
+            let eor = session.feed(&[TELNET_IAC, TELNET_EOR]);
+            assert_eq!(eor.events, vec![TelnetEvent::Prompt(Vec::new())],
+                "split at {k}: the late EOR marks the line already out");
+            // A second marker on the same line claims nothing more.
+            assert!(session.feed(&[TELNET_IAC, TELNET_GA]).events.is_empty());
+        }
+    }
+
+    /// A late GA/EOR marks only an open line: after a newline it is nothing, as before.
+    #[test]
+    fn test_late_marker_after_a_complete_line_is_nothing() {
+        let mut session = TelnetSession::new(TelnetConfig::default());
+        session.feed(&[TELNET_IAC, TELNET_NOP]); // the once-only TelnetDetected
+        let out = session.feed(b"a line long enough to go out at once, and finished\r\n");
+        assert!(out.events.is_empty());
+        assert!(session.feed(&[TELNET_IAC, TELNET_GA]).events.is_empty());
+        // A short prompt is held back and carved out at its marker as ever.
+        session.feed(b"> ");
+        assert_eq!(session.feed(&[TELNET_IAC, TELNET_GA]).events, vec![TelnetEvent::Prompt(b"> ".to_vec())]);
     }
 
     #[test]
@@ -4642,6 +4718,19 @@ mod tests {
         tls.feed(&ttype_send());
         let tls_mtts = tls.feed(&ttype_send());
         assert_eq!(tls_mtts.wire, build_ttype_response("MTTS 2317")); // 269 | MTTS_SSL(2048)
+    }
+
+    /// "MUDs: Screen Reader" sets the MTTS screen-reader bit (64); off, it stays clear.
+    #[test]
+    fn test_mtts_screen_reader_bit_follows_config_flag() {
+        let mut reader = TelnetSession::new(TelnetConfig { screen_reader: true, ..TelnetConfig::default() });
+        reader.feed(&ttype_send());
+        reader.feed(&ttype_send());
+        assert_eq!(reader.feed(&ttype_send()).wire, build_ttype_response("MTTS 333")); // 269 | MTTS_SCREEN_READER(64)
+        let mut plain = TelnetSession::new(TelnetConfig { screen_reader: false, ..TelnetConfig::default() });
+        plain.feed(&ttype_send());
+        plain.feed(&ttype_send());
+        assert_eq!(plain.feed(&ttype_send()).wire, build_ttype_response("MTTS 269"));
     }
 
     #[test]

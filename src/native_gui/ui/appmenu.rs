@@ -619,14 +619,14 @@ mod linux {
             let first = Structure::try_from(root[0][":section"].clone()).expect("a section link");
             assert_eq!(first.fields().len(), 2);
             let labels: Vec<Vec<String>> = group[1..].iter().map(|(_, _, items)| items.iter().map(|i| text(&i["label"])).collect()).collect();
-            assert_eq!(labels[0], ["Help", "World Selector", "Edit World", "Actions", "Settings", "Emoji Picker", "Import Picture"]);
+            assert_eq!(labels[0], ["Help", "World Selector", "Edit World", "Actions", "Settings", "Map", "Emoji Picker", "Import Picture"]);
             assert_eq!(labels[4], ["Quit"]);
             let help = &group[1].2[0];
             assert_eq!(text(&help["action"]), "win.help");
             assert_eq!(text(&help["accel"]), "F1");
             assert!(!group[1].2[1].contains_key("accel"), "a command isn't a key");
             let hidden: Vec<String> = group[1..].iter().flat_map(|(_, _, items)| items.iter().filter(|i| i.contains_key("hidden-when")).map(|i| text(&i["action"]))).collect();
-            assert_eq!(hidden, ["win.edit-world", "win.import-picture", "win.change-password", "win.logout"]);
+            assert_eq!(hidden, ["win.edit-world", "win.map", "win.import-picture", "win.change-password", "win.logout"]);
         }
 
         /// A server that lacks something disables its actions, and a change says which.
@@ -638,10 +638,11 @@ mod linux {
             assert!(actions.description("quit").0);
             assert!(actions.description("edit-world").0);
             let changes = actions.show(Shown { multiuser: true, picture_upload: false });
-            assert_eq!(changes.len(), 3);
+            assert_eq!(changes.len(), 4);
             assert_eq!(changes.get("logout"), Some(&true));
             assert_eq!(changes.get("change-password"), Some(&true));
             assert_eq!(changes.get("edit-world"), Some(&false), "multiuser has no world editing");
+            assert_eq!(changes.get("map"), Some(&false), "nor a map");
             assert!(actions.show(Shown { multiuser: true, picture_upload: false }).is_empty(), "no change, nothing to say");
         }
     }

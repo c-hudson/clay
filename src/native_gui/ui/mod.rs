@@ -1,5 +1,6 @@
 //! The GPUI side of the native GUI.
 
+mod a11y;
 mod actions;
 mod appmenu;
 pub mod assets;
@@ -14,6 +15,7 @@ pub mod ink;
 mod input_view;
 mod keymap;
 mod kit;
+mod map;
 mod native_spell;
 mod opacity;
 mod more;
@@ -158,6 +160,8 @@ pub struct ClayView {
     /// when the view last switched to each world (by name): the later one starts the
     /// line's reveal (`reveal_snapshot`; the console's `World::console_reveal_anchor`).
     reveal_at: HashMap<u64, Instant>,
+    /// Screen readers (a11y.rs): the live region's text, the output's lines for review.
+    a11y: a11y::A11yState,
     reveal_shown: HashMap<String, Instant>,
     keys: Keys,
     /// TF's numeric prefix (`%kbnum`), shown as [N] after the world name.
@@ -177,6 +181,8 @@ pub struct ClayView {
     select: select::SelectState,
     textdiv: textdiv::Textdiv,
     find: find::FindState,
+    /// The map pane (`/map`), the main window's only.
+    map: map::MapPane,
     /// The input line's text and editing state.
     editor: crate::native_gui::core::input::Editor,
     input: input_view::InputState,
@@ -281,6 +287,7 @@ impl ClayView {
             reveal: None,
             reveal_new_only: false,
             reveal_at: HashMap::new(),
+            a11y: Default::default(),
             reveal_shown: HashMap::new(),
             keys: Keys::default(),
             kbnum: None,
@@ -294,6 +301,7 @@ impl ClayView {
             select: select::SelectState::default(),
             textdiv: textdiv::Textdiv::default(),
             find: find::FindState::new(window, cx),
+            map: map::MapPane::new(window, cx),
             editor: Default::default(),
             input: Default::default(),
             input_height_seen: 0,
@@ -352,6 +360,7 @@ impl ClayView {
                         changed = true;
                     }
                     ref m if self.surface_message(m, cx) => {}
+                    ref m if self.map_on_reply(m, cx) => {}
                     crate::websocket::WsMessage::ExecuteLocalCommand { command } => local.push(command),
                     crate::websocket::WsMessage::McmpMedia { world_index, action, data, default_url } => {
                         // The world's own media plays only while it's shown and switched on;
@@ -581,6 +590,8 @@ impl ClayView {
     /// effect types them on from now. Stamps older than any reveal can last are dropped
     /// first, now and then.
     pub(super) fn reveal_stamp(&mut self, ids: Vec<u64>) {
+        // Screen Reader mode reads them out as they are shown.
+        self.sr_note_shown(&ids);
         if self.reveal.is_none() || ids.is_empty() {
             return;
         }
@@ -709,6 +720,11 @@ impl ClayView {
             return true;
         }
         let Some((code, mods)) = keymap::console_key(ks) else { return false };
+        // A walk (src/map) stops on a bare Escape, which then goes on to do what it always
+        // does (TF's meta key), as in the console.
+        if code == crossterm::event::KeyCode::Esc && mods.is_empty() {
+            self.map_stop_walk(cx);
+        }
         // A live shell world (src/shell) captures the keyboard: only the ten world-switch
         // actions run; everything else goes to the PTY. Clipboard shortcuts above still win.
         if self.session.core.current_is_live_shell() {
@@ -914,7 +930,9 @@ impl ClayView {
         // theme's colours.
         let mine = crate::TextReveal::from_name(s.text_reveal_profiles.get(crate::font_profile::native_key()).map_or("off", String::as_str));
         let cps = mine.native_chars_per_second();
-        self.reveal = (cps > 0.0).then(|| crate::reveal::Reveal::for_gui(cps, self.theme.is_light()));
+        // Screen Reader mode: a line being typed on can't be read.
+        let reader = s.screen_reader_for(crate::font_profile::native_key());
+        self.reveal = (cps > 0.0 && !reader).then(|| crate::reveal::Reveal::for_gui(cps, self.theme.is_light()));
         self.reveal_new_only = mine.new_only();
         // This GUI's fonts on this OS: its own, or the shared ones (src/font_profile.rs).
         let font = s.font_for(crate::font_profile::native_key());
@@ -1152,8 +1170,14 @@ impl ClayView {
         };
         let link = self.select.hover_link.is_some();
         let bar = self.select.bar_hot();
+        let review = if other { Vec::new() } else { std::mem::take(&mut self.a11y.review) };
         div()
             .id(if other { "output-other" } else { "output" })
+            // A log of lines for a screen reader to review (a11y.rs); never live - new lines
+            // are read out by the Screen Reader mode's own region, once.
+            .role(gpui::accesskit::Role::Log)
+            .aria_label(if other { "Other pane" } else { "Output" })
+            .a11y_synthetic_children(move |b| a11y::add_review_lines(b, review))
             .size_full()
             .map(|d| if bar { d.cursor_default() } else if link { d.cursor_pointer() } else { d.cursor_text() })
             // Off the output (the bar is on its edge): the bar is no longer lit.
@@ -1323,6 +1347,10 @@ impl Focusable for ClayView {
 
 impl Render for ClayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Screen readers (a11y.rs): one noticed for the first time turns Screen Reader mode
+        // on for a window that never chose; the output's node lists the newest lines.
+        self.sr_detect(window, cx);
+        self.a11y.review = self.review_lines(window);
         if let Some(at) = STARTED.get() {
             static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1389,9 +1417,18 @@ impl Render for ClayView {
             tint.a = 0.12;
             tint
         };
-        let tabs_top = self.tabs_mode() == "top";
+        // The world tabs: a strip above or below the output, or a column beside it (Tabs,
+        // this window's own). Whatever isn't taken here is the bottom strip.
+        let tabs_mode = self.tabs_mode();
         let mut tabs = if grep { None } else { self.tabs_ribbon(cx) };
+        let tabs_top = if tabs_mode == "top" { tabs.take() } else { None };
+        let tabs_left = if tabs_mode == "left" { tabs.take() } else { None };
+        let tabs_right = if tabs_mode == "right" { tabs.take() } else { None };
         let stats = if grep { None } else { self.stats_panel(cx) };
+        // The map pane (`/map`): beside the output, before a right tab column.
+        self.map_watch_if_changed(cx);
+        self.map_refresh_pick(cx);
+        let map_pane = if grep { None } else { self.map_pane(window, cx) };
         // The status bar is the bottom pane's: the other pane's while a split's top pane has
         // the focus, grey then.
         let status_bar = (!grep).then(|| match self.split.as_ref().map(|p| p.on_top) {
@@ -1412,6 +1449,11 @@ impl Render for ClayView {
             .on_action(cx.listener(|this, _: &MainCopyCtrl, window, cx| this.main_key("ctrl-c", window, cx)))
             .on_action(cx.listener(|this, _: &MainCopyCmd, window, cx| this.main_key("cmd-c", window, cx)))
             .map(|root| appmenu::listen(root, cx))
+            // In the accessibility tree, so the input below can claim the screen reader's
+            // focus while this holds the keyboard's.
+            .id("clay-main")
+            .role(gpui::accesskit::Role::Group)
+            .aria_label("Clay")
             .size_full()
             .flex()
             .flex_col()
@@ -1464,12 +1506,24 @@ impl Render for ClayView {
             }))
             .child(picture::drop_after_typing_fix())
             .children(icon_bar)
-            .when(tabs_top, |d| d.children(tabs.take()))
-            .child(div().flex_1().min_h_0().child(body))
+            .children(tabs_top)
+            // The output between the side columns (Tabs: Left/Right).
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .children(tabs_left)
+                    .child(div().flex_1().min_w_0().h_full().child(body))
+                    .children(map_pane)
+                    .children(tabs_right),
+            )
             .children(stats)
             .children(tabs)
             .children(status_bar)
             .children(input_bar)
+            .children(self.sr_announcer(window))
             .children(find_popups)
             .children(context_menu)
             .children(input_menu)

@@ -3283,7 +3283,6 @@
     /// The server's certificate and key load through rustls's own PEM reader (the
     /// rustls-pemfile crate is unmaintained): Clay's own generated pair (an EC key in
     /// PKCS#8), and the errors a bad file gets.
-    #[cfg(feature = "rustls-backend")]
     #[test]
     fn test_load_pem_cert_and_key() {
         let dir = std::env::temp_dir().join(format!("clay_pem_{}", std::process::id()));
@@ -9987,6 +9986,7 @@ third
             msp_enabled: true,
             mcp_enabled: true,
             mccp2_enabled: true,
+            status_panel: Some(false),
             world_type: "mud_timed_prompt".to_string(),
             prompt_wait_ms: 2500,
             tf_type: String::new(),
@@ -10024,6 +10024,7 @@ third
         assert_eq!(app.worlds[0].settings.prompt_wait_ms, 2500);
         assert!(app.worlds[0].settings.keep_alive_gag_enabled);
         assert_eq!(app.worlds[0].settings.keep_alive_gag, "Huh?");
+        assert!(!app.worlds[0].settings.status_panel, "the world's Status Panel switch");
         assert_eq!(app.worlds[0].settings.slack_token, "xoxb-token");
         assert_eq!(app.worlds[0].settings.slack_channel, "#general");
         assert_eq!(app.worlds[0].settings.slack_workspace, "acme");
@@ -10157,7 +10158,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Slack,
@@ -10183,7 +10184,7 @@ third
                 String::new(), "0".to_string(), true, true, true,
                 String::new(), 1000, None, String::new(), String::new(), String::new(),
                 String::new(), String::new(), String::new(), String::new(),
-                None, on, gag,
+                None, on, gag, None,
             );
         };
         save(&mut app, None, None);
@@ -10214,7 +10215,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud_timed_prompt".to_string(), 2500, None, "xoxb-new".to_string(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt);
@@ -10238,7 +10239,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "shell".to_string(), 0, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Shell);
@@ -10267,7 +10268,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Mud);
@@ -10438,7 +10439,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10459,7 +10460,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10480,7 +10481,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -10559,7 +10560,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
         assert!(!app.worlds[0].settings.mccp2_enabled);
         match rx.try_recv() {
@@ -10578,7 +10579,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None,
+            None, None, None, None,
         );
         assert!(rx.try_recv().is_err(), "an unchanged save must not re-send the toggle");
     }
@@ -10604,7 +10605,7 @@ third
             String::new(), String::new(), ws_password.to_string(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, None, None, None, taskbar_alert,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None, None, taskbar_alert, Default::default(),
         );
     }
 
@@ -10628,7 +10629,7 @@ third
             String::new(), String::new(), String::new(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, profile("native-linux", "superfast"), None, None, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, profile("native-linux", "superfast"), None, None, None, Default::default(),
         );
         assert_eq!(app.settings.text_reveal_for("native-linux"), TextReveal::SuperFast);
         assert_eq!(app.settings.text_reveal, TextReveal::Off, "the console's own is not a client's to set");
@@ -10646,7 +10647,7 @@ third
             String::new(), String::new(), String::new(),
             false, true, false, None,
             "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, profile("bogus", "fast"), None, None, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, profile("bogus", "fast"), None, None, None, Default::default(),
         );
         assert!(!app.settings.text_reveal_profiles.contains_key("bogus"), "an unknown key is refused");
         assert_eq!(app.settings.text_reveal_for("app-android"), TextReveal::Off, "an interface that never chose is Off");
@@ -10660,6 +10661,102 @@ third
         msg.text_reveal_profiles.insert(REMOTE_CONSOLE_REVEAL_KEY.to_string(), "fast".to_string());
         remote.apply_global_settings(&msg);
         assert_eq!(remote.settings.text_reveal, TextReveal::Fast);
+    }
+
+    /// A settings save carrying the shared `tabs` and the later additions (a client's own
+    /// tab location...), everything else at the defaults.
+    fn save_tabs_from(app: &mut App, shared_tabs: &str, more: crate::websocket::SettingsAdditions) {
+        app.update_global_settings(
+            0, true, true, true,
+            "unseen".to_string(), false, false, true,
+            "dark".to_string(), "dark".to_string(),
+            1.0, 0, 0, 500,
+            5, None, None, None, "monospace".to_string(), 14.0,
+            14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
+            String::new(), false, false, 9000, String::new(),
+            String::new(), String::new(), String::new(),
+            false, true, false, None,
+            "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
+            shared_tabs.to_string(), "app_tablet".to_string(), None, None, None, None, None, None, more,
+        );
+    }
+
+    /// A settings save that differs from the stored settings only in `web_secure` (which
+    /// chooses nothing since D8; the native GUI always sends `true`) doesn't restart the web
+    /// server - every native Settings save did, dropping each attached browser - while a new
+    /// port still does.
+    #[test]
+    fn a_web_secure_difference_alone_does_not_restart_the_web_server() {
+        let save = |app: &mut App, web_secure: bool, port: u16| {
+            app.update_global_settings(
+                0, true, true, true,
+                "unseen".to_string(), false, false, true,
+                "dark".to_string(), "dark".to_string(),
+                1.0, 0, 0, 500,
+                5, None, None, None, "monospace".to_string(), 14.0,
+                14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
+                String::new(), web_secure, app.settings.http_enabled, port, app.settings.web_path.clone(),
+                String::new(), String::new(), String::new(),
+                false, true, false, None,
+                "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
+                "none".to_string(), "app_tablet".to_string(), None, None, None, None, None, None, Default::default(),
+            );
+        };
+        let mut app = App::new();
+        app.settings.web_secure = false;
+        let port = app.settings.http_port;
+        save(&mut app, true, port);
+        assert!(!app.web_restart_needed, "web_secure alone is no reason to restart");
+        save(&mut app, true, port.wrapping_add(1));
+        assert!(app.web_restart_needed, "a new port is");
+    }
+
+    /// The world tabs go Top, Bottom, Left, Right or nowhere, per interface (user ruling
+    /// 2026-11-01): a client's choice is kept under its own key; an interface that never
+    /// chose uses the shared value; an older client's save (no `tabs_profile`) leaves every
+    /// interface's own alone; an unknown key is refused. The client side's helpers read and
+    /// write its own, or the shared field from a server before the split.
+    #[test]
+    fn test_tabs_location_is_per_interface() {
+        assert_eq!(TabsMode::OPTIONS.iter().map(|(n, _)| *n).collect::<Vec<_>>(), ["top", "bottom", "left", "right", "none"]);
+        for (name, _) in TabsMode::OPTIONS {
+            assert_eq!(TabsMode::from_name(name).name(), *name);
+        }
+        assert_eq!(TabsMode::from_name("Sideways"), TabsMode::None);
+        assert!(TabsMode::Left.is_side() && TabsMode::Right.is_side() && !TabsMode::Top.is_side());
+
+        let choice = |key: &str, value: &str| crate::websocket::SettingsAdditions {
+            tabs_profile: Some(crate::websocket::InterfaceChoice { key: key.to_string(), value: value.to_string() }),
+            ..Default::default()
+        };
+        let mut app = App::new();
+        save_tabs_from(&mut app, "top", choice("native-linux", "left"));
+        assert_eq!(app.settings.tabs_for("native-linux"), TabsMode::Left);
+        assert_eq!(app.settings.tabs_for("app-android"), TabsMode::Top, "never chose: the shared value");
+        save_tabs_from(&mut app, "top", Default::default());
+        assert_eq!(app.settings.tabs_for("native-linux"), TabsMode::Left, "an older client's save leaves it");
+        save_tabs_from(&mut app, "top", choice("bogus", "right"));
+        assert!(!app.settings.tabs_profiles.contains_key("bogus"), "an unknown key is refused");
+
+        let mut msg = app.build_global_settings_msg();
+        assert_eq!(msg.tabs_for("native-linux"), "left");
+        assert_eq!(msg.tabs_for("browser-linux"), "top");
+        msg.set_tabs_for("browser-linux", "right");
+        assert_eq!(msg.tabs, "top", "a client's own choice never moves the shared value");
+        assert_eq!(msg.tabs_profile_update("browser-linux"), Some(crate::websocket::InterfaceChoice { key: "browser-linux".into(), value: "right".into() }));
+        assert_eq!(msg.tabs_profile_update("app-ios"), None, "nothing of its own: nothing sent");
+        // A server before the split: the client edits the shared field, sends no profile.
+        msg.tabs_profiles = None;
+        msg.set_tabs_for("browser-linux", "bottom");
+        assert_eq!((msg.tabs.as_str(), msg.tabs_for("browser-linux").as_str()), ("bottom", "bottom"));
+        assert_eq!(msg.tabs_profile_update("browser-linux"), None);
+        let old: crate::websocket::GlobalSettingsMsg = serde_json::from_value({
+            let mut v = serde_json::to_value(&msg).unwrap();
+            v.as_object_mut().unwrap().remove("tabs_profiles");
+            v
+        })
+        .unwrap();
+        assert_eq!(old.tabs_profiles, None, "an older server's message: no profiles");
     }
 
     /// A settings save from `client_id`: its legacy text-to-speech mode (the console's,
@@ -10676,7 +10773,7 @@ third
             String::new(), String::new(), String::new(),
             false, true, false, None,
             legacy_mode.to_string(), "all".to_string(), String::new(), false, false, None, true,
-            "none".to_string(), "app_tablet".to_string(), None, None, None, None, profile, None,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None, profile, None, Default::default(),
         );
     }
 
@@ -10789,6 +10886,185 @@ third
         app.ws_say(3, 0, "hi");
         assert_eq!(spoken_to(&mut rx[2]), vec!["hi".to_string()]);
         assert!(spoken_to(&mut rx[0]).is_empty());
+    }
+
+    /// Screen Reader mode (docs/markdown/24-accessibility.md): an interface in it is not sent
+    /// arriving lines to speak - its screen reader reads them - while the others still are;
+    /// `/say` still speaks for it. Its mode is its own, set under its own key, and
+    /// "MUDs: Screen Reader" is one global setting that reaches the telnet config.
+    #[test]
+    fn screen_reader_mode_is_per_interface_and_quiets_its_tts() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("mud"));
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let mut rx: Vec<_> = (1..=2u64).map(|id| tts_test_client(&server, id)).collect();
+        app.ws_server = Some(server);
+        let local = tts::TtsProfile { mode: tts::TtsMode::Local, speak_mode: tts::TtsSpeakMode::All, voice: crate::kokoro::DEFAULT_VOICE.to_string() };
+        for (id, key) in [(1, "app-android"), (2, "browser-linux")] {
+            app.settings.tts_profiles.insert(key.to_string(), local.clone());
+            app.set_client_interface(id, key);
+            app.ws_client_view_world(id, 0);
+        }
+        save_tabs_from(&mut app, "none", crate::websocket::SettingsAdditions {
+            screen_reader_profile: Some(crate::websocket::InterfaceChoice { key: "app-android".into(), value: "on".into() }),
+            announce_screen_reader: Some(true),
+            ..Default::default()
+        });
+        assert!(app.settings.screen_reader_for("app-android") && !app.settings.screen_reader_for("browser-linux"));
+        assert!(!app.settings.screen_reader, "the console's own is not a client's to set");
+        assert!(app.settings.announce_screen_reader && crate::telnet::TelnetConfig::default().screen_reader, "MUDs are told from the next connect");
+        app.speak_arrivals(0, &["The wind blows."]);
+        assert!(spoken_to(&mut rx[0]).is_empty(), "the phone's screen reader reads it");
+        assert_eq!(spoken_to(&mut rx[1]), vec!["The wind blows.".to_string()], "the browser still speaks");
+        app.ws_say(1, 0, "hi");
+        assert_eq!(spoken_to(&mut rx[0]), vec!["hi".to_string()], "/say still speaks");
+        let msg = app.build_global_settings_msg();
+        assert!(msg.screen_reader_for("app-android") && msg.announce_screen_reader);
+        assert_eq!(msg.screen_reader_profile_update("app-android").map(|c| c.value), Some("on".to_string()));
+        save_tabs_from(&mut app, "none", crate::websocket::SettingsAdditions { announce_screen_reader: Some(false), ..Default::default() });
+        assert!(!crate::telnet::TelnetConfig::default().screen_reader);
+        assert!(app.settings.screen_reader_for("app-android"), "a save without its profile leaves it");
+    }
+
+    /// The status display (GMCP `Char.*`/MSDP) shows only while Settings' Status Panel (one
+    /// for the instance) and the world's own are both on. `/stats hide|show` sets the
+    /// world's through either server handler, saved and told to every client; a client
+    /// that predates a switch (`None`) leaves it; the console's row goes with it.
+    #[tokio::test]
+    async fn status_panel_switches_hide_the_status_display() {
+        for handler_b in [false, true] {
+            let mut app = App::new();
+            app.worlds.clear();
+            app.worlds.push(World::new("Aardwolf"));
+            app.worlds.push(World::new("Discworld"));
+            for w in app.worlds.iter_mut() {
+                w.connected = true;
+                w.protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"150"}"#);
+                w.stats_line_shown = true;
+            }
+            let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+            let mut rx = tts_test_client(&server, 7);
+            app.ws_server = Some(server);
+            assert_eq!((app.status_line_rows(0), app.status_line_rows(1)), (1, 1));
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+            let hide = WsMessage::SendCommand { world_index: 0, command: "/stats hide".into() };
+            if handler_b {
+                crate::daemon::handle_daemon_ws_message(&mut app, 7, hide, &event_tx).await;
+            } else {
+                let _ = app.handle_ws_client_msg(7, hide, &event_tx);
+            }
+            assert!(!app.worlds[0].settings.status_panel, "B={handler_b}: the world's switch");
+            assert_eq!((app.status_line_rows(0), app.status_line_rows(1)), (0, 1), "B={handler_b}: that world only");
+            let mut told = false;
+            let mut said = false;
+            while let Ok(out) = rx.try_recv() {
+                let msg = match out {
+                    crate::websocket::Outbound::Message(m) => *m,
+                    crate::websocket::Outbound::Shared(json) => serde_json::from_str(&json).unwrap(),
+                };
+                match msg {
+                    WsMessage::WorldSettingsUpdated { world_index: 0, settings, .. } => told |= settings.status_panel == Some(false),
+                    WsMessage::ServerData { data, .. } => said |= data.contains("Status display hidden for Aardwolf"),
+                    _ => {}
+                }
+            }
+            assert!(told && said, "B={handler_b}: every client told, and the line shown (told {told}, said {said})");
+            assert_eq!(app.world_settings_msg(0, false).status_panel, Some(false));
+            // A save from a client that has no such switch leaves it.
+            app.update_world_settings(
+                0, "Aardwolf".to_string(), String::new(), String::new(), String::new(),
+                String::new(), false, false,
+                "utf8".to_string(), "connect".to_string(), "nop".to_string(), String::new(),
+                String::new(), "0".to_string(), true, true, true, String::new(), 1000, None,
+                String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), String::new(),
+                None, None, None, None,
+            );
+            assert!(!app.worlds[0].settings.status_panel, "B={handler_b}: None leaves it");
+            assert!(app.set_world_status_panel(0, true).contains("shown"));
+            assert_eq!(app.status_line_rows(0), 1);
+        }
+        // Settings' switch: every world, and what clients are sent.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Aardwolf"));
+        app.worlds[0].stats_line_shown = true;
+        save_tabs_from(&mut app, "none", crate::websocket::SettingsAdditions { status_panel: Some(false), ..Default::default() });
+        assert!(!app.settings.status_panel);
+        assert_eq!(app.status_line_rows(0), 0);
+        assert_eq!(app.build_global_settings_msg().status_panel, Some(false));
+        assert!(app.set_world_status_panel(0, true).contains("stays hidden"), "the world's switch alone doesn't show it");
+        save_tabs_from(&mut app, "none", Default::default());
+        assert!(!app.settings.status_panel, "an older client's save leaves it");
+    }
+
+    /// The map's client messages work the same through both server handlers (their
+    /// wildcards would hide a missing arm): a client's MapWatch is answered with the world's
+    /// state and its whole area, a picked room with its route, a search with rooms, Walk
+    /// sends the first step, MapStop stops it.
+    #[tokio::test]
+    async fn map_messages_through_both_handlers() {
+        use crate::map::wire::MapViewReq;
+        for handler_b in [false, true] {
+            let mut app = App::new();
+            app.worlds.clear();
+            let mut w = World::new("Rome");
+            w.connected = true;
+            app.worlds.push(w);
+            let (wtx, mut wrx) = tokio::sync::mpsc::channel::<WriteCommand>(16);
+            app.worlds[0].command_tx = Some(wtx);
+            let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+            let mut rx = tts_test_client(&server, 7);
+            app.ws_server = Some(server);
+            for json in [
+                r#"{"num":"F","name":"The Forum","area":"Forum","exits":{"e":"G"}}"#,
+                r#"{"num":"G","name":"Via Sacra","area":"Forum","exits":{"w":"F","e":"H"}}"#,
+                r#"{"num":"H","name":"Via Sacra, East","area":"Forum","exits":{"w":"G"}}"#,
+            ] {
+                app.map_on_gmcp(0, "Room.Info", json);
+            }
+            app.flush_map();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+            async fn drive_one(app: &mut App, handler_b: bool, msg: WsMessage, event_tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+                if handler_b {
+                    crate::daemon::handle_daemon_ws_message(app, 7, msg, event_tx).await;
+                } else {
+                    let _ = app.handle_ws_client_msg(7, msg, event_tx);
+                }
+            }
+            let got = |rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>| -> Vec<WsMessage> {
+                let mut out = Vec::new();
+                while let Ok(o) = rx.try_recv() {
+                    out.push(match o {
+                        crate::websocket::Outbound::Message(m) => *m,
+                        crate::websocket::Outbound::Shared(json) => serde_json::from_str(&json).unwrap(),
+                    });
+                }
+                out
+            };
+            drive_one(&mut app, handler_b, WsMessage::MapWatch { views: vec![MapViewReq { world_index: 0, area: None, level: None }] }, &event_tx).await;
+            let msgs = got(&mut rx);
+            assert!(msgs.iter().any(|m| matches!(m, WsMessage::MapState { state: Some(s), .. } if s.here.as_ref().map(|h| h.id.as_str()) == Some("H"))), "B={handler_b}: the user's place");
+            assert!(msgs.iter().any(|m| matches!(m, WsMessage::MapArea { replace: true, rooms, .. } if rooms.len() == 3)), "B={handler_b}: the whole area");
+            drive_one(&mut app, handler_b, WsMessage::MapRoute { world_index: 0, request_id: 4, to: "the forum".into(), walk: false }, &event_tx).await;
+            assert!(got(&mut rx).iter().any(|m| matches!(m, WsMessage::MapRouteResult { request_id: 4, to, route, error: None, .. } if to == "F" && route.len() == 2)), "B={handler_b}: the route");
+            drive_one(&mut app, handler_b, WsMessage::MapSearch { world_index: 0, request_id: 5, query: "via".into() }, &event_tx).await;
+            assert!(got(&mut rx).iter().any(|m| matches!(m, WsMessage::MapSearchResult { request_id: 5, rooms, .. } if rooms.len() == 2)), "B={handler_b}: the search");
+            drive_one(&mut app, handler_b, WsMessage::MapRoute { world_index: 0, request_id: 6, to: "#F".into(), walk: true }, &event_tx).await;
+            assert!(matches!(wrx.try_recv(), Ok(WriteCommand::Text(t)) if t == "w"), "B={handler_b}: the first step");
+            drive_one(&mut app, handler_b, WsMessage::MapStop { world_index: 0 }, &event_tx).await;
+            assert!(!app.worlds[0].map.walker.walking(), "B={handler_b}: stopped");
+            // A change after this goes to the watching client as a room delta and state.
+            app.map_on_gmcp(0, "Room.Info", r#"{"num":"K","name":"Temple of Vesta","area":"Forum","exits":{"n":"H"}}"#);
+            app.flush_map();
+            let msgs = got(&mut rx);
+            assert!(msgs.iter().any(|m| matches!(m, WsMessage::MapArea { replace: false, rooms, .. } if rooms.iter().any(|r| r.id == "K"))), "B={handler_b}: the new room");
+            // `/map area <name>` in a client asks by the name as typed; the answer is the
+            // area under its key.
+            drive_one(&mut app, handler_b, WsMessage::MapWatch { views: vec![MapViewReq { world_index: 0, area: Some("FORUM".into()), level: Some(0) }] }, &event_tx).await;
+            let msgs = got(&mut rx);
+            assert!(msgs.iter().any(|m| matches!(m, WsMessage::MapArea { area, replace: true, rooms, .. } if area == "Forum" && rooms.len() == 4)), "B={handler_b}: the area by name: {msgs:?}");
+        }
     }
 
     /// Clear Input on Send from a client that knows it is applied; a save from an older
@@ -11377,6 +11653,7 @@ third
             other_views: false,
             expand_line: false,
             picture_upload: false,
+            map: false,
             history_on_demand: false,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
@@ -12102,6 +12379,7 @@ third
         assert!(!app.worlds[0].protocol.seen_prompt_marker,
             "a timed promotion is not a marker and must not disable further inference");
 
+        app.worlds[0].clear_prompt_after_send(); // the name was typed
         app.process_server_data(0, b"Password: ", 24, 80, false);
         let since = app.worlds[0].timed_prompt_since.unwrap();
         assert!(app.promote_due_timed_prompts(since + Duration::from_secs(2)));
@@ -12129,19 +12407,272 @@ third
             "neither may leave the prompt sitting in the output buffer");
     }
 
-    /// The parked copy must be dropped. `process_server_data` holds a trailing partial in
-    /// `trigger_partial_line` waiting for the rest of the line; once it has become a
-    /// prompt, leaving it there would prepend it to whatever the server sends next. A
-    /// marker prompt never reaches that buffer at all (`extract_prompt` drains it).
+    /// A guess never takes text out of the output stream (user ruling 2026-11-03): the
+    /// parked copy stays parked, so whatever the server sends next joins the line it
+    /// belongs to. A marker prompt never reaches that buffer at all (`extract_prompt`
+    /// drains it).
     #[test]
-    fn test_timed_prompt_clears_the_parked_partial() {
-        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::Prompt);
+    fn test_timed_prompt_keeps_the_parked_partial() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
         app.process_server_data(0, b"What be thy name? ", 24, 80, false);
         assert_eq!(app.worlds[0].trigger_partial_line, "What be thy name? ");
         let since = app.worlds[0].timed_prompt_since.unwrap();
         assert!(app.promote_due_timed_prompts(since + Duration::from_secs(2)));
-        assert!(app.worlds[0].trigger_partial_line.is_empty(),
-            "the parked partial must not survive being turned into a prompt");
+        assert_eq!(app.worlds[0].trigger_partial_line, "What be thy name? ",
+            "the guessed prompt's text must stay parked");
+        assert!(app.worlds[0].prompt_timed);
+    }
+
+    /// Promote `world`'s parked partial now, as its wait running out would.
+    fn guess_prompt(app: &mut App, world: usize) {
+        let since = app.worlds[world].timed_prompt_since.expect("a parked partial waiting");
+        assert!(app.promote_due_timed_prompts(since + Duration::from_secs(60)), "a guess was due");
+    }
+
+    fn output_texts(app: &App, world: usize) -> Vec<String> {
+        app.worlds[world].output_lines.iter().map(|l| l.text.clone()).collect()
+    }
+
+    /// The report (2026-11-03): a line that pauses mid-way is guessed as the prompt. The
+    /// rest of the line ends the guess - the prompt clears, every client is told, and the
+    /// output holds the line whole, never its tail alone.
+    #[test]
+    fn test_wrong_timed_guess_ends_and_the_line_reads_whole() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+        app.process_server_data(0, b"You see a ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        assert_eq!(app.worlds[0].prompt, "You see a ");
+        let _ = drain_ws_messages(&mut rx);
+
+        app.process_server_data(0, b"dog.\r\n", 24, 80, false);
+        assert_eq!(output_texts(&app, 0), vec!["You see a dog.".to_string()]);
+        assert!(app.worlds[0].prompt.is_empty(), "text after a guess ends it");
+        assert!(!app.worlds[0].prompt_timed);
+        let msgs = drain_ws_messages(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m,
+            crate::websocket::WsMessage::PromptUpdate { prompt, .. } if prompt.is_empty())),
+            "clients must be told the guess is over. Got: {msgs:?}");
+    }
+
+    /// A guess followed by a new line of text (chat arriving at a prompt) puts the prompt
+    /// into the output as a line, ahead of the text.
+    #[test]
+    fn test_timed_guess_then_unrelated_text_puts_the_prompt_in_the_output() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"HP:100> ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        app.process_server_data(0, b"\r\nBob says hi\r\n", 24, 80, false);
+        assert_eq!(output_texts(&app, 0), vec!["HP:100> ".to_string(), "Bob says hi".to_string()]);
+        assert!(app.worlds[0].prompt.is_empty());
+    }
+
+    /// Answered: a line sent while a guess shows makes it a real prompt. Its text goes
+    /// into the output as its own line ahead of the reply (never glued onto it), and is
+    /// not matched by actions (ruling: it was already handled as the prompt).
+    #[test]
+    fn test_answered_timed_prompt_is_its_own_line_without_triggers() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        let mut action = crate::actions::Action {
+            name: "g".to_string(),
+            command: "/gag".to_string(),
+            ..Default::default()
+        };
+        action.patterns = vec![crate::actions::MatchPattern {
+            pattern: "Name".to_string(),
+            compiled_regex: None,
+        }];
+        action.compile_regex();
+        app.settings.actions = vec![action];
+
+        app.process_server_data(0, b"Name: ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        app.worlds[0].clear_prompt_after_send(); // "bob" typed and sent
+        assert!(app.worlds[0].prompt.is_empty());
+        assert!(app.worlds[0].trigger_partial_line.is_empty());
+        assert_eq!(app.worlds[0].answered_prompt, "Name: ");
+        assert!(app.worlds[0].output_lines.is_empty(), "nothing shows until the server answers");
+
+        app.process_server_data(0, b"Password: ", 24, 80, false);
+        assert_eq!(output_texts(&app, 0), vec!["Name: ".to_string()]);
+        assert!(!app.worlds[0].output_lines[0].gagged,
+            "an answered prompt must not be matched by actions");
+        assert!(app.worlds[0].answered_prompt.is_empty());
+        guess_prompt(&mut app, 0);
+        assert_eq!(app.worlds[0].prompt, "Password: ");
+    }
+
+    /// Auto-login answers a guessed name prompt once: it lands in the output when the
+    /// server asks for the password, and the password goes at the second prompt only.
+    #[test]
+    fn test_auto_login_answers_a_timed_guess_once() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        app.worlds[0].command_tx = Some(tx);
+        app.process_server_data(0, b"Name: ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        assert!(matches!(rx.try_recv(), Ok(WriteCommand::Text(t)) if t == "myname"));
+        assert!(app.worlds[0].prompt.is_empty(), "an auto-answered prompt is cleared");
+        assert_eq!(app.worlds[0].answered_prompt, "Name: ");
+
+        app.process_server_data(0, b"Password: ", 24, 80, false);
+        assert_eq!(output_texts(&app, 0), vec!["Name: ".to_string()]);
+        assert!(rx.try_recv().is_err(), "nothing more until the password prompt is guessed");
+        guess_prompt(&mut app, 0);
+        assert!(matches!(rx.try_recv(), Ok(WriteCommand::Text(t)) if t == "secret"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.worlds[0].prompt_count, 2);
+    }
+
+    /// A line from a script or action answers a guess too, and tells clients.
+    #[test]
+    fn test_a_scripted_send_answers_a_timed_guess() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        let (tx, _cmd_rx) = tokio::sync::mpsc::channel(16);
+        app.worlds[0].command_tx = Some(tx);
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+        app.process_server_data(0, b"Name: ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        let _ = drain_ws_messages(&mut rx);
+        assert!(app.send_to_world(0, "bob".to_string()));
+        assert_eq!(app.worlds[0].answered_prompt, "Name: ");
+        assert!(app.worlds[0].prompt.is_empty());
+        let msgs = drain_ws_messages(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m,
+            crate::websocket::WsMessage::PromptUpdate { prompt, .. } if prompt.is_empty())),
+            "clients must be told. Got: {msgs:?}");
+    }
+
+    /// An invisible fragment (a colour reset) after a guess leaves it standing, and is not
+    /// waited on again - that would take the same prompt twice for auto-login.
+    #[test]
+    fn test_invisible_fragment_after_a_timed_guess_keeps_it() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"Name: ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        let count = app.worlds[0].prompt_count;
+        app.process_server_data(0, b"\x1b[0m", 24, 80, false);
+        assert_eq!(app.worlds[0].prompt, "Name: ");
+        assert!(app.worlds[0].prompt_timed);
+        assert!(app.worlds[0].timed_prompt_since.is_none(), "not waited on again");
+        assert_eq!(app.worlds[0].prompt_count, count);
+        assert_eq!(app.worlds[0].trigger_partial_line, "Name: \x1b[0m");
+    }
+
+    /// A marker prompt replaces a guess; the guess's parked text then joins the next line
+    /// as it always has.
+    #[test]
+    fn test_marker_prompt_replaces_a_timed_guess() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"Name: ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        app.handle_prompt(0, b"> ", crate::PromptSource::Marker);
+        assert_eq!(app.worlds[0].prompt, "> ");
+        assert!(!app.worlds[0].prompt_timed);
+        app.process_server_data(0, b"x\r\n", 24, 80, false);
+        assert_eq!(app.worlds[0].prompt, "> ", "a marker prompt is not ended by later text");
+    }
+
+    /// A GA/EOR in a read of its own (an empty `Prompt`) marks the line already parked
+    /// for its newline: thechattingzone.uk's 33-byte name prompt goes out as text (over
+    /// the telnet layer's 32-byte hold-back) and its EOR follows in a packet of its own.
+    /// The line becomes the prompt and leaves the output, as any marked prompt does.
+    #[test]
+    fn test_late_marker_takes_the_parked_line_as_the_prompt() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.worlds[0].settings.world_type = WorldType::Mud;
+        app.process_server_data(0, b"Welcome!\n\rPlease enter your name (Or NEW): ", 24, 80, false);
+        assert!(app.worlds[0].prompt.is_empty());
+        app.handle_prompt(0, b"", crate::PromptSource::Marker);
+        assert_eq!(app.worlds[0].prompt, "Please enter your name (Or NEW): ");
+        assert!(app.worlds[0].trigger_partial_line.is_empty());
+        app.worlds[0].clear_prompt_after_send();
+        app.process_server_data(0, b"\n\rHello!\n\r", 24, 80, false);
+        let texts = output_texts(&app, 0);
+        assert!(!texts.iter().any(|t| t.contains("Please enter")), "a marked prompt is not output: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Hello!"), "{texts:?}");
+
+        // Nothing parked: an empty marker changes nothing.
+        app.handle_prompt(0, b"> ", crate::PromptSource::Marker);
+        app.handle_prompt(0, b"", crate::PromptSource::Marker);
+        assert_eq!(app.worlds[0].prompt, "> ");
+    }
+
+    /// On a Timed world a late GA/EOR confirms a guess: the prompt is a marked one now,
+    /// and the guessing stops for the connection.
+    #[test]
+    fn test_late_marker_confirms_a_timed_guess() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"HP:10> ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        app.handle_prompt(0, b"", crate::PromptSource::Marker);
+        assert_eq!(app.worlds[0].prompt, "HP:10> ");
+        assert!(!app.worlds[0].prompt_timed, "no longer a guess");
+        assert!(app.worlds[0].trigger_partial_line.is_empty());
+        assert!(app.worlds[0].protocol.seen_prompt_marker);
+        app.process_server_data(0, b"\r\npartial", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+        assert!(!app.promote_due_timed_prompts(since + Duration::from_secs(10)));
+    }
+
+    /// The reported bug on a plain MUD world: thechattingzone.uk sends `IAC WONT ECHO` in
+    /// its banner, which used to arm a 150 ms timer that took any paused line as the
+    /// prompt - on every world type - and dropped it from the output. A MUD world never
+    /// guesses from timing; the line shows whole.
+    #[test]
+    fn test_plain_mud_world_after_wont_echo_never_guesses() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.worlds[0].settings.world_type = WorldType::Mud;
+        app.handle_prompt(0, b"Please enter your name (Or NEW): ", crate::PromptSource::Marker);
+        app.worlds[0].clear_prompt_after_send();
+        app.process_server_data(0, b"Bob shouts: hel", 24, 80, false);
+        assert!(app.worlds[0].timed_prompt_since.is_none());
+        assert!(!app.promote_due_timed_prompts(std::time::Instant::now() + Duration::from_secs(60)));
+        assert!(app.worlds[0].prompt.is_empty());
+        app.process_server_data(0, b"lo there\r\n", 24, 80, false);
+        assert_eq!(output_texts(&app, 0), vec!["Bob shouts: hello there".to_string()]);
+    }
+
+    /// TF's %lp stays an opt-in (user ruling 2026-11-03): while on, a MUD world guesses,
+    /// with the same put-back; off, it never does.
+    #[test]
+    fn test_tf_lp_makes_a_mud_world_guess_with_put_back() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.worlds[0].settings.world_type = WorldType::Mud;
+        app.process_server_data(0, b"You see a ", 24, 80, false);
+        assert!(app.worlds[0].timed_prompt_since.is_none(), "%lp off: no guessing");
+        app.tf_engine.execute("/set lp=on");
+        app.process_server_data(0, b"big ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        assert_eq!(app.worlds[0].prompt, "You see a big ");
+        app.process_server_data(0, b"dog.\r\n", 24, 80, false);
+        assert_eq!(output_texts(&app, 0), vec!["You see a big dog.".to_string()]);
+        assert!(app.worlds[0].prompt.is_empty());
+    }
+
+    /// A guess or an answered prompt survives /reload with its state, and a guess is not
+    /// waited on (or counted) again after it.
+    #[test]
+    fn test_timed_guess_and_answered_prompt_survive_a_reload() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"Name: ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &String::from_utf8(buf).unwrap()).expect("parses");
+        let w = &restored.worlds[0];
+        assert!(w.prompt_timed, "the guess survives");
+        assert!(w.timed_prompt_since.is_none(), "a guess already showing is not waited on again");
+
+        app.worlds[0].clear_prompt_after_send();
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &String::from_utf8(buf).unwrap()).expect("parses");
+        assert!(!restored.worlds[0].prompt_timed);
+        assert_eq!(restored.worlds[0].answered_prompt.trim_end(), "Name:",
+            "the answered prompt survives (its trailing space is the reload file's to keep)");
     }
 
     #[test]
@@ -13154,6 +13685,98 @@ third
         assert!(!gui.console_paused, "a GUI successor has no console to resume");
     }
 
+    /// `/pause` (user request 2026-11-03): `/remote --pause` on every interface but the one
+    /// that typed it, through either handler - the console too, when there is one - and never
+    /// a connection with the asker's owner id (its other tab). Again: all already paused. A
+    /// paused client that is used resumes. From the console: every client.
+    #[tokio::test]
+    async fn pause_pauses_every_other_interface() {
+        fn paused_and_told(app: &App, rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>, id: u64) -> (bool, bool, Vec<String>) {
+            let mut told = false;
+            let mut said = Vec::new();
+            while let Ok(out) = rx.try_recv() {
+                let msg = match out {
+                    crate::websocket::Outbound::Message(m) => *m,
+                    crate::websocket::Outbound::Shared(json) => serde_json::from_str(&json).unwrap(),
+                };
+                match msg {
+                    WsMessage::PausedState { paused: true } => told = true,
+                    WsMessage::ServerData { data, .. } => said.push(data),
+                    _ => {}
+                }
+            }
+            (app.ws_client_worlds.get(&id).is_some_and(|v| v.paused), told, said)
+        }
+        let view = || ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        };
+        assert!(matches!(parse_command("/pause"), Command::Pause));
+        for handler_b in [false, true] {
+            let mut app = App::new();
+            app.worlds.clear();
+            app.worlds.push(World::new("A"));
+            app.current_world_index = 0;
+            // Handler B serves the GUIs, -D and the phone's server: no console there.
+            app.console_tui = !handler_b;
+            let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+            let mut asker = tts_test_client(&server, 7);
+            let mut tab = tts_test_client(&server, 8);
+            let mut phone = tts_test_client(&server, 9);
+            app.ws_server = Some(server);
+            app.set_display_owner_id(7, "browser");
+            app.set_display_owner_id(8, "browser");
+            app.set_display_owner_id(9, "phone");
+            for id in [7, 8, 9] {
+                app.ws_client_worlds.insert(id, view());
+            }
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+            for round in 0..2 {
+                let pause = WsMessage::SendCommand { world_index: 0, command: "/pause".into() };
+                if handler_b {
+                    crate::daemon::handle_daemon_ws_message(&mut app, 7, pause, &event_tx).await;
+                } else {
+                    let _ = app.handle_ws_client_msg(7, pause, &event_tx);
+                }
+                let (me, me_told, said) = paused_and_told(&app, &mut asker, 7);
+                let (other_tab, tab_told, _) = paused_and_told(&app, &mut tab, 8);
+                let (ph, ph_told, _) = paused_and_told(&app, &mut phone, 9);
+                assert!(!me && !me_told && !other_tab && !tab_told, "B={handler_b}: the asker's own connections stay");
+                assert!(ph, "B={handler_b}: the phone is paused");
+                assert_eq!(app.console_paused, !handler_b, "B={handler_b}: the console, where there is one");
+                let reply = if round == 1 {
+                    assert!(!ph_told, "B={handler_b}: told once");
+                    "Every other interface is already paused.".to_string()
+                } else {
+                    assert!(ph_told, "B={handler_b}: the phone shows its PAUSED badge");
+                    let console = if handler_b { "" } else { "the console, " };
+                    format!("Paused {console}client 9 (Web, 192.168.1.20) — activity now visible")
+                };
+                assert!(said.iter().any(|l| l.starts_with(&reply)), "B={handler_b} round {round}: {said:?}");
+            }
+            let used = WsMessage::MarkWorldSeen { world_index: 0, previous_world_index: None, other_views: None };
+            if handler_b {
+                crate::daemon::handle_daemon_ws_message(&mut app, 9, used, &event_tx).await;
+            } else {
+                let _ = app.handle_ws_client_msg(9, used, &event_tx);
+            }
+            assert!(!app.ws_client_worlds[&9].paused, "B={handler_b}: a paused client that is used resumes");
+        }
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+        app.console_tui = true;
+        assert_eq!(app.pause_other_interfaces(None), "No other interface is connected.");
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let _a = tts_test_client(&server, 3);
+        let _b = tts_test_client(&server, 4);
+        app.ws_server = Some(server);
+        let msg = app.pause_other_interfaces(None);
+        assert!(msg.starts_with("Paused client 3 (Web, 192.168.1.20), client 4 (Web, 192.168.1.20) —"), "{msg}");
+        assert!(!app.console_paused, "the console typed it");
+    }
+
     /// `/split` (user request 2026-10-30): the console's world stays below with the focus, the
     /// next world in order opens above; the switch keys skip it; Shift+Tab moves the focus
     /// without switching any world; `/unsplit` closes the pane without the focus.
@@ -13251,6 +13874,71 @@ third
         app.split_close().unwrap();
         assert_eq!(app.worlds[1].output_lines.iter().filter(|l| l.display_id == Some(CONSOLE_DISPLAY_ID)).count(), 0, "▶ given back");
         assert!(!app.console_watching(1));
+    }
+
+    /// The top pane's bar shows its world's More/Hist indicator, as the main bar does for
+    /// its own (user request 2026-11-01): More while the top world holds lines, Hist while it
+    /// is scrolled back (Hist wins), the bar's fill otherwise.
+    #[test]
+    fn test_split_top_bar_shows_more_and_hist() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["A", "B"] {
+            let mut w = World::new(name);
+            w.connected = true;
+            w.was_connected = true;
+            app.worlds.push(w);
+        }
+        app.current_world_index = 0;
+        app.console_tui = true;
+        app.split_open(Some("B")).unwrap();
+        let bar = |app: &App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+            terminal.draw(|f| rendering::render_pane_bar(f, app, Rect::new(0, 0, 40, 1), 1, false)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..40u16).map(|x| buf.get(x, 0).symbol().to_string()).collect()
+        };
+        assert!(!bar(&app).starts_with("More") && !bar(&app).starts_with("Hist"), "nothing held: the fill");
+
+        app.worlds[1].paused = true;
+        app.worlds[1].pending_count = 42;
+        assert!(bar(&app).starts_with("More   42"), "paused top world: {:?}", bar(&app));
+
+        for i in 0..30 {
+            app.worlds[1].output_lines.push(OutputLine::new(format!("line {i}"), i));
+        }
+        app.worlds[1].scroll_offset = 9;
+        assert!(bar(&app).starts_with("Hist   20"), "scrolled back wins over More: {:?}", bar(&app));
+        assert_eq!(rendering::status_indicator(&app, 1).0, "Hist   20", "the main bar's own function");
+    }
+
+    /// The console in Screen Reader mode: no clock in the bar (a clock that changes every
+    /// minute repaints the bar, and a terminal screen reader reads it out), and no Text
+    /// Reveal (a line being typed on can't be read).
+    #[test]
+    fn test_console_screen_reader_mode_drops_the_clock_and_the_reveal() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("A");
+        w.connected = true;
+        w.was_connected = true;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        app.settings.text_reveal = TextReveal::Fast;
+        let bar = |app: &App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+            terminal.draw(|f| rendering::render_separator_bar(f, app, Rect::new(0, 0, 60, 1))).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..60u16).map(|x| buf.get(x, 0).symbol().to_string()).collect()
+        };
+        let clock = crate::util::get_current_time_12hr();
+        assert!(bar(&app).contains(&clock), "the clock, normally: {:?}", bar(&app));
+        assert_eq!(app.settings.console_text_reveal(), TextReveal::Fast);
+        app.settings.screen_reader = true;
+        assert!(!bar(&app).contains(&clock), "no clock in Screen Reader mode: {:?}", bar(&app));
+        assert_eq!(app.settings.console_text_reveal(), TextReveal::Off);
     }
 
     /// The split survives a console's reload by its world's name; a GUI successor has no
@@ -18339,7 +19027,12 @@ third
 
     #[test]
     fn test_parse_stats_command() {
-        assert!(matches!(parse_command("/stats"), Command::Stats));
+        assert!(matches!(parse_command("/stats"), Command::Stats { show: None }));
+        assert!(matches!(parse_command("/stats hide"), Command::Stats { show: Some(false) }));
+        assert!(matches!(parse_command("/stats OFF"), Command::Stats { show: Some(false) }));
+        assert!(matches!(parse_command("/stats show"), Command::Stats { show: Some(true) }));
+        assert!(matches!(parse_command("/stats on"), Command::Stats { show: Some(true) }));
+        assert!(matches!(parse_command("/stats hp"), Command::Stats { show: None }), "anything else lists them, as before");
     }
 
     #[test]
@@ -18349,7 +19042,7 @@ third
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
 
-        execute_stats_command(&mut app, 0, false);
+        execute_stats_command(&mut app, 0, None, false);
 
         let log = app.ws_broadcast_log.lock().unwrap();
         let found = log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("No status data")));
@@ -18364,7 +19057,7 @@ third
         app.current_world_index = 0;
         app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
 
-        execute_stats_command(&mut app, 0, false);
+        execute_stats_command(&mut app, 0, None, false);
 
         let log = app.ws_broadcast_log.lock().unwrap();
         let found = log.iter().any(|m| matches!(
@@ -18389,7 +19082,7 @@ third
         let payload = serde_json::json!({"hp": hostile}).to_string();
         app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", &payload);
 
-        execute_stats_command(&mut app, 0, false);
+        execute_stats_command(&mut app, 0, None, false);
 
         let log = app.ws_broadcast_log.lock().unwrap();
         let mut saw_hp_line = false;
@@ -19356,14 +20049,6 @@ third
     }
 
     #[test]
-    fn handle_telnet_event_wont_echo_prompt_hint_sets_uses_wont_echo_prompt() {
-        let mut app = telnet_event_test_app("w");
-        assert!(!app.worlds[0].protocol.uses_wont_echo_prompt);
-        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::WontEchoPromptHint);
-        assert!(app.worlds[0].protocol.uses_wont_echo_prompt);
-    }
-
-    #[test]
     fn handle_telnet_event_naws_requested_sets_naws_enabled() {
         let mut app = telnet_event_test_app("w");
         assert!(!app.worlds[0].protocol.naws_enabled);
@@ -20109,7 +20794,7 @@ third
     // fluffy-stallman.md): RFC 1143 Q method (finding 4) plus the paired
     // App-side fix to World::clear_connection_state, which used to leave
     // gmcp_enabled/msdp_enabled/gmcp_data/msdp_variables/mcmp_default_url/
-    // gmcp_supported_packages/uses_wont_echo_prompt set across a reconnect.
+    // gmcp_supported_packages set across a reconnect.
 
     /// End-to-end: a real `TelnetSession` sees `WILL GMCP` then `WONT GMCP`
     /// on the same connection, and the resulting events - routed through
@@ -20161,7 +20846,6 @@ third
         world.protocol.msdp_variables.insert("HP".to_string(), "100".to_string());
         world.protocol.gmcp_data.insert("Core.Hello".to_string(), "{}".to_string());
         world.protocol.mcmp_default_url = "https://example.com/media".to_string();
-        world.protocol.uses_wont_echo_prompt = true;
         world.protocol.naws_enabled = true;
         world.protocol.negotiated_encoding = Some(Encoding::Utf8);
         world.protocol.mccp2_active = true;
@@ -20187,7 +20871,6 @@ third
         assert!(world.protocol.msdp_variables.is_empty(), "msdp_variables must be cleared");
         assert!(world.protocol.gmcp_data.is_empty(), "gmcp_data must be cleared");
         assert!(world.protocol.mcmp_default_url.is_empty(), "mcmp_default_url must be cleared");
-        assert!(!world.protocol.uses_wont_echo_prompt, "uses_wont_echo_prompt must be cleared");
         assert!(!world.protocol.mccp2_active, "mccp2_active must be cleared on reconnect - a fresh \
             connection has no decompressor, and leaving this set would wrongly disconnect \
             the world on the next hot reload even though it is no longer compressed");
@@ -22378,6 +23061,48 @@ fn the_web_separator_style_options_are_the_enums_options() {
     assert_eq!(options, expected);
 }
 
+/// The web page's Tabs choices are `TabsMode::OPTIONS` (user request 2026-11-01: "Top,
+/// Bottom, Left, Right, and None"), and the page keeps its own under its interface key,
+/// echoing the shared value back and sending its own as `tabs_profile`.
+#[test]
+fn the_web_tabs_options_are_the_enums_options_and_kept_per_interface() {
+    let html = include_str!("web/index.html");
+    let start = html.find("id=\"setup-tabs-select\"").expect("the select");
+    let end = start + html[start..].find("</select>").unwrap();
+    let options: Vec<(String, String)> = html[start..end]
+        .split("<option value=\"")
+        .skip(1)
+        .map(|o| {
+            let (value, rest) = o.split_once("\">").unwrap();
+            (value.to_string(), rest.split("</option>").next().unwrap().to_string())
+        })
+        .collect();
+    let expected: Vec<(String, String)> = crate::TabsMode::OPTIONS.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect();
+    assert_eq!(options, expected);
+    let js = include_str!("web/app.js");
+    assert!(js.contains("return (tabsProfiles && tabsProfiles[fontProfileKey]) || tabsShared || 'none';"));
+    assert!(js.contains("tabs: tabsProfiles ? tabsShared : tabsMode,"));
+    assert!(js.contains("tabs_profile: (tabsProfiles && tabsProfiles[fontProfileKey]) ? { key: fontProfileKey, value: tabsProfiles[fontProfileKey] } : null,"));
+}
+
+/// The web page's Screen Reader mode (docs/markdown/24-accessibility.md): the output is a
+/// log that never speaks for itself, new lines are announced once from the paths that show
+/// them (appendNewLine) and never from a redraw, the input is named, and the per-interface
+/// setting travels as `screen_reader_profile`.
+#[test]
+fn the_web_page_announces_shown_lines_once_in_screen_reader_mode() {
+    let html = include_str!("web/index.html");
+    assert!(html.contains(r#"<div id="output" role="log" aria-live="off" aria-label="Output"></div>"#));
+    assert!(html.contains(r#"aria-label="Command" aria-describedby="prompt""#));
+    assert!(html.contains(r#"<div id="sr-announcer" class="sr-only" aria-live="polite" aria-atomic="false"></div>"#));
+    let js = include_str!("web/app.js");
+    assert_eq!(js.matches("announceLine(cleanText)").count(), 1, "announced from appendNewLine only");
+    assert!(js.contains("if (screenReader && !drawingSplit && !gagged) announceLine(cleanText);"));
+    assert!(!js[js.find("function renderOutput(").unwrap()..].split("\n    function ").next().unwrap().contains("announceLine"), "never from a redraw");
+    assert!(js.contains("screen_reader_profile: (screenReaderProfiles && fontProfileKey in screenReaderProfiles)"));
+    assert!(js.contains("if (screenReader) return 0;"), "no Text Reveal in Screen Reader mode");
+}
+
 /// The web page draws TF's status line in the Separator Style's look as the console does:
 /// the pad by look unless the script set one, and the TinyFugue look's class on the bar.
 #[test]
@@ -22677,4 +23402,33 @@ fn app_js_answers_reload_options_in_the_servers_words() {
     let js = include_str!("web/app.js");
     assert!(js.contains(&format!("const RELOAD_USAGE = \"{RELOAD_USAGE}\";")), "app.js RELOAD_USAGE drifted from main.rs");
     assert!(js.contains(&format!("const RELOAD_SWITCH_ELSEWHERE = \"{RELOAD_SWITCH_ELSEWHERE}\";")), "app.js RELOAD_SWITCH_ELSEWHERE drifted from main.rs");
+}
+
+/// A second Clay on another port (user request 2026-11-01): `web_port` is the port bound,
+/// and a change to the setting puts the configured port back in charge.
+#[test]
+fn the_web_port_is_the_bound_one_until_the_setting_changes() {
+    let mut app = App::new();
+    app.worlds.push(World::new("test")); // the save's own line needs a world to land in
+    app.settings.http_port = 9000;
+    assert_eq!(app.web_port(), 9000);
+    app.web_port_override = Some(9001);
+    assert_eq!(app.web_port(), 9001, "the port taken when 9000 was in use");
+    let same_port = WebSettings {
+        http_enabled: app.settings.http_enabled,
+        http_port: "9000".to_string(),
+        web_path: app.settings.web_path.clone(),
+        ws_password: app.settings.websocket_password.clone(),
+        ws_allow_list: app.settings.websocket_allow_list.clone(),
+        custom_cert: false,
+        ws_cert_file: String::new(),
+        ws_key_file: String::new(),
+        remote_initial_lines: app.settings.remote_initial_lines as i64,
+    };
+    apply_web_settings(&mut app, &same_port);
+    assert_eq!(app.web_port(), 9001, "a save that leaves the port alone keeps the one bound");
+    let new_port = WebSettings { http_port: "9005".to_string(), ..same_port };
+    apply_web_settings(&mut app, &new_port);
+    assert_eq!(app.settings.http_port, 9005);
+    assert_eq!(app.web_port(), 9005, "a changed setting drops the override");
 }

@@ -139,7 +139,6 @@ pub async fn run_daemon_server() -> io::Result<()> {
     // is no plain-HTTP mode for remote clients any more: it sent the login and every
     // settings message across the network unencrypted.
     if app.settings.http_enabled {
-        #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
         match resolve_web_cert_files(&mut app) {
             Some((cert_file, key_file)) => {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
@@ -167,12 +166,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
             }
             None => eprintln!("Error: no TLS certificate available; not starting the web server."),
         }
-        #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-        eprintln!("Error: built without TLS support; not starting the web server.");
     }
 
     // Check if any servers are running
-    if app.http_server.is_none() && app.https_server.is_none() {
+    if app.https_server.is_none() {
         eprintln!("Error: No servers started. Enable HTTP in settings.");
         eprintln!("Use /web command to configure, or edit ~/.clay/settings.dat");
         return Ok(());
@@ -205,6 +202,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
     let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(reconnect_sleep);
+    // The mapper's walks (src/map): a step whose room the game hasn't reported in time ends
+    // its walk. Armed at the bottom of every iteration from `next_walk_deadline`.
+    let walk_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(walk_sleep);
 
     // mud-status-display.md Job 2 (plan D4): same conditional dormant-timer idiom as
     // process_tick_sleep/reconnect_sleep above, at the ~150ms cadence run_app/
@@ -548,6 +549,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
 
             // Auto-reconnect timer (mirrors run_app_headless): services World.reconnect_at,
             // scheduled by handle_disconnected above.
+            _ = &mut walk_sleep => {
+                app.map_expire_walks();
+                walk_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+            }
             _ = &mut reconnect_sleep => {
                 app.start_due_reconnects(&event_tx);
                 // Re-arm timer for next scheduled reconnect
@@ -586,6 +591,11 @@ pub async fn run_daemon_server() -> io::Result<()> {
         // Shell worlds (src/shell): send any live PTY's screen change to clients every
         // iteration (not on a timer), so a `-D`-attached client sees output at once.
         app.flush_shell_frames();
+        // The mapper: changed rooms saved, map views told; the walk timer armed.
+        app.flush_map();
+        if let Some(due) = app.next_walk_deadline() {
+            walk_sleep.as_mut().reset(tokio::time::Instant::from_std(due));
+        }
 
         // Arm the process timer for the next process due (processes may have been added
         // during this iteration)
@@ -983,6 +993,10 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     let msg = app.toggle_console_pause();
                     app.emit_client_text(world_index, &msg, true);
                 }
+                Command::Pause => {
+                    let msg = app.pause_other_interfaces(Some(client_id));
+                    app.emit_client_text(world_index, &msg, true);
+                }
                 Command::BanList => app.ws_ban_list(client_id, world_index),
                 Command::Unban { host } => app.ws_unban(client_id, world_index, host),
                 Command::TestMusic => {
@@ -1019,8 +1033,8 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 Command::Mssp => {
                     execute_mssp_command(app, world_index, true);
                 }
-                Command::Stats => {
-                    execute_stats_command(app, world_index, true);
+                Command::Stats { show } => {
+                    execute_stats_command(app, world_index, show, true);
                 }
                 Command::Msdp { verb, target } => {
                     execute_msdp_command(app, world_index, &verb, target.as_deref(), true);
@@ -1074,6 +1088,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 Command::Tts { args } => app.tts_command(&args, Some((client_id, world_index)), event_tx),
                 Command::Menu => app.ws_menu_is_console_only(client_id, world_index),
                 Command::Split { .. } | Command::Unsplit => app.ws_split_is_the_clients(client_id, world_index, &command),
+                Command::Map { args } => app.ws_map_command(client_id, world_index, &args, &command),
                 // UI popup commands - send back to client for local handling
                 Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
@@ -1342,7 +1357,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1353,9 +1368,17 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                 zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                 log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert,
+                crate::websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel },
             );
         }
         WsMessage::ToggleWorldGmcp { world_index } => app.toggle_world_gmcp(world_index),
+        // The map (src/map): one shared method each, as handler A does.
+        WsMessage::MapWatch { views } => app.map_watch(client_id, views),
+        WsMessage::MapRoute { world_index, request_id, to, walk } => app.map_route_request(client_id, world_index, request_id, &to, walk),
+        WsMessage::MapStop { world_index } => {
+            app.map_stop(world_index);
+        }
+        WsMessage::MapSearch { world_index, request_id, query } => app.map_search(client_id, world_index, request_id, &query),
         // Android going to the background (and back), a minimised GUI: not watching, so
         // its ▶ markers and unseen counts work as on the console master's server.
         WsMessage::ClientVisibility { visible } => app.handle_client_visibility(client_id, visible),
@@ -1730,14 +1753,14 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel } => {
             app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 msp_enabled, mcp_enabled, mccp2_enabled,
                 world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                 discord_token, discord_guild, discord_channel, discord_dm_user, chat,
-                keep_alive_gag_enabled, keep_alive_gag,
+                keep_alive_gag_enabled, keep_alive_gag, status_panel,
             );
         }
         WsMessage::CalculateNextWorld { current_index, exclude } => {
@@ -1916,7 +1939,6 @@ keep_alive_type=Generic
     // unencrypted); localhost is served plain by the accept loop itself. A cert set
     // in multiuser.dat wins, else the auto-generated one.
     {
-        #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
         {
             let Some((cert_file, key_file)) = resolve_web_cert_files_multiuser(&mut app) else {
                 eprintln!("Error: no TLS certificate available; not starting the web server.");
@@ -1934,11 +1956,6 @@ keep_alive_type=Generic
                     return Ok(());
                 }
             }
-        }
-        #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-        {
-            eprintln!("Error: built without TLS support; not starting the web server.");
-            return Ok(());
         }
     }
 
@@ -2307,31 +2324,6 @@ pub async fn connect_multiuser_world(
 
             // Handle SSL if needed
             let (read_half, write_half): (StreamReader, StreamWriter) = if use_ssl {
-                #[cfg(feature = "native-tls-backend")]
-                {
-                    let connector = match native_tls::TlsConnector::builder()
-                        .danger_accept_invalid_certs(true)
-                        .build()
-                    {
-                        Ok(c) => c,
-                        Err(_) => return None,
-                    };
-                    let connector = tokio_native_tls::TlsConnector::from(connector);
-
-                    match connector.connect(host, tcp_stream).await {
-                        Ok(tls_stream) => {
-                            let peer_cert = tls_stream.get_ref().peer_certificate().ok().flatten();
-                            if crate::platform::check_native_tls_peer_pin(&format!("{}:{}", host, port), peer_cert).is_err() {
-                                return None;
-                            }
-                            let (r, w) = tokio::io::split(tls_stream);
-                            (StreamReader::Tls(r), StreamWriter::Tls(w))
-                        }
-                        Err(_) => return None,
-                    }
-                }
-
-                #[cfg(feature = "rustls-backend")]
                 {
                     use rustls::RootCertStore;
                     use tokio_rustls::TlsConnector;
@@ -2358,11 +2350,6 @@ pub async fn connect_multiuser_world(
                         }
                         Err(_) => return None,
                     }
-                }
-
-                #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-                {
-                    return None;
                 }
             } else {
                 let (r, w) = tcp_stream.into_split();
@@ -2577,7 +2564,6 @@ impl ConnectFailure {
 
 /// The cipher a TLS connection settled on, named as TF names it (its OpenSSL's names):
 /// TF's CONNECT hook gets it after the world's name.
-#[cfg(feature = "rustls-backend")]
 pub(crate) fn tls_cipher_name(conn: &rustls::ClientConnection) -> Option<String> {
     let suite = conn.negotiated_cipher_suite()?;
     Some(openssl_cipher_name(&format!("{:?}", suite.suite())))
@@ -2737,31 +2723,6 @@ pub async fn connect_daemon_world(
             let is_tls;
             let (read_half, write_half): (StreamReader, StreamWriter) = if use_ssl {
                 is_tls = true;
-                #[cfg(feature = "native-tls-backend")]
-                {
-                    let connector = match native_tls::TlsConnector::builder()
-                        .danger_accept_invalid_certs(true)
-                        .build()
-                    {
-                        Ok(c) => c,
-                        Err(e) => return Err(tls_failure(format!("TLS error: {}", e))),
-                    };
-                    let connector = tokio_native_tls::TlsConnector::from(connector);
-
-                    match connector.connect(&host_name, tcp_stream).await {
-                        Ok(tls_stream) => {
-                            let peer_cert = tls_stream.get_ref().peer_certificate().ok().flatten();
-                            if let Err(msg) = crate::platform::check_native_tls_peer_pin(&format!("{}:{}", host_name, port), peer_cert) {
-                                return Err(tls_failure(msg));
-                            }
-                            let (r, w) = tokio::io::split(tls_stream);
-                            (StreamReader::Tls(r), StreamWriter::Tls(w))
-                        }
-                        Err(e) => return Err(tls_failure(format!("SSL handshake failed: {}", e))),
-                    }
-                }
-
-                #[cfg(feature = "rustls-backend")]
                 {
                     use rustls::RootCertStore;
                     use tokio_rustls::TlsConnector;
@@ -2792,11 +2753,6 @@ pub async fn connect_daemon_world(
                         }
                         Err(e) => return Err(tls_failure(format!("SSL handshake failed: {}", e))),
                     }
-                }
-
-                #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-                {
-                    return Err(tls_failure("No TLS backend available".to_string()));
                 }
             } else {
                 is_tls = false;
@@ -2937,6 +2893,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
             WorldStateMsg {
                 index: idx,
                 name: world.name.clone(),
+                map: None, // multiuser has no map
+
                 connected,
                 // Legacy output_lines/pending_lines left empty - all clients prefer the
                 // _ts variants (see CLAUDE.md's "WebSocket InitialState" pattern; matches
@@ -2977,6 +2935,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     msp_enabled: world.settings.msp_enabled,
                     mcp_enabled: world.settings.mcp_enabled,
                     mccp2_enabled: world.settings.mccp2_enabled,
+                    status_panel: Some(world.settings.status_panel),
                     // world_type/prompt_wait_ms aren't credentials - visible to every
                     // client the same as use_ssl/encoding above, owner or not.
                     world_type: world.settings.world_type.name().to_string(),
@@ -3104,6 +3063,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         picture_upload: false,
         // Multiuser has no archive, and its scrollback is per user (deferred task M1).
         history_on_demand: false,
+        map: false,
         emoji_json: crate::emoji::emoji_json(),
         emoji_categories_json: crate::emoji::emoji_categories_json(),
         // Multiuser shows Clay's own status bar.
@@ -4054,7 +4014,10 @@ async fn multiuser_typed_line(
             app.ws_tell(client_id, world_index, &format!("Flushed {} lines from output buffer.", count));
         }
         // The user's own connection's data (the shared World's is nobody's here).
-        Command::Stats => {
+        Command::Stats { show: Some(_) } => {
+            app.ws_tell(client_id, world_index, "A multiuser server's worlds are set by its operator; the status display can't be hidden here.");
+        }
+        Command::Stats { show: None } => {
             let entries: Vec<stats::StatEntry> = app.user_connections.get(&key).map(|c| c.protocol.stats.entries().to_vec()).unwrap_or_default();
             app.ws_tell(client_id, world_index, &crate::commands::stats_lines(&entries).join("\n"));
         }
@@ -4262,7 +4225,7 @@ mod multiuser_command_tests {
     #[tokio::test]
     async fn server_wide_commands_are_refused_with_a_line() {
         let mut u = two_users();
-        for cmd in ["/reload", "/setup", "/update", "/ban", "/web", "/note /etc/passwd", "/tag"] {
+        for cmd in ["/reload", "/setup", "/update", "/ban", "/web", "/note /etc/passwd", "/tag", "/pause"] {
             typed(&mut u, cmd).await;
             let lines = told(&mut u.alice);
             assert!(lines.iter().any(|l| l.contains("not available on a multiuser server")), "{cmd}: {lines:?}");

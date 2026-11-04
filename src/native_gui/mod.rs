@@ -132,7 +132,8 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
 }
 
 /// `--gui` alone: Clay itself, in this process, as `--web-gui` runs it
-/// (webview_gui::run_master_webgui): the app on the settings' port with a session
+/// (webview_gui::run_master_webgui): the app on the settings' port (or the next free one,
+/// when another program has it) with a session
 /// password of its own (the server listens for remote clients too, so it mustn't be
 /// guessable), and this window logged in to it over the loopback.
 fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
@@ -144,22 +145,9 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
         let _ = crate::persistence::load_settings(&mut app);
         (app.settings.http_port, app.settings.websocket_password.clone())
     };
-    // Another Clay already there? (Not on a reload: the old process may hold the port
-    // a moment longer, and the server's bind retries.)
-    // Both the loopback this window connects to and every interface, where the server
-    // listens: Windows lets a loopback bind succeed beside another program listening on
-    // all interfaces, so checking the loopback alone let a Clay already running through,
-    // to a server that couldn't bind and a ten-second wait for nothing.
-    if !std::env::args().any(|a| a == "--reload") {
-        for host in ["127.0.0.1", "0.0.0.0"] {
-            if let Err(e) = std::net::TcpListener::bind((host, port)) {
-                if e.kind() == std::io::ErrorKind::AddrInUse {
-                    fail(crate::platform::port_in_use_message(port, &format!("clay --gui=127.0.0.1:{port}")));
-                }
-                fail(format!("Clay failed to start: could not bind port {port}: {e}"));
-            }
-        }
-    }
+    // A port already taken (another Clay, as a rule) is the server's to handle: it takes
+    // the next free one and says so (start_web_server_at_startup), and GUI_HTTP_PORT is
+    // where this window then connects.
     let ws_override = match crate::gui_session_password(&saved_password) {
         Ok(o) => o,
         Err(e) => fail(format!("Clay failed to start: {e}")),
@@ -191,6 +179,7 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
     if !ready {
         fail(format!("Clay failed to start: its server did not come up on port {port} within 10 seconds."));
     }
+    let port = crate::GUI_HTTP_PORT.load(std::sync::atomic::Ordering::SeqCst);
     crate::debug_log(crate::is_debug_enabled(), &format!("native-gui: Clay's server is up on port {port}"));
     LOCAL.store(true, std::sync::atomic::Ordering::Relaxed);
     let target = core::net::Target::parse(Some(&format!("127.0.0.1:{port}"))).expect("a loopback address");

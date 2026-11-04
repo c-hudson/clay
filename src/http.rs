@@ -1160,7 +1160,6 @@ impl SecurityGate {
 // ============================================================================
 
 /// HTTPS server state for the web interface
-#[cfg(feature = "native-tls-backend")]
 pub struct HttpsServer {
     pub running: Arc<RwLock<bool>>,
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1171,7 +1170,6 @@ pub struct HttpsServer {
     pub bind_retry: bool,
 }
 
-#[cfg(feature = "native-tls-backend")]
 impl HttpsServer {
     pub fn new(port: u16) -> Self {
         Self {
@@ -1184,164 +1182,6 @@ impl HttpsServer {
 }
 
 /// Start the HTTPS server (unified HTTP+WS)
-#[cfg(feature = "native-tls-backend")]
-pub async fn start_https_server(
-    server: &mut HttpsServer,
-    cert_file: &str,
-    key_file: &str,
-    ws_state: Option<Arc<WsConnectionState>>,
-    ban_list: BanList,
-    theme_css_vars: String,
-    gate: SecurityGate,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::fs::File;
-    use std::io::Read;
-
-    // Read certificate and key
-    let mut cert_data = Vec::new();
-    File::open(cert_file)?.read_to_end(&mut cert_data)?;
-
-    let mut key_data = Vec::new();
-    File::open(key_file)?.read_to_end(&mut key_data)?;
-
-    // Create identity from PEM files (same as WebSocket TLS)
-    let identity = native_tls::Identity::from_pkcs8(&cert_data, &key_data)?;
-    let tls_acceptor = native_tls::TlsAcceptor::new(identity)?;
-    let tls_acceptor = tokio_native_tls::TlsAcceptor::from(tls_acceptor);
-    let tls_acceptor = Arc::new(tls_acceptor);
-
-    let listener = bind_listener("HTTPS", server.port, server.bind_retry).await?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    server.shutdown_tx = Some(shutdown_tx);
-
-    let server_port = server.port;
-    let running = Arc::clone(&server.running);
-    *running.write().await = true;
-
-    let theme_css_vars = Arc::new(theme_css_vars);
-    let conn_counter = ConnectionCounter::new();
-    let ws_counter = ConnectionCounter::new();
-    tokio::spawn(async move {
-        // Signal ready INSIDE the spawned task — ensures the accept loop is actually
-        // running. Mirrors start_http_server's signal (this is the only server-start
-        // path the GUI uses since D8's "always HTTPS-capable" change; webview_gui.rs's
-        // startup wait loop watches this exact flag).
-        crate::GUI_HTTP_READY.store(true, std::sync::atomic::Ordering::SeqCst);
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((mut stream, addr)) => {
-                            let client_ip = addr.ip().to_string();
-                            if ban_list.is_banned(&client_ip) {
-                                continue;
-                            }
-                            let guard = match conn_counter.try_acquire(&client_ip, MAX_HTTP_CONNECTIONS_PER_IP) {
-                                Some(g) => g,
-                                None => {
-                                    log_remote_event("CONN-LIMIT", &client_ip, "connection limit reached");
-                                    continue;
-                                }
-                            };
-                            let _ = stream.set_nodelay(true);
-                            crate::platform::enable_tcp_keepalive(&stream);
-                            crate::platform::not_inherited(&stream);
-                            let tls_acceptor = tls_acceptor.clone();
-                            let theme_css_vars = theme_css_vars.clone();
-                            let ws_state = ws_state.clone();
-                            let ws_counter = ws_counter.clone();
-                            let gate = gate.clone();
-                            tokio::spawn(async move {
-                                match gate_connection(&mut stream, &client_ip, &gate).await {
-                                    GateResult::Drop => {},
-                                    GateResult::Proceed { knocked, in_allow_list } => {
-                                        // Peek first byte to detect plain HTTP vs TLS
-                                        let mut peek = [0u8; 1];
-                                        match tokio::time::timeout(
-                                            std::time::Duration::from_secs(READ_TIMEOUT_SECS),
-                                            stream.peek(&mut peek),
-                                        ).await {
-                                            Ok(Ok(1)) if peek[0] != 0x16 => {
-                                                // Not a TLS ClientHello. Localhost is always
-                                                // served plain — no TLS handshake, no cert
-                                                // prompt (desktop GUI WebView, local browser).
-                                                // Remote clients get redirected to HTTPS (D2/D6:
-                                                // reuses decide_route via gate/in_allow_list, see
-                                                // redirect_http_to_https doc comment).
-                                                if addr.ip().is_loopback() {
-                                                    route_connection(stream, ws_state, false, &theme_css_vars, addr, false, guard, &ws_counter, &gate, knocked, in_allow_list).await;
-                                                } else {
-                                                    redirect_http_to_https(stream, server_port, false, in_allow_list, knocked, &gate, &client_ip).await;
-                                                }
-                                                return;
-                                            }
-                                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
-                                            _ => {}
-                                        }
-                                        match tokio::time::timeout(
-                                            std::time::Duration::from_secs(TLS_TIMEOUT_SECS),
-                                            tls_acceptor.accept(stream),
-                                        ).await {
-                                            Ok(Ok(tls_stream)) => {
-                                                route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, true, guard, &ws_counter, &gate, knocked, in_allow_list).await;
-                                            }
-                                            Ok(Err(e)) => {
-                                                log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
-                                            }
-                                            Err(_) => {
-                                                log_remote_event("TLS-TIMEOUT", &client_ip, "handshake timeout");
-                                                gate.strike(&client_ip, "tls-timeout").await;
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                        Err(_) => break,
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    break;
-                }
-            }
-        }
-        *running.write().await = false;
-    });
-
-    Ok(())
-}
-
-// ============================================================================
-// HTTPS Server implementation for rustls-backend
-// ============================================================================
-
-/// HTTPS server state for the web interface (rustls version)
-#[cfg(feature = "rustls-backend")]
-pub struct HttpsServer {
-    pub running: Arc<RwLock<bool>>,
-    pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    pub port: u16,
-    /// Keep trying the bind while the port is in use (see `bind_listener`): a reload or
-    /// crash successor (`port_released_by_predecessor`), or `restart_http_server` dropping its own
-    /// old listener. Off, a cold start's bind answers at once.
-    pub bind_retry: bool,
-}
-
-#[cfg(feature = "rustls-backend")]
-impl HttpsServer {
-    pub fn new(port: u16) -> Self {
-        Self {
-            running: Arc::new(RwLock::new(false)),
-            shutdown_tx: None,
-            port,
-            bind_retry: false,
-        }
-    }
-}
-
-/// Start the HTTPS server (rustls version, unified HTTP+WS)
-#[cfg(feature = "rustls-backend")]
 pub async fn start_https_server(
     server: &mut HttpsServer,
     cert_file: &str,
@@ -1375,9 +1215,9 @@ pub async fn start_https_server(
     let ws_counter = ConnectionCounter::new();
     tokio::spawn(async move {
         // Signal ready INSIDE the spawned task — ensures the accept loop is actually
-        // running. Mirrors start_http_server's signal (this is the only server-start
-        // path the GUI uses since D8's "always HTTPS-capable" change; webview_gui.rs's
-        // startup wait loop watches this exact flag).
+        // running (this is the one server-start path; webview_gui.rs's startup wait
+        // loop watches this exact flag).
+        crate::GUI_HTTP_PORT.store(server_port, std::sync::atomic::Ordering::SeqCst);
         crate::GUI_HTTP_READY.store(true, std::sync::atomic::Ordering::SeqCst);
         loop {
             tokio::select! {
@@ -1635,36 +1475,6 @@ impl Drop for ConnectionGuard {
     }
 }
 
-// ============================================================================
-// HTTP Web Interface Server (no TLS)
-// ============================================================================
-
-/// HTTP server state for the web interface (no TLS)
-pub struct HttpServer {
-    pub running: Arc<RwLock<bool>>,
-    pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    pub port: u16,
-    /// Raw socket handle of the TCP listener (for passing to child process on reload)
-    #[cfg(windows)]
-    pub listener_handle: Option<u64>,
-    #[cfg(not(windows))]
-    pub listener_handle: Option<i32>,
-    /// As `HttpsServer::bind_retry`.
-    pub bind_retry: bool,
-}
-
-impl HttpServer {
-    pub fn new(port: u16) -> Self {
-        Self {
-            running: Arc::new(RwLock::new(false)),
-            shutdown_tx: None,
-            listener_handle: None,
-            port,
-            bind_retry: false,
-        }
-    }
-}
-
 /// The web server couldn't have its port.
 ///
 /// `Display` is the long form, for the GUIs' "Clay failed to start" dialog
@@ -1722,13 +1532,49 @@ pub(crate) fn start_warning(what: &str, e: &(dyn std::error::Error + 'static)) -
 /// holds (user report 2026-10-28). Read once and removed, so neither this process's
 /// children nor its own successor see a stale value.
 pub(crate) fn port_released_by_predecessor(port: u16) -> bool {
+    match predecessor_web_port() {
+        PredecessorPort::Any => true,
+        PredecessorPort::Port(p) => p == port,
+        PredecessorPort::None => false,
+    }
+}
+
+/// What the predecessor said about its web port (`CLAY_RELOAD_WEB_PORT`, read once as
+/// above): nothing, `*` (a crash with no App to ask), or the port its listener had - which
+/// a successor keeps whether or not it is the configured one, so the clients attached to
+/// it stay attached.
+pub(crate) enum PredecessorPort {
+    None,
+    Any,
+    Port(u16),
+}
+
+pub(crate) fn predecessor_web_port() -> PredecessorPort {
     let value = std::env::var(crate::platform::RELOAD_WEB_PORT_ENV).ok();
     std::env::remove_var(crate::platform::RELOAD_WEB_PORT_ENV);
     match value.as_deref() {
-        Some("*") => true,
-        Some(v) => v.parse::<u16>().ok() == Some(port),
-        None => false,
+        Some("*") => PredecessorPort::Any,
+        Some(v) => v.parse::<u16>().map(PredecessorPort::Port).unwrap_or(PredecessorPort::None),
+        None => PredecessorPort::None,
     }
+}
+
+/// How far above the configured port a Clay looks for a free one.
+pub(crate) const PORT_SEARCH_SPAN: u16 = 100;
+
+/// Whether `port` can be bound here - on the loopback and on every interface both, as the
+/// GUIs' start-up probe did before this: Windows lets a loopback bind succeed beside a
+/// program listening on all interfaces.
+pub(crate) fn port_is_free(port: u16) -> bool {
+    ["127.0.0.1", "0.0.0.0"].iter().all(|host| std::net::TcpListener::bind((*host, port)).is_ok())
+}
+
+/// The port a Clay starts its web server on: `wanted` when it is free, else the first free
+/// port above it within `PORT_SEARCH_SPAN` (`None` when there is none). A second Clay on
+/// the same machine runs beside the first this way instead of refusing to start (user
+/// request 2026-11-01); the caller says which port it ended up on.
+pub(crate) fn free_web_port(wanted: u16) -> Option<u16> {
+    (wanted..=wanted.saturating_add(PORT_SEARCH_SPAN)).find(|p| port_is_free(*p))
 }
 
 /// How long a retried bind keeps trying: `BIND_ATTEMPTS` tries, `BIND_RETRY_DELAY` apart.
@@ -1769,99 +1615,6 @@ fn http_bind_host() -> &'static str {
     } else {
         "0.0.0.0"
     }
-}
-
-/// Start the HTTP server (plain TCP, no TLS, unified HTTP+WS)
-pub async fn start_http_server(
-    server: &mut HttpServer,
-    ws_state: Option<Arc<WsConnectionState>>,
-    ban_list: BanList,
-    theme_css_vars: String,
-    inherited_handle: Option<u64>,
-    gate: SecurityGate,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = if let Some(handle) = inherited_handle {
-        // Reconstruct listener from inherited socket handle (reload on Windows)
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::FromRawSocket;
-            let std_listener = unsafe { std::net::TcpListener::from_raw_socket(handle) };
-            std_listener.set_nonblocking(true)?;
-            tokio::net::TcpListener::from_std(std_listener)?
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = handle;
-            return Err("inherited_handle not supported on this platform".into());
-        }
-    } else {
-        bind_listener("HTTP", server.port, server.bind_retry).await?
-    };
-
-    // Store the listener handle for passing to child process on reload
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawSocket;
-        server.listener_handle = Some(listener.as_raw_socket());
-    }
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    server.shutdown_tx = Some(shutdown_tx);
-
-    let running = Arc::clone(&server.running);
-    *running.write().await = true;
-
-    let theme_css_vars = Arc::new(theme_css_vars);
-    let conn_counter = ConnectionCounter::new();
-    let ws_counter = ConnectionCounter::new();
-    tokio::spawn(async move {
-        // Signal ready INSIDE the spawned task — ensures the accept loop is actually running
-        crate::GUI_HTTP_READY.store(true, std::sync::atomic::Ordering::SeqCst);
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((mut stream, addr)) => {
-                            let client_ip = addr.ip().to_string();
-                            if ban_list.is_banned(&client_ip) {
-                                drop(stream);
-                                continue;
-                            }
-                            let guard = match conn_counter.try_acquire(&client_ip, MAX_HTTP_CONNECTIONS_PER_IP) {
-                                Some(g) => g,
-                                None => {
-                                    log_remote_event("CONN-LIMIT", &client_ip, "connection limit reached");
-                                    continue;
-                                }
-                            };
-                            let _ = stream.set_nodelay(true);
-                            crate::platform::enable_tcp_keepalive(&stream);
-                            crate::platform::not_inherited(&stream);
-                            let theme_css_vars = theme_css_vars.clone();
-                            let ws_state = ws_state.clone();
-                            let ws_counter = ws_counter.clone();
-                            let gate = gate.clone();
-                            tokio::spawn(async move {
-                                match gate_connection(&mut stream, &client_ip, &gate).await {
-                                    GateResult::Drop => {},
-                                    GateResult::Proceed { knocked, in_allow_list } => {
-                                        route_connection(stream, ws_state, false, &theme_css_vars, addr, false, guard, &ws_counter, &gate, knocked, in_allow_list).await;
-                                    }
-                                }
-                            });
-                        }
-                        Err(_) => break,
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    break;
-                }
-            }
-        }
-        *running.write().await = false;
-    });
-
-    Ok(())
 }
 
 // ============================================================================
@@ -2717,6 +2470,29 @@ mod bind_tests {
         assert!(port_released_by_predecessor(9000), "unknown: retry as before");
         std::env::set_var(var, "junk");
         assert!(!port_released_by_predecessor(9000));
+        // The port is read as said, the configured one or not (a Clay running on the next
+        // free port reloads onto that port).
+        std::env::set_var(var, "9001");
+        assert!(matches!(predecessor_web_port(), PredecessorPort::Port(9001)));
+        std::env::set_var(var, "*");
+        assert!(matches!(predecessor_web_port(), PredecessorPort::Any));
+        assert!(matches!(predecessor_web_port(), PredecessorPort::None), "read once");
+    }
+
+    /// A second Clay: the configured port is held, so the next free one above it is taken;
+    /// once the port is free again it is the one.
+    #[test]
+    fn a_second_clay_takes_the_next_free_port() {
+        // Not a `testserver::free_port()`: the search probes the ports above `wanted`, and
+        // those are the ones that allocator hands the tests running alongside - a probe's
+        // momentary bind made one of them fail its own bind ("Address in use", once).
+        let wanted = 19000 + (std::process::id() % 500) as u16;
+        let held = std::net::TcpListener::bind(("0.0.0.0", wanted)).expect("a free port binds");
+        let taken = free_web_port(wanted).expect("a free port within the span");
+        assert!(taken > wanted, "{taken} is not above the held {wanted}");
+        assert!(port_is_free(taken));
+        drop(held);
+        assert_eq!(free_web_port(wanted), Some(wanted));
     }
 
     /// A second Clay: the port is held, and without the retry the answer comes at once

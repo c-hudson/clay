@@ -45,6 +45,7 @@ pub mod tts;
 pub mod kokoro;
 pub mod scrollback;
 pub mod stats;
+pub mod map;
 pub mod protocol_state;
 pub mod tfrun;
 mod tfstartup;
@@ -100,6 +101,10 @@ static STARTUP_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub static GUI_RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Flag set by HTTP server after successful bind — checked by GUI readiness wait
 pub static GUI_HTTP_READY: AtomicBool = AtomicBool::new(false);
+/// The port that server bound (set with `GUI_HTTP_READY`): the configured one, or the next
+/// free one when another program had it (`http::free_web_port`), which is where the GUI's
+/// own window then connects.
+pub static GUI_HTTP_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 /// Why the GUI's in-process server didn't start (a bind or certificate failure), for the
 /// GUIs' start-up waits: they say so at once rather than waiting out their timeout.
 pub static GUI_HTTP_FAILED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -253,7 +258,7 @@ pub use actions::{
     compile_all_action_regexes,
     find_invocable_action, rewrite_slashless_action,
 };
-pub use http::{HttpsServer, HttpServer, BanList, SecurityGate, start_https_server, start_http_server, log_http_404, log_ws_auth, log_ban};
+pub use http::{HttpsServer, BanList, SecurityGate, start_https_server, log_http_404, log_ws_auth, log_ban};
 pub use persistence::{
     encrypt_password, decrypt_password,
     save_settings, load_settings,
@@ -785,31 +790,49 @@ impl TextReveal {
     }
 }
 
-/// World-tabs ribbon display mode (web/GUI/Android only — no effect on the
-/// console TUI, which has no equivalent horizontal-strip UI).
+/// Where the world tabs go (web/GUI/Android only — the console TUI has none): a strip
+/// above or below the output, a column beside it (user request 2026-11-01), or nowhere.
+/// Kept per interface (`Settings::tabs_profiles`), with `Settings::tabs` the shared value an
+/// interface that never chose its own uses, and the one an older peer reads and writes.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TabsMode {
     #[default]
     None,
     Top,
     Bottom,
+    Left,
+    Right,
 }
 
 impl TabsMode {
+    /// Every choice, by name and label, in the order the pickers list them (the user's:
+    /// "Top, Bottom, Left, Right, and None"). The web page's `<select>` is pinned to it.
+    pub const OPTIONS: &'static [(&'static str, &'static str)] =
+        &[("top", "Top"), ("bottom", "Bottom"), ("left", "Left"), ("right", "Right"), ("none", "None")];
+
     pub fn name(&self) -> &'static str {
         match self {
             TabsMode::None => "none",
             TabsMode::Top => "top",
             TabsMode::Bottom => "bottom",
+            TabsMode::Left => "left",
+            TabsMode::Right => "right",
         }
     }
 
     pub fn from_name(name: &str) -> Self {
-        match name.to_lowercase().as_str() {
+        match name.trim().to_lowercase().as_str() {
             "top" => TabsMode::Top,
             "bottom" => TabsMode::Bottom,
+            "left" => TabsMode::Left,
+            "right" => TabsMode::Right,
             _ => TabsMode::None,
         }
+    }
+
+    /// A column beside the output rather than a strip across it.
+    pub fn is_side(&self) -> bool {
+        matches!(self, TabsMode::Left | TabsMode::Right)
     }
 }
 
@@ -1780,7 +1803,6 @@ fn custom_cert_problem(cert: &str, key: &str) -> Option<String> {
             });
         }
     }
-    #[cfg(feature = "rustls-backend")]
     if let Err(e) = crate::websocket::load_pem_cert_and_key(cert, key) {
         return Some(e);
     }
@@ -2220,8 +2242,27 @@ pub struct Settings {
     /// Each interface's own text-to-speech, by its key (`valid_interface_key`; a client
     /// names it in `AuthRequest.interface_key`). Off until that interface chose one.
     pub tts_profiles: std::collections::BTreeMap<String, tts::TtsProfile>,
-    /// World-tabs ribbon display mode (web/GUI/Android only, see TabsMode)
+    /// Where the world tabs go, shared: what an interface that never chose its own uses, and
+    /// what an older peer reads and writes (web/GUI/Android only, see TabsMode)
     pub tabs: TabsMode,
+    /// Each interface's own tab location, by its key (`valid_interface_key`; user ruling
+    /// 2026-11-01: a desktop window can have them at the side while a phone keeps the top).
+    pub tabs_profiles: std::collections::BTreeMap<String, TabsMode>,
+    /// The console's own Screen Reader mode (docs/markdown/24-accessibility.md): no text
+    /// reveal, no clock repaint, the cursor kept on the input line, and its TTS quiet (the
+    /// screen reader speaks). Every other interface's is in `screen_reader_profiles`.
+    pub screen_reader: bool,
+    /// Each interface's own Screen Reader mode, by its key; off until it chose one.
+    pub screen_reader_profiles: std::collections::BTreeMap<String, bool>,
+    /// Tell MUDs a screen reader is in use: the MTTS screen-reader bit in the TTYPE answer
+    /// (`telnet::set_announce_screen_reader`), from the next connect. One global setting:
+    /// the connection is shared by every interface.
+    pub announce_screen_reader: bool,
+    /// Settings' Status Panel (the console's Status Line): show the MUD's GMCP `Char.*`/MSDP
+    /// status display at all. One setting for the whole instance, shown in every interface's
+    /// Settings (user ruling 2026-11-02). A world's own switch is `WorldSettings::status_panel`;
+    /// the display shows only while both are on (`App::status_display_wanted`). Default on.
+    pub status_panel: bool,
     /// Icon bar visibility mode (web/GUI/Android only, see IconBarMode)
     pub icon_bar: IconBarMode,
     /// Import Picture's host (src/picture.rs): where a picture is uploaded, and whether its
@@ -2271,6 +2312,22 @@ impl Settings {
     /// One interface's own Text Reveal, by its key; Off until it chose one.
     pub fn text_reveal_for(&self, key: &str) -> TextReveal {
         self.text_reveal_profiles.get(key).copied().unwrap_or_default()
+    }
+
+    /// One interface's own Screen Reader mode, by its key; off until it chose one.
+    pub fn screen_reader_for(&self, key: &str) -> bool {
+        self.screen_reader_profiles.get(key).copied().unwrap_or(false)
+    }
+
+    /// The console's Text Reveal as it draws: Off while its Screen Reader mode is on (a
+    /// screen reader can't read a line that is still being typed on).
+    pub fn console_text_reveal(&self) -> TextReveal {
+        if self.screen_reader { TextReveal::Off } else { self.text_reveal }
+    }
+
+    /// One interface's own tab location, by its key; the shared one until it chose its own.
+    pub fn tabs_for(&self, key: &str) -> TabsMode {
+        self.tabs_profiles.get(key).copied().unwrap_or(self.tabs)
     }
 
     /// One interface's own text-to-speech, by its key; Off until it chose one.
@@ -2360,6 +2417,11 @@ impl Default for Settings {
             tts_mode: tts::TtsMode::Off,
             tts_profiles: std::collections::BTreeMap::new(),
             tabs: TabsMode::None,
+            tabs_profiles: std::collections::BTreeMap::new(),
+            screen_reader: false,
+            screen_reader_profiles: std::collections::BTreeMap::new(),
+            announce_screen_reader: false,
+            status_panel: true,
             icon_bar: IconBarMode::AppTablet,
             picture_host: picture::PictureService::default(),
             tts_speak_mode: tts::TtsSpeakMode::All,
@@ -2452,7 +2514,8 @@ pub(crate) const LEGACY_DEFAULT_GMCP_PACKAGES: &str = "Client.Media 1";
 /// stored value, including one a user deliberately edited back to look like the old
 /// default, is left alone — the plan (Job 6) accepts that these two cases are
 /// indistinguishable from the stored string alone.
-pub(crate) const DEFAULT_GMCP_PACKAGES: &str = "Client.Media 1, Char 1";
+/// `Room 1` (2026-11-01): the room the user is in, for the map (src/map).
+pub(crate) const DEFAULT_GMCP_PACKAGES: &str = "Client.Media 1, Char 1, Room 1";
 
 /// Default for `WorldSettings::prompt_wait_ms` - see that field's doc comment.
 pub(crate) const DEFAULT_PROMPT_WAIT_MS: u64 = 1000;
@@ -2530,6 +2593,11 @@ pub struct WorldSettings {
     /// sends the corresponding `DO`/`DONT` mid-session instead (see
     /// `send_mccp2_toggle_if_changed`).
     pub mccp2_enabled: bool,
+    /// Edit World's Status Panel (the console's Status Line): show this world's status
+    /// display (GMCP `Char.*`/MSDP) in every interface. Settings' `Settings::status_panel`
+    /// hides it for every world; it shows only while both are on. `/stats hide|show` (the
+    /// GUIs' × on the panel) sets it too. Default on.
+    pub status_panel: bool,
     /// Only relevant for `WorldType::MudTimedPrompt`: how long
     /// (`App::promote_due_timed_prompts`) waits, after a partial line with no
     /// terminating newline is parked with nothing else arriving, before promoting it to
@@ -2579,6 +2647,7 @@ impl Default for WorldSettings {
             msp_enabled: true,
             mcp_enabled: true,
             mccp2_enabled: true,
+            status_panel: true,
             prompt_wait_ms: DEFAULT_PROMPT_WAIT_MS,
             tf_type: String::new(),
         }
@@ -2911,6 +2980,9 @@ pub enum Command {
     Split { world: Option<String> },
     /// /unsplit - close the split pane without the focus
     Unsplit,
+    /// /map [...] - the auto-mapper (src/map): the pane forms are each interface's own,
+    /// the rest (go, path, stop, find, here, forget) run where the connection is
+    Map { args: String },
     /// /font - show font settings popup (web/GUI only)
     Font,
     /// /send [-W] [-T<type>] [-w[<world>]] [-n] [-h] <text> - send text
@@ -2952,6 +3024,8 @@ pub enum Command {
     RemotePause { client_id: u64 },
     /// /remote --pause console - toggle whether the console counts as watching its world
     RemotePauseConsole,
+    /// /pause - `/remote --pause` on every interface but the one that typed it
+    Pause,
     /// /ban - show banned hosts
     BanList,
     /// /unban <host> - remove ban for host
@@ -2972,8 +3046,10 @@ pub enum Command {
     /// panel). Read-only: derived from GMCP/MSDP the MUD already sent, nothing new is
     /// requested. Modeled on `Mssp` above — one shared body
     /// (`commands::execute_stats_command`), called identically from the console, the
-    /// single-user WS/GUI path, and multiuser.
-    Stats,
+    /// single-user WS/GUI path, and multiuser. `show`: `/stats show|hide` (also `on|off`),
+    /// the current world's own Status Panel switch (`WorldSettings::status_panel`); `None`
+    /// lists the stats.
+    Stats { show: Option<bool> },
     /// /msdp <LIST|REPORT|UNREPORT|SEND> [target] - send an MSDP (option 69)
     /// command to the current world (plan Job 12 / 4.3). Refused with a
     /// message, not sent, if MSDP was never negotiated on this connection.
@@ -3139,6 +3215,8 @@ pub fn parse_command(input: &str) -> Command {
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
         "/split" => Command::Split { world: (!args.is_empty()).then(|| args.join(" ")) },
+        // "/@map": TinyFugue's map.tf defines a /map macro, which wins when loaded.
+        "/map" | "/@map" => Command::Map { args: args.join(" ") },
         "/unsplit" => Command::Unsplit,
         "/font" => Command::Font,
         "/send" => parse_send_command(args, trimmed),
@@ -3162,6 +3240,7 @@ pub fn parse_command(input: &str) -> Command {
                 Command::Remote
             }
         }
+        "/pause" => Command::Pause,
         "/ban" => Command::BanList,
         "/unban" => {
             if args.is_empty() {
@@ -3173,7 +3252,13 @@ pub fn parse_command(input: &str) -> Command {
         "/testmusic" => Command::TestMusic,
         "/dump" => Command::Dump { args: args.iter().map(|a| a.to_string()).collect() },
         "/mssp" => Command::Mssp,
-        "/stats" => Command::Stats,
+        "/stats" => Command::Stats {
+            show: match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                Some("show" | "on") => Some(true),
+                Some("hide" | "off") => Some(false),
+                _ => None,
+            },
+        },
         "/msdp" => parse_msdp_command(args),
         "/notify" => {
             if args.is_empty() {
@@ -4342,16 +4427,27 @@ pub struct World {
     /// Per-world and persistent across TCP reads for the same reason `just_filtered_idler`
     /// is: the blanks that follow a match frequently arrive in a later packet than the match.
     suppress_blanks_remaining: u8,
-    wont_echo_time: Option<std::time::Instant>, // When WONT ECHO was seen (for timeout-based prompt detection)
     /// When a partial line with no terminating newline was parked in `trigger_partial_line`
-    /// on a `WorldType::MudTimedPrompt` world with nothing else arriving since - the timed
-    /// counterpart of `wont_echo_time`. `App::promote_due_timed_prompts` promotes it to the
-    /// input-area prompt once `WorldSettings::prompt_wait_ms` has elapsed since this was
-    /// set. `None` on any other world type, and on a Timed world whenever the partial is
-    /// empty, already promoted, or was completed by a later packet - see
-    /// `process_server_data`'s arming site and `handle_prompt_text`'s clearing of
-    /// `trigger_partial_line` for why a continuation cancels this.
+    /// on a world that guesses prompts (`timed_prompt_wait_for`: the Timed type, or any MUD
+    /// world while TF's %lp is on) with nothing else arriving since.
+    /// `App::promote_due_timed_prompts` takes it as the input-area prompt once the wait has
+    /// elapsed since this was set. `None` on any other world, and whenever the partial is
+    /// empty, already guessed, or was completed by a later packet (`process_server_data`
+    /// overwrites it on every packet).
     pub(crate) timed_prompt_since: Option<std::time::Instant>,
+    /// The current prompt is a timed guess (`PromptSource::Timed`) and its text is still
+    /// parked in `trigger_partial_line`: a guess never takes text out of the output stream.
+    /// The server's next text (anything visible, or a newline) ends the guess - the prompt
+    /// clears and the parked text joins the line it belongs to, so a wrong guess still
+    /// leaves the output right. A line sent while it shows answers it
+    /// (`answer_timed_prompt`). A marker prompt (GA/EOR/WONT ECHO) never sets this.
+    pub(crate) prompt_timed: bool,
+    /// A timed prompt that was answered (a line went to the server while it showed): the
+    /// prompt was real and its line is over. `process_server_data` puts it into the output
+    /// as a line of its own ahead of the server's next text, without triggers or actions
+    /// (it was already handled as a prompt), so the reply never runs onto it. Empty when
+    /// there is none.
+    pub(crate) answered_prompt: String,
     pub is_initial_world: bool,      // True for the auto-created world before first connection
     pub was_connected: bool,         // True if world has ever been connected (for world cycling)
     pub skip_auto_login: bool,       // True to skip auto-login on next connect (for /worlds -l)
@@ -4453,6 +4549,11 @@ pub struct World {
     /// throwaway worlds (tests, transient lookups) never burn an id. 32 lowercase
     /// hex, no dashes.
     pub world_id: String,
+    /// The world's map (src/map): its rooms, where the user is, the walk. On the Clay that
+    /// holds the connection.
+    pub map: crate::map::WorldMapper,
+    /// The SSH console's copy of this world's map, as the server sends it.
+    pub mirrored_map: crate::map::app::MirroredMap,
     /// Precomputed stat entries as received over the wire (`WorldStateMsg::stats` /
     /// `WsMessage::StatsUpdate`) — plan Job 4. This `World` struct is shared verbatim
     /// by the SSH remote console (`remote_client.rs`), which mirrors the master's
@@ -4664,8 +4765,9 @@ impl World {
             trigger_partial_line: String::new(),
             just_filtered_idler: false,
             suppress_blanks_remaining: 0,
-            wont_echo_time: None,
             timed_prompt_since: None,
+            prompt_timed: false,
+            answered_prompt: String::new(),
             is_initial_world: false,
             was_connected: false,
             skip_auto_login: false,
@@ -4690,6 +4792,8 @@ impl World {
             login_capture_guard: 6,
             reader_name: None,
             world_id: String::new(),
+            map: Default::default(),
+            mirrored_map: Default::default(),
             mirrored_stats: Vec::new(),
             mirrored_has_notes: false,
             stats_line_shown: false,
@@ -4825,7 +4929,7 @@ impl World {
         // Job 9 (T3.2): every telnet protocol mirror (negotiated_encoding, naws_enabled/
         // naws_sent_size, gmcp_enabled/msdp_enabled, mccp2_active, echo_masked, gmcp_data/
         // msdp_variables/mssp_data, stats/stats_dirty, mcmp_default_url,
-        // gmcp_supported_packages, uses_wont_echo_prompt) now lives on `ProtocolState`,
+        // gmcp_supported_packages, seen_prompt_marker) now lives on `ProtocolState`,
         // which owns clearing itself - see `ProtocolState::clear`'s doc comment for the
         // per-field rationale this used to carry inline here (finding 4's paired App-side
         // fix, Job 10a/10b, Job 12, mud-status-display.md Jobs 1/2).
@@ -4862,8 +4966,11 @@ impl World {
         self.last_nop_time = None;
         self.last_user_command_time = None;
         // A disconnect makes any parked partial's timed-prompt promotion meaningless -
-        // the connection it was waiting on silence from no longer exists.
+        // the connection it was waiting on silence from no longer exists. (`close_notice`
+        // has already put a guessed or answered prompt into the output.)
         self.timed_prompt_since = None;
+        self.prompt_timed = false;
+        self.answered_prompt.clear();
         // Clear active media tracking (processes already killed by stop_world_media)
         self.active_media.clear();
         if clear_prompt {
@@ -5733,7 +5840,24 @@ impl World {
     pub(crate) fn clear_prompt_after_send(&mut self) {
         if self.settings.world_type.is_mud() {
             self.prompt.clear();
+            self.answer_timed_prompt();
         }
+    }
+
+    /// A line went to the server while a timed guess was the prompt: the guess was a real
+    /// prompt and has been answered, so its text is a line of its own, waiting in
+    /// `answered_prompt` for the server's next text. True if there was a guess to answer.
+    pub(crate) fn answer_timed_prompt(&mut self) -> bool {
+        if !std::mem::take(&mut self.prompt_timed) {
+            return false;
+        }
+        let text = std::mem::take(&mut self.trigger_partial_line);
+        if !self.answered_prompt.is_empty() {
+            self.answered_prompt.push('\n');
+        }
+        self.answered_prompt.push_str(&text);
+        self.timed_prompt_since = None;
+        true
     }
 
     pub(crate) fn is_reconnecting(&self) -> bool {
@@ -6060,13 +6184,13 @@ pub struct App {
     /// verification (Phase 3). Mirrors `settings.websocket_auth_key`; kept in sync by
     /// settings load/reload and by handle_ws_key_request/handle_ws_key_revoke.
     pub ws_auth_key_shared: Arc<std::sync::RwLock<Option<String>>>,
-    // HTTP web interface server (no TLS)
-    pub http_server: Option<HttpServer>,
-    // HTTPS web interface server
-    #[cfg(feature = "native-tls-backend")]
+    // HTTPS web interface server (localhost is served plain by its accept loop)
     pub https_server: Option<HttpsServer>,
-    #[cfg(feature = "rustls-backend")]
-    pub https_server: Option<HttpsServer>,
+    /// The port the web server is on when it isn't the configured one: another program (a
+    /// Clay, as a rule) had `settings.http_port` at start, so this Clay took the next free
+    /// port (`http::free_web_port`) and said so. Never saved; cleared when the setting
+    /// changes. Read through `web_port`.
+    pub web_port_override: Option<u16>,
     // Track if popup was visible last frame (for terminal clear on transition)
     pub popup_was_visible: bool,
     /// Whether the last frame left the output area to `render_output_crossterm` (no
@@ -6105,6 +6229,27 @@ pub struct App {
     pub(crate) tf_resize: Option<(u16, u16)>,
     /// This is Clay's own console (the TUI in `run_app`), which has a terminal to lend.
     pub(crate) console_tui: bool,
+    /// The maps file (src/map/store.rs), opened the first time a map is needed.
+    pub(crate) maps: Option<crate::map::store::MapStore>,
+    pub(crate) maps_tried: bool,
+    /// Clients that have a map pane (they sent `MapWatch`): a server-run pane `/map` goes
+    /// back to them as `ExecuteLocalCommand`.
+    pub(crate) ws_client_maps: std::collections::HashSet<u64>,
+    /// The console's map pane (src/map, `/map`): open, and what it shows. The SSH console's
+    /// is its own too.
+    pub(crate) map_pane: Option<crate::map::app::ConsoleMapPane>,
+    /// Rows the console's map pane takes at the top of the output area, its bar included
+    /// (0 while closed). Laid out by `rendering::ui`.
+    pub(crate) map_rows: u16,
+    /// The SSH console: the server has the map (`InitialState.map`); the views it was last
+    /// told (`MapWatch`); and map requests waiting to be sent (Esc stopping a walk).
+    pub(crate) server_map: bool,
+    pub(crate) map_watch_sent: Option<Vec<crate::map::wire::MapViewReq>>,
+    pub(crate) map_outbox: Vec<WsMessage>,
+    /// What each client's map panes show (`MapWatch`), and which areas' levels it has been
+    /// sent whole (after which only changed rooms go).
+    pub(crate) ws_client_map_views: std::collections::HashMap<u64, Vec<crate::map::wire::MapViewReq>>,
+    pub(crate) ws_client_map_sent: std::collections::HashSet<(u64, usize, String, i32)>,
     /// `/remote --pause console`: nobody is at the console, so the world it shows isn't
     /// watched (`console_watching`) - its activity shows as new on other sessions, as a
     /// paused client's does. A key at the console resumes it (`console_input`).
@@ -6400,11 +6545,11 @@ struct LedgerHole {
 }
 
 /// Where a `Prompt` event's boundary came from - see `App::handle_prompt_text`. Only
-/// `Marker` is a real observation of the server's own behavior (a telnet GA/EOR/WONT-ECHO
-/// actually arrived), so only `Marker` sets `ProtocolState::seen_prompt_marker` - see that
-/// field's doc comment. `Timed` is `App::promote_due_timed_prompts` committing a parked
-/// partial line after `WorldSettings::prompt_wait_ms` of silence on a
-/// `WorldType::MudTimedPrompt` world - an inference, not an observation.
+/// `Marker` is the server marking a prompt (a telnet GA/EOR), so only `Marker` sets
+/// `ProtocolState::seen_prompt_marker` - see that field's doc comment. `Timed` is
+/// `App::promote_due_timed_prompts` taking a parked partial line as the prompt after
+/// `WorldSettings::prompt_wait_ms` of silence - a guess, which stays in the output stream
+/// (`World::prompt_timed`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PromptSource {
     Marker,
@@ -6446,11 +6591,8 @@ impl App {
             highlight_actions: false, // Default: don't highlight action matches
             ws_server: None,
             ws_auth_key_shared: Arc::new(std::sync::RwLock::new(None)),
-            http_server: None,
-            #[cfg(feature = "native-tls-backend")]
             https_server: None,
-            #[cfg(feature = "rustls-backend")]
-            https_server: None,
+            web_port_override: None,
             popup_was_visible: false,
             output_painted_by_crossterm: false,
             ws_client_worlds: std::collections::HashMap::new(),
@@ -6464,6 +6606,16 @@ impl App {
             last_temp_world: 0,
             tf_resize: None,
             console_tui: false,
+            maps: None,
+            maps_tried: false,
+            ws_client_maps: std::collections::HashSet::new(),
+            map_pane: None,
+            map_rows: 0,
+            server_map: false,
+            map_watch_sent: None,
+            map_outbox: Vec::new(),
+            ws_client_map_views: std::collections::HashMap::new(),
+            ws_client_map_sent: std::collections::HashSet::new(),
             console_paused: false,
             split: None,
             pane_rows: (0, 0),
@@ -6745,6 +6897,10 @@ impl App {
             picture_host: self.settings.picture_host.name(),
             text_reveal: self.settings.text_reveal.name(),
             text_reveal_profiles: self.settings.text_reveal_profiles.iter().map(|(k, v)| (k.clone(), v.name())).collect(),
+            tabs_profiles: Some(self.settings.tabs_profiles.iter().map(|(k, v)| (k.clone(), v.name().to_string())).collect()),
+            screen_reader_profiles: Some(self.settings.screen_reader_profiles.clone()),
+            announce_screen_reader: self.settings.announce_screen_reader,
+            status_panel: Some(self.settings.status_panel),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             tf_bound_keys_json: self.tf_bound_keys_json(),
@@ -6850,6 +7006,17 @@ impl App {
         // server with none for it (or from before the effect) leaves this console's as is.
         if let Some(mine) = settings.text_reveal_profiles.get(REMOTE_CONSOLE_REVEAL_KEY) {
             self.settings.text_reveal = TextReveal::from_name(mine);
+        }
+        // Its own Screen Reader mode, likewise; and the one global "MUDs: Screen Reader".
+        if let Some(mine) = settings.screen_reader_profiles.as_ref().and_then(|p| p.get(REMOTE_CONSOLE_REVEAL_KEY)) {
+            self.settings.screen_reader = *mine;
+        }
+        self.settings.announce_screen_reader = settings.announce_screen_reader;
+        // Settings' Status Panel (absent from a server before it: shown).
+        let status_panel = settings.status_panel.unwrap_or(true);
+        if self.settings.status_panel != status_panel {
+            self.settings.status_panel = status_panel;
+            self.needs_output_redraw = true;
         }
         let old_tts_mode = self.settings.tts_mode;
         match &settings.tts_profiles {
@@ -7829,7 +7996,7 @@ impl App {
 
     /// Open the new setup popup for global settings
     fn open_setup_popup_new(&mut self) {
-        use popup::definitions::setup::{add_import_button, create_setup_popup, SETUP_FIELD_MORE_MODE};
+        use popup::definitions::setup::{add_import_button, add_screen_reader_fields, add_status_line_field, create_setup_popup, SETUP_FIELD_MORE_MODE};
 
         let world_switching = match self.settings.world_switch_mode {
             WorldSwitchMode::UnseenFirst => "unseen_first",
@@ -7863,6 +8030,8 @@ impl App {
             &self.settings.text_reveal.name(),
             self.settings.separator_style.name(),
         );
+        add_screen_reader_fields(&mut def, self.settings.screen_reader, self.settings.announce_screen_reader);
+        add_status_line_field(&mut def, self.settings.status_panel);
         if self.is_master {
             add_import_button(&mut def);
         }
@@ -7955,6 +8124,7 @@ impl App {
             msp_enabled: world.settings.msp_enabled,
             mcp_enabled: world.settings.mcp_enabled,
             mccp2_enabled: world.settings.mccp2_enabled,
+            status_panel: world.settings.status_panel,
             prompt_wait_ms: world.settings.prompt_wait_ms,
             tf_type: world.settings.tf_type.clone(),
             slack_token: world.settings.slack_token.clone(),
@@ -8536,6 +8706,24 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
+            // The map (src/map), as the server sends it for this console's map pane.
+            WsMessage::MapState { world_index, state } => {
+                if world_index < self.worlds.len() {
+                    self.worlds[world_index].mirrored_map.state = state;
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::MapArea { world_index, area, area_name, level, levels, replace, rooms, .. } => {
+                if world_index < self.worlds.len() {
+                    let m = &mut self.worlds[world_index].mirrored_map;
+                    m.note_area_name(&area, &area_name);
+                    if !levels.is_empty() {
+                        m.levels.insert(area.clone(), levels);
+                    }
+                    m.apply_area(area, level, replace, rooms);
+                    self.needs_output_redraw = true;
+                }
+            }
             // ECHO masking (plan Phase 3, step 3.4): live update to this SSH remote
             // console's mirrored World, same pattern as GmcpUserToggled above -
             // render_input/render_input_area read World::echo_masked directly, so
@@ -8921,6 +9109,12 @@ impl App {
                     w.settings.msp_enabled = settings.msp_enabled;
                     w.settings.mcp_enabled = settings.mcp_enabled;
                     w.settings.mccp2_enabled = settings.mccp2_enabled;
+                    // The world's Status Panel moves the console's rows.
+                    let status_panel = settings.status_panel.unwrap_or(true);
+                    if w.settings.status_panel != status_panel {
+                        w.settings.status_panel = status_panel;
+                        self.needs_output_redraw = true;
+                    }
                     // `WorldSettingsMsg::world_type` here is always the server's real
                     // post-apply value (update_world_settings reads it back from the
                     // world rather than echoing a possibly-empty incoming string), so
@@ -9267,6 +9461,8 @@ impl App {
             msp_enabled: w.settings.msp_enabled,
             mcp_enabled: w.settings.mcp_enabled,
             mccp2_enabled: w.settings.mccp2_enabled,
+            // Absent from a server before the switch: shown.
+            status_panel: w.settings.status_panel.unwrap_or(true),
             // World type (and the Slack/Discord fields below) were never hydrated here
             // before — a plain `WorldStateMsg` (connect-time InitialState, not the
             // WorldSettingsUpdated broadcast above) always carries the server's real
@@ -11405,6 +11601,7 @@ impl App {
             msp_enabled: world.settings.msp_enabled,
             mcp_enabled: world.settings.mcp_enabled,
             mccp2_enabled: world.settings.mccp2_enabled,
+            status_panel: Some(world.settings.status_panel),
             world_type: world.settings.world_type.name().to_string(),
             prompt_wait_ms: world.settings.prompt_wait_ms,
             tf_type: world.settings.tf_type.clone(),
@@ -11424,6 +11621,37 @@ impl App {
             }
     }
 
+    /// Is world `idx`'s status display (GMCP `Char.*`/MSDP) wanted? Settings' Status Panel and
+    /// the world's own (Edit World) both on. `/stats` lists the data whatever they say.
+    pub(crate) fn status_display_wanted(&self, idx: usize) -> bool {
+        self.settings.status_panel && self.worlds.get(idx).is_some_and(|w| w.settings.status_panel)
+    }
+
+    /// The console's status line rows for world `idx`: 1 once this connection has shown one
+    /// (`World::stats_line_shown`) while both switches leave it on, else 0. Every reader of
+    /// the console's layout asks this, never the latch alone.
+    pub(crate) fn status_line_rows(&self, idx: usize) -> u16 {
+        u16::from(self.worlds.get(idx).is_some_and(|w| w.stats_line_shown) && self.status_display_wanted(idx))
+    }
+
+    /// `/stats show|hide` (the GUIs' × on the panel): world `idx`'s own Status Panel switch,
+    /// saved and told to every client. Returns the line to show.
+    pub(crate) fn set_world_status_panel(&mut self, idx: usize, on: bool) -> String {
+        let Some(world) = self.worlds.get_mut(idx) else { return String::new() };
+        let name = world.name.clone();
+        if world.settings.status_panel != on {
+            world.settings.status_panel = on;
+            self.needs_output_redraw = true;
+            let _ = persistence::save_settings(self);
+            self.broadcast_world_settings(idx);
+        }
+        match (on, self.settings.status_panel) {
+            (false, _) => format!("Status display hidden for {name}. /stats show, or its switch in Edit World, turns it back on."),
+            (true, true) => format!("Status display shown for {name}."),
+            (true, false) => format!("Status display on for {name}, but it is off in Settings, so it stays hidden."),
+        }
+    }
+
     /// Tell every client that world `idx`'s settings changed (`WorldSettingsUpdated`).
     pub(crate) fn broadcast_world_settings(&mut self, idx: usize) {
         let settings = self.world_settings_msg(idx, false);
@@ -11439,6 +11667,7 @@ impl App {
         let world_state = WorldStateMsg {
             index: idx,
             name: world.name.clone(),
+            map: None,
             connected: false,
             output_lines: Vec::new(),
             pending_lines: Vec::new(),
@@ -11606,6 +11835,7 @@ impl App {
         chat: Option<crate::websocket::ChatSettingsUpdate>,
         keep_alive_gag_enabled: Option<bool>,
         keep_alive_gag: Option<String>,
+        status_panel: Option<bool>,
     ) {
         if world_index >= self.worlds.len() {
             return;
@@ -11642,6 +11872,13 @@ impl App {
         }
         if let Some(gag) = keep_alive_gag {
             self.worlds[world_index].settings.keep_alive_gag = gag;
+        }
+        // None: a client from before the Status Panel switch - leave it.
+        if let Some(on) = status_panel {
+            if self.worlds[world_index].settings.status_panel != on {
+                self.worlds[world_index].settings.status_panel = on;
+                self.needs_output_redraw = true;
+            }
         }
         self.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
         let (ar_secs, ar_on_web) = WorldSettings::parse_auto_reconnect(&auto_reconnect_secs);
@@ -11726,6 +11963,7 @@ impl App {
             msp_enabled,
             mcp_enabled,
             mccp2_enabled,
+            status_panel: Some(self.worlds[world_index].settings.status_panel),
             // Read back from the world's own settings rather than the raw incoming
             // params: world_type and the Slack/Discord fields may have been left
             // unchanged above (empty incoming value), so the broadcast must reflect
@@ -11842,7 +12080,9 @@ impl App {
         font_profile: Option<font_profile::FontProfileUpdate>,
         tts_profile: Option<websocket::TtsProfileUpdate>,
         taskbar_alert: Option<bool>,
+        more: websocket::SettingsAdditions,
     ) {
+        let websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel } = more;
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
         self.settings.temp_convert_enabled = temp_convert_enabled;
@@ -11909,12 +12149,18 @@ impl App {
         }
         // Update web settings — flag a restart if server-affecting settings changed
         let sanitized_web_path = sanitize_web_path(&web_path);
-        let web_changed = self.settings.web_secure != web_secure
-            || self.settings.http_enabled != http_enabled
+        // `web_secure` is kept for older peers only and chooses nothing since the server
+        // became always TLS-capable (D8): a difference in it is no reason to restart. The
+        // native GUI always sends `true`, so every Settings save from it restarted the web
+        // server (and dropped every attached browser) while the stored value was false.
+        let web_changed = self.settings.http_enabled != http_enabled
             || self.settings.http_port != http_port
             || self.settings.web_path != sanitized_web_path;
         self.settings.web_secure = web_secure;
         self.settings.http_enabled = http_enabled;
+        if self.settings.http_port != http_port {
+            self.web_port_override = None;
+        }
         self.settings.http_port = http_port;
         self.settings.web_path = sanitized_web_path;
         if web_changed { self.web_restart_needed = true; }
@@ -11937,6 +12183,30 @@ impl App {
             None => NewIndicator::from_legacy(new_line_indicator),
         };
         self.settings.tabs = TabsMode::from_name(&tabs);
+        // One interface's own tab location (user ruling 2026-11-01); a client that knows
+        // them echoes the shared `tabs` back as it was sent.
+        if let Some(choice) = tabs_profile {
+            if valid_interface_key(&choice.key) {
+                self.settings.tabs_profiles.insert(choice.key, TabsMode::from_name(&choice.value));
+            }
+        }
+        // One interface's own Screen Reader mode; the console's is never set from a client.
+        if let Some(choice) = screen_reader_profile {
+            if valid_interface_key(&choice.key) {
+                self.settings.screen_reader_profiles.insert(choice.key, choice.value == "on");
+            }
+        }
+        if let Some(on) = announce_screen_reader {
+            self.settings.announce_screen_reader = on;
+            telnet::set_announce_screen_reader(on);
+        }
+        // Settings' Status Panel, one setting for the instance; it moves the console's rows.
+        if let Some(on) = status_panel {
+            if self.settings.status_panel != on {
+                self.settings.status_panel = on;
+                self.needs_output_redraw = true;
+            }
+        }
         self.settings.icon_bar = IconBarMode::from_name(&icon_bar);
         if let Some(picture_host) = picture_host {
             self.settings.picture_host = picture::PictureService::from_name(&picture_host);
@@ -12281,6 +12551,12 @@ impl App {
             if sent {
                 self.tf_echo_line(world_idx, "secho", "sprefix", &text);
                 self.capture_sent_line(world_idx, &text);
+                // A line from a script or action answers a guessed prompt as a typed one
+                // does - the server's reply must not run onto it. Cleared here, and told,
+                // since no client cleared its own copy.
+                if self.worlds[world_idx].answer_timed_prompt() {
+                    self.set_world_prompt(world_idx, String::new());
+                }
             }
             true
         } else {
@@ -12338,6 +12614,8 @@ impl App {
         if world_idx >= self.worlds.len() || text.is_empty() {
             return; // matches InputArea::take_input, which also skips empty input
         }
+        // A movement sent explains the next room the game reports (src/map/layout.rs).
+        self.worlds[world_idx].map.note_sent(text, std::time::Instant::now());
         // ECHO masking (plan Phase 3, step 3.4 / finding 7) - the strongest of the two
         // guards, checked first: the MUD itself told us (IAC WILL ECHO) that this is a
         // password/login prompt, not just the login_capture_guard's post-connect
@@ -13448,9 +13726,6 @@ impl App {
         }
     }
 
-    /// Toggle the paused state for a WebSocket client.
-    /// Updates both WsClientInfo (in ws_server) and ClientViewState (in ws_client_worlds).
-    /// Returns (new_paused, ip_address) if the client was found.
     /// `/remote --pause console`, from any interface: the console stops (or starts again)
     /// counting as watching the world it shows. The reply, for whoever asked.
     pub(crate) fn toggle_console_pause(&mut self) -> String {
@@ -13484,18 +13759,76 @@ impl App {
         }
     }
 
+    /// `/pause`: `/remote --pause` on every interface but the one that typed it (`asker`,
+    /// `None` = the console). The asker's other connections - a browser's other tabs, a
+    /// GUI's other windows: the same owner id - are the same interface and are left alone.
+    /// Each paused one resumes as soon as it is used. The reply, for whoever asked.
+    pub(crate) fn pause_other_interfaces(&mut self, asker: Option<u64>) -> String {
+        let mut paused = Vec::new();
+        let mut already = 0;
+        if asker.is_some() && self.console_tui {
+            if self.console_paused {
+                already += 1;
+            } else {
+                self.console_paused = true;
+                self.needs_output_redraw = true;
+                paused.push("the console".to_string());
+            }
+        }
+        let own = asker.map(|id| self.display_owner_id(id));
+        let mut clients: Vec<(u64, bool, String)> = match self.ws_server {
+            Some(ref server) => server.clients.read().unwrap().iter()
+                .filter(|(_, c)| c.authenticated)
+                .map(|(&id, c)| (id, c.paused, format!("{:?}", c.client_type)))
+                .collect(),
+            None => Vec::new(),
+        };
+        clients.sort_by_key(|(id, ..)| *id);
+        for (id, was_paused, kind) in clients {
+            if own == Some(self.display_owner_id(id)) {
+                continue;
+            }
+            if was_paused {
+                already += 1;
+            } else if let Some(ip) = self.ws_set_client_paused(id, true) {
+                self.ws_send_to_client(id, WsMessage::PausedState { paused: true });
+                paused.push(format!("client {} ({}, {})", id, kind, ip));
+            }
+        }
+        if paused.is_empty() {
+            return if already > 0 { "Every other interface is already paused." } else { "No other interface is connected." }
+                .to_string();
+        }
+        self.broadcast_activity();
+        format!("Paused {} — activity now visible on other sessions. Each resumes when it is used.", paused.join(", "))
+    }
+
+    /// Toggle the paused state for a WebSocket client.
+    /// Returns (new_paused, ip_address) if the client was found.
     fn ws_toggle_client_paused(&mut self, client_id: u64) -> Option<(bool, String)> {
-        let (was_paused, ip, current_world) = {
+        let was_paused = {
             let server = self.ws_server.as_ref()?;
             let g = server.clients.read().unwrap();
-            g.get(&client_id).map(|c| (c.paused, c.ip_address.clone(), c.current_world))?
+            g.get(&client_id)?.paused
         };
-        let new_paused = !was_paused;
+        let ip = self.ws_set_client_paused(client_id, !was_paused)?;
+        Some((!was_paused, ip))
+    }
+
+    /// Pause or resume a WebSocket client: both WsClientInfo (in ws_server) and
+    /// ClientViewState (in ws_client_worlds). Returns its ip_address if it was found; telling
+    /// it (`PausedState`) is the caller's.
+    fn ws_set_client_paused(&mut self, client_id: u64, paused: bool) -> Option<String> {
+        let (ip, current_world) = {
+            let server = self.ws_server.as_ref()?;
+            let g = server.clients.read().unwrap();
+            g.get(&client_id).map(|c| (c.ip_address.clone(), c.current_world))?
+        };
         if let Some(ref server) = self.ws_server {
-            server.set_client_paused(client_id, new_paused);
+            server.set_client_paused(client_id, paused);
         }
         if let Some(state) = self.ws_client_worlds.get_mut(&client_id) {
-            state.paused = new_paused;
+            state.paused = paused;
         } else if let Some(wi) = current_world {
             self.ws_client_worlds.insert(client_id, ClientViewState {
                 world_index: wi,
@@ -13503,12 +13836,12 @@ impl App {
                 visible_lines: 0,
                 visible_columns: 0,
                 dimensions: None,
-                paused: new_paused,
+                paused,
                 visible: true,
                 disconnected_at: None,
             });
         }
-        Some((new_paused, ip))
+        Some(ip)
     }
 
     /// Set the authenticated status for a WebSocket client
@@ -13733,6 +14066,12 @@ impl App {
 
     /// The text-to-speech `client_id` is sent speech by: its interface's own, or - for an
     /// older client, which names none - the console's (the one shared setting it knew).
+    /// Whether a client's interface is in Screen Reader mode (an older client, which names
+    /// no interface, never is).
+    pub(crate) fn client_screen_reader(&self, client_id: u64) -> bool {
+        self.ws_client_interface.get(&client_id).is_some_and(|key| self.settings.screen_reader_for(key))
+    }
+
     pub(crate) fn client_tts(&self, client_id: u64) -> tts::TtsProfile {
         match self.ws_client_interface.get(&client_id) {
             Some(key) => self.settings.tts_profile_for(key),
@@ -13774,7 +14113,7 @@ impl App {
             Some(_) => {
                 // The GUI's server binds the settings' port: free if this Clay holds it (the
                 // reload lets it go), else it has to be bindable now.
-                let port = self.settings.http_port;
+                let port = self.web_port();
                 platform::ui_switch_problem(kind, Some((port, self.web_listener_port() == Some(port))))
             }
         }
@@ -14029,6 +14368,7 @@ impl App {
             self.ws_client_other_views.remove(&client_id);
             self.ws_client_other_view_dims.remove(&client_id);
             self.ws_client_splits.remove(&client_id);
+            self.map_forget_client(client_id);
             self.ws_client_owner_ids.remove(&client_id);
             self.ws_client_interface.remove(&client_id);
         }
@@ -14406,15 +14746,33 @@ impl App {
         let world_name_for_triggers = self.worlds[world_idx].name.clone();
         let actions = self.settings.actions.clone();
 
+        // A timed guess (`World::prompt_timed`) is over once the server sends anything more
+        // than an invisible fragment: the prompt clears, and its text - still parked - joins
+        // the line it belongs to below, so a wrong guess leaves the output right. An
+        // invisible fragment (a colour reset) leaves the guess standing.
+        if self.worlds[world_idx].prompt_timed
+            && (data.contains('\n') || crate::util::prompt_has_visible_text(&data))
+        {
+            self.worlds[world_idx].prompt_timed = false;
+            self.set_world_prompt(world_idx, String::new());
+        }
+        let guess_stands = self.worlds[world_idx].prompt_timed;
+        // An answered guess goes first, as a line of its own (`World::answered_prompt`).
+        let answered = std::mem::take(&mut self.worlds[world_idx].answered_prompt);
+        let answered_lines = if answered.is_empty() { 0 } else { answered.split('\n').count() };
+
         // Combine with any partial line from previous data chunk
         let had_trigger_partial = !self.worlds[world_idx].trigger_partial_line.is_empty();
-        let combined_data = if had_trigger_partial {
+        let mut combined_data = if had_trigger_partial {
             let mut s = std::mem::take(&mut self.worlds[world_idx].trigger_partial_line);
             s.push_str(&data);
             s
         } else {
             data.clone()
         };
+        if !answered.is_empty() {
+            combined_data = format!("{}\n{}", answered, combined_data);
+        }
 
         // MCP (plan Job 15) filtering, ahead of triggers/idler/gag processing: a
         // consumed `#$#` line is protocol traffic, not game text, and must never reach
@@ -14454,6 +14812,13 @@ impl App {
         for (i, line) in lines.iter().enumerate() {
             let is_last = i == line_count - 1;
             let is_partial = is_last && !ends_with_newline;
+
+            // An answered timed prompt: shown and logged, never matched again - it was
+            // already handled as the prompt (PROMPT hook, auto-login).
+            if i < answered_lines {
+                processed_lines.push((std::borrow::Cow::Borrowed(*line), false, None));
+                continue;
+            }
 
             // Gag the keepalive's reply (Custom/Generic keep-alive types)
             if is_mud && self.worlds[world_idx].is_keepalive_reply(line) {
@@ -14628,21 +14993,17 @@ impl App {
         self.worlds[world_idx].just_filtered_idler = just_filtered_idler;
         self.worlds[world_idx].suppress_blanks_remaining = suppress_blanks_remaining;
 
-        // If we have a partial line and world uses WONT ECHO prompts, start timeout
-        if has_partial && self.worlds[world_idx].prompt.is_empty()
-            && self.worlds[world_idx].protocol.uses_wont_echo_prompt {
-            self.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
-        }
-
-        // Timed-prompt inference (`WorldType::MudTimedPrompt` only - a plain `Mud` world
-        // never infers a prompt from silence at all). Overwritten unconditionally, unlike
-        // `wont_echo_time` above: a partial that grows must restart its wait from this
+        // Timed-prompt inference (`timed_prompt_wait_for`: the Timed type, or a MUD world
+        // while TF's %lp is on - a plain `Mud` world never guesses a prompt from silence).
+        // Overwritten unconditionally: a partial that grows must restart its wait from this
         // packet's arrival, and a packet that completes the line (`has_partial` false)
         // must disarm promotion immediately rather than leave a stale deadline for text
         // that already displayed normally.
+        // A guess still standing is not waited on again: that would take the same prompt a
+        // second time (and count it again for auto-login).
         let infers_prompts = self.timed_prompt_wait(&self.worlds[world_idx]).is_some();
         self.worlds[world_idx].timed_prompt_since =
-            if has_partial && infers_prompts {
+            if has_partial && infers_prompts && !guess_stands {
                 Some(std::time::Instant::now())
             } else {
                 None
@@ -14670,7 +15031,10 @@ impl App {
 
         // Every non-gagged line in the packet, for the once-per-packet work below: TTS speaks
         // a packet as a single utterance, so it must not be run per-run.
+        // An answered prompt (the first `answered_lines`) was already the prompt: not spoken,
+        // and no BGTEXT for it.
         let non_gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
+            .skip(answered_lines)
             .filter(|(_, gagged, _)| !gagged)
             .map(|(line, _, highlight)| (line.as_ref(), highlight.clone()))
             .collect();
@@ -14778,6 +15142,8 @@ impl App {
 
     /// Handle Disconnected event for a world.
     pub(crate) fn handle_disconnected(&mut self, world_idx: usize, reason: &telnet_reader::CloseReason) {
+        // A walk (src/map) ends with the connection.
+        self.map_world_disconnected(world_idx);
         // TF's DISCONNECT hook, before cleaning up ("DISCONNECT world, reason", in real
         // tf's shape - see CloseReason::hook_args). A gagged one hides Clay's
         // "Disconnected." too, as it hid the reason line (close_notice).
@@ -15174,7 +15540,9 @@ impl App {
             text.push_str(&reason.message());
             text.push('\n');
         }
-        if text.is_empty() {
+        // An answered timed prompt still waiting for the server's next text goes into the
+        // output on its way (process_server_data puts it first), even with nothing to say.
+        if text.is_empty() && self.worlds[idx].answered_prompt.is_empty() {
             return None;
         }
         Some(AppEvent::ServerData(world_name.to_string(), text.into_bytes()))
@@ -15641,6 +16009,8 @@ impl App {
         match ev {
             TelnetEvent::TelnetDetected => self.handle_telnet_detected(world_idx),
             TelnetEvent::GmcpMessage(package, json_data) => {
+                // A room for the world's map (src/map), whatever F9 says.
+                self.map_on_gmcp(world_idx, package, json_data);
                 self.handle_gmcp_received_extras(world_idx, package, json_data);
             }
             TelnetEvent::MsdpVariable(variable, value_json) => {
@@ -15877,11 +16247,6 @@ impl App {
         }
     }
 
-    // handle_wont_echo_seen removed in Job 9 (T3.2): WontEchoPromptHint's one-line
-    // `uses_wont_echo_prompt = true` now lives directly in
-    // ProtocolState::apply_telnet_event (see its doc comment: "stored in both" World and
-    // multiuser connections), since it needed no World-only extra.
-
     // handle_echo_mask_changed removed in Job 9 (T3.2): EchoOff/EchoOn's body (the
     // change-only guard plus building WsMessage::EchoMaskChanged) now lives in
     // ProtocolState::apply_echo_mask - see this module's handle_telnet_event, which
@@ -15908,14 +16273,25 @@ impl App {
     /// without decoding twice or re-deriving it from bytes.
     fn handle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8], source: PromptSource) {
         let encoding = self.worlds[world_idx].effective_encoding();
-        let prompt_text = encoding.decode(prompt_bytes);
+        let mut prompt_text = encoding.decode(prompt_bytes);
+        // A GA/EOR with nothing in front of it in its own read: the line it marks went out
+        // as text earlier (longer than the telnet layer holds back, or the marker came in a
+        // packet of its own - thechattingzone.uk's EOR does) and is parked here waiting for
+        // its newline. That line is the prompt, taken out of the output as any marked
+        // prompt is.
+        if prompt_text.is_empty() && source == PromptSource::Marker
+            && crate::util::prompt_has_visible_text(&self.worlds[world_idx].trigger_partial_line)
+        {
+            prompt_text = std::mem::take(&mut self.worlds[world_idx].trigger_partial_line);
+            self.worlds[world_idx].timed_prompt_since = None;
+        }
         self.handle_prompt_text(world_idx, &prompt_text, source);
     }
 
     /// Handle a Prompt event's decoded text, regardless of where the prompt boundary
     /// came from (`source`).
     fn handle_prompt_text(&mut self, world_idx: usize, prompt_text: &str, source: PromptSource) {
-        // A real telnet marker (GA/EOR/WONT-ECHO) delimited this prompt —
+        // A real telnet marker (GA/EOR) delimited this prompt —
         // `TelnetEvent::Prompt` is converted straight to `AppEvent::Prompt` by
         // `to_app_event` and never passes through `ProtocolState`, so this is the only
         // place that observation can be recorded. A `Timed` promotion is an inference,
@@ -15936,6 +16312,9 @@ impl App {
             return;
         }
         let prompt_normalized = crate::util::normalize_prompt(prompt_text);
+        // A guess keeps its text parked (see `World::prompt_timed`); a marker prompt
+        // replaces any guess, whose parked text then joins the next line as it would have.
+        self.worlds[world_idx].prompt_timed = source == PromptSource::Timed;
 
         // If world is not connected, display prompt as output instead of input area
         if !self.worlds[world_idx].connected {
@@ -16042,26 +16421,32 @@ impl App {
             };
 
             if let Some(cmd) = cmd_to_send {
-                if let Some(tx) = &world.command_tx {
+                let sent = if let Some(tx) = &world.command_tx {
                     let _ = tx.try_send(WriteCommand::Text(cmd));
+                    true
+                } else {
+                    false
+                };
+                if sent {
                     world.last_send_time = Some(std::time::Instant::now());
-                    // Clear prompt since we auto-answered it
-                    world.prompt.clear();
+                    // Clear the prompt since we auto-answered it (a guessed one goes into
+                    // the output, see `World::answer_timed_prompt`), here and in every
+                    // client that was just sent it.
+                    world.clear_prompt_after_send();
+                    self.set_world_prompt(world_idx, String::new());
                 }
             }
         }
     }
 
-    /// Promote every `WorldType::MudTimedPrompt` world whose parked partial has waited
-    /// past `WorldSettings::prompt_wait_ms` with nothing else arriving, to the
-    /// input-area prompt. Mirrors the `wont_echo_time` block's "park a partial, promote
-    /// after a delay if nothing else arrived" shape, but goes through the shared
-    /// `handle_prompt_text` path instead of duplicating its inline auto-login a third
-    /// time. Returns `true` iff anything was promoted, so console callers know to repaint.
+    /// Take the parked partial of every world that guesses prompts (`timed_prompt_wait_for`)
+    /// and has waited past its wait with nothing else arriving as the input-area prompt,
+    /// through the shared `handle_prompt_text` path. The text stays parked - a guess never
+    /// takes it out of the output stream (`World::prompt_timed`). Returns `true` iff
+    /// anything was promoted, so console callers know to repaint.
     fn promote_due_timed_prompts(&mut self, now: std::time::Instant) -> bool {
         // Collect first, emit after: `handle_prompt_text` needs `&mut self`, which
-        // `self.worlds.iter_mut()` is still borrowing here - the same borrow-deferral
-        // idiom the wont-echo block above uses.
+        // `self.worlds.iter_mut()` is still borrowing here.
         let mut due: Vec<(usize, String)> = Vec::new();
         let lp_wait = self.tf_lp_wait();
         for (world_idx, world) in self.worlds.iter_mut().enumerate() {
@@ -16071,14 +16456,13 @@ impl App {
             }
             let Some(since) = world.timed_prompt_since else { continue };
             if world.trigger_partial_line.is_empty() {
-                // The wont-echo block above (same tick, a world that both marks
-                // WONT-ECHO and is Timed) may already have taken the partial - disarm
+                // Nothing parked any more (a marker prompt or a send took it) - disarm
                 // rather than promote an empty prompt.
                 world.timed_prompt_since = None;
                 continue;
             }
             if now.duration_since(since) >= wait {
-                due.push((world_idx, std::mem::take(&mut world.trigger_partial_line)));
+                due.push((world_idx, world.trigger_partial_line.clone()));
                 world.timed_prompt_since = None;
             }
         }
@@ -16309,7 +16693,7 @@ impl App {
         let (vpn_addrs, lan_ips): (Vec<String>, Vec<String>) = reach::local_ipv4_addrs()
             .into_iter()
             .partition(|ip| ip.parse::<std::net::Ipv4Addr>().map(reach::is_cgnat_v4).unwrap_or(false));
-        let port = self.settings.http_port;
+        let port = self.web_port();
         let web_path = self.settings.web_path.clone();
         let lan_urls = lan_ips.iter().map(|ip| reach::web_url(ip, port, &web_path)).collect();
         // A live mapping knows the real WAN address; otherwise fall back to an explicit lookup.
@@ -16513,8 +16897,10 @@ impl App {
         if lines.is_empty() || world_idx >= self.worlds.len() {
             return;
         }
+        // An interface in Screen Reader mode hears its screen reader instead: its own TTS
+        // would read every line a second time.
         let console = Some(self.settings.console_tts())
-            .filter(|p| p.is_on() && self.console_tui && world_idx == self.current_world_index && !self.settings.tts_muted);
+            .filter(|p| p.is_on() && self.console_tui && world_idx == self.current_world_index && !self.settings.tts_muted && !self.settings.screen_reader);
         let listeners: Vec<(u64, tts::TtsProfile)> = self
             .ws_ready_clients()
             .into_iter()
@@ -16525,6 +16911,7 @@ impl App {
                     shown && !v.paused && v.disconnected_at.is_none()
                 })
             })
+            .filter(|id| !self.client_screen_reader(*id))
             .map(|id| (id, self.client_tts(id)))
             .filter(|(_, p)| p.is_on())
             .collect();
@@ -16833,16 +17220,19 @@ impl App {
         line
     }
 
+    /// The port this Clay's web server is on, or starts on: the configured one unless
+    /// another program had it (`web_port_override`). Every address Clay prints or maps
+    /// (`/reach`, the router mapping, the GUIs' window) uses this, never the setting alone.
+    pub(crate) fn web_port(&self) -> u16 {
+        self.web_port_override.unwrap_or(self.settings.http_port)
+    }
+
     /// The port this process's web listener has, if it has one: what a reload or crash
     /// successor may have to wait for (`platform::pass_web_port_to_successor`); Android has
     /// no reload, so no relauncher asks there.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn web_listener_port(&self) -> Option<u16> {
-        #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
-        if let Some(server) = self.https_server.as_ref() {
-            return Some(server.port);
-        }
-        self.http_server.as_ref().map(|server| server.port)
+        self.https_server.as_ref().map(|server| server.port)
     }
 
     /// Hook run whenever the HTTPS server has (re)started, on every path that
@@ -16940,7 +17330,7 @@ impl App {
         if !self.settings.port_map_enabled || !self.settings.http_enabled {
             return;
         }
-        let port = self.settings.http_port;
+        let port = self.web_port();
         let live = matches!(self.port_map_status, reach::PortMapStatus::Mapped { .. } | reach::PortMapStatus::DoubleNat { .. });
         if !live {
             self.port_map_status = reach::PortMapStatus::Searching;
@@ -17009,7 +17399,7 @@ impl App {
                 reach::PortMapStatus::Mapped { external_ip, external_port, lan_ip, .. } => {
                     let line = format!(
                         "Router port mapping active: {external_ip}:{external_port} -> {lan_ip}:{} (see /reach)",
-                        self.settings.http_port
+                        self.web_port()
                     );
                     self.add_output(&line);
                 }
@@ -17041,6 +17431,8 @@ impl App {
         // Drain the archive writer before tearing anything down, so the last
         // batch of output reaches disk rather than dying with the process.
         self.flush_scrollback();
+        // And the maps' (src/map).
+        self.flush_map_store();
         // Give the router its port back (no-op unless a UPnP mapping is held).
         self.unmap_on_quit().await;
         for world in &self.worlds {
@@ -17818,6 +18210,10 @@ impl App {
                 let msg = self.toggle_console_pause();
                 self.emit_client_text(world_index, &msg, false);
             }
+            Command::Pause => {
+                let msg = self.pause_other_interfaces(Some(client_id));
+                self.emit_client_text(world_index, &msg, false);
+            }
             Command::BanList => self.ws_ban_list(client_id, world_index),
             Command::Unban { host } => self.ws_unban(client_id, world_index, host),
             Command::TestMusic => {
@@ -17855,8 +18251,8 @@ impl App {
             Command::Mssp => {
                 execute_mssp_command(self, world_index, false);
             }
-            Command::Stats => {
-                execute_stats_command(self, world_index, false);
+            Command::Stats { show } => {
+                execute_stats_command(self, world_index, show, false);
             }
             Command::Msdp { verb, target } => {
                 execute_msdp_command(self, world_index, &verb, target.as_deref(), false);
@@ -17915,6 +18311,7 @@ impl App {
             }
             Command::Menu => self.ws_menu_is_console_only(client_id, world_index),
             Command::Split { .. } | Command::Unsplit => self.ws_split_is_the_clients(client_id, world_index, command),
+            Command::Map { args } => self.ws_map_command(client_id, world_index, &args, command),
             // UI popup commands - send back to client for local handling
             Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
             Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
@@ -18393,17 +18790,17 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                     msp_enabled, mcp_enabled, mccp2_enabled,
                     world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
-                    keep_alive_gag_enabled, keep_alive_gag,
+                    keep_alive_gag_enabled, keep_alive_gag, status_panel,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -18414,6 +18811,7 @@ impl App {
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                     zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                     log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert,
+                    websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel },
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -18743,6 +19141,13 @@ impl App {
                 self.handle_request_history(client_id, world_index, count, request_id, before_seq, before_ts, archive_before);
             }
             WsMessage::ToggleWorldGmcp { world_index } => self.toggle_world_gmcp(world_index),
+            // The map (src/map): one shared method each, as handler B does.
+            WsMessage::MapWatch { views } => self.map_watch(client_id, views),
+            WsMessage::MapRoute { world_index, request_id, to, walk } => self.map_route_request(client_id, world_index, request_id, &to, walk),
+            WsMessage::MapStop { world_index } => {
+                self.map_stop(world_index);
+            }
+            WsMessage::MapSearch { world_index, request_id, query } => self.map_search(client_id, world_index, request_id, &query),
             // Plan Job 13 (Phase 4, 4.4): folded into one shared function with the two
             // daemon.rs copies (Job 12's handover named this drift by hand) - see
             // commands::execute_send_gmcp/execute_send_msdp.
@@ -19077,6 +19482,9 @@ impl App {
             WorldStateMsg {
                 index: idx,
                 name: world.name.clone(),
+                // Where the user is on the world's map (src/map), when it has one.
+                map: (!world.map.graph.is_empty() || world.map.here.is_some())
+                    .then(|| crate::map::wire::state_msg(&world.map.graph, world.map.here.as_deref(), &world.map.walker)),
                 connected: world.connected,
                 // Legacy output_lines left empty - all clients prefer output_lines_ts
                 output_lines: Vec::new(),
@@ -19112,6 +19520,7 @@ impl App {
                     msp_enabled: world.settings.msp_enabled,
                     mcp_enabled: world.settings.mcp_enabled,
                     mccp2_enabled: world.settings.mccp2_enabled,
+                    status_panel: Some(world.settings.status_panel),
                     world_type: world.settings.world_type.name().to_string(),
                     prompt_wait_ms: world.settings.prompt_wait_ms,
                     tf_type: world.settings.tf_type.clone(),
@@ -19193,6 +19602,7 @@ impl App {
             expand_line: true,
             picture_upload: true,
             history_on_demand: true,
+            map: true,
             emoji_json: crate::emoji::emoji_json(),
             emoji_categories_json: crate::emoji::emoji_categories_json(),
             tf_status: self.tf_status.iter()
@@ -19258,7 +19668,7 @@ impl App {
     pub(crate) fn on_separator_row(&self, row: u16) -> bool {
         // Below the whole output area (both panes of a split) and the bottom pane's status line.
         let bottom = rendering::console_bottom_world(self);
-        let stats = u16::from(self.worlds.get(bottom).is_some_and(|w| w.stats_line_shown));
+        let stats = self.status_line_rows(bottom);
         let top = self.output_area_rows + stats;
         row >= top && row < top + self.separator_rows()
     }
@@ -19997,7 +20407,7 @@ pub enum AppEvent {
     /// world's message, unless TF's DISCONNECT hook gags it): world_name,
     /// connection_id, why. Handled before each loop's match (`App::preprocess_event`).
     CloseNotice(String, u64, telnet_reader::CloseReason),
-    Prompt(String, Vec<u8>),      // world_name, prompt bytes (from telnet GA)
+    Prompt(String, Vec<u8>),      // world_name, prompt bytes (from telnet GA/EOR; empty: the parked line)
     /// One telnet negotiation/data event for a single-user world (plan Phase 2, Step 2.7).
     /// Replaces the nine formerly-separate variants (`TelnetDetected`, `WontEchoSeen`,
     /// `NawsRequested`, `TtypeRequested`, `CharsetRequested`, `GmcpNegotiated`,
@@ -20350,6 +20760,12 @@ pub(crate) struct SetupSettings {
     pub(crate) text_reveal: String,
     /// `SeparatorStyle` by name: the console's bar, one global setting.
     pub(crate) separator_style: String,
+    /// This console's own Screen Reader mode.
+    pub(crate) screen_reader: bool,
+    /// "MUDs: Screen Reader", one global setting.
+    pub(crate) announce_screen_reader: bool,
+    /// Status Line (`Settings::status_panel`), one setting for the instance.
+    pub(crate) status_panel: bool,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -20386,6 +20802,9 @@ pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
 
     app.settings.http_enabled = settings.http_enabled;
     app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
+    if port_changed {
+        app.web_port_override = None;
+    }
     app.settings.web_path = sanitized_web_path;
     app.settings.websocket_password = settings.ws_password.clone();
     app.settings.websocket_allow_list = settings.ws_allow_list.clone();
@@ -20452,6 +20871,7 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) msp_enabled: bool,
     pub(crate) mcp_enabled: bool,
     pub(crate) mccp2_enabled: bool,
+    pub(crate) status_panel: bool,
     /// Only meaningful for `world_type == "mud_timed_prompt"` - see
     /// `WorldSettings::prompt_wait_ms`'s doc comment.
     pub(crate) prompt_wait_ms: u64,
@@ -20550,6 +20970,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_KEEP_ALIVE_GAG,
         WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_PROMPT_WAIT_MS,
         WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_TF_TYPE,
+        WORLD_FIELD_STATUS_LINE,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
         WORLD_FIELD_DISCORD_CHANNELS, WORLD_FIELD_SLACK_APP_TOKEN, WORLD_FIELD_SLACK_CHANNELS,
@@ -20649,6 +21070,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             picture_host: state.get_selected(SETUP_FIELD_PICTURE_HOST).unwrap_or("catbox").to_string(),
             text_reveal: state.get_selected(SETUP_FIELD_TEXT_REVEAL).unwrap_or("off").to_string(),
             separator_style: state.get_selected(SETUP_FIELD_SEPARATOR_STYLE).unwrap_or("web").to_string(),
+            screen_reader: state.get_bool(popup::definitions::setup::SETUP_FIELD_SCREEN_READER).unwrap_or(false),
+            announce_screen_reader: state.get_bool(popup::definitions::setup::SETUP_FIELD_ANNOUNCE_SCREEN_READER).unwrap_or(false),
+            status_panel: state.get_bool(popup::definitions::setup::SETUP_FIELD_STATUS_LINE).unwrap_or(true),
         }
     }
 
@@ -22338,6 +22762,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     msp_enabled: state.get_bool(WORLD_FIELD_MSP_ENABLED).unwrap_or(true),
                     mcp_enabled: state.get_bool(WORLD_FIELD_MCP_ENABLED).unwrap_or(true),
                     mccp2_enabled: state.get_bool(WORLD_FIELD_MCCP2_ENABLED).unwrap_or(true),
+                    status_panel: state.get_bool(WORLD_FIELD_STATUS_LINE).unwrap_or(true),
                     // Text field parsed on save (same convention as port/auto-reconnect);
                     // anything unparsable falls back to the default rather than 0.
                     prompt_wait_ms: state.get_text(WORLD_FIELD_PROMPT_WAIT_MS)
@@ -22938,8 +23363,7 @@ async fn main() -> io::Result<()> {
     // Handle -v / --version with feature info
     if show_version {
         let mut features = Vec::new();
-        if cfg!(feature = "rustls-backend") { features.push("rustls"); }
-        if cfg!(feature = "native-tls-backend") { features.push("native-tls"); }
+        features.push("rustls");
         if cfg!(feature = "native-gui") { features.push("native-gui"); }
         if cfg!(feature = "webview-gui") { features.push("webview-gui"); }
         if cfg!(feature = "native-audio") { features.push("native-audio"); }
@@ -23460,11 +23884,68 @@ async fn main() -> io::Result<()> {
 }
 
 /// Restart the HTTP/HTTPS web server after settings change (port, enabled, or secure mode).
-/// Shuts down the current server and starts a new one on the configured port.
+/// What a Clay says when another program had its configured port and it took `port`
+/// instead (user request 2026-11-01: a second Clay runs on another port and says so).
+fn web_port_taken_notice(configured: u16, port: u16) -> String {
+    let who = platform::port_owner(configured).map(|o| format!(" by {o}")).unwrap_or_default();
+    format!("Port {configured} is in use{who}: this Clay is using port {port} instead (attach with --gui=127.0.0.1:{port}; Settings keep {configured}).")
+}
+
+/// Start the web server at start-up, for the console and headless loops alike: on the port
+/// the predecessor held (a reload or crash successor waits for it, override or not), else
+/// the configured port or, with another program on it, the next free one above it, said
+/// in the output. Always HTTPS-capable (`resolve_web_cert_files`: a user cert, else the
+/// generated one); localhost is served plain by the accept loop itself. A failure is left
+/// in `GUI_HTTP_FAILED` for the GUIs' start-up wait.
+async fn start_web_server_at_startup(app: &mut App, ws_state: Option<Arc<crate::http::WsConnectionState>>, gate: SecurityGate) {
+    if !app.settings.http_enabled {
+        return;
+    }
+    let Some((cert_file, key_file)) = resolve_web_cert_files(app) else {
+        app.add_output("Warning: No TLS certificate available — web server not started.");
+        *GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = Some("no TLS certificate available for its web server".to_string());
+        return;
+    };
+    let configured = app.settings.http_port;
+    let (port, bind_retry) = match http::predecessor_web_port() {
+        http::PredecessorPort::Port(p) => (p, true),
+        http::PredecessorPort::Any => (configured, true),
+        http::PredecessorPort::None => (http::free_web_port(configured).unwrap_or(configured), false),
+    };
+    let mut https_server = HttpsServer::new(port);
+    https_server.bind_retry = bind_retry;
+    match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), gate).await {
+        Ok(()) => {
+            app.web_port_override = (port != configured).then_some(port);
+            if !app.is_reload {
+                app.add_output(&format!("HTTPS web interface started on port {port}"));
+                if port != configured {
+                    app.add_output(&web_port_taken_notice(configured, port));
+                }
+            }
+            app.https_server = Some(https_server);
+            app.after_http_server_started();
+        }
+        Err(e) => {
+            app.add_output(&http::start_warning("HTTPS", e.as_ref()));
+            // The GUIs' "Clay failed to start" dialog gets the long form (the port's owner,
+            // where known).
+            *GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+        }
+    }
+}
+
+/// Shuts down the current server and starts a new one on the port it should be on
+/// (`App::web_port`).
 pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>) {
     // Collect everything we need before any mutable borrows
     let http_enabled = app.settings.http_enabled;
-    let http_port = app.settings.http_port;
+    // The port: the one this Clay holds now when it is still the one wanted (its old
+    // listener goes when the accept task sees the shutdown - keep trying meanwhile), else
+    // the one wanted or, with another program on it, the next free one, as at start.
+    let wanted = app.web_port();
+    let held = app.web_listener_port() == Some(wanted);
+    let (http_port, bind_retry) = if held { (wanted, true) } else { (http::free_web_port(wanted).unwrap_or(wanted), false) };
     let ban_list = app.ban_list.clone();
     let theme_css = app.gui_theme_colors().to_css_vars();
     let ws_state = app.ws_server.as_ref().map(|server| {
@@ -23496,20 +23977,11 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
         app.stop_port_mapping();
     }
 
-    // Shut down existing HTTP server
-    if let Some(ref mut server) = app.http_server {
+    // Shut down existing HTTPS server
+    if let Some(ref mut server) = app.https_server {
         if let Some(tx) = server.shutdown_tx.take() { let _ = tx.send(()); }
     }
-    app.http_server = None;
-
-    // Shut down existing HTTPS server
-    #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
-    {
-        if let Some(ref mut server) = app.https_server {
-            if let Some(tx) = server.shutdown_tx.take() { let _ = tx.send(()); }
-        }
-        app.https_server = None;
-    }
+    app.https_server = None;
 
     if !http_enabled {
         return;
@@ -23517,17 +23989,18 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
 
     // Always HTTPS-capable now (see resolve_web_cert_files); localhost is served
     // plain by the accept loop itself regardless (see http::route_connection).
-    #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
     {
         match resolve_web_cert_files(app) {
             Some((cert_file, key_file)) => {
                 let mut https_server = HttpsServer::new(http_port);
-                // The old listener goes when its accept task sees the shutdown, which may
-                // be after this bind: keep trying while the port is still ours.
-                https_server.bind_retry = true;
+                https_server.bind_retry = bind_retry;
                 match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, ban_list, theme_css, gate.clone()).await {
                     Ok(()) => {
+                        app.web_port_override = (http_port != app.settings.http_port).then_some(http_port);
                         app.add_output(&format!("HTTPS web interface restarted on port {http_port}"));
+                        if http_port != app.settings.http_port {
+                            app.add_output(&web_port_taken_notice(app.settings.http_port, http_port));
+                        }
                         app.https_server = Some(https_server);
                         app.after_http_server_started();
                     }
@@ -23996,47 +24469,10 @@ pub async fn run_app_headless(
         }
     };
 
-    // Start the unified HTTP+WS server if enabled. Always HTTPS-capable now — cert
-    // resolution (user-provided, or auto-generated + settings.dat-backed) happens in
-    // resolve_web_cert_files. NOTE: the CLAY_HTTP_LISTENER Windows socket-handle-passing
-    // optimization (previously used here for the GUI's plain HTTP listener) no longer
-    // applies since this path always binds via start_https_server; a hot reload falls
-    // back to that function's existing bind-retry-with-backoff loop instead.
-    if app.settings.http_enabled {
-        if let Some((cert_file, key_file)) = resolve_web_cert_files(&mut app) {
-            #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
-            {
-                let mut https_server = HttpsServer::new(app.settings.http_port);
-                https_server.bind_retry = http::port_released_by_predecessor(app.settings.http_port);
-                match start_https_server(
-                    &mut https_server,
-                    &cert_file,
-                    &key_file,
-                    ws_state.clone(),
-                    app.ban_list.clone(),
-                    app.gui_theme_colors().to_css_vars(),
-                    gate.clone(),
-                ).await {
-                    Ok(()) => {
-                        if !app.is_reload {
-                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
-                        }
-                        app.https_server = Some(https_server);
-                        app.after_http_server_started();
-                    }
-                    Err(e) => {
-                        app.add_output(&http::start_warning("HTTPS", e.as_ref()));
-                        // The GUI's "Clay failed to start" dialog gets the long form (the
-                        // port's owner, where known).
-                        *GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
-                    }
-                }
-            }
-        } else {
-            app.add_output("Warning: No TLS certificate available — web server not started.");
-            *GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = Some("no TLS certificate available for its web server".to_string());
-        }
-    }
+    // The web server, if enabled: one function for both loops (the plain HTTP listener
+    // and its CLAY_HTTP_LISTENER handle-passing are gone; a hot reload relies on
+    // start_https_server's bind retry).
+    start_web_server_at_startup(&mut app, ws_state.clone(), gate.clone()).await;
 
     // Re-set gui_tx and repaint callback after potential reload state load (reload clears them)
     app.gui_tx = Some(gui_tx);
@@ -24055,7 +24491,7 @@ pub async fn run_app_headless(
     // Conditional timers: sleep far-future when inactive, reset to short interval when needed.
     const FAR_FUTURE: Duration = Duration::from_secs(86400);
 
-    // Prompt timeout detection — only active when a world has wont_echo_time set
+    // FANSI login timeouts, dirty stats and timed-prompt deadlines (`App::next_timed_prompt_deadline`)
     let prompt_check_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(prompt_check_sleep);
 
@@ -24077,6 +24513,10 @@ pub async fn run_app_headless(
     // Auto-reconnect timer — fires when a world is due for reconnection
     let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(reconnect_sleep);
+    // The mapper's walks (src/map): a step whose room the game hasn't reported in time ends
+    // its walk. Armed at the bottom of every iteration from `next_walk_deadline`.
+    let walk_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(walk_sleep);
     // Job 5 (T2.7): a hot reload restores `World::reconnect_at` from the state file,
     // but this timer always starts at FAR_FUTURE and is only ever re-armed by later
     // events (a disconnect, a web-triggered reconnect) or by firing once - nothing
@@ -24154,10 +24594,6 @@ pub async fn run_app_headless(
                             let commands = app.process_server_data(
                                 world_idx, bytes, 24, 1000, true,
                             );
-                            // Activate prompt check if server data set wont_echo_time
-                            if app.worlds[world_idx].wont_echo_time.is_some() {
-                                prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
-                            }
                             // Activate timer for FANSI login timeout
                             if app.worlds[world_idx].fansi_detect_until.is_some() {
                                 prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
@@ -24500,7 +24936,7 @@ pub async fn run_app_headless(
                 }
             }
 
-            // Prompt timeout check — only fires when a world has wont_echo_time set
+            // FANSI login timeouts, dirty stats and timed-prompt deadlines
             _ = &mut prompt_check_sleep => {
                 let now = std::time::Instant::now();
                 // mud-status-display.md Job 2 (plan D4): flush any world whose stats
@@ -24508,94 +24944,6 @@ pub async fn run_app_headless(
                 // adding a second one - see the bottom-of-loop block below for how this
                 // timer gets rearmed while a world stays dirty.
                 app.flush_dirty_stats();
-                // Deferred emissions: this loop holds a mutable borrow of app.worlds, so
-                // anything that has to go out through `app` (push_and_broadcast_line,
-                // PromptUpdate) is collected here and flushed after the loop. Both were
-                // previously missing entirely - the disconnected-world branch pushed a line
-                // that no client ever received, and the connected branch set world.prompt
-                // without telling anyone, leaving remote prompt displays stale.
-                let mut timeout_lines: Vec<(usize, String)> = Vec::new();
-                let mut timeout_prompts: Vec<(usize, String)> = Vec::new();
-                for (world_idx, world) in app.worlds.iter_mut().enumerate() {
-                    if let Some(wont_echo_time) = world.wont_echo_time {
-                        if now.duration_since(wont_echo_time) >= Duration::from_millis(150) {
-                            if !world.trigger_partial_line.is_empty() && world.prompt.is_empty() {
-                                // Same rule as handle_prompt_text: nothing visible before the
-                                // marker is not a prompt. Leave the partial parked for the line
-                                // it belongs to and stop re-checking it.
-                                if !crate::util::prompt_has_visible_text(&world.trigger_partial_line) {
-                                    world.wont_echo_time = None;
-                                    continue;
-                                }
-                                let prompt_text = std::mem::take(&mut world.trigger_partial_line);
-                                let prompt_clean = prompt_text.replace('\r', "").replace('\n', " ");
-                                let normalized = format!("{} ", prompt_clean.trim());
-
-                                if !world.connected {
-                                    timeout_lines.push((world_idx, normalized.trim().to_string()));
-                                    world.wont_echo_time = None;
-                                    continue;
-                                }
-
-                                world.prompt = normalized.clone();
-                                timeout_prompts.push((world_idx, normalized));
-                                world.prompt_count += 1;
-
-                                // Handle auto-login
-                                if !world.skip_auto_login {
-                                    let auto_type = world.settings.auto_connect_type;
-                                    let (user, password) = login_credentials(&world.settings,
-                                        app.tf_engine.default_world_character.as_deref(),
-                                        app.tf_engine.default_world_password.as_deref());
-                                    let prompt_num = world.prompt_count;
-
-                                    if !user.is_empty() && !password.is_empty() {
-                                        let cmd_to_send = match auto_type {
-                                            AutoConnectType::Prompt => {
-                                                match prompt_num {
-                                                    1 => Some(user),
-                                                    2 => Some(password),
-                                                    _ => None,
-                                                }
-                                            }
-                                            AutoConnectType::MooPrompt => {
-                                                match prompt_num {
-                                                    1 => Some(user.clone()),
-                                                    2 => Some(password),
-                                                    3 => Some(user),
-                                                    _ => None,
-                                                }
-                                            }
-                                            AutoConnectType::Connect | AutoConnectType::NoLogin | AutoConnectType::Lines => None,
-                                        };
-
-                                        if let Some(cmd) = cmd_to_send {
-                                            world.prompt.clear();
-                                            if let Some(tx) = &world.command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(cmd));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            world.wont_echo_time = None;
-                        }
-                    }
-                }
-                let more_mode = app.settings.more_mode_enabled;
-                for (world_idx, text) in timeout_lines {
-                    let seq = app.worlds[world_idx].next_seq;
-                    app.worlds[world_idx].next_seq += 1;
-                    // push_line_respecting_pending (inside the helper), NOT a raw push: a
-                    // raw push planted this line's fresh high seq into output_lines ahead of
-                    // any older still-queued pending content, breaking the sorted-by-seq
-                    // invariant broadcast_released_lines depends on.
-                    let line = OutputLine::new(text, seq);
-                    app.push_and_broadcast_line(world_idx, line, more_mode);
-                }
-                for (world_idx, prompt) in timeout_prompts {
-                    app.ws_broadcast(WsMessage::PromptUpdate { world_index: world_idx, prompt });
-                }
                 // Check for expired FANSI detection windows
                 let now_fansi = std::time::Instant::now();
                 for world in &mut app.worlds {
@@ -24616,7 +24964,7 @@ pub async fn run_app_headless(
                 // whose parked partial has waited past prompt_wait_ms.
                 app.promote_due_timed_prompts(now);
                 // Re-arm: check again in 150ms if any world still needs it
-                let any_pending = app.worlds.iter().any(|w| w.wont_echo_time.is_some() || w.fansi_detect_until.is_some());
+                let any_pending = app.worlds.iter().any(|w| w.fansi_detect_until.is_some());
                 if any_pending {
                     prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
                 } else {
@@ -24706,6 +25054,10 @@ pub async fn run_app_headless(
             }
 
             // Auto-reconnect timer
+            _ = &mut walk_sleep => {
+                app.map_expire_walks();
+                walk_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+            }
             _ = &mut reconnect_sleep => {
                 app.start_due_reconnects(&event_tx);
                 // Re-arm timer for next scheduled reconnect
@@ -24726,6 +25078,11 @@ pub async fn run_app_headless(
         // Shell worlds (src/shell): send any live PTY's screen change to clients now, every
         // iteration, so a shell world's output isn't stranded waiting on a timer.
         app.flush_shell_frames();
+        // The mapper: changed rooms saved, map views told; the walk timer armed.
+        app.flush_map();
+        if let Some(due) = app.next_walk_deadline() {
+            walk_sleep.as_mut().reset(tokio::time::Instant::from_std(due));
+        }
 
         // Arm the process timer for the next process due (processes may have been added
         // during this iteration)
@@ -25370,73 +25727,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     };
 
-    // Start the unified HTTP+WS server if enabled. Always HTTPS-capable now (see
-    // resolve_web_cert_files) — user-provided cert takes priority, else an
-    // auto-generated cert backed by settings.dat. Localhost is served plain by
-    // the accept loop itself regardless (see http::route_connection), so no cert
-    // prompt is involved for local use.
-    if app.settings.http_enabled {
-        if let Some((cert_file, key_file)) = resolve_web_cert_files(&mut app) {
-            #[cfg(feature = "native-tls-backend")]
-            {
-                let mut https_server = HttpsServer::new(app.settings.http_port);
-                // A reload/crash successor waits for the port its predecessor held; a cold
-                // start, or a successor whose predecessor never had the port, binds once
-                // and says so at once (a second Clay).
-                https_server.bind_retry = http::port_released_by_predecessor(app.settings.http_port);
-                match start_https_server(
-                    &mut https_server,
-                    &cert_file,
-                    &key_file,
-                    ws_state.clone(),
-                    app.ban_list.clone(),
-                    app.gui_theme_colors().to_css_vars(),
-                    gate.clone(),
-                ).await {
-                    Ok(()) => {
-                        if !app.is_reload {
-                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
-                        }
-                        app.https_server = Some(https_server);
-                        app.after_http_server_started();
-                    }
-                    Err(e) => {
-                        app.add_output(&http::start_warning("HTTPS", e.as_ref()));
-                    }
-                }
-            }
-            #[cfg(feature = "rustls-backend")]
-            {
-                let mut https_server = HttpsServer::new(app.settings.http_port);
-                // A reload/crash successor waits for the port its predecessor held; a cold
-                // start, or a successor whose predecessor never had the port, binds once
-                // and says so at once (a second Clay).
-                https_server.bind_retry = http::port_released_by_predecessor(app.settings.http_port);
-                match start_https_server(
-                    &mut https_server,
-                    &cert_file,
-                    &key_file,
-                    ws_state.clone(),
-                    app.ban_list.clone(),
-                    app.gui_theme_colors().to_css_vars(),
-                    gate.clone(),
-                ).await {
-                    Ok(()) => {
-                        if !app.is_reload {
-                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
-                        }
-                        app.https_server = Some(https_server);
-                        app.after_http_server_started();
-                    }
-                    Err(e) => {
-                        app.add_output(&http::start_warning("HTTPS", e.as_ref()));
-                    }
-                }
-            }
-        } else {
-            app.add_output("Warning: No TLS certificate available — web server not started.");
-        }
-    }
+    // The web server, if enabled: one function for both loops.
+    start_web_server_at_startup(&mut app, ws_state.clone(), gate.clone()).await;
 
     // Keepalive: send NOP every 5 minutes if telnet mode and idle
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -25491,7 +25783,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // This eliminates ~8 wakeups/sec when idle (was: 6.7 + 1.0 + 0.5).
     const FAR_FUTURE: Duration = Duration::from_secs(86400);
 
-    // Prompt timeout detection — only active when a world has wont_echo_time set
+    // FANSI login timeouts, dirty stats and timed-prompt deadlines (`App::next_timed_prompt_deadline`)
     let prompt_check_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(prompt_check_sleep);
 
@@ -25513,6 +25805,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Auto-reconnect timer — fires when a world is due for reconnection
     let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(reconnect_sleep);
+    // The mapper's walks (src/map): a step whose room the game hasn't reported in time ends
+    // its walk. Armed at the bottom of every iteration from `next_walk_deadline`.
+    let walk_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(walk_sleep);
 
     // The text-reveal effect's next frame (src/reveal.rs) — armed only by a draw that
     // found a line still revealing on screen (render_output_crossterm's return value), so
@@ -25968,10 +26264,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 false, // not daemon mode
                             );
 
-                            // Activate prompt check if server data set wont_echo_time
-                            if app.worlds[world_idx].wont_echo_time.is_some() {
-                                prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
-                            }
                             // Activate timer for FANSI login timeout
                             if app.worlds[world_idx].fansi_detect_until.is_some() {
                                 prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
@@ -26385,7 +26677,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Redraw to update the clock display in separator bar
             }
 
-            // Prompt timeout check — only fires when a world has wont_echo_time set
+            // FANSI login timeouts, dirty stats and timed-prompt deadlines
             _ = &mut prompt_check_sleep => {
                 let now = std::time::Instant::now();
                 // mud-status-display.md Job 2 (plan D4): flush any world whose stats
@@ -26393,99 +26685,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // adding a second one - see the bottom-of-loop block below for how this
                 // timer gets rearmed while a world stays dirty.
                 app.flush_dirty_stats();
-                // Deferred emissions: this loop holds a mutable borrow of app.worlds, so
-                // anything that has to go out through `app` (push_and_broadcast_line,
-                // PromptUpdate) is collected here and flushed after the loop. Both were
-                // previously missing entirely - the disconnected-world branch pushed a line
-                // that no client ever received, and the connected branch set world.prompt
-                // without telling anyone, leaving remote prompt displays stale.
-                let mut timeout_lines: Vec<(usize, String)> = Vec::new();
-                let mut timeout_prompts: Vec<(usize, String)> = Vec::new();
-                for (world_idx, world) in app.worlds.iter_mut().enumerate() {
-                    // Check if there's a partial line waiting to become a prompt
-                    if let Some(wont_echo_time) = world.wont_echo_time {
-                        // If 150ms+ has passed since partial line was seen
-                        if now.duration_since(wont_echo_time) >= Duration::from_millis(150) {
-                            // Check if there's a partial line to extract as prompt
-                            if !world.trigger_partial_line.is_empty() && world.prompt.is_empty() {
-                                // Same rule as handle_prompt_text: nothing visible before the
-                                // marker is not a prompt. Leave the partial parked for the line
-                                // it belongs to and stop re-checking it.
-                                if !crate::util::prompt_has_visible_text(&world.trigger_partial_line) {
-                                    world.wont_echo_time = None;
-                                    continue;
-                                }
-                                needs_draw = true; // Prompt extracted — redraw input area
-                                // Extract partial line as prompt
-                                let prompt_text = std::mem::take(&mut world.trigger_partial_line);
-                                let normalized = crate::util::normalize_prompt(&prompt_text);
-
-                                // If world is not connected, display prompt as output instead
-                                if !world.connected {
-                                    timeout_lines.push((world_idx, normalized.trim().to_string()));
-                                    world.wont_echo_time = None;
-                                    continue;
-                                }
-
-                                world.prompt = normalized.clone();
-                                timeout_prompts.push((world_idx, normalized));
-                                world.prompt_count += 1;
-
-                                // Handle auto-login (same logic as AppEvent::Prompt handler)
-                                if !world.skip_auto_login {
-                                    let auto_type = world.settings.auto_connect_type;
-                                    let (user, password) = login_credentials(&world.settings,
-                                        app.tf_engine.default_world_character.as_deref(),
-                                        app.tf_engine.default_world_password.as_deref());
-                                    let prompt_num = world.prompt_count;
-
-                                    if !user.is_empty() && !password.is_empty() {
-                                        let cmd_to_send = match auto_type {
-                                            AutoConnectType::Prompt => {
-                                                match prompt_num {
-                                                    1 if !user.is_empty() => Some(user),
-                                                    2 if !password.is_empty() => Some(password),
-                                                    _ => None,
-                                                }
-                                            }
-                                            AutoConnectType::MooPrompt => {
-                                                match prompt_num {
-                                                    1 if !user.is_empty() => Some(user.clone()),
-                                                    2 if !password.is_empty() => Some(password),
-                                                    3 if !user.is_empty() => Some(user),
-                                                    _ => None,
-                                                }
-                                            }
-                                            AutoConnectType::Connect | AutoConnectType::NoLogin | AutoConnectType::Lines => None,
-                                        };
-
-                                        if let Some(cmd) = cmd_to_send {
-                                            world.prompt.clear(); // Clear prompt since we're auto-responding
-                                            if let Some(tx) = &world.command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(cmd));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            world.wont_echo_time = None;
-                        }
-                    }
-                }
-                let more_mode = app.settings.more_mode_enabled;
-                for (world_idx, text) in timeout_lines {
-                    let seq = app.worlds[world_idx].next_seq;
-                    app.worlds[world_idx].next_seq += 1;
-                    // push_line_respecting_pending (inside the helper), NOT a raw push: a
-                    // raw push planted this line's fresh high seq into output_lines ahead of
-                    // any older still-queued pending content, breaking the sorted-by-seq
-                    // invariant broadcast_released_lines depends on.
-                    let line = OutputLine::new(text, seq);
-                    app.push_and_broadcast_line(world_idx, line, more_mode);
-                }
-                for (world_idx, prompt) in timeout_prompts {
-                    app.ws_broadcast(WsMessage::PromptUpdate { world_index: world_idx, prompt });
-                }
                 // Check for expired FANSI detection windows
                 let now_fansi = std::time::Instant::now();
                 for world in &mut app.worlds {
@@ -26508,7 +26707,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     needs_draw = true; // Prompt promoted — redraw input area
                 }
                 // Re-arm: check again in 150ms if any world still needs it
-                let any_pending_prompt = app.worlds.iter().any(|w| w.wont_echo_time.is_some() || w.fansi_detect_until.is_some());
+                let any_pending_prompt = app.worlds.iter().any(|w| w.fansi_detect_until.is_some());
                 if any_pending_prompt {
                     prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
                 } else {
@@ -26588,6 +26787,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
 
             // Auto-reconnect timer
+            _ = &mut walk_sleep => {
+                app.map_expire_walks();
+                walk_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+            }
             _ = &mut reconnect_sleep => {
                 app.start_due_reconnects(&event_tx);
                 // Re-arm timer for next scheduled reconnect
@@ -26629,10 +26832,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             false, // not daemon mode
                         );
 
-                        // Activate prompt check if server data set wont_echo_time
-                        if app.worlds[world_idx].wont_echo_time.is_some() {
-                            prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
-                        }
                         // Activate pending update if lines were paused
                         if !app.worlds[world_idx].pending_lines.is_empty() {
                             pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
@@ -26974,6 +27173,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         // viewers now, every iteration - the loop woke on the Wakeup that produced it, so
         // the echo/output appears at once rather than on a timer.
         app.flush_shell_frames();
+        // The mapper: changed rooms saved, map views told (the console's pane redrawn); the
+        // walk timer armed.
+        if app.flush_map() {
+            needs_draw = true;
+        }
+        if let Some(due) = app.next_walk_deadline() {
+            walk_sleep.as_mut().reset(tokio::time::Instant::from_std(due));
+        }
 
         // Skip drawing when no visible state changed (e.g., pending update WS broadcast)
         if needs_draw {

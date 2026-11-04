@@ -39,6 +39,40 @@ Shift+Tab moves the focus between the panes; in the GUI and the web client a cli
 pane does too. Neither command connects or disconnects anything. From an action, a macro
 or a TF key binding, `/split` splits the interface that ran it.
 
+### /map
+Show or hide the map of the world, and walk to a room on it (see **The Map**).
+
+```
+/map                   # show or hide the map
+/map go <room or #id>  # walk there, one step per room the game reports
+/map path <room>       # the route, without walking it
+/map stop              # stop walking (Esc does too)
+/map find <text>       # rooms whose name has it
+/map here              # the room you are in
+/map area [name]       # show another area (no name: yours)
+/map level <n|up|down> # show another level
+/map center            # back to the room you are in
+/map forget <world>    # delete that world's map
+```
+
+Showing, hiding and moving the map act on the interface you typed them in, as `/split`
+does. While TinyFugue's `map.tf` is loaded, its own `/map` macro wins, and `/@map`
+reaches Clay's.
+
+### /pause
+Pause every interface except the one you typed it in: the console, and each GUI, browser,
+phone and SSH console attached to this Clay. It is `/remote --pause` on each of them.
+
+```
+/pause
+```
+
+A paused interface stops counting as watching its world, so text arriving there shows as
+new activity, and as new text (▶), where you are. Each one resumes as soon as it is used:
+a key at the console; typing, switching worlds or releasing held text in a client. The
+other windows and tabs of the interface you typed it in are left alone. `/remote` lists
+every interface and whether it is paused. Not available on a multiuser server.
+
 ## World Management
 
 ### /worlds
@@ -391,8 +425,16 @@ Says so if the world hasn't sent any of this data yet. `/stats` only displays wh
 already arrived — it doesn't request anything itself. The same data drives the console's
 one-line status display above the separator bar and the collapsible status panel on web/GUI/
 Android (see the **Interface Overview** and **Web Interface** chapters); both appear
-automatically the moment any data arrives and disappear again on disconnect, with nothing to
-configure. Whether anything ever appears depends entirely on the MUD: GMCP `Char.*` and MSDP
+automatically the moment any data arrives and disappear again on disconnect.
+
+```
+/stats hide     # hide the current world's status display, in every interface
+/stats show     # show it again
+```
+
+`/stats hide` and `/stats show` (also `off` and `on`) set the world's own Status Panel switch,
+the one in its editor. Settings has a Status Panel switch too, which hides the display for
+every world; it shows only while both are on. Whether anything ever appears depends entirely on the MUD: GMCP `Char.*` and MSDP
 are common on Diku-family servers, but MOOs and MUSHes generally implement neither, so
 `/stats` — and the status line/panel — correctly stay empty there.
 

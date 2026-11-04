@@ -29,6 +29,10 @@ Open with `/setup` command:
 | TTS | Text-to-speech for incoming lines, for this interface only: each interface keeps its own and sets it in its own Settings (see the table below). Off; Local (espeak or espeak-ng on Linux, `say` on macOS, the Windows voices; in a browser or the Android app, the device's own voice); Kokoro (an offline neural voice, installed once with `/tts install`); Edge (Microsoft's cloud voices, needs internet). A browser and the Android app offer Off and Local only, and the static Linux console offers no Kokoro. Each interface hears the lines of the world it shows, even in the background. F9 mutes the console's. | Off |
 | Speak Mode | All: every line. Limit: only lines like `Name says, "..."` and later lines from the same speakers | All |
 | Kokoro Voice | Which of Kokoro's 54 voices speaks, e.g. `af_heart`, `am_michael`, `bf_emma`; `/tts voices` lists them by language. Shown only where Kokoro can speak: not in a browser, the Android app or the static Linux console. In `settings.dat`: `tts_voice` (the console's), `tts.<interface>.voice` (the others') | af_heart |
+| Tabs | Where the tabs of the connected worlds go in the GUIs, the web page and the Android app: Top (a strip above the output), Bottom (a strip above the status bar), Left or Right (a column beside the output, names cut short to fit), or None. Kept per interface, so a desktop window can have them at the side while a phone keeps them at the top: each interface's own Settings sets its own, and one that never chose uses the shared value. Clicking a tab switches to that world. In `settings.dat`: `tabs` (the shared value), `tabs.<interface key>` (each interface's own) | None |
+| Screen Reader | For use with a screen reader (see **Accessibility**): new lines are read out once as they appear, Text Reveal is off, this interface's TTS stays quiet so nothing is read twice, and the focus stays where you put it. Kept per interface, set in each interface's own Settings; turned on by itself, once, in the GUI and the Android app when a screen reader is running and that interface never chose. In `settings.dat`: `screen_reader` (the console), `screen_reader.<interface key>` (the others) | Off |
+| MUDs: Screen Reader | Tell the games you connect to that you use a screen reader (the MTTS screen-reader flag), so a game that knows it can send simpler text. One global setting, shown everywhere; takes effect at the next connect. In `settings.dat`: `announce_screen_reader` | Off |
+| Status Panel | Show the stats a game sends over GMCP `Char.*` or MSDP (HP, mana and the like): the panel above the bar in the GUIs, the web page and the Android app, the status line in the console, where `/setup` calls it Status Line (see **Status Display** in the Interface chapter). Off hides it for every world, in every interface; each world also has its own switch in its editor. One global setting, shown everywhere. In `settings.dat`: `status_panel` | On |
 | Picture Host | Where Import Picture uploads a picture (see **Importing a Picture**): catbox.moe, sxcu.net, x0.at or tmpfiles.org (2d: deleted after two days), each also "+ URL Short" (the link goes through `/url`'s shortening), or Off. In `settings.dat`: `picture_host` (`catbox`, `catbox+short`, ..., `off`) | catbox.moe |
 | Separator Style | The look of the bar above the input. Clay: the gaps are spaces on the status bar colour, the look of the GUIs and the web page. TinyFugue: the gaps are underscores on the terminal background, as TinyFugue draws its status line. The look applies to TF's status line too once a script has changed it (see **Switching from TinyFugue**), in every interface; a `%status_pad` or `%status_attr` the script set is honoured in either look. Changing the setting from TinyFugue back to Clay hands the bar back to Clay: TF's layout and every `status_*` variable a script set go back to their defaults (set them again if wanted). One global setting, shown in every interface's Settings (the Theme Editor's Separator Bar group sets the same value). In `settings.dat`: `separator_style` (`web` for Clay, `tinyfugue`) | Clay |
 
@@ -79,7 +83,7 @@ Android app, and the desktop menus the native GUI fills), or edit from World Sel
 | Setting | Description |
 |---------|-------------|
 | World name | Display name for this world |
-| World type | `MUD`, `MUD - Timed Prompt`, `Slack`, or `Discord`. The two MUD types connect identically; **MUD - Timed Prompt** additionally infers a prompt from a line the server leaves unfinished (see Prompt wait below) |
+| World type | `MUD`, `MUD - Timed Prompt`, `Slack`, or `Discord`. The two MUD types connect identically; **MUD - Timed Prompt** additionally takes a line the server leaves unfinished as the prompt (see Prompt wait below). The guess never takes the text out of the output |
 | Hostname | Server address (e.g., mud.example.com) |
 | Port | Server port (e.g., 4000) |
 | Use SSL | Enable TLS/SSL connection |
@@ -108,16 +112,16 @@ Auto-login only triggers if BOTH username AND password are configured.
 
 ### Prompt Detection
 
-Clay normally recognises a prompt only when the server marks it with telnet GA/EOR (or a
-WONT-ECHO password prompt). Some MUDs never mark their prompts at all — Aardwolf's login
+Clay normally recognises a prompt only when the server marks it with telnet GA/EOR. Some
+MUDs never mark their prompts at all — Aardwolf's login
 prompt is the reference case — so `Prompt`/`MOO_prompt` auto-login could never fire there.
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| Prompt wait (ms) | Shown only for **MUD - Timed Prompt** worlds. A line the server leaves unfinished is treated as the prompt once nothing further has arrived for this long. Raise it on a slow link if a line that was merely arriving slowly gets taken for a prompt; lower it if prompts feel late | 1000 |
+| Prompt wait (ms) | Shown only for **MUD - Timed Prompt** worlds. A line the server leaves unfinished is shown as the prompt once nothing further has arrived for this long. If more text follows, the prompt clears and the line shows whole in the output; once you answer the prompt, it goes into the output as its own line. Raise it on a slow link if a line that was merely arriving slowly keeps flashing up as the prompt; lower it if prompts feel late | 1000 |
 
-Plain `MUD` worlds never infer a prompt from timing, so a server that sends long lines in
-several pieces cannot produce a false prompt there. If a world used to rely on the
+Plain `MUD` worlds never infer a prompt from timing (unless a TinyFugue script turns `%lp`
+on), so a server that sends long lines in several pieces cannot produce a false prompt there. If a world used to rely on the
 unmarked-prompt detection introduced in v1.6.5, set its type to **MUD - Timed Prompt**.
 
 ### Keep-Alive Settings
@@ -176,6 +180,7 @@ See the **Telnet Features** chapter for what each of these actually negotiates.
 | MSP Sound | Play `!!SOUND(...)`/`!!MUSIC(...)` triggers the MUD sends (MUD Sound Protocol). Off means these triggers are not recognized at all — the option is never requested, and any trigger text that still arrives is left in the output unstripped and unplayed | On |
 | MCP Edit | Support MCP (MUD Client Protocol), mainly used by MOOs — makes `@edit` open a real text editor instead of dumping verb source into the scrollback. Off means `#$#`-prefixed protocol lines display as plain text instead of being parsed | On |
 | MCCP2 | Accept MCCP2 compression when the server offers it. Off declines it at negotiation; toggling it on a live connection starts or stops compression immediately. Compressed connections survive `/reload` | On |
+| Status Panel | Show this world's GMCP `Char.*`/MSDP stats, in every interface (the console's world editor calls it Status Line). Off hides them for this world only; `/stats hide` and `/stats show`, or the × on the GUIs' panel, set it too. Settings' own Status Panel hides them for every world | On |
 
 ## Web Settings (/web)
 

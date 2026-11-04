@@ -26,7 +26,7 @@ aarch64 binary and APK into the v1.5.41 staging area; SKILL.md Step 5).
 
 ### Linux musl (x86_64)
 ```bash
-cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend,ssh-transport
+cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features ssh-transport
 ```
 - Binary: `target/x86_64-unknown-linux-musl/release/clay`
 - Release asset name: `clay-linux-x86_64-musl`
@@ -71,7 +71,7 @@ cargo +1.98.1 build --release --features webview-gui,native-audio,native-gui
 Cross-compiled here on localhost via the Android NDK — there is no 32-bit device available, so
 this one targets `armv7-linux-androideabi` using the NDK's clang. (The aarch64 no-GUI binary
 below is now cross-compiled the same way; only the aarch64 *GUI* variant is still built
-on-device.) No-GUI only (`rustls-backend`), so no
+on-device.) No-GUI only, so no
 tao/wry/X11 patches or libraries are needed.
 
 **One-time setup:**
@@ -91,7 +91,7 @@ export PATH="$HOME/.local/bin:$PATH"   # required: ~/.local/bin is NOT on PATH i
 ```
 This sets `CC_armv7_linux_androideabi`/`CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER` etc. to the
 NDK's `armv7a-linux-androideabi24-clang`, runs `cargo build --release --target armv7-linux-androideabi
---no-default-features --features rustls-backend`, then `patchelf --set-rpath` (mirroring the aarch64
+--no-default-features --features ssh-transport`, then `patchelf --set-rpath` (mirroring the aarch64
 convention but with `/system/lib` instead of `/system/lib64`), and copies the result out.
 - Binary: `target/armv7-linux-androideabi/release/clay` → copied to `/tmp/clay-termux-armv7-32bit-nogui`
 - Release asset name: `clay-termux-armv7-32bit-nogui`
@@ -104,7 +104,7 @@ Cross-compiled here on localhost via the same Android NDK as the armv7 build abo
 `aarch64-linux-android` instead. Termux doesn't ship its own libc — it links against Android's
 Bionic (`/system/lib64/libc.so`), the exact libc the NDK's `aarch64-linux-android24-clang`
 targets, so this cross-compile is ABI-compatible with the on-device Termux environment. No-GUI
-only (`rustls-backend`), same as armv7 — no tao/wry/X11 patches or libraries needed. The
+only, same as armv7 — no tao/wry/X11 patches or libraries needed. The
 GUI variant is the next section.
 
 **One-time setup:** same as armv7 above (NDK + `patchelf` already covered) plus
@@ -118,7 +118,7 @@ export PATH="$HOME/.local/bin:$PATH"   # same PATH note as armv7 — non-interac
 ```
 This sets `CC_aarch64_linux_android`/`CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` etc. to the
 NDK's `aarch64-linux-android24-clang`, runs `cargo build --release --target aarch64-linux-android
---no-default-features --features rustls-backend`, then `patchelf --set-rpath
+--no-default-features --features ssh-transport`, then `patchelf --set-rpath
 '/system/lib64:/data/data/com.termux/files/usr/lib'` (the same rpath the on-device build used to
 apply itself), and copies the result out.
 - Binary: `target/aarch64-linux-android/release/clay` → copied to `/tmp/clay-termux-aarch64-nogui`

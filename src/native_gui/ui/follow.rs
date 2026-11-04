@@ -91,6 +91,9 @@ fn is_leaders(msg: &WsMessage) -> bool {
             | WsMessage::KeybindFileSaved { .. }
             | WsMessage::ActionEditorState { .. }
             | WsMessage::NoteEditorState { .. }
+            // The map pane's answers: the pane is the main window's.
+            | WsMessage::MapRouteResult { .. }
+            | WsMessage::MapSearchResult { .. }
     )
 }
 

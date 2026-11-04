@@ -6,7 +6,7 @@
     android:layout_height="match_parent"
     android:background="#0e1220">
 
-    <WebView
+    <com.clay.mudclient.ClayWebView
         android:id="@+id/webView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
@@ -26,6 +26,7 @@
         <ProgressBar
             android:layout_width="48dp"
             android:layout_height="48dp"
+            android:contentDescription="Connecting"
             android:indeterminateTint="#d4845a"
             android:layout_marginBottom="16dp" />
 

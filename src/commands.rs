@@ -866,6 +866,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 app.add_output(&msg);
             }
         }
+        // The map (src/map): its pane is this console's, the rest the world's.
+        Command::Map { args } => app.console_map_command(&args),
         Command::Font => {
             app.add_output("Font settings are available in the web and GUI interfaces.");
         }
@@ -1201,42 +1203,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
 
                         // Handle SSL if needed
                         let connection_result: Result<(StreamReader, StreamWriter, bool), String> = if connect_use_ssl {
-                            #[cfg(feature = "native-tls-backend")]
-                            {
-                                let connector = match native_tls::TlsConnector::builder()
-                                    .danger_accept_invalid_certs(true)
-                                    .build()
-                                {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        let _ = event_tx_connect.send(AppEvent::ConnectionFailed(
-                                            world_name.clone(),
-                                            reader_conn_id,
-                                            crate::daemon::ConnectFailure::at(peer_addr, peer_port, format!("TLS error: {}", e)),
-                                        )).await;
-                                        return;
-                                    }
-                                };
-                                let connector = tokio_native_tls::TlsConnector::from(connector);
-
-                                match connector.connect(&connect_host, tcp_stream).await {
-                                    Ok(tls_stream) => {
-                                        let peer_cert = tls_stream.get_ref().peer_certificate().ok().flatten();
-                                        match crate::platform::check_native_tls_peer_pin(&format!("{}:{}", connect_host, connect_port), peer_cert) {
-                                            Ok(()) => {
-                                                let (r, w) = tokio::io::split(tls_stream);
-                                                Ok((StreamReader::Tls(r), StreamWriter::Tls(w), true))
-                                            }
-                                            Err(msg) => Err(msg),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        Err(format!("SSL handshake failed: {}", e))
-                                    }
-                                }
-                            }
-
-                            #[cfg(feature = "rustls-backend")]
                             {
                                 use rustls::RootCertStore;
                                 use tokio_rustls::TlsConnector;
@@ -1276,11 +1242,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                         Err(format!("SSL handshake failed: {}", e))
                                     }
                                 }
-                            }
-
-                            #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-                            {
-                                Err("No TLS backend available".to_string())
                             }
                         } else {
                             let (r, w) = tcp_stream.into_split();
@@ -1525,6 +1486,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             let msg = app.toggle_console_pause();
             app.add_output(&msg);
         }
+        Command::Pause => {
+            let msg = app.pause_other_interfaces(None);
+            app.add_output(&msg);
+        }
         Command::BanList => {
             // Show current banned hosts. Format matches the WS/daemon copies
             // (main.rs, daemon.rs) exactly, including the Type column this
@@ -1648,9 +1613,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             let world_idx = app.current_world_index;
             execute_mssp_command(app, world_idx, false);
         }
-        Command::Stats => {
+        Command::Stats { show } => {
             let world_idx = app.current_world_index;
-            execute_stats_command(app, world_idx, false);
+            execute_stats_command(app, world_idx, show, false);
         }
         Command::Msdp { verb, target } => {
             let world_idx = app.current_world_index;
@@ -2434,8 +2399,14 @@ pub(crate) fn mssp_lines(pairs: &[(String, String)]) -> Vec<String> {
 /// security requirement as the console status line, applied here too rather than only
 /// in the row-accounting-sensitive path. Read-only, same as `/mssp`: this is a status
 /// display derived from data the MUD already sent, not something to negotiate here.
-pub(crate) fn execute_stats_command(app: &mut App, world_idx: usize, is_daemon_mode: bool) {
+pub(crate) fn execute_stats_command(app: &mut App, world_idx: usize, show: Option<bool>, is_daemon_mode: bool) {
     if world_idx >= app.worlds.len() {
+        return;
+    }
+    // `/stats show|hide`: the world's own Status Panel switch.
+    if let Some(on) = show {
+        let line = app.set_world_status_panel(world_idx, on);
+        app.emit_client_text(world_idx, &line, is_daemon_mode);
         return;
     }
     let entries = app.worlds[world_idx].current_stat_entries();
@@ -2973,12 +2944,10 @@ mod telnet_reader_migration_tests {
     // handle_command function with a Command::Connect (via the internal "/__connect"
     // command string, which parse_connect_command maps to it - "/server" is a different,
     // unrelated feature: remote-attach), proving the migrated
-    // direct-connect loop still delivers wont_echo_seen (as
-    // AppEvent::Telnet(.., TelnetEvent::WontEchoPromptHint) since Job 8's dispatch-side
-    // consolidation; it was AppEvent::WontEchoSeen when this test was written in Job 6).
-    // commands.rs is one of only two sites in the whole codebase that ever consumed this
-    // flag (see finding 1 in the plan); losing it silently disables WONT-ECHO prompt
-    // detection for every server that relies on it instead of GA/EOR.
+    // direct-connect loop still delivers `IAC WONT ECHO` (as
+    // AppEvent::Telnet(.., TelnetEvent::EchoOn), which unmasks the input; it was
+    // AppEvent::WontEchoSeen when this test was written in Job 6), and - since
+    // 2026-11-03 - that the line in front of it is text, not a prompt.
     //
     // The proxy loops' new MCCP2 decompression (finding 1's live form on this path - they
     // used to accept IAC DO MCCP2 and then render the compressed stream as text) is not
@@ -3013,8 +2982,7 @@ mod telnet_reader_migration_tests {
     }
 
     /// End-to-end proof that the migrated direct-connect reader loop still carries
-    /// wont_echo_seen - the exact flag Job 4.5 found `TelnetEvent` had no equivalent for
-    /// until `TelnetEvent::WontEchoPromptHint` was added - from the wire through
+    /// `IAC WONT ECHO` (`TelnetEvent::EchoOn`) from the wire through
     /// `TelnetSession`/`spawn_telnet_reader` to the `AppEvent` channel `handle_command`'s
     /// caller reads from. This is the same production `handle_command` function and
     /// `Command::Connect` arm a real `/__connect` (Connect button) drives; only the fake
@@ -3044,7 +3012,8 @@ mod telnet_reader_migration_tests {
         while tokio::time::Instant::now() < deadline && !saw_wont_echo {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, event_rx.recv()).await {
-                Ok(Some(AppEvent::Telnet(TelnetTarget::World(name), TelnetEvent::WontEchoPromptHint)))
+                Ok(Some(AppEvent::Prompt(..))) => panic!("WONT ECHO is not a prompt marker"),
+                Ok(Some(AppEvent::Telnet(TelnetTarget::World(name), TelnetEvent::EchoOn)))
                     if name == "wonttest" =>
                 {
                     saw_wont_echo = true;
@@ -3053,7 +3022,7 @@ mod telnet_reader_migration_tests {
                 _ => break,
             }
         }
-        assert!(saw_wont_echo, "expected AppEvent::Telnet(.., WontEchoPromptHint) on the channel handle_command's caller reads from");
+        assert!(saw_wont_echo, "expected AppEvent::Telnet(.., EchoOn) on the channel handle_command's caller reads from");
 
         let _ = server.await;
     }

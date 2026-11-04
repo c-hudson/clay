@@ -56,14 +56,10 @@ pub struct ProtocolState {
     /// exchange completes, in which case `effective_encoding` falls back to
     /// `WorldSettings::encoding`.
     pub negotiated_encoding: Option<Encoding>,
-    /// True if this connection uses WONT ECHO as its prompt-boundary heuristic
-    /// (auto-detected) - see `TelnetEvent::WontEchoPromptHint`'s doc comment.
-    pub uses_wont_echo_prompt: bool,
     /// True once this connection has delivered a prompt via a real telnet marker
-    /// (GA/EOR/WONT-ECHO) - set only by `App::handle_prompt_text` with
-    /// `PromptSource::Marker`, never by a `PromptSource::Timed` promotion, since that is
-    /// an inference, not an observation of the server's own behavior (see
-    /// `PromptSource`'s doc comment). On such a world the marker is authoritative and
+    /// (GA/EOR) - set only by `App::handle_prompt_text` with `PromptSource::Marker`,
+    /// never by a `PromptSource::Timed` promotion, since that is an inference, not an
+    /// observation of the server's own behavior (see `PromptSource`'s doc comment). On such a world the marker is authoritative and
     /// `App::promote_due_timed_prompts`'s timed-prompt inference must stay out of the
     /// way: a trailing partial line there is ordinary mid-line output, not a prompt, and
     /// promoting it would overwrite the real prompt with whatever happened to arrive
@@ -196,7 +192,6 @@ impl ProtocolState {
         self.stats.clear();
         self.mcmp_default_url.clear();
         self.gmcp_supported_packages.clear();
-        self.uses_wont_echo_prompt = false;
         self.seen_prompt_marker = false;
     }
 
@@ -272,15 +267,6 @@ impl ProtocolState {
                     TELNET_OPT_NAWS => self.naws_enabled = false,
                     _ => {}
                 }
-                ProtocolOutcome::default()
-            }
-            // "Stored in both" (plan Job 9): multiuser has no consumer for this (no
-            // partial-line prompt timeout there - that lives in `App::process_server_data`,
-            // a `World`-only code path) but the flag itself is harmless bookkeeping either
-            // way, so it is set uniformly rather than only on `World`. Documented follow-up
-            // if multiuser ever grows that timeout.
-            TelnetEvent::WontEchoPromptHint => {
-                self.uses_wont_echo_prompt = true;
                 ProtocolOutcome::default()
             }
             TelnetEvent::EchoOff => self.apply_echo_mask(true, ctx),

@@ -30,7 +30,9 @@ Still in `/web`:
 
 **For HTTP (ws://):**
 - Enable "HTTP enabled"
-- Set "HTTP port" (default: 9000)
+- Set "HTTP port" (default: 9000). If another program already has that port when Clay
+  starts (a second Clay, as a rule), Clay takes the next free port above it and says so in
+  its output, naming the port to attach to; the setting is left as it is.
 
 **For HTTPS (wss://):**
 - Enable "HTTPS enabled"
@@ -184,9 +186,12 @@ data — the same data as the console's status line and `/stats` (see the **Inte
 Overview** and **Commands** chapters), shared by the web interface, the native WebView GUI,
 and the Android app since all three run the same interface code.
 
-- **Appears only when there's data**, and disappears again on disconnect — there is no
-  setting to show or hide it, only to collapse it. A world that never sends GMCP `Char.*` or
-  MSDP data (most MOO and MUSH servers, for instance) simply never shows a panel.
+- **Appears only when there's data**, and disappears again on disconnect. A world that never
+  sends GMCP `Char.*` or MSDP data (most MOO and MUSH servers, for instance) simply never
+  shows a panel.
+- **The × hides it for the world shown**, in every interface: it turns off that world's
+  Status Panel switch (Edit World), which is also where it comes back, or with `/stats show`.
+  Settings' Status Panel hides it for every world.
 - **Click the header to collapse or expand it.** The collapsed state is remembered per
   browser (`localStorage`), not synced between clients — collapsing it on your phone doesn't
   collapse it in a browser tab open to the same instance.

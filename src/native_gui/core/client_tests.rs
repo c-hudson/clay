@@ -129,6 +129,7 @@ impl H {
             expand_line: true,
             picture_upload: true,
             history_on_demand: true,
+            map: false,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -824,6 +825,28 @@ fn tts_saves_from_the_native_settings_under_its_own_key() {
     assert!(matches!(settings_update(&old), WsMessage::UpdateGlobalSettings { tts_profile: None, .. }));
 }
 
+/// The world tabs' location saves from the native Settings under this GUI's own key (user
+/// ruling 2026-11-01): the shared value goes back as sent, nothing is sent until it has
+/// one of its own, and a server before the split gets the shared field instead.
+#[test]
+fn tabs_save_from_the_native_settings_under_its_own_key() {
+    let key = crate::font_profile::native_key();
+    let mut app = crate::App::new();
+    app.settings.tabs = crate::TabsMode::Top;
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let mut s = app.build_global_settings_msg();
+    assert_eq!(s.tabs_for(key), "top", "never chosen: the shared value");
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { tabs_profile: None, .. }));
+    s.set_tabs_for(key, "left");
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.tabs_for(key), crate::TabsMode::Left);
+    assert_eq!(app.settings.tabs, crate::TabsMode::Top, "the shared value is untouched");
+    let mut old = app.build_global_settings_msg();
+    old.tabs_profiles = None;
+    old.set_tabs_for(key, "bottom");
+    assert!(matches!(settings_update(&old), WsMessage::UpdateGlobalSettings { tabs_profile: None, ref tabs, .. } if tabs == "bottom"));
+}
+
 /// Clear Input on Send (TF's %cleardone) round-trips through this GUI's Settings save, as
 /// a value the server applies - never left out, which would mean "unchanged".
 #[test]
@@ -1397,6 +1420,7 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
         expand_line: false,
         picture_upload: false,
         history_on_demand: false,
+        map: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1405,6 +1429,68 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
     let e = old.core.set_other_views(vec![1], Vec::new());
     old.keep(e);
     assert!(other_views(&old.sent()).is_empty(), "not to a server that doesn't take it");
+}
+
+// ---- the map ----
+
+/// The map pane's view goes to a server with the map (`InitialState.map`): an empty one at
+/// every login, so the server knows this window has a pane (a `/map` an action runs comes
+/// back here), then each change once; a request (`map_send`) goes out as it is. A server
+/// without the map is never sent either: an older server closes the connection on a
+/// message it can't parse.
+#[test]
+fn the_map_view_is_told_at_login_and_on_each_change_and_only_to_a_server_with_the_map() {
+    use crate::map::wire::MapViewReq;
+    let initial = |map: bool| WsMessage::InitialState {
+        worlds: vec![world_msg(0, "A", 0..2, 9)],
+        settings: settings(),
+        current_world_index: 0,
+        actions: Vec::new(),
+        splash_lines: Vec::new(),
+        server_version: String::new(),
+        server_version_detail: String::new(),
+        android_app_version: String::new(),
+        your_display_id: 7,
+        scrollback_push: false,
+        other_views: true,
+        expand_line: true,
+        picture_upload: true,
+        history_on_demand: true,
+        map,
+        emoji_json: String::new(),
+        emoji_categories_json: String::new(),
+        tf_status: Vec::new(),
+    };
+    let watches = |sent: &[WsMessage]| -> Vec<Vec<MapViewReq>> {
+        sent.iter().filter_map(|m| if let WsMessage::MapWatch { views } = m { Some(views.clone()) } else { None }).collect()
+    };
+    let mut h = H::password();
+    h.connect_and_login();
+    h.drain();
+    h.msg(initial(true));
+    assert_eq!(watches(&h.sent()), vec![Vec::<MapViewReq>::new()], "an empty view at login");
+    let view = vec![MapViewReq { world_index: 0, area: None, level: None }];
+    let e = h.core.map_watch(view.clone());
+    h.keep(e);
+    assert_eq!(watches(&h.sent()), vec![view.clone()], "the pane opened");
+    let e = h.core.map_watch(view.clone());
+    h.keep(e);
+    assert!(watches(&h.sent()).is_empty(), "unchanged: nothing sent");
+    let e = h.core.map_send(WsMessage::MapStop { world_index: 0 });
+    h.keep(e);
+    assert!(h.sent().iter().any(|m| matches!(m, WsMessage::MapStop { world_index: 0 })));
+
+    let mut old = H::password();
+    old.connect_and_login();
+    old.drain();
+    old.msg(initial(false));
+    assert!(watches(&old.sent()).is_empty());
+    let e = old.core.map_watch(view);
+    old.keep(e);
+    let e = old.core.map_send(WsMessage::MapStop { world_index: 0 });
+    old.keep(e);
+    let sent = old.sent();
+    assert!(watches(&sent).is_empty() && !sent.iter().any(|m| matches!(m, WsMessage::MapStop { .. })), "{sent:?}");
 }
 
 // ---- /version ----
@@ -1431,6 +1517,7 @@ fn version_names_this_gui_and_the_server() {
         expand_line: true,
         picture_upload: true,
         history_on_demand: true,
+        map: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1460,6 +1547,7 @@ fn version_names_this_gui_and_the_server() {
         expand_line: true,
         picture_upload: true,
         history_on_demand: true,
+        map: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),

@@ -454,41 +454,17 @@ pub fn run_master_webgui() -> io::Result<()> {
         disable_a11y_bridge_if_broken();
     }
 
-    // Read the configured HTTP port from settings (default 9000) - the GUI uses the same
-    // port as the web interface - and the web password the user saved, which the server
-    // runs with so other devices can log in with it (see below).
-    let (port, saved_password) = {
+    // The web password the user saved, which the server runs with so other devices can
+    // log in with it (see below). The port is the server's to pick (GUI_HTTP_PORT, below).
+    let saved_password = {
         let mut tmp_app = crate::App::new();
         let _ = crate::persistence::load_settings(&mut tmp_app);
-        (tmp_app.settings.http_port, tmp_app.settings.websocket_password.clone())
+        tmp_app.settings.websocket_password.clone()
     };
 
-    // Detect duplicate instances: probe the port before spawning anything.
-    // Skip the probe during hot-reload — the old process's listener may still be
-    // bound at this instant (it releases the port on exit, which the new server's
-    // own bind-retry-with-backoff loop tolerates), so this probe would otherwise
-    // false-positive as "already running". Was gated on CLAY_HTTP_LISTENER (Windows
-    // socket-handle-passing, no longer wired up now that the GUI always uses the
-    // always-TLS-capable start_https_server — see SECURITY-ROADMAP.md D8); the
-    // --reload flag is set on every reload exec regardless of platform, so use that.
-    let is_reload = std::env::args().any(|a| a == "--reload");
-    // Both the loopback the WebView connects to and every interface, where the server
-    // listens: Windows lets a loopback bind succeed beside another program listening on
-    // all interfaces, so the loopback alone missed a Clay already running there.
-    if !is_reload {
-        for host in ["127.0.0.1", "0.0.0.0"] {
-            if let Err(e) = std::net::TcpListener::bind((host, port)) {
-                let msg = if e.kind() == io::ErrorKind::AddrInUse {
-                    crate::platform::port_in_use_message(port, &format!("clay --web-gui=127.0.0.1:{port}"))
-                } else {
-                    format!("Clay failed to start: could not bind port {}.\n\n{}", port, e)
-                };
-                show_error_dialog("Clay", &msg);
-                return Err(e);
-            }
-        }
-        // Drop the test listeners immediately — the real bind happens inside run_app_headless.
-    }
+    // A port already taken (another Clay, as a rule) is the server's to handle: it takes
+    // the next free one and says so (start_web_server_at_startup), and GUI_HTTP_PORT is
+    // where this window then connects.
 
     // The saved web password, or a random session one from the OS CSPRNG (the server
     // listens on all interfaces for remote clients, so it must not be guessable) that is
@@ -526,7 +502,7 @@ pub fn run_master_webgui() -> io::Result<()> {
     });
 
     // Wait for the HTTP server to signal it has bound the port.
-    // Uses an atomic flag set by start_http_server after successful bind,
+    // Uses an atomic flag set by start_https_server after successful bind,
     // avoiding the race where TCP connect succeeds against a dying old socket.
     crate::GUI_HTTP_READY.store(false, std::sync::atomic::Ordering::SeqCst);
     let ws_ready = {
@@ -554,6 +530,9 @@ pub fn run_master_webgui() -> io::Result<()> {
         return Err(io::Error::other("WebSocket server did not start within 3 seconds"));
     }
 
+    // The port the server bound: the configured one, or the next free one when another
+    // program had it (said in the output).
+    let port = crate::GUI_HTTP_PORT.load(std::sync::atomic::Ordering::SeqCst);
     let params = WebViewParams {
         ws_host: "127.0.0.1".to_string(),
         ws_port: port,
@@ -848,7 +827,6 @@ async fn ws_proxy_bridge(
     } else {
         // Try WSS first with trust-on-first-use pinned cert support, fall back to WS.
         let remote_ws = {
-            #[cfg(feature = "rustls-backend")]
             {
                 // The pin is kept under host:port, without the URL's path.
                 let host_port_key = wss_url.trim_start_matches("wss://").trim_start_matches("ws://")
@@ -884,17 +862,6 @@ async fn ws_proxy_bridge(
                             None => return Err(e.into()),
                         }
                     }
-                }
-            }
-            #[cfg(not(feature = "rustls-backend"))]
-            {
-                // Without rustls, try plain connect (handles both ws:// and wss://)
-                match tokio_tungstenite::connect_async(wss_url).await {
-                    Ok((ws, _)) => ws,
-                    Err(e) => match ws_url {
-                        Some(ws_url) => tokio_tungstenite::connect_async(ws_url).await?.0,
-                        None => return Err(e.into()),
-                    },
                 }
             }
         };

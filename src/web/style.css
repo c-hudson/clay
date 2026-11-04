@@ -114,7 +114,43 @@ body {
     position: relative;
 }
 
+/* Read by screen readers only (#sr-announcer). */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+/* Keyboard focus on the controls a screen reader user reaches by Tab (app.js a11yUpgrade). */
+[role="button"]:focus-visible, [role="menuitem"]:focus-visible, [role="tab"]:focus-visible,
+[role="switch"]:focus-visible, .toggle:focus-visible, #output-container:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 1px;
+}
+
 /* ─── Output Area ─── */
+/* The output column between the side tabs (Tabs: Left/Right) and side panes. */
+#main-row {
+    display: flex;
+    flex-direction: row;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+}
+#output-column {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+}
+
 #output-container, #split-output-container {
     flex: 1;
     overflow-y: auto;
@@ -309,13 +345,38 @@ body {
     z-index: 2;
 }
 
+.stats-panel-top {
+    display: flex;
+    align-items: center;
+}
+
 .stats-panel-header {
+    flex: 1;
     display: flex;
     align-items: center;
     gap: 6px;
     padding: 2px 10px;
     cursor: pointer;
     color: var(--theme-fg-secondary, #a89fb4);
+}
+
+/* × : hide the panel for this world (the world's Status Panel switch, /stats hide). */
+.stats-panel-hide {
+    margin-right: 6px;
+    padding: 0 5px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--theme-fg-secondary, #a89fb4);
+    font: inherit;
+    font-size: 13px;
+    line-height: 16px;
+    cursor: pointer;
+}
+
+.stats-panel-hide:hover {
+    background: var(--theme-bg-hover, #2f5570);
+    color: var(--theme-fg, #eef3f7);
 }
 
 .stats-panel-title {
@@ -572,7 +633,7 @@ body.device-phone .pane-bar .pane-bar-spacer { display: none; }
     cursor: pointer;
 }
 
-/* ─── World-Tabs Ribbon (Tabs setting: none/top/bottom) ─── */
+/* ─── World Tabs (Tabs setting: top/bottom/left/right/none, per interface) ─── */
 .tabs-ribbon {
     display: none;   /* shown via JS (applyTabsMode) only when mode != 'none' */
     /* Tabs sit on the ribbon's top edge, so there is no line above them: the
@@ -662,6 +723,50 @@ body.device-phone .pane-bar .pane-bar-spacer { display: none; }
     color: var(--text-color);
     font-weight: 700;
 }
+
+/* Tabs: Left/Right - a column beside the output (user request 2026-11-01), the strip's
+   tab shape turned on its side: the current tab lifted onto the elevated colour with the
+   accent on its outer edge, names cut short with an ellipsis, the column scrolling when
+   the worlds don't fit (native bars.rs tabs_column, TABS_COLUMN_WIDTH). */
+.tabs-ribbon.tabs-vertical {
+    flex-direction: column;
+    align-items: stretch;
+    height: auto;
+    width: 150px;
+    padding: 6px 0;
+    border-bottom: none;
+}
+.tabs-ribbon.tabs-vertical.tabs-left { border-right: 1px solid var(--theme-border-subtle, #221c2b); }
+.tabs-ribbon.tabs-vertical.tabs-right { border-left: 1px solid var(--theme-border-subtle, #221c2b); }
+.tabs-ribbon.tabs-vertical .tabs-ribbon-arrow { display: none; }
+.tabs-ribbon.tabs-vertical .tabs-ribbon-tabs {
+    flex-direction: column;
+    align-items: stretch;
+    height: auto;
+    gap: 3px;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+.tabs-ribbon.tabs-vertical .tabs-ribbon-tab {
+    display: block;
+    padding: 5px 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    border-top: none;
+}
+.tabs-ribbon.tabs-left .tabs-ribbon-tab {
+    border-radius: 0 6px 6px 0;
+    border-left: 2px solid var(--border-color);
+    margin-right: 6px;
+}
+.tabs-ribbon.tabs-right .tabs-ribbon-tab {
+    border-radius: 6px 0 0 6px;
+    border-right: 2px solid var(--border-color);
+    margin-left: 6px;
+}
+.tabs-ribbon.tabs-left .tabs-ribbon-tab.active { border-left-color: var(--accent-color); }
+.tabs-ribbon.tabs-right .tabs-ribbon-tab.active { border-right-color: var(--accent-color); }
+body.device-phone .tabs-ribbon.tabs-vertical { width: 110px; }
 
 /* ─── Icon Bar (Icon Bar setting: none/app_tablet/all) ───
    Large icon+label tiles for the most-used menu items, plus any Action
@@ -4134,3 +4239,80 @@ body.picture-drag #output-container {
     outline: 2px dashed var(--accent-color);
     outline-offset: -4px;
 }
+
+/* ─── Map pane (src/map; app.js "Map pane") ───
+   Beside the output (in #main-row, before a right tab column) on a desktop or tablet, a
+   sheet over the lower output on a phone. Rooms are SVG squares on a grid, exits lines
+   between them; you in the accent, the destination and its route in the highlight. */
+.map-pane {
+    flex: 0 0 auto;
+    width: 360px;
+    max-width: 45%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: var(--theme-bg-surface, #1c1722);
+    border-left: 1px solid var(--theme-border-subtle, #221c2b);
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--text-color);
+}
+.map-header { display: flex; align-items: center; gap: 4px; padding: 8px 8px 6px 12px; border-bottom: 1px solid var(--theme-border-subtle, #221c2b); }
+.map-title { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.map-kicker { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--theme-fg-muted, #9a8fa6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.map-area { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.map-levels { display: flex; align-items: center; gap: 2px; padding: 1px; border: 1px solid var(--theme-border-subtle, #221c2b); border-radius: 6px; background: var(--theme-bg, #121212); white-space: nowrap; }
+.map-levels span { padding: 0 4px; color: var(--theme-fg-secondary, #b8b0c2); }
+.map-icon-btn { width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--theme-fg-secondary, #b8b0c2); font: inherit; font-size: 14px; cursor: pointer; }
+.map-icon-btn:hover { background: var(--theme-bg-hover, #2c2535); color: var(--text-color); }
+.map-search { position: relative; padding: 8px 10px; }
+.map-search input { width: 100%; box-sizing: border-box; height: 30px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--theme-border-medium, #3b3346); background: var(--theme-bg, #121212); color: var(--text-color); font: inherit; }
+.map-search-results { position: absolute; left: 10px; right: 10px; top: 40px; z-index: 5; max-height: 220px; overflow-y: auto; background: var(--theme-bg-elevated, #231d2a); border: 1px solid var(--theme-border-medium, #3b3346); border-radius: 6px; }
+.map-search-results button { display: block; width: 100%; text-align: left; padding: 6px 8px; border: 0; background: transparent; color: var(--text-color); font: inherit; cursor: pointer; }
+.map-search-results button:hover, .map-search-results button:focus-visible { background: var(--theme-bg-hover, #2c2535); }
+.map-search-results small { color: var(--theme-fg-muted, #9a8fa6); margin-left: 6px; }
+.map-canvas { position: relative; flex: 1 1 auto; min-height: 160px; margin: 0 10px; border: 1px solid var(--theme-border-subtle, #221c2b); border-radius: 8px; background: var(--theme-bg-deep, var(--theme-bg, #121212)); overflow: hidden; touch-action: none; cursor: grab; }
+.map-canvas svg { width: 100%; height: 100%; display: block; }
+.map-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; text-align: center; color: var(--theme-fg-muted, #9a8fa6); pointer-events: none; }
+.map-room { fill: var(--theme-bg-elevated, #231d2a); stroke: var(--theme-border-medium, #3b3346); stroke-width: 2; cursor: pointer; }
+.map-room:hover { stroke: var(--text-color); }
+.map-room.on-route { stroke: var(--theme-highlight, #f0c674); }
+.map-room.target { fill: var(--theme-highlight, #f0c674); stroke: var(--theme-highlight, #f0c674); }
+.map-room.here { fill: var(--accent-color); stroke: var(--accent-color); }
+.map-room.selected:not(.here):not(.target) { stroke: var(--theme-link, #9ec5ea); }
+.map-mark { font-size: 9px; fill: var(--theme-fg-secondary, #b8b0c2); pointer-events: none; text-anchor: middle; dominant-baseline: central; }
+.map-mark.on-dark { fill: var(--theme-bg, #121212); }
+.map-exit { stroke: var(--theme-border-medium, #3b3346); stroke-width: 2; }
+.map-exit.route { stroke: var(--theme-highlight, #f0c674); stroke-width: 4; }
+.map-stub { stroke: var(--theme-fg-dim, #6f6878); stroke-width: 2; stroke-dasharray: 3 3; }
+.map-away { stroke: var(--theme-link, #9ec5ea); stroke-width: 2; }
+.map-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 6px 12px 0; color: var(--theme-fg-muted, #9a8fa6); font-size: 11px; }
+.map-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.map-key-you { background: var(--accent-color); }
+.map-key-target { background: var(--theme-highlight, #f0c674); }
+.map-key-route { height: 3px !important; width: 14px !important; background: var(--theme-highlight, #f0c674); }
+.map-key-stub { height: 0 !important; width: 14px !important; border-top: 2px dashed var(--theme-fg-dim, #6f6878); border-radius: 0 !important; }
+.map-card { margin: 8px 10px 10px; padding: 10px 12px; border: 1px solid var(--theme-border-medium, #3b3346); border-radius: 10px; background: var(--theme-bg-elevated, #231d2a); display: flex; flex-direction: column; gap: 7px; }
+.map-card-title { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.map-card-title h2 { margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.map-card-title span { color: var(--theme-fg-muted, #9a8fa6); font-size: 11px; white-space: nowrap; }
+.map-card-exits { display: flex; flex-wrap: wrap; gap: 4px; }
+.map-card-exits span { padding: 1px 7px; border-radius: 5px; border: 1px solid var(--theme-border-medium, #3b3346); background: var(--theme-bg, #121212); font-family: var(--mono); font-size: 11px; }
+.map-card-exits span.unexplored { border-style: dashed; background: transparent; color: var(--theme-fg-muted, #9a8fa6); }
+.map-card-route { color: var(--theme-fg-secondary, #b8b0c2); }
+.map-card-route b { color: var(--theme-highlight, #f0c674); font-family: var(--mono); font-weight: 400; }
+.map-card-buttons { display: flex; gap: 8px; }
+/* A phone: a sheet over the lower output, above the status bar; the output keeps its size,
+   so nothing rewraps. */
+#main-row { position: relative; }
+body.device-phone .map-pane {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 4;
+    width: auto; max-width: none; height: min(66%, 500px);
+    border-left: 0; border-top: 1px solid var(--theme-border-medium, #3b3346);
+    border-radius: 14px 14px 0 0; box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.35);
+}
+body.device-phone .map-legend { display: none; }
+body.device-phone .map-search { padding: 6px 10px; }
+body.device-phone .map-card { margin: 6px 10px 8px; padding: 8px 10px; gap: 5px; }
+body.device-phone .map-icon-btn { width: 40px; height: 40px; }
+body.device-phone .map-card-buttons .btn { flex: 1 1 auto; min-height: 40px; }

@@ -54,9 +54,8 @@ Masking clears when the server sends `IAC WONT ECHO` (Clay answers `DONT ECHO`),
 the world disconnects/reconnects. Web, GUI, and Android clients mask their own input the
 same way, mirrored from the server's echo state.
 
-This is separate from the WONT-ECHO-based prompt-boundary heuristic used for MOO-style
-auto-login (see **Auto-Login Prompt Detection** below) — one decides which text is safe to
-keep, the other decides which text becomes the displayed prompt.
+`WONT ECHO` only ends the masking: it does not mark a prompt (see **Prompt Detection**
+below).
 
 ### SGA (Suppress Go Ahead)
 
@@ -79,8 +78,9 @@ client's list has ended:
 
 The MTTS bitmask always reports ANSI, UTF-8, 256-color, and truecolor support (all
 genuinely implemented in Clay's ANSI parser and renderer); it adds the SSL bit when the
-connection is using TLS. Clay does not claim VT100 line-drawing, mouse tracking,
-screen-reader, proxy, MNES, or MSLP support — none of those exist in Clay today.
+connection is using TLS, and the screen-reader bit when **MUDs: Screen Reader** is on in
+Settings (see the **Accessibility** chapter). Clay does not claim VT100 line-drawing, mouse
+tracking, proxy, MNES, or MSLP support — none of those exist in Clay today.
 
 ### EOR (End of Record)
 
@@ -170,9 +170,9 @@ field in the World Editor. GMCP also carries server-driven sound/music via
 
 `Char.*` packages (e.g. `Char.Vitals`) feed the same per-world status display as MSDP does —
 `/stats`, the console status line, and the web/GUI/Android status panel (see the **Commands**,
-**Interface Overview**, and **Web Interface** chapters). The GMCP field defaults to
-`Client.Media 1, Char 1`, so a new world declares support for the whole `Char` package family
-as well as media — a spec-following server has no reason to withhold `Char.*` data from a
+**Interface Overview**, and **Web Interface** chapters). `Room.Info` builds the world's map
+(see **The Map**). The GMCP field defaults to `Client.Media 1, Char 1, Room 1`, so a new
+world declares support for the whole `Char` and `Room` package families as well as media — a spec-following server has no reason to withhold `Char.*` data from a
 client that asked for it this way. An existing world created before this default changed picks
 it up automatically too, unless its GMCP field (World Editor) was already customised: the
 upgrade only ever replaces a value that is *exactly* the old `Client.Media 1` default, so
@@ -214,7 +214,12 @@ by convention alone risks misfiring on any MUD that underlines ordinary text for
 
 ## Prompt Detection
 
-Clay detects prompts using telnet GA (Go Ahead) or EOR (End of Record):
+Clay detects prompts using telnet GA (Go Ahead) or EOR (End of Record), and nothing else:
+`IAC WONT ECHO` is not a prompt marker (some servers send it at the top of their welcome
+screen, and the text in front of it was once taken for a prompt). A GA or EOR that arrives
+on its own, after the line it marks has already arrived, still marks that line. A plain
+`MUD` world never guesses a prompt from timing; only a **MUD - Timed Prompt** world does
+(see below), or any MUD world while TinyFugue's `%lp` is on.
 
 ### How It Works
 
@@ -241,7 +246,8 @@ When Auto Login is set to "Prompt" or "MOO_prompt":
 - Second telnet prompt: Password sent automatically
 - MOO_prompt third prompt: Username sent again
 
-Prompts that are auto-answered are cleared and not displayed.
+Prompts that are auto-answered are cleared from the input area. A timed prompt answered
+this way goes into the output as a line once the server replies (see Timed Prompts below).
 
 ### Timed Prompts (MUD - Timed Prompt worlds)
 
@@ -253,9 +259,22 @@ unfinished and, if nothing further arrives within the world's *Prompt wait* (def
 `Prompt`/`MOO_prompt` auto-login. A marked prompt, if the server ever sends one, always
 takes precedence.
 
-The trade-off is inherent: a line that was merely arriving slowly across two packets can
-be taken for a prompt on such a world, with its first part shown as the prompt and the
-rest as a new line. Raise the wait if that happens. Plain `MUD` worlds never do this.
+A timed prompt is a guess, so Clay never takes its text out of the output:
+
+- **The server sends more** (any visible text, or a new line): the guess is over. The
+  prompt clears from the input area, and the text joins the line it belongs to. A line
+  that only paused part-way therefore ends up whole in the output, and a real prompt
+  followed by other text (chat arriving at the prompt) shows as a line of its own.
+- **You answer it** (you or a script send a line, or auto-login does): it was a real
+  prompt. When the server next sends something, the prompt's text goes into the output
+  as a line of its own, ahead of the reply. That line is shown and logged but not matched
+  by actions or triggers, since it was already handled as the prompt.
+- A colour code with no text leaves the guess as it is.
+
+A guess can still show briefly as the prompt for a line that was only arriving slowly;
+raise the wait if that happens often. A GA or EOR prompt, once the server sends one, stops
+the guessing for the rest of the connection (the server marks its prompts). Plain `MUD`
+worlds never guess.
 
 ## Keepalive
 
@@ -328,8 +347,9 @@ Clay properly buffers incoming data:
 ### Partial Lines
 
 Lines without trailing newlines (e.g., prompts) are handled specially:
-- Held back until the line completes — or, on a **MUD - Timed Prompt** world, promoted
-  to the prompt once the world's Prompt wait passes with nothing further arriving
+- Held back until the line completes — or, on a **MUD - Timed Prompt** world, also shown
+  as the prompt once the world's Prompt wait passes with nothing further arriving (it
+  stays held for the output, see "Timed Prompts" above)
 - `partial_line` tracks incomplete lines
 - When more data arrives, the line is updated in-place
 - Prevents duplicate lines from TCP read splitting

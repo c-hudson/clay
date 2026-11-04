@@ -173,6 +173,7 @@ pub(super) const MAIN_MENU: &[Option<MenuEntry>] = &[
     Some(("edit-world", "Edit World", "/worlds -e")),
     Some(("actions", "Actions", "/actions")),
     Some(("setup", "Settings", "/setup")),
+    Some(("map", "Map", "/map")),
     Some(("emoji_picker", "Emoji Picker", "")),
     Some(("import-picture", "Import Picture", "")),
     None,
@@ -188,12 +189,13 @@ pub(super) const MAIN_MENU: &[Option<MenuEntry>] = &[
 ];
 
 /// Whether the hamburger shows `action`: Change Password and Logout only on a multiuser
-/// server, Edit World only on a single-user one (multiuser has no world editing), Import
-/// Picture only where the server uploads pictures (as app.js hides them).
+/// server, Edit World and Map only on a single-user one (multiuser has no world editing
+/// and no map), Import Picture only where the server uploads pictures (as app.js hides
+/// them).
 pub(super) fn menu_shows(action: &str, multiuser: bool, picture_upload: bool) -> bool {
     match action {
         "change-password" | "logout" => multiuser,
-        "edit-world" => !multiuser,
+        "edit-world" | "map" => !multiuser,
         "import-picture" => picture_upload,
         _ => true,
     }
@@ -344,6 +346,10 @@ impl ClayView {
                     .child(div().font_weight(FontWeight::BOLD).text_color(name_colour).whitespace_nowrap().child(w.name.clone())),
             );
         }
+        // This pane's More/History, as the status bar shows its own (user request
+        // 2026-11-01). Drawn inside `in_other_pane` for an unfocused top pane, so the scroll
+        // and holds read here are that pane's.
+        row = row.children(self.more_badge("pane-more", cx));
         // TinyFugue's look has no colour of its own: its bar is the output's background.
         let bg = if tinyfugue { hsla(self.palette.bg) } else { self.bar_colour(focused) };
         div()
@@ -360,6 +366,40 @@ impl ClayView {
                 d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _w, cx| this.split_focus_swap(cx)))
             })
             .into_any_element()
+    }
+
+    /// The More (held output) / History (scrolled back) badge for the pane being drawn -
+    /// the status bar's and a split's pane bar's alike. History wins; nothing when the pane
+    /// is at the bottom with nothing held. A click releases a screenful.
+    pub(super) fn more_badge(&self, id: &'static str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (rows_below, at_bottom) = {
+            let s = self.scroll.borrow();
+            (s.rows_below, s.at_bottom())
+        };
+        let world = self.session.core.current_world();
+        let (label, n) = if !at_bottom {
+            ("History", rows_below)
+        } else if (self.more_paused() && self.held_here() > 0) || world.is_some_and(|w| w.pending_count > 0) {
+            ("More", self.pending_total())
+        } else {
+            return None;
+        };
+        Some(
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .flex_shrink_0()
+                .cursor_pointer()
+                .font_family(self.fonts.primary.clone()).line_height(relative(MONO_LH))
+                .text_size(px(11.0))
+                .font_weight(FontWeight::BOLD)
+                .whitespace_nowrap()
+                .child(badge(label, gpui::white(), hsla(MORE_LABEL), (8.0, 6.0), (true, false)))
+                .child(badge(format_count(n), gpui::white(), hsla(MORE_COUNT), (6.0, 8.0), (false, true)))
+                .on_click(cx.listener(|this, _, _w, cx| this.release_screenful(cx)))
+                .into_any_element(),
+        )
     }
 
     /// The status bar (index.html `#status-bar`), with the menus it opens. `focused`: false
@@ -459,35 +499,7 @@ impl ClayView {
             }
 
             // More (held output) or History (scrolled back): click releases a screenful.
-            let (rows_below, at_bottom) = {
-                let s = self.scroll.borrow();
-                (s.rows_below, s.at_bottom())
-            };
-            let pending = self.pending_total();
-            let more = if !at_bottom {
-                Some(("History", rows_below))
-            } else if (self.more_paused() && self.held_here() > 0) || world.is_some_and(|w| w.pending_count > 0) {
-                Some(("More", pending))
-            } else {
-                None
-            };
-            if let Some((label, n)) = more {
-                row = row.child(
-                    div()
-                        .id("status-more")
-                        .flex()
-                        .items_center()
-                        .flex_shrink_0()
-                        .cursor_pointer()
-                        .font_family(mono.clone()).line_height(relative(MONO_LH))
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::BOLD)
-                        .whitespace_nowrap()
-                        .child(badge(label, gpui::white(), hsla(MORE_LABEL), (8.0, 6.0), (true, false)))
-                        .child(badge(format_count(n), gpui::white(), hsla(MORE_COUNT), (6.0, 8.0), (false, true)))
-                        .on_click(cx.listener(|this, _, _w, cx| this.release_screenful(cx))),
-                );
-            }
+            row = row.children(self.more_badge("status-more", cx));
 
             // Activity elsewhere: click goes to the next world.
             if core.activity > 0 {
@@ -605,6 +617,9 @@ impl ClayView {
         let hover = self.chrome.tokens.hover;
         div()
             .id(id)
+            // A button to a screen reader, named by its tooltip (a11y.rs).
+            .role(gpui::accesskit::Role::Button)
+            .aria_label(title)
             .group(id)
             .flex()
             .items_center()
@@ -668,6 +683,8 @@ impl ClayView {
         let (hover, fg) = (t.hover, t.fg);
         let mut item = div()
             .id(id)
+            .role(gpui::accesskit::Role::MenuItem)
+            .aria_label(label.clone())
             .flex()
             .items_center()
             .gap(px(8.0))
@@ -740,6 +757,9 @@ impl ClayView {
             "filter" => self.toggle_filter(window, cx),
             "search" => self.toggle_search(window, cx),
             "import-picture" => self.import_picture_menu(window, cx),
+            "map" => {
+                self.map_pane_command("/map", cx);
+            }
             "logout" => {
                 let fx = self.session.core.logout();
                 let rest = self.session.apply(fx);
@@ -909,7 +929,7 @@ mod tests {
         assert_eq!(
             ids(false, false),
             vec![
-                vec!["help", "world-selector", "edit-world", "actions", "setup", "emoji_picker"],
+                vec!["help", "world-selector", "edit-world", "actions", "setup", "map", "emoji_picker"],
                 vec!["toggle-tags", "filter", "search"],
                 vec!["new-window", "resync"],
             ],
@@ -928,6 +948,6 @@ mod tests {
         let every: Vec<&str> = every_menu_section().into_iter().flatten().map(|e| e.0).collect();
         assert_eq!(every.len(), MAIN_MENU.iter().flatten().count(), "every item, whatever the server");
         let sometimes: Vec<&str> = every.iter().copied().filter(|a| !menu_always_shows(a)).collect();
-        assert_eq!(sometimes, ["edit-world", "import-picture", "change-password", "logout"]);
+        assert_eq!(sometimes, ["edit-world", "map", "import-picture", "change-password", "logout"]);
     }
 }

@@ -136,7 +136,8 @@ Telnet prompts (GA/EOR) are per-world:
 - Cleared when you send a command
 
 On a **MUD - Timed Prompt** world a prompt is also inferred from a line the server leaves
-unfinished for longer than that world's Prompt wait; the wait is a per-world setting.
+unfinished for longer than that world's Prompt wait; the wait is a per-world setting. The
+line stays in the output either way (see [Telnet](14-telnet.md#timed-prompts-mud---timed-prompt-worlds)).
 
 ### Logging
 

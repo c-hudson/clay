@@ -94,6 +94,8 @@ struct Editor {
     msp: bool,
     mcp: bool,
     mccp2: bool,
+    /// The world's Status Panel switch; None from a server before it (no switch shown).
+    status_panel: Option<bool>,
     /// The Gag Text checkbox.
     ka_gag: bool,
     chat: ChatPicker,
@@ -256,6 +258,7 @@ impl WorldsView {
             msp: s.msp_enabled,
             mcp: s.mcp_enabled,
             mccp2: s.mccp2_enabled,
+            status_panel: s.status_panel,
             ka_gag: s.keep_alive_gag_enabled,
             chat: ChatPicker::default(),
             fields,
@@ -334,6 +337,7 @@ impl WorldsView {
             discord_dm_user: t("discord_dm_user"),
             keep_alive_gag_enabled: Some(ed.ka_gag),
             keep_alive_gag: Some(t("keep_alive_gag")),
+            status_panel: ed.status_panel,
             chat: Some(ChatSettingsUpdate {
                 discord_guild: t("discord_guild").trim().to_string(),
                 discord_channel: t("discord_channel").trim().to_string(),
@@ -778,6 +782,9 @@ impl WorldsView {
                 .child(toggle_cell("MSP Sound", "world-msp", ed.msp, |e| e.msp = !e.msp, cx))
                 .child(toggle_cell("MCP Edit", "world-mcp", ed.mcp, |e| e.mcp = !e.mcp, cx))
                 .child(toggle_cell("MCCP2", "world-mccp2", ed.mccp2, |e| e.mccp2 = !e.mccp2, cx));
+            if let Some(on) = ed.status_panel {
+                toggles = toggles.child(toggle_cell("Status Panel", "world-status-panel", on, |e| e.status_panel = e.status_panel.map(|on| !on), cx));
+            }
         }
         options = options.child(toggles);
         let section_title = |s: &'static str| div().text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(t.accent).pt(px(6.0)).pb(px(2.0)).child(s.to_uppercase());

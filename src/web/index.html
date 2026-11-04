@@ -91,25 +91,82 @@
             </div>
         </div>
 
-        <!-- Main output area -->
-        <div id="output-container">
-            <div id="output"></div>
+        <!-- Main output area. #main-row holds the output column between the world tabs
+             when they sit beside it (Tabs: Left/Right; app.js applyTabsMode) and, later,
+             side panes; #output-column holds the output and a /split's other pane
+             (splitPlace inserts beside #output-container, within its parent). -->
+        <div id="main-row">
+            <div id="output-column">
+                <div id="output-container">
+                    <!-- role="log" names the transcript for a screen reader; aria-live is
+                         off because the output is redrawn whole on a switch, a filter or a
+                         font change: new lines are announced once, by #sr-announcer. -->
+                    <div id="output" role="log" aria-live="off" aria-label="Output"></div>
+                </div>
+            </div>
+            <!-- The map (src/map, app.js "Map pane"): beside the output on a desktop or
+                 tablet, a sheet over its lower part on a phone. Drawn from the server's
+                 MapState/MapArea; a room picked asks MapRoute for its route. -->
+            <aside id="map-pane" class="map-pane" aria-label="Map" style="display:none">
+                <div class="map-header">
+                    <div class="map-title">
+                        <span class="map-kicker" id="map-world">Map</span>
+                        <span class="map-area" id="map-area-name"></span>
+                    </div>
+                    <div class="map-levels">
+                        <button type="button" class="map-icon-btn" id="map-level-down" aria-label="Level down">&#9662;</button>
+                        <span id="map-level">Level 0</span>
+                        <button type="button" class="map-icon-btn" id="map-level-up" aria-label="Level up">&#9652;</button>
+                    </div>
+                    <button type="button" class="map-icon-btn" id="map-zoom-out" aria-label="Zoom out">&minus;</button>
+                    <button type="button" class="map-icon-btn" id="map-zoom-in" aria-label="Zoom in">+</button>
+                    <button type="button" class="map-icon-btn" id="map-center" aria-label="Centre on my room">&#9678;</button>
+                    <button type="button" class="map-icon-btn" id="map-close" aria-label="Close map">&#10005;</button>
+                </div>
+                <div class="map-search">
+                    <input id="map-search" type="search" autocomplete="off" placeholder="Find a room by name" aria-label="Find a room">
+                    <div id="map-search-results" class="map-search-results" style="display:none"></div>
+                </div>
+                <div id="map-canvas" class="map-canvas">
+                    <svg id="map-svg" role="img" aria-label="Map"></svg>
+                    <div id="map-empty" class="map-empty"></div>
+                </div>
+                <div class="map-legend" aria-hidden="true">
+                    <span><i class="map-key-you"></i>You</span>
+                    <span><i class="map-key-target"></i>Destination</span>
+                    <span><i class="map-key-route"></i>Route</span>
+                    <span><i class="map-key-stub"></i>Unexplored</span>
+                </div>
+                <section id="map-card" class="map-card" aria-label="Selected room">
+                    <div class="map-card-title"><h2 id="map-card-name"></h2><span id="map-card-id"></span></div>
+                    <div id="map-card-exits" class="map-card-exits"></div>
+                    <div id="map-card-route" class="map-card-route"></div>
+                    <div class="map-card-buttons">
+                        <button type="button" class="btn btn-primary" id="map-walk">Walk here</button>
+                        <button type="button" class="btn btn-danger" id="map-stop">Stop</button>
+                    </div>
+                </section>
+            </aside>
         </div>
 
         <!-- Status/vitals panel (mud-status-display.md Job 3): a flex SIBLING of
              #output-container, never a child of #output. Hidden via inline
              display:none until updateStatsPanel() (app.js) finds the current
-             world's World.stats non-empty (plan D1 - visibility is derived from
-             data, never a setting). Kept out of #output-container specifically so
+             world's World.stats non-empty and neither Status Panel switch is off
+             (statusPanelWanted). Kept out of #output-container specifically so
              it cannot become part of the scrollable transcript; see
              updateStatsPanel()'s doc comment in app.js for how its appearing,
              updating and collapsing are kept from moving the output scroll
-             position. Collapse state is client-side only (localStorage), no
-             server setting. -->
+             position. Collapse state is client-side only (localStorage); hiding
+             it is two server settings, Settings' Status Panel and the world's own
+             (the × here sets the world's, through /stats hide). -->
         <div id="stats-panel" class="stats-panel" style="display:none">
-            <div class="stats-panel-header" id="stats-panel-header" title="Collapse/expand status panel">
-                <span class="stats-panel-title">Status</span>
-                <span class="stats-panel-toggle" id="stats-panel-toggle">&#9662;</span>
+            <div class="stats-panel-top">
+                <div class="stats-panel-header" id="stats-panel-header" title="Collapse/expand status panel">
+                    <span class="stats-panel-title">Status</span>
+                    <span class="stats-panel-toggle" id="stats-panel-toggle">&#9662;</span>
+                </div>
+                <button type="button" class="stats-panel-hide" id="stats-panel-hide" style="display:none">&times;</button>
             </div>
             <div class="stats-panel-body" id="stats-panel-body"></div>
         </div>
@@ -128,10 +185,10 @@
             <textarea id="note-editor-textarea" class="note-editor-textarea" spellcheck="true"></textarea>
         </div>
 
-        <!-- World-tabs ribbon (Tabs setting: none/top/bottom). Hidden by default;
-             lives here in the DOM as its natural "bottom ribbon" position (directly
-             above the status/separator bar) — moved before #output-container by JS
-             for "top ribbon" mode. -->
+        <!-- World tabs (Tabs: top/bottom/left/right/none, per interface). Hidden by
+             default; lives here in the DOM as its natural "bottom" position (directly
+             above the status/separator bar) - moved before #main-row for "top", or into
+             #main-row beside the output column for "left"/"right", by applyTabsMode. -->
         <div id="tabs-ribbon" class="tabs-ribbon">
             <span id="tabs-ribbon-left" class="tabs-ribbon-arrow" title="Scroll left">&#9664;</span>
             <div id="tabs-ribbon-tabs" class="tabs-ribbon-tabs"></div>
@@ -206,7 +263,7 @@
                  %cleardone off; app.js keepSentLine/layoutInputArea). Never on a phone. -->
             <div id="input-sent" aria-hidden="true"></div>
             <span id="prompt"></span>
-            <textarea id="input" autocomplete="off" autocapitalize="off" spellcheck="true" inputmode="text" autofocus rows="1"></textarea>
+            <textarea id="input" autocomplete="off" autocapitalize="off" spellcheck="true" inputmode="text" autofocus rows="1" aria-label="Command" aria-describedby="prompt"></textarea>
             <button id="send-btn">Send</button>
         </div>
 
@@ -217,6 +274,7 @@
             <div class="menu-item menu-edit-world" data-action="edit-world">Edit World<span class="shortcut">/worlds -e</span></div>
             <div class="menu-item" data-action="actions">Actions<span class="shortcut">/actions</span></div>
             <div class="menu-item" data-action="setup">Settings<span class="shortcut">/setup</span></div>
+            <div class="menu-item menu-map" data-action="map">Map<span class="shortcut">/map</span></div>
             <div class="menu-item" data-action="emoji_picker">Emoji Picker</div>
             <div class="menu-item" data-action="import-picture" style="display: none;">Import Picture</div>
             <div class="menu-sep"></div>
@@ -799,6 +857,12 @@
                                         <div id="world-edit-mccp2-enabled-toggle" class="toggle"></div>
                                     </div>
                                 </div>
+                                <div class="setting-row type-gated" id="world-edit-status-panel-field" title="Show the stats this game sends (HP, mana...) for this world, in every interface. /stats lists them either way.">
+                                    <span class="setting-label">Status Panel</span>
+                                    <div class="setting-value">
+                                        <div id="world-edit-status-panel-toggle" class="toggle"></div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                         </div>
@@ -961,6 +1025,24 @@
                                                 </select>
                                             </div>
                                         </div>
+                                        <div class="setting-row" title="For use with a screen reader (NVDA, JAWS, VoiceOver, Orca, TalkBack): new lines are read out as they arrive, Text Reveal is off, and this interface's TTS stays quiet so nothing is read twice. Kept for this interface only.">
+                                            <span class="setting-label" id="setup-screen-reader-label">Screen Reader</span>
+                                            <div class="setting-value">
+                                                <div id="setup-screen-reader-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row" title="Tell MUDs that you use a screen reader (the MTTS screen-reader flag), so a game can send simpler text. One setting for every interface; takes effect at the next connect.">
+                                            <span class="setting-label" id="setup-announce-screen-reader-label">MUDs: Screen Reader</span>
+                                            <div class="setting-value">
+                                                <div id="setup-announce-screen-reader-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row" title="Show the stats a game sends (HP, mana...) in a panel above the bar. Off hides it for every world, in every interface; Edit World has a switch for one world.">
+                                            <span class="setting-label" id="setup-status-panel-label">Status Panel</span>
+                                            <div class="setting-value">
+                                                <div id="setup-status-panel-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
                                         <div class="setting-row" title="Off (TinyFugue's default): lines you send stay in the input area above the next one until they scroll off. On: Enter clears the input. Phones always clear.">
                                             <span class="setting-label">Clear Input on Send</span>
                                             <div class="setting-value">
@@ -1037,13 +1119,15 @@
                                                 <input type="text" id="setup-tts-voice-input" autocomplete="off" class="web-input" placeholder="af_heart">
                                             </div>
                                         </div>
-                                        <div class="setting-row" title="Shows a ribbon of connected-world tabs for quick switching. No effect on the console.">
+                                        <div class="setting-row" title="Where the connected worlds' tabs go: a strip above or below the output, a column beside it, or none. Kept for this interface only. No effect on the console.">
                                             <span class="setting-label">Tabs</span>
                                             <div class="setting-value">
                                                 <select id="setup-tabs-select" class="form-select">
+                                                    <option value="top">Top</option>
+                                                    <option value="bottom">Bottom</option>
+                                                    <option value="left">Left</option>
+                                                    <option value="right">Right</option>
                                                     <option value="none">None</option>
-                                                    <option value="top">Show Top Ribbon</option>
-                                                    <option value="bottom">Show Bottom Ribbon</option>
                                                 </select>
                                             </div>
                                         </div>
@@ -1544,6 +1628,9 @@
         window.SHOW_CONNECTION_WINDOW = '{{SHOW_CONNECTION_WINDOW}}';
         window.CLIENT_VERSION = '{{CLIENT_VERSION}}';
     </script>
+    <!-- Screen Reader mode (app.js announceLine): each new line, as plain text, once, as
+         it is shown. Off the screen, read by screen readers only. -->
+    <div id="sr-announcer" class="sr-only" aria-live="polite" aria-atomic="false"></div>
     <script src="app.js"></script>
 </body>
 </html>

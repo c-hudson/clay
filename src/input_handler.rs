@@ -796,6 +796,18 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
                 app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
+                // Screen Reader mode changes what the console draws (no reveal, no clock).
+                if app.settings.screen_reader != settings.screen_reader {
+                    app.settings.screen_reader = settings.screen_reader;
+                    app.needs_output_redraw = true;
+                }
+                app.settings.announce_screen_reader = settings.announce_screen_reader;
+                crate::telnet::set_announce_screen_reader(settings.announce_screen_reader);
+                // Status Line moves the output's rows.
+                if app.settings.status_panel != settings.status_panel {
+                    app.settings.status_panel = settings.status_panel;
+                    app.needs_output_redraw = true;
+                }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_indicator = crate::NewIndicator::from_name(&settings.new_indicator);
@@ -1128,6 +1140,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd;
                     app.worlds[idx].settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
                     app.worlds[idx].settings.keep_alive_gag = settings.keep_alive_gag;
+                    app.worlds[idx].settings.status_panel = settings.status_panel;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages;
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
                     app.worlds[idx].settings.auto_reconnect_secs = ar_secs;
@@ -1152,6 +1165,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
                     app.add_output(&format!("World '{}' saved.", app.worlds[idx].name));
                     let _ = persistence::save_settings(app);
+                    // The GUIs' copies too (their status panel follows the world's switch).
+                    app.broadcast_world_settings(idx);
                 }
             }
             NewPopupAction::WorldEditorDelete(idx) => {
@@ -1299,6 +1314,12 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     if app.search_popup.visible {
         handle_search_popup_key(app, key);
         return KeyAction::None;
+    }
+
+    // A walk (src/map) stops on a bare Escape; the key goes on to do what it always does
+    // (TF's meta key), so Esc-w still switches worlds.
+    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        app.console_esc_stops_walk();
     }
 
     // A live shell world (src/shell) captures the keyboard: only the ten world-switch
@@ -1706,7 +1727,7 @@ pub(crate) fn perform_completion(app: &mut App) -> bool {
                 // Clay-specific commands
                 "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections", "/server",
                 "/setup", "/web", "/actions", "/reload", "/update", "/quit", "/gag",
-                "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify", "/split", "/unsplit",
+                "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify", "/split", "/unsplit", "/map", "/pause",
                 // TF commands (now available with / prefix)
                 "/set", "/unset", "/let", "/echo", "/send", "/beep", "/quote",
                 "/expr", "/test", "/eval", "/if", "/elseif", "/else", "/endif",

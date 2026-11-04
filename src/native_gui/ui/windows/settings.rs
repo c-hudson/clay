@@ -223,7 +223,14 @@ impl SettingsView {
             theme: Pick::new(&crate::theme::BUILTIN_THEMES, &edit.gui_theme, window, cx),
             tts: Pick::new(&crate::tts::TtsMode::OPTIONS, tts.mode.name(), window, cx),
             speak: Pick::new(&[("all", "All"), ("limit", "Limit")], tts.speak_mode.name(), window, cx),
-            tabs: Pick::new(&[("none", "None"), ("top", "Show Top Ribbon"), ("bottom", "Show Bottom Ribbon")], &edit.tabs, window, cx),
+            // This window's own tab location (user ruling 2026-11-01); a server before the
+            // per-interface split keeps only None/Top/Bottom, so only those are offered there.
+            tabs: Pick::new(
+                if edit.tabs_profiles.is_some() { crate::TabsMode::OPTIONS } else { &[("top", "Top"), ("bottom", "Bottom"), ("none", "None")] },
+                &edit.tabs_for(crate::font_profile::native_key()),
+                window,
+                cx,
+            ),
             icon_bar: Pick::new(&[("none", "None"), ("app_tablet", "App/Tablet"), ("all", "All")], &edit.icon_bar, window, cx),
             picture_host: Pick::new(crate::picture::PictureService::OPTIONS, &edit.picture_host, window, cx),
             separator: Pick::new(crate::SeparatorStyle::OPTIONS, if edit.separator_style.is_empty() { "web" } else { edit.separator_style.as_str() }, window, cx),
@@ -416,7 +423,7 @@ impl SettingsView {
         // This GUI's own text-to-speech (each interface keeps its own).
         let tts = crate::tts::TtsProfile::from_names(&self.tts.value(cx), &self.speak.value(cx), &self.text(&self.fields.voice, cx));
         s.set_tts_for(crate::font_profile::native_key(), &tts);
-        s.tabs = self.tabs.value(cx);
+        s.set_tabs_for(crate::font_profile::native_key(), &self.tabs.value(cx));
         s.icon_bar = self.icon_bar.value(cx);
         s.picture_host = self.picture_host.value(cx);
         s.separator_style = self.separator.value(cx);
@@ -557,6 +564,21 @@ impl SettingsView {
             switches.push(("Log Input", e.log_input_enabled, |s| s.log_input_enabled = !s.log_input_enabled));
         }
         switches.push(("ANSI Music", e.ansi_music_enabled, |s| s.ansi_music_enabled = !s.ansi_music_enabled));
+        // Screen readers (docs/markdown/24-accessibility.md): this GUI's own mode, and the
+        // one global "MUDs: Screen Reader"; a server from before the mode keeps neither.
+        if e.screen_reader_profiles.is_some() {
+            switches.push(("Screen Reader", e.screen_reader_for(crate::font_profile::native_key()), |s| {
+                let key = crate::font_profile::native_key();
+                let on = s.screen_reader_for(key);
+                s.set_screen_reader_for(key, !on);
+            }));
+            switches.push(("MUDs: Screen Reader", e.announce_screen_reader, |s| s.announce_screen_reader = !s.announce_screen_reader));
+        }
+        // The MUD's status display at all, one setting for the instance (each world has its
+        // own in Edit World); a server from before it has none.
+        if let Some(on) = e.status_panel {
+            switches.push(("Status Panel", on, |s| s.status_panel = s.status_panel.map(|on| !on)));
+        }
         let left = div().flex_none().flex().flex_col().children(switches.into_iter().map(|(label, on, flip)| {
             row(k, label, k.toggle(label, on, cx.listener(move |this, _, _w, cx| {
                 flip(&mut this.edit);

@@ -264,7 +264,6 @@ pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> 
                 | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP | TELNET_OPT_MSP => None,
                 _ => None,
             },
-            TelnetEvent::WontEchoPromptHint => forward_via_telnet(target, TelnetEvent::WontEchoPromptHint),
             TelnetEvent::EchoOff => forward_via_telnet(target, TelnetEvent::EchoOff),
             TelnetEvent::EchoOn => forward_via_telnet(target, TelnetEvent::EchoOn),
             TelnetEvent::MspTrigger(trigger) => forward_via_telnet(target, TelnetEvent::MspTrigger(trigger)),
@@ -314,7 +313,6 @@ pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> 
                 | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP | TELNET_OPT_MSP => None,
                 _ => None,
             },
-            TelnetEvent::WontEchoPromptHint => forward_via_telnet(target, TelnetEvent::WontEchoPromptHint),
             TelnetEvent::EchoOff => forward_via_telnet(target, TelnetEvent::EchoOff),
             TelnetEvent::EchoOn => forward_via_telnet(target, TelnetEvent::EchoOn),
             // MspTrigger still forwards (the handler, not the reader, must own the
@@ -728,12 +726,6 @@ mod tests {
         ] {
             assert!(to_app_event(&t, TelnetEvent::OptionDisabled(opt)).is_none());
         }
-        // WontEchoPromptHint drives World::uses_wont_echo_prompt via
-        // App::handle_telnet_event's WontEchoPromptHint arm.
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::WontEchoPromptHint),
-            Some(AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::WontEchoPromptHint)) if n == "w"
-        ));
     }
 
     /// Job 9 (T3.2): rewritten from a "drops everything" table into a "forwards
@@ -833,10 +825,6 @@ mod tests {
         ] {
             assert!(to_app_event(&t, TelnetEvent::OptionDisabled(opt)).is_none());
         }
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::WontEchoPromptHint),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::WontEchoPromptHint))
-        ));
         assert!(matches!(
             to_app_event(&t, TelnetEvent::EchoOff),
             Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::EchoOff))
@@ -1018,23 +1006,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wont_echo_emits_wont_echo_seen() {
+    async fn wont_echo_emits_echo_on_and_no_prompt() {
         let mut h = Harness::spawn(TelnetTarget::World("myworld".to_string()));
         let mut data = b"Login: ".to_vec();
         data.extend_from_slice(&[TELNET_IAC, TELNET_WONT, TELNET_OPT_ECHO]);
         h.send(&data).await;
 
         // Job 10b (plan Phase 3, step 3.4, finding 7): WONT ECHO now gets a real `IAC
-        // DONT ECHO` reply and an EchoOn event, in addition to (not instead of) the
-        // pre-existing WontEchoPromptHint - the comment below predates that job.
+        // DONT ECHO` reply and an EchoOn event.
         assert!(matches!(h.next_event().await, AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::TelnetDetected) if n == "myworld"));
-        assert!(matches!(h.next_event().await, AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::WontEchoPromptHint) if n == "myworld"));
         assert!(matches!(h.next_event().await, AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::EchoOn) if n == "myworld"));
-        // The trailing partial line is extracted as a prompt, same as the
-        // GA/EOR case.
+        // The line in front of it is not a prompt (only GA/EOR mark one): it is text,
+        // released by the idle flush.
         assert!(matches!(
             h.next_event().await,
-            AppEvent::Prompt(n, b) if n == "myworld" && b == b"Login: ".to_vec()
+            AppEvent::ServerData(n, b) if n == "myworld" && b == b"Login: ".to_vec()
         ));
     }
 

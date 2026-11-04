@@ -82,8 +82,11 @@ web page and the Android app.
   X` switches the focused pane, Page Up scrolls it. Move it with **Shift+Tab** in every
   interface, or, in the GUI, the web page and the Android app, by clicking (tapping) the
   other pane, as long as the click doesn't select text or follow a link.
-- **The bars.** The bar between the panes belongs to the top pane and shows only its world's
-  name and connection ball. The usual bar under the bottom pane belongs to the bottom one,
+- **The bars.** The bar between the panes belongs to the top pane and shows its world's
+  name and connection ball, and its own `More` or `Hist` count, just as the bottom bar
+  does for its pane: `More` while the top world is paused with lines held, `Hist` while
+  the top pane is scrolled back. Clicking that count in the GUI or the web page releases a
+  screenful of the top pane. The usual bar under the bottom pane belongs to the bottom one,
   with everything it always shows; its activity count leaves out both worlds on screen. The
   focused pane's bar keeps the bar colour, the other one turns grey.
 - **Both panes stay live.** Each takes its world's output under the usual rules: more-mode
@@ -105,11 +108,16 @@ Above the separator bar, Clay can show a single line summarizing the current wor
 WebView GUI, and the Android app show it as a collapsible panel instead (see the **Web
 Interface** chapter).
 
-- **Appears and disappears with data, never with a setting.** There is nothing to turn this
-  on or off: the line appears the moment the world's first stat arrives and disappears again
-  on disconnect. A world that never sends anything relevant — most MOO and MUSH servers,
-  which generally implement neither GMCP `Char.*` nor MSDP — simply never shows a status
-  line. That is correct behavior, not a fault.
+- **Appears with data.** The line appears the moment the world's first stat arrives and
+  disappears again on disconnect. A world that never sends anything relevant — most MOO and
+  MUSH servers, which generally implement neither GMCP `Char.*` nor MSDP — simply never shows
+  a status line. That is correct behavior, not a fault.
+- **Two switches hide it.** **Status Line** in `/setup` (Status Panel in the GUIs' and the
+  web page's Settings) hides it for every world, in every interface. **Status Line** in a
+  world's editor (Status Panel in the GUIs' Edit World) hides it for that world, in every
+  interface; `/stats hide` and `/stats show` set the same switch for the current world, and
+  so does the × on the GUIs' panel. It shows only while both are on, and `/stats` lists the
+  data either way.
 - **Fixed height once shown.** The line goes from 0 to 1 row exactly once per connection and
   stays 1 row for the rest of it, even as individual fields come and go — a MUD dropping or
   adding a stat mid-session never resizes the output area or disturbs scroll position.

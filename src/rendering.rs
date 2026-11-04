@@ -296,7 +296,8 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             world.stats_line_shown = true;
         }
     }
-    let stats_line_height: u16 = if app.worlds[bottom_world].stats_line_shown { 1 } else { 0 };
+    // Status Panel off (Settings or the world's own) takes the row away; the latch stays.
+    let stats_line_height: u16 = app.status_line_rows(bottom_world);
 
     // Layout: output area, status line (0 or 1), separator bar (1 line - or TF's status
     // area, when a script has it), input area
@@ -308,7 +309,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     // row) and the bottom pane, the bottom one taking any odd row. `output_height` is the
     // focused pane's rows from here on: paging, more-mode and the rest act on the focused
     // pane, as they act on the current world.
-    let area_rows = output_height.max(1);
+    // The map pane (`/map`, src/map) takes the top rows of the output area, its bar under
+    // them; the panes below share what is left. Its height depends only on the area's
+    // (never on the map's contents), so a room arriving never resizes the output.
+    let map_block = app.console_map_block(output_height);
+    let area_rows = output_height.saturating_sub(map_block).max(1);
     let pane_rows = match app.split {
         Some(_) => {
             let top = (area_rows.saturating_sub(1) / 2).max(1);
@@ -326,10 +331,14 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let new_output_height = focused_rows.max(1);
     let new_output_width = f.size().width.max(1);
     // Mark output for redraw if dimensions changed (terminal resize, a split)
+    let whole_output = output_height.max(1);
     let dimensions_changed = new_output_height != app.output_height || new_output_width != app.output_width
-        || pane_rows != app.pane_rows || area_rows != app.output_area_rows;
+        || pane_rows != app.pane_rows || whole_output != app.output_area_rows || map_block != app.map_rows;
     app.pane_rows = pane_rows;
-    app.output_area_rows = area_rows;
+    // The whole output area (the map pane's rows included): what the status line, the
+    // separator bar and the input are placed below.
+    app.output_area_rows = whole_output;
+    app.map_rows = map_block;
     if dimensions_changed {
         app.needs_output_redraw = true;
         // Width/height change invalidates visual_line_offset (wrap counts differ);
@@ -369,6 +378,10 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         .split(f.size());
 
     let output_area = chunks[0];
+    // The map pane's rows at its top; the panes carry their own place below them
+    // (`console_panes`), the split editor is laid out in what is left.
+    let map_area = Rect { height: map_block.min(output_area.height), ..output_area };
+    let below_map = Rect { y: output_area.y + map_area.height, height: output_area.height - map_area.height, ..output_area };
     let stats_line_area = chunks[1];
     let separator_area = chunks[2];
     let input_area = chunks[3];
@@ -386,8 +399,13 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     }
     app.output_painted_by_crossterm = crossterm_paints;
 
+    if map_area.height > 0 {
+        render_map_pane(f, app, map_area);
+    }
+
     // Check if editor is visible - split the output area if so
     if app.editor.visible {
+        let output_area = below_map;
         // Split output area horizontally into editor and world output
         let half_width = output_area.width / 2;
         let (editor_area, world_area) = match app.settings.editor_side {
@@ -436,7 +454,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             render_output_area(f, app, area, pane.world, pane.live_end);
         }
         if let Some(split) = app.split {
-            let bar = Rect { x: output_area.x, y: output_area.y + pane_rows.0, width: output_area.width, height: 1 };
+            let bar = Rect { x: output_area.x, y: output_area.y + app.map_rows + pane_rows.0, width: output_area.width, height: 1 };
             if bar.y < output_area.bottom() {
                 render_pane_bar(f, app, bar, split.worlds(app.current_world_index).0, split.focus_top);
             }
@@ -1150,11 +1168,11 @@ pub(crate) fn console_panes(app: &App) -> Vec<ConsolePane> {
             let (top, bottom) = split.worlds(current);
             let twice = split.other == current;
             vec![
-                ConsolePane { world: top, y: 0, rows: top_rows.max(1), focused: split.focus_top, live_end: twice && !split.focus_top },
-                ConsolePane { world: bottom, y: top_rows + 1, rows: bottom_rows.max(1), focused: !split.focus_top, live_end: twice && split.focus_top },
+                ConsolePane { world: top, y: app.map_rows, rows: top_rows.max(1), focused: split.focus_top, live_end: twice && !split.focus_top },
+                ConsolePane { world: bottom, y: app.map_rows + top_rows + 1, rows: bottom_rows.max(1), focused: !split.focus_top, live_end: twice && split.focus_top },
             ]
         }
-        None => vec![ConsolePane { world: current, y: 0, rows: app.output_height.max(1), focused: true, live_end: false }],
+        None => vec![ConsolePane { world: current, y: app.map_rows, rows: app.output_height.max(1), focused: true, live_end: false }],
     }
 }
 
@@ -1258,7 +1276,7 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
     // The text-reveal effect: applied to the wrapped row strings only, inside
     // compose_pane, after the wrap and before anything counts or prints them. It never
     // changes a row's width or a line's row count, so paging is untouched.
-    let reveal = match app.settings.text_reveal.chars_per_second() {
+    let reveal = match app.settings.console_text_reveal().chars_per_second() {
         cps if cps > 0.0 => Some(crate::reveal::Reveal::for_console(cps, app.settings.theme)),
         _ => None,
     };
@@ -1378,8 +1396,9 @@ pub(crate) fn render_output_crossterm(app: &App) -> Option<std::time::Duration> 
     // round included) as long as something marks `needs_output_redraw` when stats
     // change — see `App::handle_gmcp_received`/`handle_msdp_received`.
     // The bottom pane's world's, under the whole output area (both panes while split).
-    let bottom = &app.worlds[console_bottom_world(app)];
-    if bottom.stats_line_shown {
+    let bottom_idx = console_bottom_world(app);
+    if app.status_line_rows(bottom_idx) > 0 {
+        let bottom = &app.worlds[bottom_idx];
         let stats_row_y = app.output_area_rows;
         let entries = bottom.current_stat_entries();
         let text = build_stats_line_text(&entries, term_width).unwrap_or_default();
@@ -1470,7 +1489,7 @@ fn compose_pane(app: &App, pane: ConsolePane, reveal: Option<&crate::reveal::Rev
     let world = &app.worlds[pane.world];
     let visible_height = (pane.rows as usize).max(1);
     let term_width = (app.output_width as usize).max(1);
-    let reveal_new_only = app.settings.text_reveal.new_only();
+    let reveal_new_only = app.settings.console_text_reveal().new_only();
     let reveal_now = std::time::SystemTime::now();
     let mut frame: Option<std::time::Duration> = None;
 
@@ -1723,7 +1742,7 @@ fn queue_input_cursor(app: &App, stdout: &mut std::io::Stdout) {
     // crossterm pass runs after it).
     // The output area is both panes and the bar between them while split
     // (`output_area_rows`), and the status line is the bottom pane's world's.
-    let stats_line_height: u16 = if app.worlds[console_bottom_world(app)].stats_line_shown { 1 } else { 0 };
+    let stats_line_height: u16 = app.status_line_rows(console_bottom_world(app));
     let input_area_y = app.output_area_rows + stats_line_height + app.separator_rows();
     let input_area_width = term_width.max(1);
     let (sent_rows, live_height) = input_rows_split(app);
@@ -1767,6 +1786,11 @@ fn queue_input_cursor(app: &App, stdout: &mut std::io::Stdout) {
         let cursor_y = input_area_y + (sent_rows + viewport_line) as u16;
         let max_y = input_area_y + app.input_height - 1;
         let _ = stdout.queue(cursor::MoveTo(cursor_x, cursor_y.min(max_y)));
+    } else {
+        // The cursor's line is outside the input's viewport (the next key scrolls to it):
+        // still leave the cursor in the input area, never where the last print ended - a
+        // screen reader reads from where the cursor is.
+        let _ = stdout.queue(cursor::MoveTo(0, input_area_y + sent_rows as u16));
     }
 }
 
@@ -2605,17 +2629,75 @@ fn connection_ball(world: &World, theme: crate::Theme) -> Span<'static> {
 /// The bar between a split's two panes (`/split`): the top pane's world - its connection
 /// ball and its name, nothing else (user request 2026-10-30) - lined up with the full bar
 /// below, in the current Separator Style, grey when the top pane hasn't the focus.
+/// Width of a bar's More/Hist indicator: "More XXXX" / "Hist XXXX".
+const STATUS_INDICATOR_LEN: usize = 9;
+
+/// A bar's More/Hist indicator for one world, as the bar shows it: `Hist N` while the
+/// world is scrolled back (it wins), `More N` while it holds lines (or rows hidden below
+/// the screen), else the bar's fill. The main bar asks it for its pane's world, a split's
+/// pane bar for the top pane's, so both read the same. A shell world has no scrollback and
+/// holds nothing: its screen is always "the whole thing, now".
+pub(crate) fn status_indicator(app: &App, world_index: usize) -> (String, bool) {
+    let fill = || app.settings.separator_style.fill_char().to_string().repeat(STATUS_INDICATOR_LEN);
+    let Some(world) = app.worlds.get(world_index) else { return (fill(), false) };
+    if world.settings.world_type.is_shell() {
+        return (fill(), false);
+    }
+    if !world.is_at_bottom() {
+        return (format!("Hist {}", format_more_count(world.lines_from_bottom(app.show_tags))), true);
+    }
+    let metrics = if world_index == app.current_world_index {
+        RowMetrics::for_console(app)
+    } else {
+        RowMetrics::new(&app.settings, app.show_tags, (app.output_width as usize).max(1))
+    };
+    match more_indicator_count(world, &metrics) {
+        Some(count) => (format!("More {}", format_more_count(count)), true),
+        None => (fill(), false),
+    }
+}
+
+/// The indicator's colours: black on red while it says something, the bar's dim fill when not.
+fn status_indicator_style(theme: crate::Theme, active: bool) -> Style {
+    if active {
+        Style::default().fg(theme.button_selected_fg()).bg(theme.fg_error())
+    } else {
+        Style::default().fg(theme.fg_dim())
+    }
+}
+
+/// The map pane (`/map`, src/map): the map's rows, then its bar - "Map · area · level ·
+/// rooms" and the walk going on - on the bar's colour.
+fn render_map_pane(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.settings.theme;
+    let rows = area.height.saturating_sub(1);
+    let (lines, bar) = app.console_map_lines(area.width as usize, rows as usize);
+    let base = Style::default().fg(theme.fg());
+    let text: Vec<Line> = lines.iter().take(rows as usize).map(|l| ansi_line(l, base)).collect();
+    f.render_widget(ratatui::widgets::Clear, Rect { height: rows, ..area });
+    f.render_widget(Paragraph::new(text), Rect { height: rows, ..area });
+    let bar_area = Rect { y: area.y + rows, height: 1, ..area };
+    let fill = app.settings.separator_style.fill_char().to_string();
+    let text = format!("{fill}{fill} {bar} ");
+    let width = crate::input::display_width(&text);
+    let line = Line::from(vec![
+        Span::styled(text, Style::default().fg(theme.fg())),
+        Span::styled(fill.repeat((area.width as usize).saturating_sub(width)), Style::default().fg(theme.fg_dim())),
+    ]);
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(bar_background(app, true))), bar_area);
+}
+
 pub(crate) fn render_pane_bar(f: &mut Frame, app: &App, area: Rect, world_index: usize, focused: bool) {
     let Some(world) = app.worlds.get(world_index) else { return };
     let theme = app.settings.theme;
     let sep_style = app.settings.separator_style;
     let fill = sep_style.fill_char().to_string();
-    // The full bar's 9-column More/Hist indicator comes first there: the ball goes under
-    // the same column here.
-    const STATUS_INDICATOR_LEN: usize = 9;
+    // The full bar's 9-column More/Hist indicator, for this pane's world: Hist while it is
+    // scrolled back, More while it holds lines (user request 2026-11-01).
+    let (status_str, status_active) = status_indicator(app, world_index);
     let name_width = crate::input::display_width(&world.name);
     let mut spans = vec![
-        Span::styled(fill.repeat(STATUS_INDICATOR_LEN), Style::default().fg(theme.fg_dim())),
+        Span::styled(status_str, status_indicator_style(theme, status_active)),
         connection_ball(world, theme),
         Span::styled(world.name.clone(), Style::default().fg(theme.fg())),
     ];
@@ -2650,36 +2732,17 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Build bar components
     // Clay's 12-hour clock, or TF's %clock_format once a script has set one.
-    let time_str = if app.settings.clock_format.is_empty() {
+    // None in Screen Reader mode: a clock that changes every minute repaints the bar, and
+    // a terminal screen reader reads the change out.
+    let time_str = if app.settings.screen_reader {
+        String::new()
+    } else if app.settings.clock_format.is_empty() {
         get_current_time_12hr()
     } else {
         crate::util::format_clock(&app.settings.clock_format)
     };
 
-    // Status indicator - always reserve space for "More XXXX" or "Hist XXXX" (9 chars)
-    // Priority: Hist (when scrolled back) > More (when paused) > underscores
-    const STATUS_INDICATOR_LEN: usize = 9;
-    // A shell world (src/shell) has no scrollback and no pending output, so it never shows
-    // a Hist/More indicator - its screen is always "the whole thing, now".
-    let is_shell = world.settings.world_type.is_shell();
-    let metrics = if world_index == app.current_world_index {
-        RowMetrics::for_console(app)
-    } else {
-        RowMetrics::new(&app.settings, app.show_tags, (app.output_width as usize).max(1))
-    };
-    let more = if is_shell { None } else { more_indicator_count(world, &metrics) };
-    let (status_str, status_active) = if !is_shell && !world.is_at_bottom() {
-        // Show History indicator when scrolled back (takes precedence over More)
-        let lines_back = world.lines_from_bottom(app.show_tags);
-        (format!("Hist {}", format_more_count(lines_back)), true)
-    } else if let Some(count) = more {
-        // Show More indicator when paused with pending lines, or when
-        // visual_line_offset truncation is hiding rows of the current world
-        (format!("More {}", format_more_count(count)), true)
-    } else {
-        // Fill when nothing to show
-        (fill_str(STATUS_INDICATOR_LEN), false)
-    };
+    let (status_str, status_active) = status_indicator(app, world_index);
 
     // World name
     let world_display = world.name.clone();
@@ -2741,14 +2804,7 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
 
     // Status indicator on the left (black on red if active, dim underscores if not)
-    spans.push(Span::styled(
-        status_str.clone(),
-        if status_active {
-            Style::default().fg(theme.button_selected_fg()).bg(theme.fg_error())
-        } else {
-            Style::default().fg(theme.fg_dim())
-        },
-    ));
+    spans.push(Span::styled(status_str.clone(), status_indicator_style(theme, status_active)));
 
     // Only show connection ball, world name, and tag indicator if world has ever connected
     // Use world.was_connected flag (set to true on first connection)

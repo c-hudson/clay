@@ -213,7 +213,7 @@ No GUI features needed — the standard build in the **Installation** chapter wo
 
 ```bash
 cargo build --target x86_64-unknown-linux-musl \
-    --no-default-features --features rustls-backend,ssh-transport
+    --no-default-features --features ssh-transport
 ```
 
 ## Example Setup

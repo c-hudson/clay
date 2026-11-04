@@ -572,6 +572,10 @@ per-key/per-command ruling tables this was decided from.
   yank), the F-keys (help/tags/filter/history-search/highlights/GMCP
   media), `Shift-Up/Down` (cycle all worlds) and `Alt-Up/Down` (resize
   input) are Clay-only additions with no TF equivalent.
+- **`%lp`**: as in TF, while it is on, a line the world leaves unfinished becomes the
+  prompt after `%prompt_wait`, on every MUD world. Unlike TF, the line also stays in the
+  output (see [Telnet](14-telnet.md#timed-prompts-mud---timed-prompt-worlds)). For one
+  world, set its type to **MUD - Timed Prompt** instead (`/addworld -T lp` does).
 - **Commands**: `/recall -D` (also searches the long-term scrollback
   archive), `/world -e` (open the world editor), `/watchdog -w<world>`
   (spam detection), the `/connections` table, `/trigger -d` (delete

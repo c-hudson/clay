@@ -25,6 +25,15 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 ```
 
+### The build script
+
+`./build.sh` builds a release binary with whatever this machine supports. It adds the
+native GUI (`native-gui`) where GPUI's libraries and a Rust 1.98 toolchain are found, and
+the WebView GUI (`webview-gui`) only where the native one can't be built - Termux, a
+machine without those libraries, or a native build that fails - so a desktop build
+carries one GUI, not two. Audio and the SSH transport come along where they can, and a
+Linux machine with none of the GUI or audio libraries gets the static musl build below.
+
 ### Linux (Recommended: musl build)
 
 The musl build produces a fully static binary that works on any Linux system regardless of glibc version:
@@ -35,7 +44,7 @@ rustup target add x86_64-unknown-linux-musl
 
 # Build
 cargo build --target x86_64-unknown-linux-musl \
-    --no-default-features --features rustls-backend,ssh-transport
+    --no-default-features --features ssh-transport
 
 # Binary location
 ./target/x86_64-unknown-linux-musl/debug/clay
@@ -47,10 +56,10 @@ cargo build --target x86_64-unknown-linux-musl \
 - glibc's NSS requires dynamic loading even in static builds
 - musl handles DNS resolution properly in fully static binaries
 
-**Why rustls instead of native-tls?**
-
-- native-tls requires OpenSSL, which needs cross-compilation setup for musl
-- rustls is pure Rust and works seamlessly with musl builds
+**TLS is rustls, always.** It is pure Rust, so it needs no OpenSSL and builds the same
+on every platform, and Clay pins certificates itself (trust on first use) rather than
+asking the operating system's trust store. `rustls-backend` is still accepted as a
+feature name, doing nothing, so older build commands keep working.
 
 ### Linux with WebView GUI
 
@@ -71,7 +80,7 @@ macOS builds use the native toolchain (no musl needed):
 
 ```bash
 # Terminal client only
-cargo build --no-default-features --features rustls-backend,ssh-transport
+cargo build --no-default-features --features ssh-transport
 
 # With WebView GUI (audio included by default, no extra deps)
 cargo build --features webview-gui
@@ -90,7 +99,7 @@ ships a universal binary combining both via `lipo`.
 pkg install rust
 
 # Build TUI only (no GUI dependencies)
-cargo build --no-default-features --features rustls-backend,ssh-transport
+cargo build --no-default-features --features ssh-transport
 
 # Binary location
 ./target/debug/clay
@@ -124,8 +133,7 @@ cargo build --release --features webview-gui
 
 | Feature | Description |
 |---------|-------------|
-| `rustls-backend` | Use rustls for TLS (recommended for musl) |
-| `native-tls-backend` | Use native TLS (requires OpenSSL) |
+| `rustls-backend` | Accepted and ignored: TLS is always rustls now |
 | `native-gui` | Build the native GUI (GPUI; needs Rust 1.98 or newer and a display; `--gui`) |
 | `webview-gui` | Build the WebView GUI client (requires display; `--web-gui`, and `--gui` in a build without `native-gui`) |
 | `native-audio` | ANSI music / MSP sound playback via rodio (on by default) |

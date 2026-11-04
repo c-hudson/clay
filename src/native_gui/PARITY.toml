@@ -399,7 +399,7 @@ section = "status"
 phase = 2
 status = "done"
 feature = "handle StatsUpdate"
-note = "stats panel"
+note = "stats panel; hidden while Settings' or the world's Status Panel is off (GlobalSettingsMsg/WorldSettingsMsg.status_panel), its × sends /stats hide"
 
 [[item]]
 id = "msg:TfStatus"
@@ -2537,7 +2537,7 @@ section = "status"
 phase = 2
 status = "done"
 feature = "hamburger menu (dropdown upward); items open their features as those land"
-note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings, Emoji Picker (not on a phone or tablet), Import Picture (when the server uploads pictures) | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab; Notes, Notes List and Recent Worlds left it 2026-10-17: /note, the status bar's note icon, /note -l, and the recent_worlds key action)"
+note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings, Map (not on a multiuser server), Emoji Picker (not on a phone or tablet), Import Picture (when the server uploads pictures) | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab; Notes, Notes List and Recent Worlds left it 2026-10-17: /note, the status bar's note icon, /note -l, and the recent_worlds key action)"
 
 [[item]]
 id = "ui:status.world"
@@ -2648,7 +2648,7 @@ id = "ui:status.tabs"
 section = "status"
 phase = 2
 status = "done"
-feature = "tabs ribbon of connected worlds (tabs = top/bottom), overflow arrows"
+feature = "world tabs (Tabs: top/bottom strip, left/right column, per interface), overflow arrows on the strip"
 note = ""
 
 [[item]]
@@ -3330,3 +3330,107 @@ phase = 4
 status = "see"
 feature = "wire PictureUploaded"
 note = "handled: see msg:PictureUploaded"
+
+[[item]]
+id = "wire:MapState"
+section = "wire"
+phase = 0
+status = "see"
+feature = "wire MapState"
+note = "handled: see msg:MapState"
+
+[[item]]
+id = "wire:MapArea"
+section = "wire"
+phase = 0
+status = "see"
+feature = "wire MapArea"
+note = "handled: see msg:MapArea"
+
+[[item]]
+id = "wire:MapRouteResult"
+section = "wire"
+phase = 0
+status = "see"
+feature = "wire MapRouteResult"
+note = "handled: see msg:MapRouteResult"
+
+[[item]]
+id = "wire:MapSearchResult"
+section = "wire"
+phase = 0
+status = "see"
+feature = "wire MapSearchResult"
+note = "handled: see msg:MapSearchResult"
+
+[[item]]
+id = "wire:MapWatch"
+section = "wire"
+phase = 0
+status = "done"
+feature = "wire MapWatch"
+note = "the map pane's view (ui/map.rs), kept by the core (`map_watch`) and sent again after every InitialState when the server says map; a /window has no map pane"
+
+[[item]]
+id = "wire:MapRoute"
+section = "wire"
+phase = 0
+status = "done"
+feature = "wire MapRoute"
+note = "a room clicked on the map (route) or Walk here (walk)"
+
+[[item]]
+id = "wire:MapStop"
+section = "wire"
+phase = 0
+status = "done"
+feature = "wire MapStop"
+note = "Stop on the map's card, or Esc while walking"
+
+[[item]]
+id = "wire:MapSearch"
+section = "wire"
+phase = 0
+status = "done"
+feature = "wire MapSearch"
+note = "the map pane's room search"
+
+[[item]]
+id = "ui:map-pane"
+section = "navigation"
+phase = 0
+status = "done"
+feature = "map pane beside the output (src/map): rooms, route, Walk here / Stop, search, levels, zoom"
+note = "ui/map.rs: the main window's, between the output and a right tab column; Map in the hamburger (not multiuser); /map's pane forms local; Esc stops a walk"
+
+[[item]]
+id = "msg:MapState"
+section = "navigation"
+phase = 0
+status = "done"
+feature = "handle MapState"
+note = "the map pane's place, walk and card (src/map)"
+
+[[item]]
+id = "msg:MapArea"
+section = "navigation"
+phase = 0
+status = "done"
+feature = "handle MapArea"
+note = "the map pane's rooms, whole or changed"
+
+[[item]]
+id = "msg:MapRouteResult"
+section = "navigation"
+phase = 0
+status = "done"
+feature = "handle MapRouteResult"
+note = "a picked room's route on the map's card"
+
+[[item]]
+id = "msg:MapSearchResult"
+section = "navigation"
+phase = 0
+status = "done"
+feature = "handle MapSearchResult"
+note = "the map pane's search results"

@@ -91,7 +91,6 @@ pub(crate) async fn run_grep_client(
 
     let host_port_key = remote.host_port.clone();
 
-    #[cfg(feature = "rustls-backend")]
     let connect_result = if ws_url.starts_with("wss://") {
         let tls_config = rustls::ClientConfig::builder()
             .dangerous()
@@ -108,9 +107,6 @@ pub(crate) async fn run_grep_client(
         connect_async(&ws_url).await
     };
 
-    #[cfg(not(feature = "rustls-backend"))]
-    let connect_result = connect_async(&ws_url).await;
-
     let (ws_stream, _) = match connect_result {
         Ok(result) => result,
         Err(_) if try_fallback => {
@@ -124,7 +120,6 @@ pub(crate) async fn run_grep_client(
             }
         }
         Err(e) => {
-            #[cfg(feature = "rustls-backend")]
             if let Some(mismatch) = platform::danger::take_cert_mismatch() {
                 eprintln!(
                     "TLS certificate for {} has changed! Was {}, now {}.",
@@ -510,10 +505,7 @@ pub(crate) async fn run_import_client(
     let ws_url = remote.url("wss");
 
     let ws_stream = {
-        #[cfg(feature = "rustls-backend")]
         let attempt = tokio::time::timeout(IMPORT_NET_TIMEOUT, connect_wss(&ws_url, &host_port_key)).await;
-        #[cfg(not(feature = "rustls-backend"))]
-        let attempt = tokio::time::timeout(IMPORT_NET_TIMEOUT, connect_async(&ws_url)).await;
 
         match attempt {
             Ok(Ok((stream, _))) => stream,
@@ -521,7 +513,6 @@ pub(crate) async fn run_import_client(
                 // A pin mismatch means the target's certificate changed since we last trusted
                 // it (possible MITM, or a reinstalled/re-keyed server) — never silently fall
                 // back to plaintext ws:// for that, unlike an ordinary connection failure.
-                #[cfg(feature = "rustls-backend")]
                 if let Some(mismatch) = platform::danger::take_cert_mismatch() {
                     return Err(ImportClientError::ConnectFailed(format!(
                         "TLS certificate for {} has changed (was {}, now {}) - refusing to connect",
@@ -716,14 +707,11 @@ impl ConnectTarget {
         use tokio_tungstenite::connect_async;
         match self {
             ConnectTarget::Direct { ws_url, fallback_url, remote } => {
-                #[cfg(feature = "rustls-backend")]
                 let result = if ws_url.starts_with("wss://") {
                     connect_wss(ws_url, &remote.host_port).await
                 } else {
                     connect_async(ws_url.as_str()).await.map_err(Box::new)
                 };
-                #[cfg(not(feature = "rustls-backend"))]
-                let result = connect_async(ws_url.as_str()).await;
                 match result {
                     Ok((stream, _)) => {
                         let (w, r) = stream.split();
@@ -790,7 +778,6 @@ impl ConnectTarget {
 /// `wss://` with Clay's trust-on-first-use pinning (`~/.clay/known_hosts.dat`, see
 /// platform::danger_rustls) rather than CA verification: Clay's own server is self-signed.
 /// The error is boxed: tungstenite's is large, and these results are passed around.
-#[cfg(feature = "rustls-backend")]
 async fn connect_wss(ws_url: &str, host_port_key: &str) -> Result<
     (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
      tokio_tungstenite::tungstenite::handshake::client::Response),
@@ -903,9 +890,12 @@ async fn reconnect_once(
 /// console's worlds, settings and view become the server's again. What belongs to the
 /// console - the input line, its history, an open editor - stays.
 fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSender<WsMessage>, version_mismatch_shown: &mut bool) {
-    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, other_views, .. } = msg else {
+    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, other_views, map, .. } = msg else {
         return;
     };
+    // The map (src/map): the server has one; tell it this console's pane again.
+    app.server_map = map;
+    app.map_watch_sent = None;
     app.server_expands_line = expand_line;
     app.server_picture_upload = picture_upload;
     app.server_history_on_demand = history_on_demand;
@@ -1441,6 +1431,14 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                     }
                 }
             }
+        }
+        // The map pane (src/map): what it shows, to the server when that changed; and map
+        // requests made meanwhile (Esc stopping a walk).
+        if let Some(msg) = app.remote_map_watch_due() {
+            let _ = ws_tx.send(msg);
+        }
+        for msg in app.map_outbox.drain(..) {
+            let _ = ws_tx.send(msg);
         }
 
         // Arm the wait for the server's /update answer when a request starts; disarm it
@@ -2294,6 +2292,17 @@ pub(crate) fn handle_remote_client_key(
                 // Applied here at once; the master keeps it under this console's own key
                 // (REMOTE_CONSOLE_REVEAL_KEY) in the UpdateGlobalSettings below.
                 app.settings.text_reveal = crate::TextReveal::from_name(&settings.text_reveal);
+                // This console's own Screen Reader mode, likewise kept by the master under its
+                // key; "MUDs: Screen Reader" is the master's one global setting.
+                if app.settings.screen_reader != settings.screen_reader {
+                    app.settings.screen_reader = settings.screen_reader;
+                    app.needs_output_redraw = true;
+                }
+                app.settings.announce_screen_reader = settings.announce_screen_reader;
+                if app.settings.status_panel != settings.status_panel {
+                    app.settings.status_panel = settings.status_panel;
+                    app.needs_output_redraw = true;
+                }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_indicator = crate::NewIndicator::from_name(&settings.new_indicator);
@@ -2393,6 +2402,13 @@ pub(crate) fn handle_remote_client_key(
                         speak_mode: app.settings.tts_speak_mode.name().to_string(),
                         voice: app.settings.tts_voice.clone(),
                     }),
+                    tabs_profile: None,
+                    screen_reader_profile: Some(crate::websocket::InterfaceChoice {
+                        key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string(),
+                        value: if app.settings.screen_reader { "on" } else { "off" }.to_string(),
+                    }),
+                    announce_screen_reader: Some(app.settings.announce_screen_reader),
+                    status_panel: Some(app.settings.status_panel),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -2643,6 +2659,7 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd.clone();
                     app.worlds[idx].settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
                     app.worlds[idx].settings.keep_alive_gag = settings.keep_alive_gag.clone();
+                    app.worlds[idx].settings.status_panel = settings.status_panel;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages.clone();
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
                     app.worlds[idx].settings.auto_reconnect_secs = ar_secs;
@@ -2688,6 +2705,7 @@ pub(crate) fn handle_remote_client_key(
                         discord_dm_user: settings.discord_dm_user,
                         keep_alive_gag_enabled: Some(settings.keep_alive_gag_enabled),
                         keep_alive_gag: Some(settings.keep_alive_gag),
+                        status_panel: Some(settings.status_panel),
                     });
                 }
             }
@@ -2957,6 +2975,13 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
         }
         Command::Version => version_command(app),
         Command::Menu => app.open_menu_popup_new(),
+        // The map pane is this console's own (the server sends it what to draw); the rest
+        // of /map is the world's, on the server.
+        Command::Map { ref args } if crate::map::app::MapCmd::parse(args).is_pane() => {
+            for line in app.console_map_pane(&crate::map::app::MapCmd::parse(args)) {
+                app.add_output(&line);
+            }
+        }
         // The split is this console's own, typed or sent back by the server (an action).
         // Quiet when it works (the panes show it); only an error is said.
         Command::Split { world } => {
@@ -3657,6 +3682,10 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         text_reveal_profile: None,
         font_profile: None,
         tts_profile: None,
+        tabs_profile: None,
+        screen_reader_profile: None,
+        announce_screen_reader: None,
+        status_panel: None,
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {

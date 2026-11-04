@@ -505,6 +505,15 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "clear_input_on_send={}", app.settings.clear_input_on_send)?;
     writeln!(file, "taskbar_alert={}", app.settings.taskbar_alert)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
+    for (key, mode) in &app.settings.tabs_profiles {
+        writeln!(file, "tabs.{key}={}", mode.name())?;
+    }
+    writeln!(file, "screen_reader={}", app.settings.screen_reader)?;
+    for (key, on) in &app.settings.screen_reader_profiles {
+        writeln!(file, "screen_reader.{key}={on}")?;
+    }
+    writeln!(file, "announce_screen_reader={}", app.settings.announce_screen_reader)?;
+    writeln!(file, "status_panel={}", app.settings.status_panel)?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
     writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
 
@@ -575,6 +584,10 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         // value - same convention as gmcp_packages/auto_reconnect_secs above.
         if !world.settings.msp_enabled {
             writeln!(file, "msp_enabled=false")?;
+        }
+        // Edit World's Status Panel: default `true`, same convention.
+        if !world.settings.status_panel {
+            writeln!(file, "status_panel=false")?;
         }
         // Job 15 (plan Phase 4): same convention - default is `true`.
         if !world.settings.mcp_enabled {
@@ -1429,6 +1442,26 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
                     }
+                    // One interface's own tab location.
+                    k if k.starts_with("tabs.") => {
+                        if let Some(key) = k.strip_prefix("tabs.") {
+                            app.settings.tabs_profiles.insert(key.to_string(), crate::TabsMode::from_name(value));
+                        }
+                    }
+                    "screen_reader" => {
+                        app.settings.screen_reader = value == "true";
+                    }
+                    // One interface's own Screen Reader mode.
+                    k if k.starts_with("screen_reader.") => {
+                        if let Some(key) = k.strip_prefix("screen_reader.") {
+                            app.settings.screen_reader_profiles.insert(key.to_string(), value == "true");
+                        }
+                    }
+                    "announce_screen_reader" => {
+                        app.settings.announce_screen_reader = value == "true";
+                        crate::telnet::set_announce_screen_reader(app.settings.announce_screen_reader);
+                    }
+                    "status_panel" => app.settings.status_panel = value == "true",
                     "icon_bar" => {
                         app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
@@ -1460,6 +1493,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
+                        "status_panel" => world.settings.status_panel = value == "true",
                         "prompt_wait_ms" => {
                             world.settings.prompt_wait_ms =
                                 value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
@@ -1908,6 +1942,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
+                        "status_panel" => world.settings.status_panel = value == "true",
                         "prompt_wait_ms" => {
                             world.settings.prompt_wait_ms =
                                 value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
@@ -2090,6 +2125,7 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             // Job 15 (plan Phase 4).
             writeln!(file, "mcp_enabled={}", world.settings.mcp_enabled)?;
             writeln!(file, "mccp2_enabled={}", world.settings.mccp2_enabled)?;
+            writeln!(file, "status_panel={}", world.settings.status_panel)?;
             writeln!(file, "prompt_wait_ms={}", world.settings.prompt_wait_ms)?;
             if !world.settings.tf_type.is_empty() {
                 writeln!(file, "tf_type={}", world.settings.tf_type)?;
@@ -2270,6 +2306,11 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             writeln!(file, "split_focus_top={}", split.focus_top)?;
         }
     }
+    // The map pane (`/map`, src/map): open, and the area and level it shows by choice.
+    if let Some(pane) = &app.map_pane {
+        writeln!(file, "map_pane_area={}", pane.area.as_deref().unwrap_or(""))?;
+        writeln!(file, "map_pane_level={}", pane.level.map_or(String::new(), |l| l.to_string()))?;
+    }
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "separator_style={}", app.settings.separator_style.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme)?;
@@ -2354,6 +2395,15 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "clear_input_on_send={}", app.settings.clear_input_on_send)?;
     writeln!(file, "taskbar_alert={}", app.settings.taskbar_alert)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
+    for (key, mode) in &app.settings.tabs_profiles {
+        writeln!(file, "tabs.{key}={}", mode.name())?;
+    }
+    writeln!(file, "screen_reader={}", app.settings.screen_reader)?;
+    for (key, on) in &app.settings.screen_reader_profiles {
+        writeln!(file, "screen_reader.{key}={on}")?;
+    }
+    writeln!(file, "announce_screen_reader={}", app.settings.announce_screen_reader)?;
+    writeln!(file, "status_panel={}", app.settings.status_panel)?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
     writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
 
@@ -2452,7 +2502,11 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         if let Some(enc) = world.protocol.negotiated_encoding {
             writeln!(file, "negotiated_encoding={}", enc.iana_name())?;
         }
-        writeln!(file, "uses_wont_echo_prompt={}", world.protocol.uses_wont_echo_prompt)?;
+        // A timed prompt still showing as a guess, its text still parked - see
+        // `World::prompt_timed`.
+        if world.prompt_timed {
+            writeln!(file, "prompt_timed=true")?;
+        }
         // Job 5 (T1.8): a reload keeps the same socket, so unlike a real reconnect
         // the MUD will not resend `WILL ECHO` - see `World::echo_masked`'s doc
         // comment. Without this, `/reload` at a password prompt unmasked the input
@@ -2486,6 +2540,11 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         if !world.trigger_partial_line.is_empty() {
             let escaped = world.trigger_partial_line.replace('=', "\\e");
             writeln!(file, "trigger_partial_line={}", escaped)?;
+        }
+        // An answered timed prompt not yet in the output - see `World::answered_prompt`.
+        if !world.answered_prompt.is_empty() {
+            let escaped = world.answered_prompt.replace('=', "\\e");
+            writeln!(file, "answered_prompt={}", escaped)?;
         }
         writeln!(file, "next_seq={}", world.next_seq)?;
         // The stable archive identity must survive a reload, or the rebuilt World
@@ -2588,6 +2647,16 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
                 writeln!(file, "stats_json={}", json)?;
             }
         }
+        // The map (src/map): the room the user is in and the walk going on - the rooms
+        // themselves are in maps.db.
+        if let Some(here) = &world.map.here {
+            writeln!(file, "map_here={}", here)?;
+        }
+        if let Some(walk) = world.map.walker.keep(std::time::Instant::now()) {
+            if let Ok(json) = serde_json::to_string(&walk) {
+                writeln!(file, "map_walk_json={}", json)?;
+            }
+        }
         if let Ok(json) = serde_json::to_string(&world.mcp) {
             // Always written (even for a fresh, all-default McpState) rather than
             // gated on "has data": unlike stats/mssp_data there's no cheap
@@ -2604,6 +2673,10 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         // is recorded, same convention as log_enabled above.
         if !world.settings.msp_enabled {
             writeln!(file, "msp_enabled=false")?;
+        }
+        // Edit World's Status Panel: default `true`, same convention.
+        if !world.settings.status_panel {
+            writeln!(file, "status_panel=false")?;
         }
         // Job 15 (plan Phase 4): same convention as msp_enabled above.
         if !world.settings.mcp_enabled {
@@ -2896,7 +2969,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         showing_splash: bool,
         telnet_mode: bool,
         negotiated_encoding: Option<Encoding>,
-        uses_wont_echo_prompt: bool,
+        prompt_timed: bool,
         prompt: String,
         settings: WorldSettings,
         /// Chat worlds: the live session's send target and Discord resume data.
@@ -2920,6 +2993,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         reconnect_in_ms: Option<u64>,
         log_custom_path: Option<PathBuf>,
         trigger_partial_line: String,
+        answered_prompt: String,
         /// Keyed by index (see `mssp_name_N`/`mssp_value_N` in save_reload_state_to)
         /// rather than accumulated straight into a `Vec` because name and value are
         /// two separate lines - reassembled into an ordered `Vec<(String, String)>`
@@ -2931,6 +3005,8 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         /// than overwrite it with an empty one.
         stats: Option<stats::WorldStats>,
         mcp: Option<mcp::McpState>,
+        map_here: Option<String>,
+        map_walk: Option<crate::map::walk::KeptWalk>,
     }
 
     // Parse a saved output/pending line with timestamp
@@ -3068,7 +3144,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         showing_splash: false,
                         telnet_mode: false,
                         negotiated_encoding: None,
-                        uses_wont_echo_prompt: false,
+                        prompt_timed: false,
                         prompt: String::new(),
                         // A pre-overhaul state file has no chat_settings_version key.
                         settings: WorldSettings { chat_settings_version: 0, ..WorldSettings::default() },
@@ -3088,10 +3164,13 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         reconnect_in_ms: None,
                         log_custom_path: None,
                         trigger_partial_line: String::new(),
+                        answered_prompt: String::new(),
                         mssp_names: std::collections::HashMap::new(),
                         mssp_values: std::collections::HashMap::new(),
                         stats: None,
                         mcp: None,
+                        map_here: None,
+                        map_walk: None,
                     });
                 }
             } else if let Some(suffix) = section.strip_prefix("output:") {
@@ -3218,6 +3297,12 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     }
                     "split_other" => split_other = Some(value.to_string()),
                     "split_focus_top" => split_focus_top = value == "true",
+                    "map_pane_area" => {
+                        app.map_pane.get_or_insert_with(Default::default).area = (!value.is_empty()).then(|| value.to_string());
+                    }
+                    "map_pane_level" => {
+                        app.map_pane.get_or_insert_with(Default::default).level = value.parse().ok();
+                    }
                     "theme" => {
                         app.settings.theme = Theme::from_name(value);
                     }
@@ -3469,6 +3554,26 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
                     }
+                    // One interface's own tab location.
+                    k if k.starts_with("tabs.") => {
+                        if let Some(key) = k.strip_prefix("tabs.") {
+                            app.settings.tabs_profiles.insert(key.to_string(), crate::TabsMode::from_name(value));
+                        }
+                    }
+                    "screen_reader" => {
+                        app.settings.screen_reader = value == "true";
+                    }
+                    // One interface's own Screen Reader mode.
+                    k if k.starts_with("screen_reader.") => {
+                        if let Some(key) = k.strip_prefix("screen_reader.") {
+                            app.settings.screen_reader_profiles.insert(key.to_string(), value == "true");
+                        }
+                    }
+                    "announce_screen_reader" => {
+                        app.settings.announce_screen_reader = value == "true";
+                        crate::telnet::set_announce_screen_reader(app.settings.announce_screen_reader);
+                    }
+                    "status_panel" => app.settings.status_panel = value == "true",
                     "icon_bar" => {
                         app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
@@ -3540,7 +3645,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "showing_splash" => tw.showing_splash = value == "true",
                             "telnet_mode" => tw.telnet_mode = value == "true",
                             "negotiated_encoding" => tw.negotiated_encoding = Encoding::from_iana_name(value),
-                            "uses_wont_echo_prompt" => tw.uses_wont_echo_prompt = value == "true",
+                            "prompt_timed" => tw.prompt_timed = value == "true",
                             // Job 5 (T1.8/T2.7): see the matching writes in save_reload_state_to.
                             "echo_masked" => tw.echo_masked = value == "true",
                             "naws_enabled" => tw.naws_enabled = value == "true",
@@ -3557,6 +3662,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "reconnect_in_ms" => tw.reconnect_in_ms = value.parse().ok(),
                             "log_custom_path" => tw.log_custom_path = Some(PathBuf::from(unescape_string(value))),
                             "trigger_partial_line" => tw.trigger_partial_line = unescape_string(value),
+                            "answered_prompt" => tw.answered_prompt = unescape_string(value),
                             "prompt" => {
                                 // Prompts always end with a single trailing space (normalized on receive)
                                 // but trailing spaces are trimmed during file parsing, so add it back
@@ -3590,6 +3696,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "msp_enabled" => tw.settings.msp_enabled = value == "true",
                             "mcp_enabled" => tw.settings.mcp_enabled = value == "true",
                             "mccp2_enabled" => tw.settings.mccp2_enabled = value == "true",
+                            "status_panel" => tw.settings.status_panel = value == "true",
                             "prompt_wait_ms" => {
                                 tw.settings.prompt_wait_ms =
                                     value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
@@ -3657,6 +3764,12 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                                 if let Ok(s) = serde_json::from_str::<stats::WorldStats>(value) {
                                     tw.stats = Some(s);
                                 }
+                            }
+                            "map_here" => {
+                                tw.map_here = (!value.is_empty()).then(|| value.to_string());
+                            }
+                            "map_walk_json" => {
+                                tw.map_walk = serde_json::from_str(value).ok();
                             }
                             "mcp_json" => {
                                 if let Ok(m) = serde_json::from_str::<mcp::McpState>(value) {
@@ -3755,7 +3868,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.showing_splash = tw.showing_splash;
         world.telnet_mode = tw.telnet_mode;
         world.protocol.negotiated_encoding = tw.negotiated_encoding;
-        world.protocol.uses_wont_echo_prompt = tw.uses_wont_echo_prompt;
+        world.prompt_timed = tw.prompt_timed;
         world.prompt = tw.prompt;
         world.socket_fd = tw.socket_fd;
         world.proxy_pid = tw.proxy_pid;
@@ -3845,6 +3958,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
             .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
         world.log_custom_path = tw.log_custom_path;
         world.trigger_partial_line = tw.trigger_partial_line;
+        world.answered_prompt = tw.answered_prompt;
         // Job (investigate-differences-between-tinyfugu-fluffy-stallman.md): `Instant`
         // cannot be persisted, so a restored non-empty partial on a Timed Prompt world
         // must re-arm `timed_prompt_since` here or it would sit parked forever (nothing
@@ -3853,7 +3967,8 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         // is deliberately the restore moment, not the original park time (which is lost)
         // - the same posture as `reconnect_at` just above using the restore moment as
         // its baseline.
-        if !world.trigger_partial_line.is_empty()
+        // A partial already showing as a timed prompt is not waited on again.
+        if !world.trigger_partial_line.is_empty() && !world.prompt_timed
             && world.settings.world_type == WorldType::MudTimedPrompt {
             world.timed_prompt_since = Some(std::time::Instant::now());
         }
@@ -3880,6 +3995,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         if let Some(mcp) = tw.mcp {
             world.mcp = mcp;
         }
+        world.map.here = tw.map_here;
+        if let Some(walk) = tw.map_walk {
+            world.map.walker.restore(walk, std::time::Instant::now());
+        }
         // Leave timing fields as None for connected worlds after reload
         // This triggers immediate keepalive since we don't know how long connection was idle
         app.worlds.push(world);
@@ -3893,6 +4012,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         app.current_world_index = 0;
     }
 
+    // Only a console keeps its map pane, as its split.
+    if !app.console_tui {
+        app.map_pane = None;
+    }
     // Only a console keeps its split: a GUI successor keeps its own (its relaunch stash).
     if app.console_tui {
         if let Some(other) = split_other.and_then(|name| app.worlds.iter().position(|w| w.name == name)) {
@@ -4078,6 +4201,16 @@ mod tests {
             taskbar_alert: true,               // default: false
             keyboard_always_visible: false,    // default: true
             tabs: TabsMode::Top,               // default: None
+            tabs_profiles: [
+                ("native-linux".to_string(), TabsMode::Left),
+                ("app-android".to_string(), TabsMode::Right),
+            ]
+            .into_iter()
+            .collect(),                        // default: empty
+            screen_reader: true,               // default: false
+            screen_reader_profiles: [("browser-windows".to_string(), true), ("app-android".to_string(), false)].into_iter().collect(), // default: empty
+            announce_screen_reader: true,      // default: false
+            status_panel: false,               // default: true
             icon_bar: IconBarMode::All,        // default: AppTablet
             picture_host: crate::picture::PictureService::from_name("x0+short"), // default: catbox
             text_reveal_profiles: [
@@ -4138,6 +4271,7 @@ mod tests {
             auto_reconnect_secs: 30,                       // default: 0
             auto_reconnect_on_web: true,                   // default: false
             msp_enabled: false,                            // default: true
+            status_panel: false,                           // default: true
             mcp_enabled: false,                            // default: true
             mccp2_enabled: false,                          // default: true
             prompt_wait_ms: 2500,                          // default: 1000
@@ -4215,6 +4349,11 @@ mod tests {
         assert_eq!(a.taskbar_alert, b.taskbar_alert, "{context}: taskbar_alert");
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
         assert_eq!(a.tabs, b.tabs, "{context}: tabs");
+        assert_eq!(a.tabs_profiles, b.tabs_profiles, "{context}: tabs_profiles");
+        assert_eq!(a.screen_reader, b.screen_reader, "{context}: screen_reader");
+        assert_eq!(a.screen_reader_profiles, b.screen_reader_profiles, "{context}: screen_reader_profiles");
+        assert_eq!(a.announce_screen_reader, b.announce_screen_reader, "{context}: announce_screen_reader");
+        assert_eq!(a.status_panel, b.status_panel, "{context}: status_panel");
         assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
         assert_eq!(a.picture_host, b.picture_host, "{context}: picture_host");
         assert_eq!(a.font_profiles, b.font_profiles, "{context}: font_profiles");
@@ -4253,6 +4392,7 @@ mod tests {
         assert_eq!(a.auto_reconnect_secs, b.auto_reconnect_secs, "{context}: auto_reconnect_secs");
         assert_eq!(a.auto_reconnect_on_web, b.auto_reconnect_on_web, "{context}: auto_reconnect_on_web");
         assert_eq!(a.msp_enabled, b.msp_enabled, "{context}: msp_enabled");
+        assert_eq!(a.status_panel, b.status_panel, "{context}: status_panel");
         assert_eq!(a.mcp_enabled, b.mcp_enabled, "{context}: mcp_enabled");
         assert_eq!(a.mccp2_enabled, b.mccp2_enabled, "{context}: mccp2_enabled");
         assert_eq!(a.prompt_wait_ms, b.prompt_wait_ms, "{context}: prompt_wait_ms");
@@ -4921,7 +5061,7 @@ mod tests {
             String::new(), "0".to_string(), true, true, true,
             "discord".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), "Guild".to_string(), "#dev".to_string(), String::new(),
-            Some(chat), None, None,
+            Some(chat), None, None, None,
         );
         let s = &app.worlds[0].settings;
         assert_eq!(s.discord_channel, "#dev");
@@ -5624,6 +5764,11 @@ pattern=foo
         assert_ne!(non_default.taskbar_alert, default.taskbar_alert, "taskbar_alert should differ");
         assert_ne!(non_default.keyboard_always_visible, default.keyboard_always_visible, "keyboard_always_visible should differ");
         assert_ne!(non_default.tabs, default.tabs, "tabs should differ");
+        assert_ne!(non_default.tabs_profiles, default.tabs_profiles, "tabs_profiles should differ");
+        assert_ne!(non_default.screen_reader, default.screen_reader, "screen_reader should differ");
+        assert_ne!(non_default.screen_reader_profiles, default.screen_reader_profiles, "screen_reader_profiles should differ");
+        assert_ne!(non_default.announce_screen_reader, default.announce_screen_reader, "announce_screen_reader should differ");
+        assert_ne!(non_default.status_panel, default.status_panel, "status_panel should differ");
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");
         assert_ne!(non_default.picture_host, default.picture_host, "picture_host should differ");
         assert_ne!(non_default.font_profiles, default.font_profiles, "font_profiles should differ");
@@ -5671,6 +5816,7 @@ pattern=foo
         assert_ne!(non_default.auto_reconnect_secs, default.auto_reconnect_secs, "auto_reconnect_secs should differ");
         assert_ne!(non_default.auto_reconnect_on_web, default.auto_reconnect_on_web, "auto_reconnect_on_web should differ");
         assert_ne!(non_default.msp_enabled, default.msp_enabled, "msp_enabled should differ");
+        assert_ne!(non_default.status_panel, default.status_panel, "status_panel should differ");
         assert_ne!(non_default.mcp_enabled, default.mcp_enabled, "mcp_enabled should differ");
         assert_ne!(non_default.mccp2_enabled, default.mccp2_enabled, "mccp2_enabled should differ");
         assert_ne!(non_default.prompt_wait_ms, default.prompt_wait_ms, "prompt_wait_ms should differ");

@@ -37,6 +37,8 @@ pub const WORLD_FIELD_KEEP_ALIVE_WARNING: FieldId = FieldId(27);
 /// A Custom keepalive's own reply to gag. Its checkbox is the label's `[✓]`/`[ ]`
 /// (Space flips it, `toggle_keep_alive_gag`), held in `custom_data`.
 pub const WORLD_FIELD_KEEP_ALIVE_GAG: FieldId = FieldId(28);
+/// Status Line: the world's own Status Panel switch (`WorldSettings::status_panel`).
+pub const WORLD_FIELD_STATUS_LINE: FieldId = FieldId(29);
 // Field IDs - Slack
 pub const WORLD_FIELD_SLACK_TOKEN: FieldId = FieldId(30);
 pub const WORLD_FIELD_SLACK_CHANNEL: FieldId = FieldId(31);
@@ -172,6 +174,8 @@ pub struct WorldSettings {
     pub msp_enabled: bool,
     pub mcp_enabled: bool,
     pub mccp2_enabled: bool,
+    /// The world's Status Panel switch, "Status Line" here.
+    pub status_panel: bool,
     /// Only meaningful for `world_type == "mud_timed_prompt"` - see the matching
     /// `WorldSettings::prompt_wait_ms` (main.rs) doc comment.
     pub prompt_wait_ms: u64,
@@ -335,6 +339,11 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             WORLD_FIELD_MCCP2_ENABLED,
             "MCCP2",
             FieldKind::toggle(settings.mccp2_enabled),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_STATUS_LINE,
+            "Status Line",
+            FieldKind::toggle(settings.status_panel),
         ))
         // Slack fields
         .with_field(Field::new(
@@ -538,8 +547,9 @@ fn world_editor_help_text() -> Vec<String> {
         "  gagged too, for a MUD whose reply doesn't",
         "  repeat the command, such as Huh?.",
         "",
-        "GMCP: Space-separated GMCP packages to request from",
-        "  the server (e.g. Char.Items Room.Info).",
+        "GMCP: Comma-separated GMCP packages to request from",
+        "  the server (e.g. Char 1, Room 1). Room is what the",
+        "  map is built from.",
         "",
         "Reconnect: When/how to reconnect after disconnect.",
         "  0 = disabled, 30 = reconnect after 30 seconds,",
@@ -563,6 +573,11 @@ fn world_editor_help_text() -> Vec<String> {
         "  compression - the connection still works, just",
         "  uncompressed. Toggling this on a live connection asks",
         "  the server to start/stop compressing immediately.",
+        "",
+        "Status Line: Show the stats this game sends (HP, mana...",
+        "  over GMCP or MSDP) for this world, in every interface",
+        "  (the GUIs call it the Status Panel). /stats lists them",
+        "  either way; Status Line in /setup hides it everywhere.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -574,7 +589,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_ENCODING,
         WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_TF_TYPE, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
         WORLD_FIELD_MSP_ENABLED,
-        WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED,
+        WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_STATUS_LINE,
     ];
 
     // Slack fields

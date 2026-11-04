@@ -266,8 +266,24 @@ public class MainActivity extends AppCompatActivity {
             @Override public void onInputDeviceChanged(int deviceId) { refreshMouseAttached(); }
         };
 
+    /** A screen reader (TalkBack, or another that explores by touch) is running. */
+    boolean isScreenReaderRunning() {
+        android.view.accessibility.AccessibilityManager am =
+            (android.view.accessibility.AccessibilityManager) getSystemService(Context.ACCESSIBILITY_SERVICE);
+        return am != null && am.isEnabled() && am.isTouchExplorationEnabled();
+    }
+
     // JavaScript interface for communication between web and Android
     public class AndroidInterface {
+        /**
+         * Screen Reader mode (app.js receiveScreenReader): a screen reader is running, so an
+         * interface that never chose turns the mode on, once.
+         */
+        @JavascriptInterface
+        public boolean isScreenReaderOn() {
+            return isScreenReaderRunning();
+        }
+
         @JavascriptInterface
         public void openServerSettings() {
             runOnUiThread(() -> {
@@ -1062,6 +1078,15 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> applyThemeAppearance(c, light));
         }
 
+        /** A live shell world is (or is no longer) current: the soft keyboard types a
+         *  letter at a time there instead of composing words (ClayWebView). */
+        @JavascriptInterface
+        public void setShellKeyboard(boolean on) {
+            runOnUiThread(() -> {
+                if (webView instanceof ClayWebView) ((ClayWebView) webView).setCharInput(on);
+            });
+        }
+
         @JavascriptInterface
         public void openExternalUrl(String url) {
             runOnUiThread(() -> {
@@ -1204,7 +1229,8 @@ public class MainActivity extends AppCompatActivity {
         // setKeyboardForceActive() call), but hardware-keyboard presence is knowable right
         // now from the current Configuration, so it's not left defaulting to "absent".
         hardwareKeyboardAttached = isHardwareKeyboardAttached(getResources().getConfiguration());
-        keyboardForceActive = migratePrefs.getBoolean(KEY_KEYBOARD_ALWAYS_VISIBLE, true) && !hardwareKeyboardAttached;
+        // A screen reader moves the focus itself: never pull it back to the input for one.
+        keyboardForceActive = migratePrefs.getBoolean(KEY_KEYBOARD_ALWAYS_VISIBLE, true) && !hardwareKeyboardAttached && !isScreenReaderRunning();
         applyKeyboardForce(keyboardForceActive);
         mouseAttached = isMouseAttached();
         inputManager = (android.hardware.input.InputManager) getSystemService(Context.INPUT_SERVICE);

@@ -12,7 +12,7 @@
 # Android's public linker namespace), so no rpath patching is needed the way
 # the Termux builds require for Termux's separate userland.
 #
-# No-GUI (rustls-backend): the local-server mode never opens a native
+# No-GUI: the local-server mode never opens a native
 # WebView (the Android app's own WebView is the client), so webview-gui
 # (wry/tao/webkit2gtk/X11) is neither needed nor available for this target.
 # ssh-transport IS included: the same binary also serves as the --ssh-proxy
@@ -63,7 +63,7 @@ export CARGO_TARGET_DIR="$SCRIPT_DIR/target/android"
 
 echo "Building clay for aarch64-linux-android (API $API)..."
 cargo build --release --target aarch64-linux-android \
-    --no-default-features --features rustls-backend,ssh-transport
+    --no-default-features --features ssh-transport
 
 BIN="$CARGO_TARGET_DIR/aarch64-linux-android/release/clay"
 OUT_DIR="android/app/src/main/jniLibs/arm64-v8a"

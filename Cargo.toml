@@ -27,20 +27,20 @@ base64 = "0.21"
 # Self-signed certificate generation (pure Rust, same crypto as rustls)
 rcgen = "0.14"
 
-# TLS support - native-tls by default, rustls for static builds
-tokio-native-tls = { version = "0.3", optional = true }
-native-tls = { version = "0.2", optional = true }
+# TLS is always rustls (the native-tls backend went 2026-11-01: no build used it, and
+# Clay pins certificates itself - TOFU in platform::danger_rustls - rather than asking
+# the OS's trust store, which is the one thing native-tls offered).
 # default-features = false + explicit "ring" feature: rustls 0.23 defaults its
 # crypto provider to aws-lc-rs, which needs a C toolchain and does not
 # cross-compile cleanly to Android armv7 (breaks the Termux build). ring
 # cross-compiles fine and is what Clay has always used. Every TLS dep below
 # must stay pinned to ring the same way - see TofuVerifier in platform.rs.
-tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["logging", "tls12", "ring"] }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "logging", "std", "tls12"] }
-webpki-roots = { version = "0.26", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = "0.26"
 
-# WebSocket support (TLS features are conditional on backend)
-tokio-tungstenite = "0.24"
+# WebSocket support, over the same ring-backed rustls
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # Serialization for WebSocket protocol
 serde = { version = "1", features = ["derive"] }
@@ -201,9 +201,10 @@ winres = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 
 [features]
-default = ["rustls-backend", "native-audio", "ssh-transport"]
-native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
-rustls-backend = ["tokio-rustls", "rustls", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
+default = ["native-audio", "ssh-transport"]
+# TLS is built in (rustls, always). The name is kept, doing nothing, so every command
+# line and script that says `--features rustls-backend,...` still builds.
+rustls-backend = []
 native-audio = ["rodio"]
 webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk", "gio", "glib", "x11rb", "zbus", "windows", "objc2-app-kit", "objc2-foundation"]
 ssh-transport = ["russh"]

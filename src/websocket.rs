@@ -82,6 +82,8 @@ pub(crate) fn message_world_index(msg: &WsMessage) -> Option<usize> {
         | WsMessage::ServerSpeak { world_index, .. }
         | WsMessage::AnsiMusic { world_index, .. }
         | WsMessage::StatsUpdate { world_index, .. }
+        | WsMessage::MapState { world_index, .. }
+        | WsMessage::MapArea { world_index, .. }
         | WsMessage::GmcpData { world_index, .. }
         | WsMessage::MsdpData { world_index, .. }
         | WsMessage::McmpMedia { world_index, .. }
@@ -438,6 +440,11 @@ pub enum WsMessage {
         /// is; a multiuser server, which has no archive, says false. `serde(default)` = false.
         #[serde(default)]
         history_on_demand: bool,
+        /// `true` = this server has the map (src/map) and takes `MapWatch`, `MapRoute`,
+        /// `MapStop` and `MapSearch`. Gated as `other_views` is; a multiuser server says
+        /// false. `serde(default)` = false.
+        #[serde(default)]
+        map: bool,
         /// The emoji picker's curated table, in the compact wire form
         /// `[[ch, name, "kw1 kw2", category_index], ...]` from `emoji::emoji_json()`. The
         /// table is static, so it is sent once per connection here rather than on every
@@ -583,6 +590,52 @@ pub enum WsMessage {
     /// same data's `#[serde(default)]` initial-state counterpart, which does need it for an
     /// older server.
     StatsUpdate { world_index: usize, stats: Vec<crate::stats::StatEntry> },
+
+    /// The map (src/map): where the user is on a world's map and the walk going on
+    /// (server -> client, to the clients that show the world's map; `None` = no map).
+    MapState { world_index: usize, state: Option<crate::map::wire::MapStateMsg> },
+    /// The map: rooms of one area's level, nearest the view's centre. `replace` = these are
+    /// all of them (an area or level change, a new view); else just the rooms that changed.
+    MapArea {
+        world_index: usize,
+        area: String,
+        #[serde(default)]
+        area_name: String,
+        level: i32,
+        #[serde(default)]
+        levels: Vec<i32>,
+        replace: bool,
+        #[serde(default)]
+        truncated: bool,
+        rooms: Vec<crate::map::wire::MapRoomMsg>,
+    },
+    /// The answer to a `MapRoute` (to the asking client only): the room meant and the route
+    /// there, or why there is none.
+    MapRouteResult {
+        world_index: usize,
+        request_id: u64,
+        #[serde(default)]
+        to: String,
+        #[serde(default)]
+        room: Option<crate::map::wire::MapRoomMsg>,
+        #[serde(default)]
+        route: Vec<crate::map::wire::MapStepMsg>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// The answer to a `MapSearch` (to the asking client only).
+    MapSearchResult { world_index: usize, request_id: u64, rooms: Vec<crate::map::wire::MapRoomBrief> },
+    /// What this client's map panes show (client -> server; only to a server whose
+    /// `InitialState.map` is true). Sent after every InitialState; an empty list = it can
+    /// show a map, but none is open.
+    MapWatch { views: Vec<crate::map::wire::MapViewReq> },
+    /// A room picked on the map, or typed (client -> server): `to` is "#id" or a name. With
+    /// `walk`, walk there; else just answer the route (`MapRouteResult`).
+    MapRoute { world_index: usize, request_id: u64, to: String, walk: bool },
+    /// Stop a world's walk (client -> server).
+    MapStop { world_index: usize },
+    /// Rooms by name (client -> server); answered with `MapSearchResult`.
+    MapSearch { world_index: usize, request_id: u64, query: String },
 
     /// GMCP data received from MUD server (server -> client)
     GmcpData { world_index: usize, package: String, data: String },
@@ -781,6 +834,10 @@ pub enum WsMessage {
         keep_alive_gag_enabled: Option<bool>,
         #[serde(default)]
         keep_alive_gag: Option<String>,
+        /// Edit World's Status Panel (`WorldSettings::status_panel`). None - an older
+        /// client, or an editor with no such switch - leaves it.
+        #[serde(default)]
+        status_panel: Option<bool>,
     },
     /// World editor "Fetch": look up a chat world's servers/channels with the given
     /// (possibly unsaved) tokens. Empty token = use the stored one. Reply:
@@ -923,6 +980,24 @@ pub enum WsMessage {
         /// the console's own, which only an older client still edits.
         #[serde(default)]
         tts_profile: Option<TtsProfileUpdate>,
+        /// This client's own tab location (`TabsMode` name), under its interface key (user
+        /// ruling 2026-11-01). `None` (an older client, or a server before the split) =
+        /// unchanged; such a client edits the shared `tabs` instead.
+        #[serde(default)]
+        tabs_profile: Option<InterfaceChoice>,
+        /// This client's own Screen Reader mode ("on"/"off"), under its interface key.
+        /// `None` (an older client, one with none of its own, or a server before the
+        /// split) = unchanged.
+        #[serde(default)]
+        screen_reader_profile: Option<InterfaceChoice>,
+        /// "MUDs: Screen Reader" (`Settings::announce_screen_reader`), one global setting.
+        /// `None` (an older client) = unchanged.
+        #[serde(default)]
+        announce_screen_reader: Option<bool>,
+        /// Settings' Status Panel (`Settings::status_panel`), one setting for the instance.
+        /// `None` (an older client) = unchanged.
+        #[serde(default)]
+        status_panel: Option<bool>,
     },
 
     // Settings update confirmations (server -> client)
@@ -1762,6 +1837,9 @@ pub struct WorldStateMsg {
     /// same as every other field this pattern covers.
     #[serde(default)]
     pub stats: Vec<crate::stats::StatEntry>,
+    /// Where the user is on this world's map (src/map), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<crate::map::wire::MapStateMsg>,
     /// A shell world's screen (see src/shell); `None` for every other world type, and for
     /// a shell world not connected. Carried in `InitialState` and on reconnect so a client
     /// starts from the full screen before deltas arrive.
@@ -1882,6 +1960,10 @@ pub struct WorldSettingsMsg {
     /// to `true`, not `serde(default)`'s implicit `false`.
     #[serde(default = "default_mccp2_enabled")]
     pub mccp2_enabled: bool,
+    /// Mirrors `WorldSettings::status_panel` (Edit World's Status Panel). `None` from a
+    /// server before the switch: the status display shows, and the editors have no switch.
+    #[serde(default)]
+    pub status_panel: Option<bool>,
     /// Mirrors `WorldSettings::world_type` (`WorldType::name()`) so the web/GUI
     /// editor can show/select MUD, MUD - Timed Prompt, Slack, or Discord - closing
     /// the pre-existing three-interface-rule gap where world type was console-only.
@@ -1953,6 +2035,26 @@ pub struct TextRevealProfile {
     pub value: String,
 }
 
+/// The settings an `UpdateGlobalSettings` carries that were added after the long list of
+/// positional parameters to `App::update_global_settings` - kept together so the next one
+/// is a field here, not another argument at every call. `Default` = an older client's save:
+/// nothing of these changes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SettingsAdditions {
+    pub tabs_profile: Option<InterfaceChoice>,
+    pub screen_reader_profile: Option<InterfaceChoice>,
+    pub announce_screen_reader: Option<bool>,
+    pub status_panel: Option<bool>,
+}
+
+/// One interface's own choice of a per-interface setting, by name: its key
+/// (`valid_interface_key`) and the value it chose (`UpdateGlobalSettings.tabs_profile`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct InterfaceChoice {
+    pub key: String,
+    pub value: String,
+}
+
 /// One interface's own text-to-speech (`GlobalSettingsMsg.tts_profiles`): `tts::TtsMode`,
 /// `tts::TtsSpeakMode` and the Kokoro voice, by name.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -2001,6 +2103,48 @@ impl GlobalSettingsMsg {
                 self.tts_voice = profile.voice.clone();
             }
         }
+    }
+
+    /// Where interface `key` puts its world tabs: its own, else the shared setting.
+    pub fn tabs_for(&self, key: &str) -> String {
+        self.tabs_profiles.as_ref().and_then(|p| p.get(key)).cloned().unwrap_or_else(|| self.tabs.clone())
+    }
+
+    /// Set interface `key`'s own tab location, as its Settings' Save does: under its key, or
+    /// the shared setting for a server before the split.
+    pub fn set_tabs_for(&mut self, key: &str, value: &str) {
+        match &mut self.tabs_profiles {
+            Some(profiles) => {
+                profiles.insert(key.to_string(), value.to_string());
+            }
+            None => self.tabs = value.to_string(),
+        }
+    }
+
+    /// Whether interface `key` is in Screen Reader mode: its own choice, else off.
+    pub fn screen_reader_for(&self, key: &str) -> bool {
+        self.screen_reader_profiles.as_ref().and_then(|p| p.get(key)).copied().unwrap_or(false)
+    }
+
+    /// Set interface `key`'s own Screen Reader mode (nothing to set on a server before it).
+    pub fn set_screen_reader_for(&mut self, key: &str, on: bool) {
+        if let Some(profiles) = &mut self.screen_reader_profiles {
+            profiles.insert(key.to_string(), on);
+        }
+    }
+
+    /// The `UpdateGlobalSettings.screen_reader_profile` for interface `key`: its own, once
+    /// it has one.
+    pub fn screen_reader_profile_update(&self, key: &str) -> Option<InterfaceChoice> {
+        let on = self.screen_reader_profiles.as_ref()?.get(key)?;
+        Some(InterfaceChoice { key: key.to_string(), value: if *on { "on" } else { "off" }.to_string() })
+    }
+
+    /// The `UpdateGlobalSettings.tabs_profile` for interface `key`: its own, once the server
+    /// keeps them and it has one.
+    pub fn tabs_profile_update(&self, key: &str) -> Option<InterfaceChoice> {
+        let value = self.tabs_profiles.as_ref()?.get(key)?;
+        Some(InterfaceChoice { key: key.to_string(), value: value.clone() })
     }
 
     /// The `UpdateGlobalSettings.tts_profile` for interface `key`: its own, once the server
@@ -2143,8 +2287,8 @@ pub struct GlobalSettingsMsg {
     /// app included); ignored when a hardware keyboard is attached.
     #[serde(default = "default_keyboard_always_visible")]
     pub keyboard_always_visible: bool,
-    /// World-tabs ribbon display mode: "none" (default) / "top" / "bottom".
-    /// web/GUI/Android only — see TabsMode.
+    /// The shared world-tabs location (`TabsMode` name: none (default), top, bottom, left,
+    /// right) - what an interface without its own uses. web/GUI/Android only.
     #[serde(default)]
     pub tabs: String,
     /// Icon bar visibility mode: "none" / "app_tablet" (default) / "all".
@@ -2165,6 +2309,22 @@ pub struct GlobalSettingsMsg {
     /// altogether from a server before the effect (serde leaves it empty).
     #[serde(default)]
     pub text_reveal_profiles: std::collections::BTreeMap<String, String>,
+    /// Each interface's own tab location (`TabsMode` name), by its key; a key without one
+    /// uses the shared `tabs`. `None` from a server before the split: the client then edits
+    /// the shared `tabs`, and offers only none/top/bottom, which such a server keeps.
+    #[serde(default)]
+    pub tabs_profiles: Option<std::collections::BTreeMap<String, String>>,
+    /// Each interface's own Screen Reader mode, by its key; off until it chose one. `None`
+    /// from a server before Screen Reader mode: the client then has none to show.
+    #[serde(default)]
+    pub screen_reader_profiles: Option<std::collections::BTreeMap<String, bool>>,
+    /// "MUDs: Screen Reader": tell MUDs a screen reader is in use (MTTS). Global.
+    #[serde(default)]
+    pub announce_screen_reader: bool,
+    /// Settings' Status Panel (`Settings::status_panel`), one setting for the instance. `None`
+    /// from a server before it: the status display shows, and Settings has no switch.
+    #[serde(default)]
+    pub status_panel: Option<bool>,
     /// Theme colors from ~/.clay/theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
@@ -2562,9 +2722,6 @@ pub struct WebSocketServer {
     pub users: Arc<std::sync::RwLock<HashMap<String, UserCredential>>>,
     /// Ban list for security (shared with HTTP server)
     pub ban_list: BanList,
-    #[cfg(feature = "native-tls-backend")]
-    pub tls_acceptor: Option<Arc<tokio_native_tls::TlsAcceptor>>,
-    #[cfg(feature = "rustls-backend")]
     pub tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
 }
 
@@ -2596,9 +2753,6 @@ impl WebSocketServer {
             multiuser_mode,
             users: Arc::new(std::sync::RwLock::new(HashMap::new())),
             ban_list,
-            #[cfg(feature = "native-tls-backend")]
-            tls_acceptor: None,
-            #[cfg(feature = "rustls-backend")]
             tls_acceptor: None,
         }
     }
@@ -2952,7 +3106,6 @@ impl AckAuditOutcome {
 /// A server's certificate chain and private key from PEM files - a key in PKCS#8, PKCS#1
 /// (RSA) or SEC1 (EC) form. Through rustls's own PEM reader (`rustls::pki_types::pem`):
 /// the rustls-pemfile crate this used to need is unmaintained (RUSTSEC-2025-0134).
-#[cfg(feature = "rustls-backend")]
 pub(crate) fn load_pem_cert_and_key(
     cert_file: &str,
     key_file: &str,
@@ -3192,32 +3345,6 @@ impl WebSocketServer {
     }
 
     /// Configure TLS for WSS support
-    #[cfg(feature = "native-tls-backend")]
-    pub fn configure_tls(&mut self, cert_file: &str, key_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-        use std::fs::File;
-        use std::io::Read;
-
-        // Read certificate file
-        let mut cert_data = Vec::new();
-        File::open(cert_file)?.read_to_end(&mut cert_data)?;
-
-        // Read key file
-        let mut key_data = Vec::new();
-        File::open(key_file)?.read_to_end(&mut key_data)?;
-
-        // Create identity from PEM files
-        let identity = native_tls::Identity::from_pkcs8(&cert_data, &key_data)?;
-
-        // Create TLS acceptor
-        let tls_acceptor = native_tls::TlsAcceptor::new(identity)?;
-        let tls_acceptor = tokio_native_tls::TlsAcceptor::from(tls_acceptor);
-
-        self.tls_acceptor = Some(Arc::new(tls_acceptor));
-        Ok(())
-    }
-
-    /// Configure TLS for WSS support (rustls version)
-    #[cfg(feature = "rustls-backend")]
     pub fn configure_tls(&mut self, cert_file: &str, key_file: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (certs, key) = load_pem_cert_and_key(cert_file, key_file)?;
 
@@ -3442,9 +3569,6 @@ pub async fn start_websocket_server(
     let multiuser_mode = server.multiuser_mode;
     let users = server.users.clone();
     let ban_list = server.ban_list.clone();
-    #[cfg(feature = "native-tls-backend")]
-    let tls_acceptor = server.tls_acceptor.clone();
-    #[cfg(feature = "rustls-backend")]
     let tls_acceptor = server.tls_acceptor.clone();
 
     *running.write().await = true;
@@ -3481,59 +3605,10 @@ pub async fn start_websocket_server(
                             let users = users.clone();
                             let ban_list = ban_list.clone();
                             let password_enabled = *password_enabled.read().unwrap();
-                            #[cfg(feature = "native-tls-backend")]
-                            let tls_acceptor = tls_acceptor.clone();
-                            #[cfg(feature = "rustls-backend")]
                             let tls_acceptor = tls_acceptor.clone();
 
                             tokio::spawn(async move {
-                                // If TLS is enabled, wrap the stream (native-tls)
-                                #[cfg(feature = "native-tls-backend")]
-                                if let Some(acceptor) = tls_acceptor {
-                                    match acceptor.accept(stream).await {
-                                        Ok(tls_stream) => {
-                                            if let Err(_e) = handle_ws_client(
-                                                tls_stream,
-                                                client_id,
-                                                clients,
-                                                password_hash,
-                                                password_enabled,
-                                                allow_list,
-                                                whitelisted_host,
-                                                client_addr,
-                                                event_tx,
-                                                multiuser_mode,
-                                                users,
-                                                ban_list,
-                                                false, // standalone WS-only server: no accept-time knock support
-                                            ).await {
-                                                // Connection error, client disconnected
-                                            }
-                                        }
-                                        Err(_e) => {
-                                            // TLS handshake failed
-                                        }
-                                    }
-                                } else if let Err(_e) = handle_ws_client(
-                                    stream,
-                                    client_id,
-                                    clients,
-                                    password_hash,
-                                    password_enabled,
-                                    allow_list,
-                                    whitelisted_host,
-                                    client_addr,
-                                    event_tx,
-                                    multiuser_mode,
-                                    users,
-                                    ban_list,
-                                    false, // standalone WS-only server: no accept-time knock support
-                                ).await {
-                                    // Connection error, client disconnected
-                                }
-
-                                // If TLS is enabled, wrap the stream (rustls)
-                                #[cfg(feature = "rustls-backend")]
+                                // If TLS is enabled, wrap the stream
                                 if let Some(acceptor) = tls_acceptor {
                                     match acceptor.accept(stream).await {
                                         Ok(tls_stream) => {

@@ -60,8 +60,7 @@ pub mod danger {
         CERT_MISMATCH.get_or_init(|| Mutex::new(None))
     }
 
-    /// Record a pin mismatch for a later UI read (called by both the rustls
-    /// verifier below and the native-tls pin check for the MUD path).
+    /// Record a pin mismatch for a later UI read (called by the `TofuVerifier` below).
     pub fn record_cert_mismatch(host: String, old_fingerprint: String, new_fingerprint: String) {
         if let Ok(mut slot) = cert_mismatch_slot().lock() {
             *slot = Some(CertMismatch { host, old_fingerprint, new_fingerprint });
@@ -87,9 +86,7 @@ pub mod danger {
     /// pins silently) or the fingerprint matches; returns `Err` (and records a
     /// `CertMismatch`) if it differs from the pinned value.
     ///
-    /// Shared by the rustls `TofuVerifier` below and the native-tls MUD path
-    /// (which checks the peer certificate post-handshake since native-tls has no
-    /// pluggable verifier callback — see `platform::check_native_tls_peer_pin`).
+    /// Called by the `TofuVerifier` below during every handshake.
     pub fn check_pin(host_port: &str, fingerprint: &str) -> Result<(), String> {
         match crate::persistence::get_pin(host_port) {
             None => {
@@ -108,10 +105,8 @@ pub mod danger {
     }
 }
 
-// Rustls-specific TOFU verifier. Kept in its own cfg-gated module since it needs
-// rustls's ServerCertVerifier trait/types; the pin logic itself (above) is shared
-// with the native-tls MUD path.
-#[cfg(feature = "rustls-backend")]
+// The TOFU verifier rustls calls during the handshake; the pin logic itself (above)
+// is backend-neutral.
 pub mod danger_rustls {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -199,37 +194,6 @@ pub mod danger_rustls {
             crypto_provider().signature_verification_algorithms.supported_schemes()
         }
     }
-}
-
-/// Post-handshake TOFU pin check for the native-tls MUD path.
-///
-/// native-tls has no pluggable certificate-verifier callback like rustls's
-/// `ServerCertVerifier` (that's a rustls-specific extension point), so it cannot
-/// reject a mismatched certificate *during* the handshake the way `TofuVerifier`
-/// does. Instead, connections still use `danger_accept_invalid_certs(true)` to
-/// complete the handshake (self-signed MUD certs are expected), and this function
-/// is called immediately afterwards with the peer's certificate. On a pin
-/// mismatch it records the same `CertMismatch` the rustls path would and returns
-/// an error; callers must treat that as a failed connection and tear the stream
-/// down rather than using it. Because native-tls (unlike our rustls verifier)
-/// performs its own internal handshake signature verification (it isn't skipped
-/// the way the old `NoCertificateVerification` skipped rustls's), a replayed
-/// certificate without the matching private key still fails the handshake before
-/// this function is ever reached.
-#[cfg(feature = "native-tls-backend")]
-pub fn check_native_tls_peer_pin(
-    host_port: &str,
-    cert: Option<native_tls::Certificate>,
-) -> Result<(), String> {
-    let cert = match cert {
-        Some(c) => c,
-        None => return Err(format!("no peer certificate presented by {}", host_port)),
-    };
-    let der = cert
-        .to_der()
-        .map_err(|e| format!("could not read peer certificate for {}: {}", host_port, e))?;
-    let fingerprint = danger::sha256_hex(&der);
-    danger::check_pin(host_port, &fingerprint)
 }
 
 pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
@@ -1005,22 +969,6 @@ pub(crate) fn tasklist_name(csv: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// What to tell someone whose Clay can't have its port: who has it, and what to do.
-/// `attach` is how this interface attaches to a Clay already running, offered only when
-/// it is (or may be) one.
-#[cfg_attr(not(any(feature = "native-gui", feature = "webview-gui")), allow(dead_code))] // the GUIs' start-up
-pub(crate) fn port_in_use_message(port: u16, attach: &str) -> String {
-    match port_owner(port) {
-        Some(owner) if owner.to_ascii_lowercase().starts_with("clay") => {
-            format!("Clay is already running: {owner} has port {port}. Only one Clay runs at a time. To attach to it: {attach}")
-        }
-        Some(owner) => format!(
-            "Clay can't have its web port {port}: {owner} is using it. Close that program, or give Clay another port (Web settings: /web in clay --console)."
-        ),
-        None => format!("Clay is already running (port {port} is in use). Only one Clay runs at a time. To attach to it: {attach}"),
-    }
-}
-
 /// Check if a process with the given PID is still alive
 #[cfg(all(unix, not(target_os = "android")))]
 pub(crate) fn is_process_alive(pid: u32) -> bool {
@@ -1209,7 +1157,6 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &Pa
     enable_tcp_keepalive(&tcp_stream);
 
     // Establish TLS connection
-    #[cfg(feature = "rustls-backend")]
     let tls_stream = {
         use rustls::RootCertStore;
         use tokio_rustls::TlsConnector;
@@ -1235,35 +1182,6 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &Pa
             Err(_) => return,
         }
     };
-
-    #[cfg(feature = "native-tls-backend")]
-    let tls_stream = {
-        let connector = match native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let connector = tokio_native_tls::TlsConnector::from(connector);
-
-        match connector.connect(host, tcp_stream).await {
-            Ok(s) => {
-                let peer_cert = s.get_ref().peer_certificate().ok().flatten();
-                if check_native_tls_peer_pin(&format!("{}:{}", host, port), peer_cert).is_err() {
-                    return;
-                }
-                s
-            }
-            Err(_) => return,
-        }
-    };
-
-    #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-    {
-        // No TLS backend available
-        return;
-    }
 
     // Step 2: Create Unix socket listener with restrictive permissions
     // Set umask to 0o077 before binding so socket is created with 0o600 atomically
@@ -1533,7 +1451,6 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path
     enable_tcp_keepalive(&tcp_stream);
 
     // Establish TLS connection (same backends as Unix version)
-    #[cfg(feature = "rustls-backend")]
     let tls_stream = {
         use rustls::RootCertStore;
         use tokio_rustls::TlsConnector;
@@ -1558,34 +1475,6 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path
             Err(_) => return,
         }
     };
-
-    #[cfg(feature = "native-tls-backend")]
-    let tls_stream = {
-        let connector = match native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let connector = tokio_native_tls::TlsConnector::from(connector);
-
-        match connector.connect(host, tcp_stream).await {
-            Ok(s) => {
-                let peer_cert = s.get_ref().peer_certificate().ok().flatten();
-                if check_native_tls_peer_pin(&format!("{}:{}", host, port), peer_cert).is_err() {
-                    return;
-                }
-                s
-            }
-            Err(_) => return,
-        }
-    };
-
-    #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-    {
-        return;
-    }
 
     debug_log(is_debug_enabled(), "TLS-PROXY: TLS handshake complete");
 
@@ -2237,6 +2126,8 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // never sees a channel disconnect and would otherwise lose whatever is still
     // batched.
     app.flush_scrollback();
+    // And the maps' (src/map).
+    app.flush_map_store();
 
     // Shell worlds (src/shell). On Linux the PTY survives the exec: clear FD_CLOEXEC on
     // each live master so the successor inherits it, and record world:fd:pid for the
@@ -2367,19 +2258,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // once the accept task sees it, which may be after the successor's first bind.
     let web_port = app.web_listener_port();
 
-    // Shut down HTTP/HTTPS servers to release the port before spawning new process
-    if let Some(ref mut server) = app.http_server {
-        if let Some(tx) = server.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-    }
-    #[cfg(feature = "rustls-backend")]
-    if let Some(ref mut server) = app.https_server {
-        if let Some(tx) = server.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-    }
-    #[cfg(feature = "native-tls-backend")]
+    // Shut down the HTTPS server to release the port before spawning new process
     if let Some(ref mut server) = app.https_server {
         if let Some(tx) = server.shutdown_tx.take() {
             let _ = tx.send(());
@@ -2461,16 +2340,6 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     );
 
     if is_headless {
-        // GUI/headless mode: pass the HTTP listener socket to the child process
-        // so it can reuse port 9000 without rebinding (avoids Windows port zombie issue).
-        if let Some(ref server) = app.http_server {
-            if let Some(handle) = server.listener_handle {
-                if make_inheritable(handle).is_ok() {
-                    std::env::set_var("CLAY_HTTP_LISTENER", handle.to_string());
-                }
-            }
-        }
-
         let mut command = std::process::Command::new(&exe);
         command.args(&args);
         // A GUI let go of its console at startup (FreeConsole), but its standard handles
@@ -3127,7 +2996,6 @@ mod tests {
         crate::persistence::remove_pin(host);
     }
 
-    #[cfg(feature = "rustls-backend")]
     #[test]
     fn test_tofu_verifier_supported_schemes_nonempty() {
         use rustls::client::danger::ServerCertVerifier;
@@ -3145,7 +3013,6 @@ mod tests {
     /// verification instead of the old `assertion()` rubber-stamp — a bare
     /// fingerprint check alone would NOT catch this, since certificates are
     /// public and sent in the clear during the handshake.
-    #[cfg(feature = "rustls-backend")]
     #[tokio::test]
     async fn test_tofu_full_handshake_pin_then_mismatch_then_key_replay_fails() {
         use rcgen::{CertificateParams, KeyPair};

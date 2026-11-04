@@ -76,15 +76,14 @@ BUILD_TARGET=""
 echo ""
 echo "Detecting available features..."
 
-# --- TLS backend ---
-# Always use rustls (works everywhere, no OpenSSL dependency)
-FEATURES="rustls-backend"
-echo "  [+] rustls-backend (TLS)"
+# --- TLS ---
+# Always rustls, built in (pure Rust, no OpenSSL); nothing to choose.
+echo "  [+] rustls (TLS, built in)"
 
 # --- SSH-tunneled transport (--ssh) ---
 # Pure Rust (russh + RustCrypto), no system library dependencies - unlike
-# webview-gui/native-audio below, always included, same as rustls-backend.
-FEATURES="$FEATURES,ssh-transport"
+# webview-gui/native-audio below, always included.
+FEATURES="ssh-transport"
 echo "  [+] ssh-transport (--ssh tunneling)"
 
 # --- musl static linking (Linux only) ---
@@ -96,84 +95,6 @@ if [ "$OS" = "linux" ]; then
     else
         echo "  [-] musl target not installed (will use native target)"
         echo "      Install with: rustup target add $MUSL_TARGET"
-    fi
-fi
-
-# --- WebView GUI ---
-check_webview() {
-    case "$OS" in
-        linux)
-            # Need webkit2gtk and gtk3
-            if command -v pkg-config &> /dev/null; then
-                if pkg-config --exists webkit2gtk-4.1 2>/dev/null && \
-                   pkg-config --exists gtk+-3.0 2>/dev/null; then
-                    return 0
-                fi
-                # Check what's missing for helpful error
-                if ! pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
-                    MISSING_DEPS="$MISSING_DEPS libwebkit2gtk-4.1-dev"
-                fi
-                if ! pkg-config --exists gtk+-3.0 2>/dev/null; then
-                    MISSING_DEPS="$MISSING_DEPS libgtk-3-dev"
-                fi
-            else
-                MISSING_DEPS="$MISSING_DEPS pkg-config"
-            fi
-            return 1
-            ;;
-        macos|windows)
-            # WebView is always available (WKWebView / WebView2)
-            return 0
-            ;;
-        termux)
-            # Need patched tao/wry, webkit2gtk-4.1, and xorgproto
-            local pkgcfg_path="/data/data/com.termux/files/usr/lib/pkgconfig"
-            if ! PKG_CONFIG_PATH="$pkgcfg_path" pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
-                MISSING_DEPS="$MISSING_DEPS webkit2gtk-4.1"
-                echo "      Install: pkg install webkit2gtk-4.1 xorgproto"
-                return 1
-            fi
-            if [ -f "tao-0.34.5-patched/.patched" ] && [ -f "wry-0.48.1-patched/.patched" ]; then
-                # Patched dirs exist but [patch.crates-io] may be missing after git stash/pull
-                if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then
-                    echo "  [?] Re-adding [patch.crates-io] to Cargo.toml..."
-                    cat >> Cargo.toml <<'PATCH'
-
-[patch.crates-io]
-tao = { path = "tao-0.34.5-patched" }
-wry = { path = "wry-0.48.1-patched" }
-PATCH
-                fi
-                return 0
-            elif [ -f "patches/apply-patches.sh" ]; then
-                echo "  [?] WebView patches not applied, applying now..."
-                if ./patches/apply-patches.sh; then
-                    return 0
-                else
-                    echo "  [!] apply-patches.sh failed — webview-gui disabled"
-                fi
-            fi
-            return 1
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-if check_webview; then
-    HAS_WEBVIEW=true
-    FEATURES="$FEATURES,webview-gui"
-    echo "  [+] webview-gui (WebView GUI)"
-else
-    echo "  [-] webview-gui (not available)"
-    if [ -n "$MISSING_DEPS" ]; then
-        echo "      Missing:$MISSING_DEPS"
-        case "$OS" in
-            linux)
-                echo "      Install: sudo apt install$MISSING_DEPS"
-                ;;
-        esac
     fi
 fi
 
@@ -263,6 +184,95 @@ else
     FEATURES="$FEATURES,native-gui"
     NATIVE_LABEL=${NATIVE_TOOLCHAIN#+}
     echo "  [+] native-gui (native GUI, Rust ${NATIVE_LABEL:-$RUST_VERSION})"
+fi
+
+# --- WebView GUI ---
+# The native GUI is Clay's GUI. The WebView GUI is built only where the native one
+# can't be - Termux/Android, a machine without GPUI's libraries or a new enough
+# Rust, or a native build that fails below - so a desktop build carries one GUI.
+check_webview() {
+    case "$OS" in
+        linux)
+            # Need webkit2gtk and gtk3
+            if command -v pkg-config &> /dev/null; then
+                if pkg-config --exists webkit2gtk-4.1 2>/dev/null && \
+                   pkg-config --exists gtk+-3.0 2>/dev/null; then
+                    return 0
+                fi
+                # Check what's missing for helpful error
+                if ! pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+                    MISSING_DEPS="$MISSING_DEPS libwebkit2gtk-4.1-dev"
+                fi
+                if ! pkg-config --exists gtk+-3.0 2>/dev/null; then
+                    MISSING_DEPS="$MISSING_DEPS libgtk-3-dev"
+                fi
+            else
+                MISSING_DEPS="$MISSING_DEPS pkg-config"
+            fi
+            return 1
+            ;;
+        macos|windows)
+            # WebView is always available (WKWebView / WebView2)
+            return 0
+            ;;
+        termux)
+            # Need patched tao/wry, webkit2gtk-4.1, and xorgproto
+            local pkgcfg_path="/data/data/com.termux/files/usr/lib/pkgconfig"
+            if ! PKG_CONFIG_PATH="$pkgcfg_path" pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+                MISSING_DEPS="$MISSING_DEPS webkit2gtk-4.1"
+                echo "      Install: pkg install webkit2gtk-4.1 xorgproto"
+                return 1
+            fi
+            if [ -f "tao-0.34.5-patched/.patched" ] && [ -f "wry-0.48.1-patched/.patched" ]; then
+                # Patched dirs exist but [patch.crates-io] may be missing after git stash/pull
+                if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then
+                    echo "  [?] Re-adding [patch.crates-io] to Cargo.toml..."
+                    cat >> Cargo.toml <<'PATCH'
+
+[patch.crates-io]
+tao = { path = "tao-0.34.5-patched" }
+wry = { path = "wry-0.48.1-patched" }
+PATCH
+                fi
+                return 0
+            elif [ -f "patches/apply-patches.sh" ]; then
+                echo "  [?] WebView patches not applied, applying now..."
+                if ./patches/apply-patches.sh; then
+                    return 0
+                else
+                    echo "  [!] apply-patches.sh failed — webview-gui disabled"
+                fi
+            fi
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+add_webview_if_available() {
+    if check_webview; then
+        HAS_WEBVIEW=true
+        FEATURES="$FEATURES,webview-gui"
+        echo "  [+] webview-gui (WebView GUI)"
+    else
+        echo "  [-] webview-gui (not available)"
+        if [ -n "$MISSING_DEPS" ]; then
+            echo "      Missing:$MISSING_DEPS"
+            case "$OS" in
+                linux)
+                    echo "      Install: sudo apt install$MISSING_DEPS"
+                    ;;
+            esac
+        fi
+    fi
+}
+
+if $HAS_NATIVE_GUI; then
+    echo "  [-] webview-gui (not built: the native GUI is)"
+else
+    add_webview_if_available
 fi
 
 # --- Native audio ---
@@ -372,11 +382,13 @@ if build_with_fallback "$FEATURES" "$BUILD_TARGET" "$EXTRA_RUSTFLAGS" "full feat
     BUILD_OK=true
 fi
 
-# Fallback: try without the native GUI (everything else as before)
+# Fallback: try without the native GUI; the WebView GUI stands in for it where it can
 if ! $BUILD_OK && $HAS_NATIVE_GUI; then
     echo ""
     echo "Full build failed. Retrying without native-gui..."
     FEATURES=$(echo "$FEATURES" | sed 's/,native-gui//')
+    HAS_NATIVE_GUI=false
+    add_webview_if_available
     if build_with_fallback "$FEATURES" "$BUILD_TARGET" "$EXTRA_RUSTFLAGS" "without native-gui ($FEATURES)"; then
         BUILD_OK=true
     fi
@@ -408,9 +420,9 @@ fi
 if ! $BUILD_OK && [ "$OS" = "linux" ] && $HAS_MUSL; then
     echo ""
     echo "Build failed. Retrying with musl static build..."
-    if build_with_fallback "rustls-backend,ssh-transport" "--target x86_64-unknown-linux-musl --no-default-features" "" "musl static (rustls-backend,ssh-transport only)"; then
+    if build_with_fallback "ssh-transport" "--target x86_64-unknown-linux-musl --no-default-features" "" "musl static (ssh-transport only)"; then
         BUILD_OK=true
-        FEATURES="rustls-backend,ssh-transport"
+        FEATURES="ssh-transport"
         BUILD_TARGET="--target x86_64-unknown-linux-musl --no-default-features"
     fi
 fi
@@ -419,9 +431,9 @@ fi
 if ! $BUILD_OK; then
     echo ""
     echo "All attempts failed. Trying minimal build..."
-    if build_with_fallback "rustls-backend,ssh-transport" "--no-default-features" "" "minimal (rustls-backend,ssh-transport only)"; then
+    if build_with_fallback "ssh-transport" "--no-default-features" "" "minimal (ssh-transport only)"; then
         BUILD_OK=true
-        FEATURES="rustls-backend,ssh-transport"
+        FEATURES="ssh-transport"
     fi
 fi
 

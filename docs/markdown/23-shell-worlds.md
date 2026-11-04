@@ -52,6 +52,15 @@ world where you need every key, use the desktop GUI, the WebView, or the console
 including with an input method (IME) and on a phone's on-screen keyboard, is sent to the
 terminal as you type.
 
+On a phone, the Clay app tells the on-screen keyboard not to build words in a shell world
+(no suggestions or autocorrect there), so each letter goes to the shell as you press it and
+nothing collects in the input box. A phone's web browser can't be told this: there each
+letter is still sent as you type it, and when the keyboard rewrites a word (its own
+Backspace, an autocorrection) the shell is sent Backspaces and the new letters. That is
+fine at a shell prompt; in a full-screen program such as an editor, use the app. On a
+desktop, an input method's composition (Chinese, Japanese, Korean) is sent once you pick
+the text.
+
 ## What a shell world does not do
 
 A shell world is deliberately plain: its output is **not** logged, archived, searched

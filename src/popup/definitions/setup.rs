@@ -48,6 +48,15 @@ pub const SETUP_FIELD_TEXT_REVEAL: FieldId = FieldId(30);
 /// The console's separator-bar style (`Settings::separator_style`): one global setting,
 /// shown in every interface's Settings (user ruling 2026-10-27).
 pub const SETUP_FIELD_SEPARATOR_STYLE: FieldId = FieldId(31);
+/// This console's own Screen Reader mode (`Settings::screen_reader`; an attached
+/// console's is kept by the server under its key).
+pub const SETUP_FIELD_SCREEN_READER: FieldId = FieldId(32);
+/// "MUDs: Screen Reader" (`Settings::announce_screen_reader`): tell MUDs a screen reader is
+/// in use (MTTS), one global setting.
+pub const SETUP_FIELD_ANNOUNCE_SCREEN_READER: FieldId = FieldId(33);
+/// Status Line (`Settings::status_panel`, the GUIs' Status Panel): the MUD's status display
+/// at all, one setting for the instance.
+pub const SETUP_FIELD_STATUS_LINE: FieldId = FieldId(34);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -165,13 +174,10 @@ pub fn tts_speak_mode_options() -> Vec<SelectOption> {
     ]
 }
 
-/// World-tabs ribbon display options (web/GUI/Android only)
+/// Where the world tabs go (web/GUI/Android only; hidden in the console, kept so a Save
+/// sends the shared value back unchanged): `TabsMode::OPTIONS`, the one list.
 pub fn tabs_options() -> Vec<SelectOption> {
-    vec![
-        SelectOption::new("none", "None"),
-        SelectOption::new("top", "Show Top Ribbon"),
-        SelectOption::new("bottom", "Show Bottom Ribbon"),
-    ]
+    crate::TabsMode::OPTIONS.iter().map(|(value, label)| SelectOption::new(*value, *label)).collect()
 }
 
 /// Icon bar visibility options (web/GUI/Android only)
@@ -272,7 +278,7 @@ pub fn create_setup_popup(
     let text_reveal_idx = text_reveal_index(text_reveal);
     let tts_mode_idx = tts_mode_index(tts_mode);
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
-    let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
+    let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).or_else(|| tabs_options().iter().position(|o| o.value == "none")).unwrap_or(0);
     let icon_bar_idx = icon_bar_options().iter().position(|o| o.value == icon_bar).unwrap_or(1);
     let picture_host_idx = picture_host_options().iter().position(|o| o.value == picture_host).unwrap_or(0);
     let separator_style_idx = separator_style_options().iter().position(|o| o.value == separator_style).unwrap_or(0);
@@ -432,6 +438,22 @@ pub fn create_setup_popup(
     def
 }
 
+/// The Screen Reader rows, after Text Reveal (which Screen Reader mode turns off): this
+/// console's own mode, and "MUDs: Screen Reader", which tells MUDs (MTTS). Added to the
+/// popup `create_setup_popup` built, by both consoles.
+pub fn add_screen_reader_fields(def: &mut PopupDefinition, screen_reader: bool, announce: bool) {
+    let at = def.fields.iter().position(|f| f.id == SETUP_FIELD_TEXT_REVEAL).map_or(def.fields.len(), |i| i + 1);
+    def.fields.insert(at, Field::new(SETUP_FIELD_SCREEN_READER, "Screen Reader", FieldKind::toggle(screen_reader)));
+    def.fields.insert(at + 1, Field::new(SETUP_FIELD_ANNOUNCE_SCREEN_READER, "MUDs: Screen Reader", FieldKind::toggle(announce)));
+}
+
+/// The Status Line row (`Settings::status_panel`), after ANSI Music. Added to the popup
+/// `create_setup_popup` built, by both consoles.
+pub fn add_status_line_field(def: &mut PopupDefinition, on: bool) {
+    let at = def.fields.iter().position(|f| f.id == SETUP_FIELD_ANSI_MUSIC).map_or(def.fields.len(), |i| i + 1);
+    def.fields.insert(at, Field::new(SETUP_FIELD_STATUS_LINE, "Status Line", FieldKind::toggle(on)));
+}
+
 /// The Import button (Import Settings), for the master console (a remote console has no
 /// `/import`, as its `/menu` has no Import Settings).
 pub fn add_import_button(def: &mut PopupDefinition) {
@@ -523,6 +545,11 @@ fn setup_help_text() -> Vec<String> {
         "  two separate emoji instead of one combined one.",
         "",
         "ANSI Music: Play ANSI music sequences from MUDs.",
+        "",
+        "Status Line: Show the stats a game sends (HP, mana...",
+        "  over GMCP or MSDP) above the bar, in every interface",
+        "  (the GUIs' Status Panel). Off hides them for every",
+        "  world; Edit World has a switch for one world.",
         "",
         "New Indicator: How text that arrived while you were",
         "  in another world is marked. Character: a green ▶",

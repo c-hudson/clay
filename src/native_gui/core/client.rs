@@ -189,6 +189,9 @@ pub struct World {
     pub echo_masked: bool,
     /// The MUD status display's rows (GMCP/MSDP), empty when it has none.
     pub stats: Vec<StatEntry>,
+    /// The world's map as the server sends it (src/map): where you are, the walk, the
+    /// rooms of the areas the map pane has shown.
+    pub map: crate::map::app::MirroredMap,
     /// TF's status area for this world, once a script has made it its own.
     pub tf_status: Option<StatusView>,
     /// When a line last went to or came from the MUD (Recent Worlds): seeded from
@@ -360,6 +363,12 @@ pub struct ClientCore {
     /// The server takes `RequestHistory` (`InitialState.history_on_demand`): scrolling up
     /// past everything held asks it for older lines, then its archive's.
     pub server_history_on_demand: bool,
+    /// The server has the map (`InitialState.map`): it takes MapWatch, MapRoute, MapStop
+    /// and MapSearch.
+    pub server_map: bool,
+    /// What this window's map pane shows (`MapWatch`): sent when it changes and after
+    /// every login (empty too: the server then knows this window has a pane).
+    map_views: Vec<crate::map::wire::MapViewReq>,
     /// The server's build, for the `Remote` line of `/version` (`version_lines`).
     server_version_detail: Option<String>,
     requests: HashMap<u64, (RequestKind, usize, Instant)>,
@@ -421,6 +430,8 @@ impl ClientCore {
             server_expands_line: false,
             server_picture_upload: false,
             server_history_on_demand: false,
+            server_map: false,
+            map_views: Vec::new(),
             server_version_detail: None,
             requests: HashMap::new(),
             next_request_id: 1,
@@ -887,6 +898,27 @@ impl ClientCore {
         self.take()
     }
 
+    /// What the map pane shows (none when it is closed): the server hears it when it
+    /// changes, and again after each login.
+    pub fn map_watch(&mut self, views: Vec<crate::map::wire::MapViewReq>) -> Vec<Effect> {
+        if views != self.map_views {
+            self.map_views = views;
+            if self.phase == Phase::Online && self.server_map {
+                self.send(WsMessage::MapWatch { views: self.map_views.clone() });
+            }
+        }
+        self.take()
+    }
+
+    /// A map request to the server (MapRoute, MapStop, MapSearch), when it has the map
+    /// and this client is online.
+    pub fn map_send(&mut self, msg: WsMessage) -> Vec<Effect> {
+        if self.phase == Phase::Online && self.server_map {
+            self.send(msg);
+        }
+        self.take()
+    }
+
     /// Release `count` screen rows of the server's held output for `world` (0 = all),
     /// counting them released straight away as app.js does.
     pub fn release_pending(&mut self, world: usize, count: usize) -> Vec<Effect> {
@@ -1147,7 +1179,8 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, map, .. } => {
+                self.server_map = map;
                 self.server_version_detail = crate::server_version_detail(&server_version_detail, &server_version);
                 self.server_takes_other_views = other_views;
                 self.server_expands_line = expand_line;
@@ -1367,6 +1400,23 @@ impl ClientCore {
             WsMessage::StatsUpdate { world_index, stats } => {
                 if let Some(w) = self.worlds.get_mut(world_index) {
                     w.stats = stats;
+                    self.changed();
+                }
+            }
+            // The map (src/map): where you are and the walk; an area's rooms.
+            WsMessage::MapState { world_index, state } => {
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.map.state = state;
+                    self.changed();
+                }
+            }
+            WsMessage::MapArea { world_index, area, area_name, level, levels, replace, rooms, .. } => {
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.map.note_area_name(&area, &area_name);
+                    if !levels.is_empty() {
+                        w.map.levels.insert(area.clone(), levels);
+                    }
+                    w.map.apply_area(area, level, replace, rooms);
                     self.changed();
                 }
             }
@@ -1593,6 +1643,7 @@ impl ClientCore {
             gmcp_user_enabled: m.gmcp_user_enabled,
             echo_masked: m.echo_masked,
             stats: m.stats.clone(),
+            map: crate::map::app::MirroredMap { state: m.map.clone(), ..Default::default() },
             shell: m.shell.as_ref().map(crate::shell::ShellScreen::from_state_msg),
             last_activity: [m.last_recv_secs, m.last_send_secs]
                 .into_iter()
@@ -1711,6 +1762,11 @@ impl ClientCore {
             self.send_view_state();
             if !self.other_views.is_empty() && self.server_takes_other_views {
                 self.send_other_views();
+            }
+            // Always, even with the pane closed: it tells the server this window has a
+            // map pane, so a `/map` an action runs comes back here to show it.
+            if self.server_map {
+                self.send(WsMessage::MapWatch { views: self.map_views.clone() });
             }
             if self.visible {
                 self.send(WsMessage::MarkWorldSeen { world_index: self.current, previous_world_index: None, other_views: None });
@@ -2302,6 +2358,11 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         font_profile: s.font_update_for(crate::font_profile::native_key()),
         // This GUI's own text-to-speech, once the server keeps them and it has one.
         tts_profile: s.tts_profile_update(crate::font_profile::native_key()),
+        tabs_profile: s.tabs_profile_update(crate::font_profile::native_key()),
+        screen_reader_profile: s.screen_reader_profile_update(crate::font_profile::native_key()),
+        announce_screen_reader: Some(s.announce_screen_reader),
+        // None from a server before Status Panel: nothing to send back.
+        status_panel: s.status_panel,
     }
 }
 

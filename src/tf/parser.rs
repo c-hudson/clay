@@ -2432,10 +2432,10 @@ Usage: $[function(args)] or in /expr//test"#.to_string()
 Clay:
   /setup  /web  /actions  /menu  /connections
   /world  /server  /disconnect  /dc  /addworld  /unworld
-  /reload  /version  /quit  /remote  /ban  /unban
+  /reload  /version  /quit  /remote  /pause  /ban  /unban
   /flush  /dump  /note  /tag  /notify  /import  /window
   /font  /update  /dict  /urban  /translate  /url  /testmusic
-  /mssp  /msdp  /stats  /chat  /split  /unsplit
+  /mssp  /msdp  /stats  /chat  /split  /unsplit  /map
 Variables:
   /set  /unset  /let  /setenv  /listvar  /toggle  /export
 Expressions & Control Flow:
@@ -4660,8 +4660,8 @@ mod tests {
         // (reachable via `main.rs::parse_command`), plus the `/tf<name>` prefix escape.
         const CLAY_NATIVE_ONLY: &[&str] = &[
             "actions", "chat", "dict", "dump", "flush", "font", "import",
-            "menu", "msdp", "mssp", "note", "notify", "reload", "remote", "server", "setup", "stats", "tag",
-            "split", "testmusic", "tfgag", "tfhelp", "translate", "tts", "unban", "unsplit", "update",
+            "menu", "msdp", "mssp", "note", "notify", "pause", "reload", "remote", "server", "setup", "stats", "tag",
+            "map", "split", "testmusic", "tfgag", "tfhelp", "translate", "tts", "unban", "unsplit", "update",
             "urban", "url", "web", "window",
         ];
 

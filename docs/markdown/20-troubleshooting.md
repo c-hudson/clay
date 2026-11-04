@@ -249,7 +249,7 @@ Common issues and their solutions.
 **Symptoms:** Link errors
 
 **Solutions:**
-1. Use `--no-default-features --features rustls-backend,ssh-transport` for minimal
+1. Use `--no-default-features --features ssh-transport` for minimal
    deps (add `,ssh-transport` or `--ssh` silently stops working instead of erroring)
 2. Check platform-specific requirements
 3. Update Rust: `rustup update`

@@ -503,6 +503,7 @@
         // Status/vitals panel (mud-status-display.md Job 3)
         statsPanel: document.getElementById('stats-panel'),
         statsPanelHeader: document.getElementById('stats-panel-header'),
+        statsPanelHide: document.getElementById('stats-panel-hide'),
         statsPanelToggle: document.getElementById('stats-panel-toggle'),
         statsPanelBody: document.getElementById('stats-panel-body'),
         // World-tabs ribbon
@@ -685,6 +686,8 @@
         worldEditMcpEnabledToggle: document.getElementById('world-edit-mcp-enabled-toggle'),
         worldEditMccp2EnabledField: document.getElementById('world-edit-mccp2-enabled-field'),
         worldEditMccp2EnabledToggle: document.getElementById('world-edit-mccp2-enabled-toggle'),
+        worldEditStatusPanelField: document.getElementById('world-edit-status-panel-field'),
+        worldEditStatusPanelToggle: document.getElementById('world-edit-status-panel-toggle'),
         worldEditSlackTokenField: document.getElementById('world-edit-slack-token-field'),
         worldEditSlackToken: document.getElementById('world-edit-slack-token'),
         worldEditSlackChannelField: document.getElementById('world-edit-slack-channel-field'),
@@ -749,6 +752,9 @@
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
         setupClearInputToggle: document.getElementById('setup-clear-input-toggle'),
+        setupScreenReaderToggle: document.getElementById('setup-screen-reader-toggle'),
+        setupAnnounceScreenReaderToggle: document.getElementById('setup-announce-screen-reader-toggle'),
+        setupStatusPanelToggle: document.getElementById('setup-status-panel-toggle'),
         setupTaskbarAlertToggle: document.getElementById('setup-taskbar-alert-toggle'),
         setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
@@ -1559,6 +1565,9 @@
     let setupAnsiMusic = true;
     let setupZwj = false;
     let setupClearInput = false;
+    let setupScreenReader = false;
+    let setupAnnounceScreenReader = false;
+    let setupStatusPanel = true;
     let setupTaskbarAlert = false;
     let setupTtsMode = 'Off';
     let setupTabsMode = 'none';
@@ -1815,8 +1824,269 @@
     let statsPanelRows = new Map(); // stat key -> {row, fillEl, valueEl, isGauge}
     let statsPanelSignature = null; // last-rendered "key:kind|..." shape, or null when hidden
 
-    // World-tabs ribbon mode, synced from server settings ('none', 'top', 'bottom')
+    // Where this page's world tabs go ('top', 'bottom', 'left', 'right', 'none'): its own
+    // choice under fontProfileKey (user ruling 2026-11-01), else the server's shared one.
     let tabsMode = 'none';
+    let tabsShared = 'none';   // the server's shared Tabs, for an interface without its own
+    let tabsProfiles = null;   // each interface's own; null = a server before the split
+    function myTabsMode() {
+        return (tabsProfiles && tabsProfiles[fontProfileKey]) || tabsShared || 'none';
+    }
+    function receiveTabs(settings) {
+        if (settings.tabs !== undefined) tabsShared = settings.tabs || 'none';
+        tabsProfiles = settings.tabs_profiles ? Object.assign({}, settings.tabs_profiles) : null;
+        applyTabsMode(myTabsMode());
+    }
+
+    // ─── Screen Reader mode (docs/markdown/24-accessibility.md) ───
+    // Per interface: this page's own, under fontProfileKey, off until it chose one. On: each
+    // new line is announced once, as plain text, as it is shown (#sr-announcer; never from a
+    // redraw); Text Reveal is off; nothing pulls the focus back to the input; phones keep
+    // their native <select>s; F6 / Shift+F6 move between the page's regions. The server stops
+    // sending this page's TTS (App::speak_arrivals), so nothing is read twice.
+    let screenReader = false;
+    let screenReaderProfiles = null;  // each interface's own; null = a server before the mode
+    let announceScreenReader = false; // "MUDs: Screen Reader": tell MUDs (MTTS); one setting
+    // Settings' Status Panel, one setting for the instance (each world has its own in Edit
+    // World); null = a server from before it (shown, and no switch).
+    let statusPanelSetting = null;
+    function screenReaderDetected() {
+        try {
+            return !!(window.Android && typeof Android.isScreenReaderOn === 'function' && Android.isScreenReaderOn());
+        } catch (e) {
+            return false;
+        }
+    }
+    function receiveScreenReader(settings) {
+        screenReaderProfiles = settings.screen_reader_profiles ? Object.assign({}, settings.screen_reader_profiles) : null;
+        announceScreenReader = !!settings.announce_screen_reader;
+        let on = !!(screenReaderProfiles && screenReaderProfiles[fontProfileKey]);
+        // A screen reader is running (TalkBack) and this interface never chose: turn the mode
+        // on, once, and keep it so; the user can turn it off in Settings.
+        if (screenReaderProfiles && !(fontProfileKey in screenReaderProfiles) && screenReaderDetected()) {
+            screenReaderProfiles[fontProfileKey] = true;
+            on = true;
+            setTimeout(sendGlobalSettings, 0);
+        }
+        applyScreenReader(on);
+    }
+    function applyScreenReader(on) {
+        const changed = screenReader !== on;
+        screenReader = on;
+        document.body.classList.toggle('screen-reader', on);
+        if (!changed) return;
+        // Phones and tablets swap their <select>s for drawn dropdowns a screen reader can't
+        // work; with the mode on they keep the native ones.
+        if (deviceMode === 'phone' || deviceMode === 'tablet') {
+            destroyCustomDropdowns();
+            if (!on) initCustomDropdowns();
+        }
+        applyKeyboardForceState();
+    }
+    // One shown line, as a screen reader should hear it: the text alone.
+    function announceLine(text) {
+        const box = document.getElementById('sr-announcer');
+        if (!box) return;
+        const plain = (stripMudTag(stripAnsi(String(text))) || '').replace(/[\u200b\u2060\ufeff]/g, '').trim();
+        if (!plain) return;
+        const row = document.createElement('div');
+        row.textContent = plain;
+        box.appendChild(row);
+        while (box.childNodes.length > 20) box.removeChild(box.firstChild);
+    }
+
+    // Names, roles and keyboard reach for the page's clickable controls that aren't real
+    // buttons (divs and spans with click handlers): a screen reader announces them, Tab
+    // reaches them, Enter or Space clicks them (a11yKeys). Run at start and by each render
+    // that rebuilds them (icon bar, tabs, world menu, dialogs). Always on: nothing on screen
+    // changes.
+    const A11Y_CONTROLS = [
+        ['#menu-btn, #nav-menu-btn', 'button', 'Menu'],
+        ['.icon-tile', 'button', null],
+        ['.icon-bar-arrow', 'button', null],
+        ['.status-item', 'button', null],
+        ['.status-note-btn', 'button', 'Notes'],
+        ['#status-more, .pane-bar .status-more', 'button', null],
+        ['#activity-indicator', 'button', null],
+        ['.stats-panel-header', 'button', null],
+        ['.tabs-ribbon-arrow', 'button', null],
+        ['.tabs-ribbon-tab', 'tab', null],
+        ['.menu-item', 'menuitem', null],
+        ['.toggle', 'switch', null],
+        ['.popup-close', 'button', 'Close'],
+    ];
+    function a11yLabelOf(el, role) {
+        if (role === 'switch') {
+            const row = el.closest('.setting-row');
+            const label = row && row.querySelector('.setting-label');
+            if (label) return label.textContent.trim();
+        }
+        return el.getAttribute('title');
+    }
+    function a11yUpgrade(root) {
+        const scope = root || document;
+        A11Y_CONTROLS.forEach(function(c) {
+            const sel = c[0], role = c[1], label = c[2];
+            scope.querySelectorAll(sel).forEach(function(el) {
+                if (/^(BUTTON|INPUT|SELECT|TEXTAREA|A)$/.test(el.tagName)) {
+                    if (label && !el.getAttribute('aria-label')) el.setAttribute('aria-label', label);
+                    return;
+                }
+                if (el.getAttribute('role') !== role) el.setAttribute('role', role);
+                if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', role === 'menuitem' ? '-1' : '0');
+                const name = label || a11yLabelOf(el, role);
+                if (name && el.getAttribute('aria-label') !== name) el.setAttribute('aria-label', name);
+                if (role === 'switch') el.setAttribute('aria-checked', el.classList.contains('active') ? 'true' : 'false');
+                if (role === 'tab') el.setAttribute('aria-selected', el.classList.contains('active') ? 'true' : 'false');
+            });
+        });
+        scope.querySelectorAll('.tabs-ribbon-tabs').forEach(function(el) {
+            el.setAttribute('role', 'tablist');
+            el.setAttribute('aria-label', 'Worlds');
+        });
+        scope.querySelectorAll('.menu-dropdown').forEach(function(el) { el.setAttribute('role', 'menu'); });
+    }
+
+    // Keys for those controls (capture phase, before the page's own key handling): Enter or
+    // Space clicks one; arrows move through an open menu, Escape closes it and returns to
+    // its button; F6 / Shift+F6 (Screen Reader mode) move between the regions.
+    let menuAnchor = null;
+    function a11yKeys(e) {
+        // A walk (src/map) stops on Escape; the key goes on to do what it always does.
+        if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.metaKey && mapWalking()) {
+            send({ type: 'MapStop', world_index: currentWorldIndex });
+        }
+        if (screenReader && e.key === 'F6' && !e.ctrlKey && !e.altKey && !e.metaKey && !tfBoundKeys.has(keyEventToName(e))) {
+            e.preventDefault();
+            e.stopPropagation();
+            cycleRegion(e.shiftKey ? -1 : 1);
+            return;
+        }
+        const t = e.target;
+        if (!t || t === elements.input || !t.getAttribute) return;
+        const role = t.getAttribute('role');
+        if ((e.key === 'Enter' || e.key === ' ') && t.tagName !== 'BUTTON' && (role === 'button' || role === 'menuitem' || role === 'switch' || role === 'tab')) {
+            e.preventDefault();
+            e.stopPropagation();
+            t.click();
+            return;
+        }
+        const menu = t.closest && t.closest('[role="menu"]');
+        if (!menu) return;
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
+            const items = Array.from(menu.querySelectorAll('[role="menuitem"]')).filter(function(i) { return i.offsetParent !== null; });
+            if (!items.length) return;
+            const at = items.indexOf(t);
+            let next = e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1
+                : e.key === 'ArrowDown' ? (at + 1) % items.length : (at - 1 + items.length) % items.length;
+            items[next].focus();
+            e.preventDefault();
+            e.stopPropagation();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            if (menuOpen) closeMenu();
+            if (worldMenuOpen) closeWorldMenu();
+            if (menuAnchor && menuAnchor.isConnected) menuAnchor.focus(); else elements.input.focus();
+        }
+    }
+    function focusFirstMenuItem(menu) {
+        const first = Array.from(menu.querySelectorAll('[role="menuitem"]')).find(function(i) { return i.offsetParent !== null; });
+        if (first) first.focus();
+    }
+    // F6: the input, the output, the tabs, the bar's world; Shift+F6 back.
+    function cycleRegion(dir) {
+        const regions = [
+            elements.input,
+            elements.outputContainer,
+            document.querySelector('.tabs-ribbon-tab.active'),
+            elements.statusItem,
+            document.getElementById('map-pane'),
+        ].filter(function(el) { return el && el.offsetParent !== null; });
+        if (!regions.length) return;
+        const active = document.activeElement;
+        let at = regions.findIndex(function(r) { return r === active || r.contains(active); });
+        at = at < 0 ? 0 : (at + dir + regions.length) % regions.length;
+        const target = regions[at];
+        if (!target.hasAttribute('tabindex') && !/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(target.tagName)) target.setAttribute('tabindex', '-1');
+        target.focus();
+    }
+
+    // Every dialog - the static .modal ones and the ones built in JS - is announced as a
+    // modal dialog named by its title; in Screen Reader mode the focus goes into it as it
+    // opens and back to where it was when it closes.
+    let dialogTitleSeq = 0;
+    function dialogShown(m) {
+        return m.classList.contains('visible') || m.style.display === 'flex' || m.style.display === 'block';
+    }
+    function a11yDialog(m) {
+        const box = m.querySelector('.modal-content') || m;
+        if (!box.getAttribute('role')) box.setAttribute('role', 'dialog');
+        box.setAttribute('aria-modal', 'true');
+        const title = box.querySelector('.popup-title, .modal-title, .modal-header h2, h2, h3');
+        if (title) {
+            if (!title.id) title.id = 'dialog-title-' + (++dialogTitleSeq);
+            box.setAttribute('aria-labelledby', title.id);
+        }
+        a11yUpgrade(m);
+    }
+    function firstFocusable(m) {
+        return Array.from(m.querySelectorAll('input:not([type="hidden"]), select, textarea, button, [role="button"], [role="switch"], [tabindex="0"]'))
+            .find(function(el) { return el.offsetParent !== null && !el.disabled; });
+    }
+    function dialogOpened(m) {
+        a11yDialog(m);
+        m._a11yOpener = document.activeElement;
+        if (!screenReader) return;
+        requestAnimationFrame(function() {
+            if (m.contains(document.activeElement)) return;
+            const f = firstFocusable(m);
+            if (f) f.focus();
+        });
+    }
+    function dialogClosed(m) {
+        const opener = m._a11yOpener;
+        m._a11yOpener = null;
+        if (!screenReader) return;
+        requestAnimationFrame(function() {
+            if (opener && opener.isConnected && opener.offsetParent !== null && opener !== document.body) opener.focus();
+        });
+    }
+    function watchDialogs() {
+        if (!window.MutationObserver) return;
+        const check = function(m) {
+            const shown = dialogShown(m);
+            if (shown === !!m._a11yShown) return;
+            m._a11yShown = shown;
+            if (shown) dialogOpened(m); else dialogClosed(m);
+        };
+        const attrs = new MutationObserver(function(recs) { recs.forEach(function(r) { check(r.target); }); });
+        const watch = function(m) {
+            if (m._a11yWatched) return;
+            m._a11yWatched = true;
+            attrs.observe(m, { attributes: true, attributeFilter: ['class', 'style'] });
+            check(m);
+        };
+        document.querySelectorAll('.modal').forEach(watch);
+        // Dialogs built in JS are added to the page open and removed to close.
+        new MutationObserver(function(recs) {
+            recs.forEach(function(r) {
+                r.addedNodes.forEach(function(n) {
+                    if (n.nodeType !== 1) return;
+                    if (n.classList.contains('modal')) watch(n);
+                    else if (n.querySelector && n.querySelector('.js-dialog')) { n._a11yShown = true; dialogOpened(n); }
+                });
+                r.removedNodes.forEach(function(n) {
+                    if (n.nodeType === 1 && n._a11yShown && !(n.classList && n.classList.contains('modal'))) dialogClosed(n);
+                });
+            });
+        }).observe(document.body, { childList: true });
+        // A switch's state follows its class.
+        const toggles = new MutationObserver(function(recs) {
+            recs.forEach(function(r) { r.target.setAttribute('aria-checked', r.target.classList.contains('active') ? 'true' : 'false'); });
+        });
+        document.querySelectorAll('.toggle').forEach(function(t) { toggles.observe(t, { attributes: true, attributeFilter: ['class'] }); });
+    }
     // Icon bar visibility mode, synced from server settings ('none', 'app_tablet', 'all')
     let iconBarMode = 'app_tablet';
     // Import Picture's host (Settings > General; src/picture.rs). '' = a server from before
@@ -2296,7 +2566,7 @@
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'reach', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'server', 'import',
-        'flush', 'menu', 'split', 'unsplit', 'send', 'remote', 'ban', 'unban',
+        'flush', 'menu', 'split', 'unsplit', 'send', 'remote', 'pause', 'ban', 'unban',
         'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say', 'tts',
         'log', 'unworld', 'chat', 'discord', 'slack',
@@ -2507,9 +2777,11 @@
     // by Java via window.onHardwareKeyboardChanged; always false on non-Android
     // clients, so this reduces to the old deviceMode check there).
     function keyboardForceEnabled() {
+        // Screen Reader mode: the focus stays where the screen reader put it.
         return keyboardAlwaysVisible
             && (deviceMode === 'phone' || deviceMode === 'tablet')
-            && !hardwareKeyboardPresent;
+            && !hardwareKeyboardPresent
+            && !screenReader;
     }
 
     // Push the current keyboardForceEnabled() verdict to the native Android layer
@@ -2548,6 +2820,8 @@
     let activeCustomDropdown = null;
 
     function initCustomDropdowns() {
+        // Screen Reader mode keeps the native <select>s, which a screen reader can work.
+        if (screenReader) return;
         document.querySelectorAll('select.form-select').forEach(select => {
             // Create wrapper
             const wrapper = document.createElement('div');
@@ -2885,6 +3159,14 @@
 
     // Initialize
     function init() {
+        // Screen readers: names and roles for the clickable controls, dialogs announced and
+        // focused, keys for them (capture phase: before the page's own key handling); the
+        // output can take the focus (F6) to be read and scrolled.
+        a11yUpgrade(document);
+        setupMapPane();
+        watchDialogs();
+        document.addEventListener('keydown', a11yKeys, true);
+        if (elements.outputContainer && !elements.outputContainer.hasAttribute('tabindex')) elements.outputContainer.setAttribute('tabindex', '-1');
         // Capture Ctrl+W at window level to prevent browser from closing tab
         // Uses capture phase (true) to intercept before any other handlers
         window.addEventListener('keydown', function(e) {
@@ -4028,6 +4310,12 @@
                 // The server takes OtherViews (a split's other pane).
                 serverTakesOtherViews = !!msg.other_views;
                 lastOtherViewsSent = null;
+                // The server has the map (src/map): its pane is told again what to show
+                // (MapWatch, from updateStatusBar once the worlds are in).
+                serverMap = !!msg.map;
+                lastMapWatch = null;
+                mapData = {};
+                (msg.worlds || []).forEach(function(w, i) { if (w.map) mapOf(i).state = w.map; });
                 // The server's build, for /version's Remote line; from a server before
                 // that field, its version number alone.
                 serverVersionDetail = msg.server_version_detail ||
@@ -4492,7 +4780,9 @@
                     }
                     taskbarAlert = !!msg.settings.taskbar_alert;
                     applyTtsSettings(msg.settings);
-                    if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
+                    receiveTabs(msg.settings);
+                    receiveScreenReader(msg.settings);
+                    receiveStatusPanel(msg.settings);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
                     // This page's own Text Reveal, under its interface key (per interface,
@@ -5405,7 +5695,9 @@
                     }
                     taskbarAlert = !!msg.settings.taskbar_alert;
                     applyTtsSettings(msg.settings);
-                    if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
+                    receiveTabs(msg.settings);
+                    receiveScreenReader(msg.settings);
+                    receiveStatusPanel(msg.settings);
                     if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
                     // This page's own Text Reveal, under its interface key (per interface,
@@ -5827,6 +6119,20 @@
                 if (noteSaveClose && msg.world_index === noteSaveClose.world_index) {
                     closeNoteEditor();
                 }
+                break;
+
+            // The map (src/map): where you are, an area's rooms, a route, a search.
+            case 'MapState':
+                mapOnState(msg);
+                break;
+            case 'MapArea':
+                mapOnArea(msg);
+                break;
+            case 'MapRouteResult':
+                mapOnRoute(msg);
+                break;
+            case 'MapSearchResult':
+                mapOnSearch(msg);
                 break;
 
             case 'StatsUpdate':
@@ -7651,6 +7957,12 @@
             return;
         }
 
+        // /map's pane forms are this page's own (its map pane); the rest go to the server.
+        if (/^\/@?map(\s|$)/i.test(cmdTrimmed) && mapPaneCommand(cmdTrimmed)) {
+            elements.input.value = '';
+            return;
+        }
+
         // Intercept /window --grep locally only — this opens a client-side filtered
         // view that the server has no concept of (parse_command's Command::Window
         // only knows a plain world-name argument, so a --grep string would be
@@ -8246,6 +8558,12 @@
                 splitCommand(trimmed);
                 break;
 
+            // A /map pane form the server sent back (typed or run there): this page's pane.
+            case '/map':
+            case '/@map':
+                mapPaneCommand(trimmed);
+                break;
+
             case '/web':
                 openSettingsPopup('web');
                 break;
@@ -8583,6 +8901,324 @@
         }
     }
 
+    // ─── Map pane (src/map; docs/markdown/25-mapper.md) ───
+    // The server builds each world's map from the rooms the game reports over GMCP and
+    // sends it to a page that shows its pane: MapState (where you are, the walk) and
+    // MapArea (the rooms of the area's level the pane shows, whole or just what changed).
+    // A room clicked asks MapRoute for its route; Walk here asks it to walk there; Stop and
+    // Esc send MapStop. This page tells the server what its pane shows with MapWatch, after
+    // every InitialState and whenever that changes.
+    let serverMap = false;       // InitialState.map
+    let mapOpen = false;
+    try { mapOpen = localStorage.getItem('clay_map_open') === '1'; } catch (e) {}
+    let mapView = { area: null, level: null };  // null: follow you
+    let mapZoom = 1;
+    let mapPan = { x: 0, y: 0 };
+    let mapData = {};            // world index -> { state, areas: { 'area|level': rooms }, levels: { area: [..] }, names: { area: name } }
+    let mapSelected = null;      // { world, id, from (where you were), room, route: [steps], error }
+    let mapReqId = 1;
+    let lastMapWatch = null;
+    const MAP_UNIT = 28;
+    const MAP_ROOM = 14;
+    const MAP_DIRS = { n: [0, -1], ne: [1, -1], e: [1, 0], se: [1, 1], s: [0, 1], sw: [-1, 1], w: [-1, 0], nw: [-1, -1] };
+
+    function mapOf(i) {
+        if (!mapData[i]) mapData[i] = { state: null, areas: {}, levels: {}, names: {} };
+        return mapData[i];
+    }
+    // The key of an area the user named (`/map area <name>`): the server is asked by that
+    // name and answers with the key, found again here (MirroredMap::area_key).
+    function mapAreaKey(m, typed) {
+        const t = String(typed).trim();
+        const st = m.state;
+        if (m.levels[t] || Object.keys(m.areas).some(function(k) { return k.split('|')[0] === t; }) || (st && st.area === t)) return t;
+        const lower = t.toLowerCase();
+        const named = function(key, name) { return String(key).toLowerCase() === lower || String(name || '').toLowerCase() === lower; };
+        if (st && named(st.area, st.area_name)) return st.area;
+        const hit = Object.keys(m.names).find(function(k) { return named(k, m.names[k]); });
+        return hit !== undefined ? hit : t;
+    }
+    // The area and level the pane shows for the current world.
+    function mapShown() {
+        const m = mapOf(currentWorldIndex);
+        const st = m.state;
+        const area = (mapView.area ? mapAreaKey(m, mapView.area) : null) || (st && st.here ? st.area : null);
+        if (!area) return null;
+        let level = mapView.level;
+        if (level === null) level = (st && st.here && st.area === area) ? st.level : ((m.levels[area] || [0])[0] || 0);
+        return { area: area, level: level };
+    }
+    // MapWatch, when what the pane shows changed since the server was last told.
+    function mapWatchIfChanged(force) {
+        if (!serverMap || !authenticated) return;
+        const views = mapOpen ? [{ world_index: currentWorldIndex, area: mapView.area, level: mapView.level }] : [];
+        const key = JSON.stringify(views);
+        if (!force && key === lastMapWatch) return;
+        lastMapWatch = key;
+        send({ type: 'MapWatch', views: views });
+        renderMap();
+    }
+    function mapSetOpen(open) {
+        mapOpen = open;
+        try { localStorage.setItem('clay_map_open', open ? '1' : '0'); } catch (e) {}
+        if (!open) mapSelected = null;
+        const pane = document.getElementById('map-pane');
+        if (pane) pane.style.display = open ? 'flex' : 'none';
+        mapWatchIfChanged();
+        renderMap();
+    }
+    // `/map` typed here, or sent back by the server (an action ran it): the pane forms.
+    // True when it was one (the rest go to the server).
+    function mapPaneCommand(line) {
+        const m = /^\/@?map(?:\s+(\S+))?(?:\s+(.*))?$/i.exec(line.trim());
+        if (!m) return false;
+        const verb = (m[1] || '').toLowerCase();
+        const rest = (m[2] || '').trim();
+        const shown = mapShown();
+        switch (verb) {
+            case '': mapSetOpen(!mapOpen); return true;
+            case 'show': case 'on': case 'open': mapSetOpen(true); return true;
+            case 'hide': case 'off': case 'close': mapSetOpen(false); return true;
+            case 'center': case 'centre': mapView = { area: null, level: null }; mapPan = { x: 0, y: 0 }; mapSetOpen(true); return true;
+            case 'area': mapView = { area: rest || null, level: null }; mapSetOpen(true); return true;
+            case 'level': {
+                const cur = shown ? shown.level : 0;
+                const n = rest === 'up' ? cur + 1 : rest === 'down' ? cur - 1 : parseInt(rest, 10);
+                if (isNaN(n)) return true;
+                mapView = { area: shown ? shown.area : null, level: n };
+                mapSetOpen(true);
+                return true;
+            }
+            default: return false;
+        }
+    }
+    function mapOnState(msg) {
+        mapOf(msg.world_index).state = msg.state || null;
+        // A picked room's route was worked out from where you were: once you are somewhere
+        // else (a walk over, or moved by hand), it is asked for again - or dropped when
+        // you are there.
+        const st = msg.state;
+        const here = st && st.here ? st.here.id : null;
+        if (mapSelected && mapSelected.world === msg.world_index && !(st && st.walk) && here !== mapSelected.from) {
+            if (here === mapSelected.id) mapSelected = null;
+            else if (msg.world_index === currentWorldIndex) mapPick(mapSelected.id);
+        }
+        if (msg.world_index === currentWorldIndex) renderMap();
+    }
+    function mapOnArea(msg) {
+        const m = mapOf(msg.world_index);
+        const key = msg.area + '|' + msg.level;
+        if (msg.levels && msg.levels.length) m.levels[msg.area] = msg.levels;
+        if (msg.area_name) m.names[msg.area] = msg.area_name;
+        if (msg.replace || !m.areas[key]) {
+            m.areas[key] = msg.rooms || [];
+        } else {
+            const list = m.areas[key];
+            (msg.rooms || []).forEach(function(r) {
+                const i = list.findIndex(function(o) { return o.id === r.id; });
+                if (i >= 0) list[i] = r; else list.push(r);
+            });
+        }
+        if (msg.world_index === currentWorldIndex) renderMap();
+    }
+    function mapOnRoute(msg) {
+        if (!mapSelected || mapSelected.req !== msg.request_id) return;
+        mapSelected.room = msg.room || null;
+        mapSelected.route = msg.route || [];
+        mapSelected.error = msg.error || null;
+        renderMap();
+    }
+    function mapOnSearch(msg) {
+        const box = document.getElementById('map-search-results');
+        if (!box || msg.world_index !== currentWorldIndex) return;
+        box.innerHTML = '';
+        (msg.rooms || []).forEach(function(r) {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.innerHTML = escapeHtml(r.name || ('#' + r.id)) + '<small>' + escapeHtml((r.area_name || '') + ' · level ' + r.level) + '</small>';
+            b.onclick = function() {
+                box.style.display = 'none';
+                // The room's own area and level (a server before `area` was sent: yours).
+                mapView = r.area ? { area: r.area, level: r.level } : { area: null, level: null };
+                mapPan = { x: 0, y: 0 };
+                mapWatchIfChanged();
+                mapPick(r.id);
+            };
+            box.appendChild(b);
+        });
+        box.style.display = (msg.rooms || []).length ? '' : 'none';
+    }
+    // A room picked: its route from where you are (MapRoute without walking).
+    function mapPick(id) {
+        const m = mapData[currentWorldIndex];
+        const from = m && m.state && m.state.here ? m.state.here.id : null;
+        mapSelected = { world: currentWorldIndex, id: id, from: from, room: null, route: [], error: null, req: ++mapReqId };
+        send({ type: 'MapRoute', world_index: currentWorldIndex, request_id: mapSelected.req, to: '#' + id, walk: false });
+        renderMap();
+    }
+    function mapWalking() {
+        const m = mapData[currentWorldIndex];
+        return !!(m && m.state && m.state.walk);
+    }
+    function renderMap() {
+        const pane = document.getElementById('map-pane');
+        if (!pane) return;
+        pane.style.display = mapOpen ? 'flex' : 'none';
+        if (!mapOpen) return;
+        const world = worlds[currentWorldIndex];
+        const m = mapOf(currentWorldIndex);
+        const st = m.state;
+        const shown = mapShown();
+        const rooms = shown ? (m.areas[shown.area + '|' + shown.level] || []) : [];
+        document.getElementById('map-world').textContent = 'Map · ' + (world ? world.name : '');
+        document.getElementById('map-area-name').textContent = shown ? ((st && st.area === shown.area && st.area_name) ? st.area_name : (m.names[shown.area] || shown.area)) : '';
+        document.getElementById('map-level').textContent = 'Level ' + (shown ? shown.level : 0);
+        const empty = document.getElementById('map-empty');
+        empty.textContent = rooms.length ? '' : (serverMap ? 'No map yet: Clay builds it from the rooms the game reports over GMCP (Room.Info) as you move.' : 'The server this page is connected to has no map.');
+        const here = st && st.here ? st.here.id : null;
+        const walk = st && st.walk;
+        const sel = mapSelected && mapSelected.world === currentWorldIndex ? mapSelected : null;
+        const target = walk ? walk.to : (sel ? sel.id : null);
+        const route = new Set();
+        if (here) route.add(here);
+        (walk ? walk.steps.slice(walk.next) : (sel ? sel.route : [])).forEach(function(s) { route.add(s.to); });
+        // The centre: you, else the room picked or walked to, else the middle of the rooms
+        // shown; then the pan.
+        const svg = document.getElementById('map-svg');
+        const canvas = document.getElementById('map-canvas');
+        const w = canvas.clientWidth, h = canvas.clientHeight;
+        const byId = {};
+        rooms.forEach(function(r) { byId[r.id] = r; });
+        let cx = 0, cy = 0;
+        if (here && byId[here]) { cx = byId[here].x; cy = byId[here].y; }
+        else if (target && byId[target]) { cx = byId[target].x; cy = byId[target].y; }
+        else if (rooms.length) {
+            const xs = rooms.map(function(r) { return r.x; }), ys = rooms.map(function(r) { return r.y; });
+            cx = (Math.min.apply(null, xs) + Math.max.apply(null, xs)) / 2;
+            cy = (Math.min.apply(null, ys) + Math.max.apply(null, ys)) / 2;
+        }
+        const px = function(r) { return [(r.x - cx) * MAP_UNIT, (r.y - cy) * MAP_UNIT]; };
+        let lines = '', boxes = '', seen = {};
+        rooms.forEach(function(r) {
+            const a = px(r);
+            (r.exits || []).forEach(function(e) {
+                const d = e.dir ? MAP_DIRS[e.dir] : null;
+                if (e.kind === 0 && e.to && byId[e.to]) {
+                    const pair = r.id < e.to ? r.id + '\u0000' + e.to : e.to + '\u0000' + r.id;
+                    if (seen[pair]) return;
+                    seen[pair] = 1;
+                    const b = px(byId[e.to]);
+                    const onRoute = route.has(r.id) && route.has(e.to);
+                    lines += '<line class="map-exit' + (onRoute ? ' route' : '') + '" x1="' + a[0] + '" y1="' + a[1] + '" x2="' + b[0] + '" y2="' + b[1] + '"/>';
+                } else if (d && (e.kind === 3 || e.kind === 2)) {
+                    const len = MAP_UNIT * 0.5;
+                    lines += '<line class="' + (e.kind === 3 ? 'map-stub' : 'map-away') + '" x1="' + a[0] + '" y1="' + a[1] + '" x2="' + (a[0] + d[0] * len) + '" y2="' + (a[1] + d[1] * len) + '"/>';
+                }
+            });
+            const up = (r.exits || []).some(function(e) { return e.dir === 'u'; });
+            const down = (r.exits || []).some(function(e) { return e.dir === 'd'; });
+            const cls = 'map-room' + (r.id === here ? ' here' : '') + (r.id === target && r.id !== here ? ' target' : '') + (route.has(r.id) ? ' on-route' : '') + (sel && sel.id === r.id ? ' selected' : '');
+            const half = MAP_ROOM / 2;
+            boxes += '<rect class="' + cls + '" data-id="' + escapeHtml(r.id) + '" x="' + (a[0] - half) + '" y="' + (a[1] - half) + '" width="' + MAP_ROOM + '" height="' + MAP_ROOM + '" rx="3"><title>' + escapeHtml(r.name || ('#' + r.id)) + '</title></rect>';
+            if (up || down) {
+                const dark = r.id === here || (r.id === target && r.id !== here);
+                boxes += '<text class="map-mark' + (dark ? ' on-dark' : '') + '" x="' + a[0] + '" y="' + a[1] + '">' + (up && down ? '↕' : up ? '▴' : '▾') + '</text>';
+            }
+        });
+        // A phone's sheet is small: a little further out to start with.
+        const zoom = mapZoom * (deviceMode === 'phone' ? 0.8 : 1);
+        svg.innerHTML = '<g transform="translate(' + (w / 2 + mapPan.x) + ',' + (h / 2 + mapPan.y) + ') scale(' + zoom + ')">' + lines + boxes + '</g>';
+        const hereRoom = here && byId[here];
+        svg.setAttribute('aria-label', 'Map of ' + (shown ? shown.area : 'nothing yet') + (hereRoom ? ': you are in ' + hereRoom.name : ''));
+        renderMapCard(st, sel, here, walk);
+    }
+    function renderMapCard(st, sel, here, walk) {
+        const room = sel ? (sel.room || null) : (st && st.here) || null;
+        const card = document.getElementById('map-card');
+        card.style.display = (room || walk || (sel && sel.error)) ? '' : 'none';
+        document.getElementById('map-card-name').textContent = room ? (room.name || ('#' + room.id)) : (walk ? walk.to_name : '');
+        document.getElementById('map-card-id').textContent = room ? ('#' + room.id + ' · level ' + room.z) : '';
+        const exits = document.getElementById('map-card-exits');
+        exits.innerHTML = room ? (room.exits || []).map(function(e) {
+            return '<span class="' + (e.kind === 3 ? 'unexplored' : '') + '">' + escapeHtml(e.cmd) + '</span>';
+        }).join('') : '';
+        const routeEl = document.getElementById('map-card-route');
+        const walkBtn = document.getElementById('map-walk');
+        const stopBtn = document.getElementById('map-stop');
+        if (walk) {
+            routeEl.innerHTML = 'Walking to ' + escapeHtml(walk.to_name) + ' · step ' + (walk.next + 1) + ' of ' + walk.steps.length;
+        } else if (sel && sel.error) {
+            routeEl.textContent = sel.error;
+        } else if (sel && sel.route && sel.route.length) {
+            routeEl.innerHTML = '<b>' + escapeHtml(sel.route.map(function(s) { return s.cmd; }).join(', ')) + '</b> · ' + sel.route.length + (sel.route.length === 1 ? ' step' : ' steps');
+        } else if (sel && sel.id === here) {
+            routeEl.textContent = 'You are here.';
+        } else if (st && st.last_stop && !sel) {
+            routeEl.textContent = st.last_stop;
+        } else {
+            routeEl.textContent = '';
+        }
+        walkBtn.style.display = (!walk && sel && !sel.error && sel.route && sel.route.length) ? '' : 'none';
+        stopBtn.style.display = walk ? '' : 'none';
+    }
+    function setupMapPane() {
+        const pane = document.getElementById('map-pane');
+        if (!pane) return;
+        const svg = document.getElementById('map-svg');
+        const canvas = document.getElementById('map-canvas');
+        svg.addEventListener('click', function(e) {
+            const r = e.target.closest && e.target.closest('.map-room');
+            if (r && !mapDragged) mapPick(r.getAttribute('data-id'));
+        });
+        // Drag to pan, the wheel to zoom.
+        let drag = null, mapDragged = false;
+        canvas.addEventListener('pointerdown', function(e) { drag = { x: e.clientX, y: e.clientY, px: mapPan.x, py: mapPan.y }; mapDragged = false; });
+        canvas.addEventListener('pointermove', function(e) {
+            if (!drag) return;
+            const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+            if (Math.abs(dx) + Math.abs(dy) > 4) mapDragged = true;
+            if (mapDragged) { mapPan = { x: drag.px + dx, y: drag.py + dy }; renderMap(); }
+        });
+        window.addEventListener('pointerup', function() { drag = null; setTimeout(function() { mapDragged = false; }, 0); });
+        canvas.addEventListener('wheel', function(e) {
+            e.preventDefault();
+            mapZoom = Math.min(3, Math.max(0.3, mapZoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+            renderMap();
+        }, { passive: false });
+        document.getElementById('map-zoom-in').onclick = function() { mapZoom = Math.min(3, mapZoom * 1.25); renderMap(); };
+        document.getElementById('map-zoom-out').onclick = function() { mapZoom = Math.max(0.3, mapZoom / 1.25); renderMap(); };
+        document.getElementById('map-center').onclick = function() { mapView = { area: null, level: null }; mapPan = { x: 0, y: 0 }; mapSelected = null; mapWatchIfChanged(); renderMap(); };
+        document.getElementById('map-close').onclick = function() { mapSetOpen(false); };
+        document.getElementById('map-level-up').onclick = function() { mapPaneCommand('/map level up'); };
+        document.getElementById('map-level-down').onclick = function() { mapPaneCommand('/map level down'); };
+        document.getElementById('map-walk').onclick = function() {
+            if (!mapSelected) return;
+            send({ type: 'MapRoute', world_index: currentWorldIndex, request_id: ++mapReqId, to: '#' + mapSelected.id, walk: true });
+        };
+        document.getElementById('map-stop').onclick = function() { send({ type: 'MapStop', world_index: currentWorldIndex }); };
+        const search = document.getElementById('map-search');
+        let searchTimer = null;
+        search.addEventListener('input', function() {
+            clearTimeout(searchTimer);
+            const q = search.value.trim();
+            if (!q) { document.getElementById('map-search-results').style.display = 'none'; return; }
+            searchTimer = setTimeout(function() { send({ type: 'MapSearch', world_index: currentWorldIndex, request_id: ++mapReqId, query: q }); }, 250);
+        });
+        // The keys typed in the search are its own, not the input line's.
+        search.addEventListener('keydown', function(e) {
+            e.stopPropagation();
+            if (e.key === 'Enter') {
+                const first = document.querySelector('#map-search-results button');
+                if (first) first.click();
+            } else if (e.key === 'Escape') {
+                search.value = '';
+                document.getElementById('map-search-results').style.display = 'none';
+            }
+        });
+        if (typeof ResizeObserver !== 'undefined') new ResizeObserver(function() { if (mapOpen) renderMap(); }).observe(canvas);
+        pane.style.display = mapOpen ? 'flex' : 'none';
+    }
+
     // ─── /split (user request 2026-10-30) ───
     // The output in two panes, one above the other, each showing a world, with a bar
     // between them for the top pane (its dot and name). The focused pane is always
@@ -8699,6 +9335,48 @@
         updatePaneBars();
     }
 
+    // The More (held lines) / History (scrolled back) badge for one pane: the focused one
+    // (#output-container) or a split's other one. History wins; null when the pane is at
+    // the bottom with nothing held. The status bar and the split's pane bar both ask it,
+    // each for its own pane, so the two read alike (user request 2026-11-01).
+    function paneMoreHist(focused) {
+        if (!focused) {
+            if (!splitPane) return null;
+            const idx = splitWorldIndex();
+            const w = worlds[idx];
+            if (!splitPane.followBottom) {
+                const c = splitPane.container;
+                return { label: 'History', count: Math.max(0, Math.floor((c.scrollHeight - c.scrollTop - c.clientHeight) / lineHeightPx())) };
+            }
+            const held = moreOf(idx).held.length + ((w && w.pending_count) || 0);
+            return held > 0 ? { label: 'More', count: held } : null;
+        }
+        const world = worlds[currentWorldIndex];
+        if (!isAtBottom() && !scrollRafPending) {
+            const container = elements.outputContainer;
+            let linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeightPx());
+            // Slid up into history: the lines below the page count too.
+            if (world && world._renderEndLine) linesFromBottom += (world.output_lines || []).length - renderEndIdx(world);
+            return { label: 'History', count: linesFromBottom };
+        }
+        const serverPending = world ? (world.pending_count || 0) : 0;
+        if ((moreNow().paused && moreNow().held.length > 0) || serverPending > 0) {
+            return { label: 'More', count: pendingTotal() };
+        }
+        return null;
+    }
+
+    function showMoreBadge(box, label, count, mh) {
+        if (!box) return;
+        if (mh) {
+            label.textContent = mh.label;
+            count.textContent = formatCount(mh.count);
+            box.style.display = '';
+        } else {
+            box.style.display = 'none';
+        }
+    }
+
     // The bar between the panes (the top pane's world) and the full bar's grey.
     function updatePaneBars() {
         if (!splitPane) {
@@ -8713,6 +9391,9 @@
             dot.className = 'status-dot' + (w.connected ? '' : (isWorldReconnecting(w) ? ' reconnecting' : ' off'));
             name.textContent = w.name;
         }
+        // The top pane's own More/History, as the status bar shows the bottom pane's.
+        const more = splitPane.bar.querySelector('.status-more');
+        showMoreBadge(more, more && more.querySelector('.more-label'), more && more.querySelector('.more-count'), paneMoreHist(topFocused));
         splitPane.bar.classList.toggle('pane-unfocused', !topFocused);
         elements.statusBar.classList.toggle('pane-unfocused', topFocused);
     }
@@ -8736,11 +9417,15 @@
         container.id = 'split-output-container';
         const output = document.createElement('div');
         output.id = 'split-output';
+        output.setAttribute('role', 'log');
+        output.setAttribute('aria-live', 'off');
+        output.setAttribute('aria-label', 'Other pane');
         container.appendChild(output);
         const bar = document.createElement('div');
         bar.className = 'pane-bar';
         bar.innerHTML = '<div class="status-btn pane-bar-spacer"><svg width="16" height="16" viewBox="0 0 16 16"></svg></div>' +
-            '<div class="status-item"><div class="status-dot"></div><span class="status-world"></span></div>';
+            '<div class="status-item"><div class="status-dot"></div><span class="status-world"></span></div>' +
+            '<div class="status-more" style="display:none"><span class="more-label"></span><span class="more-count"></span></div>';
         const pane = { container, output, bar, followBottom: true, lastRenderedWorld: null, userScrollAt: 0, observer: null };
         // Only the user un-pins a pane from its newest lines (followBottom's rule).
         const intent = () => { pane.userScrollAt = Date.now(); };
@@ -8752,6 +9437,9 @@
             if (splitPane !== pane) return;
             const c = pane.container;
             const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 4;
+            // Its bar's History count (and the status bar's, while this is the bottom pane)
+            // follows the scroll, as #output-container's does.
+            requestAnimationFrame(() => { if (splitPane === pane) updateStatusBar(); });
             if (atBottom) {
                 pane.followBottom = true;
             } else if (Date.now() - pane.userScrollAt < USER_SCROLL_WINDOW_MS) {
@@ -8776,6 +9464,14 @@
         bar.addEventListener('click', () => {
             if (splitPane === pane && splitPane.onTop) splitFocusSwap();
         });
+        // Its More/History badge releases a screenful of its pane, as the status bar's does
+        // (the focus comes to the pane first).
+        bar.querySelector('.status-more').addEventListener('click', guard('paneMore', (e) => {
+            e.stopPropagation();
+            if (splitPane !== pane) return;
+            if (splitPane.onTop) splitFocusSwap();
+            releaseScreenful();
+        }));
         // Its size goes to the server (paging, a shell world's PTY); following, it stays
         // at the bottom as it grows or shrinks.
         if (typeof ResizeObserver !== 'undefined') {
@@ -9187,6 +9883,7 @@
             { l: '/remote --kill &lt;id&gt;', r: 'Disconnect a client' },
             { l: '/remote --pause &lt;id&gt;', r: 'Toggle pause on a client' },
             { l: '/remote --pause console', r: 'Toggle pause on the console' },
+            { l: '/pause', r: 'Pause every other interface' },
         ]},
         { heading: 'TF Commands', rows: [
             { l: 'For TinyFugue commands (triggers, macros,', r: '' },
@@ -9783,7 +10480,7 @@
             '  30 seconds of a keepalive - for a MUD whose reply',
             '  doesn\'t repeat the command, such as Huh?.', '',
             'Encoding: UTF-8 (modern), Latin-1 (older MUDs), FANSI.', '',
-            'GMCP: Space-separated GMCP packages to request.', '',
+            'GMCP: Comma-separated GMCP packages to request (e.g. Char 1, Room 1); Room is what the map is built from.', '',
             'MCCP2: Accept the MUD\'s offer to compress output.',
             '  Turn off to decline compression - the connection',
             '  still works, just uncompressed. Toggling this on',
@@ -10541,6 +11238,8 @@
     // Set by lineHtml(): the delay to the line's next frame, null when it drew the line whole.
     let revealFrameNext = null;
     function textRevealCps() {
+        // Screen Reader mode: a line being typed on can't be read.
+        if (screenReader) return 0;
         const typed = revealCustomCps(textReveal);
         if (typed !== null) return typed;
         if (textReveal === 'superfast' && fontProfileKey === 'app-android') return REVEAL_CPS_ANDROID_SUPERFAST;
@@ -11112,18 +11811,44 @@
         elements.input.value = '';
     }
 
+    // A phone or tablet's keyboard composing a word in a shell world: what this composition
+    // has already sent. Each change goes to the PTY as it happens - Backspaces for what the
+    // keyboard took back (its own Backspace, an autocorrection), then the new letters - so
+    // typing is a letter at a time, as on a desktop. A desktop waits for the composition
+    // to end instead: a CJK IME's composition is not text until it is chosen.
+    let shellComposeSent = '';
+    function shellComposesLive() {
+        return deviceMode === 'phone' || deviceMode === 'tablet';
+    }
+    function shellSendComposition(text) {
+        const was = Array.from(shellComposeSent);
+        const now = Array.from(text);
+        let same = 0;
+        while (same < was.length && same < now.length && was[same] === now[same]) same++;
+        for (let i = same; i < was.length; i++) {
+            send({ type: 'ShellInput', world_index: currentWorldIndex, key: { key: 'Backspace', ctrl: false, alt: false, shift: false } });
+        }
+        const added = now.slice(same).join('');
+        if (added) send({ type: 'ShellInput', world_index: currentWorldIndex, text: added, paste: false });
+        shellComposeSent = text;
+    }
+
     // While a live shell world is current, turn off the input field's autocorrect /
-    // suggestions / spellcheck so a soft keyboard (Android GBoard especially) stops
-    // *composing* each word - composition buffers keystrokes and only commits them at a
-    // space/Return, which made shell input feel like line mode. With composition off each
-    // key is a discrete `input` event that goes straight to the PTY. Restored for ordinary
-    // worlds, which want suggestions. The attributes take effect the next time the field is
-    // focused, which on a shell world is when the user taps in to type.
+    // suggestions / spellcheck. That alone does not stop a soft keyboard (Gboard) from
+    // *composing* each word - buffering keystrokes and committing them only at a
+    // space/Return - so the Android app is also told (`Android.setShellKeyboard`), and its
+    // WebView asks the keyboard for a field it must not compose in (ClayWebView.java): each
+    // key is then a discrete `beforeinput` that goes straight to the PTY. A phone's browser
+    // can't be told; there `shellSendComposition` sends each composed letter as it comes.
+    // Restored for ordinary worlds, which want suggestions.
     function setShellInputMode(on) {
         const el = elements.input;
         if (!el) return;
         const already = el.dataset.shellMode === '1';
         if (on === already) return;
+        if (typeof Android !== 'undefined' && Android.setShellKeyboard) {
+            try { Android.setShellKeyboard(on); } catch (e) { /* an older app */ }
+        }
         if (on) {
             el.dataset.shellMode = '1';
             el.spellcheck = false;
@@ -11396,6 +12121,8 @@
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
         elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(lineSpanHtml(html, lineIndex, lineObj, newGlow(o))));
         if (revealFrameNext !== null) revealTrack(elements.output.lastElementChild, cleanText, lineObj, o);
+        // Screen Reader mode: read out, once, as it's shown (the focused pane's lines).
+        if (screenReader && !drawingSplit && !gagged) announceLine(cleanText);
 
         scheduleScrollToBottom();
     }
@@ -13087,11 +13814,22 @@
     // only) and updateStatusBar() (world switch, connect/disconnect, InitialState, and
     // everything else that already calls it) both route through here, so there is exactly
     // one place that decides show/hide and exactly one scroll-guard idiom to keep correct.
+    // Settings' Status Panel (one for the instance) and the world's own (Edit World), both
+    // on. A server from before them sends neither, and the panel shows.
+    function statusPanelWanted(world) {
+        if (statusPanelSetting === false) return false;
+        return !(world && world.settings && world.settings.status_panel === false);
+    }
+    function receiveStatusPanel(settings) {
+        statusPanelSetting = (settings.status_panel === undefined || settings.status_panel === null) ? null : !!settings.status_panel;
+        updateStatsPanel();
+    }
+
     function updateStatsPanel() {
         if (!elements.statsPanel) return;
         const world = worlds[currentWorldIndex];
         const entries = (world && Array.isArray(world.stats)) ? world.stats : [];
-        const showNow = entries.length > 0;
+        const showNow = entries.length > 0 && statusPanelWanted(world);
         const wasShown = elements.statsPanel.style.display !== 'none';
         const sig = statsEntrySignature(entries);
         const shapeChanged = sig !== statsPanelSignature;
@@ -13106,6 +13844,18 @@
             }
             statsPanelSignature = null;
             return;
+        }
+
+        // × hides it for this world (its own switch, through /stats hide): only where the
+        // server has the switch, and never on a multiuser server (its worlds are its operator's).
+        if (elements.statsPanelHide) {
+            const canHide = typeof (world.settings && world.settings.status_panel) === 'boolean' && !multiuserMode;
+            elements.statsPanelHide.style.display = canHide ? '' : 'none';
+            if (canHide) {
+                const label = 'Hide for ' + (world.name || 'this world');
+                elements.statsPanelHide.title = label;
+                elements.statsPanelHide.setAttribute('aria-label', label);
+            }
         }
 
         if (!wasShown || shapeChanged) {
@@ -13136,6 +13886,8 @@
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
         reportBadge();
+        // The map pane follows the world shown (src/map): the server is told when that moved.
+        if (typeof mapWatchIfChanged === 'function') mapWatchIfChanged();
 
         // Remember the focused world so a cold start can restore it (see
         // persistLastActiveWorld() / the InitialState handler). This is the single
@@ -13175,39 +13927,8 @@
             elements.worldName.style.display = 'none';
         }
 
-        // More/Hist badge
-        const serverPending = world ? (world.pending_count || 0) : 0;
-        const totalPending = pendingTotal();
-        if (!barFocused) {
-            // The other pane's world: its own scroll and holds.
-            const held = moreOf(barIdx).held.length + ((barWorld && barWorld.pending_count) || 0);
-            if (!splitPane.followBottom) {
-                const c = splitPane.container;
-                elements.moreLabel.textContent = 'History';
-                elements.moreCount.textContent = formatCount(Math.max(0, Math.floor((c.scrollHeight - c.scrollTop - c.clientHeight) / lineHeightPx())));
-                elements.statusMore.style.display = '';
-            } else if (held > 0) {
-                elements.moreLabel.textContent = 'More';
-                elements.moreCount.textContent = formatCount(held);
-                elements.statusMore.style.display = '';
-            } else {
-                elements.statusMore.style.display = 'none';
-            }
-        } else if (!isAtBottom() && !scrollRafPending) {
-            const container = elements.outputContainer;
-            let linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeightPx());
-            // Slid up into history: the lines below the page count too.
-            if (world && world._renderEndLine) linesFromBottom += (world.output_lines || []).length - renderEndIdx(world);
-            elements.moreLabel.textContent = 'History';
-            elements.moreCount.textContent = formatCount(linesFromBottom);
-            elements.statusMore.style.display = '';
-        } else if ((moreNow().paused && moreNow().held.length > 0) || serverPending > 0) {
-            elements.moreLabel.textContent = 'More';
-            elements.moreCount.textContent = formatCount(totalPending);
-            elements.statusMore.style.display = '';
-        } else {
-            elements.statusMore.style.display = 'none';
-        }
+        // More/Hist badge: this bar's pane's (the other pane's while the top one has the focus).
+        showMoreBadge(elements.statusMore, elements.moreLabel, elements.moreCount, paneMoreHist(barFocused));
 
         // Activity badge with hover tooltip showing which worlds have activity
         if (serverActivityCount > 0) {
@@ -14013,6 +14734,10 @@
         });
         // Edit World: multiuser has no world editing
         document.querySelectorAll('.menu-edit-world').forEach(el => {
+            el.style.display = multiuserMode ? 'none' : '';
+        });
+        // Map: multiuser has no map
+        document.querySelectorAll('.menu-map').forEach(el => {
             el.style.display = multiuserMode ? 'none' : '';
         });
 
@@ -15067,6 +15792,9 @@
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
         setupClearInput = clearInputOnSend;
+        setupScreenReader = screenReader;
+        setupAnnounceScreenReader = announceScreenReader;
+        setupStatusPanel = statusPanelSetting !== false;
         setupTaskbarAlert = taskbarAlert;
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'kokoro' ? 'Kokoro' : ttsMode === 'edge' ? 'Edge' : 'Off';
         // Where only Local is offered, any engine reads as Local (the device's voice spoke).
@@ -15178,6 +15906,15 @@
         } else {
             elements.setupZwjToggle.classList.remove('active');
         }
+        if (elements.setupScreenReaderToggle) {
+            elements.setupScreenReaderToggle.classList.toggle('active', setupScreenReader);
+        }
+        if (elements.setupAnnounceScreenReaderToggle) {
+            elements.setupAnnounceScreenReaderToggle.classList.toggle('active', setupAnnounceScreenReader);
+        }
+        if (elements.setupStatusPanelToggle) {
+            elements.setupStatusPanelToggle.classList.toggle('active', setupStatusPanel);
+        }
         if (elements.setupClearInputToggle) {
             elements.setupClearInputToggle.classList.toggle('active', setupClearInput);
         }
@@ -15194,6 +15931,12 @@
             elements.setupTtsVoiceInput.value = ttsVoice;
         }
         if (elements.setupTabsSelect) {
+            // A server before the per-interface split keeps only none/top/bottom.
+            Array.from(elements.setupTabsSelect.options).forEach(function(o) {
+                const side = o.value === 'left' || o.value === 'right';
+                o.hidden = side && !tabsProfiles;
+                o.disabled = side && !tabsProfiles;
+            });
             elements.setupTabsSelect.value = setupTabsMode;
             updateCustomDropdown(elements.setupTabsSelect);
         }
@@ -15282,6 +16025,11 @@
             ['setup-zwj-toggle', false],
             ['setup-keyboard-visible-toggle', touch],
             ['setup-clear-input-toggle', deviceMode !== 'phone'],
+            // A server from before Screen Reader mode keeps neither.
+            ['setup-screen-reader-toggle', screenReaderProfiles !== null],
+            ['setup-announce-screen-reader-toggle', screenReaderProfiles !== null],
+            // A server from before Status Panel keeps none.
+            ['setup-status-panel-toggle', statusPanelSetting !== null],
             ['setup-taskbar-alert-toggle', !!window.WEBVIEW_MODE],
             ['font-phone-minus', !window.WEBVIEW_MODE],
             ['font-tablet-minus', !window.WEBVIEW_MODE],
@@ -15349,7 +16097,16 @@
             tts_speak_mode: ttsSpeakMode,
             tts_voice: ttsVoice,
             tts_profile: ttsProfilesKept ? { key: fontProfileKey, mode: ttsMode, speak_mode: ttsSpeakMode, voice: ttsVoice } : null,
-            tabs: tabsMode,
+            // The shared Tabs goes back as the server sent it; this page's own goes as
+            // tabs_profile (null = it has none of its own, or the server keeps none).
+            tabs: tabsProfiles ? tabsShared : tabsMode,
+            tabs_profile: (tabsProfiles && tabsProfiles[fontProfileKey]) ? { key: fontProfileKey, value: tabsProfiles[fontProfileKey] } : null,
+            // This page's own Screen Reader mode, and the global "MUDs: Screen Reader"; null
+            // = unchanged (none of its own, or a server from before the mode).
+            screen_reader_profile: (screenReaderProfiles && fontProfileKey in screenReaderProfiles) ? { key: fontProfileKey, value: screenReaderProfiles[fontProfileKey] ? 'on' : 'off' } : null,
+            announce_screen_reader: screenReaderProfiles ? announceScreenReader : null,
+            // Settings' Status Panel; null = unchanged (a server from before it).
+            status_panel: statusPanelSetting,
             icon_bar: iconBarMode,
             // null = unchanged (a server from before Import Picture sent none).
             picture_host: pictureHost || null,
@@ -15491,14 +16248,34 @@
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
         clearInputOnSend = setupClearInput;
+        // This page's own Screen Reader mode (once it has one, or changes it: merely saving
+        // Settings doesn't make one, which would stop TalkBack from turning it on later),
+        // and "MUDs: Screen Reader", the one global setting.
+        if (screenReaderProfiles) {
+            if (fontProfileKey in screenReaderProfiles || setupScreenReader !== screenReader) screenReaderProfiles[fontProfileKey] = setupScreenReader;
+            announceScreenReader = setupAnnounceScreenReader;
+            applyScreenReader(!!screenReaderProfiles[fontProfileKey]);
+        }
         if (clearInputOnSend) clearSentLines();
+        if (statusPanelSetting !== null && statusPanelSetting !== setupStatusPanel) {
+            statusPanelSetting = setupStatusPanel;
+            updateStatsPanel();
+        }
         taskbarAlert = setupTaskbarAlert;
         ttsMode = setupTtsMode.toLowerCase();
         if (elements.setupTtsVoiceInput) {
             var typedVoice = elements.setupTtsVoiceInput.value.trim().toLowerCase();
             if (typedVoice) ttsVoice = typedVoice;  // the server keeps only a name it knows
         }
-        applyTabsMode(setupTabsMode);
+        // This page's own tab location (once it has one, or picks something other than the
+        // shared value; merely saving Settings doesn't make one), or the shared one for a
+        // server before the split.
+        if (tabsProfiles) {
+            if (tabsProfiles[fontProfileKey] || setupTabsMode !== tabsShared) tabsProfiles[fontProfileKey] = setupTabsMode;
+        } else {
+            tabsShared = setupTabsMode;
+        }
+        applyTabsMode(myTabsMode());
         applyIconBarMode(setupIconBarMode);
         if (pictureHost) pictureHost = setupPictureHost;
         if (separatorStyle) separatorStyle = setupSeparatorStyle;
@@ -16459,6 +17236,11 @@
         } else {
             elements.worldEditMccp2EnabledToggle.classList.remove('active');
         }
+        // The world's Status Panel: default on; a server from before it sends none, and the
+        // row stays hidden (the type gating shows it only with this cleared).
+        const statusPanelKnown = typeof world.settings?.status_panel === 'boolean';
+        elements.worldEditStatusPanelToggle.classList.toggle('active', world.settings?.status_panel !== false);
+        elements.worldEditStatusPanelField.style.display = statusPanelKnown ? '' : 'none';
         elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
         elements.worldEditKeepAliveGagEnabled.checked = !!world.settings?.keep_alive_gag_enabled;
         elements.worldEditKeepAliveGag.value = world.settings?.keep_alive_gag || '';
@@ -16568,7 +17350,7 @@
         'worldEditPasswordField', 'worldEditSslField', 'worldEditAutoLoginField', 'worldEditTfTypeField',
         'worldEditKeepAliveField', 'worldEditEncodingField', 'worldEditGmcpField',
         'worldEditMspEnabledField',
-        'worldEditMcpEnabledField', 'worldEditMccp2EnabledField'
+        'worldEditMcpEnabledField', 'worldEditMccp2EnabledField', 'worldEditStatusPanelField'
     ];
     const WORLD_EDIT_SLACK_FIELD_IDS = [
         'worldEditSlackTokenField', 'worldEditSlackAppTokenField', 'worldEditSlackWorkspaceField',
@@ -16678,6 +17460,8 @@
             msp_enabled: elements.worldEditMspEnabledToggle.classList.contains('active'),
             mcp_enabled: elements.worldEditMcpEnabledToggle.classList.contains('active'),
             mccp2_enabled: elements.worldEditMccp2EnabledToggle.classList.contains('active'),
+            // null = unchanged: the server has no such switch (the row was hidden).
+            status_panel: elements.worldEditStatusPanelField.style.display === 'none' ? null : elements.worldEditStatusPanelToggle.classList.contains('active'),
             world_type: worldType,
             prompt_wait_ms: promptWaitMs,
             tf_type: tfType,
@@ -16726,6 +17510,9 @@
         world.settings.msp_enabled = elements.worldEditMspEnabledToggle.classList.contains('active');
         world.settings.mcp_enabled = elements.worldEditMcpEnabledToggle.classList.contains('active');
         world.settings.mccp2_enabled = elements.worldEditMccp2EnabledToggle.classList.contains('active');
+        if (elements.worldEditStatusPanelField.style.display !== 'none') {
+            world.settings.status_panel = elements.worldEditStatusPanelToggle.classList.contains('active');
+        }
         world.settings.world_type = worldType;
         world.settings.prompt_wait_ms = promptWaitMs;
         world.settings.tf_type = tfType;
@@ -18199,22 +18986,36 @@
         const overflowing = elements.tabsRibbonTabs.scrollWidth > elements.tabsRibbonTabs.clientWidth;
         elements.tabsRibbonLeft.classList.toggle('hidden', !overflowing);
         elements.tabsRibbonRight.classList.toggle('hidden', !overflowing);
+        a11yUpgrade(elements.tabsRibbon);
     }
 
-    // Apply a Tabs setting change: move the ribbon to the right place in the
-    // DOM (top: before the output area; bottom: its natural position directly
-    // above the status bar) and show/hide/re-render it. DOM position is moved
-    // rather than juggled via flex `order` on every sibling — simpler and it
-    // can't accidentally affect unrelated layout.
+    // Apply a Tabs setting change: move the ribbon to its place in the DOM and
+    // show/hide/re-render it. Top: before #main-row (so above a split's two panes, never
+    // between one and its bar); bottom: its natural place above the status bar; left/right:
+    // inside #main-row beside the output column, as a column (.tabs-vertical). The DOM
+    // position is moved rather than juggled via flex `order` on every sibling - simpler, and
+    // it can't affect unrelated layout.
     function applyTabsMode(mode) {
         tabsMode = mode;
-        if (!elements.tabsRibbon) return;
+        const ribbon = elements.tabsRibbon;
+        if (!ribbon) return;
         const app = document.getElementById('app');
+        const row = document.getElementById('main-row');
+        const column = document.getElementById('output-column');
+        const side = mode === 'left' || mode === 'right';
+        ribbon.classList.toggle('tabs-vertical', side);
+        ribbon.classList.toggle('tabs-left', mode === 'left');
+        ribbon.classList.toggle('tabs-right', mode === 'right');
         if (mode === 'top') {
-            app.insertBefore(elements.tabsRibbon, elements.outputContainer);
+            app.insertBefore(ribbon, row);
+        } else if (mode === 'left') {
+            row.insertBefore(ribbon, column);
+        } else if (mode === 'right') {
+            // At the row's end: beyond the map pane when it is open.
+            row.appendChild(ribbon);
         } else {
             // 'bottom' (or 'none', where position doesn't matter since hidden)
-            app.insertBefore(elements.tabsRibbon, elements.statusBar);
+            app.insertBefore(ribbon, elements.statusBar);
         }
         renderTabsRibbon();
     }
@@ -18300,6 +19101,7 @@
         const overflowing = elements.iconBarShortcuts.scrollWidth > elements.iconBarShortcuts.clientWidth;
         elements.iconBarLeft.classList.toggle('hidden', !overflowing);
         elements.iconBarRight.classList.toggle('hidden', !overflowing);
+        a11yUpgrade(elements.iconBar);
     }
 
     // Invoke a shortcut Action the same way manual invocation already works
@@ -18335,12 +19137,17 @@
             // ever reaches the document.body.onclick handler that would
             // otherwise close the other one - has to be done explicitly here.
             if (menuOpen) closeMenu();
+            const fromKeyboard = document.activeElement === elements.statusItem;
+            menuAnchor = elements.statusItem;
             renderWorldMenu();
             const rect = elements.statusItem.getBoundingClientRect();
             elements.worldMenuDropdown.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
             elements.worldMenuDropdown.style.left = rect.left + 'px';
+            elements.worldMenuDropdown.classList.add('visible');
+            if (screenReader || fromKeyboard) focusFirstMenuItem(elements.worldMenuDropdown);
         }
         elements.worldMenuDropdown.classList.toggle('visible', worldMenuOpen);
+        elements.statusItem.setAttribute('aria-expanded', worldMenuOpen ? 'true' : 'false');
     }
 
     function closeWorldMenu() {
@@ -18382,6 +19189,7 @@
 
             elements.worldMenuDropdown.appendChild(item);
         });
+        a11yUpgrade(elements.worldMenuDropdown);
     }
 
     elements.worldMenuDropdown && (elements.worldMenuDropdown.onclick = function(e) {
@@ -18396,7 +19204,9 @@
     // Toggle menu dropdown (unified - opens upward from button)
     function toggleMenu(anchorBtn) {
         menuOpen = !menuOpen;
+        if (anchorBtn) anchorBtn.setAttribute('aria-expanded', menuOpen ? 'true' : 'false');
         if (menuOpen) {
+            menuAnchor = anchorBtn || null;
             // Opening this menu - dismiss the world-switch dropdown if it's
             // up, for the same stopPropagation reason as toggleWorldMenu().
             if (worldMenuOpen) closeWorldMenu();
@@ -18408,12 +19218,18 @@
             }
         }
         elements.menuDropdown.classList.toggle('visible', menuOpen);
+        // Opened from the keyboard (or with a screen reader): into its first item.
+        if (menuOpen && (screenReader || (anchorBtn && document.activeElement === anchorBtn))) {
+            a11yUpgrade(elements.menuDropdown);
+            focusFirstMenuItem(elements.menuDropdown);
+        }
     }
 
     // Close menu dropdown
     function closeMenu() {
         menuOpen = false;
         elements.menuDropdown.classList.remove('visible');
+        if (menuAnchor) menuAnchor.setAttribute('aria-expanded', 'false');
     }
 
     // Close every content/navigation popup that could be left open from a
@@ -18467,6 +19283,9 @@
                 break;
             case 'world-selector':
                 openWorldSelectorPopup();
+                break;
+            case 'map':
+                mapSetOpen(!mapOpen);
                 break;
             case 'edit-world':
                 // The current world's editor (`/worlds -e`).
@@ -19003,6 +19822,12 @@
                 setStatsPanelCollapsed(!statsPanelCollapsed);
             }));
         }
+        if (elements.statsPanelHide) {
+            elements.statsPanelHide.addEventListener('click', guard('statsPanelHide', function(e) {
+                e.stopPropagation();
+                send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/stats hide' });
+            }));
+        }
 
         // Click on the world name to open the world-switch dropdown
         if (elements.statusItem) {
@@ -19274,6 +20099,8 @@
             if (worldMenuOpen && !e.target.closest('.status-item')) {
                 closeWorldMenu();
             }
+            // Screen Reader mode: activating a control mustn't move the focus to the input.
+            if (screenReader) return;
 
             // Don't steal focus if user has selected text (for copy)
             const selection = window.getSelection();
@@ -20040,10 +20867,21 @@
         // Reset command completion state when input changes (typing, not Tab)
         // Also check for temperature conversion
         // A live shell world: typed/IME/pasted text goes to the PTY, not the input line.
-        elements.input.addEventListener('compositionstart', function() { shellComposing = true; });
+        elements.input.addEventListener('compositionstart', function() {
+            shellComposing = true;
+            // Anything already in the box was sent before this composition began.
+            shellComposeSent = elements.input.value;
+        });
         elements.input.addEventListener('compositionend', function() {
             shellComposing = false;
-            if (shellActive()) shellSendText(elements.input.value, false);
+            if (!shellActive()) return;
+            if (shellComposesLive()) {
+                shellSendComposition(elements.input.value);
+                shellComposeSent = '';
+                elements.input.value = '';
+            } else {
+                shellSendText(elements.input.value, false);
+            }
         });
         elements.input.addEventListener('paste', function(e) {
             if (!shellActive()) return;
@@ -20105,7 +20943,9 @@
                 // Fallback for any insert `beforeinput` didn't cancel (e.g. a keyboard that
                 // fires no beforeinput): send what's in the box when not composing. When
                 // beforeinput already sent + prevented, the box is empty, so this is a no-op.
+                // While composing on a phone or tablet, send the composition as it changes.
                 if (!shellComposing) shellSendText(elements.input.value, false);
+                else if (shellComposesLive()) shellSendComposition(elements.input.value);
                 return;
             }
             spellCycle = null; // the user's own edit ends a Ctrl+Q round
@@ -20303,6 +21143,9 @@
         elements.worldEditMccp2EnabledToggle.onclick = function() {
             this.classList.toggle('active');
         };
+        elements.worldEditStatusPanelToggle.onclick = function() {
+            this.classList.toggle('active');
+        };
         elements.worldEditKeepAliveSelect.onchange = function() {
             updateWorldEditorTypeVisibility();
         };
@@ -20368,6 +21211,24 @@
             setupZwj = !setupZwj;
             updateSetupPopupUI();
         };
+        if (elements.setupScreenReaderToggle) {
+            elements.setupScreenReaderToggle.onclick = function() {
+                setupScreenReader = !setupScreenReader;
+                updateSetupPopupUI();
+            };
+        }
+        if (elements.setupAnnounceScreenReaderToggle) {
+            elements.setupAnnounceScreenReaderToggle.onclick = function() {
+                setupAnnounceScreenReader = !setupAnnounceScreenReader;
+                updateSetupPopupUI();
+            };
+        }
+        if (elements.setupStatusPanelToggle) {
+            elements.setupStatusPanelToggle.onclick = function() {
+                setupStatusPanel = !setupStatusPanel;
+                updateSetupPopupUI();
+            };
+        }
         if (elements.setupClearInputToggle) {
             elements.setupClearInputToggle.onclick = function() {
                 setupClearInput = !setupClearInput;

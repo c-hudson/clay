@@ -507,6 +507,8 @@ impl ClayView {
         // its rows and PAD below, adding up to the same height.
         let sent_rows = self.fit_sent(masked, rows, window);
         let field_h = if sent_rows > 0 { height - PAD - sent_rows as f32 * row_h } else { height };
+        // What a screen reader hears the command line hold: never a masked password.
+        let input_text = if masked { String::new() } else { self.editor.text.clone() };
         let field = Field {
             text: self.editor.text.clone(),
             cursor: self.editor.cursor,
@@ -577,6 +579,12 @@ impl ClayView {
         bar.child(line.child(
             div()
                 .id("input")
+                // For a screen reader: the command line, with what is typed as its value; it
+                // claims the screen reader's focus while the window's root holds the keys'.
+                .role(gpui::accesskit::Role::MultilineTextInput)
+                .aria_label("Command")
+                .aria_value(input_text)
+                .aria_active_descendant()
                 .flex_1()
                 .min_w_0()
                 .h(px(field_h))
@@ -940,6 +948,13 @@ impl ClayView {
             self.split_command(&trimmed, cx);
             return;
         }
+        // `/map`'s pane forms are this window's own (map.rs); the rest go to the server.
+        if (first.eq_ignore_ascii_case("/map") || first.eq_ignore_ascii_case("/@map")) && self.map_pane_command(&trimmed, cx) {
+            self.editor.remember(&trimmed, false);
+            self.editor.clear();
+            self.input_touched(cx);
+            return;
+        }
         if first.eq_ignore_ascii_case("/server") || first.eq_ignore_ascii_case("/reload") {
             self.editor.remember(&trimmed, false);
             self.editor.clear();
@@ -1082,6 +1097,12 @@ impl ClayView {
             "/menu" => self.client_line("/menu is the console's menu; here, use the menu button (\u{2630}).", cx),
             // A /split an action or macro ran on the server: this window's own.
             "/split" | "/unsplit" => self.split_command(command, cx),
+            // A /map pane form an action or macro ran on the server.
+            "/map" | "/@map" => {
+                if !self.map_pane_command(command, cx) {
+                    self.client_line(&format!("% {first} isn't available in this GUI."), cx);
+                }
+            }
             "/help" => self.later(|v, window, cx| v.open_surface("help", window, cx), cx),
             "/note" => match command.split_whitespace().nth(1) {
                 None => self.open_notes(cx),
