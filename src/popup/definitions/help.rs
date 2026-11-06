@@ -13,11 +13,11 @@ pub const HELP_FIELD_CONTENT: FieldId = FieldId(1);
 // Button IDs
 pub const HELP_BTN_OK: ButtonId = ButtonId(1);
 
-/// Main help content lines (no topic specified)
+/// The first page of `/help` (no topic). The only copy: TF's `cmd_help` answers a bare
+/// `/help` with it too, which is what an SSH console and the server's other routes show.
 pub const HELP_LINES: &[&str] = &[
     "Getting Started:",
-    "  /setup               - Open settings (server, colors, etc.)",
-    "  /world               - Setup connection(s) to a world(s)",
+    "  /world               - World selector: add, edit, connect",
     "  /world <name>        - Connect/switch to a world",
     "  /dc                  - Disconnect from current world",
     "  /connections         - Show all connected worlds",
@@ -27,13 +27,13 @@ pub const HELP_LINES: &[&str] = &[
     "  PgUp / PgDn          - Scroll through output history",
     "  Esc-Left / Esc-Right - Switch connected worlds",
     "  Ctrl-P / Ctrl-N      - Command history",
-    "  Tab                  - Release world output when paused.",
+    "  Tab                  - Page down; at the bottom, release held output",
     "  Shift-Tab            - Move to the other pane (/split)",
     "  Esc-e                - Open the emoji picker",
     "",
     "Basic Configuration:",
-    "  /setup               - General settings popup",
-    "  /web                 - Web interface / remote access settings",
+    "  /setup               - Settings (more mode, TTS, display, ...)",
+    "  /web                 - Web server / remote access settings",
     "  /reach               - How other devices can reach this Clay",
     "  /actions             - Manage triggers and actions",
     "",
@@ -41,11 +41,8 @@ pub const HELP_LINES: &[&str] = &[
     "  /help commands       - List of commands",
     "  /help functions      - List of functions",
     "  /help <command>      - Help on a specific command (e.g. /help def)",
-    "  /help keys           - All keyboard bindings",
-    "  /help web            - Websocket help (remote interfaces)",
-    "",
-    "Keybind editor: open http://localhost:<port>/keybind-editor in a",
-    "browser (the port from /web; HTTP must be enabled there).",
+    "  /help keys           - Keyboard bindings (short list)",
+    "  /help web            - Remote access, and the browser editors",
 ];
 
 /// Topic-specific help content for Clay commands.
@@ -54,14 +51,19 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
     let lines: Vec<&str> = match topic {
         "worlds" | "world" => vec![
             "/worlds                    Open world selector popup",
-            "/worlds <name>             Connect to or create world",
+            "/worlds <name>             Switch to a world, connecting it",
             "/worlds <host> <port>      Connect to a host/port (temp world)",
-            "/worlds -e [name]          Edit world settings",
+            "/worlds -e [name]          Edit a world (the current one if no",
+            "                           name; a new name makes a new world)",
             "/worlds -l <name>          Connect without auto-login",
             "/worlds -b <name>          Connect in the background",
-            "/worlds -x <name>          Force SSL (host/port form only)",
+            "/worlds -x <host> <port>   Use SSL (a named world uses its own",
+            "                           SSL setting)",
+            "/world activity (or act)   Other worlds' new lines as they",
+            "                           arrive (/help activity)",
             "",
-            "-q, -n, -f are accepted but not distinct (see /tfhelp world).",
+            "/world is the same command (TinyFugue's name for it).",
+            "-q, -n and -f are accepted, not distinct.",
             "",
             "The world selector shows all worlds with columns:",
             "  World name, Hostname, Port, User",
@@ -69,7 +71,8 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "Controls in world selector:",
             "  Up/Down - Navigate    Enter - Connect",
             "  Tab - Cycle buttons   Esc - Close",
-            "  Type to filter        / - Focus filter",
+            "  Type to filter        F - Focus filter",
+            "  A Add  E Edit  D Delete  O Connect  C Cancel",
         ],
         "disconnect" | "dc" => vec![
             "/disconnect (or /dc) [<world>|-ALL]   Disconnect a world",
@@ -78,16 +81,23 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "name, disconnects that world instead. Given -ALL (case-",
             "insensitive), disconnects every connected world.",
         ],
-        "connections" | "l" => vec![
+        "connections" | "l" | "listsockets" => vec![
             "/connections (or /l)       List connected worlds",
-            "/listsockets [-sn] [-S<field>] [<name>]  Same table, more options",
+            "/listsockets [-s] [-S<field>] [<name>]  Same table, more options",
             "",
             "Shows a table with columns:",
-            "  World  Unseen  LastSend  LastRecv  LastNOP  NextNOP",
-            "  * marks the current world",
+            "  SSH     SSH: the connection uses TLS (PRX: through the",
+            "          reload proxy)",
+            "  World   * marks the current world",
+            "  Unseen  Lines you haven't seen",
+            "  Last    Since the last line received / sent",
+            "  KA      Since the last keepalive / until the next",
+            "  Buffer  Lines held for the world",
             "",
             "/listsockets -s prints one world name per line instead;",
             "-S<field> sorts by name/host/port/character/lines/idle.",
+            "<name> lists only worlds whose name contains it.",
+            "-n, -m and -T are accepted, not distinct.",
         ],
         "server" => vec![
             "/server <host[:port]>      Attach to a remote Clay server",
@@ -103,19 +113,11 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "whatever server you're attached to and starting a fresh,",
             "independent master. Only available from local console/GUI input.",
         ],
-        "send" => vec![
-            "/send [-W] [-w<world>] [-n] <text>",
-            "",
-            "Send text to a world.",
-            "  -w<world>  Send to specified world (by name)",
-            "  -W         Send to all connected worlds",
-            "  -n         Send without end-of-line marker",
-            "  No flags: Send to current world",
-        ],
         "notify" => vec![
             "/notify <message>",
             "",
-            "Send a push notification to the Android app.",
+            "Send a notification, titled with the world's name: the",
+            "Android app's, and the desktop's in both GUIs.",
             "Can be used in action commands: /notify Page from $1",
         ],
         "actions" => vec![
@@ -127,33 +129,43 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "  /gag in commands hides matched line",
             "  Enable 'Startup' to run on Clay start/reload",
         ],
-        "gag" => vec![
-            "/gag <pattern>             Gag lines matching pattern",
-            "",
-            "Creates a gag action that hides lines matching the",
-            "regex pattern. Gagged lines are still visible with F2.",
-        ],
         "setup" => vec![
             "/setup                     Open global settings",
             "",
-            "Settings: more mode, spell check, temp convert,",
-            "world switching, show tags, input height, themes,",
-            "mouse, ZWJ, ANSI music, TLS proxy",
+            "Settings: more mode, spell check, temp convert, world",
+            "switching, debug, input height, clear input on send,",
+            "TLS proxy, editor side, ZWJ, ANSI music, status line,",
+            "new indicator, text reveal, screen reader, TTS, archive,",
+            "log input, wrap space, picture host, separator style.",
+            "Import copies another Clay's settings (/help import).",
+            "The ? button explains each one.",
         ],
         "web" => vec![
-            "/web                       Open web/WebSocket settings",
+            "/web                       Web server settings",
+            "/reach                     How other devices can reach this Clay",
             "",
-            "Configure WebSocket (ws/wss), HTTP/HTTPS servers,",
-            "TLS certificates, passwords, and allow lists.",
-            "Remote Access (also /reach) shows how other devices",
-            "reach this Clay: addresses, firewall, router mapping.",
+            "One web server for the web page, the GUIs, the phone app",
+            "and remote consoles: TLS for other devices, plain on this",
+            "machine. /web sets its Port (or Disabled), Web Path,",
+            "Remote Lines, Password, allow list, your own certificate",
+            "and the Auth Key. Remote Access (also /reach) shows",
+            "how other devices reach this Clay: addresses, firewall,",
+            "router mapping.",
+            "",
+            "Browser editors, once /web has a port and a password:",
+            "  http://localhost:<port>/theme-editor     GUI colours",
+            "  http://localhost:<port>/action-editor    Actions",
+            "  http://localhost:<port>/keybind-editor   Key bindings",
+            "From another device: https://<host>:<port>/<web path>/...",
+            "(/reach shows the port and addresses). The web page and",
+            "the GUIs open all three from Settings.",
         ],
         "menu" => vec![
             "/menu                      Open the console's menu",
             "",
             "Lists every window and popup the console can open",
             "without anything more from you. Console only: the",
-            "web and GUI interfaces have their menu bar.",
+            "web and GUI interfaces have their \u{2630} menu.",
         ],
         "flush" => vec![
             "/flush                     Clear output buffer",
@@ -180,13 +192,16 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         ],
         "stats" => vec![
             "/stats                     Show the current world's status display",
+            "/stats hide|show           This world's Status Panel switch",
             "",
             "Shows every stat derived from GMCP Char.* packages and MSDP",
             "variables - vitals like HP/MP first, then everything else.",
             "A paired current/maximum (e.g. hp/maxhp) shows as one gauge",
             "entry. Shown only when the MUD has sent this data; nothing is",
-            "requested. The console also shows a compact one-line summary",
-            "above the input area once any data has arrived.",
+            "requested. The console shows a one-line summary above the",
+            "input area (the GUIs a panel) while this world's switch and",
+            "/setup's Status Line are both on. hide/show (also off/on)",
+            "set this world's switch, as the panel's x does in a GUI.",
         ],
         "msdp" => vec![
             "/msdp <LIST|REPORT|UNREPORT|SEND> [target]",
@@ -211,11 +226,12 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "the main instance's machine: a remote console, the",
             "web page, the GUI and the app edit the server's.",
         ],
-        "help" => vec![
+        "help" | "tfhelp" => vec![
             "/help [topic]              Show help",
             "",
-            "Without a topic, shows the full help popup.",
+            "Without a topic, shows the first help page.",
             "With a topic, shows help for that specific command.",
+            "/tfhelp is the same command.",
             "",
             "Works for both Clay and TF commands:",
             "  /help worlds     - World management commands",
@@ -225,6 +241,7 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "",
             "A topic Clay doesn't cover comes from TinyFugue's help",
             "file when tf is installed (/help intro, /help kecho).",
+            "Those topics are case-sensitive, as in TF.",
         ],
         "version" => vec![
             "/version                   Show version info",
@@ -246,6 +263,20 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "/reach --lookup (-l)       Look up the public IP (asks",
             "                           checkip.amazonaws.com; never automatic)",
         ],
+        "import" => vec![
+            "/import [host[:port]]      Import settings from another Clay",
+            "",
+            "Copies another Clay's settings into this one, asking for",
+            "its password or auth key (the host filled in if given).",
+            "In the web page and the GUIs it is also the Import button",
+            "on Settings' General tab. The main instance's own: a",
+            "remote console can't.",
+        ],
+        "map" => crate::map::app::MAP_HELP.lines().chain([
+            "",
+            "Built from the rooms the game reports over GMCP. While",
+            "TinyFugue's map.tf is loaded, /@map reaches Clay's.",
+        ]).collect(),
         "reload" => vec![
             "/reload                    Hot reload binary",
             "/reload --console          ... coming back as the console",
@@ -277,7 +308,7 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         "testmusic" => vec![
             "/testmusic                 Play test ANSI music",
             "",
-            "Plays C-D-E-F-G to verify audio is working.",
+            "Plays a short tune (Super Mario Bros) to test audio.",
         ],
         "tag" | "tags" => vec![
             "/tag                       Toggle MUD tag display (F2)",
@@ -299,13 +330,14 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "in the input buffer with cursor at start — type a prefix",
             "(e.g. 'say') then press Enter to send.",
         ],
-        "translate" | "tr" => vec![
-            "/translate <lang> <text>  (or /tr)",
+        "translate" => vec![
+            "/translate <lang> <text>",
             "",
             "Translate text to the specified language.",
             "<lang> can be a code (es, fr) or name (spanish).",
             "Result is placed in the input buffer with cursor at",
             "start — type a prefix then press Enter to send.",
+            "(/tr is TinyFugue's character translation: /help tr.)",
         ],
         "url" => vec![
             "/url <url>",
@@ -327,7 +359,7 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "Use --kill <id> to forcibly disconnect a client.",
             "Use --pause <id> to pause/resume a client. While paused,",
             "activity on that session's world is visible to other",
-            "sessions. The client resumes automatically on next input.",
+            "sessions. The client resumes as soon as it is used.",
             "--pause console does the same for the console, from any",
             "interface: activity on the world it shows becomes new",
             "activity for everyone else. Any key pressed at the",
@@ -346,30 +378,46 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         "font" => vec![
             "/font                      Font settings (web/GUI)",
             "",
-            "Adjusts font size in the web and GUI interfaces.",
+            "Opens Settings' Font tab in the web page and the GUIs:",
+            "the font, its size per device, weight, line height and",
+            "spacing. Each program keeps its own fonts on each OS.",
+            "The console's font is the terminal's.",
         ],
         "update" => vec![
             "/update [-f]               Download and install update",
             "",
-            "Downloads latest release from GitHub.",
-            "  -f  Force update even if version matches",
+            "Installs the latest release from GitHub and reloads,",
+            "keeping connections. -f (--force): even if not newer.",
+            "In a GUI or console attached to another Clay, the server",
+            "is updated first, then this program. clay --upgrade",
+            "installs it from a shell.",
         ],
-        "addworld" => vec![
-            "/addworld [-pxe] [-T<type>] [-s<srchost>] name [char pass] host port [file]",
-            "/addworld [-T<type>] name",
-            "/addworld [-T<type>] DEFAULT [char pass [file]]",
+        "activity" | "act" => vec![
+            "/world activity  (or /world act)",
+            "/split activity  (or /split act)",
             "",
-            "Create or update a world (TF-compatible).",
-            "  -x  Use SSL/TLS for connection",
-            "  -s<srchost>  Accepted, not persisted (no bind-address setting)",
-            "  file  Per-world script, kept for this session only",
-            "  DEFAULT  Fallback character/password/file for worlds with none",
+            "The Activity world shows the new lines of every world you",
+            "aren't looking at, as they arrive, each after the name of",
+            "the world it came from, on a block of the New Indicator's",
+            "colour (yellow when it has none). It never pauses for more,",
+            "and nothing it shows is logged, fires a trigger or counts",
+            "as activity: the lines did all that in their own worlds.",
             "",
-            "See /tfhelp addworld for the full option list.",
+            "Each interface has its own: it holds only what arrives",
+            "while it is on screen there, starting empty each time you",
+            "go to it, and leaves out any world that interface shows",
+            "itself (the other pane, another window). Gagged and blank",
+            "lines and Clay's own messages aren't shown. The switch keys",
+            "and Esc-w never go to it, and no world list shows it;",
+            "a world of your own named Activity takes its place.",
         ],
         "split" | "unsplit" => vec![
             "/split                     Split the output: the next world above",
             "/split <world>             Split with <world> above",
+            "/split act                 Other worlds' new lines above",
+            "                           (/help activity)",
+            "/split -n <lines> [world]  The top pane <lines> high (split,",
+            "                           -n alone just resizes it)",
             "/unsplit                   Close the pane without the focus",
             "",
             "Two worlds at once, one pane above the other. The world",
@@ -383,23 +431,32 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "/split <world> puts it in the pane without the focus.",
             "Nothing connects or disconnects; the split survives",
             "/reload.",
+            "",
+            "Each pane keeps one line at least. The size, set by -n or",
+            "(in the GUI and the web page) by dragging the bar between",
+            "the panes, is this program's own, and the next /split",
+            "opens at it again.",
         ],
         "window" => vec![
-            "/window [world]            Open a new browser window/tab",
-            "/window --grep [pattern]   Open a grep/filter window",
+            "/window [world]            Open another window",
+            "/window --grep <pattern> [-w <world>] [--regexp]",
+            "                           Open a grep/filter window",
             "",
-            "Opens a new web/GUI window. Optionally locks it to a",
-            "specific world by name. The --grep form opens a half-",
-            "height window with a live filter — type a regex to show",
-            "only matching lines from the current world.",
+            "Opens another window of the web page or GUI, kept to",
+            "<world> if one is named. The --grep form opens a half-",
+            "height window showing only the lines of the current",
+            "world (or <world>) that match <pattern>: a glob,",
+            "or a regex with --regexp. Not in a console.",
         ],
         "say" => vec![
             "/say <text>                Speak text aloud (TTS)",
             "",
-            "Uses text-to-speech to read <text> aloud in the TTS mode",
-            "set in /setup: Local (espeak, say, PowerShell), Kokoro",
-            "(the neural voice from /tts install) or Edge (cloud).",
-            "Web/Android clients use the browser's Web Speech API.",
+            "Speaks <text> in the interface it was typed in, with that",
+            "interface's own TTS (set in its Settings; the console's",
+            "in /setup): Local (espeak, say, PowerShell), Kokoro (the",
+            "neural voice from /tts install) or Edge (cloud). Typed at",
+            "the console or run by an action, every interface speaks",
+            "it, each with its own.",
         ],
         "tts" => vec![
             "/tts                       Text-to-speech status",
@@ -410,12 +467,14 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "/tts test                  Speak a test line",
             "",
             "Kokoro is an offline neural voice. /tts install downloads",
-            "its runtime and model (about 160 MB, 230 MB on disk) into",
-            "~/.clay/tts; then set TTS to Kokoro in /setup. Until the",
-            "files are there, Kokoro mode speaks with the Local engine.",
-            "A static build (the musl console) cannot load it; use the",
-            "GUI build. A remote GUI uses its own machine's files:",
-            "run `clay --tts-install` there.",
+            "its runtime and the model build this CPU runs fastest",
+            "(160 to 340 MB) into ~/.clay/tts; then set TTS to Kokoro",
+            "in this interface's Settings (the console's: /setup).",
+            "Until the files are there, Kokoro mode speaks with the",
+            "Local engine. A static build (the musl console) cannot",
+            "load it; use the GUI build. A GUI attached to another",
+            "Clay uses its own machine's files: /tts install there",
+            "fetches them onto that machine (clay --tts-install too).",
         ],
         _ => return None,
     };
@@ -499,5 +558,49 @@ mod tests {
     fn test_topic_help() {
         assert!(get_topic_help("worlds").is_some());
         assert!(get_topic_help("nonexistent").is_none());
+    }
+
+    /// The first page names each command once (`/setup` used to be on it twice) and
+    /// leaves the browser editors to `/help web`: they need `/web` set up first.
+    #[test]
+    fn the_first_page_names_each_command_once_and_no_editor() {
+        let mut seen = std::collections::HashSet::new();
+        for line in HELP_LINES.iter().filter(|l| l.trim_start().starts_with('/')) {
+            // What is typed: "/world" and "/world <name>" are two entries.
+            let typed = line.split(" - ").next().unwrap_or(line).trim();
+            assert!(seen.insert(typed), "listed twice on the first page: {line:?}");
+        }
+        assert!(!HELP_LINES.iter().any(|l| l.contains("-editor")), "the editors are /help web's");
+        assert!(get_topic_help("web").unwrap().iter().any(|l| l.contains("/keybind-editor")));
+    }
+
+    /// One first page: TF's bare `/help`, which the SSH console and the server's other
+    /// routes show, is this one. Two copies drifted apart.
+    #[test]
+    fn a_bare_help_is_this_page_everywhere() {
+        assert_eq!(crate::tf::parser::help_text(&crate::tf::TfEngine::new(), ""), HELP_LINES.join("\n"));
+    }
+
+    /// A topic lives in one file. The console asks this file first, every other
+    /// interface asks TF's `cmd_help` first, so a topic both defined showed different
+    /// text depending on where `/help <topic>` was typed (a GUI's `/help version` said
+    /// "Display Clay version information.").
+    #[test]
+    fn every_clay_topic_is_answered_the_same_by_tf() {
+        let src = include_str!("help.rs");
+        let body = &src[src.find("pub fn get_topic_help").unwrap()..];
+        let body = &body[..body.find("        _ => return None,").unwrap()];
+        let mut names = Vec::new();
+        for line in body.lines() {
+            let Some(arms) = line.strip_prefix("        \"").and_then(|l| l.split(" =>").next()) else { continue };
+            names.extend(arms.split('|').map(|a| a.trim().trim_matches('"')));
+        }
+        assert!(names.len() > 40, "{names:?}");
+        let engine = crate::tf::TfEngine::new();
+        for name in names {
+            let lines = get_topic_help(name).unwrap_or_else(|| panic!("{name:?} has an arm but no help"));
+            assert_eq!(crate::tf::parser::help_text(&engine, name), lines.join("\n"),
+                "/help {name}: TF's cmd_help has its own text - keep one");
+        }
     }
 }

@@ -673,6 +673,8 @@
         worldEditKeepAliveGagField: document.getElementById('world-edit-keep-alive-gag-field'),
         worldEditKeepAliveGagEnabled: document.getElementById('world-edit-keep-alive-gag-enabled'),
         worldEditKeepAliveGag: document.getElementById('world-edit-keep-alive-gag'),
+        worldEditLoginCommandField: document.getElementById('world-edit-login-command-field'),
+        worldEditLoginCommand: document.getElementById('world-edit-login-command'),
         worldEditEncodingField: document.getElementById('world-edit-encoding-field'),
         worldEditEncodingSelect: document.getElementById('world-edit-encoding-select'),
         worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
@@ -818,6 +820,7 @@
         fontWeightValue: document.getElementById('font-weight-value'),
         fontAdvancedToggle: document.getElementById('font-advanced-toggle'),
         fontAdvancedSection: document.getElementById('font-advanced-section'),
+        fontSample: document.getElementById('font-sample'),
         fontLineheightMinus: document.getElementById('font-lineheight-minus'),
         fontLineheightPlus: document.getElementById('font-lineheight-plus'),
         fontLineheightValue: document.getElementById('font-lineheight-value'),
@@ -966,6 +969,12 @@
     // The server takes RequestHistory (InitialState.history_on_demand); an older one would
     // close the connection on it.
     var serverHistoryOnDemand = false;
+    // This connection is paused (/pause, /remote --pause: the server's PausedState), and
+    // the server takes ResumeSession (InitialState.resume_session): any use of the page
+    // asks it, once, to resume (noteUserActive).
+    var sessionPaused = false;
+    var serverResumesSession = false;
+    var resumeAsked = false;
     let pendingReconnectCommand = null;  // Command to resend after reconnect
     // T1.12/D3: the world to resend to is remembered by NAME, not index. Indices
     // shift across a reconnect exactly like the InitialState focus resolution below
@@ -1502,6 +1511,11 @@
         }
     })();
 
+    // The running program, the same in each of its windows (the WebView GUI injects it):
+    // two WebView GUIs on one machine share clientUid (one localStorage) and are still two
+    // interfaces to /pause. Empty in a browser and the phone app.
+    const clayInstanceId = (typeof window.CLAY_INSTANCE_ID === 'string') ? window.CLAY_INSTANCE_ID : '';
+
     // Command completion state
     let lastCompletionPrefix = '';
     let lastCompletionIndex = -1;
@@ -1571,7 +1585,7 @@
     let setupTaskbarAlert = false;
     let setupTtsMode = 'Off';
     let setupTabsMode = 'none';
-    let setupIconBarMode = 'app_tablet';
+    let setupIconBarPlace = 'none';
     let setupPictureHost = 'catbox';
     let setupSeparatorStyle = 'web';
     let setupTlsProxy = false;
@@ -1598,7 +1612,7 @@
     let searchPopupOpen = false;
     let searchText = '';
     let searchMatchIndices = [];  // the output_lines objects that match (an index goes stale when older history is put in front)
-    let searchCurrentPos = -1;    // which match is currently shown at bottom
+    let searchCurrentPos = -1;    // which match is shown (in the middle of the output)
 
     // Emoji picker popup state (Esc-e, EMOJI-PICKER-ROADMAP.md Step 7; navigation
     // rework in EMOJI-PICKER-ROADMAP.md's "Navigation rework (v1.6.12)" section)
@@ -1666,15 +1680,6 @@
     }
     const fontProfileKey = window.Android ? 'app-android'
         : (window.WEBVIEW_MODE ? 'webview-' : 'browser-') + detectFontOs();
-    // As font_profile::label: "a web browser on Linux", "the Android app".
-    function fontProfileLabel(key) {
-        if (key === 'app-android') return 'the Android app';
-        const programs = { native: 'the native GUI', webview: 'the WebView GUI', browser: 'a web browser', app: 'the Android app' };
-        const oses = { windows: 'Windows', macos: 'macOS', linux: 'Linux', android: 'Android', ios: 'iOS', chromeos: 'ChromeOS', other: 'another OS' };
-        const at = key.indexOf('-');
-        const program = key.slice(0, at), os = key.slice(at + 1);
-        return (programs[program] || program) + ' on ' + (oses[os] || os);
-    }
     function fontsInUse() {
         return {
             name: fontName, size_phone: webFontSizePhone, size_tablet: webFontSizeTablet,
@@ -1811,7 +1816,7 @@
     // Status/vitals panel (mud-status-display.md Job 3): a client-only collapse
     // toggle (plan D6-style override, but deliberately NOT synced from server
     // settings - the plan is explicit that this stays purely client-side, unlike
-    // tabsMode/iconBarMode below). One row of DOM per stat key is kept across
+    // tabsMode/iconBarPlace below). One row of DOM per stat key is kept across
     // renders in statsPanelRows so ordinary vitals updates only touch text/width,
     // never the DOM subtree - see updateStatsPanel()'s doc comment further down.
     let statsPanelCollapsed = (function() {
@@ -2087,8 +2092,12 @@
         });
         document.querySelectorAll('.toggle').forEach(function(t) { toggles.observe(t, { attributes: true, attributeFilter: ['class'] }); });
     }
-    // Icon bar visibility mode, synced from server settings ('none', 'app_tablet', 'all')
-    let iconBarMode = 'app_tablet';
+    // Where this page's icon bar goes ('top', 'bottom', 'left', 'right', 'none'): its own
+    // place under fontProfileKey (user request 2026-11-04), else the one the server's shared
+    // Icon Bar ('none', 'app_tablet', 'all') gives it (sharedIconBarPlace).
+    let iconBarPlace = 'none';
+    let iconBarShared = 'app_tablet';   // the server's shared Icon Bar
+    let iconBarProfiles = null;   // each interface's own; null = a server before the split
     // Import Picture's host (Settings > General; src/picture.rs). '' = a server from before
     // Import Picture, which sends none and can't upload.
     let pictureHost = '';
@@ -2633,6 +2642,35 @@
         return matches[nextIndex] + args;
     }
 
+    // Tab on /world or /worlds with an argument: the world named by what is typed, -e or -l
+    // before it kept; the next world each Tab while what is typed is still a prefix of
+    // another name. A copy of input.rs complete_world_arg, the console's and the native
+    // GUI's rule. null: not such a line, so a command is completed instead; else the line
+    // after Tab, unchanged when no world matches.
+    function completeWorldArg(input) {
+        const space = input.indexOf(' ');
+        if (space < 0) return null;
+        const cmd = input.substring(0, space);
+        if (!/^\/worlds?$/i.test(cmd)) return null;
+        const args = input.substring(space + 1);
+        let flag = '';
+        let partial = args;
+        const f = args.substring(0, 2).toLowerCase();
+        if (f === '-e' || f === '-l') {
+            if (args.length === 2) return input;
+            if (args[2] === ' ') {
+                flag = f + ' ';
+                partial = args.substring(3).trimStart();
+            }
+        }
+        const lower = partial.toLowerCase();
+        const byLower = (a, b) => { const x = a.toLowerCase(), y = b.toLowerCase(); return x < y ? -1 : x > y ? 1 : 0; };
+        const matches = worlds.map(w => w.name).filter(n => n.toLowerCase().startsWith(lower)).sort(byLower);
+        if (matches.length === 0) return input;
+        const at = matches.findIndex(n => n.toLowerCase() === lower);
+        return cmd + ' ' + flag + matches[at >= 0 ? (at + 1) % matches.length : 0];
+    }
+
     // Reset completion state (call when input changes by typing)
     function resetCompletion() {
         lastCompletionPrefix = '';
@@ -2972,7 +3010,7 @@
     }
 
     function recentWorldEntries() {
-        return worlds.map((w, i) => ({ i, at: w ? w._lastActivityMs : undefined }))
+        return worlds.map((w, i) => ({ i, at: w && !w.is_activity ? w._lastActivityMs : undefined }))
             .filter(e => e.i !== currentWorldIndex && typeof e.at === 'number')
             .sort((a, b) => b.at - a.at)
             .slice(0, 6);
@@ -3151,10 +3189,10 @@
         // A phone keeps the input that clears on Enter.
         if (mode === 'phone') clearSentLines();
         applyKeyboardForceState();
-        // Device mode affects iconBarVisible() ('app_tablet' mode) - re-render
-        // on every device-mode change (auto-detect at startup, or the manual
-        // long-press override) so the icon bar's visibility stays correct.
-        renderIconBar();
+        // The device mode decides where a shared App/Tablet puts the icon bar
+        // (sharedIconBarPlace) - place it again on every device-mode change (auto-detect at
+        // startup, or the manual long-press override).
+        applyIconBarPlace(myIconBarPlace());
     }
 
     // Initialize
@@ -3166,6 +3204,11 @@
         setupMapPane();
         watchDialogs();
         document.addEventListener('keydown', a11yKeys, true);
+        // A paused session resumes when the page is used (capture phase: before anything
+        // can stop the event).
+        ['keydown', 'pointerdown', 'touchstart', 'wheel'].forEach(function(type) {
+            window.addEventListener(type, noteUserActive, { capture: true, passive: true });
+        });
         if (elements.outputContainer && !elements.outputContainer.hasAttribute('tabindex')) elements.outputContainer.setAttribute('tabindex', '-1');
         // Capture Ctrl+W at window level to prevent browser from closing tab
         // Uses capture phase (true) to intercept before any other handlers
@@ -3469,7 +3512,7 @@
         setTimeout(hideConnectionLog, 800);
 
         if (window.AUTO_PASSWORD) {
-            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, interface_key: fontProfileKey }));
+            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, instance_id: clayInstanceId, interface_key: fontProfileKey }));
             return;
         }
 
@@ -4307,6 +4350,11 @@
                 serverPictureUpload = !!msg.picture_upload;
                 // The server answers RequestHistory (older lines on demand, then its archive).
                 serverHistoryOnDemand = !!msg.history_on_demand;
+                // A pause is a connection's: a new one starts unpaused, and a resync's
+                // PausedState follows if this one still is. Kept, the badge outlived a
+                // reconnect (a server's reload) and nothing ever took it down.
+                serverResumesSession = !!msg.resume_session;
+                setSessionPaused(false);
                 // The server takes OtherViews (a split's other pane).
                 serverTakesOtherViews = !!msg.other_views;
                 lastOtherViewsSent = null;
@@ -4783,7 +4831,7 @@
                     receiveTabs(msg.settings);
                     receiveScreenReader(msg.settings);
                     receiveStatusPanel(msg.settings);
-                    if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
+                    receiveIconBar(msg.settings);
                     if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
                     // This page's own Text Reveal, under its interface key (per interface,
                     // like fonts); a server from before the effect sends no map.
@@ -5243,9 +5291,12 @@
                         // Client-generated messages (from_server: false) are always complete
                         // Only use partial line handling for MUD server data
                         const isFromServer = msg.from_server !== false;
-                        // Output from the MUD now (not a refill of history): Recent Worlds.
-                        if (isFromServer && !isGapFill) noteWorldActivity(msg.world_index);
-                        if (isFromServer && !isGapFill && !msg.gagged && msg.data) noteTaskbarAlert();
+                        // Output from the MUD now (not a refill of history): Recent Worlds,
+                        // and the Taskbar Alert. The Activity world's lines are copies, which
+                        // their own worlds already counted.
+                        const liveText = isFromServer && !isGapFill && !world.is_activity;
+                        if (liveText) noteWorldActivity(msg.world_index);
+                        if (liveText && !msg.gagged && msg.data) noteTaskbarAlert();
 
                         // Prepend any partial line from previous read (only for server data)
                         let data = msg.data;
@@ -5698,7 +5749,7 @@
                     receiveTabs(msg.settings);
                     receiveScreenReader(msg.settings);
                     receiveStatusPanel(msg.settings);
-                    if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
+                    receiveIconBar(msg.settings);
                     if (msg.settings.picture_host !== undefined) pictureHost = msg.settings.picture_host || '';
                     // This page's own Text Reveal, under its interface key (per interface,
                     // like fonts); a server from before the effect sends no map.
@@ -6164,11 +6215,9 @@
                 updateStatusBar();
                 break;
 
-            case 'PausedState': {
-                const el = document.getElementById('session-paused-indicator');
-                if (el) el.style.display = msg.paused ? 'flex' : 'none';
+            case 'PausedState':
+                setSessionPaused(!!msg.paused);
                 break;
-            }
 
             case 'ShowTagsChanged':
                 // Server toggled show_tags (F2 or /tag command)
@@ -6807,13 +6856,15 @@
         // only it moves the view or the badge.
         const m = moreOf(worldIndex);
         const onScreen = worldIndex === currentWorldIndex;
-        const rows = (m.paused || !moreModeEnabled) ? 0 : lineRows(text, !!(obj && obj.gagged));
+        // The Activity world never pauses: it is there to watch everything go by.
+        const pages = moreModeEnabled && !(heldWorld && heldWorld.is_activity);
+        const rows = (m.paused || !pages) ? 0 : lineRows(text, !!(obj && obj.gagged));
 
         if (m.paused) {
             // Already paused, queue the line info
             m.held.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
             if (onScreen) updateStatusBar();
-        } else if (moreModeEnabled && rows > 0 && m.rowsSincePause > 0 && m.rowsSincePause + rows > threshold) {
+        } else if (pages && rows > 0 && m.rowsSincePause > 0 && m.rowsSincePause + rows > threshold) {
             // Trigger pause: this line would not fit in what's left of the screenful.
             m.paused = true;
             m.held.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
@@ -6979,6 +7030,20 @@
     }
 
     // Send message to server - returns true if sent, false if connection lost
+    // The PAUSED badge on the status bar: what the server last said of this connection.
+    function setSessionPaused(paused) {
+        sessionPaused = paused;
+        resumeAsked = false;
+        const el = document.getElementById('session-paused-indicator');
+        if (el) el.style.display = paused ? 'flex' : 'none';
+    }
+
+    // A key, a press, a touch or a wheel turn anywhere on the page: a paused session resumes.
+    function noteUserActive() {
+        if (!sessionPaused || !serverResumesSession || resumeAsked) return;
+        if (send({ type: 'ResumeSession' })) resumeAsked = true;
+    }
+
     function send(msg) {
         if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
             ws.send(JSON.stringify(msg));
@@ -7644,7 +7709,7 @@
             challenge_response: usesChallenge,
             request_key: false,
             resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(),
-            client_uid: clientUid, interface_key: fontProfileKey
+            client_uid: clientUid, instance_id: clayInstanceId, interface_key: fontProfileKey
         };
         if (currentWorldIndex !== undefined) {
             msg.current_world = currentWorldIndex;
@@ -7729,7 +7794,7 @@
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
             const challengeHash = await hashPassword(hash + serverChallenge);
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, interface_key: fontProfileKey };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, instance_id: clayInstanceId, interface_key: fontProfileKey };
             if (username) {
                 msg.username = username;
             }
@@ -7742,7 +7807,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             const challengeHash = sha256Fallback(hash + serverChallenge);
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, interface_key: fontProfileKey };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: true, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, instance_id: clayInstanceId, interface_key: fontProfileKey };
             if (username) {
                 msg.username = username;
             }
@@ -8615,8 +8680,7 @@
                     // typed; they aren't part of the name.
                     let rest = args.slice();
                     while (rest.length > 1 && /^-[a-z]+$/i.test(rest[0])) rest.shift();
-                    const name = rest.join(' ');
-                    const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
+                    const idx = findWorldTyped(rest.join(' '));
                     if (idx >= 0) switchWorldLocal(idx);
                 }
                 break;
@@ -9234,6 +9298,12 @@
     let drawingSplit = false;
     let serverTakesOtherViews = false;
     let splitRenderPending = false;
+    // The panes' size (user requests 2026-11-05): dragging the bar between them moves it,
+    // as dragging the input's top edge resizes the input, and `/split -n <lines>` sets it.
+    // The top pane's lines (null: half each), this page's own, kept for its next /split and
+    // across a relaunch (saveSplitState); each pane keeps one line.
+    let splitTopLines = null;
+    let splitResizeDrag = null; // { y, h, moved }
     let lastOtherViewsSent = null;
 
     function splitWorldIndex() {
@@ -9256,9 +9326,24 @@
     // util::split_next_world (the console's /split rule), ported: the next connected world
     // after `current` in alphabetical order (case-insensitive, wrapping), else the next of
     // all worlds; -1 when there is no other world.
+    // A world named in `/world <name>` or `/split <name>`: by name (any case), else `act`
+    // for the Activity world; a real world of either name wins (util::find_world_typed).
+    function findWorldTyped(name) {
+        const lower = (name || '').trim().toLowerCase();
+        const idx = worlds.findIndex(w => w && (w.name || '').toLowerCase() === lower);
+        if (idx >= 0 || lower !== 'act') return idx;
+        return worlds.findIndex(w => w && w.is_activity);
+    }
+
+    // The Activity world (WorldStateMsg.is_activity): only ever named, never listed.
+    function isActivityWorld(i) {
+        return !!(worlds[i] && worlds[i].is_activity);
+    }
+
     function splitNextWorld(current) {
         const order = [];
-        worlds.forEach((w, i) => { if (w) order.push(i); });
+        // The Activity world is only ever named, never the next one (util::split_next_world).
+        worlds.forEach((w, i) => { if (w && (!w.is_activity || i === current)) order.push(i); });
         order.sort((a, b) => {
             const x = (worlds[a].name || '').toLowerCase(), y = (worlds[b].name || '').toLowerCase();
             return x < y ? -1 : x > y ? 1 : a - b;
@@ -9388,7 +9473,7 @@
         const dot = splitPane.bar.querySelector('.status-dot');
         const name = splitPane.bar.querySelector('.status-world');
         if (w) {
-            dot.className = 'status-dot' + (w.connected ? '' : (isWorldReconnecting(w) ? ' reconnecting' : ' off'));
+            dot.className = 'status-dot' + (w.connected || w.is_activity ? '' : (isWorldReconnecting(w) ? ' reconnecting' : ' off'));
             name.textContent = w.name;
         }
         // The top pane's own More/History, as the status bar shows the bottom pane's.
@@ -9410,6 +9495,83 @@
             parent.insertBefore(splitPane.bar, main.nextSibling);
             parent.insertBefore(splitPane.container, splitPane.bar.nextSibling);
         }
+        applySplitSize();
+    }
+
+    // The height a pane takes to show `lines` (getVisibleLineCount's rows, with the pane's
+    // own padding; every box is border-box).
+    function splitPaneHeight(el, lines) {
+        const cs = getComputedStyle(el);
+        return lines * lineHeightPx() + (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    }
+    // The top pane its lines, else half; it gives way to the bottom pane's one line when
+    // the window is short (each pane's min-height).
+    function applySplitSize() {
+        const main = elements.outputContainer;
+        if (!splitPane) {
+            main.style.flex = '';
+            main.style.minHeight = '';
+            return;
+        }
+        const top = splitPane.onTop ? splitPane.container : main;
+        const bottom = splitPane.onTop ? main : splitPane.container;
+        top.style.flex = splitTopLines ? '0 1 ' + splitPaneHeight(top, splitTopLines) + 'px' : '1 1 0px';
+        bottom.style.flex = '1 1 0px';
+        top.style.minHeight = splitPaneHeight(top, 1) + 'px';
+        bottom.style.minHeight = splitPaneHeight(bottom, 1) + 'px';
+    }
+
+    // A press on the pane bar moves the focus to a grey bar's pane, as before, and a drag
+    // from it moves the bar a line at a time, leaving each pane a line at least. Its
+    // More/History badge is a button of its own.
+    function startSplitResize(e) {
+        if (!splitPane || (e.button !== undefined && e.button !== 0)) return;
+        if (e.target.closest && e.target.closest('.status-more')) return;
+        if (splitPane.onTop) splitFocusSwap();
+        const top = splitPane.onTop ? splitPane.container : elements.outputContainer;
+        splitResizeDrag = { y: e.clientY, h: top.offsetHeight, moved: false };
+        try { splitPane.bar.setPointerCapture(e.pointerId); } catch (err) { /* a mouse event without capture */ }
+        e.preventDefault();
+    }
+    function moveSplitResize(e) {
+        const d = splitResizeDrag;
+        if (!d || !splitPane) return;
+        const dy = e.clientY - d.y;
+        if (!d.moved && Math.abs(dy) < 3) return;
+        d.moved = true;
+        const top = splitPane.onTop ? splitPane.container : elements.outputContainer;
+        const bottom = splitPane.onTop ? elements.outputContainer : splitPane.container;
+        const row = lineHeightPx();
+        const pad = splitPaneHeight(top, 0);
+        const most = Math.max(1, Math.floor((top.offsetHeight + bottom.offsetHeight - splitPaneHeight(bottom, 1) - pad) / row));
+        const lines = Math.min(most, Math.max(1, Math.round((d.h + dy - pad) / row)));
+        if (lines !== splitTopLines) {
+            splitTopLines = lines;
+            applySplitSize();
+        }
+        e.preventDefault();
+    }
+    // Let go: the size is kept for this page's next split (and a relaunch).
+    function endSplitResize() {
+        const d = splitResizeDrag;
+        splitResizeDrag = null;
+        if (d && d.moved) saveSplitState();
+    }
+
+    // What /split was given: `-n <lines>` (`-n10` too), then a world name. A port of
+    // util.rs parse_split_args; `error` is the line to say.
+    function parseSplitArgs(args) {
+        const words = args.trim().split(/\s+/).filter(Boolean);
+        let lines = null;
+        if (words.length && words[0].startsWith('-')) {
+            const first = words.shift();
+            const usage = { error: 'Usage: /split [-n <lines>] [world]' };
+            if (!first.startsWith('-n')) return usage;
+            const number = first.length > 2 ? first.slice(2) : (words.shift() || '');
+            if (!/^\d+$/.test(number) || parseInt(number, 10) < 1) return usage;
+            lines = parseInt(number, 10);
+        }
+        return { lines: lines, world: words.join(' ') };
     }
 
     function splitBuild() {
@@ -9461,9 +9623,10 @@
             if (e.target.closest && e.target.closest('a')) return;
             splitFocusSwap();
         });
-        bar.addEventListener('click', () => {
-            if (splitPane === pane && splitPane.onTop) splitFocusSwap();
-        });
+        bar.addEventListener('pointerdown', startSplitResize);
+        bar.addEventListener('pointermove', moveSplitResize);
+        bar.addEventListener('pointerup', endSplitResize);
+        bar.addEventListener('pointercancel', endSplitResize);
         // Its More/History badge releases a screenful of its pane, as the status bar's does
         // (the focus comes to the pane first).
         bar.querySelector('.status-more').addEventListener('click', guard('paneMore', (e) => {
@@ -9503,10 +9666,13 @@
     function splitStorageKey() {
         return 'clay_split_' + getServerIdentity();
     }
+    // The split and its size (kept for the next /split whether split now or not).
     function saveSplitState() {
         try {
-            if (splitPane) {
-                localStorage.setItem(splitStorageKey(), JSON.stringify({ world: splitPane.name, on_top: splitPane.onTop }));
+            const kept = splitPane ? { world: splitPane.name, on_top: splitPane.onTop } : {};
+            if (splitTopLines) kept.top_lines = splitTopLines;
+            if (Object.keys(kept).length) {
+                localStorage.setItem(splitStorageKey(), JSON.stringify(kept));
             } else {
                 localStorage.removeItem(splitStorageKey());
             }
@@ -9518,6 +9684,7 @@
         if (splitPane || popupWindowMode || noteMode || grepRegex) return;
         let kept = null;
         try { kept = JSON.parse(localStorage.getItem(splitStorageKey()) || 'null'); } catch (e) { kept = null; }
+        if (kept && Number.isInteger(kept.top_lines) && kept.top_lines >= 1) splitTopLines = kept.top_lines;
         if (!kept || !kept.world || worlds.findIndex(w => w && w.name === kept.world) < 0) return;
         splitOpen(kept.world, true);
         if (splitPane && splitPane.onTop !== !!kept.on_top) {
@@ -9534,8 +9701,7 @@
     function splitOpen(name, quiet) {
         let target;
         if (name) {
-            const lower = name.toLowerCase();
-            target = worlds.findIndex(w => w && (w.name || '').toLowerCase() === lower);
+            target = findWorldTyped(name);
             if (target < 0) return "World '" + name + "' not found.";
         } else if (splitPane) {
             return 'The output is already split; /unsplit closes the pane without the focus.';
@@ -9575,6 +9741,7 @@
         pane.container.remove();
         pane.bar.remove();
         splitPane = null;
+        applySplitSize();
         // The world closed counts afresh if it holds nothing, as a world left does.
         if (i >= 0 && i !== currentWorldIndex) {
             const m = moreOf(i);
@@ -9592,9 +9759,24 @@
     }
 
     // Quiet when it works (the panes show it); only an error is said.
+    // `-n` makes the top pane that many lines, kept for this page's next /split (user
+    // request 2026-11-05; the console's App::split_command); while split, `-n` alone only
+    // resizes.
     function splitCommand(cmd) {
         const parts = cmd.trim().split(/\s+/);
-        const reply = parts[0].toLowerCase() === '/unsplit' ? splitClose() : splitOpen(parts.slice(1).join(' '));
+        let reply;
+        if (parts[0].toLowerCase() === '/unsplit') {
+            reply = splitClose();
+        } else {
+            const args = parseSplitArgs(parts.slice(1).join(' '));
+            reply = args.error || '';
+            if (!reply && !(args.lines && !args.world && splitPane)) reply = splitOpen(args.world);
+            if (!reply && args.lines) {
+                splitTopLines = args.lines;
+                applySplitSize();
+                saveSplitState();
+            }
+        }
         if (reply) appendClientLine(reply);
     }
 
@@ -9769,7 +9951,8 @@
         searchCurrentPos = -1;
         elements.searchPopup.style.display = 'none';
         elements.input.focus();
-        renderOutput();
+        // Back to the newest lines, as the search found them.
+        renderOutput({ toBottom: true });
     }
 
     function computeSearchMatches() {
@@ -9806,7 +9989,7 @@
         searchText = elements.searchInput.value;
         computeSearchMatches();
         updateSearchMatchInfo();
-        renderOutput();
+        showSearchMatch();
     }
 
     function advanceSearch() {
@@ -9817,7 +10000,38 @@
             searchCurrentPos = searchMatchIndices.length - 1;
         }
         updateSearchMatchInfo();
-        renderOutput();
+        showSearchMatch();
+    }
+
+    // The search's match in the middle of the output (user ruling 2026-11-05). The output
+    // is no longer cut off at it, so the lines after it can be scrolled to as well as those
+    // before. The render window moves to hold it, half a window either side; no match, the
+    // newest lines.
+    function showSearchMatch() {
+        const world = worlds[currentWorldIndex];
+        const lines = world ? (world.output_lines || []) : [];
+        const match = searchCurrentPos >= 0 ? searchMatchIndices[searchCurrentPos] : null;
+        const k = match ? lines.indexOf(match) : -1;
+        if (!world || k < 0) {
+            renderOutput({ toBottom: true });
+            return;
+        }
+        const half = Math.floor(RENDER_WINDOW_INITIAL / 2);
+        setRenderRange(world, Math.max(0, k - half), Math.min(lines.length, k + half + 1));
+        world._renderStartObj = null;
+        renderOutput({ preserveScroll: true });
+        // The match's line, or (hidden: gagged, or not in F4's filter) the nearest drawn
+        // one before it.
+        let el = null;
+        for (let i = k; i >= Math.max(0, k - half) && !el; i--) {
+            el = elements.output.querySelector(`.line[data-lid="${lineId(lines[i])}"]`);
+        }
+        if (!el) return;
+        const c = elements.outputContainer;
+        c.scrollTop += el.getBoundingClientRect().top - c.getBoundingClientRect().top - (c.clientHeight - el.offsetHeight) / 2;
+        // Near the newest lines it can only sit lower: following them then, as any view at
+        // the bottom does.
+        followBottom = !renderSlid() && isAtBottom();
     }
 
     // Help popup functions (/help)
@@ -9826,55 +10040,62 @@
     // view (see buildHelpQuickStartCards below) - renderHelpReferenceHtml() turns it
     // into the collapsed "full reference" disclosure instead.
     const helpSections = [
-        { heading: 'Commands', note: '(/help &lt;command&gt; for details)', rows: [
+        { heading: 'Commands', rows: [
             { heading: 'Connection' },
             { l: '/worlds', r: 'Open world selector' },
-            { l: '/worlds &lt;name&gt;', r: 'Connect to or create world' },
-            { l: '/worlds -e [name]', r: 'Edit world settings' },
+            { l: '/worlds &lt;name&gt;', r: 'Switch to a world, connecting it' },
+            { l: '/worlds &lt;host&gt; &lt;port&gt;', r: 'Connect to an address (temporary world)' },
+            { l: '/worlds -e [name]', r: 'Edit a world (a new name makes one)' },
             { l: '/worlds -l &lt;name&gt;', r: 'Connect without auto-login' },
             { l: '/worlds -b &lt;name&gt;', r: 'Connect in background (no switch)' },
             { l: '/addworld [-x] name host port', r: 'Create a new world' },
-            { l: '/disconnect (or /dc)', r: 'Disconnect from server' },
+            { l: '/disconnect [world|-ALL] (or /dc)', r: 'Disconnect a world (the current one if none)' },
             { l: '/connections (or /l)', r: 'List connected worlds' },
+            { l: '/chat [channels|users|to|msg]', r: 'Slack/Discord world (or /discord, /slack)' },
             { l: '/server &lt;host[:port]&gt;', r: 'Attach to a remote Clay server' },
             { l: '/server --close', r: 'Detach and become an independent master' },
             { l: '/server --cancel', r: 'Cancel a pending confirmation' },
             { heading: 'Communication' },
             { l: '/send [-W] [-w&lt;world&gt;] [-n] &lt;text&gt;', r: 'Send text to world(s)' },
             { l: '', r: '-W=all worlds, -n=no newline' },
-            { l: '/notify &lt;message&gt;', r: 'Send notification to mobile' },
+            { l: '/notify &lt;message&gt;', r: 'Notification on the phone app and the desktop GUIs' },
             { l: '/say &lt;text&gt;', r: 'Speak text aloud (TTS)' },
             { heading: 'Lookup &amp; Translation' },
             { l: '/dict &lt;word&gt;', r: 'Look up word definition' },
             { l: '/urban &lt;word&gt;', r: 'Look up Urban Dictionary' },
-            { l: '/translate &lt;lang&gt; &lt;text&gt;', r: 'Translate text (or /tr)' },
+            { l: '/translate &lt;lang&gt; &lt;text&gt;', r: 'Translate text' },
             { l: '/url &lt;url&gt;', r: 'Shorten a URL' },
             { heading: 'Actions &amp; Triggers' },
             { l: '/actions [world]', r: 'Open actions editor' },
-            { l: '/gag [pattern]', r: 'List gags, or gag lines matching pattern' },
+            { l: '/gag [pattern]', r: 'Gag lines matching pattern (none: turn gags on)' },
             { l: '/&lt;action_name&gt; [args]', r: 'Execute named action' },
             { heading: 'Settings' },
             { l: '/setup', r: 'Open global settings' },
-            { l: '/web', r: 'Open web/WebSocket settings' },
+            { l: '/web', r: 'Open web server settings' },
+            { l: '/reach [-r] [-l]', r: 'How other devices can reach this Clay' },
             { l: '/tag', r: 'Toggle MUD tag display (F2)' },
             { l: '/font', r: 'Font settings (web/GUI)' },
             { heading: 'Display' },
             { l: '/menu', r: 'Menu of windows and popups (console)' },
             { l: '/flush', r: 'Clear output buffer' },
             { l: '/dump [-w world] [-n lines]', r: 'Dump scrollback to file' },
-            { l: '/note [file]', r: 'Open split-screen editor' },
-            { l: '/window [world]', r: 'Open new browser window/tab' },
-            { l: '/window --grep [pattern]', r: 'Open grep/filter window' },
+            { l: '/note [file]', r: 'Edit the notes of this world, or a file' },
+            { l: '/note -l', r: 'List every world with notes' },
+            { l: '/window [world]', r: 'Open another window (kept to that world)' },
+            { l: '/window --grep &lt;pattern&gt; [-w world] [--regexp]', r: 'Window of the matching lines' },
             { l: '/split [world]', r: 'Split the output: a second world above (Shift+Tab moves between them)' },
+            { l: '/split -n <lines>', r: 'The top pane that many lines high (or drag the bar between the panes)' },
+            { l: '/split act', r: 'The Activity world above: the other worlds as lines arrive (or /world act)' },
             { l: '/unsplit', r: 'Close the pane without the focus' },
+            { l: '/map [go|path|find|stop|...]', r: 'Show/hide the map; walk to a room' },
+            { l: '/stats [hide|show]', r: 'Status data; hide/show its panel' },
             { heading: 'System' },
             { l: '/help [topic]', r: 'Show help (topic = command)' },
-            { l: '/version', r: 'Show version info' },
+            { l: '/version', r: 'Show version (this program and the server)' },
             { l: '/reload [--console|--gui]', r: 'Hot reload binary (switching interface)' },
-            { l: '/update [-f]', r: 'Download and install update' },
+            { l: '/update [-f]', r: 'Update the server, then this program' },
             { l: '/testmusic', r: 'Test ANSI music playback' },
-            { l: '/say &lt;text&gt;', r: 'Speak text aloud' },
-            { l: '/tts [install|voices|voice|test]', r: 'Text-to-speech status; Kokoro voice files' },
+            { l: '/tts [status|install|remove|voices|voice &lt;name&gt;|test]', r: 'Text-to-speech for this interface; Kokoro voice' },
             { l: '/quit', r: 'Exit client' },
             { heading: 'Security' },
             { l: '/ban', r: 'Show banned hosts' },
@@ -9887,55 +10108,46 @@
         ]},
         { heading: 'TF Commands', rows: [
             { l: 'For TinyFugue commands (triggers, macros,', r: '' },
-            { l: 'variables, control flow): /help tf or /tfhelp', r: '' },
+            { l: 'variables, control flow): /help commands', r: '' },
         ]},
         { heading: 'World Switching', rows: [
-            { l: 'Up/Down', r: 'Switch between active worlds' },
-            { l: 'Ctrl+Up/Down', r: 'Switch between all worlds' },
-            { l: 'Alt+W', r: 'Switch to world with activity' },
+            { l: 'Alt+Left/Right', r: 'Switch between connected worlds' },
+            { l: 'Esc+{ / Esc+}', r: 'Switch between active worlds' },
+            { l: 'Shift+Up/Down', r: 'Switch between all worlds' },
+            { l: 'Esc+w / Alt+w', r: 'Switch to world with activity' },
+            { l: 'Shift+Tab', r: 'Move to the other pane of a split (/split)' },
         ]},
         { heading: 'Input', rows: [
             { l: 'Left/Right, Ctrl+B/F', r: 'Move cursor' },
-            { l: 'Ctrl+Up/Down', r: 'Move cursor up/down lines' },
-            { l: 'Alt+Up/Down', r: 'Resize input area' },
-            { l: 'Ctrl+U', r: 'Clear input' },
+            { l: 'Up/Down', r: 'Move between input lines; history past the first or last' },
+            { l: 'Alt+Up/Down', r: 'Resize input area (or drag its top edge)' },
+            { l: 'Ctrl+U', r: 'Delete to start of line' },
             { l: 'Ctrl+W', r: 'Delete word before cursor' },
             { l: 'Ctrl+K', r: 'Delete to end of line' },
             { l: 'Ctrl+D', r: 'Delete character under cursor' },
             { l: 'Ctrl+A/Home', r: 'Jump to start of line' },
             { l: 'Ctrl+E/End', r: 'Jump to end of line' },
-            { l: 'Esc+D', r: 'Delete word forward' },
-            { l: 'Esc+C / Esc+L / Esc+U', r: 'Capitalize / Lower / Upper' },
-            { l: 'Ctrl+P/N', r: 'Command history' },
+            { l: 'Esc+d', r: 'Delete word forward' },
+            { l: 'Esc+c / Esc+l / Esc+u', r: 'Capitalize / Lower / Upper' },
+            { l: 'Ctrl+P/N, Ctrl+Up/Down', r: 'Command history' },
             { l: 'Ctrl+Q', r: 'Spell suggestions' },
-            { l: 'Tab', r: 'Command completion' },
+            { l: 'Tab', r: 'Complete a /command' },
         ]},
         { heading: 'Output', rows: [
             { l: 'PageUp/PageDown', r: 'Scroll output' },
-            { l: 'Tab', r: 'Release one screenful (paused)' },
-            { l: 'Alt+J', r: 'Jump to end, release all' },
-            { l: 'Esc+H', r: 'Half-page scroll/release' },
+            { l: 'Tab', r: 'Page down; at the bottom, release a screenful' },
+            { l: 'Esc+j / Alt+j', r: 'Jump to end, release all' },
+            { l: 'Esc+h', r: 'Half-page scroll/release' },
         ]},
         { heading: 'Display', rows: [
             { l: 'F1', r: 'Show this help' },
             { l: 'F2', r: 'Toggle MUD tag display' },
             { l: 'F4', r: 'Filter output' },
-            { l: 'F5', r: 'Search history' },
+            { l: 'F5', r: 'Search the output' },
             { l: 'F8', r: 'Highlight action matches' },
             { l: 'F9', r: 'Toggle GMCP media audio' },
         ]},
     ];
-
-    function getBaseUrl() {
-        const proto = window.location.protocol; // 'http:' or 'https:'
-        const host = window.location.hostname;
-        const port = window.location.port;
-        // Use origin if port matches default, otherwise include port
-        if (port && port !== '80' && port !== '443') {
-            return proto + '//' + host + ':' + port;
-        }
-        return proto + '//' + host;
-    }
 
     // Switch the CURRENT page/WebView into note-editing mode in place: hides the
     // normal chat chrome and shows the note editor view, same DOM swap the
@@ -10183,6 +10395,10 @@
     function openNoteEditor(worldIndex) {
         if (worldIndex === undefined) worldIndex = currentWorldIndex;
         if (!worlds[worldIndex]) return;
+        if (isActivityWorld(worldIndex)) {
+            appendClientLine("The Activity world can't be given notes.", currentWorldIndex, 'system');
+            return;
+        }
         if (window.Android) {
             enterNoteMode(worldIndex);
         } else if (window.WEBVIEW_MODE) {
@@ -10200,44 +10416,54 @@
     // help - see src/popup/definitions/help.rs; deliberately different content, not a
     // CLAUDE.md parity gap). Icons are inline stroke-style SVGs (24x24 viewBox,
     // stroke-width 1.6) so they render crisp at any zoom without an icon font.
-    // "Make it yours" gets its editor links filled in at render time (needs baseUrl).
-    function buildHelpQuickStartCards(baseUrl) {
+    // `touch` (a phone or tablet layout) picks the wording where the two differ - the
+    // ▲/▼ buttons are a touch layout's only - and the native GUI's copy (windows/help.rs
+    // CARDS) is the desktop wording, segment for segment: each desc stays one literal so
+    // its test can find it. The theme/action/keybind editors are left to Settings (user
+    // ruling 2026-11-04: not on the first page). Keep a desc to about 100 characters:
+    // both clients cut it at two lines.
+    function buildHelpQuickStartCards(touch) {
         return [
             {
                 icon: '<path d="M9 2v4M15 2v4M6 6h12v5a6 6 0 0 1-12 0V6z"/><path d="M12 17v5"/>',
                 title: 'Connect to a world',
-                desc: 'Tap the world name, or open <strong>World Selector</strong> and hit <strong>Add</strong> to set one up.'
+                desc: 'Open <strong>World Selector</strong> from the menu, pick a world and hit <strong>Connect</strong>, or <strong>Add</strong> one.'
             },
             {
                 icon: '<path d="M4 8h13l-3-3M20 16H7l3 3"/>',
                 title: 'Switch between worlds',
-                desc: 'Tap the world name, swipe the tabs, or use <kbd>&#9650;</kbd>/<kbd>&#9660;</kbd> at the bottom.'
+                desc: touch
+                    ? 'Tap the world name or a world tab (<strong>Settings &rarr; Tabs</strong>), or the <kbd>&#9650;</kbd>/<kbd>&#9660;</kbd> buttons.'
+                    : 'Click the world name or a world tab (<strong>Settings &rarr; Tabs</strong>), or press <kbd>Alt+&larr;</kbd>/<kbd>Alt+&rarr;</kbd>.'
             },
             {
                 icon: '<path d="M3 12l18-8-8 18-2-8-8-2z"/>',
                 title: 'Type &amp; send',
-                desc: 'Type below and tap <strong>Send</strong>. Hold <kbd>&#9650;</kbd>/<kbd>&#9660;</kbd> to reuse something you typed before.'
+                desc: touch
+                    ? 'Type below and press Enter on the keyboard. Hold <kbd>&#9650;</kbd>/<kbd>&#9660;</kbd> to reuse something you typed before.'
+                    : 'Type below and press <kbd>Enter</kbd>. <kbd>Ctrl+&uarr;</kbd>/<kbd>Ctrl+&darr;</kbd> bring back what you typed before.'
             },
             {
                 icon: '<path d="M4 8l8-4 8 4-8 4-8-4z"/><path d="M4 13l8 4 8-4"/>',
                 title: 'Catch up on output',
-                desc: '<strong>MORE</strong> means text is waiting, tap to reveal it. <strong>ACT</strong> flags other busy worlds.'
+                desc: touch
+                    ? '<strong>More</strong> means text is waiting: tap it for the next screenful. Tap <strong>ACT</strong> to go to a busy world.'
+                    : '<strong>More</strong> means text is waiting: <kbd>Tab</kbd> or a click shows the next screenful. Click <strong>ACT</strong> for a busy world.'
             },
             {
                 icon: '<path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/>',
                 title: 'Automate with Actions',
-                desc: '<strong>Actions</strong> auto-respond to things the world sends. Pin one to the toolbar as a button.'
+                desc: '<strong>Actions</strong> auto-respond to what the world sends. <strong>GUI Menu Shortcut</strong> puts one on the icon bar.'
             },
             {
                 icon: '<path d="M4 6h6M14 6h6M4 12h10M18 12h2M4 18h13M20 18h1"/><circle cx="12" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="19" cy="18" r="2"/>',
                 title: 'Make it yours',
-                desc: 'Settings links to the <a href="' + baseUrl + '/theme-editor" target="_blank">Theme</a> and ' +
-                    '<a href="' + baseUrl + '/keybind-editor" target="_blank">Keybind</a> editors. The A&nbsp;&mdash;&nbsp;A slider resizes text.'
+                desc: 'Pick a <strong>Theme</strong> and fonts (the <strong>Font</strong> tab) in <strong>Settings</strong>. The A slider on the bar resizes text.'
             },
             {
                 icon: '<path d="M2 8.5a16 16 0 0 1 20 0M5.5 12a11 11 0 0 1 13 0M9 15.5a6 6 0 0 1 6 0"/><circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"/>',
                 title: 'Use it from anywhere',
-                desc: 'Turn on remote access in <strong>Settings &rarr; Web</strong>, and manage this device&rsquo;s key there.'
+                desc: 'Set a password in <strong>Settings &rarr; Web</strong>; its <strong>Remote Access</strong> shows what to type on the other device.'
             },
             {
                 icon: '<rect x="4.5" y="4" width="12" height="16" rx="1.5"/><path d="M8 9.5h5M8 13h5"/><path d="M15.5 15l4-4 2 2-4 4h-2v-2z"/>',
@@ -10297,7 +10523,6 @@
     function openHelpPopup() {
         if (openInPopupWindow('help', null)) return;
         helpPopupOpen = true;
-        const baseUrl = getBaseUrl();
         // Name the build in the title bar - on web/GUI/Android this is the only place the
         // client's own version is visible (the console has /version and its startup banner).
         if (elements.helpTitle) {
@@ -10306,7 +10531,9 @@
         }
 
         let html = '<div class="help-quickstart">';
-        for (const card of buildHelpQuickStartCards(baseUrl)) {
+        // A touch layout's wording: a phone or tablet, unless the Android app has a
+        // keyboard and mouse (it then draws the desktop chrome).
+        for (const card of buildHelpQuickStartCards(deviceMode !== 'desktop' && !desktopInputAttached())) {
             html += '<div class="help-card">' +
                 '<span class="help-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' + card.icon + '</svg></span>' +
                 '<div><h3>' + card.title + '</h3><p>' + card.desc + '</p></div>' +
@@ -10429,6 +10656,8 @@
         ],
         font: [
             'Font Settings', '',
+            'Sample Text: two lines in the font as you edit it,',
+            '  at the size this device uses, before you save.', '',
             'Each program keeps its own fonts on each OS: the',
             '  native GUI, the WebView GUI, a web browser and the',
             '  Android app, on Windows, macOS, Linux and so on.',
@@ -10447,7 +10676,7 @@
             '  device; in the web client, hold the menu button for',
             '  2 seconds to choose. The size slider in the status',
             '  bar changes the one in use.', '',
-            'Advanced: the settings below, greyed out until ticked.', '',
+            'Advanced: tick it to show the spacing settings below.', '',
             'Input Ht: line height of the input line, 0.5-3.0',
             '  (default 1.2). The output always keeps rows exactly',
             '  one line tall, so ANSI and box-drawing art joins up.', '',
@@ -10486,6 +10715,14 @@
             '  still works, just uncompressed. Toggling this on',
             '  a live connection asks the server to start/stop',
             '  compressing immediately.', '',
+            'Login Command: Commands run once Clay has logged in',
+            '  (sent the connect line, or answered the login',
+            '  prompts): one per line, and ; between commands on',
+            '  one line (\\; sends a ;). "say hello;say bye" then',
+            '  "look" is three commands. A /command runs as typed;',
+            '  anything else goes to the MUD. Not run when Clay',
+            '  doesn\'t log in (no User or Password, Auto Login',
+            '  None, /worlds -l).', '',
             '--- Slack / Discord ---',
             '',
             'A Discord world is one server; a Slack world is one',
@@ -10920,9 +11157,8 @@
             // !followBottom: only a user who has scrolled back into history grows the
             // window. A following view near the top can only be a code-caused drop (a
             // cleared/rebuilding DOM, a reflow) - growing then would add 500 lines above it
-            // and strand it hundreds of lines up (the keyboard/resume jump). A search match
-            // on display fixes the window's end: no growing or sliding then.
-            if (!followBottom && !searchCutOff() && container.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && st > 0) {
+            // and strand it hundreds of lines up (the keyboard/resume jump).
+            if (!followBottom && container.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && st > 0) {
                 noteScrollCause('grow');
                 // Obey the same contract as every other preserveScroll rebuild: cover every
                 // line the DOM holds. appendNewLine() only ever appends, and the
@@ -10938,7 +11174,7 @@
                 setRenderRange(world, Math.max(0, st - RENDER_WINDOW_STEP), end);
                 renderOutput({ preserveScroll: true });
                 updateStatusBar();
-            } else if (world._renderEndLine && !searchCutOff() && belowPx < RENDER_WINDOW_GROW_TRIGGER_PX) {
+            } else if (world._renderEndLine && belowPx < RENDER_WINDOW_GROW_TRIGGER_PX) {
                 // Slid, and the reader is back near the page's bottom: slide down a step
                 // (all the way back to the tail at the end).
                 noteScrollCause('slide-down');
@@ -10949,7 +11185,7 @@
                 // bottom any other way is.
                 if (isAtBottom()) followBottom = true;
                 updateStatusBar();
-            } else if (st === 0 && !searchCutOff() && (!followBottom || nothingToScroll)
+            } else if (st === 0 && (!followBottom || nothingToScroll)
                 && performance.now() - lastUserUpScrollAt < 1000
                 && container.scrollTop < Math.max(RENDER_WINDOW_GROW_TRIGGER_PX, container.clientHeight * 2)) {
                 // Everything held is drawn and the user is scrolling up near its top:
@@ -11070,11 +11306,6 @@
         if (!drawingSplit && filterPopupOpen && filterText.length > 0 && !matchesFilter(stripAnsiForFilter(cleanLine), filterText)) return false;
         if (grepRegex && !grepRegex.test(stripMudTag(stripAnsiForFilter(cleanLine)))) return false;
         return true;
-    }
-
-    // A search match (F5) is on display: the view ends at the matched line.
-    function searchCutOff() {
-        return searchPopupOpen && searchCurrentPos >= 0 && searchCurrentPos < searchMatchIndices.length;
     }
 
     // An emoji cluster as a browser shows it in colour: a character whose default form is
@@ -11908,9 +12139,9 @@
 
         // A rebuild (F2, F8, a filter, a theme or font change) must not throw a reader who
         // has scrolled up back to the bottom, or re-pin them: only the user does that. A
-        // different world, or a search match to show, still starts at the bottom.
+        // different world still starts at the bottom.
         const keepView = !preserveScroll && !followBottom && !(opts && opts.toBottom)
-            && world === lastRenderedWorld && (drawingSplit || !searchCutOff());
+            && world === lastRenderedWorld;
         const anchor = keepView ? viewAnchor() : null;
 
         // A rebuild that puts the view at the bottom shows the tail: the window stops
@@ -11918,22 +12149,15 @@
         if (!preserveScroll && !keepView) world._renderEndLine = null;
         const slid = !!world._renderEndLine;
 
-        // When search popup is active and has a match, truncate output at the match line
-        // so the matched line appears at the bottom of the output area. Otherwise the
-        // window ends at the tail, or where it has slid to.
-        let searchEndIdx = renderEndIdx(world);
-        if (!drawingSplit && searchPopupOpen && searchCurrentPos >= 0 && searchCurrentPos < searchMatchIndices.length) {
-            const k = lines.indexOf(searchMatchIndices[searchCurrentPos]);
-            searchEndIdx = k >= 0 ? k + 1 : lines.length;
-        }
+        // The window ends at the tail, or where it has slid to (F5's match moves it there:
+        // showSearchMatch).
+        const endIdx = renderEndIdx(world);
 
         // Render window: starts at RENDER_WINDOW_INITIAL, grows toward RENDER_WINDOW_MAX as
-        // the user scrolls up (see the outputContainer.onscroll handler below). searchEndIdx
-        // above already anchors the window's END at a search match when one is active, same
-        // as before this change - a match is always the newest line in the window regardless
-        // of _renderWindow's current size.
+        // the user scrolls up (see the outputContainer.onscroll handler below), from the
+        // window's end.
         const renderWindow = world._renderWindow || RENDER_WINDOW_INITIAL;
-        const startIdx = Math.max(0, searchEndIdx - renderWindow);
+        const startIdx = Math.max(0, endIdx - renderWindow);
         world._renderStartObj = lines[startIdx] || null;
 
         // Lines held back by more-mode are already in output_lines but must not be drawn
@@ -11955,13 +12179,13 @@
         // mid-reveal is tracked for its next frames once the DOM exists (one entry per
         // lineSpanHtml, in order, null when drawn whole).
         // (Not in a split's other pane, which is drawn whole.)
-        const revealFrom = (slid || drawingSplit) ? Infinity : searchEndIdx - (getVisibleLineCount() * 2 + 10);
+        const revealFrom = (slid || drawingSplit) ? Infinity : endIdx - (getVisibleLineCount() * 2 + 10);
         const revealTracked = [];
         let revealAny = false;
 
         // Build lines as HTML with explicit <br> line breaks
         const htmlParts = [];
-        for (let i = startIdx; i < searchEndIdx; i++) {
+        for (let i = startIdx; i < endIdx; i++) {
             const lineObj = lines[i];
             if (lineObj === undefined || lineObj === null) continue;
             if (held.size && held.has(lineObj)) continue;
@@ -12102,10 +12326,6 @@
         const gagged = !!(lineObj && typeof lineObj === 'object' && lineObj.gagged);
         // The same rules as renderOutput(): a line it wouldn't draw isn't drawn here either.
         if (!lineIsDrawn(cleanText, gagged)) return;
-        // A search match is on display and the view ends at it: later lines wait for the
-        // search to close (which redraws).
-        if (searchCutOff()) return;
-
         // Shown live (an arrival, or more-mode letting it through): the text-reveal effect
         // types it on from now.
         if (lineObj && typeof lineObj === 'object' && textRevealCps() > 0) lineObj._revealAt = performance.now();
@@ -13883,9 +14103,37 @@
         }
     }
 
+    // The worlds on screen in this page when the Activity world last dropped theirs.
+    let activityShownKey = null;
+    // A world that comes on screen here leaves this page's Activity world: its lines are
+    // there to read already (user request 2026-11-05). The server sends none from it while
+    // it is on screen; this takes the ones that came before (App::copy_to_activity). Each
+    // line starts with its world's name, which never has a space.
+    function dropShownFromActivity() {
+        const act = worlds.findIndex(w => w && w.is_activity);
+        if (act < 0) return;
+        const shown = [currentWorldIndex, splitWorldIndex()]
+            .filter(i => i >= 0 && worlds[i] && !worlds[i].is_activity)
+            .map(i => (worlds[i].name || '').toLowerCase());
+        const key = shown.sort().join(' ');
+        if (key === activityShownKey) return;
+        activityShownKey = key;
+        const world = worlds[act];
+        if (!world.output_lines || !world.output_lines.length) return;
+        const from = l => (String(l.text || '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim().split(/\s+/)[0] || '').toLowerCase();
+        const kept = world.output_lines.filter(l => !shown.includes(from(l)));
+        if (kept.length === world.output_lines.length) return;
+        world.output_lines = kept;
+        world._renderEndLine = null;
+        worldOutputCache[act] = [];
+        if (act === currentWorldIndex) setTimeout(renderOutput, 0);
+        else if (splitShows(act)) scheduleSplitRender();
+    }
+
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
         reportBadge();
+        dropShownFromActivity();
         // The map pane follows the world shown (src/map): the server is told when that moved.
         if (typeof mapWatchIfChanged === 'function') mapWatchIfChanged();
 
@@ -13912,9 +14160,10 @@
         updatePaneBars();
 
         // Connection dot and world name
-        if (barWorld && barWorld.name && barWorld.was_connected) {
+        // The Activity world has no connection; it is live whenever it is shown.
+        if (barWorld && barWorld.name && (barWorld.was_connected || barWorld.is_activity)) {
             elements.statusDot.className = 'status-dot' +
-                (barWorld.connected ? '' : (isWorldReconnecting(barWorld) ? ' reconnecting' : ' off'));
+                (barWorld.connected || barWorld.is_activity ? '' : (isWorldReconnecting(barWorld) ? ' reconnecting' : ' off'));
             const gmcpInd = (barWorld && barWorld.gmcp_user_enabled) ? ' [g]' : '';
             // TF-parity plan Job 22b/P2.7: show a pending numeric prefix next to the
             // world name, mirroring the console's own separator-bar "[N]" (rendering.rs).
@@ -15800,7 +16049,7 @@
         // Where only Local is offered, any engine reads as Local (the device's voice spoke).
         if (ttsDeviceVoiceOnly && setupTtsMode !== 'Off') setupTtsMode = 'Local';
         setupTabsMode = tabsMode;
-        setupIconBarMode = iconBarMode;
+        setupIconBarPlace = iconBarPlace;
         setupPictureHost = pictureHost || 'catbox';
         setupSeparatorStyle = separatorStyle || 'web';
         setupTextReveal = textReveal || 'off';
@@ -15825,11 +16074,6 @@
         // live preview (previewFontEdit) the font tab applies while it's open.
         fontPreviewSaved = currentFontSettings();
         transparencyPreviewSaved = guiTransparency;
-        const fontOwner = document.getElementById('font-owner-note');
-        if (fontOwner) {
-            fontOwner.textContent = fontProfiles === null ? ''
-                : 'Fonts for ' + fontProfileLabel(fontProfileKey) + ' (each program keeps its own on each OS).';
-        }
         fontEditName = fontName;
         refreshFontWeights();
         fontEditSizePhone = Math.round(webFontSizePhone);
@@ -15842,6 +16086,10 @@
         // Set advanced checkbox based on whether any advanced setting is non-default
         if (elements.fontAdvancedToggle) {
             elements.fontAdvancedToggle.checked = (webFontLineHeight !== 1.2 || webFontLetterSpacing !== 0 || webFontWordSpacing !== 0);
+            // Folded or not before the dialog shows, so it opens without the drop-down.
+            if (elements.fontAdvancedSection) {
+                elements.fontAdvancedSection.classList.toggle('open', elements.fontAdvancedToggle.checked);
+            }
         }
         // Show modal
         elements.settingsModal.className = 'modal visible';
@@ -15941,7 +16189,13 @@
             updateCustomDropdown(elements.setupTabsSelect);
         }
         if (elements.setupIconBarSelect) {
-            elements.setupIconBarSelect.value = setupIconBarMode;
+            // A server before the per-interface split keeps only which interfaces show it.
+            Array.from(elements.setupIconBarSelect.options).forEach(function(o) {
+                const placed = o.value !== 'top' && o.value !== 'none';
+                o.hidden = placed && !iconBarProfiles;
+                o.disabled = placed && !iconBarProfiles;
+            });
+            elements.setupIconBarSelect.value = setupIconBarPlace;
             updateCustomDropdown(elements.setupIconBarSelect);
         }
         if (elements.setupPictureHostSelect) {
@@ -16107,7 +16361,11 @@
             announce_screen_reader: screenReaderProfiles ? announceScreenReader : null,
             // Settings' Status Panel; null = unchanged (a server from before it).
             status_panel: statusPanelSetting,
-            icon_bar: iconBarMode,
+            // The shared Icon Bar goes back as the server sent it (or as an older server's
+            // one setting); this page's own place goes as icon_bar_profile (null = it has
+            // none of its own, or the server keeps none).
+            icon_bar: iconBarShared,
+            icon_bar_profile: (iconBarProfiles && iconBarProfiles[fontProfileKey]) ? { key: fontProfileKey, value: iconBarProfiles[fontProfileKey] } : null,
             // null = unchanged (a server from before Import Picture sent none).
             picture_host: pictureHost || null,
             // The console's bar, one global setting; null = unchanged (an older server
@@ -16276,7 +16534,14 @@
             tabsShared = setupTabsMode;
         }
         applyTabsMode(myTabsMode());
-        applyIconBarMode(setupIconBarMode);
+        // This page's own icon bar place, by the same rule; a server before the split keeps
+        // one setting for every interface: Top is All there, None is None.
+        if (iconBarProfiles) {
+            if (iconBarProfiles[fontProfileKey] || setupIconBarPlace !== sharedIconBarPlace()) iconBarProfiles[fontProfileKey] = setupIconBarPlace;
+        } else if (setupIconBarPlace !== sharedIconBarPlace()) {
+            iconBarShared = setupIconBarPlace === 'none' ? 'none' : 'all';
+        }
+        applyIconBarPlace(myIconBarPlace());
         if (pictureHost) pictureHost = setupPictureHost;
         if (separatorStyle) separatorStyle = setupSeparatorStyle;
         textReveal = setupTextReveal;
@@ -16520,14 +16785,31 @@
         if (elements.fontLineheightValue) elements.fontLineheightValue.textContent = fontEditLineHeight.toFixed(1);
         if (elements.fontLetterspacingValue) elements.fontLetterspacingValue.textContent = fontEditLetterSpacing.toFixed(1);
         if (elements.fontWordspacingValue) elements.fontWordspacingValue.textContent = fontEditWordSpacing.toFixed(1);
-        // Grey out advanced section based on checkbox
+        // The advanced rows unfold while the checkbox is ticked (style.css's transition);
+        // folded, they are inert so Tab can't reach the hidden buttons.
         var adv = elements.fontAdvancedSection;
         var chk = elements.fontAdvancedToggle;
         if (adv && chk) {
-            adv.style.opacity = chk.checked ? '1' : '0.35';
-            adv.style.pointerEvents = chk.checked ? '' : 'none';
+            adv.classList.toggle('open', chk.checked);
+            adv.inert = !chk.checked;
         }
+        updateFontSample();
         previewFontEdit();
+    }
+
+    // Settings > Font's Sample Text: the two lines in the font as edited, at this
+    // device's size (as previewFontEdit picks it), Input Ht as the space between them.
+    function updateFontSample() {
+        var sample = elements.fontSample;
+        if (!sample) return;
+        var fontPx = deviceType === 'phone' ? fontEditSizePhone :
+                     deviceType === 'tablet' ? fontEditSizeTablet : fontEditSizeDesktop;
+        sample.style.fontFamily = fontFamilyCss(fontEditName) || 'var(--mono)';
+        sample.style.fontWeight = fontEditWeight;
+        sample.style.fontSize = clampFontSize(fontPx) + 'px';
+        sample.style.lineHeight = fontEditLineHeight;
+        sample.style.letterSpacing = fontEditLetterSpacing ? fontEditLetterSpacing + 'px' : '';
+        sample.style.wordSpacing = fontEditWordSpacing ? fontEditWordSpacing + 'px' : '';
     }
 
     // Show the font tab's edit values on the window right away, so the user sees a
@@ -16818,8 +17100,8 @@
         elements.worldSelectorTableBody.innerHTML = '';
 
         worlds.forEach((world, index) => {
-            // Filter by "Only Connected" toggle
-            if (worldSelectorOnlyConnected && !world.connected) {
+            // Filter by "Only Connected" toggle; never the Activity world (only named).
+            if (world.is_activity || (worldSelectorOnlyConnected && !world.connected)) {
                 return;
             }
 
@@ -16973,8 +17255,8 @@
         const filter = elements.worldFilter.value.toLowerCase();
         const indices = [];
         worlds.forEach((world, index) => {
-            // Filter by "Only Connected" toggle
-            if (worldSelectorOnlyConnected && !world.connected) {
+            // Filter by "Only Connected" toggle; never the Activity world (only named).
+            if (world.is_activity || (worldSelectorOnlyConnected && !world.connected)) {
                 return;
             }
             const name = (world.name || '').toLowerCase();
@@ -17168,6 +17450,10 @@
             return;
         }
         if (worldIndex < 0 || worldIndex >= worlds.length) return;
+        if (isActivityWorld(worldIndex)) {
+            appendClientLine("The Activity world can't be edited.", currentWorldIndex, 'system');
+            return;
+        }
         // Desktop GUI: the Worlds window hosts the editor (by name - indices are per-client).
         if (openInPopupWindow('worlds', { edit: worlds[worldIndex].name,
                 current: worlds[currentWorldIndex] ? worlds[currentWorldIndex].name : null })) return;
@@ -17244,6 +17530,7 @@
         elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
         elements.worldEditKeepAliveGagEnabled.checked = !!world.settings?.keep_alive_gag_enabled;
         elements.worldEditKeepAliveGag.value = world.settings?.keep_alive_gag || '';
+        elements.worldEditLoginCommand.value = world.settings?.login_command || '';
         if (elements.worldEditGmcpPackages) {
             elements.worldEditGmcpPackages.value = world.settings?.gmcp_packages || '';
         }
@@ -17350,7 +17637,8 @@
         'worldEditPasswordField', 'worldEditSslField', 'worldEditAutoLoginField', 'worldEditTfTypeField',
         'worldEditKeepAliveField', 'worldEditEncodingField', 'worldEditGmcpField',
         'worldEditMspEnabledField',
-        'worldEditMcpEnabledField', 'worldEditMccp2EnabledField', 'worldEditStatusPanelField'
+        'worldEditMcpEnabledField', 'worldEditMccp2EnabledField', 'worldEditStatusPanelField',
+        'worldEditLoginCommandField'
     ];
     const WORLD_EDIT_SLACK_FIELD_IDS = [
         'worldEditSlackTokenField', 'worldEditSlackAppTokenField', 'worldEditSlackWorkspaceField',
@@ -17455,6 +17743,7 @@
             keep_alive_cmd: elements.worldEditKeepAliveCmd.value,
             keep_alive_gag_enabled: elements.worldEditKeepAliveGagEnabled.checked,
             keep_alive_gag: elements.worldEditKeepAliveGag.value,
+            login_command: elements.worldEditLoginCommand.value,
             gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : '',
             auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0',
             msp_enabled: elements.worldEditMspEnabledToggle.classList.contains('active'),
@@ -17501,6 +17790,7 @@
         world.settings.keep_alive_cmd = elements.worldEditKeepAliveCmd.value;
         world.settings.keep_alive_gag_enabled = elements.worldEditKeepAliveGagEnabled.checked;
         world.settings.keep_alive_gag = elements.worldEditKeepAliveGag.value;
+        world.settings.login_command = elements.worldEditLoginCommand.value;
         if (elements.worldEditGmcpPackages) {
             world.settings.gmcp_packages = elements.worldEditGmcpPackages.value;
         }
@@ -18358,6 +18648,14 @@
     function performCompletion() {
         const inputValue = elements.input.value;
         if (!inputValue.startsWith('/')) return false;
+        const world = completeWorldArg(inputValue);
+        if (world !== null) {
+            if (world !== inputValue) {
+                elements.input.value = world;
+                elements.input.setSelectionRange(world.length, world.length);
+            }
+            return true;
+        }
         const completed = completeCommand(inputValue);
         if (completed === null) return false;
         elements.input.value = completed;
@@ -19011,32 +19309,66 @@
         } else if (mode === 'left') {
             row.insertBefore(ribbon, column);
         } else if (mode === 'right') {
-            // At the row's end: beyond the map pane when it is open.
-            row.appendChild(ribbon);
+            // At the row's end: beyond the map pane when it is open, inside a right icon bar.
+            if (iconBarPlace === 'right' && elements.iconBar.parentNode === row) row.insertBefore(ribbon, elements.iconBar);
+            else row.appendChild(ribbon);
         } else {
-            // 'bottom' (or 'none', where position doesn't matter since hidden)
-            app.insertBefore(ribbon, elements.statusBar);
+            // 'bottom' (or 'none', where position doesn't matter since hidden), above a
+            // bottom icon bar
+            const below = iconBarPlace === 'bottom' && elements.iconBar.parentNode === app ? elements.iconBar : elements.statusBar;
+            app.insertBefore(ribbon, below);
         }
         renderTabsRibbon();
     }
 
-    // Whether the icon bar (Worlds/Actions/Settings/Find tiles + shortcuts,
-    // see renderIconBar()) should be visible right now: the user setting,
-    // combined with the current effective device type. Mirrors
-    // keyboardForceEnabled()'s "setting && device check" shape.
-    function iconBarVisible() {
-        if (iconBarMode === 'none') return false;
-        if (iconBarMode === 'all') return true;
-        // 'app_tablet': the desktop WebView GUI app, or a tablet-width
-        // layout - NOT a plain desktop browser tab, NOT phone - unless the Android
-        // app has a keyboard and mouse, when it looks like the desktop GUI.
+    // Whether the shared Icon Bar's App/Tablet shows the bar on this page: the desktop
+    // WebView GUI app, or a tablet-width layout - NOT a plain desktop browser tab, NOT a
+    // phone - unless the Android app has a keyboard and mouse, when it looks like the
+    // desktop GUI. (The native GUI always counts: GlobalSettingsMsg::icon_bar_for.)
+    function iconBarLegacyShows() {
         return deviceMode === 'tablet' || (deviceMode === 'desktop' && window.WEBVIEW_MODE)
             || desktopInputAttached();
     }
+    // The place the shared Icon Bar gives a page without its own: None hides it, All puts
+    // it at the top, App/Tablet at the top where iconBarLegacyShows.
+    function sharedIconBarPlace() {
+        if (iconBarShared === 'none') return 'none';
+        if (iconBarShared === 'all') return 'top';
+        return iconBarLegacyShows() ? 'top' : 'none';
+    }
+    function myIconBarPlace() {
+        return (iconBarProfiles && iconBarProfiles[fontProfileKey]) || sharedIconBarPlace();
+    }
+    function receiveIconBar(settings) {
+        if (settings.icon_bar !== undefined) iconBarShared = settings.icon_bar || 'app_tablet';
+        iconBarProfiles = settings.icon_bar_profiles ? Object.assign({}, settings.icon_bar_profiles) : null;
+        applyIconBarPlace(myIconBarPlace());
+    }
 
-    // Apply an Icon Bar setting change and re-render.
-    function applyIconBarMode(mode) {
-        iconBarMode = mode;
+    // Put the icon bar at its place (Icon Bar: top/bottom/left/right/none, per interface)
+    // and re-render it. Always outside the world tabs: top, the first thing in #app; bottom,
+    // just above the status bar (below a bottom tab strip); left/right, the outermost column
+    // of #main-row (.icon-bar-vertical). Moved in the DOM like the tabs ribbon (applyTabsMode).
+    function applyIconBarPlace(place) {
+        iconBarPlace = place;
+        const bar = elements.iconBar;
+        if (!bar) return;
+        const app = document.getElementById('app');
+        const row = document.getElementById('main-row');
+        const side = place === 'left' || place === 'right';
+        bar.classList.toggle('icon-bar-vertical', side);
+        bar.classList.toggle('icon-bar-left', place === 'left');
+        bar.classList.toggle('icon-bar-right', place === 'right');
+        bar.classList.toggle('icon-bar-bottom', place === 'bottom');
+        if (place === 'top') {
+            if (app.firstElementChild !== bar) app.insertBefore(bar, app.firstElementChild);
+        } else if (place === 'bottom') {
+            app.insertBefore(bar, elements.statusBar);
+        } else if (place === 'left') {
+            if (row.firstElementChild !== bar) row.insertBefore(bar, row.firstElementChild);
+        } else if (place === 'right') {
+            row.appendChild(bar);
+        }
         renderIconBar();
     }
 
@@ -19047,15 +19379,15 @@
         return actions.filter(a => a.enabled && a.gui_shortcut);
     }
 
-    // Rebuild the icon bar: show/hide it per iconBarVisible(), and - only
+    // Rebuild the icon bar: show/hide it per its place, and - only
     // if there's at least one shortcut-enabled action - build the shortcut
-    // tiles and show the ‹/› cycle arrows when they overflow. The 4
-    // built-in tiles (Worlds/Actions/Settings/Find) are static markup in
-    // index.html and never move; everything right of them (divider, cycle
+    // tiles and show the ‹/› cycle arrows when they overflow (a row only: a column
+    // scrolls as a whole). The built-in tiles (Worlds/Actions/Settings/Find/Tags) are
+    // static markup in index.html and never move; everything after them (divider, cycle
     // arrows, shortcuts) is hidden entirely with zero shortcuts configured.
     function renderIconBar() {
         if (!elements.iconBar) return;
-        const visible = iconBarVisible();
+        const visible = iconBarPlace !== 'none';
         elements.iconBar.style.display = visible ? 'flex' : 'none';
         if (!visible) return;
 
@@ -20267,12 +20599,16 @@
 
         // Filter input handler
         elements.filterInput.addEventListener('input', updateFilter);
+        // The keys a field takes go no further: F4/F5 reaching the page's own key handler
+        // too toggled the popup straight back open.
         elements.filterInput.addEventListener('keydown', function(e) {
             if (e.key === 'Escape') {
                 e.preventDefault();
+                e.stopPropagation();
                 closeFilterPopup();
             } else if (e.key === 'F4') {
                 e.preventDefault();
+                e.stopPropagation();
                 closeFilterPopup();
             }
         });
@@ -20282,12 +20618,15 @@
         elements.searchInput.addEventListener('keydown', function(e) {
             if (e.key === 'Escape') {
                 e.preventDefault();
+                e.stopPropagation();
                 closeSearchPopup();
             } else if (e.key === 'F5') {
                 e.preventDefault();
+                e.stopPropagation();
                 closeSearchPopup();
             } else if (e.key === 'Enter') {
                 e.preventDefault();
+                e.stopPropagation();
                 advanceSearch();
             }
         });
@@ -20890,18 +21229,15 @@
             shellSendText(text, true);
         });
 
-        // Paste from the WebView GUI's output menu (webview_gui.rs): into the input, as the
-        // input's own Paste does. wry lets the page read the clipboard on Linux and Windows:
-        // execCommand pastes through the input's paste event (a shell world's included);
-        // where it can't (WebView2, macOS), the async clipboard API.
+        // Paste from the WebView GUI's output menu (webview_gui.rs) and the input's own menu
+        // below: into the input, as the input's own Paste does. wry lets the page read the
+        // clipboard on Linux and Windows: execCommand pastes through the input's paste event
+        // (a shell world's included). The Android app reads it for its page, which can't
+        // (an older app has no getClipboardText); elsewhere (a browser, WebView2, macOS) the
+        // async clipboard API, which may ask the user first.
         window.clayPasteIntoInput = function() {
             const input = elements.input;
-            input.focus();
-            try {
-                if (document.execCommand('paste')) return;
-            } catch (e) { /* not supported here */ }
-            if (!navigator.clipboard || !navigator.clipboard.readText) return;
-            navigator.clipboard.readText().then(function(text) {
+            const insert = function(text) {
                 if (!text) return;
                 if (shellActive()) {
                     shellSendText(text, true);
@@ -20910,8 +21246,87 @@
                 input.focus();
                 input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end');
                 input.dispatchEvent(new Event('input', { bubbles: true }));
-            }).catch(function() { /* refused */ });
+            };
+            input.focus();
+            try {
+                if (document.execCommand('paste')) return;
+            } catch (e) { /* not supported here */ }
+            if (window.Android && typeof window.Android.getClipboardText === 'function') {
+                insert(window.Android.getClipboardText());
+                return;
+            }
+            if (!navigator.clipboard || !navigator.clipboard.readText) return;
+            navigator.clipboard.readText().then(insert).catch(function() { /* refused */ });
         };
+
+        // The input's right-click menu, for a press in the input area outside the textarea
+        // (the lines sent above it, the prompt, the edges), where the browser's own menu
+        // would be the page's: Cut, Copy, Paste and Select All on the input, as the native
+        // GUI's input bar has (input_view.rs). The textarea keeps the browser's own menu, its
+        // spelling suggestions with it. The typed line keeps its cursor and selection.
+        let inputMenu = null;
+        function closeInputMenu() {
+            if (inputMenu) {
+                inputMenu.remove();
+                inputMenu = null;
+            }
+        }
+        function openInputMenu(e) {
+            const input = elements.input;
+            const start = input.selectionStart, end = input.selectionEnd;
+            closeInputMenu();
+            const menu = document.createElement('div');
+            menu.className = 'menu-dropdown visible input-menu';
+            const item = function(label, enabled, run) {
+                const d = document.createElement('div');
+                d.className = 'menu-item' + (enabled ? '' : ' disabled');
+                d.textContent = label;
+                // Keep the focus in the input.
+                d.addEventListener('mousedown', function(ev) { ev.preventDefault(); });
+                // On the click, not the press: the release would land on the input below
+                // and undo a selection made at the press.
+                d.addEventListener('click', function(ev) {
+                    ev.stopPropagation();
+                    closeInputMenu();
+                    if (!enabled) return;
+                    input.focus();
+                    input.setSelectionRange(start, end);
+                    run();
+                });
+                menu.appendChild(d);
+            };
+            const hasSel = start !== end;
+            item('Cut', hasSel, function() {
+                if (document.execCommand('cut') || !document.execCommand('copy')) return;
+                input.setRangeText('', start, end, 'end');
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            });
+            item('Copy', hasSel, function() { document.execCommand('copy'); });
+            item('Paste', true, function() { window.clayPasteIntoInput(); });
+            item('Select All', input.value.length > 0, function() { input.select(); });
+            menu.style.left = e.clientX + 'px';
+            menu.style.top = e.clientY + 'px';
+            document.body.appendChild(menu);
+            inputMenu = menu;
+            // Kept on screen; above the pointer when it would run off the bottom.
+            const r = menu.getBoundingClientRect();
+            if (r.right > window.innerWidth) menu.style.left = Math.max(0, window.innerWidth - r.width - 4) + 'px';
+            if (r.bottom > window.innerHeight) menu.style.top = Math.max(0, Math.min(e.clientY - r.height, window.innerHeight - r.height - 4)) + 'px';
+        }
+        document.addEventListener('contextmenu', function(e) {
+            const t = e.target;
+            if (!t || !t.closest || !t.closest('#input-container') || t.closest('#input, button')) return;
+            e.preventDefault();
+            openInputMenu(e);
+        });
+        // A press anywhere else, any key, or the window losing the focus or resizing
+        // closes it (as the native GUI's).
+        document.addEventListener('pointerdown', function(e) {
+            if (inputMenu && !inputMenu.contains(e.target)) closeInputMenu();
+        }, true);
+        document.addEventListener('keydown', closeInputMenu, true);
+        window.addEventListener('blur', closeInputMenu);
+        window.addEventListener('resize', closeInputMenu);
 
         // A live shell world: send each insertion/deletion/newline to the PTY as it
         // happens. `beforeinput` carries the inputType and data even for a soft keyboard
@@ -21256,7 +21671,7 @@
         }
         if (elements.setupIconBarSelect) {
             elements.setupIconBarSelect.onchange = function() {
-                setupIconBarMode = this.value;
+                setupIconBarPlace = this.value;
             };
         }
         if (elements.setupPictureHostSelect) {

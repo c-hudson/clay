@@ -112,7 +112,8 @@ impl Tokens {
 
     /// A world's connection dot: on, still trying (amber), or off.
     pub fn dot(&self, world: &World) -> Hsla {
-        if world.connected {
+        // The Activity world has no connection; it is live whenever it is shown.
+        if world.connected || world.is_activity {
             self.success
         } else if reconnecting(world) {
             self.highlight
@@ -248,6 +249,8 @@ pub struct Chrome {
     pub tf_cols: Rc<Cell<usize>>,
     pub tabs_scroll: gpui::ScrollHandle,
     pub shortcuts_scroll: gpui::ScrollHandle,
+    /// The icon bar as a column (Icon Bar: Left/Right), which scrolls as a whole.
+    pub icon_column_scroll: gpui::ScrollHandle,
 }
 
 impl Chrome {
@@ -263,6 +266,7 @@ impl Chrome {
             tf_cols: Rc::new(Cell::new(80)),
             tabs_scroll: gpui::ScrollHandle::new(),
             shortcuts_scroll: gpui::ScrollHandle::new(),
+            icon_column_scroll: gpui::ScrollHandle::new(),
         }
     }
 }
@@ -327,7 +331,7 @@ impl ClayView {
     /// The bar between a split's panes (`/split`): the top pane's world - the current one
     /// here, `in_other_pane` when that pane hasn't the focus - showing only its connection
     /// ball and name (user request 2026-10-30), its dot under the full bar's. A press on it
-    /// moves the focus to that pane.
+    /// moves the focus to that pane, and dragging it resizes the panes (split.rs).
     pub(super) fn pane_bar(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let t = self.chrome.tokens.clone();
         let tinyfugue = self.session.core.settings.as_ref().is_some_and(|s| s.separator_style == "tinyfugue");
@@ -362,9 +366,8 @@ impl ClayView {
             .child(div().h(px(1.0)).bg(t.border))
             .child(div().flex().min_h(px(BAR_HEIGHT - 2.0)).child(row))
             .child(div().h(px(1.0)).bg(t.border_subtle))
-            .when(!focused, |d| {
-                d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _w, cx| this.split_focus_swap(cx)))
-            })
+            .cursor_ns_resize()
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _w, cx| this.split_bar_down(ev, focused, cx)))
             .into_any_element()
     }
 
@@ -466,7 +469,7 @@ impl ClayView {
             row = row.child(div().relative().flex_1().min_w_0().flex().py(px(2.0)).child(rows));
         } else {
             // The world: its dot and name, and the [g]/[N] markers; click for the world menu.
-            if let Some(w) = world.filter(|w| !w.name.is_empty() && w.was_connected) {
+            if let Some(w) = world.filter(|w| !w.name.is_empty() && (w.was_connected || w.is_activity)) {
                 let mut name = w.name.clone();
                 if w.gmcp_user_enabled {
                     name.push_str(" [g]");
@@ -751,6 +754,8 @@ impl ClayView {
 
     pub(super) fn menu_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.chrome.menu = None;
+        // The desktop's app menu comes here without a press in the window.
+        self.user_active(cx);
         match action {
             "toggle-tags" => self.run_action("toggle_tags", window, cx),
             "reload" | "resync" => self.restart_connection(cx),

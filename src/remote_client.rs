@@ -185,6 +185,7 @@ pub(crate) async fn run_grep_client(
         // One-shot invocation: never renders output, so it owns no ▶ markers and needs no
         // stable identity.
         client_uid: String::new(),
+        instance_id: String::new(),
         interface_key: String::new(),
     });
 
@@ -592,6 +593,7 @@ pub(crate) async fn run_import_client(
             client_version: crate::VERSION.to_string(),
             // /import client: fetches settings only, renders nothing, owns no ▶ markers.
             client_uid: String::new(),
+            instance_id: String::new(),
             interface_key: String::new(),
         }
     } else {
@@ -608,6 +610,7 @@ pub(crate) async fn run_import_client(
             client_version: crate::VERSION.to_string(),
             // /import client: fetches settings only, renders nothing, owns no ▶ markers.
             client_uid: String::new(),
+            instance_id: String::new(),
             interface_key: String::new(),
         }
     };
@@ -857,6 +860,7 @@ async fn reconnect_once(
             resume_epochs: Vec::new(),
             client_version: String::new(),
             client_uid: String::new(),
+            instance_id: String::new(),
             // This console's own text-to-speech is kept under this key.
             interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string(),
         };
@@ -1168,7 +1172,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             // for a connection that stays up is handled separately via
                             // `ResyncRequired` in `App::handle_remote_ws_message`
                             // (PROTOCOL-ROADMAP.md Step 6).
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username: username.clone(), current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string() });
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username: username.clone(), current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string() });
                             break;
                         }
                         KeyCode::Char(c) => {
@@ -2409,6 +2413,7 @@ pub(crate) fn handle_remote_client_key(
                     }),
                     announce_screen_reader: Some(app.settings.announce_screen_reader),
                     status_panel: Some(app.settings.status_panel),
+                    icon_bar_profile: None,
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -2659,6 +2664,7 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd.clone();
                     app.worlds[idx].settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
                     app.worlds[idx].settings.keep_alive_gag = settings.keep_alive_gag.clone();
+                    app.worlds[idx].settings.login_command = settings.login_command.clone();
                     app.worlds[idx].settings.status_panel = settings.status_panel;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages.clone();
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
@@ -2706,6 +2712,7 @@ pub(crate) fn handle_remote_client_key(
                         keep_alive_gag_enabled: Some(settings.keep_alive_gag_enabled),
                         keep_alive_gag: Some(settings.keep_alive_gag),
                         status_panel: Some(settings.status_panel),
+                        login_command: Some(settings.login_command),
                     });
                 }
             }
@@ -2984,8 +2991,8 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
         }
         // The split is this console's own, typed or sent back by the server (an action).
         // Quiet when it works (the panes show it); only an error is said.
-        Command::Split { world } => {
-            if let Err(msg) = app.split_open(world.as_deref()) {
+        Command::Split { args } => {
+            if let Err(msg) = app.split_command(&args) {
                 app.add_output(&msg);
             }
         }
@@ -3686,6 +3693,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         screen_reader_profile: None,
         announce_screen_reader: None,
         status_panel: None,
+        icon_bar_profile: None,
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {

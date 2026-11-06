@@ -74,6 +74,19 @@ pub fn text_on(bg: Rgb) -> Rgb {
     if lum > 140.0 { Rgb(0, 0, 0) } else { Rgb(255, 255, 255) }
 }
 
+/// The Activity world's name block when the New Indicator has no colour (None, Character):
+/// yellow (user request 2026-11-05).
+pub const YELLOW: Rgb = Rgb(255, 255, 0);
+
+/// The world name at the start of an Activity world line, on a solid block of the New
+/// Indicator's colour (yellow when it has none) in black or white text, then a space: the
+/// one form every interface draws, since the colours travel in the line's own SGR.
+pub fn activity_label(indicator: &crate::encoding::NewIndicator, world: &str) -> String {
+    let bg = indicator.glow_start().unwrap_or(YELLOW);
+    let fg = text_on(bg);
+    format!("\x1b[0m{}\x1b[38;2;{};{};{}m{}\x1b[0m ", bg.sgr_bg(), fg.0, fg.1, fg.2, world)
+}
+
 /// What the console's glow fades to: the terminal's background is unknown, so black on the
 /// Dark theme and white on Light (the user's words).
 pub fn console_target(theme: Theme) -> Rgb {

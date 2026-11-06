@@ -177,6 +177,9 @@ pub struct World {
     pub name: String,
     pub connected: bool,
     pub was_connected: bool,
+    /// The server's Activity world (`WorldStateMsg::is_activity`): never in a world list,
+    /// never held by more-mode, no alerts; reached only by `/world act`, `/split act`.
+    pub is_activity: bool,
     pub showing_splash: bool,
     pub lines: Vec<Line>,
     pub prompt: String,
@@ -334,8 +337,14 @@ pub struct ClientCore {
     /// The MUD sent text that shows (live, not history, not gagged) since `take_live_text`
     /// last looked: Taskbar Alert's cue (ui/taskbar.rs).
     live_text: bool,
-    /// An operator paused this client (`/remote pause`).
+    /// An operator paused this client (`/remote --pause`, `/pause`). Only the server's
+    /// word for this connection: cleared at each login, set again by its `PausedState`.
     pub paused: bool,
+    /// `ResumeSession` went for this pause; the server's `PausedState` answers it.
+    resume_asked: bool,
+    /// The server takes `ResumeSession` (`InitialState.resume_session`): any use of a
+    /// paused window resumes it, not only what it sends.
+    server_resumes: bool,
     pub visible: bool,
     /// The ASCII splash shown before there's any world (multiuser, before connecting).
     pub splash_lines: Vec<String>,
@@ -417,6 +426,8 @@ impl ClientCore {
             activity: 0,
             live_text: false,
             paused: false,
+            resume_asked: false,
+            server_resumes: false,
             splash_lines: Vec::new(),
             cached: HashMap::new(),
             preferred_world: None,
@@ -935,6 +946,24 @@ impl ClientCore {
         self.take()
     }
 
+    /// The Activity world: drop the lines that came from a `shown` world, now on screen in
+    /// this program (any window, any pane), so no longer activity here (user request
+    /// 2026-11-05). The server already sends none from them while they are; this takes the
+    /// ones that came before. True when any went.
+    pub fn drop_activity_from(&mut self, shown: &[String]) -> bool {
+        let Some(w) = self.worlds.iter_mut().find(|w| w.is_activity) else { return false };
+        let before = w.lines.len();
+        w.lines.retain(|l| {
+            !crate::util::activity_line_world(&l.text).is_some_and(|n| shown.iter().any(|s| s.eq_ignore_ascii_case(&n)))
+        });
+        if w.lines.len() == before {
+            return false;
+        }
+        w.touch();
+        self.changed();
+        true
+    }
+
     /// Ctrl+L (app.js `redraw`): drop this client's own notices from the current world and
     /// clear its ▶ markers there.
     pub fn redraw(&mut self) -> Vec<Effect> {
@@ -973,6 +1002,16 @@ impl ClientCore {
     /// request): so the answer lands in the same place in both.
     pub fn adopt_request(&mut self, id: u64, request: PendingRequest) {
         self.requests.insert(id, (request.0, request.1, request.2));
+    }
+
+    /// The user did something in this window (a key, a click, the wheel, a menu): a
+    /// paused session asks the server to resume it, once.
+    pub fn user_active(&mut self) -> Vec<Effect> {
+        if self.paused && self.server_resumes && !self.resume_asked && self.is_online() {
+            self.resume_asked = true;
+            self.send(WsMessage::ResumeSession);
+        }
+        self.take()
     }
 
     pub fn send_message(&mut self, msg: WsMessage) -> Vec<Effect> {
@@ -1179,8 +1218,14 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, map, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, map, resume_session, .. } => {
                 self.server_map = map;
+                // A pause is a connection's: a new one starts unpaused, and a resync's
+                // `PausedState` follows if this one still is. Kept, the badge outlived a
+                // reconnect (a server's reload) and nothing ever took it down.
+                self.paused = false;
+                self.resume_asked = false;
+                self.server_resumes = resume_session;
                 self.server_version_detail = crate::server_version_detail(&server_version_detail, &server_version);
                 self.server_takes_other_views = other_views;
                 self.server_expands_line = expand_line;
@@ -1395,6 +1440,7 @@ impl ClientCore {
             }
             WsMessage::PausedState { paused } => {
                 self.paused = paused;
+                self.resume_asked = false;
                 self.changed();
             }
             WsMessage::StatsUpdate { world_index, stats } => {
@@ -1499,6 +1545,9 @@ impl ClientCore {
             resume_epochs: resume_epochs.clone(),
             client_version: self.client_version.clone(),
             client_uid: self.client_uid.clone(),
+            // This GUI's other windows share the connection; another GUI on this machine
+            // shares the uid, not this.
+            instance_id: crate::util::process_instance_id().to_string(),
             // This GUI's text-to-speech is kept under its key (its program on its OS).
             interface_key: crate::font_profile::native_key().to_string(),
         };
@@ -1633,6 +1682,7 @@ impl ClientCore {
             name: m.name.clone(),
             connected: m.connected,
             was_connected: m.was_connected,
+            is_activity: m.is_activity,
             showing_splash: m.showing_splash,
             prompt: m.prompt.clone(),
             pending_count: m.pending_count,
@@ -1664,7 +1714,7 @@ impl ClientCore {
             .worlds
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != self.current)
+            .filter(|(i, w)| *i != self.current && !w.is_activity)
             .filter_map(|(i, w)| w.last_activity.map(|at| (i, now.saturating_duration_since(at))))
             .collect();
         list.sort_by_key(|&(_, ago)| ago);
@@ -1812,10 +1862,15 @@ impl ClientCore {
             w.history_inflight = None;
             w.touch();
             gap_fill = false;
+            // A flush with no text (the Activity world emptied) is all there is.
+            if d.data.is_empty() {
+                return;
+            }
         }
         let mut data = d.data;
-        if d.from_server && !gap_fill {
-            // Output from the MUD now, not a refill of history.
+        if d.from_server && !gap_fill && !self.worlds[d.world_index].is_activity {
+            // Output from the MUD now, not a refill of history. (The Activity world's lines
+            // are copies: their own worlds already counted them.)
             self.worlds[d.world_index].last_activity = Some(Instant::now());
             self.live_text |= !d.gagged && !data.is_empty();
         }
@@ -2363,6 +2418,7 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         announce_screen_reader: Some(s.announce_screen_reader),
         // None from a server before Status Panel: nothing to send back.
         status_panel: s.status_panel,
+        icon_bar_profile: s.icon_bar_profile_update(crate::font_profile::native_key()),
     }
 }
 

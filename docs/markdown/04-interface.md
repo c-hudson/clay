@@ -54,7 +54,7 @@ colour, or underscores with Settings > Separator Style set to TinyFugue (see **S
 The input area is where you type commands:
 
 - **Prompt display**: Server prompts (detected via telnet GA/EOR, or by timing on MUD - Timed Prompt worlds) shown in cyan
-- **Multi-line support**: Resize with `Alt+Up/Down` (1-15 lines). In the GUI and the web client you can also drag the line above the input up or down with the mouse; the console has no drag, only the keys. Either way the height is kept (it is that interface's Input height setting: the console, phones, tablets and desktop clients each have their own) and comes back on the next start and after `/reload`
+- **Multi-line support**: Resize with `Alt+Up/Down` (1-15 lines). In the GUI and the web client you can also drag the line above the input up or down with the mouse; the console has no drag, only the keys. A right-click anywhere in the input area, the lines already sent above the one being typed included, opens a Cut, Copy, Paste and Select All menu for the input: in the GUI, the web page and the Android app with a mouse. On the typed line itself, the web page and the Android app show the browser's own menu, with its spelling suggestions; a browser may ask once before Clay's Paste can read the clipboard. Either way the height is kept (it is that interface's Input height setting: the console, phones, tablets and desktop clients each have their own) and comes back on the next start and after `/reload`
 - **Lines sent stay on screen**: as in TinyFugue, a line you send stays in the input area (its text alone; the prompt belongs to the line you are typing, which shows the current world's), and the next one starts on the row below. Once the area is full, the oldest row scrolls off the top, and the line being typed takes the rows it needs from them. A line typed at a password prompt leaves an empty row. `Ctrl+L` (Redraw) clears them. Turn **Clear Input on Send** on in Settings (TF's `/cleardone on`) to have Enter clear the input instead. On a phone the input always clears
 - **Cursor**: Standard text cursor with left/right movement
 - **Spell checking**: Misspelled words highlighted in red
@@ -89,6 +89,14 @@ web page and the Android app.
   screenful of the top pane. The usual bar under the bottom pane belongs to the bottom one,
   with everything it always shows; its activity count leaves out both worlds on screen. The
   focused pane's bar keeps the bar colour, the other one turns grey.
+- **The panes' size.** `/split -n <lines>` makes the top pane that many lines high, in
+  every interface: it splits the output if it isn't split, and only resizes it if it is.
+  In the GUI and the web page (the Android app too) you can also drag the bar between the
+  panes up or down, a line at a time, with a finger on a touch screen. Each pane keeps at
+  least one line. A press on the bar also gives its pane the focus. The size is that
+  program's own (each console, GUI window and browser page has its own); the next
+  `/split` opens at it again, and it survives `/reload`. Until you set one, the panes are
+  half and half.
 - **Both panes stay live.** Each takes its world's output under the usual rules: more-mode
   pauses each at its own height, ▶ marks what arrived unseen, and neither counts as activity
   while it is on screen.

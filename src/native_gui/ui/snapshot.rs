@@ -159,6 +159,31 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     pressed_button: (verb == "move" && left_down).then_some(gpui::MouseButton::Left),
                     modifiers: mods,
                 })],
+                // The link a press at x,y would follow, as text: in the focused pane
+                // (`link`), or in a split's other pane (`olink`).
+                "link" | "olink" => {
+                    cx.run_until_parked();
+                    let _ = cx.update_window(window.into(), |_, w, app| {
+                        let _ = w.draw(app);
+                    });
+                    let (x, y) = (nums.first().copied().unwrap_or(0.0), nums.get(1).copied().unwrap_or(0.0));
+                    let other = verb == "olink";
+                    cx.update(|app| {
+                        view.update(app, |v, _| {
+                            let find = |v: &mut ClayView| v.link_at_point(x, y).and_then(|(id, r)| v.styled.get(&id).map(|(_, s)| s.text[r].to_string()));
+                            let link = if other { v.in_other_pane(find).flatten() } else { find(v) };
+                            println!("snapshot-{verb}: {x},{y} {link:?}");
+                        })
+                    });
+                    Vec::new()
+                }
+                // The mouse wheel at x,y, `dy` lines (negative: up the page, to older lines).
+                "wheel" => vec![gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position: at(),
+                    delta: gpui::ScrollDelta::Lines(gpui::point(0.0, nums.get(2).copied().unwrap_or(0.0))),
+                    modifiers: mods,
+                    touch_phase: gpui::TouchPhase::Moved,
+                })],
                 "up" => {
                     left_down = false;
                     vec![gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button: gpui::MouseButton::Left, position: at(), modifiers: mods, click_count: 1 })]

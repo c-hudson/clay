@@ -41,7 +41,7 @@ use crate::native_gui::core::wrap::{rows_in_columns, wrap_rows};
 /// The GUI's `#output-container { padding: 2px 4px }` (webview_gui.rs's override of
 /// style.css's 4px).
 const PAD_X: f32 = 4.0;
-const PAD_Y: f32 = 2.0;
+pub(super) const PAD_Y: f32 = 2.0;
 
 pub fn hsla(c: Rgb) -> Hsla {
     Rgba { r: c[0] as f32 / 255.0, g: c[1] as f32 / 255.0, b: c[2] as f32 / 255.0, a: 1.0 }.into()
@@ -185,6 +185,10 @@ pub struct Scroll {
     pub row_h: f32,
     /// The scroll bar, as last laid out.
     pub bar: Option<Bar>,
+    /// What the wheel turned short of a whole row, kept for its next turn.
+    pub wheel_rest: f32,
+    /// A line to show in the middle of the view at the next layout (F5's match).
+    center: Option<u64>,
 }
 
 pub type ScrollHandle = Rc<RefCell<Scroll>>;
@@ -235,6 +239,8 @@ impl Default for Scroll {
             hits: Vec::new(),
             row_h: 16.0,
             bar: None,
+            wheel_rest: 0.0,
+            center: None,
         }
     }
 }
@@ -249,6 +255,14 @@ impl Scroll {
     pub fn follow_bottom(&mut self) {
         self.follow = true;
         self.top = None;
+        self.pending = 0;
+        self.center = None;
+    }
+
+    /// Show line `id` in the middle of the view at the next layout (F5's match), as far as
+    /// the lines before and after it allow.
+    pub fn center_on(&mut self, id: u64) {
+        self.center = Some(id);
         self.pending = 0;
     }
 
@@ -711,6 +725,23 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         })
     };
 
+    // A line asked for in the middle (F5's match): the top row is half the rows the view
+    // has to spare above it, or the first row there is. Near the end, `plan_view` follows
+    // the bottom instead.
+    if let Some(id) = st.center.take() {
+        if let Some(mi) = snapshot.lines.iter().position(|l| l.0 == id) {
+            let mut need = view_rows.saturating_sub(rows_of(mi, &mut st, &mut laid)) / 2;
+            let mut top = (mi, 0);
+            while need > 0 && top.0 > 0 {
+                let r = rows_of(top.0 - 1, &mut st, &mut laid);
+                top = (top.0 - 1, r.saturating_sub(need));
+                need = need.saturating_sub(r);
+            }
+            st.follow = false;
+            st.top = Some((snapshot.lines[top.0].0, top.1));
+            st.pending = 0;
+        }
+    }
     // Where the view is, worked out against the lines' row counts.
     let anchored = if st.follow { None } else { st.top.and_then(|(id, r)| snapshot.lines.iter().position(|l| l.0 == id).map(|i| (i, r))) };
     let (follow, pending) = (st.follow, st.pending);

@@ -74,6 +74,48 @@ When you switch to a world:
 - Its unseen count is cleared
 - All clients are notified (console, web, GUI stay in sync)
 
+## The Activity World
+
+The Activity world shows every other world's new lines as they arrive, in one place. It
+is meant for a split pane, so you can watch everything else while you play in one world:
+
+```
+/split act          # the Activity world above (or /split activity)
+/world act          # go to it (or /world activity)
+```
+
+Each line starts with the name of the world it came from, then a space, then the line.
+The name sits on a solid block of the **New Indicator** colour from Settings: green for
+Background, the chosen colour for Custom, and yellow when the indicator has no colour
+(None or Character). The colour is part of the line, so changing the setting changes
+only lines that arrive afterwards.
+
+The Activity world is only for watching:
+
+- It never pauses for more, and nothing it shows counts as activity, adds to More or
+  takes a ▶ marker, in any world.
+- Its lines aren't logged, archived or spoken, and they fire no triggers or hooks. They
+  already did all of that in their own worlds.
+- It shows only what the MUD or chat server sent. Gagged lines, blank lines, Clay's own
+  messages and what you type aren't copied. A MUD tag (`[chan:]`) is left off, as the world itself
+  shows it.
+- Each interface has its own. It holds only the lines that arrived while that interface
+  showed it, so it starts empty each time you go to it. It never shows lines from a world
+  that interface is showing itself: with `8bit` in the bottom pane and Activity above it,
+  nothing from `8bit` appears in Activity, and when you switch the bottom pane to `8bit`,
+  the `8bit` lines already in Activity go. That includes another window of the same GUI.
+  What other interfaces show (the console, another GUI, a phone) makes no difference.
+- The switch-world keys and Escape+w never go to it, and it isn't in the World
+  Selector, the tabs, Recent Worlds or `/connections`. Only `/world` and `/split` reach
+  it by name.
+- It can't be edited, connected, deleted or given notes. Text typed while it has the
+  focus goes nowhere, as in any world that isn't connected.
+
+Every interface has it: the console, the SSH console, the GUIs, the web page and the
+Android app. A multiuser server has none. If you already have a world of your own named
+Activity, that world keeps the name and there is no Activity world; a new world can't
+take the name.
+
 ## Managing Connections
 
 ### Listing Connections

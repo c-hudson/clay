@@ -231,11 +231,8 @@ impl ClayView {
             cx.notify();
             return;
         }
-        let (hit, on) = {
-            let s = self.scroll.borrow();
-            (s.hit(x, y), s.byte_at(x, y))
-        };
-        self.select.press_link = on.and_then(|p| self.styled_text(p.id).and_then(|s| link_at(&s, p.byte)).map(|r| (p.id, r)));
+        let hit = self.scroll.borrow().hit(x, y);
+        self.select.press_link = self.link_at_point(x, y);
         let Some(pos) = hit else {
             self.select.sel = None;
             cx.notify();
@@ -254,6 +251,12 @@ impl ClayView {
         self.select.sel = Some(Selection { anchor, head: anchor.1, unit, dragging: true });
         self.select.drag_at = Some(ev.position);
         cx.notify();
+    }
+
+    /// The link under window point (x, y) in the pane being handled: its line and bytes.
+    pub(super) fn link_at_point(&self, x: f32, y: f32) -> Option<(u64, Range<usize>)> {
+        let on = self.scroll.borrow().byte_at(x, y)?;
+        self.styled_text(on.id).and_then(|s| link_at(&s, on.byte)).map(|r| (on.id, r))
     }
 
     pub(super) fn output_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -278,8 +281,7 @@ impl ClayView {
             self.select.bar_hover = on_bar;
             cx.notify();
         }
-        let on = self.scroll.borrow().byte_at(x, y);
-        let link = on.and_then(|p| self.styled_text(p.id).and_then(|s| link_at(&s, p.byte)).map(|r| (p.id, r)));
+        let link = self.link_at_point(x, y);
         if link != self.select.hover_link {
             self.select.hover_link = link;
             cx.notify();

@@ -794,6 +794,7 @@ impl TextReveal {
 /// above or below the output, a column beside it (user request 2026-11-01), or nowhere.
 /// Kept per interface (`Settings::tabs_profiles`), with `Settings::tabs` the shared value an
 /// interface that never chose its own uses, and the one an older peer reads and writes.
+/// The icon bar's places are the same (`IconBarPlace`, `Settings::icon_bar_profiles`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TabsMode {
     #[default]
@@ -836,11 +837,18 @@ impl TabsMode {
     }
 }
 
-/// Icon bar visibility mode (web/GUI/Android only — no visual effect on the
-/// console TUI, though the setting itself is still editable there). The
-/// icon bar is the row of large Worlds/Actions/Settings/Find tiles plus
-/// user-defined Action shortcuts (see Action::gui_shortcut) shown above the
-/// output area.
+/// Where an interface puts its icon bar (the large Worlds/Actions/Settings/Find/Tags tiles
+/// plus the Actions marked as shortcuts, see Action::gui_shortcut): a row above or below the
+/// output, a column beside it, or nowhere (user request 2026-11-04). Each interface's own,
+/// in `Settings::icon_bar_profiles`; one that never chose takes its place from the shared
+/// `IconBarMode`.
+pub type IconBarPlace = TabsMode;
+
+/// The shared Icon Bar setting from before each interface had its own place: which
+/// interfaces show the bar, at the top. Kept for older peers, which read and write it, and
+/// as the place an interface that never chose its own takes: None hides it, All puts it at
+/// the top, App/Tablet at the top in the GUIs, on a tablet and in the Android app with a
+/// keyboard and mouse (app.js `iconBarLegacyShows`), else hides it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum IconBarMode {
     None,
@@ -2263,8 +2271,12 @@ pub struct Settings {
     /// Settings (user ruling 2026-11-02). A world's own switch is `WorldSettings::status_panel`;
     /// the display shows only while both are on (`App::status_display_wanted`). Default on.
     pub status_panel: bool,
-    /// Icon bar visibility mode (web/GUI/Android only, see IconBarMode)
+    /// The shared Icon Bar setting (web/GUI/Android only, see IconBarMode): what an older
+    /// peer reads and writes, and where an interface without its own place takes it from.
     pub icon_bar: IconBarMode,
+    /// Each interface's own icon bar place, by its key (`valid_interface_key`; user request
+    /// 2026-11-04: each interface keeps its own).
+    pub icon_bar_profiles: std::collections::BTreeMap<String, IconBarPlace>,
     /// Import Picture's host (src/picture.rs): where a picture is uploaded, and whether its
     /// link is shortened; Off turns picture uploads off.
     pub picture_host: picture::PictureService,
@@ -2423,6 +2435,7 @@ impl Default for Settings {
             announce_screen_reader: false,
             status_panel: true,
             icon_bar: IconBarMode::AppTablet,
+            icon_bar_profiles: std::collections::BTreeMap::new(),
             picture_host: picture::PictureService::default(),
             tts_speak_mode: tts::TtsSpeakMode::All,
             tts_voice: kokoro::DEFAULT_VOICE.to_string(),
@@ -2538,6 +2551,10 @@ pub struct WorldSettings {
     /// beside it. Gagged as well as `##rand##`'s marker, never instead of it.
     pub keep_alive_gag_enabled: bool,
     pub keep_alive_gag: String,
+    /// Edit World's Login Command: what Clay runs once its auto-login has been sent
+    /// (`App::run_login_commands`), one command per line, `;` between commands on one line
+    /// (`\;` a literal one) - `WorldSettings::login_commands`. Empty runs nothing.
+    pub login_command: String,
     // Slack settings (see src/chat/). `slack_token` is the bot token (xoxb-),
     // `slack_app_token` the app-level Socket Mode token (xapp-). `slack_channel` is the
     // Send To spec, `slack_channels` the comma-separated "Show Only" filter (empty =
@@ -2629,6 +2646,7 @@ impl Default for WorldSettings {
             keep_alive_cmd: String::new(),
             keep_alive_gag_enabled: false,
             keep_alive_gag: String::new(),
+            login_command: String::new(),
             slack_token: String::new(),
             slack_app_token: String::new(),
             slack_channel: String::new(),
@@ -2655,6 +2673,13 @@ impl Default for WorldSettings {
 }
 
 impl WorldSettings {
+    /// The Login Command's commands in the order they are run: each line, and each part of
+    /// a line between `;`s, as an action's command is split (`split_action_commands`:
+    /// `\;` is a literal `;`, blank parts are dropped).
+    pub(crate) fn login_commands(&self) -> Vec<String> {
+        self.login_command.lines().flat_map(split_action_commands).collect()
+    }
+
     /// Check if this world has enough settings to attempt a connection
     fn has_connection_settings(&self) -> bool {
         match self.world_type {
@@ -2975,9 +3000,10 @@ pub enum Command {
     Flush,
     /// /menu - show menu popup to select windows/popups
     Menu,
-    /// /split [world] - split the output: a second pane above showing `world` (else the
-    /// next world in order); each interface splits its own (user request 2026-10-30)
-    Split { world: Option<String> },
+    /// /split [-n <lines>] [world] - split the output: a second pane above showing `world`
+    /// (else the next world in order), `-n` lines high; each interface splits its own (user
+    /// requests 2026-10-30, 2026-11-05). Read by `App::split_command`.
+    Split { args: String },
     /// /unsplit - close the split pane without the focus
     Unsplit,
     /// /map [...] - the auto-mapper (src/map): the pane forms are each interface's own,
@@ -3214,7 +3240,7 @@ pub fn parse_command(input: &str) -> Command {
         }
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
-        "/split" => Command::Split { world: (!args.is_empty()).then(|| args.join(" ")) },
+        "/split" => Command::Split { args: args.join(" ") },
         // "/@map": TinyFugue's map.tf defines a /map macro, which wins when loaded.
         "/map" | "/@map" => Command::Map { args: args.join(" ") },
         "/unsplit" => Command::Unsplit,
@@ -4454,6 +4480,11 @@ pub struct World {
     /// TF's `/connect <host> <port>` world, "(unnamed<N>)": never saved to settings.dat,
     /// and removed once disconnected and not in the foreground (`App::reap_temporary_world`).
     pub(crate) is_temporary: bool,
+    /// The Activity world (`/world activity`, `/split act`): every other world's new lines
+    /// as they arrive, each after its world's name (`App::copy_to_activity`). Made at start-up
+    /// (`App::ensure_activity_world`); never connected, saved to settings.dat, counted or
+    /// switched to by a key.
+    pub(crate) is_activity: bool,
     /// `/connect -q`: the next login is a quiet one.
     pub(crate) quiet_login: bool,
     /// `/connect -x`: use SSL for the next connection even though the world doesn't.
@@ -4772,6 +4803,7 @@ impl World {
             was_connected: false,
             skip_auto_login: false,
             is_temporary: false,
+            is_activity: false,
             quiet_login: false,
             force_ssl_once: false,
             temp_connect_started: None,
@@ -5683,6 +5715,21 @@ impl World {
         self.visual_line_offset = 0;
     }
 
+    /// The Activity world: drop the lines that came from a `shown` world (on screen in this
+    /// interface now, so no longer activity there). True when any went.
+    pub(crate) fn drop_activity_from(&mut self, shown: &[String]) -> bool {
+        let before = self.output_lines.len();
+        self.output_lines.retain(|l| {
+            !crate::util::activity_line_world(&l.text).is_some_and(|w| shown.iter().any(|s| s.eq_ignore_ascii_case(&w)))
+        });
+        if self.output_lines.len() == before {
+            return false;
+        }
+        self.scroll_to_bottom();
+        self.needs_redraw = true;
+        true
+    }
+
     /// Visual rows of the partially-shown (VLO-truncated) line that are hidden
     /// from the display. 0 when no truncation is active.
     /// Mirrors the partial-line lookup in release_pending_screenful (walk back
@@ -6204,6 +6251,12 @@ pub struct App {
     /// (`WsMessage::OtherViews`, the native GUI's `/window`s). They count as on screen
     /// while the client itself does (`ws_client_viewing`); reaped with its view state.
     pub ws_client_other_views: std::collections::HashMap<u64, Vec<usize>>,
+    /// The clients that had the Activity world on screen at the last look
+    /// (`note_activity_viewers`): each is sent its own copies of the lines.
+    pub(crate) activity_viewers: std::collections::HashSet<u64>,
+    /// The console had the Activity world on screen at the last look: its copy in the
+    /// world's own buffer is collected.
+    pub(crate) console_showed_activity: bool,
     /// Client id -> the size it shows each of its other views at (`OtherViews.dims`): they
     /// page those worlds for it (`min_viewer_lines`) and size a shell world's PTY.
     pub ws_client_other_view_dims: std::collections::HashMap<u64, Vec<websocket::ViewDims>>,
@@ -6217,6 +6270,8 @@ pub struct App {
     /// Connection id -> the interface it named at login (`AuthRequest.interface_key`):
     /// whose text-to-speech it is sent (`App::client_tts`). Absent for an older client.
     pub ws_client_interface: std::collections::HashMap<u64, String>,
+    /// Each client's running program (`AuthRequest.instance_id`), when it names one.
+    pub ws_client_instance: std::collections::HashMap<u64, String>,
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     pub is_master: bool,
@@ -6256,6 +6311,9 @@ pub struct App {
     pub(crate) console_paused: bool,
     /// `/split`: the console's second pane; None while the output is one area.
     pub(crate) split: Option<ConsoleSplit>,
+    /// `/split -n <lines>` or nothing (half): the top pane's lines, this console's own and
+    /// kept for its next `/split` (user request 2026-11-05). Each pane keeps one row.
+    pub(crate) split_top_rows: Option<usize>,
     /// The rows of the top and bottom panes as last laid out by `ui()`, while split.
     pub(crate) pane_rows: (u16, u16),
     /// The rows of the whole output area (both panes and the bar between them).
@@ -6597,10 +6655,13 @@ impl App {
             output_painted_by_crossterm: false,
             ws_client_worlds: std::collections::HashMap::new(),
             ws_client_other_views: std::collections::HashMap::new(),
+            activity_viewers: std::collections::HashSet::new(),
+            console_showed_activity: false,
             ws_client_other_view_dims: std::collections::HashMap::new(),
             ws_client_splits: std::collections::HashSet::new(),
             ws_client_owner_ids: std::collections::HashMap::new(),
             ws_client_interface: std::collections::HashMap::new(),
+            ws_client_instance: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
             deferred_tf: std::collections::VecDeque::new(),
             last_temp_world: 0,
@@ -6618,6 +6679,7 @@ impl App {
             ws_client_map_sent: std::collections::HashSet::new(),
             console_paused: false,
             split: None,
+            split_top_rows: None,
             pane_rows: (0, 0),
             output_area_rows: 20,
             console_drawn_world: None,
@@ -6898,6 +6960,7 @@ impl App {
             text_reveal: self.settings.text_reveal.name(),
             text_reveal_profiles: self.settings.text_reveal_profiles.iter().map(|(k, v)| (k.clone(), v.name())).collect(),
             tabs_profiles: Some(self.settings.tabs_profiles.iter().map(|(k, v)| (k.clone(), v.name().to_string())).collect()),
+            icon_bar_profiles: Some(self.settings.icon_bar_profiles.iter().map(|(k, v)| (k.clone(), v.name().to_string())).collect()),
             screen_reader_profiles: Some(self.settings.screen_reader_profiles.clone()),
             announce_screen_reader: self.settings.announce_screen_reader,
             status_panel: Some(self.settings.status_panel),
@@ -7083,9 +7146,10 @@ impl App {
             initial_world.scrollback_tx = self.scrollback.as_ref().map(|db| db.sender());
             self.worlds.push(initial_world);
         } else {
-            // Add splash to current world if it has no output yet
+            // Add splash to current world if it has no output yet (never the Activity
+            // world, which shows only what arrives while it's on screen)
             let current = &mut self.worlds[self.current_world_index];
-            if current.output_lines.is_empty() && !current.connected {
+            if current.output_lines.is_empty() && !current.connected && !current.is_activity {
                 // Allocate from next_seq, not 0 - the buffer being empty does not mean no
                 // seqs have been handed out (a /flush empties it and leaves next_seq alone).
                 current.output_lines = World::generate_splash_lines(current.next_seq);
@@ -7179,6 +7243,7 @@ impl App {
                 world_type: world.settings.world_type.name().to_string(),
                 tf_type: world.settings.tf_type.clone(),
                 is_temporary: world.is_temporary,
+                is_activity: world.is_activity,
                 login: world.settings.auto_connect_type != AutoConnectType::NoLogin,
                 telnet: world.telnet_mode,
                 local_echo: !world.protocol.echo_masked,
@@ -7457,6 +7522,7 @@ impl App {
             let all_worlds: Vec<popup::definitions::world_selector::WorldInfo> = self.worlds
                 .iter()
                 .enumerate()
+                .filter(|(_, w)| !w.is_activity)
                 .map(|(idx, w)| popup::definitions::world_selector::WorldInfo {
                     name: w.name.clone(),
                     hostname: w.settings.hostname.clone(),
@@ -7477,7 +7543,8 @@ impl App {
     fn open_world_selector_new(&mut self) {
         use popup::definitions::world_selector::{create_world_selector_popup, WorldInfo, SELECTOR_FIELD_LIST};
 
-        let worlds: Vec<WorldInfo> = self.worlds.iter().enumerate().map(|(i, w)| {
+        // Never the Activity world, which is only named (`/world act`).
+        let worlds: Vec<WorldInfo> = self.worlds.iter().enumerate().filter(|(_, w)| !w.is_activity).map(|(i, w)| {
             WorldInfo {
                 name: w.name.clone(),
                 hostname: w.settings.hostname.clone(),
@@ -7487,6 +7554,7 @@ impl App {
                 is_current: i == self.current_world_index,
             }
         }).collect();
+        let current_row = worlds.iter().position(|w| w.is_current).unwrap_or(0);
 
         let visible_height = 10.min(worlds.len().max(3));
         let def = create_world_selector_popup(&worlds, visible_height);
@@ -7498,7 +7566,7 @@ impl App {
             // Set selection to current world
             if let Some(field) = state.field_mut(SELECTOR_FIELD_LIST) {
                 if let popup::FieldKind::List { selected_index, .. } = &mut field.kind {
-                    *selected_index = self.current_world_index;
+                    *selected_index = current_row;
                 }
             }
         }
@@ -7553,7 +7621,7 @@ impl App {
         let mut entries: Vec<(usize, u64)> = self.worlds
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != current_idx)
+            .filter(|(i, w)| *i != current_idx && !w.is_activity)
             .filter_map(|(i, w)| {
                 // Use the more-recent of last_receive_time and last_send_time.
                 let recv = w.last_receive_time.map(|t| now.duration_since(t).as_secs());
@@ -7613,6 +7681,8 @@ impl App {
                     } else {
                         self.request_server_file(path);
                     }
+                } else if let Some(why) = self.activity_refusal(self.current_world_index, "given notes") {
+                    self.add_output(&why);
                 } else {
                     self.open_notes_editor(self.current_world_index);
                 }
@@ -8119,6 +8189,7 @@ impl App {
             keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
             keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
             keep_alive_gag: world.settings.keep_alive_gag.clone(),
+            login_command: world.settings.login_command.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
             auto_reconnect_secs: world.settings.auto_reconnect_display(),
             msp_enabled: world.settings.msp_enabled,
@@ -8327,6 +8398,10 @@ impl App {
                         world.lines_since_pause = 0;
                         world.scroll_offset = 0;
                         self.needs_output_redraw = true;
+                        // A flush with no text (the Activity world emptied) is all there is.
+                        if data.is_empty() {
+                            return;
+                        }
                     }
                     // Dedup: msg_seq <= max_received_seq means the server sent us something
                     // we've already fully processed (e.g. a resume/gap-fill reply overlapping
@@ -9106,6 +9181,7 @@ impl App {
                     w.settings.keep_alive_cmd = settings.keep_alive_cmd;
                     w.settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
                     w.settings.keep_alive_gag = settings.keep_alive_gag;
+                    w.settings.login_command = settings.login_command;
                     w.settings.msp_enabled = settings.msp_enabled;
                     w.settings.mcp_enabled = settings.mcp_enabled;
                     w.settings.mccp2_enabled = settings.mccp2_enabled;
@@ -9361,6 +9437,7 @@ impl App {
         world.scrollback_tx = self.scrollback.as_ref().map(|db| db.sender());
         world.connected = w.connected;
         world.was_connected = w.was_connected;
+        world.is_activity = w.is_activity;
         // Set proxy_pid sentinel if server reports proxy (actual PID not needed for display)
         world.proxy_pid = if w.is_proxy { Some(0) } else { None };
         let output_lines_count = w.output_lines_ts.len();
@@ -9458,6 +9535,7 @@ impl App {
             keep_alive_cmd: w.settings.keep_alive_cmd,
             keep_alive_gag_enabled: w.settings.keep_alive_gag_enabled,
             keep_alive_gag: w.settings.keep_alive_gag,
+            login_command: w.settings.login_command,
             msp_enabled: w.settings.msp_enabled,
             mcp_enabled: w.settings.mcp_enabled,
             mccp2_enabled: w.settings.mccp2_enabled,
@@ -9778,6 +9856,7 @@ impl App {
     /// than in each way of switching worlds, which differ between the two consoles.
     /// Returns true when the console shows a different world than it drew last.
     pub(crate) fn track_console_world(&mut self) -> bool {
+        self.note_activity_viewers();
         // Each pane by its place: the bottom one (the only one while not split) and a
         // split's top one. A focus change moves neither pane's world, so it is no switch.
         let (top, bottom) = match self.split {
@@ -9803,6 +9882,14 @@ impl App {
         let now = [Some(bottom_now.clone()), top_now.clone()];
         if drawn == now {
             return false;
+        }
+        // A world now on screen here leaves this console's Activity world: its lines are in
+        // its own pane (the server's copy for the console, the SSH console's own mirror).
+        let shown: Vec<String> = now.iter().flatten().cloned().collect();
+        if let Some(act) = self.activity_world() {
+            if self.worlds[act].drop_activity_from(&shown) {
+                self.needs_output_redraw = true;
+            }
         }
         // A world no pane shows any more has been seen up to its newest line...
         for prev in drawn.iter().flatten() {
@@ -9905,7 +9992,7 @@ impl App {
     /// disconnects. Says nothing when it works (the pane shows it); the error otherwise.
     pub(crate) fn split_open(&mut self, world: Option<&str>) -> Result<(), String> {
         let named = match world.map(str::trim).filter(|w| !w.is_empty()) {
-            Some(name) => match self.find_world_index(name) {
+            Some(name) => match self.find_world_typed(name) {
                 Some(i) => Some(i),
                 None => return Err(format!("World '{}' not found.", name)),
             },
@@ -9915,7 +10002,7 @@ impl App {
             (Some(i), _) => i,
             (None, Some(_)) => return Err("The output is already split; /unsplit closes the pane without the focus.".to_string()),
             (None, None) => {
-                let worlds: Vec<(&str, bool)> = self.worlds.iter().map(|w| (w.name.as_str(), w.connected)).collect();
+                let worlds: Vec<(&str, bool, bool)> = self.worlds.iter().map(|w| (w.name.as_str(), w.connected, w.is_activity)).collect();
                 match crate::util::split_next_world(&worlds, self.current_world_index) {
                     Some(i) => i,
                     None => return Err("There is no other world to show.".to_string()),
@@ -9934,6 +10021,22 @@ impl App {
         self.needs_output_redraw = true;
         self.needs_terminal_clear = true;
         self.broadcast_activity();
+        Ok(())
+    }
+
+    /// `/split [-n <lines>] [world]`, the console's and the SSH console's: `split_open`, and
+    /// with `-n` the top pane that many lines, kept for this console's next `/split` (user
+    /// request 2026-11-05). While split, `-n` alone only resizes.
+    pub(crate) fn split_command(&mut self, args: &str) -> Result<(), String> {
+        let (lines, world) = crate::util::parse_split_args(args)?;
+        if !(lines.is_some() && world.is_none() && self.split.is_some()) {
+            self.split_open(world.as_deref())?;
+        }
+        if lines.is_some() {
+            self.split_top_rows = lines;
+            self.needs_output_redraw = true;
+            self.needs_terminal_clear = true;
+        }
         Ok(())
     }
 
@@ -10182,6 +10285,40 @@ impl App {
         self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name))
     }
 
+    /// The Activity world's index, when this Clay has one.
+    pub(crate) fn activity_world(&self) -> Option<usize> {
+        self.worlds.iter().position(|w| w.is_activity)
+    }
+
+    /// A world named in `/world <name>` or `/split <name>`: by name or reader name (any
+    /// case), else `act` for the Activity world - a real world of either name wins.
+    pub(crate) fn find_world_typed(&self, name: &str) -> Option<usize> {
+        self.find_world_index(name)
+            .or_else(|| if crate::util::is_activity_alias(name) { self.activity_world() } else { None })
+    }
+
+    /// Start-up: the Activity world, after every other world (so a cold start never opens on
+    /// it). None in multiuser, and none while a real world is named Activity.
+    pub(crate) fn ensure_activity_world(&mut self) {
+        if self.multiuser_mode || self.activity_world().is_some() || self.find_world(crate::util::ACTIVITY_WORLD_NAME).is_some() {
+            return;
+        }
+        let mut world = World::new(crate::util::ACTIVITY_WORLD_NAME);
+        world.is_activity = true;
+        self.worlds.push(world);
+    }
+
+    /// `name` belongs to the Activity world, so no other world may take it.
+    pub(crate) fn reserved_world_name(&self, name: &str) -> bool {
+        self.activity_world().is_some() && name.trim().eq_ignore_ascii_case(crate::util::ACTIVITY_WORLD_NAME)
+    }
+
+    /// The line a command acting on a world gets for the Activity world, which has no
+    /// settings, connection or notes of its own; `None` for any other world.
+    pub(crate) fn activity_refusal(&self, idx: usize, what: &str) -> Option<String> {
+        self.worlds.get(idx).filter(|w| w.is_activity).map(|_| format!("The Activity world can't be {}.", what))
+    }
+
     fn find_or_create_world(&mut self, name: &str) -> usize {
         if let Some(idx) = self.find_world(name) {
             idx
@@ -10197,12 +10334,20 @@ impl App {
     /// Calculate the next world index from a given starting point (without switching),
     /// never landing on `exclude` (a split's other pane).
     fn calculate_next_world_from(&self, from_index: usize, exclude: &[usize]) -> Option<usize> {
-        crate::util::calculate_world_switch(&self.world_switch_info(), from_index, self.settings.world_switch_mode, crate::util::SwitchDirection::Next, exclude)
+        crate::util::calculate_world_switch(&self.world_switch_info(), from_index, self.settings.world_switch_mode, crate::util::SwitchDirection::Next, &self.switch_exclude(exclude))
     }
 
     /// Calculate the previous world index from a given starting point (without switching)
     fn calculate_prev_world_from(&self, from_index: usize, exclude: &[usize]) -> Option<usize> {
-        crate::util::calculate_world_switch(&self.world_switch_info(), from_index, self.settings.world_switch_mode, crate::util::SwitchDirection::Previous, exclude)
+        crate::util::calculate_world_switch(&self.world_switch_info(), from_index, self.settings.world_switch_mode, crate::util::SwitchDirection::Previous, &self.switch_exclude(exclude))
+    }
+
+    /// `exclude` plus the Activity world, which no switch key ever reaches (it is only
+    /// named: `/world act`, `/split act`).
+    fn switch_exclude(&self, exclude: &[usize]) -> Vec<usize> {
+        let mut all = exclude.to_vec();
+        all.extend(self.activity_world());
+        all
     }
 
     /// Where Esc-w goes from `current_index` - the console's (`switch_to_oldest_pending`)
@@ -10216,6 +10361,7 @@ impl App {
     /// recent world in `history` that is connected and not the current one. None: stay.
     /// Never `exclude` (a split's other pane, already on screen).
     fn calculate_oldest_pending_world_from(&self, current_index: usize, history: &[String], exclude: &[usize]) -> Option<usize> {
+        let exclude = self.switch_exclude(exclude);
         let elsewhere = |idx: usize| idx != current_index && !exclude.contains(&idx);
         // 1) Oldest held output.
         let oldest_pending = self.worlds.iter().enumerate()
@@ -10497,7 +10643,8 @@ impl App {
     /// `WsMessage::RequestScrollback` handling — shared by master-WS and daemon (T40).
     /// Confirmed byte-identical between the two previous copies — pure duplication.
     pub(crate) fn handle_request_scrollback(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>, request_id: Option<u64>) {
-        if world_index >= self.worlds.len() {
+        // The Activity world's buffer is the console's own copy, never a client's.
+        if world_index >= self.worlds.len() || self.worlds[world_index].is_activity {
             return;
         }
         let world = &self.worlds[world_index];
@@ -10643,6 +10790,14 @@ impl App {
         /// One reply's most; a client asks for 500.
         const HISTORY_MAX: usize = 5000;
         let Some(world) = self.worlds.get(world_index) else { return };
+        if world.is_activity {
+            // The console's own copy, never a client's: there is nothing older to give.
+            self.ws_send_to_client(client_id, WsMessage::HistoryLines {
+                world_index, request_id, before_seq, archive_before,
+                lines: Vec::new(), archive: Vec::new(), done: true,
+            });
+            return;
+        }
         let count = count.clamp(1, HISTORY_MAX);
         let ts_ms = |l: &OutputLine| l.timestamp.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
         let world_name = world.name.clone();
@@ -10989,17 +11144,18 @@ impl App {
     }
 
     /// Discard the initial "fake" world if it exists and is not connected.
-    /// Called after first successful connection to a real world.
+    /// Called after first successful connection to a real world. Removed as `delete_world`
+    /// removes one, every client told: an attached GUI used to keep it in its list, every
+    /// world after it one index past the server's, and stayed on an index past the end - the
+    /// world just connected showed none of its text (found 2026-11-04).
     fn discard_initial_world(&mut self) {
         // Find index of initial world that's not connected
         if let Some(idx) = self.worlds.iter().position(|w| w.is_initial_world && !w.connected) {
             // Don't discard if it's the only world or if it's the current world
             if self.worlds.len() > 1 && idx != self.current_world_index {
                 self.worlds.remove(idx);
-                // Adjust current_world_index if needed
-                if self.current_world_index > idx {
-                    self.current_world_index -= 1;
-                }
+                self.fixup_indices_after_remove(idx);
+                self.ws_broadcast(WsMessage::WorldRemoved { world_index: idx });
             }
         }
     }
@@ -11564,6 +11720,11 @@ impl App {
     /// world, broadcasts `WorldAdded` to all clients, and tells the requesting client its new
     /// index via `WorldCreated`.
     pub(crate) fn create_world(&mut self, client_id: u64, name: &str) {
+        if self.reserved_world_name(name) {
+            let at = self.ws_client_worlds.get(&client_id).map(|v| v.world_index).unwrap_or(self.current_world_index);
+            self.ws_tell(client_id, at, &format!("{} is the Activity world's name; pick another.", crate::util::ACTIVITY_WORLD_NAME));
+            return;
+        }
         let new_world = World::new(name);
         self.worlds.push(new_world);
         let idx = self.worlds.len() - 1;
@@ -11595,6 +11756,7 @@ impl App {
             keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
             keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
             keep_alive_gag: world.settings.keep_alive_gag.clone(),
+            login_command: world.settings.login_command.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
             auto_reconnect_secs: world.settings.auto_reconnect_display(),
             has_notes: !world.settings.notes.is_empty(),
@@ -11700,6 +11862,7 @@ impl App {
             shell: None,
             // Nothing in it to own yet.
             own_new_seqs: None,
+            is_activity: world.is_activity,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
     }
@@ -11770,6 +11933,30 @@ impl App {
                 d.world -= 1;
             }
         }
+        // Each client's own world, and its connection's, move as the client's list does on
+        // `WorldRemoved` (app.js, the native core): one back past the removed world, onto
+        // the last past the end - until the client next reports its view, the server would
+        // otherwise count it as watching the world now in its old place.
+        let last = self.worlds.len().saturating_sub(1);
+        let moved = |i: usize| if i > world_index { i - 1 } else { i.min(last) };
+        for view in self.ws_client_worlds.values_mut() {
+            view.world_index = moved(view.world_index);
+        }
+        if let Some(server) = &self.ws_server {
+            server.move_client_worlds(moved);
+        }
+        // A map pane on the world removed closes; one on a later world moves with it.
+        for views in self.ws_client_map_views.values_mut() {
+            views.retain(|v| v.world_index != world_index);
+            for v in views.iter_mut().filter(|v| v.world_index > world_index) {
+                v.world_index -= 1;
+            }
+        }
+        self.ws_client_map_sent = std::mem::take(&mut self.ws_client_map_sent)
+            .into_iter()
+            .filter(|(_, w, ..)| *w != world_index)
+            .map(|(c, w, area, level)| (c, if w > world_index { w - 1 } else { w }, area, level))
+            .collect();
     }
 
     /// `WsMessage::DeleteWorld` handling — shared by master-WS and daemon (T36). Never deletes
@@ -11783,7 +11970,9 @@ impl App {
     /// unrelated to whichever world was actually deleted, so it could misattribute the
     /// message to the wrong world or even the wrong client's session.
     pub(crate) fn delete_world(&mut self, world_index: usize) {
-        if self.worlds.len() <= 1 || world_index >= self.worlds.len() {
+        // Never the last real world, and never the Activity world (made at every start).
+        let real = self.worlds.iter().filter(|w| !w.is_activity).count();
+        if real <= 1 || world_index >= self.worlds.len() || self.worlds[world_index].is_activity {
             return;
         }
         self.worlds.remove(world_index);
@@ -11836,10 +12025,15 @@ impl App {
         keep_alive_gag_enabled: Option<bool>,
         keep_alive_gag: Option<String>,
         status_panel: Option<bool>,
+        login_command: Option<String>,
     ) {
-        if world_index >= self.worlds.len() {
+        // The Activity world has no settings (every editor refuses to open it).
+        if world_index >= self.worlds.len() || self.worlds[world_index].is_activity {
             return;
         }
+        // Activity is the Activity world's name while it exists: a rename to it keeps the
+        // world's own name (`/addworld` and a new world refuse it).
+        let name = if self.reserved_world_name(&name) { self.worlds[world_index].name.clone() } else { name };
         self.worlds[world_index].name = name.clone();
         self.worlds[world_index].settings.hostname = hostname.clone();
         self.worlds[world_index].settings.port = port.clone();
@@ -11872,6 +12066,10 @@ impl App {
         }
         if let Some(gag) = keep_alive_gag {
             self.worlds[world_index].settings.keep_alive_gag = gag;
+        }
+        // None: a client from before the Login Command - leave it. Lines end in \n only.
+        if let Some(commands) = login_command {
+            self.worlds[world_index].settings.login_command = commands.replace("\r\n", "\n").replace('\r', "\n");
         }
         // None: a client from before the Status Panel switch - leave it.
         if let Some(on) = status_panel {
@@ -11958,6 +12156,7 @@ impl App {
             keep_alive_type, keep_alive_cmd, gmcp_packages,
             keep_alive_gag_enabled: self.worlds[world_index].settings.keep_alive_gag_enabled,
             keep_alive_gag: self.worlds[world_index].settings.keep_alive_gag.clone(),
+            login_command: self.worlds[world_index].settings.login_command.clone(),
             auto_reconnect_secs,
             has_notes,
             msp_enabled,
@@ -12082,7 +12281,7 @@ impl App {
         taskbar_alert: Option<bool>,
         more: websocket::SettingsAdditions,
     ) {
-        let websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel } = more;
+        let websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } = more;
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
         self.settings.temp_convert_enabled = temp_convert_enabled;
@@ -12208,6 +12407,13 @@ impl App {
             }
         }
         self.settings.icon_bar = IconBarMode::from_name(&icon_bar);
+        // One interface's own icon bar place (user request 2026-11-04); a client that knows
+        // them echoes the shared `icon_bar` back as it was sent.
+        if let Some(choice) = icon_bar_profile {
+            if valid_interface_key(&choice.key) {
+                self.settings.icon_bar_profiles.insert(choice.key, IconBarPlace::from_name(&choice.value));
+            }
+        }
         if let Some(picture_host) = picture_host {
             self.settings.picture_host = picture::PictureService::from_name(&picture_host);
         }
@@ -12287,20 +12493,44 @@ impl App {
             WsMessage::MarkWorldSeen { .. } | WsMessage::ConnectWorld { .. } |
             WsMessage::DisconnectWorld { .. } | WsMessage::RunKeyBinding { .. }
         );
-        if !is_user_action {
-            return;
+        if is_user_action {
+            self.resume_client_sessions(client_id);
         }
-        let was_paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
-        if was_paused {
-            if let Some(ref server) = self.ws_server {
-                server.set_client_paused(client_id, false);
-            }
-            if let Some(state) = self.ws_client_worlds.get_mut(&client_id) {
-                state.paused = false;
-            }
+    }
+
+    /// `ResumeSession`: the user did something at this client (a key, a click, a menu)
+    /// while it showed PAUSED. It resumes, and is told it isn't paused either way, so a
+    /// badge the server doesn't agree with goes out too.
+    pub(crate) fn ws_resume_session(&mut self, client_id: u64) {
+        if !self.resume_client_sessions(client_id) {
             self.ws_send_to_client(client_id, WsMessage::PausedState { paused: false });
+        }
+    }
+
+    /// Somebody is at this client again: every paused connection of its interface - its
+    /// other tabs and windows, which `/pause` paused with it (`same_interface`) - resumes,
+    /// each told so. Whether any was paused.
+    fn resume_client_sessions(&mut self, client_id: u64) -> bool {
+        // Both records of a pause (`ws_set_client_paused`): the view state, and the
+        // connection's own, which is all a client with no world yet has.
+        let mut paused: Vec<u64> = self.ws_client_worlds.iter()
+            .filter(|(_, v)| v.paused)
+            .map(|(&id, _)| id)
+            .chain(self.ws_server.iter().flat_map(|server| {
+                server.clients.read().unwrap().iter().filter(|(_, c)| c.paused).map(|(&id, _)| id).collect::<Vec<_>>()
+            }))
+            .filter(|&id| self.same_interface(client_id, id))
+            .collect();
+        paused.sort_unstable();
+        paused.dedup();
+        for &id in &paused {
+            self.ws_set_client_paused(id, false);
+            self.ws_send_to_client(id, WsMessage::PausedState { paused: false });
+        }
+        if !paused.is_empty() {
             self.broadcast_activity();
         }
+        !paused.is_empty()
     }
 
     /// Broadcasts a set of just-released pending lines (from `World::release_pending` /
@@ -13761,7 +13991,7 @@ impl App {
 
     /// `/pause`: `/remote --pause` on every interface but the one that typed it (`asker`,
     /// `None` = the console). The asker's other connections - a browser's other tabs, a
-    /// GUI's other windows: the same owner id - are the same interface and are left alone.
+    /// GUI's other windows (`same_interface`) - are the same interface and are left alone.
     /// Each paused one resumes as soon as it is used. The reply, for whoever asked.
     pub(crate) fn pause_other_interfaces(&mut self, asker: Option<u64>) -> String {
         let mut paused = Vec::new();
@@ -13775,7 +14005,6 @@ impl App {
                 paused.push("the console".to_string());
             }
         }
-        let own = asker.map(|id| self.display_owner_id(id));
         let mut clients: Vec<(u64, bool, String)> = match self.ws_server {
             Some(ref server) => server.clients.read().unwrap().iter()
                 .filter(|(_, c)| c.authenticated)
@@ -13785,7 +14014,7 @@ impl App {
         };
         clients.sort_by_key(|(id, ..)| *id);
         for (id, was_paused, kind) in clients {
-            if own == Some(self.display_owner_id(id)) {
+            if asker.is_some_and(|asker| self.same_interface(asker, id)) {
                 continue;
             }
             if was_paused {
@@ -14048,6 +14277,23 @@ impl App {
         self.ws_client_owner_ids.insert(client_id, id);
     }
 
+    /// Record which running program `client_id` is from (`AuthRequest.instance_id`).
+    pub(crate) fn set_client_instance(&mut self, client_id: u64, instance_id: &str) {
+        if instance_id.is_empty() {
+            self.ws_client_instance.remove(&client_id);
+        } else {
+            self.ws_client_instance.insert(client_id, instance_id.to_string());
+        }
+    }
+
+    /// Whether two connections are one interface to `/pause` and its resume: one owner id
+    /// (a browser's tabs, an app's windows) and one running program where they name it -
+    /// two GUIs on one machine share the owner id, not the program.
+    fn same_interface(&self, a: u64, b: u64) -> bool {
+        self.display_owner_id(a) == self.display_owner_id(b)
+            && self.ws_client_instance.get(&a) == self.ws_client_instance.get(&b)
+    }
+
     /// Record which interface `client_id` is (`AuthRequest.interface_key`), so it is sent
     /// speech by its own text-to-speech. Empty: an older client, which follows the
     /// console's as the one shared setting did. The GUI this Clay runs for speaks on this
@@ -14189,6 +14435,112 @@ impl App {
     /// is born viewed and is no activity for anyone.
     pub(crate) fn world_watched(&self, world_index: usize) -> bool {
         self.console_watching(world_index) || self.ws_client_viewing(world_index)
+    }
+
+    /// Whether client `id` has `world` on screen: its view's world, or one of its other
+    /// views (a split pane, the native GUI's `/window`s).
+    fn client_shows(&self, id: u64, world: usize) -> bool {
+        self.ws_client_worlds.get(&id).is_some_and(|v| v.world_index == world)
+            || self.ws_client_other_views.get(&id).is_some_and(|o| o.contains(&world))
+    }
+
+    /// The Activity world is each interface's own (user requests 2026-11-05): it holds only
+    /// what arrived while that interface showed it, and never a world that interface shows
+    /// itself. The console's copy is the world's own buffer; each client is sent its own
+    /// lines and keeps them (`copy_to_activity`). This looks at who shows it now: a client
+    /// that came to it or left it is sent a `flush` (it starts empty, and holds nothing
+    /// while it isn't there), and the console's buffer is emptied the same way. Run before
+    /// each copy, at the start of every client message (both handlers) and at every
+    /// console draw. Only the server's: an attached console mirrors its worlds.
+    pub(crate) fn note_activity_viewers(&mut self) {
+        if !self.is_master {
+            return;
+        }
+        let Some(act) = self.activity_world() else { return };
+        let console_now = self.console_tui && self.console_shows(act);
+        if console_now != self.console_showed_activity {
+            self.console_showed_activity = console_now;
+            let world = &mut self.worlds[act];
+            world.output_lines.clear();
+            world.scroll_offset = 0;
+            world.visual_line_offset = 0;
+            world.needs_redraw = true;
+            self.needs_output_redraw = true;
+        }
+        let now: std::collections::HashSet<u64> = self.ws_client_worlds.iter()
+            .filter(|(id, v)| v.disconnected_at.is_none() && self.client_shows(**id, act))
+            .map(|(id, _)| *id)
+            .collect();
+        let changed: Vec<u64> = now.symmetric_difference(&self.activity_viewers).copied().collect();
+        for id in changed {
+            self.ws_send_to_client(id, WsMessage::ServerData {
+                world_index: act,
+                data: String::new(),
+                is_viewed: true,
+                ts: 0,
+                from_server: true,
+                seq: 0,
+                end_seq: None,
+                flush: true,
+                gagged: false,
+                archive_sourced: false,
+                highlight_colors: Vec::new(),
+            });
+        }
+        self.activity_viewers = now;
+    }
+
+    /// A packet's visible lines from `world_idx`, copied into each interface's Activity
+    /// world that is on screen there, unless that interface shows `world_idx` itself: each
+    /// after its world's name (`newbg::activity_label`), its MUD tag stripped first as the
+    /// world shows it; blank lines aren't copied. The console's copy goes into the world's
+    /// buffer, never broadcast; each client is sent its own as unnumbered lines (no seq to
+    /// track or gap-fill), so nothing holds, counts, logs, archives or claims them.
+    /// Triggers, TTS, hooks and activity all ran on the original.
+    fn copy_to_activity(&mut self, world_idx: usize, lines: &[&str]) {
+        let Some(act) = self.activity_world() else { return };
+        if act == world_idx {
+            return;
+        }
+        self.note_activity_viewers();
+        // A blank or colour-only line is no activity: it would be the world's name alone.
+        let lines: Vec<&&str> = lines.iter().filter(|t| !crate::util::strip_ansi_codes(t).trim().is_empty()).collect();
+        if lines.is_empty() {
+            return;
+        }
+        let label = crate::newbg::activity_label(&self.settings.new_indicator, &self.worlds[world_idx].name);
+        let texts: Vec<String> = lines.iter().map(|t| format!("{}{}", label, crate::util::strip_mud_tag(t))).collect();
+        if self.console_showed_activity && !self.console_shows(world_idx) {
+            for text in &texts {
+                let seq = self.worlds[act].next_seq;
+                self.worlds[act].next_seq += 1;
+                let mut line = OutputLine::new(text.clone(), seq);
+                line.viewed = true;
+                self.worlds[act].push_line_respecting_pending(line, false);
+            }
+            self.needs_output_redraw = true;
+        }
+        let to: Vec<u64> = self.activity_viewers.iter().copied().filter(|&id| !self.client_shows(id, world_idx)).collect();
+        if to.is_empty() {
+            return;
+        }
+        let data = format!("{}\n", texts.join("\n"));
+        let ts = current_timestamp_secs();
+        for id in to {
+            self.ws_send_to_client(id, WsMessage::ServerData {
+                world_index: act,
+                data: data.clone(),
+                is_viewed: true,
+                ts,
+                from_server: true,
+                seq: 0,
+                end_seq: None,
+                flush: false,
+                gagged: false,
+                archive_sourced: false,
+                highlight_colors: Vec::new(),
+            });
+        }
     }
 
     pub(crate) fn ws_client_viewing(&self, world_index: usize) -> bool {
@@ -14371,6 +14723,7 @@ impl App {
             self.map_forget_client(client_id);
             self.ws_client_owner_ids.remove(&client_id);
             self.ws_client_interface.remove(&client_id);
+            self.ws_client_instance.remove(&client_id);
         }
     }
 
@@ -14702,14 +15055,7 @@ impl App {
                 }
             } else {
                 // Detection window expired — send deferred login now (one line each)
-                if let Some(login_cmd) = self.worlds[world_idx].fansi_login_pending.take() {
-                    if let Some(tx) = &self.worlds[world_idx].command_tx {
-                        for line in login_cmd.split('\n') {
-                            let _ = tx.try_send(WriteCommand::Text(line.to_string()));
-                        }
-                    }
-                }
-                self.worlds[world_idx].fansi_detect_until = None;
+                self.finish_fansi_login(world_idx);
             }
         }
 
@@ -15110,6 +15456,7 @@ impl App {
             // Text-to-speech, for each interface showing this world with its own.
             let lines: Vec<&str> = non_gagged_lines.iter().map(|(line, _)| *line).collect();
             self.speak_arrivals(world_idx, &lines);
+            self.copy_to_activity(world_idx, &lines);
         }
 
         // Keep scroll at bottom if we were already there, even when paused.
@@ -16399,6 +16746,8 @@ impl App {
         let (user, password) = login_credentials(&world.settings,
             self.tf_engine.default_world_character.as_deref(), self.tf_engine.default_world_password.as_deref());
         let prompt_num = world.prompt_count;
+        // The prompt this login's last line answers: the Login Command follows it.
+        let last_step = matches!((auto_type, prompt_num), (AutoConnectType::Prompt, 2) | (AutoConnectType::MooPrompt, 3));
 
         if !user.is_empty() && !password.is_empty() {
             let cmd_to_send = match auto_type {
@@ -16434,8 +16783,51 @@ impl App {
                     // client that was just sent it.
                     world.clear_prompt_after_send();
                     self.set_world_prompt(world_idx, String::new());
+                    if last_step {
+                        self.run_login_commands(world_idx);
+                    }
                 }
             }
+        }
+    }
+
+    /// The world's Login Command (Edit World > Options), run once Clay's auto-login has
+    /// been sent - after the connect line(s), or the answer to the login's last prompt -
+    /// and never when Clay doesn't log in (no character or password, Auto Login None,
+    /// `/worlds -l`, TF's %login off). Each command (`WorldSettings::login_commands`) runs
+    /// as an action's does: a `/` command through TF, anything else sent to the world.
+    fn run_login_commands(&mut self, world_idx: usize) {
+        let Some(world) = self.worlds.get(world_idx) else { return };
+        for cmd in world.settings.login_commands() {
+            if cmd.starts_with('/') {
+                let effects = self.run_tf_in_world(world_idx, &cmd);
+                self.apply_tf_effects_now(effects, tfrun::TfEffectCtx::for_world(world_idx, !self.console_tui));
+            } else {
+                self.send_to_world_and_mark_sent(world_idx, cmd);
+            }
+        }
+    }
+
+    /// FANSI's detection window is over (or the client response went out): send the login
+    /// it held back, then the Login Command. One method for `process_server_data` and the
+    /// event loops' timers, which each used to carry their own copy of the send.
+    fn finish_fansi_login(&mut self, world_idx: usize) {
+        let Some(world) = self.worlds.get_mut(world_idx) else { return };
+        world.fansi_detect_until = None;
+        let Some(login_cmd) = world.fansi_login_pending.take() else { return };
+        if let Some(tx) = &world.command_tx {
+            for line in login_cmd.split('\n') {
+                let _ = tx.try_send(WriteCommand::Text(line.to_string()));
+            }
+        }
+        self.run_login_commands(world_idx);
+    }
+
+    /// `finish_fansi_login` for every world whose FANSI detection window has run out.
+    pub(crate) fn finish_due_fansi_logins(&mut self, now: std::time::Instant) {
+        let due: Vec<usize> = (0..self.worlds.len()).filter(|&i| self.worlds[i].fansi_detect_until.is_some_and(|d| now >= d)).collect();
+        for world_idx in due {
+            self.finish_fansi_login(world_idx);
         }
     }
 
@@ -16595,6 +16987,7 @@ impl App {
             client_uid,
             client_version,
             interface_key,
+            instance_id,
             ..
         } = msg
         {
@@ -16637,6 +17030,7 @@ impl App {
                 // reconnect and got no replay of what it missed.
                 self.set_display_owner_id(client_id, &client_uid);
                 self.set_client_interface(client_id, &interface_key);
+                self.set_client_instance(client_id, &instance_id);
                 self.handle_ws_auth_initial_state(client_id, current_world, resume, resume_epochs);
             } else {
                 crate::http::log_remote_event("WS-KEY-REJECT", client_ip, "no matching key");
@@ -17634,6 +18028,11 @@ impl App {
             // this loop is about to scan anyway.
             world.ensure_next_seq_above_buffer();
 
+            // The Activity world's lines are the console's own, never broadcast: each client
+            // is sent its own copies (`copy_to_activity`).
+            if world.is_activity {
+                continue;
+            }
             let Some(newest) = world.output_lines.last().map(|l| l.seq) else { continue };
             // Never audit up to the newest line: a broadcast for it may be in flight right
             // now (the ledger is written at fan-out time, but a caller can push first and
@@ -17769,7 +18168,7 @@ impl App {
         // Worlds with real seqs only. `next_seq == 0` means nothing has ever been assigned
         // (a brand-new world), so there is nothing to be behind on.
         let deliverables: Vec<(usize, u64)> = self.worlds.iter().enumerate()
-            .filter(|(_, w)| w.next_seq > 0)
+            .filter(|(_, w)| w.next_seq > 0 && !w.is_activity)
             .filter_map(|(idx, w)| w.deliverable_high_seq().map(|seq| (idx, seq)))
             .collect();
         if deliverables.is_empty() {
@@ -17882,21 +18281,30 @@ impl App {
             if matches!(auto_connect_type, AutoConnectType::Connect | AutoConnectType::Lines) {
                 self.worlds[world_idx].skip_auto_login = false;
             }
+            // A connect-time style (Connect, Lines) logged in just now; a prompt style
+            // logs in at its last answer (advance_auto_login), FANSI after its detection
+            // window (finish_fansi_login), and each runs the Login Command there.
+            let mut logged_in = false;
             // FANSI worlds: always set up client detection window
             if self.worlds[world_idx].settings.encoding == Encoding::Fansi {
                 self.worlds[world_idx].fansi_detect_until = Some(std::time::Instant::now() + Duration::from_secs(2));
                 if !skip_login && !login_lines.is_empty() {
                     self.worlds[world_idx].fansi_login_pending = Some(login_lines.join("\n"));
                 }
-            } else if !skip_login {
+            } else if !skip_login && !login_lines.is_empty() {
                 for line in login_lines {
                     let _ = cmd_tx.try_send(WriteCommand::Text(line));
                 }
+                logged_in = true;
             }
             // TF's LOGIN hook: a script's own login for a world with a character - after
             // Clay's, which stands in for the library hooks TF ships for the world types.
             if !skip_login && !user.is_empty() {
                 self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Login, &world_name_for_hook, false);
+            }
+            // The world's Login Command, after Clay's login and a script's LOGIN hook.
+            if logged_in {
+                self.run_login_commands(world_idx);
             }
 
             // Broadcast connection status
@@ -18392,7 +18800,7 @@ impl App {
             }
             // WorldSwitch and WorldConnectNoLogin need proper handling
             Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
-                if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                if let Some(idx) = self.find_world_typed(name) {
                     // Switch only the requesting client's world, not the console
                     self.ws_client_view_world(client_id, idx);
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
@@ -18542,6 +18950,9 @@ impl App {
     fn handle_ws_client_msg(&mut self, client_id: u64, msg: WsMessage, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
         // Auto-resume a paused session when the user interacts (mirrors "exit more mode by acting")
         self.auto_resume_if_user_action(client_id, &msg);
+        // A view the last message moved off the Activity world empties it before this one
+        // can move a view back onto it.
+        self.note_activity_viewers();
 
         let auth_current_world = if let WsMessage::AuthRequest { ref current_world, .. } = msg {
             *current_world
@@ -18568,17 +18979,24 @@ impl App {
         } else {
             String::new()
         };
+        let auth_instance_id = if let WsMessage::AuthRequest { ref instance_id, .. } = msg {
+            instance_id.clone()
+        } else {
+            String::new()
+        };
         match msg {
             WsMessage::AuthRequest { .. } => {
                 // Record the stable ownership id BEFORE building InitialState, so the
                 // your_display_id it reports matches what any claim will stamp on lines.
                 self.set_display_owner_id(client_id, &auth_client_uid);
                 self.set_client_interface(client_id, &auth_interface_key);
+                self.set_client_instance(client_id, &auth_instance_id);
                 self.handle_ws_auth_initial_state(client_id, auth_current_world, auth_resume, auth_resume_epochs);
             }
             WsMessage::ClientVisibility { visible } => {
                 self.handle_client_visibility(client_id, visible);
             }
+            WsMessage::ResumeSession => self.ws_resume_session(client_id),
             WsMessage::SendCommand { world_index, command } => {
                 // A live shell world: a line of text (not a Clay command) is typed at the
                 // shell, so a client's ordinary input box still works. A "/..." command
@@ -18790,17 +19208,17 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                     msp_enabled, mcp_enabled, mccp2_enabled,
                     world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
-                    keep_alive_gag_enabled, keep_alive_gag, status_panel,
+                    keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -18811,7 +19229,7 @@ impl App {
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                     zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                     log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert,
-                    websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel },
+                    websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile },
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -19460,7 +19878,9 @@ impl App {
             // unrelated worlds compare equal.
             let client_holds_this_world = resume_epochs.iter()
                 .any(|&(i, epoch)| i == idx && World::seq_epoch_matches(world.seq_epoch, epoch));
-            let max_initial_lines = if client_holds_this_world {
+            // The Activity world's lines are the console's own (each client is sent its
+            // own as they arrive, `copy_to_activity`): none to send.
+            let max_initial_lines = if client_holds_this_world || world.is_activity {
                 0
             } else {
                 per_world_cap.min(budget_remaining)
@@ -19479,7 +19899,7 @@ impl App {
             // toward max_initial_lines) would still eat into what's left for other worlds.
             budget_remaining = budget_remaining.saturating_sub(visible_count);
             let pending_lines_ts: Vec<TimestampedLine> = Vec::new();
-            WorldStateMsg {
+            let mut state = WorldStateMsg {
                 index: idx,
                 name: world.name.clone(),
                 // Where the user is on the world's map (src/map), when it has one.
@@ -19514,6 +19934,7 @@ impl App {
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                     keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
                     keep_alive_gag: world.settings.keep_alive_gag.clone(),
+                    login_command: world.settings.login_command.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
                     has_notes: !world.settings.notes.is_empty(),
@@ -19578,7 +19999,16 @@ impl App {
                     .filter(|l| l.display_id == Some(your_display_id))
                     .map(|l| l.seq)
                     .collect()),
+                is_activity: world.is_activity,
+            };
+            if world.is_activity {
+                // Nothing of the console's copy, so nothing for a client to catch up on.
+                state.total_output_lines = 0;
+                state.total_visible_lines = Some(0);
+                state.next_seq = 0;
+                state.own_new_seqs = Some(Vec::new());
             }
+            state
         }).collect();
 
         let settings = self.build_global_settings_msg();
@@ -19603,6 +20033,7 @@ impl App {
             picture_upload: true,
             history_on_demand: true,
             map: true,
+            resume_session: true,
             emoji_json: crate::emoji::emoji_json(),
             emoji_categories_json: crate::emoji::emoji_categories_json(),
             tf_status: self.tf_status.iter()
@@ -20866,6 +21297,7 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) keep_alive_cmd: String,
     pub(crate) keep_alive_gag_enabled: bool,
     pub(crate) keep_alive_gag: String,
+    pub(crate) login_command: String,
     pub(crate) gmcp_packages: String,
     pub(crate) auto_reconnect_secs: String,
     pub(crate) msp_enabled: bool,
@@ -20967,7 +21399,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
-        WORLD_FIELD_KEEP_ALIVE_GAG,
+        WORLD_FIELD_KEEP_ALIVE_GAG, WORLD_FIELD_LOGIN_COMMAND,
         WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_PROMPT_WAIT_MS,
         WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_TF_TYPE,
         WORLD_FIELD_STATUS_LINE,
@@ -22757,6 +23189,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     keep_alive_cmd: state.get_text(WORLD_FIELD_KEEP_ALIVE_CMD).unwrap_or("").to_string(),
                     keep_alive_gag_enabled: popup::definitions::world_editor::keep_alive_gag_enabled(&state.definition),
                     keep_alive_gag: state.get_text(WORLD_FIELD_KEEP_ALIVE_GAG).unwrap_or("").to_string(),
+                    login_command: state.get_text(WORLD_FIELD_LOGIN_COMMAND).unwrap_or("").to_string(),
                     gmcp_packages: state.get_text(WORLD_FIELD_GMCP_PACKAGES).unwrap_or(DEFAULT_GMCP_PACKAGES).to_string(),
                     auto_reconnect_secs: state.get_text(WORLD_FIELD_AUTO_RECONNECT).unwrap_or("0").to_string(),
                     msp_enabled: state.get_bool(WORLD_FIELD_MSP_ENABLED).unwrap_or(true),
@@ -22791,6 +23224,11 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 .unwrap_or(false);
             let is_select = state.selected_field()
                 .map(|f| matches!(&f.kind, popup::FieldKind::Select { .. }))
+                .unwrap_or(false);
+            // The Login Command (three lines): Enter, Up and Down edit it as the action
+            // editor's Command field does.
+            let is_multiline = state.selected_field()
+                .map(|f| matches!(&f.kind, popup::FieldKind::MultilineText { .. }))
                 .unwrap_or(false);
 
             // Macro to update visibility when type or keep_alive changes
@@ -22846,7 +23284,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     }
                 }
                 Enter => {
-                    if state.editing {
+                    if state.editing && is_multiline {
+                        state.insert_newline();
+                    } else if state.editing {
                         // Single-line: commit and exit edit mode, staying on this field
                         state.commit_edit();
                     } else if state.is_on_button() {
@@ -22905,6 +23345,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     // Exact reverse of Tab
                     state.cycle_field_buttons_rev();
                 }
+                Up if state.editing && is_multiline => state.cursor_up(),
+                Down if state.editing && is_multiline => state.cursor_down(),
                 Up => {
                     if state.editing {
                         state.commit_edit();
@@ -22984,10 +23426,14 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 }
                 _ => {}
             }
-            // A committed KA Command shows or hides the ##rand## warning.
+            // A committed KA Command shows or hides the ##rand## warning; the Login
+            // Command's three lines follow its cursor.
             if let Some(state) = app.popup_manager.current_mut() {
                 if state.definition.id == popup::PopupId("world_editor") {
                     popup::definitions::world_editor::refresh_keep_alive_rows(&mut state.definition);
+                    if state.editing && is_multiline {
+                        state.ensure_multiline_cursor_visible();
+                    }
                 }
             }
             return NewPopupAction::None;
@@ -24117,6 +24563,7 @@ pub async fn run_app_headless(
     }
 
     app.ensure_has_world();
+    app.ensure_activity_world();
 
     // Open scrollback archive if enabled
     app.init_scrollback();
@@ -24648,12 +25095,13 @@ pub async fn run_app_headless(
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
-                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, interface_key, .. } = &*msg {
+                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, interface_key, instance_id, .. } = &*msg {
                             // The stable ownership id first, as the console master does: the
                             // InitialState's your_display_id must match what claims stamp,
                             // or a password login loses its ▶ markers on every reconnect.
                             app.set_display_owner_id(client_id, client_uid);
                             app.set_client_interface(client_id, interface_key);
+                            app.set_client_instance(client_id, instance_id);
                             app.handle_ws_auth_initial_state(client_id, *current_world, resume.clone(), resume_epochs.clone());
                             if app.web_reconnect_needed {
                                 app.web_reconnect_needed = false;
@@ -24945,21 +25393,7 @@ pub async fn run_app_headless(
                 // timer gets rearmed while a world stays dirty.
                 app.flush_dirty_stats();
                 // Check for expired FANSI detection windows
-                let now_fansi = std::time::Instant::now();
-                for world in &mut app.worlds {
-                    if let Some(deadline) = world.fansi_detect_until {
-                        if now_fansi >= deadline {
-                            if let Some(login_cmd) = world.fansi_login_pending.take() {
-                                if let Some(tx) = &world.command_tx {
-                                    for line in login_cmd.split('\n') {
-                                        let _ = tx.try_send(WriteCommand::Text(line.to_string()));
-                                    }
-                                }
-                            }
-                            world.fansi_detect_until = None;
-                        }
-                    }
-                }
+                app.finish_due_fansi_logins(std::time::Instant::now());
                 // Timed-prompt inference: promote any WorldType::MudTimedPrompt world
                 // whose parked partial has waited past prompt_wait_ms.
                 app.promote_due_timed_prompts(now);
@@ -25242,6 +25676,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
     debug_log(is_debug_enabled(), "STARTUP: Ensuring has world...");
     app.ensure_has_world();
+    app.ensure_activity_world();
     debug_log(is_debug_enabled(), &format!("STARTUP: Have {} worlds", app.worlds.len()));
 
     // Open scrollback archive if enabled
@@ -26686,21 +27121,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // timer gets rearmed while a world stays dirty.
                 app.flush_dirty_stats();
                 // Check for expired FANSI detection windows
-                let now_fansi = std::time::Instant::now();
-                for world in &mut app.worlds {
-                    if let Some(deadline) = world.fansi_detect_until {
-                        if now_fansi >= deadline {
-                            if let Some(login_cmd) = world.fansi_login_pending.take() {
-                                if let Some(tx) = &world.command_tx {
-                                    for line in login_cmd.split('\n') {
-                                        let _ = tx.try_send(WriteCommand::Text(line.to_string()));
-                                    }
-                                }
-                            }
-                            world.fansi_detect_until = None;
-                        }
-                    }
-                }
+                app.finish_due_fansi_logins(std::time::Instant::now());
                 // Timed-prompt inference: promote any WorldType::MudTimedPrompt world
                 // whose parked partial has waited past prompt_wait_ms.
                 if app.promote_due_timed_prompts(now) {

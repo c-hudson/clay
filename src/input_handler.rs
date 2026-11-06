@@ -108,6 +108,24 @@ pub(crate) fn save_editor_content(app: &mut App) -> KeyAction {
     KeyAction::None
 }
 
+/// F5's match in the middle of the output (user ruling 2026-11-05: every interface; the GUIs
+/// used to cut their output off at it), as far as the lines before and after it allow:
+/// shown whole, with half the rows to spare below it.
+fn show_search_match(app: &mut App, line_idx: usize) {
+    let height = (app.output_height as usize).max(1);
+    let divider = app.console_divider_rows();
+    let metrics = crate::rendering::RowMetrics::new(&app.settings, app.show_tags, (app.output_width as usize).max(1)).with_divider(divider);
+    let world = &mut app.worlds[app.current_world_index];
+    world.scroll_offset = line_idx;
+    world.visual_line_offset = 0;
+    let Some(at) = metrics.anchor_of(world) else { return };
+    let mut anchor = metrics.forward(world, at, height.saturating_sub(at.rows) / 2);
+    if let Some(top) = metrics.top_anchor(world, height) {
+        anchor = anchor.max(top);
+    }
+    metrics.apply_anchor(world, anchor);
+}
+
 /// The F5 Search History popup's keys, for both consoles (the remote console had none).
 pub(crate) fn handle_search_popup_key(app: &mut App, key: KeyEvent) {
     match key.code {
@@ -124,7 +142,7 @@ pub(crate) fn handle_search_popup_key(app: &mut App, key: KeyEvent) {
             // Re-update in case lines changed
             app.search_popup.update_search(&output_lines, show_tags);
             if let Some(line_idx) = app.search_popup.advance() {
-                app.current_world_mut().scroll_offset = line_idx;
+                show_search_match(app, line_idx);
                 app.needs_output_redraw = true;
             }
         }
@@ -136,7 +154,7 @@ pub(crate) fn handle_search_popup_key(app: &mut App, key: KeyEvent) {
                 let show_tags = app.show_tags;
                 app.search_popup.update_search(&output_lines, show_tags);
                 if let Some(line_idx) = app.search_popup.current_match_line() {
-                    app.current_world_mut().scroll_offset = line_idx;
+                    show_search_match(app, line_idx);
                 }
                 app.needs_output_redraw = true;
             }
@@ -148,20 +166,20 @@ pub(crate) fn handle_search_popup_key(app: &mut App, key: KeyEvent) {
                 let show_tags = app.show_tags;
                 app.search_popup.update_search(&output_lines, show_tags);
                 if let Some(line_idx) = app.search_popup.current_match_line() {
-                    app.current_world_mut().scroll_offset = line_idx;
+                    show_search_match(app, line_idx);
                 }
                 app.needs_output_redraw = true;
             }
         }
         KeyCode::Up => {
             if let Some(line_idx) = app.search_popup.advance() {
-                app.current_world_mut().scroll_offset = line_idx;
+                show_search_match(app, line_idx);
                 app.needs_output_redraw = true;
             }
         }
         KeyCode::Down => {
             if let Some(line_idx) = app.search_popup.retreat() {
-                app.current_world_mut().scroll_offset = line_idx;
+                show_search_match(app, line_idx);
                 app.needs_output_redraw = true;
             }
         }
@@ -184,7 +202,7 @@ pub(crate) fn handle_search_popup_key(app: &mut App, key: KeyEvent) {
             let show_tags = app.show_tags;
             app.search_popup.update_search(&output_lines, show_tags);
             if let Some(line_idx) = app.search_popup.current_match_line() {
-                app.current_world_mut().scroll_offset = line_idx;
+                show_search_match(app, line_idx);
             }
             app.needs_output_redraw = true;
         }
@@ -1140,6 +1158,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd;
                     app.worlds[idx].settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
                     app.worlds[idx].settings.keep_alive_gag = settings.keep_alive_gag;
+                    app.worlds[idx].settings.login_command = settings.login_command;
                     app.worlds[idx].settings.status_panel = settings.status_panel;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages;
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
@@ -1582,7 +1601,7 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) {
         let show_tags = app.show_tags;
         app.search_popup.update_search(&output_lines, show_tags);
         if let Some(line_idx) = app.search_popup.current_match_line() {
-            app.current_world_mut().scroll_offset = line_idx;
+            show_search_match(app, line_idx);
         }
         app.needs_output_redraw = true;
         return;
@@ -1668,52 +1687,11 @@ pub(crate) fn perform_completion(app: &mut App) -> bool {
         input.as_str()
     };
 
-    // Check if this is a /worlds or /world command with arguments (for world name completion)
-    let is_worlds_cmd = partial.eq_ignore_ascii_case("/worlds") || partial.eq_ignore_ascii_case("/world");
-    if is_worlds_cmd && input.contains(' ') {
-        // World name completion for /worlds and /world commands
-        let args_part = &input[input.find(' ').unwrap() + 1..];
-
-        // Parse out -e or -l flag if present
-        let (has_flag, partial_name) = if args_part.starts_with("-e ") || args_part.starts_with("-E ")
-            || args_part.starts_with("-l ") || args_part.starts_with("-L ")
-        {
-            (true, args_part[3..].trim_start())
-        } else if args_part == "-e" || args_part == "-E" || args_part == "-l" || args_part == "-L" {
-            // Just the flag with no world name yet
-            return true;
-        } else {
-            (false, args_part)
-        };
-
-        // Get matching world names
-        let partial_lower = partial_name.to_lowercase();
-        let mut world_matches: Vec<String> = app.worlds.iter()
-            .map(|w| w.name.clone())
-            .filter(|name| name.to_lowercase().starts_with(&partial_lower))
-            .collect();
-        world_matches.sort_by_key(|a| a.to_lowercase());
-
-        if !world_matches.is_empty() {
-            // Find current match index
-            let current_idx = world_matches.iter().position(|m| m.eq_ignore_ascii_case(partial_name));
-            let next_idx = match current_idx {
-                Some(idx) => (idx + 1) % world_matches.len(),
-                None => 0,
-            };
-
-            // Build the completed input
-            let completion = &world_matches[next_idx];
-            let flag_part = if has_flag {
-                if args_part.starts_with("-e") || args_part.starts_with("-E") {
-                    "-e "
-                } else {
-                    "-l "
-                }
-            } else {
-                ""
-            };
-            app.input.buffer = format!("{} {}{}", partial, flag_part, completion);
+    // A world name after /world or /worlds (crate::input::complete_world_arg, the native
+    // GUI's and app.js's rule too).
+    if let Some(text) = crate::input::complete_world_arg(&input, app.worlds.iter().map(|w| w.name.as_str())) {
+        if text != input {
+            app.input.buffer = text;
             app.input.cursor_position = app.input.buffer.len();
         }
         return true;

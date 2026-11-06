@@ -6,8 +6,8 @@ extras — see the "Differences from TinyFugue" section of
 `docs/markdown/06-tf-commands.md` and `TINYFUGUE-COMPAT.md`). Every binding
 below — including every chord — is stored in `~/.clay/keybindings.dat` and can
 be freely rebound there or from the browser-based keybind editor
-(`/keybind-editor`, when the HTTP server is enabled — see `/web`; the GUI's
-Settings opens the same editor). A change in the editor takes effect at once;
+(`/keybind-editor`, once `/web` has a port and a password — see `/help web`;
+the Settings of the web page and the GUIs open the same editor). A change in the editor takes effect at once;
 **Save** keeps it, and **Cancel** (or closing the editor without saving) drops
 every change made since it was opened or last saved and closes it. Rebind a
 key to `UNBOUND` to remove a default without picking a replacement.
@@ -207,7 +207,7 @@ the full list of changed defaults.
 |---|---|
 | `F1` | Help |
 | `F2` | Toggle MUD tag display (channel tags and timestamps) |
-| `F5` | Search command history |
+| `F5` | Search the output: the newest match is shown in the middle of the output, Enter steps to older ones, and you can scroll back and forward from it. F5 or Esc closes the search and goes back to the newest lines |
 | `F8` | Toggle action-pattern highlighting |
 | `F9` | Toggle GMCP media audio |
 | `Esc-e` | Open the emoji picker |

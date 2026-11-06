@@ -8,8 +8,8 @@
 //!   interfaces block the same saves with the same words.
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative,
+    AnimationExt, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
+    Render, SharedString, SpringAnimation, SpringConfig, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::select::SelectEvent;
@@ -231,7 +231,15 @@ impl SettingsView {
                 window,
                 cx,
             ),
-            icon_bar: Pick::new(&[("none", "None"), ("app_tablet", "App/Tablet"), ("all", "All")], &edit.icon_bar, window, cx),
+            // This window's own icon bar place (user request 2026-11-04); a server before
+            // the per-interface split keeps only which interfaces show it, so only Top and
+            // None are offered there.
+            icon_bar: Pick::new(
+                if edit.icon_bar_profiles.is_some() { crate::TabsMode::OPTIONS } else { &[("top", "Top"), ("none", "None")] },
+                &edit.icon_bar_for(crate::font_profile::native_key(), true),
+                window,
+                cx,
+            ),
             picture_host: Pick::new(crate::picture::PictureService::OPTIONS, &edit.picture_host, window, cx),
             separator: Pick::new(crate::SeparatorStyle::OPTIONS, if edit.separator_style.is_empty() { "web" } else { edit.separator_style.as_str() }, window, cx),
             new_indicator,
@@ -424,7 +432,7 @@ impl SettingsView {
         let tts = crate::tts::TtsProfile::from_names(&self.tts.value(cx), &self.speak.value(cx), &self.text(&self.fields.voice, cx));
         s.set_tts_for(crate::font_profile::native_key(), &tts);
         s.set_tabs_for(crate::font_profile::native_key(), &self.tabs.value(cx));
-        s.icon_bar = self.icon_bar.value(cx);
+        s.set_icon_bar_for(crate::font_profile::native_key(), &self.icon_bar.value(cx), true);
         s.picture_host = self.picture_host.value(cx);
         s.separator_style = self.separator.value(cx);
         // The style by name, and the bool an older server reads (`settings_update`).
@@ -698,12 +706,39 @@ impl SettingsView {
         let advanced = self.advanced;
         // The weight by name, among the weights this font comes in (the stepper walks them).
         let weight_label = crate::font_profile::weight_label(e.web_font_weight, &crate::native_gui::ui::fonts::weights_of(&e.font_name));
-        // Whose fonts these are, then three cards: the family, the sizes, the advanced spacing.
+        // Sample Text: the font as edited, as the output draws it (Input Ht between the
+        // two lines), on the output's colours.
+        let mut sample_fonts = k.fonts.clone();
+        sample_fonts.set_user(&e.font_name, e.web_font_weight);
+        let sample_font = sample_fonts.font(sample_fonts.base(), false, false);
+        let (letter, word) = (e.web_font_letter_spacing, e.web_font_word_spacing);
+        let sample = div()
+            .bg(k.field_bg)
+            .text_color(t.fg)
+            .border_1()
+            .border_color(t.border)
+            .rounded(px(6.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .overflow_hidden()
+            .font(sample_font)
+            .text_size(px(e.web_font_size_desktop.round().clamp(7.0, 20.0)))
+            .line_height(relative(e.web_font_line_height.clamp(0.5, 3.0)))
+            .child(sample_line("How now, brown cow.", letter, word))
+            .child(sample_line("The quick brown fox jumps over the lazy dog.", letter, word));
+        // Four cards: the sample, the family, the sizes, the advanced spacing.
         div()
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .child(k.note(format!("Fonts for {} (each program keeps its own on each OS).", crate::font_profile::label(crate::font_profile::native_key()))).text_size(px(12.0)))
+            .child(
+                k.card()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(div().text_size(px(12.0)).text_color(t.fg2).child("Sample Text"))
+                    .child(sample),
+            )
             .child(
                 k.card()
                     .flex()
@@ -742,19 +777,47 @@ impl SettingsView {
                                 cx.notify();
                             })),
                     )
+                    // The spacing rows unfold while Advanced is ticked: a spring on the
+                    // height, so a click part-way turns it back, and a window opened with
+                    // Advanced ticked starts unfolded.
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .gap(px(6.0))
-                            .when(!advanced, |d| d.opacity(0.35))
+                            .overflow_hidden()
                             .child(row(k, "Input Ht", self.stepper(k, "font-lineheight", num(e.web_font_line_height), |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, -0.1, (0.5, 3.0)) }, |v| if v.advanced { v.edit.web_font_line_height = step(v.edit.web_font_line_height, 0.1, (0.5, 3.0)) }, cx)))
                             .child(row(k, "Letter", self.stepper(k, "font-letter", num(e.web_font_letter_spacing), |v| if v.advanced { v.edit.web_font_letter_spacing = step(v.edit.web_font_letter_spacing, -0.5, (-5.0, 10.0)) }, |v| if v.advanced { v.edit.web_font_letter_spacing = step(v.edit.web_font_letter_spacing, 0.5, (-5.0, 10.0)) }, cx)))
-                            .child(row(k, "Word", self.stepper(k, "font-word", num(e.web_font_word_spacing), |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, -0.5, (-5.0, 20.0)) }, |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, 0.5, (-5.0, 20.0)) }, cx))),
+                            .child(row(k, "Word", self.stepper(k, "font-word", num(e.web_font_word_spacing), |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, -0.5, (-5.0, 20.0)) }, |v| if v.advanced { v.edit.web_font_word_spacing = step(v.edit.web_font_word_spacing, 0.5, (-5.0, 20.0)) }, cx)))
+                            .with_spring("font-advanced-fold", SpringAnimation::new(ADVANCED_FOLD).to(if advanced { 1.0 } else { 0.0 }), |d, v| {
+                                let v = v.clamp(0.0, 1.0);
+                                if v < 0.01 { d.hidden() } else { d.max_h(px(v * ADVANCED_ROWS_H)).opacity(v) }
+                            }),
                     ),
             )
             .into_any_element()
     }
+}
+
+/// How the Font tab's Advanced rows unfold: critically damped (no bounce), settled in
+/// about a fifth of a second.
+const ADVANCED_FOLD: SpringConfig = SpringConfig::new(600.0, 49.0, 1.0);
+/// A height above the three Advanced rows', which the unfolding grows to.
+const ADVANCED_ROWS_H: f32 = 110.0;
+
+/// One Sample Text line, cut off where it no longer fits. GPUI's text has no letter or
+/// word spacing, so with either set the line is one element per character, spaced as
+/// the output spaces its glyphs (output.rs): letter spacing after each cluster, word
+/// spacing after each space.
+fn sample_line(text: &'static str, letter: f32, word: f32) -> gpui::Div {
+    use unicode_segmentation::UnicodeSegmentation;
+    if letter == 0.0 && word == 0.0 {
+        return div().whitespace_nowrap().overflow_hidden().child(text);
+    }
+    div().flex().overflow_hidden().children(text.graphemes(true).map(|g| {
+        let space = g == " ";
+        div().flex_shrink_0().mr(px(letter + if space { word } else { 0.0 })).child(if space { "\u{a0}" } else { g })
+    }))
 }
 
 /// `.setting-row`: a right-aligned label and its control.

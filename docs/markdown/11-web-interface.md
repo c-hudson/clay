@@ -72,8 +72,8 @@ On a phone or tablet, a row of buttons sits under the separator bar:
 - On a phone, the hamburger menu (☰) and the font slider move into this row too
 
 **The Android app with a keyboard and a mouse** looks like the desktop GUI: the button
-row goes, the separator bar carries the menu and the font slider, the icon bar (with
-Icon Bar set to App/Tablet) and the output's scroll bar appear, and the menu offers the
+row goes, the separator bar carries the menu and the font slider, the icon bar (until
+the app has an Icon Bar place of its own) and the output's scroll bar appear, and the menu offers the
 Emoji Picker again. Unplug either one and the phone or tablet layout comes back. Your
 phone or tablet font size and input height stay as they were, and dialogs keep the
 layout that fits the screen.
@@ -81,16 +81,20 @@ layout that fits the screen.
 Settings → Font sets the font, its size per device type and its weight. **Weight** steps
 through the weights the chosen font comes in, by name: the JetBrains Mono that comes with
 Clay goes from Thin to Extra Bold, while most system fonts, `monospace` among them, have
-only Normal and Bold. Under **Advanced**: **Input Ht** is the line height of the input line (the output's rows stay
+only Normal and Bold. The **Sample Text** card at the top shows two lines in the font as
+you edit it, at the size the device you are on uses, so you can see a change before you
+save it; a line too long for the window is cut off. Tick **Advanced** to unfold its
+settings: **Input Ht** is the line height of the input line (the output's rows stay
 at 1.0, so ANSI and box-drawing art joins up), **Letter** and **Word** add spacing to the
-output and the input. The desktop GUI's Settings window has the same controls.
+output and the input. Unticking it folds them away again; what they are set to still
+applies. The desktop GUI's Settings window has the same controls.
 
 Each program keeps its own fonts on each operating system: the native GUI, the WebView
 GUI, a web browser and the Android app, on Windows, macOS, Linux, Android and iOS. A font
 that suits the GUI on Windows can differ from the one it uses on Linux, and a browser on
-the same machine keeps its own again. Settings → Font says whose fonts you are editing.
-Until you change a font, size or spacing in one of them (the slider counts), it uses the
-fonts every interface shared before; from then on it has its own. The phone, tablet and
+the same machine keeps its own again. Settings → Font edits the fonts of the program and OS
+you are in. Until you change a font, size or spacing in one of them (the slider counts), it
+uses the fonts every interface shared before; from then on it has its own. The phone, tablet and
 desktop sizes are kept inside each one as before. A Clay server from before this change
 keeps one set for everything, as it always did.
 

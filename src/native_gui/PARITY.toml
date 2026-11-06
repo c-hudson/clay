@@ -1498,6 +1498,14 @@ feature = "wire PausedState"
 note = "handled: see msg:PausedState"
 
 [[item]]
+id = "wire:ResumeSession"
+section = "wire"
+phase = 0
+status = "done"
+feature = "wire ResumeSession"
+note = "a key, mouse press, wheel turn or menu choice in any window while PAUSED shows (ui/activity.rs, core `user_active`), once per pause, only when InitialState.resume_session"
+
+[[item]]
 id = "wire:ShowTagsChanged"
 section = "wire"
 phase = 1
@@ -2632,7 +2640,7 @@ id = "ui:status.iconbar"
 section = "status"
 phase = 2
 status = "done"
-feature = "icon bar: Worlds/Actions/Settings/Find/Tags tiles (icon_bar setting)"
+feature = "icon bar: Worlds/Actions/Settings/Find/Tags tiles (Icon Bar: top/bottom row, left/right column, per interface)"
 note = "tiles open phase-4 windows as they land; Tags shows on while tags are"
 
 [[item]]
@@ -2916,6 +2924,14 @@ feature = "Custom keepalive: the ##rand## warning under Keep Alive Cmd while it 
 note = "app.js updateKeepAliveWarning; telnet.rs KEEP_ALIVE_RAND_WARNING"
 
 [[item]]
+id = "ui:dialog.world_editor.login_command"
+section = "dialogs"
+phase = 4
+status = "done"
+feature = "the Login Command card in Options (MUD worlds): three lines, run after Clay's auto-login, one command per line and ; between commands"
+note = "app.js #world-edit-login-command-field; main.rs App::run_login_commands"
+
+[[item]]
 id = "ui:output.keep_alive_reply_under_f2"
 section = "output"
 phase = 4
@@ -2952,8 +2968,8 @@ id = "ui:settings.font_preview"
 section = "dialogs"
 phase = 4
 status = "done"
-feature = "the Font tab previews family, size, weight and spacing on the main window; Cancel or closing puts the saved font back; Save keeps it until the server answers"
-note = "app.js previewFontEdit"
+feature = "the Font tab previews family, size, weight and spacing on the main window and in its Sample Text card; Advanced folds its rows away until ticked; Cancel or closing puts the saved font back; Save keeps it until the server answers"
+note = "app.js previewFontEdit, updateFontSample"
 
 [[item]]
 id = "ui:settings.separator_style"

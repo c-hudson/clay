@@ -194,10 +194,39 @@ impl ClayView {
         }
         self.link.followers.retain(|(f, _)| f.upgrade().is_some());
         let (worlds, dims) = self.other_views_now(cx);
+        self.drop_shown_from_activity(&worlds, cx);
         let fx = self.session.set_other_views(worlds, dims);
         if !fx.is_empty() {
             self.after(fx, cx);
         }
+    }
+
+    /// The worlds on screen in this program's windows (`others`, plus this window's own)
+    /// leave every window's Activity world once they come on screen: their lines are there
+    /// to read already.
+    fn drop_shown_from_activity(&mut self, others: &[usize], cx: &mut Context<Self>) {
+        let core = &self.session.core;
+        let mut shown: Vec<String> = std::iter::once(core.current).chain(others.iter().copied())
+            .filter_map(|i| core.worlds.get(i))
+            .filter(|w| !w.is_activity)
+            .map(|w| w.name.clone())
+            .collect();
+        shown.sort();
+        shown.dedup();
+        if shown == self.activity_shown {
+            return;
+        }
+        if self.session.core.drop_activity_from(&shown) {
+            cx.notify();
+        }
+        for f in self.link.followers.iter().filter_map(|(f, _)| f.upgrade()) {
+            f.update(cx, |v, cx| {
+                if v.session.core.drop_activity_from(&shown) {
+                    cx.notify();
+                }
+            });
+        }
+        self.activity_shown = shown;
     }
 
     /// The worlds on screen besides this window's focused one - its split's other pane

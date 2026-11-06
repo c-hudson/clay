@@ -87,11 +87,6 @@ impl ClayView {
         self.input_touched(cx);
     }
 
-    /// `--theme-prompt`, which the web client's help links use.
-    pub(super) fn link_color(&self) -> gpui::Hsla {
-        super::output::hsla([self.theme.prompt.r, self.theme.prompt.g, self.theme.prompt.b])
-    }
-
     /// Run `f` on the next frame, with the window.
     pub(super) fn later(&mut self, f: impl FnOnce(&mut ClayView, &mut Window, &mut Context<ClayView>) + 'static, cx: &mut Context<Self>) {
         self.surf.later.push(Box::new(f));
@@ -205,6 +200,12 @@ impl ClayView {
     /// The Worlds window: the selector, or a world's editor.
     pub(super) fn open_worlds(&mut self, show: super::windows::worlds::Show, cx: &mut Context<Self>) {
         use super::windows::{Kind as Win, worlds::WorldsView};
+        if let super::windows::worlds::Show::Edit(i) = show {
+            if self.session.core.worlds.get(i).is_some_and(|w| w.is_activity) {
+                self.client_line("The Activity world can't be edited.", cx);
+                return;
+            }
+        }
         let again = show.clone();
         self.open_window(
             Win::Worlds,
@@ -219,7 +220,7 @@ impl ClayView {
     /// a name (or `-l name`) switches to that world, which the server has connected.
     pub(super) fn worlds_command(&mut self, args: &[&str], cx: &mut Context<Self>) {
         use super::windows::worlds::Show;
-        let find = |v: &Self, name: &str| v.session.core.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name));
+        let find = |v: &Self, name: &str| crate::util::find_world_typed(v.session.core.worlds.iter().map(|w| (w.name.as_str(), w.is_activity)), name);
         match args {
             [] => self.open_worlds(Show::Selector, cx),
             ["-e"] => {
@@ -516,7 +517,7 @@ impl ClayView {
     pub(super) fn stash_input_for_relaunch(&self) {
         let key = saved_input_key(&self.session.target.key());
         let split = self.split_to_keep();
-        if self.editor.text.is_empty() && self.input.sent.is_empty() && split.is_none() {
+        if self.editor.text.is_empty() && self.input.sent.is_empty() && split.is_none() && self.split_size.top_lines.is_none() {
             crate::native_gui::core::store::set_pref(&key, "");
             return;
         }
@@ -527,6 +528,7 @@ impl ClayView {
             sent: self.input.sent.iter().map(|e| e.text.clone()).collect(),
             sent_rows: self.input.sent_rows,
             split,
+            split_top_lines: self.split_size.top_lines,
         };
         if let Ok(json) = serde_json::to_string(&saved) {
             crate::native_gui::core::store::set_pref(&key, &json);
@@ -551,6 +553,7 @@ impl ClayView {
         if let Some(split) = saved.split {
             self.split_restore(split);
         }
+        self.split_size.top_lines = saved.split_top_lines;
     }
 
     /// `/server ...` (app.js sendCommand's remote-GUI branch): attach to another Clay,
@@ -847,6 +850,10 @@ impl ClayView {
     pub(super) fn open_notes_for(&mut self, index: usize, cx: &mut Context<Self>) {
         use super::windows::{Kind as Win, notes::NoteView};
         let Some(name) = self.session.core.worlds.get(index).map(|w| w.name.clone()) else { return };
+        if self.session.core.worlds[index].is_activity {
+            self.client_line("The Activity world can't be given notes.", cx);
+            return;
+        }
         self.open_window(Win::Notes(index), move |main, window, cx| cx.new(|cx| NoteView::notes(main, index, &name, window, cx)), |_, _, _| {}, cx);
     }
 
@@ -1153,6 +1160,9 @@ struct SavedInput {
     /// The split (`/split`), kept across the relaunch as every interface keeps it.
     #[serde(default)]
     split: Option<super::split::KeptSplit>,
+    /// Its size (`/split -n`, a drag), kept for the next `/split` whether split or not.
+    #[serde(default)]
+    split_top_lines: Option<usize>,
 }
 
 /// How long a stash is taken back: a relaunch is seconds, a later start is not.
@@ -1186,14 +1196,16 @@ mod relaunch_tests {
     #[test]
     fn a_stashed_input_is_taken_back_only_while_fresh() {
         let split = Some(super::super::split::KeptSplit { world: "Rome".into(), on_top: true });
-        let saved = SavedInput { at: 1000, text: "half typed".into(), cursor: 4, sent: vec!["look".into(), String::new()], sent_rows: 2, split: split.clone() };
+        let saved = SavedInput { at: 1000, text: "half typed".into(), cursor: 4, sent: vec!["look".into(), String::new()], sent_rows: 2, split: split.clone(), split_top_lines: Some(9) };
         let json = serde_json::to_string(&saved).unwrap();
         let back = saved_input_from(&json, 1000 + RELAUNCH_INPUT_SECS).expect("fresh");
         assert_eq!((back.text.as_str(), back.cursor, back.sent.len(), back.sent_rows), ("half typed", 4, 2, 2));
         assert_eq!(back.split, split, "the split comes back");
+        assert_eq!(back.split_top_lines, Some(9), "and its size");
         // A stash from before splits had none.
         let older = r#"{"at":1000,"text":"x","cursor":1,"sent":[],"sent_rows":0}"#;
         assert_eq!(saved_input_from(older, 1000).expect("parses").split, None);
+        assert_eq!(saved_input_from(older, 1000).expect("parses").split_top_lines, None);
         assert!(saved_input_from(&json, 1000 + RELAUNCH_INPUT_SECS + 1).is_none(), "stale");
         assert!(saved_input_from("not json", 1000).is_none());
     }

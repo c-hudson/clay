@@ -1,8 +1,9 @@
 //! F4 Find and F5 Search History, as the web client has them: small popups at the top
 //! right. Find shows only the lines containing its text (`*` and `?` are wildcards);
-//! Esc-L (`toggle_limit`) closes it and brings it back with the last text. Search cuts
-//! the output off at a matching line so it sits at the bottom, Enter stepping to older
-//! matches.
+//! Esc-L (`toggle_limit`) closes it and brings it back with the last text. Search shows
+//! a matching line in the middle of the output, Enter stepping to older matches; the lines
+//! before and after it can be scrolled to (user ruling 2026-11-05: it used to cut the
+//! output off at the match, so nothing after it could be).
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -94,7 +95,7 @@ impl FindState {
                 InputEvent::PressEnter { .. } => this.advance_search(),
                 _ => return,
             }
-            this.scroll.borrow_mut().follow_bottom();
+            this.show_search_match();
             cx.notify();
         })
         .detach();
@@ -116,8 +117,8 @@ impl FindState {
         (self.filter_open && !self.filter_text.is_empty()).then_some(self.filter_text.as_str())
     }
 
-    /// The line the search shows at the bottom, if any.
-    pub fn search_cut(&self) -> Option<u64> {
+    /// The line the search shows, if any.
+    pub fn search_match(&self) -> Option<u64> {
         if !self.search_open {
             return None;
         }
@@ -146,6 +147,14 @@ pub fn search_matches(world: &World, text: &str) -> Vec<u64> {
 }
 
 impl ClayView {
+    /// The search's match in the middle of the output; no match, the newest lines.
+    fn show_search_match(&mut self) {
+        match self.find.search_match() {
+            Some(id) => self.scroll.borrow_mut().center_on(id),
+            None => self.scroll.borrow_mut().follow_bottom(),
+        }
+    }
+
     fn compute_search(&mut self) {
         let matches = self.session.core.current_world().map(|w| search_matches(w, &self.find.search_text)).unwrap_or_default();
         self.find.pos = matches.len().checked_sub(1);
@@ -274,11 +283,12 @@ impl ClayView {
         if search {
             self.find.search_text = value;
             self.compute_search();
+            self.show_search_match();
         } else {
             self.find.filter_text = value.clone();
             self.find.last_filter = value;
+            self.scroll.borrow_mut().follow_bottom();
         }
-        self.scroll.borrow_mut().follow_bottom();
         cx.notify();
         true
     }

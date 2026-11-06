@@ -95,6 +95,8 @@ impl PopupWindow {
         subs.push(cx.observe_window_appearance(window, |_, _window, cx| cx.notify()));
         // Focus on any Clay window stops Taskbar Alert's flash.
         super::taskbar::watch(window, cx);
+        // Used, it resumes a paused session as the main window does.
+        subs.push(super::activity::watch_keys(main.clone(), window, cx));
         let content_focus = content.focus_handle(cx);
         window.focus(&content_focus, cx);
         Self { main, content: content.into(), content_focus, stack: Default::default(), opacity: Default::default(), titlebar: Default::default(), _subs: subs }
@@ -127,7 +129,13 @@ impl Render for PopupWindow {
         let alpha = self.main.upgrade().map_or(1.0, |m| m.read(cx).transparency());
         self.opacity.apply(window, alpha);
         self.titlebar.apply(window, !light);
-        div().size_full().relative().bg(bg).child(self.content.clone()).children(self.stack.render())
+        div()
+            .size_full()
+            .relative()
+            .bg(bg)
+            .child(super::activity::watch_mouse(self.main.clone()))
+            .child(self.content.clone())
+            .children(self.stack.render())
     }
 }
 

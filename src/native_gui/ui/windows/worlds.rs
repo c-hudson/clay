@@ -13,7 +13,7 @@ use gpui::{
 };
 use gpui_component::IndexPath;
 use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{InputEvent, InputState};
+use gpui_component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 
 use super::MainEvent;
@@ -27,13 +27,14 @@ use crate::websocket::{ChatDirectoryMsg, ChatPickItem, ChatSettingsUpdate, WsMes
 
 
 /// The worlds the selector shows: by name, hostname or user, and only connected ones
-/// when the toggle is on (app.js `getFilteredWorldIndices`).
+/// when the toggle is on (app.js `getFilteredWorldIndices`). Never the Activity world,
+/// which is only named (`/world act`).
 pub fn shown(worlds: &[World], filter: &str, only_connected: bool) -> Vec<usize> {
     let f = filter.to_lowercase();
     (0..worlds.len())
         .filter(|&i| {
             let w = &worlds[i];
-            if only_connected && !w.connected {
+            if w.is_activity || (only_connected && !w.connected) {
                 return false;
             }
             let s = w.settings.as_ref();
@@ -98,6 +99,8 @@ struct Editor {
     status_panel: Option<bool>,
     /// The Gag Text checkbox.
     ka_gag: bool,
+    /// The Login Command card's three lines (`WorldSettings::login_command`).
+    login_command: Entity<TextareaState>,
     chat: ChatPicker,
 }
 
@@ -260,6 +263,10 @@ impl WorldsView {
             mccp2: s.mccp2_enabled,
             status_panel: s.status_panel,
             ka_gag: s.keep_alive_gag_enabled,
+            login_command: {
+                let c = s.login_command.clone();
+                cx.new(|cx| TextareaState::new(window, cx).rows(3).default_value(c).placeholder("say hello;say goodbye\nlook"))
+            },
             chat: ChatPicker::default(),
             fields,
         };
@@ -337,6 +344,7 @@ impl WorldsView {
             discord_dm_user: t("discord_dm_user"),
             keep_alive_gag_enabled: Some(ed.ka_gag),
             keep_alive_gag: Some(t("keep_alive_gag")),
+            login_command: Some(ed.login_command.read(cx).value().to_string()),
             status_panel: ed.status_panel,
             chat: Some(ChatSettingsUpdate {
                 discord_guild: t("discord_guild").trim().to_string(),
@@ -787,6 +795,25 @@ impl WorldsView {
             }
         }
         options = options.child(toggles);
+        // The Login Command: a card of its own, three lines tall (app.js
+        // #world-edit-login-command-field).
+        if is_mud {
+            options = options.child(
+                div()
+                    .mt(px(6.0))
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .border_1()
+                    .border_color(t.border_subtle)
+                    .rounded(px(6.0))
+                    .child(div().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(t.fg2).child("Login Command"))
+                    .child(Textarea::new(&ed.login_command).w_full().bg(k.field_bg).text_color(t.fg).font_family(mono.clone()).text_size(px(13.0)))
+                    .child(div().text_size(px(11.0)).text_color(t.muted).child("Run after Clay logs in: one command per line, ; between commands.")),
+            );
+        }
         let section_title = |s: &'static str| div().text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(t.accent).pt(px(6.0)).pb(px(2.0)).child(s.to_uppercase());
         let body: gpui::AnyElement = if wide {
             div()

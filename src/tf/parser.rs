@@ -1557,7 +1557,7 @@ impl WorldRow {
 
 /// The worlds, in the order they were defined, then the DEFAULT world if it has anything.
 fn world_rows(engine: &TfEngine) -> Vec<WorldRow> {
-    let mut rows: Vec<WorldRow> = engine.world_info_cache.iter().map(|w| WorldRow {
+    let mut rows: Vec<WorldRow> = engine.world_info_cache.iter().filter(|w| !w.is_activity).map(|w| WorldRow {
         name: w.name.clone(),
         tf_type: w.tf_type.clone(),
         host: w.host.clone(),
@@ -1935,36 +1935,7 @@ fn cmd_help(engine: &TfEngine, args: &str) -> TfCommandResult {
     let topic = args.trim().trim_start_matches('/').to_lowercase();
 
     if topic.is_empty() {
-        let help_text = r#"Getting Started:
-  /setup               - Open settings (server, colors, etc.)
-  /world               - Setup connection(s) to a world(s)
-  /world <name>        - Connect/switch to a world
-  /dc                  - Disconnect from current world
-  /connections         - Show all connected worlds
-  /quit                - Exit Clay
-
-Keys:
-  PgUp / PgDn          - Scroll through output history
-  Esc-Left / Esc-Right - Switch connected worlds
-  Ctrl-P / Ctrl-N      - Command history
-  Tab                  - Release world output when paused.
-
-Basic Configuration:
-  /setup               - General settings popup
-  /web                 - Web interface / remote access settings
-  /actions             - Manage triggers and actions
-
-For more help:
-  /help commands       - List of commands
-  /help functions      - List of functions
-  /help <command>      - Help on a specific command (e.g. /help def)
-  /help substitution   - %var, %{var-default}, %*, %-N, %L, $[..], $(..)
-  /help keys           - All keyboard bindings
-  /help web            - Websocket help (remote interfaces)
-
-Keybind editor: open http://localhost:<port>/keybind-editor in a browser
-(the port from /web; HTTP must be enabled there) - not a Clay command."#;
-        TfCommandResult::Success(Some(help_text.to_string()))
+        TfCommandResult::Success(Some(crate::popup::definitions::help::HELP_LINES.join("\n")))
     } else {
         match topic.as_str() {
             "set" => TfCommandResult::Success(Some(
@@ -1990,9 +1961,6 @@ Keybind editor: open http://localhost:<port>/keybind-editor in a browser
             )),
             "send" => TfCommandResult::Success(Some(
                 "/send [-W] [-T<type>] [-w[<world>]] [-n] [-h] text\n\nSend text to a world (or several), bypassing macro/alias expansion.\n\nOptions:\n  -W          Send to every connected world\n  -T<type>    Send to every connected world whose type matches <type>\n  -w<world>   Send to <world> (attached, no space; bare -w means the current world)\n  -n          Do not append an end-of-line marker\n  -h          Fire the SEND hook first (by default /send does not run hooks)\n\nExamples:\n  /send say Hello everyone!\n  /send -wOtherMUD look\n  /send -W quit\n  /send -Tmud who".to_string()
-            )),
-            "say" => TfCommandResult::Success(Some(
-                "/say <text>\n\nSpeak text aloud via text-to-speech.\nConsole/GUI: the TTS mode set in /setup - Local (espeak, say, PowerShell), Kokoro (the neural voice from /tts install) or Edge (cloud).\nWeb/Android: uses the browser's Web Speech API.\n\nExample: /say Hello world\n\nEnable automatic TTS for MUD output in Setup > TTS.".to_string()
             )),
             "def" => TfCommandResult::Success(Some(
                 r#"/def [options] name = body
@@ -2278,7 +2246,9 @@ Function form:
 Options:
   -x    Use SSL/TLS for connections
   -e    Echo sent text (ignored)
-  -Ttype World type (ignored, defaults to MUD)
+  -Ttype The world's TF type, saved with it. It picks the auto-login
+         style, and lp, diku, aber and telnet make a MUD world Timed
+         Prompt (lpp and tiny make it a plain MUD world)
   -p    No proxy (ignored)
   -s<srchost>  Local bind address for the connection (accepted, not
                persisted - Clay has no per-world bind-address setting)
@@ -2378,11 +2348,10 @@ Info Functions:
   nlog()                   - Number of worlds being logged
   getpid()                 - Process ID
   gethostname()            - Local host name
-  systype()                - System type ("unix")
+  systype()                - System type ("unix"; "cygwin32" on Windows)
   filename(path)           - Expand ~ in path
   features([name])         - List optional features, or test one by name
-  status_fields([i])       - Fields of status row i (always "" - Clay has
-                             no configurable status bar)
+  status_fields([i])       - Fields of status row i (/help status)
 
 Macro Functions:
   ismacro(name)            - Check if macro exists
@@ -2430,12 +2399,12 @@ Usage: $[function(args)] or in /expr//test"#.to_string()
             "commands" | "cmds" => TfCommandResult::Success(Some(
                 r#"Commands (/help <command> for details)
 Clay:
-  /setup  /web  /actions  /menu  /connections
+  /setup  /web  /reach  /actions  /menu  /connections
   /world  /server  /disconnect  /dc  /addworld  /unworld
   /reload  /version  /quit  /remote  /pause  /ban  /unban
   /flush  /dump  /note  /tag  /notify  /import  /window
   /font  /update  /dict  /urban  /translate  /url  /testmusic
-  /mssp  /msdp  /stats  /chat  /split  /unsplit  /map
+  /mssp  /msdp  /stats  /chat  /split  /unsplit  /map  /say  /tts
 Variables:
   /set  /unset  /let  /setenv  /listvar  /toggle  /export
 Expressions & Control Flow:
@@ -2469,7 +2438,7 @@ Settings:
   /insert  /borg  /redef  /shpause  /sockmload  /background  /clearfull
   /cleardone  /gpri  /hpri  /isize  /ptime  /wrapspace  /kecho  /mecho  /qecho
   /input  /grab  /trigger  /more  /wrap  /restrict  /core
-  /features  /ver  /man  /say  /tts
+  /features  /ver  /man
 Legacy/stub (accepted for script compatibility; mapped to a Clay
 equivalent or a no-op - see /help <command>):
   /telnet  /finger  /getfile  /putfile  /liststreams  /changes
@@ -2478,18 +2447,20 @@ TinyFugue prefix escape (checked before the table above):
   /tfhelp  /tfgag"#.to_string()
             )),
             "keys" | "keybindings" => TfCommandResult::Success(Some(
-                r#"Keyboard Shortcuts (short form - see docs/markdown/07-keyboard-shortcuts.md
-for the complete, generated-from-code table, including every chord)
+                r#"Keyboard Shortcuts (short form - the full table, every chord included,
+is the Keyboard Shortcuts chapter of Clay's documentation)
 
 World Switching:
-  Esc+Left/Right, Esc+{/} - Cycle connected worlds (TF SOCKETB/SOCKETF)
+  Esc+Left/Right       - Cycle connected worlds (TF SOCKETB/SOCKETF)
+  Esc+{ / Esc+}        - Previous/next active world (World Switching order)
   Shift+Up/Down        - Cycle through all worlds
-  Esc+W                - Switch to world with activity
+  Esc+w                - Switch to world with activity
+  Shift+Tab            - Move to the other pane (/split)
 
 Input Editing:
   Left/Right, Ctrl+B/F - Move cursor
-  Esc+B/F, Ctrl+Left/Right - Word left/right
-  Up/Down              - Move cursor up/down lines
+  Esc+b/f, Ctrl+Left/Right - Word left/right
+  Up/Down              - Cursor up/down; past the top or bottom row, history
   Alt+Up/Down          - Resize input area
   Ctrl+A / Home        - Jump to start of line
   Ctrl+E / End         - Jump to end of line
@@ -2499,35 +2470,38 @@ Input Editing:
   Ctrl+D               - Delete character under cursor
   Ctrl+T               - Transpose characters
   Ctrl+Y               - Yank (paste killed text)
-  Esc+D                - Delete word forward
-  Esc+C/L/U            - Capitalize / lowercase / uppercase word forward
+  Esc+d                - Delete word forward
+  Esc+c/l/u            - Capitalize / lowercase / uppercase word forward
   Esc+Space            - Collapse spaces to one
   Esc+=                - Goto matching bracket
   Esc+. or Esc+_       - Insert last arg from history
   Ctrl+P/N, Ctrl+Up/Down - Command history
   Ctrl+Home/End, Esc+</> - Jump to oldest/newest history entry
-  Esc+P                - Search history backward
-  Esc+N                - Search history forward
-  Insert, Esc+V        - Toggle insert/overwrite mode
+  Esc+p                - Search history backward
+  Esc+n                - Search history forward
+  Insert, Esc+v        - Toggle insert/overwrite mode
   Esc+0-9, Esc+-       - Build a numeric repeat-count prefix (%kbnum)
   Ctrl+Q               - Spell suggestions
-  Tab, Esc+Tab         - Release pending output / command completion
+  Tab                  - Complete a /command (see Output for the rest)
+  Esc+Tab              - Command completion
 
 Output:
   PageUp/PageDown      - Scroll output
-  Esc+J (lowercase)    - Jump to end, release all
-  Esc+J (uppercase)    - Selective flush (keep hilite)
-  Esc+H                - Half-page scroll/release
+  Tab                  - Page down; at the bottom, release held output
+  Esc+j                - Jump to end, release all
+  Esc+J                - Selective flush (keep hilite)
+  Esc+h                - Half-page scroll/release
+  Esc+L                - Toggle the F4 filter (the last /limit)
   Ctrl+S               - Pause output (TF PAUSE)
 
 Display:
   F1                   - Show help
   F2                   - Toggle MUD tag display
   F4                   - Filter output
-  F5                   - Search command history
+  F5                   - Search the output
   F8                   - Highlight action matches
   F9                   - Toggle GMCP media audio
-  Esc+E                - Open the emoji picker
+  Esc+e                - Open the emoji picker
 
 System:
   Ctrl+C (twice)       - Quit
@@ -2552,8 +2526,8 @@ Mapping named keys to functions:
   macro typically calls; unlike bare /dokey <NAME> (always a single step),
   the movement-related dokey_<name> commands honor the numeric prefix above.
 
-Customize with /bind, /def -b/-B, or /def key_<name> - or the browser-based
-keybind editor at /keybind-editor, when the HTTP server is enabled (/web):
+Customize with /bind, /def -b/-B, or /def key_<name> - or the keybind editor
+(Settings in the web page and the GUIs; from the console, /help web):
   /bind F5 = cast heal
   /def key_up = /dokey_recallb
   /bind ^S = /save macros.tf"#.to_string()
@@ -2624,7 +2598,7 @@ See also: /help result, /help return, /help def, /help shift"#.to_string()
                 "/sys <command>\n\nRun <command> via the shell, echo every stdout/stderr line, and set\n%? to the command's real process exit status (not a 0/1 boolean).\nHonours /restrict (SHELL and above refuse it).\n\nExample: /sys ls -la".to_string()
             )),
             "xtitle" => TfCommandResult::Success(Some(
-                "/xtitle <text>\n\nPut <text> on the console's terminal-tab/titlebar. Console only - a\nweb/GUI/remote-console client has no terminal tab of its own to rename.".to_string()
+                "/xtitle <text>\n\nPut <text> on the console's terminal tab or title bar, or, typed in the\nweb page or a GUI, on its browser tab or window. An SSH console leaves\nits terminal's title alone.".to_string()
             )),
             "more" => TfCommandResult::Success(Some(
                 "/more [on|off|1|0]\n\nToggle Clay's more-mode (pause when the screen fills). A bare or\ninvalid argument is an error (matches real tf's own validated %more\nflag).\n\nExample: /more on".to_string()
@@ -2663,13 +2637,13 @@ See also: /help result, /help return, /help def, /help shift"#.to_string()
                 "/:\n\nThe null command: a no-op that always sets %?=1. No output.".to_string()
             )),
             "limit" => TfCommandResult::Success(Some(
-                "/limit [-v] [-a] [-m<style>] [<pattern>]\n\nOpen the F4 filter popup, showing only lines matching <pattern>\n(console only - see /help unlimit, /help relimit).\n\n  -v         show only lines that DON'T match <pattern>\n  -a         show only lines that have attributes\n  -m<style>  simple, glob or regexp instead of %matching's default\n\nWith no options or pattern, %? is 1 if a limit is in effect, 0 if not.\n\nExample: /limit -v error".to_string()
+                "/limit [-v] [-a] [-m<style>] [<pattern>]\n\nOpen the F4 filter popup, showing only lines matching <pattern>,\nin the interface it was typed in (see /help unlimit, /help relimit).\n\n  -v         show only lines that DON'T match <pattern>\n  -a         show only lines that have attributes\n  -m<style>  simple, glob or regexp instead of %matching's default\n\nWith no options or pattern, %? is 1 if a limit is in effect, 0 if not.\n\nExample: /limit -v error".to_string()
             )),
             "unlimit" => TfCommandResult::Success(Some(
-                "/unlimit\n\nClose the F4 filter popup opened by /limit. Console only.\n\nSee also: /help limit, /help relimit".to_string()
+                "/unlimit\n\nClose the F4 filter popup opened by /limit, in the interface it was\ntyped in.\n\nSee also: /help limit, /help relimit".to_string()
             )),
             "relimit" => TfCommandResult::Success(Some(
-                "/relimit\n\nRe-apply the most recently applied /limit. Console only.\n\nSee also: /help limit, /help unlimit".to_string()
+                "/relimit\n\nRe-apply the most recently applied /limit, in the interface it was\ntyped in.\n\nSee also: /help limit, /help unlimit".to_string()
             )),
             "status_add" | "status_rm" | "status_edit" | "status_defaults" | "status_save"
             | "status_restore" | "clock" | "status" | "status line" => TfCommandResult::Success(Some(
@@ -2705,7 +2679,7 @@ Example: /status_add -A@world hp:4"#.to_string()
                 "/prompt [-a<attrs>] [-p] <text>\nprompt(<text>)\n\nMake <text> the current world's prompt (shown in the input area),\nreplacing the one it has. -a<attrs> shows it in those attributes; -p\napplies \"@{<attr>}\" codes within <text>. %? (or the function's\nvalue) is 1, or 0 when there is no world.\n\nMost useful from a PROMPT hook, which takes the prompt over:\n  /def -h\"PROMPT *> \" catch_prompt = /test prompt({*})".to_string()
             )),
             "suspend" => TfCommandResult::Success(Some(
-                "/suspend\n\nSuspend Clay, as ^Z does, if the shell it runs under has job control;\nits fg brings Clay back, redrawn. Clay's own console only.".to_string()
+                "/suspend\n\nSuspend Clay, as ^Z does, if the shell it runs under has job control;\nits fg brings Clay back, redrawn. Clay's console, or an SSH or\nremote console (which suspends itself, not the server).".to_string()
             )),
             "dokey" => TfCommandResult::Success(Some(
                 "/dokey keyname\n\nSimulate pressing a named edit key. Sets %? to TF's documented\nreturn value where that's cheap to compute (movement/deletion: new\ncursor position; otherwise 1).\n\nKey names:\n  BSPC/BACKSPACE     - Backspace\n  BWORD              - Delete previous word\n  DLINE/DELINE       - Delete entire line\n  REFRESH/REDRAW     - Redraw screen\n  LNEXT              - Treat the next key literally\n  UP                 - Cursor up (no history fallback - that's the key's job)\n  DOWN               - Cursor down (no history fallback)\n  LEFT/RIGHT         - Move cursor\n  HOME/END           - Start/end of line\n  NEWLINE/ENTER      - Submit input\n  RECALLB            - Previous history entry\n  RECALLF            - Next history entry\n  RECALLBEG          - First history entry\n  RECALLEND          - Last history entry\n  SEARCHB/SEARCHF    - Search history backward/forward\n  SOCKETB/SOCKETF    - Previous/next world\n  DWORD              - Delete next word\n  DCH/DELETE         - Delete character under cursor\n  CLEAR              - Clear the output view (scrollback refills it)\n  WLEFT/WRIGHT       - Word left/right\n  DEOL               - Delete to end of line\n  PAUSE              - Pause output\n  PAGE/PGDN          - Page forward\n  PAGEBACK/PGUP/PAGEUP - Page backward\n  HPAGE              - Half page forward\n  HPAGEBACK          - Half page backward\n  LINE               - Scroll forward one line\n  LINEBACK           - Scroll backward one line\n  FLUSH              - Jump to end, releasing all pending output\n  SELFLUSH           - Show highlighted pending lines, then jump to end".to_string()
@@ -2723,7 +2697,7 @@ Example: /status_add -A@world hp:4"#.to_string()
                 "/replace old new string\n\nReplace all occurrences of 'old' with 'new' in string.\nEchoes the result.\n\nFunction form: $[replace(old, new, str [,count])]\n(TF argument order - note this is a behavior change from Clay's\nprevious (str, old, new) function argument order; the /replace\ncommand's own argument order is unchanged.)\n\nExample: /replace foo bar \"foo and foo\"  => \"bar and bar\"".to_string()
             )),
             "tr" => TfCommandResult::Success(Some(
-                "/tr domain range string\n\nTranslate characters: each character in 'domain' is replaced\nby the corresponding character in 'range'.\n\nFunction form: $[tr(domain, range, string)]\n\nExample: /tr abc ABC \"a big cat\"  => \"A Big CAt\"".to_string()
+                "/tr domain range string\n\nTranslate characters: each character in 'domain' is replaced\nby the corresponding character in 'range'.\n\nFunction form: $[tr(domain, range, string)]\n\nExample: /tr abc ABC \"a big cat\"  => \"A Big CAt\"\n\nClay's translation into another language is /translate.".to_string()
             )),
             "trig" => TfCommandResult::Success(Some(
                 "/trig pattern = body\n\nCreate an unnamed trigger (glob mode).\nEquivalent to: /def -t\"pattern\" = body\n\nSee also: /trigp, /trigc, /trigpc, /untrig".to_string()
@@ -2865,7 +2839,7 @@ Examples:
   /recall -D -wmud.example.com *   - All archived lines for a world"#.to_string()
             )),
             "gag" => TfCommandResult::Success(Some(
-                "/gag [pattern]\n\nWith no args: list all gag triggers.\nWith a pattern: create a trigger that suppresses matching lines.\nEquivalent to: /def -ag -t\"pattern\"\n\nExample: /gag * has left the game.".to_string()
+                "/gag [pattern [= response]]\n\nWith no args: turn gags on (sets %{gag} to 1).\nWith a pattern: create a trigger that suppresses matching lines,\nmatched in %{matching}'s style (glob by default), at priority %{gpri}.\nEquivalent to: /def -ag -t\"pattern\" [= response]\nGagged lines are still shown with F2.\n\nExample: /gag * has left the game.".to_string()
             )),
             "ungag" => TfCommandResult::Success(Some(
                 "/ungag pattern\n\nRemove gag triggers matching the given pattern.\n\nExample: /ungag * has left the game.".to_string()
@@ -2883,7 +2857,7 @@ Options:
             of one. If more than one of -c<N>/-</-> is given, the LAST
             one wins (matches real tf).
   -s        Suppress "world not found" instead of showing an error.
-  -n        Accepted, not distinct: Clay's console always shows one
+  -n        Accepted, not distinct: Clay's console always shows a
             world, so there is no "no world foreground" state to enter.
   -q, -l    Accepted, not distinct.
 
@@ -2894,9 +2868,6 @@ Examples:
   /fg -s SomeWorldThatMightNotExist"#.to_string()
             )),
             "chat" | "discord" | "slack" => chat_help(),
-            "dc" | "disconnect" => TfCommandResult::Success(Some(
-                "/dc [<world>|-ALL]\n\nDisconnect from the current world, a named world, or (with -ALL,\ncase-insensitive) every connected world.\n\nExamples:\n  /dc\n  /dc MyMUD\n  /dc -ALL".to_string()
-            )),
             "connect" => TfCommandResult::Success(Some(
                 r#"/connect [-lqxbf] [<world>]
 /connect [-lqxbf] <host> <port>
@@ -2922,29 +2893,6 @@ Errors: "CONNECT: <name>: no such world",
 
 Clay's own command to attach to another Clay server is /server."#.to_string()
             )),
-            "world" => TfCommandResult::Success(Some(
-                r#"/world [-lqnxfb] [<name>]
-/world [-lqnxfb] <host> <port>
-
-Switch to or connect to a world by name, or connect directly to a
-host/port (creates a temporary world named "host:port"). Without
-arguments, opens the world selector.
-
-Options (same as /fg and /connect):
-  -l    Connect without auto-login.
-  -b    Connect in the background (don't switch to it).
-  -x    Use SSL - honored for the host/port form; for a named world,
-        the world's own saved SSL setting is used instead.
-  -q, -n, -f  Accepted, not distinct.
-  -e    Edit the world's settings (Clay extra).
-
-Examples:
-  /world MyMUD
-  /world -l MyMUD
-  /world -b MyMUD
-  /world mud.example.com 4000
-  /world -e MyMUD"#.to_string()
-            )),
             "listworlds" => TfCommandResult::Success(Some(
                 r#"/listworlds [-cus] [-m<style>] [-S<field>] [-T<type>] [<name>]
 
@@ -2967,27 +2915,6 @@ Examples:
   /listworlds -s
   /listworlds -c
   /listworlds -Sh Cave"#.to_string()
-            )),
-            "listsockets" | "connections" => TfCommandResult::Success(Some(
-                r#"/listsockets [-sn] [-m<style>] [-S<field>] [-T<type>] [<name>]
-
-List connected worlds (sockets). Maps to Clay's /connections table; /l is
-the same command.
-
-Options:
-  -s          Short form: one world name per line (used by /send -W).
-  -S<field>   Sort by name/host/port/character/lines/idle/- (default: -,
-              i.e. unsorted).
-  -n, -m, -T  Accepted, not distinct: Clay stores whatever host string
-              you typed (no separate numeric form), always matches by
-              substring (no glob/regexp style), and has no per-world
-              type to filter or sort by.
-  <name>      Only worlds whose name contains this text.
-
-Examples:
-  /listsockets
-  /listsockets -s
-  /listsockets -Sidle"#.to_string()
             )),
             "undef" => TfCommandResult::Success(Some(
                 "/undef <name>...\n\nFor each <name> given, remove the macro with that exact name. Each name\nis processed independently - a missing name doesn't stop the rest.\nSilent on success; reports a diagnostic message per missing name.\n\nExample: /undef my_trigger other_macro".to_string()
@@ -3076,12 +3003,6 @@ Examples:
             "runtime" => TfCommandResult::Success(Some(
                 "/runtime <command>\n\nRun <command>, then print \"real=<secs> cpu=<secs>\" - the wall-clock and\nCPU time it took. <command>'s own output (if any) is shown first.\n\nExample:\n  /runtime /load big_script.tf".to_string()
             )),
-            "version" => TfCommandResult::Success(Some(
-                "/version\n\nDisplay Clay version information.".to_string()
-            )),
-            "quit" => TfCommandResult::Success(Some(
-                "/quit\n\nExit Clay.".to_string()
-            )),
             "shift" => TfCommandResult::Success(Some(
                 "/shift [<n>]\n\nShift positional parameters left by <n> (default 1): %(n+1)...%# become\n%1...%(#-n). <n> is clamped to the argument count rather than erroring.\nUsed inside macros to iterate through arguments.\n\nExample:\n  /def showargs = /while ({1} !~ \"\") /echo %1%; /shift%; /done".to_string()
             )),
@@ -3099,9 +3020,6 @@ Examples:
             )),
             "cat" | "paste" => TfCommandResult::Success(Some(
                 "/cat and /paste are not supported in Clay.\nUse bracketed paste instead (paste normally into the input area).".to_string()
-            )),
-            "help" | "tfhelp" => TfCommandResult::Success(Some(
-                "/help [topic] or /tfhelp [topic]\n\nShow help on TF commands and features.\n\nTopics: set, echo, send, def, if, while, for, expr, test,\n  bind, hooks, repeat, load, recall, quote, gag, addworld,\n  watchdog, watchname, functions, and more.\n\nA topic Clay has no help of its own for is looked up in TinyFugue's\nhelp file (%TFHELP, else tf-help in %TFLIBDIR) when one is installed,\nas TF would: /help intro, /help special variables, /help kecho.\nThose topics are case-sensitive, as in TF.\n\nExample: /help def".to_string()
             )),
             "purgeworld" | "saveworld" | "loadworld" => TfCommandResult::Success(Some(
                 "/saveworld [-a] [<file>]\n  Write every world definition to <file> (default ~/tiny.world)\n  as /test addworld(...) lines; -a appends. The file holds passwords\n  and is written readable by you only.\n\n/loadworld [<file>]\n  Read world definitions back (a /load of the file).\n\n/purgeworld [-m<style>] [-T<type>] [<name>]\n  Remove the world definitions matching <name> and <type> (all of\n  them when neither is given) - Clay's saved worlds included.".to_string()
@@ -4661,7 +4579,7 @@ mod tests {
         const CLAY_NATIVE_ONLY: &[&str] = &[
             "actions", "chat", "dict", "dump", "flush", "font", "import",
             "menu", "msdp", "mssp", "note", "notify", "pause", "reload", "remote", "server", "setup", "stats", "tag",
-            "map", "split", "testmusic", "tfgag", "tfhelp", "translate", "tts", "unban", "unsplit", "update",
+            "map", "reach", "split", "testmusic", "tfgag", "tfhelp", "translate", "tts", "unban", "unsplit", "update",
             "urban", "url", "web", "window",
         ];
 

@@ -515,6 +515,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "announce_screen_reader={}", app.settings.announce_screen_reader)?;
     writeln!(file, "status_panel={}", app.settings.status_panel)?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
+    for (key, place) in &app.settings.icon_bar_profiles {
+        writeln!(file, "icon_bar.{key}={}", place.name())?;
+    }
     writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
 
     // Save each world's settings.
@@ -541,7 +544,8 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         }
         // TF's /connect <host> <port> world lives only as long as its connection (it
         // does survive a /reload, through the reload state).
-        if world.is_temporary {
+        // The Activity world is made at every start (`App::ensure_activity_world`).
+        if world.is_temporary || world.is_activity {
             continue;
         }
         writeln!(file)?;
@@ -569,6 +573,10 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         }
         if !world.settings.keep_alive_gag.is_empty() {
             writeln!(file, "keep_alive_gag={}", world.settings.keep_alive_gag)?;
+        }
+        // Lines escaped as notes are (`unescape_string` reads them back).
+        if !world.settings.login_command.is_empty() {
+            writeln!(file, "login_command={}", escape_multiline(&world.settings.login_command))?;
         }
         if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
@@ -1465,6 +1473,12 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "icon_bar" => {
                         app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
+                    // One interface's own icon bar place.
+                    k if k.starts_with("icon_bar.") => {
+                        if let Some(key) = k.strip_prefix("icon_bar.") {
+                            app.settings.icon_bar_profiles.insert(key.to_string(), crate::IconBarPlace::from_name(value));
+                        }
+                    }
                     "picture_host" => {
                         app.settings.picture_host = crate::picture::PictureService::from_name(value);
                     }
@@ -1520,6 +1534,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         }
                         "keep_alive_gag" => {
                             world.settings.keep_alive_gag = value.to_string();
+                        }
+                        "login_command" => {
+                            world.settings.login_command = unescape_string(value);
                         }
                         "gmcp_packages" => {
                             world.settings.gmcp_packages = migrate_gmcp_packages(value);
@@ -2306,6 +2323,10 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             writeln!(file, "split_focus_top={}", split.focus_top)?;
         }
     }
+    // Its size (`/split -n`, a drag), kept for the next `/split` whether split now or not.
+    if let Some(rows) = app.split_top_rows {
+        writeln!(file, "split_top_rows={}", rows)?;
+    }
     // The map pane (`/map`, src/map): open, and the area and level it shows by choice.
     if let Some(pane) = &app.map_pane {
         writeln!(file, "map_pane_area={}", pane.area.as_deref().unwrap_or(""))?;
@@ -2405,6 +2426,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "announce_screen_reader={}", app.settings.announce_screen_reader)?;
     writeln!(file, "status_panel={}", app.settings.status_panel)?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
+    for (key, place) in &app.settings.icon_bar_profiles {
+        writeln!(file, "icon_bar.{key}={}", place.name())?;
+    }
     writeln!(file, "picture_host={}", app.settings.picture_host.name())?;
 
     // Save watchdog state
@@ -2455,6 +2479,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         writeln!(file, "name={}", world.name.replace('=', "\\e"))?;
         if world.is_temporary {
             writeln!(file, "is_temporary=true")?;
+        }
+        if world.is_activity {
+            writeln!(file, "is_activity=true")?;
         }
         writeln!(file, "scroll_offset={}", world.scroll_offset)?;
         // A shell world (src/shell): on Linux its PTY is carried across the reload exec
@@ -2595,6 +2622,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         }
         if !world.settings.keep_alive_gag.is_empty() {
             writeln!(file, "keep_alive_gag={}", world.settings.keep_alive_gag.replace('=', "\\e"))?;
+        }
+        if !world.settings.login_command.is_empty() {
+            writeln!(file, "login_command={}", escape_multiline(&world.settings.login_command))?;
         }
         if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages.replace('=', "\\e"))?;
@@ -2868,6 +2898,12 @@ fn escape_state_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n").replace('=', "\\e")
 }
 
+/// A multi-line value on one `key=value` line, as notes are written: `\`, newlines and
+/// `=` escaped. `unescape_string` is the inverse.
+fn escape_multiline(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('=', "\\e")
+}
+
 pub fn unescape_string(s: &str) -> String {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
@@ -2930,6 +2966,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
     // A split's other pane (by name) and focus, put back once the worlds are loaded.
     let mut split_other: Option<String> = None;
     let mut split_focus_top = false;
+    let mut split_top_rows: Option<usize> = None;
 
     // Temporary storage for world data
     struct TempWorld {
@@ -2966,6 +3003,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         mccp2_resume_after_reload: bool,
         was_connected: bool,
         is_temporary: bool,
+        is_activity: bool,
         showing_splash: bool,
         telnet_mode: bool,
         negotiated_encoding: Option<Encoding>,
@@ -3141,6 +3179,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         mccp2_resume_after_reload: false,
                         was_connected: false,
                         is_temporary: false,
+                        is_activity: false,
                         showing_splash: false,
                         telnet_mode: false,
                         negotiated_encoding: None,
@@ -3297,6 +3336,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     }
                     "split_other" => split_other = Some(value.to_string()),
                     "split_focus_top" => split_focus_top = value == "true",
+                    "split_top_rows" => split_top_rows = value.parse().ok().filter(|&n| n >= 1),
                     "map_pane_area" => {
                         app.map_pane.get_or_insert_with(Default::default).area = (!value.is_empty()).then(|| value.to_string());
                     }
@@ -3577,6 +3617,12 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "icon_bar" => {
                         app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
+                    // One interface's own icon bar place.
+                    k if k.starts_with("icon_bar.") => {
+                        if let Some(key) = k.strip_prefix("icon_bar.") {
+                            app.settings.icon_bar_profiles.insert(key.to_string(), crate::IconBarPlace::from_name(value));
+                        }
+                    }
                     "picture_host" => {
                         app.settings.picture_host = crate::picture::PictureService::from_name(value);
                     }
@@ -3642,6 +3688,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "mccp2_resume_after_reload" => tw.mccp2_resume_after_reload = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
                             "is_temporary" => tw.is_temporary = value == "true",
+                            "is_activity" => tw.is_activity = value == "true",
                             "showing_splash" => tw.showing_splash = value == "true",
                             "telnet_mode" => tw.telnet_mode = value == "true",
                             "negotiated_encoding" => tw.negotiated_encoding = Encoding::from_iana_name(value),
@@ -3724,6 +3771,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "keep_alive_gag" => {
                                 tw.settings.keep_alive_gag = value.replace("\\e", "=");
                             }
+                            "login_command" => tw.settings.login_command = unescape_string(value),
                             "gmcp_packages" => {
                                 tw.settings.gmcp_packages = migrate_gmcp_packages(&unescape_string(value));
                             }
@@ -3865,6 +3913,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.mccp2_resume_after_reload = tw.mccp2_resume_after_reload;
         world.was_connected = tw.was_connected;
         world.is_temporary = tw.is_temporary;
+        world.is_activity = tw.is_activity;
         world.showing_splash = tw.showing_splash;
         world.telnet_mode = tw.telnet_mode;
         world.protocol.negotiated_encoding = tw.negotiated_encoding;
@@ -4021,6 +4070,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         if let Some(other) = split_other.and_then(|name| app.worlds.iter().position(|w| w.name == name)) {
             app.split = Some(crate::ConsoleSplit { other, focus_top: split_focus_top });
         }
+        app.split_top_rows = split_top_rows;
     }
 
     // Load auth key from ~/.clay/settings.dat (it's not in the reload state file)
@@ -4212,6 +4262,12 @@ mod tests {
             announce_screen_reader: true,      // default: false
             status_panel: false,               // default: true
             icon_bar: IconBarMode::All,        // default: AppTablet
+            icon_bar_profiles: [
+                ("native-linux".to_string(), crate::IconBarPlace::Left),
+                ("browser-linux".to_string(), crate::IconBarPlace::None),
+            ]
+            .into_iter()
+            .collect(),                        // default: empty
             picture_host: crate::picture::PictureService::from_name("x0+short"), // default: catbox
             text_reveal_profiles: [
                 ("native-linux".to_string(), TextReveal::SuperFast),
@@ -4255,6 +4311,7 @@ mod tests {
             keep_alive_cmd: "keepalive_cmd".to_string(), // default: ""
             keep_alive_gag_enabled: true,              // default: false
             keep_alive_gag: "keepalive gag".to_string(), // default: ""
+            login_command: "say a=b;say c\\;d\nlook\\there".to_string(), // default: ""
             slack_token: "slack_tok".to_string(),
             slack_channel: "slack_chan".to_string(),
             slack_workspace: "slack_ws".to_string(),
@@ -4350,6 +4407,7 @@ mod tests {
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
         assert_eq!(a.tabs, b.tabs, "{context}: tabs");
         assert_eq!(a.tabs_profiles, b.tabs_profiles, "{context}: tabs_profiles");
+        assert_eq!(a.icon_bar_profiles, b.icon_bar_profiles, "{context}: icon_bar_profiles");
         assert_eq!(a.screen_reader, b.screen_reader, "{context}: screen_reader");
         assert_eq!(a.screen_reader_profiles, b.screen_reader_profiles, "{context}: screen_reader_profiles");
         assert_eq!(a.announce_screen_reader, b.announce_screen_reader, "{context}: announce_screen_reader");
@@ -4376,6 +4434,7 @@ mod tests {
         assert_eq!(a.keep_alive_cmd, b.keep_alive_cmd, "{context}: keep_alive_cmd");
         assert_eq!(a.keep_alive_gag_enabled, b.keep_alive_gag_enabled, "{context}: keep_alive_gag_enabled");
         assert_eq!(a.keep_alive_gag, b.keep_alive_gag, "{context}: keep_alive_gag");
+        assert_eq!(a.login_command, b.login_command, "{context}: login_command");
         assert_eq!(a.slack_token, b.slack_token, "{context}: slack_token");
         assert_eq!(a.slack_channel, b.slack_channel, "{context}: slack_channel");
         assert_eq!(a.slack_workspace, b.slack_workspace, "{context}: slack_workspace");
@@ -5061,7 +5120,7 @@ mod tests {
             String::new(), "0".to_string(), true, true, true,
             "discord".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), "Guild".to_string(), "#dev".to_string(), String::new(),
-            Some(chat), None, None, None,
+            Some(chat), None, None, None, None,
         );
         let s = &app.worlds[0].settings;
         assert_eq!(s.discord_channel, "#dev");
@@ -5098,6 +5157,36 @@ mod tests {
         let bogus = app.worlds.iter().find(|w| w.name == "Bogus").expect("Bogus world restored");
         assert!(matches!(bogus.settings.world_type, WorldType::Mud),
             "an unrecognized world_type value must fall back to WorldType::Mud");
+    }
+
+    /// The Login Command's lines - with `=`, `\;` and a backslash in them - survive
+    /// settings.dat and a reload, and a world without one writes no key.
+    #[test]
+    fn test_login_command_round_trips_in_settings_dat_and_reload_state() {
+        let commands = "say hello;say goodbye\nlook = here\\;there\nsay a\\b".to_string();
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = crate::World::new("Login");
+        w.settings.login_command = commands.clone();
+        app.worlds.push(w);
+        app.worlds.push(crate::World::new("Plain"));
+
+        let mut buf = Vec::new();
+        write_settings_dat(&app, &mut buf, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches("login_command=").count(), 1, "only the world with one: {text}");
+        let mut fresh = App::new();
+        load_settings_from_str(&mut fresh, &text);
+        let w = fresh.worlds.iter().find(|w| w.name == "Login").expect("world loaded");
+        assert_eq!(w.settings.login_command, commands, "{text}");
+
+        let mut buf = Vec::new();
+        save_reload_state_to(&app, &mut buf).unwrap();
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &String::from_utf8(buf).unwrap()).unwrap();
+        let w = reloaded.worlds.iter().find(|w| w.name == "Login").expect("world restored");
+        assert_eq!(w.settings.login_command, commands);
+        assert_eq!(w.settings.login_commands(), ["say hello", "say goodbye", "look = here;there", "say a\\b"]);
     }
 
     /// A Custom keepalive's Gag (checkbox and text) survives settings.dat and a reload.
@@ -5770,6 +5859,7 @@ pattern=foo
         assert_ne!(non_default.announce_screen_reader, default.announce_screen_reader, "announce_screen_reader should differ");
         assert_ne!(non_default.status_panel, default.status_panel, "status_panel should differ");
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");
+        assert_ne!(non_default.icon_bar_profiles, default.icon_bar_profiles, "icon_bar_profiles should differ");
         assert_ne!(non_default.picture_host, default.picture_host, "picture_host should differ");
         assert_ne!(non_default.font_profiles, default.font_profiles, "font_profiles should differ");
         assert_ne!(non_default.text_reveal_profiles, default.text_reveal_profiles, "text_reveal_profiles should differ");
@@ -5801,6 +5891,7 @@ pattern=foo
         assert_ne!(non_default.keep_alive_cmd, default.keep_alive_cmd, "keep_alive_cmd should differ");
         assert_ne!(non_default.keep_alive_gag_enabled, default.keep_alive_gag_enabled, "keep_alive_gag_enabled should differ");
         assert_ne!(non_default.keep_alive_gag, default.keep_alive_gag, "keep_alive_gag should differ");
+        assert_ne!(non_default.login_command, default.login_command, "login_command should differ");
         assert_ne!(non_default.slack_token, default.slack_token, "slack_token should differ");
         assert_ne!(non_default.slack_channel, default.slack_channel, "slack_channel should differ");
         assert_ne!(non_default.slack_workspace, default.slack_workspace, "slack_workspace should differ");

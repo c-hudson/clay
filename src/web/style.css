@@ -607,8 +607,8 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
    its dot and name only - on the status bar's colour. It and the full #status-bar below
    turn grey (--pane-unfocused-bg: the bar's colour as a grey of the same lightness, set by
    app.js applyPaneGrey) while their pane hasn't the focus; a press on a grey bar moves the
-   focus to its pane. The spacer is the menu button's twin, so the dot sits under the full
-   bar's. */
+   focus to its pane, and dragging the bar resizes the panes (app.js startSplitResize). The
+   spacer is the menu button's twin, so the dot sits under the full bar's. */
 .pane-bar {
     display: flex;
     align-items: center;
@@ -623,15 +623,18 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
     user-select: none;
     position: relative;
     z-index: 2;
+    cursor: ns-resize;
+    /* A finger drags it too, rather than scrolling the page. */
+    touch-action: none;
 }
 .pane-bar .pane-bar-spacer { visibility: hidden; }
 body.device-phone .pane-bar .pane-bar-spacer { display: none; }
-.pane-bar .status-item { cursor: default; }
+.pane-bar .status-item { cursor: inherit; }
 .pane-bar.pane-unfocused,
 #status-bar.pane-unfocused {
     background: var(--pane-unfocused-bg, #555);
-    cursor: pointer;
 }
+#status-bar.pane-unfocused { cursor: pointer; }
 
 /* ─── World Tabs (Tabs setting: top/bottom/left/right/none, per interface) ─── */
 .tabs-ribbon {
@@ -768,10 +771,11 @@ body.device-phone .pane-bar .pane-bar-spacer { display: none; }
 .tabs-ribbon.tabs-right .tabs-ribbon-tab.active { border-right-color: var(--accent-color); }
 body.device-phone .tabs-ribbon.tabs-vertical { width: 110px; }
 
-/* ─── Icon Bar (Icon Bar setting: none/app_tablet/all) ───
+/* ─── Icon Bar (Icon Bar setting: top/bottom/left/right/none, per interface) ───
    Large icon+label tiles for the most-used menu items, plus any Action
-   marked "GUI Menu Shortcut" appended at the end of the same row. Visible
-   only when the window/device qualifies (see iconBarVisible() in app.js). */
+   marked "GUI Menu Shortcut" appended at the end of the same row. Placed
+   and shown by applyIconBarPlace() in app.js; Left/Right make it a column
+   (.icon-bar-vertical, below). */
 .icon-bar {
     display: none;   /* shown via JS (applyIconBarMode/renderIconBar) */
     align-items: center;
@@ -913,6 +917,34 @@ body.theme-light .icon-bar {
 
 .icon-bar-shortcuts::-webkit-scrollbar {
     display: none;
+}
+
+/* Icon Bar: Left/Right - a column beside the output, outside a side tab column (user
+   request 2026-11-04): the built-in tiles, a line, then the shortcuts, the whole column
+   scrolling when they don't fit, so it has no arrows (native bars.rs icon_bar_column). */
+.icon-bar.icon-bar-vertical {
+    flex-direction: column;
+    align-items: center;
+    border-top: none;
+    border-bottom: none;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: none;
+}
+.icon-bar.icon-bar-vertical::-webkit-scrollbar { display: none; }
+.icon-bar.icon-bar-left { border-right: 1px solid var(--theme-border-subtle, #221c2b); }
+.icon-bar.icon-bar-right { border-left: 1px solid var(--theme-border-subtle, #221c2b); }
+.icon-bar.icon-bar-vertical .icon-bar-sep,
+.icon-bar.icon-bar-vertical .icon-bar-arrow { display: none; }
+.icon-bar.icon-bar-vertical .icon-bar-divider {
+    width: auto;
+    height: 1px;
+    margin: 3px 0;
+}
+.icon-bar.icon-bar-vertical .icon-bar-shortcuts {
+    flex-direction: column;
+    overflow: visible;
+    max-width: none;
 }
 
 /* ─── Note Editor (own window/tab, NOTE_MODE — see webview_gui.rs's
@@ -1455,6 +1487,18 @@ body.device-tablet #menu-dropdown .menu-item[data-action="emoji_picker"] {
     display: none;
 }
 
+/* The input's right-click menu (app.js openInputMenu), as the native GUI's. */
+.menu-dropdown.input-menu {
+    min-width: 150px;
+    z-index: 10001;
+}
+.menu-dropdown .menu-item.disabled,
+.menu-dropdown .menu-item.disabled:hover {
+    background: transparent;
+    color: var(--theme-fg-dim, #4a4255);
+    cursor: default;
+}
+
 .menu-sep {
     height: 1px;
     background: var(--border-color);
@@ -1525,7 +1569,8 @@ body.device-phone #output-container, body.device-phone #split-output-container {
 /* app.js desktopInputAttached(), on a phone or a tablet alike: the separator bar carries the
    menu and the font slider, and the button row under it goes. With the on-screen keyboard
    gone, so is its emoji picker, so the menu offers Clay's again. The icon bar (app.js
-   iconBarVisible) and the output's scroll bar (below) show as on the desktop. Dialogs keep
+   iconBarLegacyShows, until the app picks its own place) and the output's scroll bar
+   (below) show as on the desktop. Dialogs keep
    the layout of the screen's size, which is what fits on it. These follow the phone and
    tablet rules above and match their specificity, so they win. */
 body.desktop-input #nav-bar { display: none; }
@@ -2641,6 +2686,28 @@ body.device-phone .side-tile-label {
     font-size: 11px;
 }
 
+/* The Advanced card's spacing rows fold away until its checkbox is ticked: the grid
+   row's 0fr -> 1fr transition is the drop-down (an engine that can't animate it just
+   opens). app.js updateFontPopupUI sets .open, and inert while closed. */
+#font-advanced-section {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 0.18s ease;
+}
+
+#font-advanced-section.open {
+    grid-template-rows: 1fr;
+}
+
+.font-advanced-inner {
+    overflow: hidden;
+    min-height: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #font-advanced-section { transition: none; }
+}
+
 /* Dialogs app.js builds itself (certificate, Modify Key, Remote Access, Import):
    the same panel as every other modal, left-aligned text. */
 .js-dialog {
@@ -3305,6 +3372,34 @@ body.device-phone .side-tile-label {
     padding: 6px 0 2px 0;
 }
 
+/* The Login Command card in Options (native worlds.rs: a card of its own). */
+.world-editor-modal-content .setting-row.we-login-command.visible {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    margin-top: 6px;
+    padding: 8px 10px;
+    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
+    border-radius: 6px;
+}
+
+.we-login-command-title {
+    color: var(--theme-fg-secondary, #a1a1aa);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.world-editor-modal-content .we-login-command textarea {
+    font-family: var(--mono, monospace);
+    resize: none;
+    line-height: 1.4;
+}
+
+.we-login-command-hint {
+    color: var(--theme-fg-muted, #71717a);
+    font-size: 11px;
+}
+
 .we-toggle-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -3917,10 +4012,25 @@ body.device-phone .settings-two-column > .settings-column:first-child {
     padding-bottom: 4px;
 }
 
-.font-owner-note {
-    color: var(--theme-fg-secondary, #a1a1aa);
-    font-size: 12px;
-    padding: 0 2px;
+/* Settings > Font's Sample Text: the two lines in the font as edited (app.js
+   updateFontSample), on the output's own colours. A line too long is cut off. */
+.font-sample {
+    text-align: left;
+    background: var(--bg-color);
+    color: var(--text-color);
+    font-family: var(--mono);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 6px 8px;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+.font-sample > div {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: clip;
 }
 
 .font-family-list {

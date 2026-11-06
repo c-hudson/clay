@@ -86,6 +86,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
 
     // Ensure at least one world exists
     app.ensure_has_world();
+    app.ensure_activity_world();
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
     app.tf_event_tx = Some(event_tx.clone());
@@ -315,9 +316,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         // resume-aware history skip and replay, the client's view state, and
                         // the activity count. `-D` used to build InitialState here itself and
                         // skipped the rest.
-                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, interface_key, .. } = *msg {
+                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, interface_key, instance_id, .. } = *msg {
                             app.set_display_owner_id(client_id, &client_uid);
                             app.set_client_interface(client_id, &interface_key);
+                            app.set_client_instance(client_id, &instance_id);
                             app.handle_ws_auth_initial_state(client_id, current_world, resume, resume_epochs);
                         } else {
                             handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
@@ -666,6 +668,9 @@ pub async fn handle_daemon_ws_message(
     // A client's command or key binding: TF's keyboard functions see the client's input line
     // (empty once a line is sent; a binding brings its own), and what they leave goes back
     // to that client - never to anyone's console.
+    // A view the last message moved off the Activity world empties it before this one can
+    // move a view back onto it (App::note_activity_viewers).
+    app.note_activity_viewers();
     let clients_own = matches!(msg, WsMessage::SendCommand { .. } | WsMessage::RunKeyBinding { .. });
     let saved_keyboard = if clients_own { app.client_keyboard.replace(crate::tf::KeyboardBufferState::default()) } else { app.client_keyboard.clone() };
     if clients_own {
@@ -1201,7 +1206,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     }
                 }
                 Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
-                    if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                    if let Some(idx) = app.find_world_typed(name) {
                         // The server's foreground world follows (TF's WORLD hook, media,
                         // Esc-w's history), as a console's would; with no console it claims
                         // no ▶ there (`switch_world`). The requesting client's view moves,
@@ -1357,7 +1362,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 app.shell_mouse(world_index, &kind, button, col, row, ctrl, alt, shift);
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1368,7 +1373,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                 zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                 log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert,
-                crate::websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel },
+                crate::websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile },
             );
         }
         WsMessage::ToggleWorldGmcp { world_index } => app.toggle_world_gmcp(world_index),
@@ -1382,6 +1387,8 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         // Android going to the background (and back), a minimised GUI: not watching, so
         // its ▶ markers and unseen counts work as on the console master's server.
         WsMessage::ClientVisibility { visible } => app.handle_client_visibility(client_id, visible),
+        // A paused client was used (a key, a click, a menu): it resumes.
+        WsMessage::ResumeSession => app.ws_resume_session(client_id),
         // Plan Job 13 (Phase 4, 4.4): folded into one shared function with main.rs's
         // App::handle_ws_client_msg and this file's other copy below - see
         // commands::execute_send_gmcp/execute_send_msdp.
@@ -1753,14 +1760,14 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command } => {
             app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 msp_enabled, mcp_enabled, mccp2_enabled,
                 world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                 discord_token, discord_guild, discord_channel, discord_dm_user, chat,
-                keep_alive_gag_enabled, keep_alive_gag, status_panel,
+                keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command,
             );
         }
         WsMessage::CalculateNextWorld { current_index, exclude } => {
@@ -2929,6 +2936,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     keep_alive_cmd: if is_owner { world.settings.keep_alive_cmd.clone() } else { String::new() },
                     keep_alive_gag_enabled: is_owner && world.settings.keep_alive_gag_enabled,
                     keep_alive_gag: if is_owner { world.settings.keep_alive_gag.clone() } else { String::new() },
+                    login_command: if is_owner { world.settings.login_command.clone() } else { String::new() },
                     gmcp_packages: if is_owner { world.settings.gmcp_packages.clone() } else { String::new() },
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
                     has_notes: is_owner && !world.settings.notes.is_empty(),
@@ -3014,6 +3022,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 shell: None,
                 // Multiuser hands out no ▶ ownership (your_display_id is 0).
                 own_new_seqs: None,
+                // Multiuser has no Activity world.
+                is_activity: false,
             }
         }).collect();
 
@@ -3064,6 +3074,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         // Multiuser has no archive, and its scrollback is per user (deferred task M1).
         history_on_demand: false,
         map: false,
+        resume_session: false,
         emoji_json: crate::emoji::emoji_json(),
         emoji_categories_json: crate::emoji::emoji_categories_json(),
         // Multiuser shows Clay's own status bar.
@@ -4601,7 +4612,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(1, 0)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
+            resume: vec![(1, 0)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);
@@ -4657,7 +4668,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(0, 7)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
+            resume: vec![(0, 7)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);

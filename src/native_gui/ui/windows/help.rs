@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, InteractiveElement, InteractiveText, IntoElement, KeyDownEvent,
+    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledText, WeakEntity, Window, div, prelude::*, px, relative, svg,
 };
 
@@ -15,12 +15,11 @@ use crate::native_gui::ui::chrome::MONO_LH;
 use crate::native_gui::ui::dialogs::DialogEvent;
 use crate::native_gui::ui::kit::Btn;
 
-/// A piece of a card's text: plain, `<strong>`, `<kbd>`, or a link to a surface.
+/// A piece of a card's text: plain, `<strong>` or `<kbd>`.
 enum Seg {
     T(&'static str),
     B(&'static str),
     K(&'static str),
-    L(&'static str, &'static str),
 }
 
 struct Card {
@@ -29,19 +28,27 @@ struct Card {
     desc: &'static [Seg],
 }
 
-/// app.js `buildHelpQuickStartCards`, word for word.
+/// app.js `buildHelpQuickStartCards`'s desktop wording (`touch` false), word for word.
 const CARDS: &[Card] = &[
-    Card { icon: "help-connect", title: "Connect to a world", desc: &[Seg::T("Tap the world name, or open "), Seg::B("World Selector"), Seg::T(" and hit "), Seg::B("Add"), Seg::T(" to set one up.")] },
-    Card { icon: "help-switch", title: "Switch between worlds", desc: &[Seg::T("Tap the world name, swipe the tabs, or use "), Seg::K("▲"), Seg::T("/"), Seg::K("▼"), Seg::T(" at the bottom.")] },
-    Card { icon: "help-send", title: "Type & send", desc: &[Seg::T("Type below and tap "), Seg::B("Send"), Seg::T(". Hold "), Seg::K("▲"), Seg::T("/"), Seg::K("▼"), Seg::T(" to reuse something you typed before.")] },
-    Card { icon: "help-catchup", title: "Catch up on output", desc: &[Seg::B("MORE"), Seg::T(" means text is waiting, tap to reveal it. "), Seg::B("ACT"), Seg::T(" flags other busy worlds.")] },
-    Card { icon: "help-actions", title: "Automate with Actions", desc: &[Seg::B("Actions"), Seg::T(" auto-respond to things the world sends. Pin one to the toolbar as a button.")] },
+    Card { icon: "help-connect", title: "Connect to a world", desc: &[Seg::T("Open "), Seg::B("World Selector"), Seg::T(" from the menu, pick a world and hit "), Seg::B("Connect"), Seg::T(", or "), Seg::B("Add"), Seg::T(" one.")] },
+    Card {
+        icon: "help-switch",
+        title: "Switch between worlds",
+        desc: &[Seg::T("Click the world name or a world tab ("), Seg::B("Settings → Tabs"), Seg::T("), or press "), Seg::K("Alt+←"), Seg::T("/"), Seg::K("Alt+→"), Seg::T(".")],
+    },
+    Card { icon: "help-send", title: "Type & send", desc: &[Seg::T("Type below and press "), Seg::K("Enter"), Seg::T(". "), Seg::K("Ctrl+↑"), Seg::T("/"), Seg::K("Ctrl+↓"), Seg::T(" bring back what you typed before.")] },
+    Card {
+        icon: "help-catchup",
+        title: "Catch up on output",
+        desc: &[Seg::B("More"), Seg::T(" means text is waiting: "), Seg::K("Tab"), Seg::T(" or a click shows the next screenful. Click "), Seg::B("ACT"), Seg::T(" for a busy world.")],
+    },
+    Card { icon: "help-actions", title: "Automate with Actions", desc: &[Seg::B("Actions"), Seg::T(" auto-respond to what the world sends. "), Seg::B("GUI Menu Shortcut"), Seg::T(" puts one on the icon bar.")] },
     Card {
         icon: "help-yours",
         title: "Make it yours",
-        desc: &[Seg::T("Settings links to the "), Seg::L("Theme", "theme-editor"), Seg::T(" and "), Seg::L("Keybind", "keybind-editor"), Seg::T(" editors. The A\u{a0}—\u{a0}A slider resizes text.")],
+        desc: &[Seg::T("Pick a "), Seg::B("Theme"), Seg::T(" and fonts (the "), Seg::B("Font"), Seg::T(" tab) in "), Seg::B("Settings"), Seg::T(". The A slider on the bar resizes text.")],
     },
-    Card { icon: "help-remote", title: "Use it from anywhere", desc: &[Seg::T("Turn on remote access in "), Seg::B("Settings → Web"), Seg::T(", and manage this device’s key there.")] },
+    Card { icon: "help-remote", title: "Use it from anywhere", desc: &[Seg::T("Set a password in "), Seg::B("Settings → Web"), Seg::T("; its "), Seg::B("Remote Access"), Seg::T(" shows what to type on the other device.")] },
     Card { icon: "help-notes", title: "Keep notes", desc: &[Seg::T("The notepad icon (when a world has notes) opens a simple editor for it.")] },
 ];
 
@@ -130,34 +137,22 @@ impl Render for HelpView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(k) = self.main.upgrade().map(|m| m.read(cx).kit()) else { return div().into_any_element() };
         let t = k.t.clone();
-        let link = self.main.upgrade().map(|m| m.read(cx).link_color()).unwrap_or(t.accent);
         let cards = CARDS.iter().enumerate().map(|(i, card)| {
             let mut text = String::new();
             let mut hl = Vec::new();
-            let mut links = Vec::new();
             for seg in card.desc {
                 let start = text.len();
                 let (s, style) = match seg {
                     Seg::T(s) => (*s, None),
                     Seg::B(s) => (*s, Some(HighlightStyle { font_weight: Some(FontWeight::BOLD), color: Some(t.fg), ..Default::default() })),
                     Seg::K(s) => (*s, Some(HighlightStyle { color: Some(t.fg), background_color: Some(t.surface), ..Default::default() })),
-                    Seg::L(s, target) => {
-                        links.push((start..start + s.len(), *target));
-                        (*s, Some(HighlightStyle { color: Some(link), underline: Some(gpui::UnderlineStyle { thickness: px(1.0), color: Some(link), wavy: false }), ..Default::default() }))
-                    }
                 };
                 text.push_str(s);
                 if let Some(style) = style {
                     hl.push((start..text.len(), style));
                 }
             }
-            let ranges: Vec<_> = links.iter().map(|(r, _)| r.clone()).collect();
-            let targets: Vec<&'static str> = links.iter().map(|(_, t)| *t).collect();
-            let main = self.main.clone();
-            let desc = InteractiveText::new(("help-card-text", i), StyledText::new(text).with_highlights(hl)).on_click(ranges, move |ix, window, cx| {
-                let target = targets[ix];
-                let _ = main.update(cx, |v, cx| v.open_surface(target, window, cx));
-            });
+            let desc = StyledText::new(text).with_highlights(hl);
             div()
                 .flex()
                 .items_start()
@@ -280,6 +275,28 @@ impl Render for HelpView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CARDS` is app.js's desktop wording: each card's title and text are found in
+    /// `buildHelpQuickStartCards` once its tags and the entities it uses are taken out.
+    #[test]
+    fn the_cards_are_app_js_desktop_wording() {
+        let js = crate::http::WEB_APP_JS;
+        let start = js.find("function buildHelpQuickStartCards(touch)").expect("the cards' function");
+        let body = &js[start..start + js[start..].find("\n    }\n").unwrap()];
+        let mut plain = body.to_string();
+        for tag in ["<strong>", "</strong>", "<kbd>", "</kbd>"] {
+            plain = plain.replace(tag, "");
+        }
+        for (entity, ch) in [("&rarr;", "→"), ("&larr;", "←"), ("&uarr;", "↑"), ("&darr;", "↓"), ("&rsquo;", "’"), ("&amp;", "&")] {
+            plain = plain.replace(entity, ch);
+        }
+        for card in CARDS {
+            let text: String = card.desc.iter().map(|seg| match seg { Seg::T(s) | Seg::B(s) | Seg::K(s) => *s }).collect();
+            assert!(plain.contains(&format!("title: '{}'", card.title)), "title {:?}", card.title);
+            assert!(plain.contains(&format!("'{text}'")), "{:?}: {text:?} is not app.js's desktop wording", card.title);
+        }
+        assert!(!body.contains("-editor"), "the editors are left to Settings");
+    }
 
     #[test]
     fn the_reference_is_app_js_help_sections_grouped_as_the_web_groups_it() {

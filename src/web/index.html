@@ -30,9 +30,9 @@
 </head>
 <body>
     <div id="app">
-        <!-- Icon bar (Icon Bar setting: none/app_tablet/all). Hidden by
-             default via CSS; shown via JS (applyIconBarMode/renderIconBar)
-             per iconBarVisible(). The 4 built-in tiles reuse the exact
+        <!-- Icon bar (Icon Bar setting: top/bottom/left/right/none, per
+             interface). Hidden by default via CSS; moved to its place and shown
+             via JS (applyIconBarPlace/renderIconBar). The built-in tiles reuse the exact
              actions the hamburger menu's data-action dispatch already
              handles; user-defined shortcuts (Actions with GUI Menu
              Shortcut enabled) are appended after the divider and cycle
@@ -864,6 +864,13 @@
                                     </div>
                                 </div>
                             </div>
+                            <!-- Login Command: run after Clay's auto-login (WorldSettings::login_command).
+                                 Its own card, three lines tall, as in the native editor. -->
+                            <div class="setting-row type-gated we-login-command" id="world-edit-login-command-field">
+                                <label class="we-login-command-title" for="world-edit-login-command">Login Command</label>
+                                <textarea id="world-edit-login-command" class="editor-input" rows="3" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="say hello;say goodbye&#10;look"></textarea>
+                                <div class="we-login-command-hint">Run after Clay logs in: one command per line, ; between commands.</div>
+                            </div>
                         </div>
                         </div>
                     </div>
@@ -1131,13 +1138,15 @@
                                                 </select>
                                             </div>
                                         </div>
-                                        <div class="setting-row" title="Shows a row of large Worlds/Actions/Settings/Find icons (plus any Action marked GUI Menu Shortcut) above the output area. No effect on the console.">
+                                        <div class="setting-row" title="Where the large Worlds/Actions/Settings/Find/Tags icons (plus any Action marked GUI Menu Shortcut) go: a row above or below the output, a column beside it, or nowhere. This interface's own. No effect on the console.">
                                             <span class="setting-label">Icon Bar</span>
                                             <div class="setting-value">
                                                 <select id="setup-iconbar-select" class="form-select">
+                                                    <option value="top">Top</option>
+                                                    <option value="bottom">Bottom</option>
+                                                    <option value="left">Left</option>
+                                                    <option value="right">Right</option>
                                                     <option value="none">None</option>
-                                                    <option value="app_tablet">App/Tablet</option>
-                                                    <option value="all">All</option>
                                                 </select>
                                             </div>
                                         </div>
@@ -1273,8 +1282,14 @@
                         <!-- Font section -->
                         <div class="settings-section" id="settings-font">
                             <div class="popup-body card-stack">
-                                <!-- Whose fonts these are: each program keeps its own on each OS (app.js fontProfileKey) -->
-                                <div class="font-owner-note" id="font-owner-note"></div>
+                                <!-- The font as edited, before it is saved (app.js updateFontSample) -->
+                                <div class="card">
+                                <div class="font-family-label">Sample Text</div>
+                                <div class="font-sample" id="font-sample">
+                                    <div>How now, brown cow.</div>
+                                    <div>The quick brown fox jumps over the lazy dog.</div>
+                                </div>
+                                </div>
                                 <div class="card">
                                 <div class="font-family-label">Font family</div>
                                 <div class="font-family-list" id="font-family-list"></div>
@@ -1328,35 +1343,37 @@
                                             <input type="checkbox" id="font-advanced-toggle"> Advanced
                                         </label>
                                     </div>
-                                    <!-- Advanced settings (greyed out until checkbox) -->
+                                    <!-- Advanced settings (folded away until the checkbox is ticked) -->
                                     <div id="font-advanced-section">
-                                        <div class="setting-row">
-                                            <span class="setting-label" title="Line height of the input line (output rows stay at 1.0, so ANSI art joins up)">Input Ht</span>
-                                            <div class="setting-value">
-                                                <div class="stepper">
-                                                    <button id="font-lineheight-minus" class="stepper-btn">&#8722;</button>
-                                                    <span id="font-lineheight-value" class="stepper-value">1.2</span>
-                                                    <button id="font-lineheight-plus" class="stepper-btn">+</button>
+                                        <div class="font-advanced-inner">
+                                            <div class="setting-row">
+                                                <span class="setting-label" title="Line height of the input line (output rows stay at 1.0, so ANSI art joins up)">Input Ht</span>
+                                                <div class="setting-value">
+                                                    <div class="stepper">
+                                                        <button id="font-lineheight-minus" class="stepper-btn">&#8722;</button>
+                                                        <span id="font-lineheight-value" class="stepper-value">1.2</span>
+                                                        <button id="font-lineheight-plus" class="stepper-btn">+</button>
+                                                    </div>
                                                 </div>
                                             </div>
-                                        </div>
-                                        <div class="setting-row">
-                                            <span class="setting-label">Letter</span>
-                                            <div class="setting-value">
-                                                <div class="stepper">
-                                                    <button id="font-letterspacing-minus" class="stepper-btn">&#8722;</button>
-                                                    <span id="font-letterspacing-value" class="stepper-value">0</span>
-                                                    <button id="font-letterspacing-plus" class="stepper-btn">+</button>
+                                            <div class="setting-row">
+                                                <span class="setting-label">Letter</span>
+                                                <div class="setting-value">
+                                                    <div class="stepper">
+                                                        <button id="font-letterspacing-minus" class="stepper-btn">&#8722;</button>
+                                                        <span id="font-letterspacing-value" class="stepper-value">0</span>
+                                                        <button id="font-letterspacing-plus" class="stepper-btn">+</button>
+                                                    </div>
                                                 </div>
                                             </div>
-                                        </div>
-                                        <div class="setting-row">
-                                            <span class="setting-label">Word</span>
-                                            <div class="setting-value">
-                                                <div class="stepper">
-                                                    <button id="font-wordspacing-minus" class="stepper-btn">&#8722;</button>
-                                                    <span id="font-wordspacing-value" class="stepper-value">0</span>
-                                                    <button id="font-wordspacing-plus" class="stepper-btn">+</button>
+                                            <div class="setting-row">
+                                                <span class="setting-label">Word</span>
+                                                <div class="setting-value">
+                                                    <div class="stepper">
+                                                        <button id="font-wordspacing-minus" class="stepper-btn">&#8722;</button>
+                                                        <span id="font-wordspacing-value" class="stepper-value">0</span>
+                                                        <button id="font-wordspacing-plus" class="stepper-btn">+</button>
+                                                    </div>
                                                 </div>
                                             </div>
                                         </div>

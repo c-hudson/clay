@@ -167,9 +167,12 @@ impl ClayView {
         cx.notify();
     }
 
-    /// Tab completion over the commands and the actions with no pattern (app.js
-    /// `completeCommand`).
+    /// Tab completion: a world name after `/world` (`Editor::complete_world`), else the
+    /// commands and the actions with no pattern (app.js `completeCommand`).
     fn complete_input(&mut self) -> bool {
+        if self.editor.complete_world(self.session.core.worlds.iter().map(|w| w.name.as_str())) {
+            return true;
+        }
         let mut cmds: Vec<String> = crate::native_gui::core::input::internal_commands().to_vec();
         cmds.extend(self.session.core.actions.iter().filter(|a| a.pattern.trim().is_empty()).map(|a| format!("/{}", a.name)));
         self.editor.complete(&cmds)

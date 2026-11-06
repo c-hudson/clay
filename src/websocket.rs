@@ -318,6 +318,13 @@ pub enum WsMessage {
         /// id and behaves as before (markers lost on reconnect).
         #[serde(default)]
         client_uid: String,
+        /// The running program this connection is from, the same for each of its windows
+        /// (a native GUI's per-process id, the WebView GUI's `CLAY_INSTANCE_ID`). Two
+        /// programs on one machine share `client_uid` (one file, one localStorage) and are
+        /// still two interfaces to `/pause`. Empty from a browser, the phone app or an older
+        /// client: its `client_uid` alone says which interface it is.
+        #[serde(default)]
+        instance_id: String,
     },
     AuthResponse {
         success: bool,
@@ -445,6 +452,11 @@ pub enum WsMessage {
         /// false. `serde(default)` = false.
         #[serde(default)]
         map: bool,
+        /// `true` = this server takes `ResumeSession` (a paused client resumes on any use,
+        /// not only on what it sends). Gated as `other_views` is; a multiuser server, which
+        /// has no `/pause`, says false. `serde(default)` = false.
+        #[serde(default)]
+        resume_session: bool,
         /// The emoji picker's curated table, in the compact wire form
         /// `[[ch, name, "kw1 kw2", category_index], ...]` from `emoji::emoji_json()`. The
         /// table is static, so it is sent once per connection here rather than on every
@@ -547,6 +559,10 @@ pub enum WsMessage {
     ActivityUpdate { count: usize },
     /// Sent to a specific client when its server-side pause state changes
     PausedState { paused: bool },
+    /// The user did something at this client - a key, a click, a menu - while it showed
+    /// PAUSED (client -> server; only to a server whose `InitialState.resume_session` is
+    /// true). The server resumes it and answers `PausedState { paused: false }` either way.
+    ResumeSession,
     /// Broadcast when show_tags setting changes (F2 or /tag command)
     ShowTagsChanged { show_tags: bool },
     /// Server is about to reload - clients should auto-reconnect
@@ -834,6 +850,10 @@ pub enum WsMessage {
         keep_alive_gag_enabled: Option<bool>,
         #[serde(default)]
         keep_alive_gag: Option<String>,
+        /// Edit World's Login Command (`WorldSettings::login_command`, lines joined by
+        /// `\n`). None - an older client that doesn't know it - leaves it; empty clears it.
+        #[serde(default)]
+        login_command: Option<String>,
         /// Edit World's Status Panel (`WorldSettings::status_panel`). None - an older
         /// client, or an editor with no such switch - leaves it.
         #[serde(default)]
@@ -998,6 +1018,11 @@ pub enum WsMessage {
         /// `None` (an older client) = unchanged.
         #[serde(default)]
         status_panel: Option<bool>,
+        /// This client's own icon bar place (`IconBarPlace` name), under its interface key
+        /// (user request 2026-11-04). `None` (an older client, one with none of its own, or
+        /// a server before the split) = unchanged; such a client edits the shared `icon_bar`.
+        #[serde(default)]
+        icon_bar_profile: Option<InterfaceChoice>,
     },
 
     // Settings update confirmations (server -> client)
@@ -1854,6 +1879,12 @@ pub struct WorldStateMsg {
     /// server before the field, and where nobody owns markers (multiuser, `WorldAdded`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own_new_seqs: Option<Vec<u64>>,
+    /// The Activity world (`World::is_activity`): every world's new lines, each after its
+    /// world's name. A client hides it from its world lists, never holds it in more-mode or
+    /// alerts from it, and names it with `act` too. Absent from an older server, which has
+    /// none; an older client shows it as an ordinary unconnected world.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_activity: bool,
 }
 
 /// Chat-world settings in `UpdateWorldSettings` (see its `chat` field).
@@ -1984,6 +2015,9 @@ pub struct WorldSettingsMsg {
     pub keep_alive_gag_enabled: bool,
     #[serde(default)]
     pub keep_alive_gag: String,
+    /// Mirrors `WorldSettings::login_command` (lines joined by `\n`).
+    #[serde(default)]
+    pub login_command: String,
     /// Mirror of `WorldSettings::slack_token`/`slack_channel`/`slack_workspace` and
     /// `discord_token`/`discord_guild`/`discord_channel`/`discord_dm_user`. Tokens
     /// follow the password precedent above: sent plaintext to authenticated clients,
@@ -2045,6 +2079,7 @@ pub struct SettingsAdditions {
     pub screen_reader_profile: Option<InterfaceChoice>,
     pub announce_screen_reader: Option<bool>,
     pub status_panel: Option<bool>,
+    pub icon_bar_profile: Option<InterfaceChoice>,
 }
 
 /// One interface's own choice of a per-interface setting, by name: its key
@@ -2119,6 +2154,40 @@ impl GlobalSettingsMsg {
             }
             None => self.tabs = value.to_string(),
         }
+    }
+
+    /// Where interface `key` puts its icon bar (`IconBarPlace` name): its own place, else the
+    /// one the shared setting gives it - `legacy_shows` is whether App/Tablet shows the bar
+    /// in this interface (the GUIs, a tablet, the Android app with a keyboard and mouse).
+    pub fn icon_bar_for(&self, key: &str, legacy_shows: bool) -> String {
+        if let Some(own) = self.icon_bar_profiles.as_ref().and_then(|p| p.get(key)) {
+            return own.clone();
+        }
+        let shows = match crate::IconBarMode::from_name(&self.icon_bar) {
+            crate::IconBarMode::None => false,
+            crate::IconBarMode::All => true,
+            crate::IconBarMode::AppTablet => legacy_shows,
+        };
+        if shows { "top" } else { "none" }.to_string()
+    }
+
+    /// Set interface `key`'s own icon bar place, as its Settings' Save does: under its key,
+    /// or, for a server before the split, the shared setting (Top is All there, None is
+    /// None; a place the shared setting already gives leaves it as it was).
+    pub fn set_icon_bar_for(&mut self, key: &str, place: &str, legacy_shows: bool) {
+        let place = crate::IconBarPlace::from_name(place).name();
+        if let Some(profiles) = &mut self.icon_bar_profiles {
+            profiles.insert(key.to_string(), place.to_string());
+        } else if self.icon_bar_for(key, legacy_shows) != place {
+            self.icon_bar = if place == "none" { "none" } else { "all" }.to_string();
+        }
+    }
+
+    /// The `UpdateGlobalSettings.icon_bar_profile` for interface `key`: its own, once the
+    /// server keeps them and it has one.
+    pub fn icon_bar_profile_update(&self, key: &str) -> Option<InterfaceChoice> {
+        let value = self.icon_bar_profiles.as_ref()?.get(key)?;
+        Some(InterfaceChoice { key: key.to_string(), value: value.clone() })
     }
 
     /// Whether interface `key` is in Screen Reader mode: its own choice, else off.
@@ -2291,8 +2360,9 @@ pub struct GlobalSettingsMsg {
     /// right) - what an interface without its own uses. web/GUI/Android only.
     #[serde(default)]
     pub tabs: String,
-    /// Icon bar visibility mode: "none" / "app_tablet" (default) / "all".
-    /// web/GUI/Android only — see IconBarMode.
+    /// The shared Icon Bar setting (`IconBarMode` name: "none" / "app_tablet" (default) /
+    /// "all"): what an interface without its own place takes it from (`icon_bar_for`).
+    /// web/GUI/Android only.
     #[serde(default)]
     pub icon_bar: String,
     /// Import Picture's host (`picture::PictureService` value; "off" = no uploads).
@@ -2314,6 +2384,11 @@ pub struct GlobalSettingsMsg {
     /// the shared `tabs`, and offers only none/top/bottom, which such a server keeps.
     #[serde(default)]
     pub tabs_profiles: Option<std::collections::BTreeMap<String, String>>,
+    /// Each interface's own icon bar place (`IconBarPlace` name), by its key; a key without
+    /// one takes its place from the shared `icon_bar`. `None` from a server before the split:
+    /// the client then edits the shared `icon_bar`, and offers only Top and None.
+    #[serde(default)]
+    pub icon_bar_profiles: Option<std::collections::BTreeMap<String, String>>,
     /// Each interface's own Screen Reader mode, by its key; off until it chose one. `None`
     /// from a server before Screen Reader mode: the client then has none to show.
     #[serde(default)]
@@ -3244,6 +3319,14 @@ impl WebSocketServer {
         }
     }
 
+    /// Move every client's current world by `moved` (a world was removed: `App::fixup_indices_after_remove`).
+    pub fn move_client_worlds(&self, moved: impl Fn(usize) -> usize) {
+        let mut clients = self.clients.write().unwrap();
+        for client in clients.values_mut() {
+            client.current_world = client.current_world.map(&moved);
+        }
+    }
+
     /// Set the paused state for a connected client. Returns (was_paused, ip_address, current_world).
     pub fn set_client_paused(&self, client_id: u64, paused: bool) -> Option<(bool, String, Option<usize>)> {
         let mut clients = self.clients.write().unwrap();
@@ -3820,7 +3903,7 @@ where
         };
         try_send_local(&clients, client_id, &tx, &client_ip, response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new() }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new() }))).await;
     }
 
     // Combined receive/send/keepalive loop.

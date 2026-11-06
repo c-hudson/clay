@@ -32,12 +32,21 @@ Split the output in two, one pane above the other, to watch two worlds at once (
 ```
 /split            # the next world in order opens above; the focus stays below
 /split <world>    # that world above (or, already split, in the pane without the focus)
+/split act        # the Activity world above: the other worlds' new lines (or /split activity)
+/split -n 10      # the top pane 10 lines high: splits if not split, else only resizes it
+/split -n 10 rome # rome above, 10 lines high
 /unsplit          # close the pane without the focus
 ```
 
 Shift+Tab moves the focus between the panes; in the GUI and the web client a click on a
 pane does too. Neither command connects or disconnects anything. From an action, a macro
 or a TF key binding, `/split` splits the interface that ran it.
+
+Each pane always keeps at least one line: a `-n` too big for the window leaves the bottom
+pane its one line. The size you last set, with `-n` or by dragging the bar between the
+panes in the GUI and the web client, belongs to that program (each console, GUI window or
+browser page has its own), and the next `/split` opens at it again; until then the panes
+are half and half. It survives `/reload`.
 
 ### /map
 Show or hide the map of the world, and walk to a room on it (see **The Map**).
@@ -69,8 +78,12 @@ phone and SSH console attached to this Clay. It is `/remote --pause` on each of 
 
 A paused interface stops counting as watching its world, so text arriving there shows as
 new activity, and as new text (▶), where you are. Each one resumes as soon as it is used:
-a key at the console; typing, switching worlds or releasing held text in a client. The
-other windows and tabs of the interface you typed it in are left alone. `/remote` lists
+a key at the console; in a GUI, a browser or the phone app, any key, click, touch or turn
+of the mouse wheel in any of its windows, or a choice from the desktop's menu (until
+then the status bar says PAUSED); in an SSH console, a line sent, a world switch or held
+text released. A pause is a connection's: one that reconnects (after the server's
+`/reload`, say) starts unpaused. The other windows and tabs of the interface you typed it
+in are left alone; two GUIs running on one computer are two interfaces. `/remote` lists
 every interface and whether it is paused. Not available on a multiuser server.
 
 ## World Management
@@ -80,8 +93,9 @@ Open the World Selector popup or manage worlds.
 
 ```
 /worlds                 # Open world selector popup
-/worlds <name>          # Connect to world (create if doesn't exist)
-/worlds -e [name]       # Edit world settings (current if no name)
+/worlds <name>          # Switch to a world, connecting it (an unknown name: "not found")
+/worlds act             # The Activity world: other worlds' new lines (or /worlds activity)
+/worlds -e [name]       # Edit world settings (current if no name; a new name makes a world)
 /worlds -l <name>       # Connect without auto-login
 ```
 
@@ -105,12 +119,12 @@ List all connected worlds in a table format.
 
 | Column | Description |
 |--------|-------------|
+| SSH | `SSH` when the connection uses TLS, `PRX` when it goes through the reload proxy |
 | World | World name (* = current) |
 | Unseen | Count of unseen lines |
-| LastSend | Time since last command sent |
-| LastRecv | Time since last data received |
-| LastNOP | Time since last NOP keepalive |
-| NextNOP | Time until next NOP |
+| Last | Time since the last data received / the last command sent |
+| KA | Time since the last keepalive / until the next |
+| Buffer | Lines held for the world (output and pending) |
 
 ### /disconnect (or /dc)
 Disconnect the current world and close its log file.
@@ -350,7 +364,7 @@ and `/tts voice` are the shared setting and go to the server. (`clay --tts-insta
 that machine does the same install from a shell.)
 
 ### /testmusic
-Play a test ANSI music sequence (C-D-E-F-G) to verify audio.
+Play a short tune (the Super Mario Bros theme) to verify that ANSI music plays.
 
 ```
 /testmusic

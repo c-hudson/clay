@@ -130,6 +130,7 @@ impl H {
             picture_upload: true,
             history_on_demand: true,
             map: false,
+            resume_session: true,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -341,6 +342,44 @@ fn a_flush_starts_the_world_over() {
     h.msg(m);
     assert_eq!(h.texts(0), vec!["after"]);
     assert_eq!(h.core.worlds[0].seen.ranges(), &[(3, 3)]);
+}
+
+/// The Activity world's emptying is a flush with no text: nothing else arrives with it.
+#[test]
+fn an_empty_flush_empties_the_activity_world_and_adds_nothing() {
+    let mut h = H::password();
+    let mut act = world_msg(1, "Activity", 0..3, 9);
+    act.is_activity = true;
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..3, 9), act]);
+    assert!(h.core.worlds[1].is_activity && !h.core.worlds[0].is_activity);
+    h.msg(WsMessage::ServerData {
+        world_index: 1,
+        data: String::new(),
+        is_viewed: true,
+        ts: 0,
+        from_server: true,
+        seq: 0,
+        end_seq: None,
+        flush: true,
+        gagged: false,
+        archive_sourced: false,
+        highlight_colors: Vec::new(),
+    });
+    assert!(h.texts(1).is_empty(), "{:?}", h.texts(1));
+    // Its lines are copies: no Recent Worlds entry, no Taskbar Alert from them.
+    h.core.worlds[1].last_activity = None;
+    h.msg(data(1, 3, "A copied\n"));
+    assert_eq!(h.texts(1), vec!["A copied"]);
+    assert!(h.core.worlds[1].last_activity.is_none());
+    assert!(!h.core.take_live_text());
+    // A world that comes on screen here takes its lines out of the Activity world.
+    h.msg(data(1, 4, "B other\n"));
+    assert!(!h.core.drop_activity_from(&["C".to_string()]));
+    assert!(h.core.drop_activity_from(&["a".to_string()]));
+    assert_eq!(h.texts(1), vec!["B other"]);
+    // `act` names it; a real world of that name would win.
+    let names = h.core.worlds.iter().map(|w| (w.name.as_str(), w.is_activity));
+    assert_eq!(crate::util::find_world_typed(names, "act"), Some(1));
 }
 
 // ---- keeping in step ----
@@ -845,6 +884,35 @@ fn tabs_save_from_the_native_settings_under_its_own_key() {
     old.tabs_profiles = None;
     old.set_tabs_for(key, "bottom");
     assert!(matches!(settings_update(&old), WsMessage::UpdateGlobalSettings { tabs_profile: None, ref tabs, .. } if tabs == "bottom"));
+}
+
+/// The icon bar's place saves from this GUI's Settings under its own key (user request
+/// 2026-11-04): until it has one, the shared App/Tablet puts it at the top here; the shared
+/// value goes back as sent; a server before the split gets the shared field instead, All for
+/// a bar shown and None for none.
+#[test]
+fn icon_bar_saves_from_the_native_settings_under_its_own_key() {
+    let key = crate::font_profile::native_key();
+    let mut app = crate::App::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let mut s = app.build_global_settings_msg();
+    assert_eq!(s.icon_bar, "app_tablet");
+    assert_eq!(s.icon_bar_for(key, true), "top", "never chosen: App/Tablet shows it in the GUI");
+    assert_eq!(s.icon_bar_for(key, false), "none", "and not where App/Tablet doesn't");
+    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { icon_bar_profile: None, .. }));
+    s.set_icon_bar_for(key, "right", true);
+    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
+    assert_eq!(app.settings.icon_bar_profiles.get(key), Some(&crate::IconBarPlace::Right));
+    assert_eq!(app.settings.icon_bar, crate::IconBarMode::AppTablet, "the shared value is untouched");
+    assert_eq!(app.build_global_settings_msg().icon_bar_for(key, true), "right");
+    let mut old = app.build_global_settings_msg();
+    old.icon_bar_profiles = None;
+    old.set_icon_bar_for(key, "top", true);
+    assert_eq!(old.icon_bar, "app_tablet", "the place it already had: left as it was");
+    old.set_icon_bar_for(key, "none", true);
+    assert!(matches!(settings_update(&old), WsMessage::UpdateGlobalSettings { icon_bar_profile: None, ref icon_bar, .. } if icon_bar == "none"));
+    old.set_icon_bar_for(key, "top", true);
+    assert_eq!(old.icon_bar, "all");
 }
 
 /// Clear Input on Send (TF's %cleardone) round-trips through this GUI's Settings save, as
@@ -1421,6 +1489,7 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
         picture_upload: false,
         history_on_demand: false,
         map: false,
+        resume_session: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1457,6 +1526,7 @@ fn the_map_view_is_told_at_login_and_on_each_change_and_only_to_a_server_with_th
         picture_upload: true,
         history_on_demand: true,
         map,
+        resume_session: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1518,6 +1588,7 @@ fn version_names_this_gui_and_the_server() {
         picture_upload: true,
         history_on_demand: true,
         map: false,
+        resume_session: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1548,6 +1619,7 @@ fn version_names_this_gui_and_the_server() {
         picture_upload: true,
         history_on_demand: true,
         map: false,
+        resume_session: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1677,4 +1749,69 @@ fn archive_lines_survive_a_reconnect_and_stay_out_of_the_cache() {
     assert_eq!(h.core.worlds[0].history_position().0, (None, Some(crate::websocket::ArchiveCursor { wseq: Some(40), ts_ms: 500_000 })));
     // A gap fill's lines go below the archive, never above it.
     assert_eq!(h.seqs(0).last(), Some(&111));
+}
+
+/// A pause is the server's word for this connection (user report 2026-11-04: the GUI kept
+/// its PAUSED badge after the server reloaded, though it was used): any use asks once to
+/// resume, and a login starts unpaused. A server that doesn't take `ResumeSession` is
+/// never sent one (it would close the connection).
+#[test]
+fn a_paused_session_asks_once_to_resume_and_a_login_takes_the_badge_down() {
+    let resumes = |sent: &[WsMessage]| sent.iter().filter(|m| matches!(m, WsMessage::ResumeSession)).count();
+    let mut h = H::password();
+    h.connect_and_login();
+    // Its program, so another GUI on this machine (the same uid) is another interface.
+    let sent = h.sent();
+    assert!(matches!(auth_request(&sent), WsMessage::AuthRequest { instance_id, .. } if instance_id == crate::util::process_instance_id()));
+    h.initial(vec![world_msg(0, "A", 0..2, 9)]);
+    h.drain();
+    let e = h.core.user_active();
+    h.keep(e);
+    assert_eq!(resumes(&h.sent()), 0, "not paused: nothing to ask");
+    h.msg(WsMessage::PausedState { paused: true });
+    assert!(h.core.paused);
+    for _ in 0..3 {
+        let e = h.core.user_active();
+        h.keep(e);
+    }
+    assert_eq!(resumes(&h.sent()), 1, "once per pause");
+    h.msg(WsMessage::PausedState { paused: false });
+    assert!(!h.core.paused);
+    h.msg(WsMessage::PausedState { paused: true });
+    let e = h.core.user_active();
+    h.keep(e);
+    assert_eq!(resumes(&h.sent()), 1, "a new pause asks again");
+    // Connected again (the server reloaded): the new connection isn't paused.
+    h.initial(vec![world_msg(0, "A", 0..2, 9)]);
+    assert!(!h.core.paused, "a login starts unpaused");
+
+    let mut old = H::password();
+    old.connect_and_login();
+    old.msg(WsMessage::InitialState {
+        worlds: vec![world_msg(0, "A", 0..2, 9)],
+        settings: settings(),
+        current_world_index: 0,
+        actions: Vec::new(),
+        splash_lines: Vec::new(),
+        server_version: String::new(),
+        server_version_detail: String::new(),
+        android_app_version: String::new(),
+        your_display_id: 7,
+        scrollback_push: false,
+        other_views: true,
+        expand_line: true,
+        picture_upload: true,
+        history_on_demand: true,
+        map: false,
+        resume_session: false,
+        emoji_json: String::new(),
+        emoji_categories_json: String::new(),
+        tf_status: Vec::new(),
+    });
+    old.msg(WsMessage::PausedState { paused: true });
+    old.drain();
+    let e = old.core.user_active();
+    old.keep(e);
+    assert_eq!(resumes(&old.sent()), 0, "an older server is never sent it");
+    assert!(old.core.paused, "and its badge shows until it says otherwise");
 }

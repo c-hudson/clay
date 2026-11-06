@@ -582,6 +582,21 @@ impl Editor {
         true
     }
 
+    /// Tab on `/world [-e|-l] <name>`: the console's world-name completion
+    /// (`crate::input::complete_world_arg`), the cursor at the end. False when the line
+    /// isn't one, so a command is completed instead; true even with no world to complete,
+    /// as on the console.
+    pub fn complete_world<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> bool {
+        let Some(text) = crate::input::complete_world_arg(&self.text, names) else { return false };
+        if text != self.text {
+            self.text = text;
+            self.cursor = self.text.len();
+            self.anchor = None;
+            self.completion = None;
+        }
+        true
+    }
+
     pub fn reset_completion(&mut self) {
         self.completion = None;
     }
@@ -806,6 +821,21 @@ mod tests {
         assert!(!ed("say", 3).complete(&cmds));
         let list = internal_commands();
         assert!(list.contains(&"/connect".to_string()) && list.contains(&"/nogag".to_string()), "{} commands", list.len());
+    }
+
+    #[test]
+    fn tab_completes_a_world_name_as_the_console_does() {
+        let names = ["Mellow", "mush"];
+        let mut e = ed("/world me", 9);
+        assert!(e.complete_world(names));
+        assert_eq!((e.text.as_str(), e.cursor), ("/world Mellow", 13));
+        let mut e = ed("/worlds -e m", 5);
+        assert!(e.complete_world(names), "wherever the cursor is, as on the console");
+        assert_eq!((e.text.as_str(), e.cursor), ("/worlds -e Mellow", 17));
+        let mut e = ed("/world zz", 9);
+        assert!(e.complete_world(names), "a /world line with nothing to complete is still handled");
+        assert_eq!(e.text, "/world zz");
+        assert!(!ed("/wor", 4).complete_world(names), "the command itself is completed instead");
     }
 
     #[test]

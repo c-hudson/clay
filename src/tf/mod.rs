@@ -1057,6 +1057,8 @@ pub struct WorldInfoCache {
     pub tf_type: String,
     /// A `/connect <host> <port>` world (listed only by `/listworlds -u`).
     pub is_temporary: bool,
+    /// Clay's Activity world: no world definition, so never listed, saved or purged.
+    pub is_activity: bool,
     /// Automatic login is enabled for this world (`world_info(w, "login")`).
     pub login: bool,
     /// The server speaks telnet (it has negotiated something).

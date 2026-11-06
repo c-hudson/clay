@@ -285,6 +285,33 @@ fn scramble_one_word(word: &[char], rng: &mut Scrambler) -> Vec<char> {
     out
 }
 
+/// Tab on `/world` or `/worlds` with an argument: the world named by what is typed, `-e` or
+/// `-l` before it kept. Each Tab takes the next world whose name starts with what is now
+/// typed, so it moves on only while that is still a prefix of another name, as command
+/// completion does. The one rule for the console, the SSH console (`perform_completion`) and
+/// the native GUI (`Editor::complete_world`); app.js `completeWorldArg` is its copy.
+/// None: not such a line, so a command is completed instead. Some: the line after Tab,
+/// unchanged when no world matches (Tab then does nothing else).
+pub fn complete_world_arg<'a>(text: &str, names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let (cmd, args) = text.split_once(' ')?;
+    if !cmd.eq_ignore_ascii_case("/worlds") && !cmd.eq_ignore_ascii_case("/world") {
+        return None;
+    }
+    let (flag, partial) = match args.get(..2).map(str::to_ascii_lowercase).as_deref() {
+        Some("-e" | "-l") if args.len() == 2 => return Some(text.to_string()),
+        Some(f @ ("-e" | "-l")) if args[2..].starts_with(' ') => (format!("{f} "), args[3..].trim_start()),
+        _ => (String::new(), args),
+    };
+    let lower = partial.to_lowercase();
+    let mut matches: Vec<&str> = names.into_iter().filter(|n| n.to_lowercase().starts_with(&lower)).collect();
+    if matches.is_empty() {
+        return Some(text.to_string());
+    }
+    matches.sort_by_key(|n| n.to_lowercase());
+    let next = matches.iter().position(|n| n.to_lowercase() == lower).map_or(0, |i| (i + 1) % matches.len());
+    Some(format!("{cmd} {flag}{}", matches[next]))
+}
+
 /// Scramble the interior letters of every word in `text`, leaving the first and last
 /// letter of each word, and every non-letter, exactly where they are.
 ///
@@ -1599,6 +1626,33 @@ impl Default for InputArea {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_completes_a_world_name_after_world() {
+        let names = ["alpha", "apex", "Beta", "mud", "mud2"];
+        let tab = |text: &str| complete_world_arg(text, names.iter().copied());
+        assert_eq!(tab("/world a").as_deref(), Some("/world alpha"));
+        assert_eq!(tab("/world alpha").as_deref(), Some("/world alpha"), "narrowed to what is now typed");
+        assert_eq!(tab("/world mud").as_deref(), Some("/world mud2"), "on to the next while it is a prefix");
+        assert_eq!(tab("/world mud2").as_deref(), Some("/world mud2"));
+        assert_eq!(tab("/worlds -e b").as_deref(), Some("/worlds -e Beta"), "case-insensitive, the flag kept");
+        assert_eq!(tab("/WORLD -L  ap").as_deref(), Some("/WORLD -l apex"));
+        assert_eq!(tab("/world ").as_deref(), Some("/world alpha"), "nothing typed: the first");
+        assert_eq!(tab("/world -e").as_deref(), Some("/world -e"), "a flag alone: nothing to do");
+        assert_eq!(tab("/world zz").as_deref(), Some("/world zz"), "no match: unchanged");
+        assert_eq!(tab("/world"), None, "no argument: the command is completed");
+        assert_eq!(tab("/wor a"), None);
+        assert_eq!(tab("say a"), None);
+    }
+
+    /// app.js keeps its own copy (`completeWorldArg`), tried before a command is completed.
+    #[test]
+    fn the_web_client_completes_world_names_first() {
+        let js = crate::http::WEB_APP_JS;
+        let perform = &js[js.find("function performCompletion()").expect("performCompletion")..];
+        let world = perform.find("completeWorldArg(inputValue)").expect("Tab asks for a world name");
+        assert!(world < perform.find("completeCommand(inputValue)").expect("and for a command"), "a world name first");
+    }
 
     /// Type `line` the way Enter does (recorded in history), then substitute.
     fn type_and_substitute(input: &mut InputArea, line: &str) -> HistorySub {

@@ -19,24 +19,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// The programs that draw fonts, as the first half of a key, with how they are named.
-pub const PROGRAMS: &[(&str, &str)] = &[
-    ("native", "the native GUI"),
-    ("webview", "the WebView GUI"),
-    ("browser", "a web browser"),
-    ("app", "the Android app"),
-];
+/// The programs that draw fonts, as the first half of a key: the native GUI, the WebView
+/// GUI, a web browser and the Android app.
+pub const PROGRAMS: &[&str] = &["native", "webview", "browser", "app"];
 
 /// The operating systems, as the second half of a key.
-pub const OSES: &[(&str, &str)] = &[
-    ("windows", "Windows"),
-    ("macos", "macOS"),
-    ("linux", "Linux"),
-    ("android", "Android"),
-    ("ios", "iOS"),
-    ("chromeos", "ChromeOS"),
-    ("other", "another OS"),
-];
+pub const OSES: &[&str] = &["windows", "macos", "linux", "android", "ios", "chromeos", "other"];
 
 /// One program's fonts on one OS: the Font tab's settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,21 +104,8 @@ impl FontProfile {
 /// Whether `key` is `<program>-<os>` from `PROGRAMS` and `OSES`.
 pub fn valid_key(key: &str) -> bool {
     key.split_once('-').is_some_and(|(program, os)| {
-        PROGRAMS.iter().any(|(p, _)| *p == program) && OSES.iter().any(|(o, _)| *o == os)
+        PROGRAMS.contains(&program) && OSES.contains(&os)
     })
-}
-
-/// How a key reads in the Font tab: "the native GUI on Windows", "the Android app".
-pub fn label(key: &str) -> String {
-    if key == "app-android" {
-        return "the Android app".to_string();
-    }
-    let Some((program, os)) = key.split_once('-') else {
-        return key.to_string();
-    };
-    let program = PROGRAMS.iter().find(|(p, _)| *p == program).map_or(program, |(_, l)| l);
-    let os = OSES.iter().find(|(o, _)| *o == os).map_or(os, |(_, l)| l);
-    format!("{program} on {os}")
 }
 
 /// The OS this Clay was built for, as a key's second half.
@@ -355,9 +330,6 @@ mod tests {
         assert!(!valid_key("native-beos"));
         assert!(!valid_key("console-linux"));
         assert!(!valid_key("font.native-linux"));
-        assert_eq!(label("native-windows"), "the native GUI on Windows");
-        assert_eq!(label("browser-linux"), "a web browser on Linux");
-        assert_eq!(label("app-android"), "the Android app");
         assert!(valid_key(native_key()));
     }
 

@@ -2,6 +2,7 @@
 
 mod a11y;
 mod actions;
+mod activity;
 mod appmenu;
 pub mod assets;
 mod bars;
@@ -146,6 +147,9 @@ pub struct ClayView {
     actions_sig: String,
     /// Bumped whenever the same line would style differently (clears `styled`).
     style_epoch: u64,
+    /// The worlds on screen in this program when the Activity world last dropped theirs
+    /// (`drop_shown_from_activity`), by name.
+    activity_shown: Vec<String>,
     scroll: ScrollHandle,
     /// More-mode per world, by world name (more.rs): the console pages every world.
     more: HashMap<String, MoreMode>,
@@ -227,9 +231,13 @@ pub struct ClayView {
     pictures: crate::picture::ClientUploads,
     /// `/split`: the pane without the focus (split.rs); None while the output is one.
     split: Option<split::OtherPane>,
+    /// The panes' size, dragged on the bar between them (split.rs).
+    split_size: split::SplitSize,
     /// The other pane is being drawn or handled (`in_other_pane`): the focused pane's Find
     /// filter isn't applied to it.
     drawing_other_pane: bool,
+    /// Every keystroke in this window resumes a paused session (ui/activity.rs).
+    _keys: Option<gpui::Subscription>,
 }
 
 impl ClayView {
@@ -281,6 +289,7 @@ impl ClayView {
             matcher: ActionMatcher::default(),
             actions_sig: String::new(),
             style_epoch: 0,
+            activity_shown: Vec::new(),
             scroll: ScrollHandle::default(),
             more: HashMap::new(),
             history_check: false,
@@ -321,8 +330,11 @@ impl ClayView {
             badge: Default::default(),
             pictures: Default::default(),
             split: None,
+            split_size: Default::default(),
             drawing_other_pane: false,
+            _keys: None,
         };
+        view._keys = Some(activity::watch_keys(cx.entity().downgrade(), window, cx));
         view.apply_settings();
         theme_bridge::apply(&view.theme, &view.fonts, cx);
         view.bridged_theme = view.theme_json.clone();
@@ -565,7 +577,8 @@ impl ClayView {
                 rows_in_columns(&styled.text, &styled.breaks, cols, indent)
             };
             let m = self.more.entry(world.name.clone()).or_default();
-            let paused_now = m.arrivals(world, enabled, threshold, &mut rows);
+            // The Activity world never pauses: it is there to watch everything go by.
+            let paused_now = m.arrivals(world, enabled && !world.is_activity, threshold, &mut rows);
             arrived_all.extend(m.take_arrived());
             if paused_now && i == shown {
                 self.scroll.borrow_mut().follow_bottom();
@@ -1036,9 +1049,8 @@ impl ClayView {
         };
         let mut out = Vec::with_capacity(world.lines.len());
         let mut seqs = Vec::with_capacity(world.lines.len());
-        // Find's filter and search are the focused pane's (`/split`).
+        // Find's filter is the focused pane's (`/split`).
         let filter = self.find.filtering().map(str::to_string).filter(|_| !self.drawing_other_pane);
-        let cut = self.find.search_cut().filter(|_| !self.drawing_other_pane);
         let mut styler = Styler {
             styled: &mut self.styled,
             palette: &self.palette,
@@ -1055,9 +1067,6 @@ impl ClayView {
         for line in &world.lines {
             holding |= more.is_some_and(|m| m.is_held(line.id));
             if holding || (line.gagged && !self.show_tags) || hidden_line(&line.text) {
-                if Some(line.id) == cut {
-                    break;
-                }
                 continue;
             }
             // F4: only the lines containing Find's text.
@@ -1070,13 +1079,17 @@ impl ClayView {
             }
             seqs.push(line.seq.filter(|_| !line.from_archive));
             out.push((line.id, styler.line(line)));
-            if Some(line.id) == cut {
-                // F5: the output ends at the match.
-                break;
-            }
         }
-        if self.styled.len() > 2 * out.len() + 1024 {
-            let live: std::collections::HashSet<u64> = world.lines.iter().map(|l| l.id).collect();
+        // The styled lines kept are those of the worlds on screen here: this one's and, split,
+        // the other pane's. Only the focused pane's drawing prunes, as it knows both: the
+        // other pane's, drawn last, used to keep its own world's alone, so whenever it held
+        // far fewer lines (the Activity world) every frame ended with the focused pane's
+        // gone, and a click on a link there found no line to follow (user report 2026-11-05:
+        // links dead in a split until Shift+Tab).
+        let other = if self.drawing_other_pane { None } else { self.split_other().and_then(|i| self.session.core.worlds.get(i)) };
+        let shown = world.lines.len() + other.map_or(0, |w| w.lines.len());
+        if !self.drawing_other_pane && self.styled.len() > 2 * shown + 1024 {
+            let live: std::collections::HashSet<u64> = world.lines.iter().chain(other.into_iter().flat_map(|w| w.lines.iter())).map(|l| l.id).collect();
             self.styled.retain(|id, _| live.contains(id));
         }
         // TF's %textdiv divider for this visit (not in a filtered view).
@@ -1114,13 +1127,30 @@ impl ClayView {
         };
         let _ = window;
         let (top, bottom) = if other_on_top { (other, focused) } else { (focused, other) };
+        // The top pane its lines (`/split -n`, a drag of the bar: split.rs), else half; it
+        // gives way to the bottom pane's one line when the window is short. Each says how
+        // high it was laid out, for a drag to measure from.
+        let one_line = px(self.pane_height(1));
+        let top_basis = self.split_size.top_lines.map(|n| px(self.pane_height(n)));
+        let pane = |el: gpui::AnyElement, h: std::rc::Rc<std::cell::Cell<f32>>| {
+            div()
+                .relative()
+                .flex_shrink(1.0)
+                .min_h(one_line)
+                .child(gpui::canvas(move |bounds, _, _| h.set(f32::from(bounds.size.height)), |_, _, _, _| {}).absolute().size_full())
+                .child(el)
+        };
+        let top = match top_basis {
+            Some(basis) => pane(top, self.split_size.top_h.clone()).flex_grow(0.0).flex_basis(basis),
+            None => pane(top, self.split_size.top_h.clone()).flex_grow(1.0).flex_basis(px(0.0)),
+        };
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(div().flex_1().min_h_0().child(top))
+            .child(top)
             .child(bar)
-            .child(div().flex_1().min_h_0().child(bottom))
+            .child(pane(bottom, self.split_size.bottom_h.clone()).flex_grow(1.0).flex_basis(px(0.0)))
             .into_any_element()
     }
 
@@ -1411,7 +1441,14 @@ impl Render for ClayView {
         };
         // A grep window shows its matches and nothing else (app.js GREP_MODE).
         let grep = self.mode.grep.is_some();
-        let icon_bar = if grep { None } else { self.icon_bar(cx) };
+        // The icon bar: a row above or below the output, or a column beside it (Icon Bar,
+        // this window's own), always outside the tabs. Whatever isn't taken here is the
+        // bottom row.
+        let icon_place = self.icon_bar_place();
+        let mut icon_bar = if grep { None } else { self.icon_bar(&icon_place, cx) };
+        let icon_top = if icon_place == "top" { icon_bar.take() } else { None };
+        let icon_left = if icon_place == "left" { icon_bar.take() } else { None };
+        let icon_right = if icon_place == "right" { icon_bar.take() } else { None };
         let drop_tint = {
             let mut tint = self.chrome.tokens.accent;
             tint.a = 0.12;
@@ -1472,6 +1509,7 @@ impl Render for ClayView {
             // the end of a press.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
                 this.bar_drag(ev, cx);
+                this.split_bar_drag(ev, cx);
                 if this.chrome.slider_drag {
                     if ev.pressed_button == Some(MouseButton::Left) {
                         this.slide_to(ev.position.x, cx);
@@ -1494,6 +1532,7 @@ impl Render for ClayView {
                     this.chrome.closed_by_press = None;
                     this.input_resize_end(cx);
                     this.bar_release(cx);
+                    this.split_bar_up();
                 }),
             )
             // Import Picture: pictures dropped onto the window (a tint while they're over it).
@@ -1505,22 +1544,26 @@ impl Render for ClayView {
                 }
             }))
             .child(picture::drop_after_typing_fix())
-            .children(icon_bar)
+            .child(activity::watch_mouse(cx.entity().downgrade()))
+            .children(icon_top)
             .children(tabs_top)
-            // The output between the side columns (Tabs: Left/Right).
+            // The output between the side columns (Tabs, Icon Bar: Left/Right).
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .flex_1()
                     .min_h_0()
+                    .children(icon_left)
                     .children(tabs_left)
                     .child(div().flex_1().min_w_0().h_full().child(body))
                     .children(map_pane)
-                    .children(tabs_right),
+                    .children(tabs_right)
+                    .children(icon_right),
             )
             .children(stats)
             .children(tabs)
+            .children(icon_bar)
             .children(status_bar)
             .children(input_bar)
             .children(self.sr_announcer(window))

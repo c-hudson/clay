@@ -96,6 +96,18 @@ pub fn is_loopback_host(host: &str) -> bool {
     h.parse::<std::net::IpAddr>().map(|ip| crate::websocket::is_loopback_ip(&ip)).unwrap_or(false)
 }
 
+/// This running program's id, the same all its life and for each of its windows
+/// (`AuthRequest.instance_id`): what tells two GUIs on one machine apart, which share
+/// their `client_uid`.
+pub fn process_instance_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        let _ = getrandom::getrandom(&mut bytes);
+        format!("p-{}-{}", std::process::id(), hex::encode(bytes))
+    })
+}
+
 /// Constant-time byte comparison — avoids leaking a secret's length or
 /// prefix-match progress via timing. Unlike a naive `a == b` (or a compare
 /// that early-returns on a length mismatch), this always walks the full
@@ -880,13 +892,58 @@ pub fn calculate_world_switch(
     }
 }
 
+/// The Activity world's name (user request 2026-11-05): `/world activity`, or `act`.
+pub const ACTIVITY_WORLD_NAME: &str = "Activity";
+
+/// The world an Activity world line came from: its first word, since every line there
+/// starts with its world's name and a world name never has a space.
+pub fn activity_line_world(text: &str) -> Option<String> {
+    strip_ansi_codes(text).split_whitespace().next().map(str::to_string)
+}
+
+/// `act`, the Activity world's short name in `/world` and `/split`.
+pub fn is_activity_alias(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("act")
+}
+
+/// A world named in `/world <name>` or `/split <name>`, for the clients that keep their own
+/// list (the native GUI): by name (any case), else `act` for the Activity world. `worlds`
+/// is each world's (name, is_activity). `App::find_world_typed` is the server's.
+pub fn find_world_typed<'a>(worlds: impl IntoIterator<Item = (&'a str, bool)>, name: &str) -> Option<usize> {
+    let worlds: Vec<(&str, bool)> = worlds.into_iter().collect();
+    let name = name.trim();
+    worlds.iter().position(|w| w.0.eq_ignore_ascii_case(name))
+        .or_else(|| if is_activity_alias(name) { worlds.iter().position(|w| w.1) } else { None })
+}
+
+/// What `/split` was given: `-n <lines>` (the top pane's lines, user request 2026-11-05;
+/// `-n10` too) and a world name, in that order. The one parser for every interface (app.js
+/// `parseSplitArgs` is a port of it); `Err` is the line to say.
+pub fn parse_split_args(args: &str) -> Result<(Option<usize>, Option<String>), String> {
+    const USAGE: &str = "Usage: /split [-n <lines>] [world]";
+    let mut words = args.split_whitespace().peekable();
+    let mut lines = None;
+    if let Some(first) = words.peek().copied().filter(|w| w.starts_with('-')) {
+        words.next();
+        let Some(rest) = first.strip_prefix("-n") else { return Err(USAGE.to_string()) };
+        let number = if rest.is_empty() { words.next().unwrap_or("") } else { rest };
+        match number.parse::<usize>() {
+            Ok(n) if n >= 1 => lines = Some(n),
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    let world: Vec<&str> = words.collect();
+    Ok((lines, (!world.is_empty()).then(|| world.join(" "))))
+}
+
 /// The world a bare `/split` opens beside `current` (user ruling 2026-10-30: "the next in
 /// order"): the next connected world after it in alphabetical order (case-insensitive,
 /// wrapping), else the next of all worlds; None when there is no other world. `worlds` is
-/// each world's (name, connected). The one rule for every interface: the console and the
-/// native GUI call this, app.js `splitNextWorld` is a port of it.
-pub fn split_next_world(worlds: &[(&str, bool)], current: usize) -> Option<usize> {
-    let mut order: Vec<usize> = (0..worlds.len()).collect();
+/// each world's (name, connected, is_activity): the Activity world is never picked, only
+/// named. The one rule for every interface: the console and the native GUI call this,
+/// app.js `splitNextWorld` is a port of it.
+pub fn split_next_world(worlds: &[(&str, bool, bool)], current: usize) -> Option<usize> {
+    let mut order: Vec<usize> = (0..worlds.len()).filter(|&i| !worlds[i].2 || i == current).collect();
     order.sort_by_key(|&i| (worlds[i].0.to_lowercase(), i));
     let at = order.iter().position(|&i| i == current)?;
     let after = || (1..order.len()).map(|k| order[(at + k) % order.len()]);
@@ -1718,15 +1775,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_split_args_takes_n_lines_then_a_world() {
+        assert_eq!(parse_split_args(""), Ok((None, None)));
+        assert_eq!(parse_split_args("Big World"), Ok((None, Some("Big World".to_string()))));
+        assert_eq!(parse_split_args("-n 10"), Ok((Some(10), None)));
+        assert_eq!(parse_split_args("-n10 rome"), Ok((Some(10), Some("rome".to_string()))));
+        assert_eq!(parse_split_args("  -n  3   act "), Ok((Some(3), Some("act".to_string()))));
+        for bad in ["-n", "-n 0", "-n x", "-n -2", "-x rome", "-n 2.5"] {
+            assert_eq!(parse_split_args(bad), Err("Usage: /split [-n <lines>] [world]".to_string()), "{bad}");
+        }
+    }
+
+    #[test]
     fn test_split_next_world() {
-        let w = [("Charlie", true), ("alpha", true), ("Bravo", false), ("delta", true)];
+        let w = [("Charlie", true, false), ("alpha", true, false), ("Bravo", false, false), ("delta", true, false)];
         // From alpha: Bravo isn't connected, so Charlie; from delta, round to alpha.
         assert_eq!(split_next_world(&w, 1), Some(0));
         assert_eq!(split_next_world(&w, 3), Some(1));
         // Nothing else connected: the next of all worlds.
-        let quiet = [("alpha", true), ("Bravo", false), ("Charlie", false)];
+        let quiet = [("alpha", true, false), ("Bravo", false, false), ("Charlie", false, false)];
         assert_eq!(split_next_world(&quiet, 0), Some(1));
-        assert_eq!(split_next_world(&[("only", true)], 0), None);
+        assert_eq!(split_next_world(&[("only", true, false)], 0), None);
+        // The Activity world is only ever named, never the next one.
+        let act = [("alpha", true, false), ("Activity", false, true), ("Bravo", false, false)];
+        assert_eq!(split_next_world(&act, 0), Some(2));
+        assert_eq!(split_next_world(&[("alpha", true, false), ("Activity", false, true)], 0), None);
+        // From the Activity world itself, the next connected world in order.
+        assert_eq!(split_next_world(&act, 1), Some(0));
+    }
+
+    #[test]
+    fn activity_line_world_is_the_first_word() {
+        let label = crate::newbg::activity_label(&crate::encoding::NewIndicator::None, "8bit");
+        assert_eq!(activity_line_world(&format!("{label}\x1b[31mYou hear a bell")).as_deref(), Some("8bit"));
+        assert_eq!(activity_line_world("   "), None);
+    }
+
+    #[test]
+    fn find_world_typed_takes_act_for_the_activity_world() {
+        let w = [("alpha", false), ("Activity", true)];
+        assert_eq!(find_world_typed(w, "ACT"), Some(1));
+        assert_eq!(find_world_typed(w, "activity"), Some(1));
+        assert_eq!(find_world_typed(w, "Alpha"), Some(0));
+        assert_eq!(find_world_typed(w, "beta"), None);
+        // A real world named Act wins.
+        assert_eq!(find_world_typed([("Act", false), ("Activity", true)], "act"), Some(0));
+        // No Activity world: act is nothing.
+        assert_eq!(find_world_typed([("alpha", false)], "act"), None);
     }
 
     #[test]

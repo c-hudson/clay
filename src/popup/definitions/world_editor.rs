@@ -58,6 +58,8 @@ pub const WORLD_FIELD_DISCORD_SERVER_PICK: FieldId = FieldId(45);
 pub const WORLD_FIELD_DISCORD_CHANNEL_PICK: FieldId = FieldId(46);
 /// Fetch result / progress line for chat worlds (Slack and Discord share it).
 pub const WORLD_FIELD_CHAT_STATUS: FieldId = FieldId(47);
+/// MUD worlds: the Login Command, three lines run after Clay's auto-login.
+pub const WORLD_FIELD_LOGIN_COMMAND: FieldId = FieldId(48);
 
 // Button IDs
 pub const WORLD_BTN_SAVE: ButtonId = ButtonId(1);
@@ -169,6 +171,8 @@ pub struct WorldSettings {
     pub keep_alive_cmd: String,
     pub keep_alive_gag_enabled: bool,
     pub keep_alive_gag: String,
+    /// The Login Command (`WorldSettings::login_command` in main.rs).
+    pub login_command: String,
     pub gmcp_packages: String,
     pub auto_reconnect_secs: String,
     pub msp_enabled: bool,
@@ -344,6 +348,11 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             WORLD_FIELD_STATUS_LINE,
             "Status Line",
             FieldKind::toggle(settings.status_panel),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_LOGIN_COMMAND,
+            "Login Cmd",
+            FieldKind::multiline(&settings.login_command, 3),
         ))
         // Slack fields
         .with_field(Field::new(
@@ -578,6 +587,14 @@ fn world_editor_help_text() -> Vec<String> {
         "  over GMCP or MSDP) for this world, in every interface",
         "  (the GUIs call it the Status Panel). /stats lists them",
         "  either way; Status Line in /setup hides it everywhere.",
+        "",
+        "Login Cmd: Commands run once Clay has logged in (sent",
+        "  the connect line, or answered the login prompts):",
+        "  one per line, and ; between commands on one line",
+        "  (\\; sends a ;). say hello;say bye then look is three",
+        "  commands. A /command runs as typed; anything else",
+        "  goes to the MUD. Not run when Clay doesn't log in",
+        "  (no User or Password, Auto Login None, /worlds -l).",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -590,6 +607,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_TF_TYPE, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
         WORLD_FIELD_MSP_ENABLED,
         WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_STATUS_LINE,
+        WORLD_FIELD_LOGIN_COMMAND,
     ];
 
     // Slack fields

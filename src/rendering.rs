@@ -306,9 +306,10 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let output_height = total_height.saturating_sub(separator_height + input_total_height + stats_line_height);
 
     // Split (`/split`): the output area is the top pane, the bar between the panes (one
-    // row) and the bottom pane, the bottom one taking any odd row. `output_height` is the
-    // focused pane's rows from here on: paging, more-mode and the rest act on the focused
-    // pane, as they act on the current world.
+    // row) and the bottom pane: the top pane `/split -n` rows, else half with the bottom one
+    // taking any odd row, and each pane one row at least. `output_height` is the focused
+    // pane's rows from here on: paging, more-mode and the rest act on the focused pane, as
+    // they act on the current world.
     // The map pane (`/map`, src/map) takes the top rows of the output area, its bar under
     // them; the panes below share what is left. Its height depends only on the area's
     // (never on the map's contents), so a room arriving never resizes the output.
@@ -316,7 +317,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let area_rows = output_height.saturating_sub(map_block).max(1);
     let pane_rows = match app.split {
         Some(_) => {
-            let top = (area_rows.saturating_sub(1) / 2).max(1);
+            let most = area_rows.saturating_sub(2).max(1);
+            let top = match app.split_top_rows {
+                Some(n) => (n.min(most as usize) as u16).max(1),
+                None => (area_rows.saturating_sub(1) / 2).max(1),
+            };
             (top, area_rows.saturating_sub(top + 1).max(1))
         }
         None => (0, area_rows),
@@ -2616,7 +2621,8 @@ fn grey_bar_text<'a>(spans: Vec<Span<'a>>, app: &App) -> Vec<Span<'a>> {
 /// is actively retrying (`World::is_reconnecting` - distinct from a plain disconnect so
 /// "still trying" reads differently from "gave up"), red when disconnected outright.
 fn connection_ball(world: &World, theme: crate::Theme) -> Span<'static> {
-    let dot_color = if world.connected {
+    // The Activity world has no connection; it is live whenever it is shown.
+    let dot_color = if world.connected || world.is_activity {
         theme.fg_success()
     } else if world.is_reconnecting() {
         theme.fg_highlight()
@@ -2808,7 +2814,7 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Only show connection ball, world name, and tag indicator if world has ever connected
     // Use world.was_connected flag (set to true on first connection)
-    let was_connected = world.was_connected;
+    let was_connected = world.was_connected || world.is_activity;
 
     let current_pos = if was_connected {
         // Connection status ball (`connection_ball`). Reused for the SSH remote console for

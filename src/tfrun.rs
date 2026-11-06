@@ -125,7 +125,7 @@ impl App {
             None => {
                 let name = match req.world {
                     Some(name) => name,
-                    None => self.worlds.iter().find(|w| !w.is_temporary && !w.is_initial_world)
+                    None => self.worlds.iter().find(|w| !w.is_temporary && !w.is_initial_world && !w.is_activity)
                         .map(|w| w.name.clone())
                         .ok_or_else(|| "CONNECT: default world: no such world".to_string())?,
                 };

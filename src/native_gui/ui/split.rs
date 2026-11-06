@@ -8,6 +8,9 @@
 //! (Shift+Tab, a plain click in the other pane) swaps the two, and drawing or handling the
 //! mouse in the other pane swaps them in for the while (`in_other_pane`).
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{Context, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, px};
 
 use super::ClayView;
@@ -21,6 +24,31 @@ pub(super) struct KeptSplit {
     pub world: String,
     pub on_top: bool,
 }
+
+/// The panes' size (user requests 2026-11-05): dragging the bar between them moves it, as
+/// dragging the input's top edge resizes the input, and `/split -n <lines>` sets it. It is
+/// the top pane's lines, this window's own, kept for its next `/split` and across a relaunch
+/// (never in a file other windows read); each pane keeps one line.
+#[derive(Default)]
+pub(super) struct SplitSize {
+    /// The top pane's lines; None: half each.
+    pub top_lines: Option<usize>,
+    /// A press on the bar, until it is let go.
+    drag: Option<SplitDrag>,
+    /// The two panes' heights as last laid out, for a drag to measure from.
+    pub top_h: Rc<Cell<f32>>,
+    pub bottom_h: Rc<Cell<f32>>,
+}
+
+struct SplitDrag {
+    from_y: f32,
+    /// The top pane's height when pressed.
+    from_h: f32,
+    moved: bool,
+}
+
+/// How far a press on the bar moves before it is a drag, not a click.
+const DRAG_SLOP: f32 = 3.0;
 
 /// The pane without the focus.
 #[derive(Default)]
@@ -57,7 +85,7 @@ impl ClayView {
     pub(super) fn split_open(&mut self, world: Option<&str>) -> Result<(), String> {
         let core = &self.session.core;
         let named = match world.map(str::trim).filter(|w| !w.is_empty()) {
-            Some(name) => match core.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+            Some(name) => match crate::util::find_world_typed(core.worlds.iter().map(|w| (w.name.as_str(), w.is_activity)), name) {
                 Some(i) => Some(i),
                 None => return Err(format!("World '{name}' not found.")),
             },
@@ -67,7 +95,7 @@ impl ClayView {
             (Some(i), _) => i,
             (None, true) => return Err("The output is already split; /unsplit closes the pane without the focus.".to_string()),
             (None, false) => {
-                let worlds: Vec<(&str, bool)> = core.worlds.iter().map(|w| (w.name.as_str(), w.connected)).collect();
+                let worlds: Vec<(&str, bool, bool)> = core.worlds.iter().map(|w| (w.name.as_str(), w.connected, w.is_activity)).collect();
                 match crate::util::split_next_world(&worlds, core.current) {
                     Some(i) => i,
                     None => return Err("There is no other world to show.".to_string()),
@@ -86,8 +114,10 @@ impl ClayView {
         Ok(())
     }
 
-    /// `/split [world]` or `/unsplit`, typed here or sent back by the server (an action):
-    /// only an error is said in the output.
+    /// `/split [-n <lines>] [world]` or `/unsplit`, typed here or sent back by the server
+    /// (an action): only an error is said in the output. `-n` makes the top pane that many
+    /// lines, kept for this window's next `/split` (user request 2026-11-05; the console's
+    /// `App::split_command`); while split, `-n` alone only resizes.
     pub(super) fn split_command(&mut self, command: &str, cx: &mut Context<Self>) {
         let mut words = command.split_whitespace();
         let first = words.next().unwrap_or("").to_lowercase();
@@ -95,8 +125,15 @@ impl ClayView {
         let done = if first == "/unsplit" {
             self.split_close()
         } else {
-            let world = (!rest.is_empty()).then(|| rest.join(" "));
-            self.split_open(world.as_deref())
+            crate::util::parse_split_args(&rest.join(" ")).and_then(|(lines, world)| {
+                if !(lines.is_some() && world.is_none() && self.split.is_some()) {
+                    self.split_open(world.as_deref())?;
+                }
+                if lines.is_some() {
+                    self.split_size.top_lines = lines;
+                }
+                Ok(())
+            })
         };
         if let Err(reply) = done {
             self.client_line(&reply, cx);
@@ -169,6 +206,7 @@ impl ClayView {
 
     /// The split, for a relaunch to bring back.
     pub(super) fn split_to_keep(&self) -> Option<KeptSplit> {
+        // (Its size goes on its own, `SavedInput.split_top_lines`: kept while not split too.)
         self.split.as_ref().map(|p| KeptSplit { world: p.world.clone(), on_top: p.on_top })
     }
 
@@ -222,6 +260,55 @@ impl ClayView {
         }
     }
 
+    // ---- the bar between the panes ----
+
+    /// A press on the pane bar moves the focus to the bar's pane, as before, and a drag
+    /// from it moves the bar (the panes' size), as a window's title bar does both.
+    pub(super) fn split_bar_down(&mut self, ev: &MouseDownEvent, focused: bool, cx: &mut Context<Self>) {
+        if !focused {
+            self.split_focus_swap(cx);
+        }
+        self.split_size.drag = Some(SplitDrag { from_y: f32::from(ev.position.y), from_h: self.split_size.top_h.get(), moved: false });
+    }
+
+    /// The height a pane takes to show `lines` (output.rs: a row is the font size, with
+    /// `PAD_Y` above and below).
+    pub(super) fn pane_height(&self, lines: usize) -> f32 {
+        lines as f32 * self.font_size + 2.0 * super::output::PAD_Y
+    }
+
+    /// The mouse moved with the bar pressed (the root's mouse-move, wherever the mouse is):
+    /// the bar follows it a line at a time, leaving each pane a line at least.
+    pub(super) fn split_bar_drag(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.split_size.drag.is_none() {
+            return;
+        }
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.split_size.drag = None;
+            return;
+        }
+        let row = self.font_size.max(1.0);
+        let pad = self.pane_height(0);
+        let area = self.split_size.top_h.get() + self.split_size.bottom_h.get();
+        let most = (((area - self.pane_height(1) - pad) / row).floor() as usize).max(1);
+        let Some(d) = self.split_size.drag.as_mut() else { return };
+        let dy = f32::from(ev.position.y) - d.from_y;
+        if !d.moved && dy.abs() < DRAG_SLOP {
+            return;
+        }
+        d.moved = true;
+        let lines = (((d.from_h + dy - pad) / row).round().max(1.0) as usize).min(most);
+        if self.split_size.top_lines != Some(lines) {
+            self.split_size.top_lines = Some(lines);
+            cx.notify();
+        }
+    }
+
+    /// The press on the bar let go.
+    pub(super) fn split_bar_up(&mut self) {
+        self.split_size.drag = None;
+    }
+
     // ---- the other pane's mouse ----
 
     pub(super) fn other_pane_mouse_down(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
@@ -243,6 +330,10 @@ impl ClayView {
     }
 
     pub(super) fn other_pane_mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        // The bar's press let go over this pane: no click of this pane's (the root ends it).
+        if self.split_size.drag.is_some() {
+            return;
+        }
         // A plain click - no text selected, no link followed - moves the focus here.
         if self.in_other_pane(|this| this.output_mouse_up(ev, cx)).unwrap_or(false) {
             self.split_focus_swap(cx);
@@ -270,7 +361,20 @@ impl ClayView {
             }
         } else {
             self.more_mut().wheel_px = 0.0;
-            let rows = (dy / self.font_size).round() as isize;
+            // A touchpad, a trackpad or a high-resolution wheel turns a fraction of a row at
+            // a time: the rest is kept for the next turn (rounding each turn alone, those
+            // never scrolled up at all). Turning the other way starts afresh.
+            let rows = {
+                let mut s = self.scroll.borrow_mut();
+                let turn = dy / self.font_size;
+                if s.wheel_rest * turn < 0.0 {
+                    s.wheel_rest = 0.0;
+                }
+                s.wheel_rest += turn;
+                let rows = s.wheel_rest.trunc();
+                s.wheel_rest -= rows;
+                rows as isize
+            };
             if rows != 0 {
                 self.user_scroll(rows);
             }

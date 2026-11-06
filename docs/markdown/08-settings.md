@@ -30,6 +30,7 @@ Open with `/setup` command:
 | Speak Mode | All: every line. Limit: only lines like `Name says, "..."` and later lines from the same speakers | All |
 | Kokoro Voice | Which of Kokoro's 54 voices speaks, e.g. `af_heart`, `am_michael`, `bf_emma`; `/tts voices` lists them by language. Shown only where Kokoro can speak: not in a browser, the Android app or the static Linux console. In `settings.dat`: `tts_voice` (the console's), `tts.<interface>.voice` (the others') | af_heart |
 | Tabs | Where the tabs of the connected worlds go in the GUIs, the web page and the Android app: Top (a strip above the output), Bottom (a strip above the status bar), Left or Right (a column beside the output, names cut short to fit), or None. Kept per interface, so a desktop window can have them at the side while a phone keeps them at the top: each interface's own Settings sets its own, and one that never chose uses the shared value. Clicking a tab switches to that world. In `settings.dat`: `tabs` (the shared value), `tabs.<interface key>` (each interface's own) | None |
+| Icon Bar | Where the large Worlds, Actions, Settings, Find and Tags buttons (and any Action marked GUI Menu Shortcut) go in the GUIs, the web page and the Android app: Top (a row above the output), Bottom (a row above the status bar), Left or Right (a column beside the output, outside the tabs; it scrolls when the buttons don't fit), or None. Kept per interface: each interface's own Settings sets its own, and the others keep theirs. One that never chose keeps what it showed before: at the top in the GUIs, on a tablet and in the Android app with a keyboard and a mouse, nothing in a desktop browser or on a phone. In `settings.dat`: `icon_bar.<interface key>` (each interface's own); `icon_bar` is the older shared setting (`none`, `app_tablet`, `all`) that an interface without its own place follows | Top in the GUIs and on a tablet, else None |
 | Screen Reader | For use with a screen reader (see **Accessibility**): new lines are read out once as they appear, Text Reveal is off, this interface's TTS stays quiet so nothing is read twice, and the focus stays where you put it. Kept per interface, set in each interface's own Settings; turned on by itself, once, in the GUI and the Android app when a screen reader is running and that interface never chose. In `settings.dat`: `screen_reader` (the console), `screen_reader.<interface key>` (the others) | Off |
 | MUDs: Screen Reader | Tell the games you connect to that you use a screen reader (the MTTS screen-reader flag), so a game that knows it can send simpler text. One global setting, shown everywhere; takes effect at the next connect. In `settings.dat`: `announce_screen_reader` | Off |
 | Status Panel | Show the stats a game sends over GMCP `Char.*` or MSDP (HP, mana and the like): the panel above the bar in the GUIs, the web page and the Android app, the status line in the console, where `/setup` calls it Status Line (see **Status Display** in the Interface chapter). Off hides it for every world, in every interface; each world also has its own switch in its editor. One global setting, shown everywhere. In `settings.dat`: `status_panel` | On |
@@ -109,6 +110,26 @@ Send To, Show Only, and a **Fetch** button that fills in pick lists); see the
 | MOO_prompt | Like Prompt, but sends username again on third prompt |
 
 Auto-login only triggers if BOTH username AND password are configured.
+
+### Login Command
+
+The **Login Command** card in the editor's Options (the console's **Login Cmd**, three
+lines tall in every interface) holds commands Clay runs once its auto-login is done:
+right after the `connect` line (Connect) or the two lines (Lines), after the answer to
+the last login prompt (Prompt, MOO_prompt), and for a FANSI world after the login it
+holds back while it detects the client. Each line is a command, and `;` separates
+commands on one line (`\;` sends a `;`), as in an action's command:
+
+```
+say hello;say goodbye
+look somewhere
+```
+
+is three commands sent in that order: `say hello`, `say goodbye`, `look somewhere`. A
+line starting with `/` runs as if typed (a Clay or TinyFugue command, a macro, an
+action); anything else goes to the MUD. Nothing runs when Clay doesn't log in: no User
+or Password, Auto Login set to None, `/worlds -l`, or TinyFugue's `%login` off. In
+`settings.dat`: `login_command` (newlines written as `\n`).
 
 ### Prompt Detection
 

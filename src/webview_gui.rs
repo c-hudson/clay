@@ -1088,7 +1088,8 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     document.addEventListener('contextmenu', function(e) {
-        /* Only override context menu in the output area; use browser default elsewhere (input, etc.) */
+        /* Only override context menu in the output area; the input area's is app.js's
+           (openInputMenu), the textarea's WebKit's. */
         if (!e.target.closest('#output-container, #split-output-container')) return;
         e.preventDefault();
         closeCtxMenu();
@@ -1175,10 +1176,12 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 </script>"#;
     // The OS for the fonts this GUI keeps on it (src/font_profile.rs): the page can't tell
-    // from its user agent (Termux's WebKitGTK says Linux).
+    // from its user agent (Termux's WebKitGTK says Linux). And this program's id, the same
+    // in each of its windows, for `/pause` (`AuthRequest.instance_id`): another WebView
+    // GUI on this machine shares the page's localStorage, and so its client_uid.
     let webview_overrides = webview_overrides.replace(
         "window.WEBVIEW_MODE = true;",
-        &format!("window.WEBVIEW_MODE = true;\nwindow.CLAY_GUI_OS = '{}';", crate::font_profile::this_os()),
+        &format!("window.WEBVIEW_MODE = true;\nwindow.CLAY_GUI_OS = '{}';\nwindow.CLAY_INSTANCE_ID = '{}';", crate::font_profile::this_os(), crate::util::process_instance_id()),
     );
     html = html.replace("</head>", &format!("{}\n</head>", webview_overrides));
 

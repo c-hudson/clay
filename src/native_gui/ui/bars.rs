@@ -1,4 +1,4 @@
-//! The other bars around the output, as the web client draws them: the icon bar above it
+//! The other bars around the output, as the web client draws them: the icon bar
 //! (`#icon-bar`: the built-in tiles and the Actions marked as shortcuts), the world-tabs
 //! ribbon (`#tabs-ribbon`) and the MUD's status panel (`#stats-panel`).
 
@@ -17,6 +17,9 @@ use crate::websocket::WsMessage;
 const ARROW_STEP: f32 = 120.0;
 /// The width of the world tabs when they sit beside the output (Tabs: Left/Right).
 const TABS_COLUMN_WIDTH: f32 = 150.0;
+/// The icon bar's padding round its tiles, the same as a row and as a column.
+const ICON_BAR_PAD_X: f32 = 7.0;
+const ICON_BAR_PAD_Y: f32 = 5.0;
 
 /// The built-in tiles: (menu action, icon, label, title).
 const TILES: &[(&str, &str, &str, &str)] = &[
@@ -75,10 +78,11 @@ fn scroll_by(handle: &gpui::ScrollHandle, step: f32) {
 }
 
 impl ClayView {
-    /// Whether the icon bar shows: the `icon_bar` setting is "app_tablet" (this is the
-    /// desktop app) or "all".
-    fn icon_bar_on(&self) -> bool {
-        self.session.core.settings.as_ref().is_some_and(|s| s.icon_bar != "none")
+    /// Where this window's icon bar goes: "top", "bottom", "left", "right" or "none" - its
+    /// own place (user request 2026-11-04), else the shared setting's, under which App/Tablet
+    /// shows it here (this is the desktop app).
+    pub(super) fn icon_bar_place(&self) -> String {
+        self.session.core.settings.as_ref().map_or_else(|| "none".to_string(), |s| s.icon_bar_for(crate::font_profile::native_key(), true))
     }
 
     /// A tile: an icon over a label, lifted off the bar, lit when hovered or on.
@@ -142,22 +146,31 @@ impl ClayView {
         if shown { a } else { invisible(a) }
     }
 
-    pub(super) fn icon_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.icon_bar_on() {
-            return None;
+    /// The icon bar at `place` (`icon_bar_place`): a row above or below the output, a column
+    /// beside it, or nothing.
+    pub(super) fn icon_bar(&self, place: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        match place {
+            "top" | "bottom" => Some(self.icon_bar_row(cx)),
+            "left" | "right" => Some(self.icon_bar_column(place == "left", cx)),
+            _ => None,
         }
-        let t = &self.chrome.tokens;
+    }
+
+    /// The built-in tiles, each running its menu item.
+    fn builtin_tiles(&self, cx: &mut Context<Self>) -> Vec<gpui::Stateful<gpui::Div>> {
         let show_tags = self.show_tags;
-        let mut row = div().flex().items_center().px(px(7.0)).py(px(5.0)).gap(px(2.0));
-        for (action, icon_name, label, title) in TILES {
-            let action: &'static str = action;
-            let on = action == "toggle-tags" && show_tags;
-            row = row.child(
+        TILES
+            .iter()
+            .map(|&(action, icon_name, label, title)| {
+                let on = action == "toggle-tags" && show_tags;
                 self.tile(format!("tile-{action}").into(), icon_name, label.to_string(), title.to_string(), on)
-                    .on_click(cx.listener(move |this, _, w, cx| this.menu_action(action, w, cx))),
-            );
-        }
-        row = row.child(div().flex_1());
+                    .on_click(cx.listener(move |this, _, w, cx| this.menu_action(action, w, cx)))
+            })
+            .collect()
+    }
+
+    /// A tile for each enabled Action marked as a shortcut, each sending `/<name>`.
+    fn shortcut_tiles(&self, cx: &mut Context<Self>) -> Vec<gpui::Stateful<gpui::Div>> {
         let shortcuts: Vec<(usize, String)> = self
             .session
             .core
@@ -167,22 +180,33 @@ impl ClayView {
             .filter(|(_, a)| a.enabled && a.gui_shortcut)
             .map(|(i, a)| (i, a.name.clone()))
             .collect();
+        shortcuts
+            .into_iter()
+            .map(|(i, name)| {
+                let title = name.clone();
+                self.tile(format!("shortcut-{i}").into(), "star", name.clone(), title, false).on_click(cx.listener(move |this, _, _w, cx| {
+                    let command = format!("/{name}");
+                    let world_index = this.session.core.current;
+                    this.more_mut().caught_up();
+                    let fx = this.session.send(WsMessage::SendCommand { world_index, command });
+                    this.after(fx, cx);
+                }))
+            })
+            .collect()
+    }
+
+    /// The icon bar as a row (Icon Bar: Top/Bottom): the built-in tiles at the left, the
+    /// shortcuts at the right in a strip the ‹ › arrows scroll.
+    fn icon_bar_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = &self.chrome.tokens;
+        let mut row = div().flex().items_center().px(px(ICON_BAR_PAD_X)).py(px(ICON_BAR_PAD_Y)).gap(px(2.0));
+        row = row.children(self.builtin_tiles(cx));
+        row = row.child(div().flex_1());
+        let shortcuts = self.shortcut_tiles(cx);
         if !shortcuts.is_empty() {
             let handle = self.chrome.shortcuts_scroll.clone();
             let overflowing = f32::from(handle.max_offset().x) > 0.5;
-            let mut strip = div().id("icon-bar-shortcuts").flex().items_center().gap(px(2.0)).min_w_0().max_w(px(221.0)).overflow_x_scroll().track_scroll(&handle);
-            for (i, name) in shortcuts {
-                let title = name.clone();
-                strip = strip.child(self.tile(format!("shortcut-{i}").into(), "star", name.clone(), title, false).on_click(cx.listener(
-                    move |this, _, _w, cx| {
-                        let command = format!("/{name}");
-                        let world_index = this.session.core.current;
-                        this.more_mut().caught_up();
-                        let fx = this.session.send(WsMessage::SendCommand { world_index, command });
-                        this.after(fx, cx);
-                    },
-                )));
-            }
+            let strip = div().id("icon-bar-shortcuts").flex().items_center().gap(px(2.0)).min_w_0().max_w(px(221.0)).overflow_x_scroll().track_scroll(&handle).children(shortcuts);
             let (left, right) = (handle.clone(), handle);
             row = row
                 .child(div().w(px(1.0)).self_stretch().mx(px(3.0)).my(px(7.0)).flex_shrink_0().bg(t.border))
@@ -196,17 +220,44 @@ impl ClayView {
                     w.refresh();
                 }));
         }
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .flex_shrink_0()
-                .bg(t.bar)
-                .child(div().h(px(1.0)).bg(t.border))
-                .child(row)
-                .child(div().h(px(1.0)).bg(t.border_subtle))
-                .into_any_element(),
-        )
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .bg(t.bar)
+            .child(div().h(px(1.0)).bg(t.border))
+            .child(row)
+            .child(div().h(px(1.0)).bg(t.border_subtle))
+            .into_any_element()
+    }
+
+    /// The icon bar as a column beside the output (Icon Bar: Left/Right): the built-in
+    /// tiles, a line, then the shortcuts, the whole column scrolling when they don't fit -
+    /// a wheel or a drag scrolls it, so it needs no arrows.
+    fn icon_bar_column(&self, left: bool, cx: &mut Context<Self>) -> AnyElement {
+        let t = &self.chrome.tokens;
+        let mut list = div()
+            .id("icon-bar-column")
+            .flex()
+            .flex_col()
+            .items_center()
+            .flex_1()
+            .min_h_0()
+            .gap(px(2.0))
+            .px(px(ICON_BAR_PAD_X))
+            .py(px(ICON_BAR_PAD_Y))
+            .overflow_y_scroll()
+            .track_scroll(&self.chrome.icon_column_scroll)
+            .children(self.builtin_tiles(cx));
+        let shortcuts = self.shortcut_tiles(cx);
+        if !shortcuts.is_empty() {
+            list = list.child(div().h(px(1.0)).w_full().my(px(3.0)).flex_shrink_0().bg(t.border)).children(shortcuts);
+        }
+        // The line between the column and the output, on the output's side.
+        let line = div().w(px(1.0)).h_full().bg(t.border_subtle);
+        let column = div().flex().flex_col().h_full().flex_shrink_0().bg(t.bar).child(list);
+        let row = div().flex().flex_row().h_full().flex_shrink_0();
+        if left { row.child(column).child(line) } else { row.child(line).child(column) }.into_any_element()
     }
 
     /// Where this window's tabs go: "top", "bottom", "left", "right" or nowhere - its own

@@ -545,6 +545,9 @@ impl ClayView {
             .text_size(px(self.font_size))
             .line_height(px(row_h))
             .text_color(hsla(self.palette.fg))
+            // A right-click anywhere in the input bar opens its menu: the lines sent above
+            // the field, the prompt beside it and the edges too, not the field alone.
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.input_menu_at(ev, cx)))
             // The top edge, a few pixels either side of the line: drag it up or down to
             // resize the input (the root's mouse-move and -up carry the drag on, see
             // `input_resize_to`).
@@ -591,7 +594,6 @@ impl ClayView {
                 .cursor_text()
                 .child(canvas(|_, _, _| {}, move |bounds, _, window, cx| paint_field(bounds, field, window, cx)).size_full())
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.input_mouse_down(ev, cx)))
-                .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _w, cx| this.input_menu_at(ev, cx)))
                 .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| this.input_mouse_move(ev, cx)))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _w, _cx| this.input.dragging = false)),
         ))
@@ -759,15 +761,22 @@ impl ClayView {
         self.input.spell_round = Some(spell::Round::new(range, word, list));
     }
 
-    /// Right-click in the input: Cut, Copy, Paste, Select All, and for a misspelled word
-    /// its suggestions first (as a browser's text field menu has).
+    /// Right-click in the input bar: Cut, Copy, Paste, Select All, and for a misspelled
+    /// word its suggestions first (as a browser's text field menu has). Only a click on
+    /// the field itself places the cursor or finds a word: one on a line sent above it or
+    /// on the prompt leaves the typed line as it is.
     fn input_menu_at(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
-        let at = self.input.layout.borrow().hit(f32::from(ev.position.x), f32::from(ev.position.y));
+        let at = {
+            let layout = self.input.layout.borrow();
+            layout.bounds.contains(&ev.position).then(|| layout.hit(f32::from(ev.position.x), f32::from(ev.position.y))).flatten()
+        };
         let word = at.and_then(|at| self.input.misspelled.iter().find(|w| w.start <= at && at <= w.end).cloned());
         let suggest = word.and_then(|w| Some((w.clone(), self.suggest(&self.editor.text[w], 5)?)));
-        // A right-click outside the selection moves the cursor there.
+        // A right-click outside the selection moves the cursor there. Its end is on it: a
+        // click on the right half of the last letter selected lands there, and moving the
+        // cursor dropped the selection Copy was opened for.
         if let Some(at) = at {
-            if !self.editor.selection().is_some_and(|s| s.contains(&at)) {
+            if !self.editor.selection().is_some_and(|s| s.start <= at && at <= s.end) {
                 self.editor.set_cursor(at, false);
             }
         }

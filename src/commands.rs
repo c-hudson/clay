@@ -856,8 +856,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.open_menu_popup_new();
         }
         // Quiet when it works (the panes show it); only an error is said.
-        Command::Split { world } => {
-            if let Err(msg) = app.split_open(world.as_deref()) {
+        Command::Split { args } => {
+            if let Err(msg) = app.split_command(&args) {
                 app.add_output(&msg);
             }
         }
@@ -901,6 +901,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 // /worlds -e - edit current world
                 (app.current_world_index, false)
             };
+            if let Some(why) = app.activity_refusal(idx, "edited") {
+                app.add_output(&why);
+                return false;
+            }
             app.open_world_editor_popup_new(idx, created);
         }
         Command::WorldConnectNoLogin { name } => {
@@ -922,7 +926,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::WorldSwitch { name } => {
             // /worlds <name> - switch to world and connect if not already connected
-            if let Some(idx) = app.find_world(&name) {
+            if let Some(idx) = app.find_world_typed(&name) {
                 // World exists - switch to it
                 app.switch_world(idx);
                 // Connect if not already connected and has settings
@@ -2544,6 +2548,9 @@ fn add_or_update_world(
     password: Option<String>,
     use_ssl: bool,
 ) -> Result<(usize, bool), String> {
+    if app.reserved_world_name(name) {
+        return Err(format!("Error: {} is the Activity world's name", crate::util::ACTIVITY_WORLD_NAME));
+    }
     let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name));
     let world_idx = if let Some(idx) = existing_idx {
         idx

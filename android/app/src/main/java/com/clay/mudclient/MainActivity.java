@@ -820,6 +820,38 @@ public class MainActivity extends AppCompatActivity {
                 .remove(KEY_SSH_PASSWORD).apply();
         }
 
+        /**
+         * The clipboard's text, for Paste in Clay's own input menu (app.js
+         * clayPasteIntoInput): the page can't read the clipboard in a WebView. Read on the UI
+         * thread, where the clipboard service is safe to create on every Android version.
+         */
+        @JavascriptInterface
+        public String getClipboardText() {
+            AtomicReference<String> text = new AtomicReference<>("");
+            CountDownLatch done = new CountDownLatch(1);
+            runOnUiThread(() -> {
+                try {
+                    android.content.ClipboardManager cm =
+                        (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                    android.content.ClipData clip = cm == null ? null : cm.getPrimaryClip();
+                    if (clip != null && clip.getItemCount() > 0) {
+                        CharSequence t = clip.getItemAt(0).coerceToText(MainActivity.this);
+                        if (t != null) text.set(t.toString());
+                    }
+                } catch (RuntimeException e) {
+                    android.util.Log.w("Clay", "getClipboardText: " + e);
+                } finally {
+                    done.countDown();
+                }
+            });
+            try {
+                done.await(2, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return text.get();
+        }
+
         @JavascriptInterface
         public void showToast(String message) {
             runOnUiThread(() -> {

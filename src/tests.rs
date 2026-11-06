@@ -399,7 +399,7 @@
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new() };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new() };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
@@ -1247,7 +1247,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
         };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
@@ -1317,7 +1317,7 @@
             username: Some("star".to_string()),
             current_world: None, auth_key: None, request_key: false,
             challenge_response: true,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
         match source.next().await {
@@ -1418,7 +1418,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
         };
         sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap())).await.unwrap();
         let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
@@ -1439,7 +1439,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
         };
         sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap())).await.unwrap();
         let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
@@ -1567,7 +1567,7 @@
             auth_key: Some("test_key".to_string()),
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
         };
         let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string(), "test_challenge".to_string());
 
@@ -1633,7 +1633,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), interface_key: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
 
@@ -9980,6 +9980,7 @@ third
             keep_alive_cmd: String::new(),
             keep_alive_gag_enabled: true,
             keep_alive_gag: "Huh?".to_string(),
+            login_command: "say hi\nlook".to_string(),
             gmcp_packages: String::new(),
             auto_reconnect_secs: "0".to_string(),
             has_notes: true,
@@ -10024,6 +10025,7 @@ third
         assert_eq!(app.worlds[0].settings.prompt_wait_ms, 2500);
         assert!(app.worlds[0].settings.keep_alive_gag_enabled);
         assert_eq!(app.worlds[0].settings.keep_alive_gag, "Huh?");
+        assert_eq!(app.worlds[0].settings.login_command, "say hi\nlook");
         assert!(!app.worlds[0].settings.status_panel, "the world's Status Panel switch");
         assert_eq!(app.worlds[0].settings.slack_token, "xoxb-token");
         assert_eq!(app.worlds[0].settings.slack_channel, "#general");
@@ -10158,7 +10160,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Slack,
@@ -10184,7 +10186,7 @@ third
                 String::new(), "0".to_string(), true, true, true,
                 String::new(), 1000, None, String::new(), String::new(), String::new(),
                 String::new(), String::new(), String::new(), String::new(),
-                None, on, gag, None,
+                None, on, gag, None, None,
             );
         };
         save(&mut app, None, None);
@@ -10198,6 +10200,40 @@ third
         let log = app.ws_broadcast_log.lock().unwrap();
         assert!(log.iter().any(|m| matches!(m, WsMessage::WorldSettingsUpdated { settings, .. }
             if !settings.keep_alive_gag_enabled && settings.keep_alive_gag == "thisistheidlemessage")), "{log:?}");
+    }
+
+    /// The Login Command from a client's save: None (an older client) leaves it, a value
+    /// replaces it with `\n` line ends only, and every client is told.
+    #[test]
+    fn test_update_world_settings_login_command() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].settings.login_command = "look".to_string();
+        let save = |app: &mut App, commands: Option<String>| {
+            app.update_world_settings(
+                0, "alpha".to_string(), String::new(), String::new(), String::new(),
+                String::new(), false, false,
+                "utf8".to_string(), "connect".to_string(), "NOP".to_string(), String::new(),
+                String::new(), "0".to_string(), true, true, true,
+                String::new(), 1000, None, String::new(), String::new(), String::new(),
+                String::new(), String::new(), String::new(), String::new(),
+                None, None, None, None, commands,
+            );
+        };
+        save(&mut app, None);
+        assert_eq!(app.worlds[0].settings.login_command, "look");
+
+        app.ws_broadcast_log.lock().unwrap().clear();
+        save(&mut app, Some("say hello;say goodbye\r\nlook somewhere".to_string()));
+        assert_eq!(app.worlds[0].settings.login_command, "say hello;say goodbye\nlook somewhere");
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(log.iter().any(|m| matches!(m, WsMessage::WorldSettingsUpdated { settings, .. }
+            if settings.login_command == "say hello;say goodbye\nlook somewhere")), "{log:?}");
+        drop(log);
+
+        save(&mut app, Some(String::new()));
+        assert!(app.worlds[0].settings.login_command.is_empty(), "empty clears it");
     }
 
     /// A save that DOES send a real `world_type`/`prompt_wait_ms`/token must apply all
@@ -10215,7 +10251,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud_timed_prompt".to_string(), 2500, None, "xoxb-new".to_string(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt);
@@ -10239,7 +10275,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "shell".to_string(), 0, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Shell);
@@ -10268,7 +10304,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Mud);
@@ -10439,7 +10475,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10460,7 +10496,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10481,7 +10517,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -10560,7 +10596,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
         assert!(!app.worlds[0].settings.mccp2_enabled);
         match rx.try_recv() {
@@ -10579,7 +10615,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None,
+            None, None, None, None, None,
         );
         assert!(rx.try_recv().is_err(), "an unchanged save must not re-send the toggle");
     }
@@ -10757,6 +10793,48 @@ third
         })
         .unwrap();
         assert_eq!(old.tabs_profiles, None, "an older server's message: no profiles");
+    }
+
+    /// The icon bar goes Top, Bottom, Left, Right or nowhere, per interface (user request
+    /// 2026-11-04): a client's place is kept under its own key and never moves the shared
+    /// setting; an interface that never chose takes its place from the shared one (None:
+    /// none, All: top, App/Tablet: top where it used to show, else none); an older client's
+    /// save leaves every interface's own alone; an unknown key is refused.
+    #[test]
+    fn test_icon_bar_place_is_per_interface() {
+        let choice = |key: &str, value: &str| crate::websocket::SettingsAdditions {
+            icon_bar_profile: Some(crate::websocket::InterfaceChoice { key: key.to_string(), value: value.to_string() }),
+            ..Default::default()
+        };
+        let mut app = App::new();
+        assert_eq!(app.settings.icon_bar, crate::IconBarMode::AppTablet);
+        save_tabs_from(&mut app, "none", choice("native-linux", "left"));
+        assert_eq!(app.settings.icon_bar_profiles.get("native-linux"), Some(&crate::IconBarPlace::Left));
+        assert_eq!(app.settings.icon_bar, crate::IconBarMode::AppTablet, "the shared value stays");
+        save_tabs_from(&mut app, "none", choice("app-android", "bottom"));
+        save_tabs_from(&mut app, "none", Default::default());
+        assert_eq!(app.settings.icon_bar_profiles.len(), 2, "an older client's save leaves them");
+        save_tabs_from(&mut app, "none", choice("bogus", "right"));
+        assert!(!app.settings.icon_bar_profiles.contains_key("bogus"), "an unknown key is refused");
+
+        let mut msg = app.build_global_settings_msg();
+        assert_eq!(msg.icon_bar_for("native-linux", true), "left");
+        assert_eq!(msg.icon_bar_for("app-android", false), "bottom", "its own, whatever App/Tablet says");
+        assert_eq!(msg.icon_bar_for("browser-linux", true), "top");
+        assert_eq!(msg.icon_bar_for("browser-linux", false), "none");
+        msg.icon_bar = "all".to_string();
+        assert_eq!(msg.icon_bar_for("browser-linux", false), "top");
+        msg.icon_bar = "none".to_string();
+        assert_eq!(msg.icon_bar_for("browser-linux", true), "none");
+        assert_eq!(msg.icon_bar_profile_update("app-android"), Some(crate::websocket::InterfaceChoice { key: "app-android".into(), value: "bottom".into() }));
+        assert_eq!(msg.icon_bar_profile_update("browser-linux"), None, "nothing of its own: nothing sent");
+        let old: crate::websocket::GlobalSettingsMsg = serde_json::from_value({
+            let mut v = serde_json::to_value(&msg).unwrap();
+            v.as_object_mut().unwrap().remove("icon_bar_profiles");
+            v
+        })
+        .unwrap();
+        assert_eq!(old.icon_bar_profiles, None, "an older server's message: no profiles");
     }
 
     /// A settings save from `client_id`: its legacy text-to-speech mode (the console's,
@@ -10978,7 +11056,7 @@ third
                 "utf8".to_string(), "connect".to_string(), "nop".to_string(), String::new(),
                 String::new(), "0".to_string(), true, true, true, String::new(), 1000, None,
                 String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), String::new(),
-                None, None, None, None,
+                None, None, None, None, None,
             );
             assert!(!app.worlds[0].settings.status_panel, "B={handler_b}: None leaves it");
             assert!(app.set_world_status_panel(0, true).contains("shown"));
@@ -11655,6 +11733,7 @@ third
             picture_upload: false,
             map: false,
             history_on_demand: false,
+            resume_session: false,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -13777,6 +13856,106 @@ third
         assert!(!app.console_paused, "the console typed it");
     }
 
+    /// `ResumeSession` (user report 2026-11-04: a GUI kept its PAUSED badge though it was
+    /// used): a paused client that is used in any way resumes, with every connection of its
+    /// owner id (the interface's other tabs, which `/pause` paused with it) and through
+    /// either handler; each is told. One that isn't paused is told so anyway, which takes a
+    /// stale badge down. The server says it takes the message.
+    #[tokio::test]
+    async fn resume_session_resumes_the_owners_connections_and_always_answers() {
+        fn told(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) -> Vec<bool> {
+            let mut states = Vec::new();
+            while let Ok(out) = rx.try_recv() {
+                let msg = match out {
+                    crate::websocket::Outbound::Message(m) => *m,
+                    crate::websocket::Outbound::Shared(json) => serde_json::from_str(&json).unwrap(),
+                };
+                if let WsMessage::PausedState { paused } = msg {
+                    states.push(paused);
+                }
+            }
+            states
+        }
+        let view = || ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        };
+        for handler_b in [false, true] {
+            let mut app = App::new();
+            app.worlds.clear();
+            app.worlds.push(World::new("A"));
+            app.current_world_index = 0;
+            app.console_tui = !handler_b;
+            let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+            let mut gui = tts_test_client(&server, 7);
+            let mut gui_tab = tts_test_client(&server, 8);
+            let mut phone = tts_test_client(&server, 9);
+            app.ws_server = Some(server);
+            app.set_display_owner_id(7, "gui");
+            app.set_display_owner_id(8, "gui");
+            app.set_display_owner_id(9, "phone");
+            for id in [7, 8, 9] {
+                app.ws_client_worlds.insert(id, view());
+            }
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+            app.pause_other_interfaces(None);
+            for rx in [&mut gui, &mut gui_tab, &mut phone] {
+                assert_eq!(told(rx), vec![true]);
+            }
+            for round in 0..2 {
+                if handler_b {
+                    crate::daemon::handle_daemon_ws_message(&mut app, 7, WsMessage::ResumeSession, &event_tx).await;
+                } else {
+                    let _ = app.handle_ws_client_msg(7, WsMessage::ResumeSession, &event_tx);
+                }
+                assert!(!app.ws_client_worlds[&7].paused && !app.ws_client_worlds[&8].paused, "B={handler_b}: the GUI's connections resume");
+                let connections = app.ws_server.as_ref().unwrap().clients.read().unwrap().iter().filter(|(_, c)| c.paused).map(|(&id, _)| id).collect::<Vec<_>>();
+                assert_eq!(connections, vec![9], "B={handler_b}: only the phone stays paused");
+                assert_eq!(told(&mut gui), vec![false], "B={handler_b} round {round}: told once, paused or not");
+                assert_eq!(told(&mut gui_tab), if round == 0 { vec![false] } else { vec![] }, "B={handler_b} round {round}");
+                assert!(told(&mut phone).is_empty(), "B={handler_b}: the phone is not told");
+            }
+        }
+        let app = App::new();
+        assert!(matches!(app.build_initial_state(0), WsMessage::InitialState { resume_session: true, .. }));
+    }
+
+    /// Two GUIs on one machine share their `client_uid` (one native-gui.dat, one WebView
+    /// localStorage) but not their program (`AuthRequest.instance_id`; user report
+    /// 2026-11-04: `/pause` in one left the other unpaused, "already paused"). They are two
+    /// interfaces: `/pause` in one pauses the other, and using the one that typed it doesn't
+    /// resume the other. Connections naming the same program, or none (a browser's tabs),
+    /// are still one.
+    #[test]
+    fn pause_tells_two_programs_sharing_a_uid_apart() {
+        let view = || ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        };
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let clients: Vec<_> = (1..=5).map(|id| tts_test_client(&server, id)).collect();
+        app.ws_server = Some(server);
+        // 1 and 2: two GUI programs, one uid. 3: GUI 1's other window. 4 and 5: two tabs.
+        for (id, uid, instance) in [(1, "n-x", "p-1"), (2, "n-x", "p-2"), (3, "n-x", "p-1"), (4, "c-y", ""), (5, "c-y", "")] {
+            app.set_display_owner_id(id, uid);
+            app.set_client_instance(id, instance);
+            app.ws_client_worlds.insert(id, view());
+        }
+        let paused = |app: &App| (1..=5).filter(|id| app.ws_client_worlds[id].paused).collect::<Vec<u64>>();
+        app.pause_other_interfaces(Some(1));
+        assert_eq!(paused(&app), vec![2, 4, 5], "the other GUI and the browser; not GUI 1's other window");
+        app.auto_resume_if_user_action(1, &WsMessage::SendCommand { world_index: 0, command: "look".into() });
+        assert_eq!(paused(&app), vec![2, 4, 5], "using GUI 1 resumes nothing of GUI 2's");
+        app.ws_resume_session(4);
+        assert_eq!(paused(&app), vec![2], "a tab resumes with the browser's other tabs");
+        app.pause_other_interfaces(Some(4));
+        assert_eq!(paused(&app), vec![1, 2, 3], "from a tab: both GUIs, every window");
+        drop(clients);
+    }
+
     /// `/split` (user request 2026-10-30): the console's world stays below with the focus, the
     /// next world in order opens above; the switch keys skip it; Shift+Tab moves the focus
     /// without switching any world; `/unsplit` closes the pane without the focus.
@@ -13834,9 +14013,89 @@ third
         lone.current_world_index = 0;
         assert_eq!(lone.split_open(None), Err("There is no other world to show.".to_string()));
 
-        assert!(matches!(parse_command("/split Big World"), Command::Split { world: Some(ref w) } if w == "Big World"));
-        assert!(matches!(parse_command("/split"), Command::Split { world: None }));
+        assert!(matches!(parse_command("/split Big World"), Command::Split { ref args } if args == "Big World"));
+        assert!(matches!(parse_command("/split -n 5"), Command::Split { ref args } if args == "-n 5"));
+        assert!(matches!(parse_command("/split"), Command::Split { ref args } if args.is_empty()));
         assert!(matches!(parse_command("/unsplit"), Command::Unsplit));
+    }
+
+    /// F5's match sits in the middle of the output (user ruling 2026-11-05), with the lines
+    /// after it below - the console never cut its output off, but put the match at the
+    /// bottom; near either end of the buffer it goes as far as it can.
+    #[test]
+    fn test_search_match_is_in_the_middle_of_the_output() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("A");
+        for n in 0..100 {
+            w.output_lines.push(OutputLine::new(format!("line {n:03}"), n as u64));
+        }
+        w.scroll_to_bottom();
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        app.output_height = 21;
+        app.output_width = 80;
+        app.search_popup.open();
+        app.current_world_mut().search_active = true;
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                crate::input_handler::handle_search_popup_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+        };
+        // 21 rows: the match, 10 above it and 10 below.
+        typed(&mut app, "line 050");
+        assert_eq!(app.current_world().scroll_offset, 60, "ten lines after the match are below it");
+        // Near the end: the view can only go to the bottom.
+        app.search_popup.close();
+        app.search_popup.open();
+        typed(&mut app, "line 095");
+        assert_eq!(app.current_world().scroll_offset, 99, "the last line at the bottom");
+        // Near the start: the first screenful.
+        app.search_popup.close();
+        app.search_popup.open();
+        typed(&mut app, "line 003");
+        assert_eq!(app.current_world().scroll_offset, 20, "the first 21 lines on screen");
+    }
+
+    /// `/split -n <lines>` (user request 2026-11-05): opens the split with the top pane that
+    /// many rows, or resizes it while split; each pane keeps one row; the size is this
+    /// console's and the next bare `/split` opens at it again; a bad `-n` says how.
+    #[test]
+    fn test_split_n_sizes_the_top_pane() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["A", "B"] {
+            app.worlds.push(World::new(name));
+        }
+        app.current_world_index = 0;
+        app.input_height = 1;
+        // 24 rows: 22 for the output area (the separator bar and the input take two).
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        let mut draw = |app: &mut App| {
+            terminal.draw(|f| rendering::ui(f, app)).unwrap();
+            app.pane_rows
+        };
+        assert_eq!(app.split_command(""), Ok(()));
+        assert_eq!(draw(&mut app), (10, 11), "half, the bottom one taking the odd row");
+        assert_eq!(app.split_command("-n 5"), Ok(()), "split: -n alone resizes");
+        assert_eq!(draw(&mut app), (5, 16));
+        assert_eq!(app.split_command("-n 500"), Ok(()));
+        assert_eq!(draw(&mut app), (20, 1), "the bottom pane keeps one row");
+        assert_eq!(app.split_command("-n1"), Ok(()));
+        assert_eq!(draw(&mut app), (1, 20));
+        assert_eq!(app.split_command("-n 0"), Err("Usage: /split [-n <lines>] [world]".to_string()));
+        assert_eq!(app.split_command("-n 7 Nowhere"), Err("World 'Nowhere' not found.".to_string()));
+        assert_eq!(draw(&mut app), (1, 20), "a failed /split changes no size");
+        app.split_close().unwrap();
+        assert_eq!(app.split_command(""), Ok(()));
+        assert_eq!(draw(&mut app), (1, 20), "the next /split opens at the size kept");
+        app.split_close().unwrap();
+        assert_eq!(app.split_command("-n 8"), Ok(()), "not split: -n opens it");
+        assert!(app.split.is_some());
+        assert_eq!(draw(&mut app), (8, 13));
+        assert_eq!(app.split_command(""), Err("The output is already split; /unsplit closes the pane without the focus.".to_string()));
     }
 
     /// Both panes' worlds are watched: their lines are born viewed and they are no activity;
@@ -13941,6 +14200,239 @@ third
         assert_eq!(app.settings.console_text_reveal(), TextReveal::Off);
     }
 
+    /// The fresh start's placeholder world, dropped when another world connects, is dropped
+    /// from every client too (`WorldRemoved`), and what the server keeps of each client by
+    /// index - its world, its connection's world, its map panes - moves with the worlds as
+    /// the client's own list does. Before, an attached GUI kept the placeholder, sat on an
+    /// index past the end, and the connected world's text never showed (found 2026-11-04).
+    #[test]
+    fn test_discarding_the_initial_world_tells_every_client() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut initial = World::new("clay");
+        initial.is_initial_world = true;
+        app.worlds.push(initial);
+        app.worlds.push(World::new("test"));
+        app.worlds.push(World::new("other"));
+        app.current_world_index = 1;
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        let view = |world_index| ClientViewState {
+            world_index,
+            history: Vec::new(),
+            visible_lines: 24,
+            visible_columns: 80,
+            dimensions: None,
+            paused: false,
+            visible: true,
+            disconnected_at: None,
+        };
+        app.ws_client_worlds.insert(client_id, view(1));
+        app.ws_client_worlds.insert(9, view(0));
+        app.ws_server.as_ref().unwrap().set_client_world(client_id, Some(1));
+        app.ws_client_map_views.insert(client_id, vec![
+            crate::map::wire::MapViewReq { world_index: 0, area: None, level: None },
+            crate::map::wire::MapViewReq { world_index: 2, area: None, level: None },
+        ]);
+        app.ws_client_map_sent.insert((client_id, 2, "a".to_string(), 0));
+
+        app.discard_initial_world();
+        assert_eq!(app.worlds.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["test", "other"]);
+        assert_eq!(app.current_world_index, 0);
+        let removed: Vec<usize> = drain_ws_messages(&mut rx)
+            .into_iter()
+            .filter_map(|m| if let WsMessage::WorldRemoved { world_index } = m { Some(world_index) } else { None })
+            .collect();
+        assert_eq!(removed, vec![0], "every client is told");
+        assert_eq!(app.ws_client_worlds[&client_id].world_index, 0, "still on test");
+        assert_eq!(app.ws_client_worlds[&9].world_index, 0, "on the placeholder: the world now in its place, as the client does");
+        assert_eq!(app.ws_server.as_ref().unwrap().clients_viewing_world(0), vec![client_id]);
+        let maps: Vec<usize> = app.ws_client_map_views[&client_id].iter().map(|v| v.world_index).collect();
+        assert_eq!(maps, vec![1], "the placeholder's map pane goes, the other moves");
+        assert!(app.ws_client_map_sent.contains(&(client_id, 1, "a".to_string(), 0)));
+
+        // Never the console's own world, nor the last one.
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut initial = World::new("clay");
+        initial.is_initial_world = true;
+        app.worlds.push(initial);
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.discard_initial_world();
+        assert_eq!(app.worlds.len(), 2);
+    }
+
+    /// An App with two MUD worlds and the Activity world after them, the console on "one".
+    fn activity_app() -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("one"));
+        app.worlds.push(World::new("two"));
+        app.ensure_activity_world();
+        app.current_world_index = 0;
+        app.console_tui = true;
+        app
+    }
+
+    /// The Activity world (user request 2026-11-05): made after every other world, named
+    /// by `act` too, never saved, never a switch key's, never a bare /split's.
+    #[test]
+    fn test_activity_world_is_named_never_switched_to() {
+        let mut app = activity_app();
+        assert_eq!(app.activity_world(), Some(2));
+        app.ensure_activity_world();
+        assert_eq!(app.worlds.len(), 3, "only one");
+        assert_eq!(app.find_world_typed("act"), Some(2));
+        assert_eq!(app.find_world_typed("ACTIVITY"), Some(2));
+        assert_eq!(app.find_world_typed("two"), Some(1));
+
+        // Every world busy: no switch key lands on it, from anywhere.
+        for w in &mut app.worlds {
+            w.connected = true;
+            w.unseen_lines = 3;
+        }
+        for from in 0..3 {
+            assert_ne!(app.calculate_next_world_from(from, &[]), Some(2));
+            assert_ne!(app.calculate_prev_world_from(from, &[]), Some(2));
+            assert_ne!(app.calculate_oldest_pending_world_from(from, &["Activity".to_string()], &[]), Some(2));
+        }
+        assert!(app.split_open(None).is_ok());
+        assert_eq!(app.split_other(), Some(1), "a bare /split takes the next real world");
+        assert!(app.split_open(Some("act")).is_ok());
+        assert_eq!(app.split_other(), Some(2), "/split act");
+
+        // A real world named Activity wins, and there is no Activity world then.
+        let mut real = App::new();
+        real.worlds.clear();
+        real.worlds.push(World::new("Activity"));
+        real.ensure_activity_world();
+        assert_eq!(real.worlds.len(), 1);
+        assert_eq!(real.find_world_typed("act"), None);
+        // ...and a new world can't take the name while it exists.
+        assert!(app.reserved_world_name("activity"));
+        assert!(!real.reserved_world_name("activity"));
+
+        // Not saved; the reload state keeps it by its place.
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+        assert!(text.contains("is_activity=true"));
+        let mut back = App::new();
+        crate::persistence::load_reload_state_from_str(&mut back, &text).expect("parses");
+        assert_eq!(back.activity_world(), Some(2));
+        for w in &mut app.worlds {
+            w.settings.hostname = "localhost".to_string();
+        }
+        let tmp = std::env::temp_dir().join(format!("clay-activity-{}.dat", std::process::id()));
+        crate::persistence::save_settings_to_path(&app, &tmp).expect("save");
+        let saved = std::fs::read_to_string(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(saved.contains("[world:one]") && !saved.contains("[world:Activity]"), "{saved}");
+
+        // Nothing to edit, delete or give notes to.
+        assert!(app.activity_refusal(2, "edited").is_some());
+        assert!(app.activity_refusal(0, "edited").is_none());
+        app.delete_world(2);
+        assert_eq!(app.activity_world(), Some(2));
+    }
+
+    /// Each interface's Activity world (user requests 2026-11-05) gets every world's lines
+    /// while it is on screen there, after their world's name on the New Indicator's colour -
+    /// except a world that interface shows itself; gagged and blank lines never, and nothing
+    /// is held, counted or claimed. Leaving it empties that interface's copy only.
+    #[test]
+    fn test_activity_world_copies_lines_per_interface() {
+        let mut app = activity_app();
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        app.tf_engine.execute("/def -ag -t\"hidden*\" hide_hidden");
+        let view = |world_index| ClientViewState {
+            world_index, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        };
+        let sent_to_client = |rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>| -> Vec<(String, bool)> {
+            drain_ws_messages(rx).into_iter()
+                .filter_map(|m| match m { WsMessage::ServerData { world_index: 2, data, flush, seq, end_seq, .. } => {
+                    assert!(seq == 0 && end_seq.is_none(), "unnumbered");
+                    Some((crate::util::strip_ansi_codes(&data), flush))
+                } _ => None })
+                .collect()
+        };
+        let console_texts = |app: &App| -> Vec<String> {
+            app.worlds[2].output_lines.iter().map(|l| crate::util::strip_ansi_codes(&l.text)).collect()
+        };
+
+        // Nobody shows it: nothing is copied anywhere.
+        app.ws_client_worlds.insert(client_id, view(1));
+        app.process_server_data(1, b"before\r\n", 24, 80, false);
+        assert!(app.worlds[2].output_lines.is_empty());
+        assert!(sent_to_client(&mut rx).is_empty());
+
+        // The console: "one" below, Activity above. The client: "two", Activity in its split.
+        app.settings.more_mode_enabled = true;
+        app.split_open(Some("act")).unwrap();
+        app.ws_client_other_views.insert(client_id, vec![2]);
+        app.worlds[1].paused = true;
+        app.process_server_data(1, b"[chan:] hello\r\nhidden one\r\n\r\n\x1b[0m\r\nthere\r\n", 24, 80, false);
+        app.process_server_data(0, b"from one\r\n", 24, 80, false);
+        assert_eq!(console_texts(&app), ["two hello", "two there"], "never the console's own world, one");
+        let label = crate::newbg::activity_label(&app.settings.new_indicator, "two");
+        assert!(app.worlds[2].output_lines[0].text.starts_with(&label));
+        assert!(app.worlds[2].output_lines.iter().all(|l| l.viewed && l.display_id.is_none()));
+        let act = &app.worlds[2];
+        assert_eq!((act.unseen_lines, act.pending_lines.len(), act.paused), (0, 0, false));
+        assert!(!app.worlds[1].pending_lines.is_empty(), "the source world still holds its own");
+        let got = sent_to_client(&mut rx);
+        assert_eq!(got, [(String::new(), true), ("one from one\n".to_string(), false)],
+            "a flush as it came to it, then only one's line: it shows two itself");
+
+        // Neither the console's copy nor any other line reaches a client by catch-up.
+        let WsMessage::InitialState { worlds, .. } = app.build_initial_state(0) else { panic!("InitialState") };
+        assert!(worlds[2].is_activity && worlds[2].output_lines_ts.is_empty() && worlds[2].next_seq == 0);
+        let tally = app.audit_broadcast_ledger();
+        assert_eq!(tally, 0, "the console's copy owes no broadcast");
+
+        // The client leaves it: a flush, and nothing more is sent to it.
+        app.ws_client_other_views.insert(client_id, vec![]);
+        app.process_server_data(1, b"later\r\n", 24, 80, false);
+        assert_eq!(sent_to_client(&mut rx), [(String::new(), true)]);
+        assert_eq!(console_texts(&app).last().map(String::as_str), Some("two later"), "the console's copy goes on");
+
+        // The console's bottom pane goes to two: two's lines leave its Activity world (they
+        // are in two's own pane), and no more arrive from it.
+        app.track_console_world();
+        app.switch_world(1);
+        app.track_console_world();
+        assert!(console_texts(&app).is_empty(), "{:?}", console_texts(&app));
+        app.process_server_data(1, b"in view\r\n", 24, 80, false);
+        app.process_server_data(0, b"now one\r\n", 24, 80, false);
+        assert_eq!(console_texts(&app), ["one now one"]);
+        app.switch_world(0);
+        app.track_console_world();
+
+        // The console leaves it: its copy empties; back on it, it starts empty.
+        app.split_close().unwrap();
+        app.note_activity_viewers();
+        assert!(app.worlds[2].output_lines.is_empty());
+        app.split_open(Some("act")).unwrap();
+        app.process_server_data(1, b"fresh\r\n", 24, 80, false);
+        assert_eq!(console_texts(&app), ["two fresh"]);
+    }
+
+    /// The name's block is the New Indicator's colour, yellow when it has none.
+    #[test]
+    fn test_activity_label_takes_the_new_indicator_colour() {
+        use crate::encoding::NewIndicator;
+        let green = crate::newbg::activity_label(&NewIndicator::Background, "w");
+        assert!(green.contains("\x1b[48;2;0;100;0m") && green.contains("38;2;255;255;255m"), "{green:?}");
+        for none in [NewIndicator::None, NewIndicator::Character] {
+            let yellow = crate::newbg::activity_label(&none, "w");
+            assert!(yellow.contains("\x1b[48;2;255;255;0m") && yellow.contains("38;2;0;0;0m"), "{yellow:?}");
+        }
+        let teal = crate::newbg::activity_label(&NewIndicator::Custom(0), "w");
+        assert!(teal.contains("\x1b[48;2;0;95;95m"));
+        assert!(green.ends_with("w\x1b[0m "), "the name, then a space on the line's own background");
+    }
+
     /// The split survives a console's reload by its world's name; a GUI successor has no
     /// console to split; deleting a pane's world closes it, one before it moves it.
     #[test]
@@ -13954,6 +14446,7 @@ third
         app.console_tui = true;
         app.split_open(Some("C")).unwrap();
         app.split_swap_focus();
+        app.split_top_rows = Some(7);
         let mut buf: Vec<u8> = Vec::new();
         crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
         let text = String::from_utf8(buf).expect("utf-8");
@@ -13962,6 +14455,7 @@ third
         crate::persistence::load_reload_state_from_str(&mut console, &text).expect("parses");
         assert_eq!(console.current_world_index, 2, "C has the focus");
         assert_eq!(console.split, Some(ConsoleSplit { other: 0, focus_top: true }));
+        assert_eq!(console.split_top_rows, Some(7), "its size (/split -n, kept for the next /split)");
         let mut gui = App::new();
         crate::persistence::load_reload_state_from_str(&mut gui, &text).expect("parses");
         assert_eq!(gui.split, None);
@@ -14071,6 +14565,7 @@ third
             resume_epochs: Vec::new(),
             client_version: "test".into(),
             client_uid: "device-with-key".into(),
+            instance_id: String::new(),
             interface_key: "app-android".into(),
         };
         app.handle_ws_auth_key_validation(client_id, request, "127.0.0.1", challenge);
@@ -22054,6 +22549,72 @@ third
         sent
     }
 
+    /// Edit World's Login Command runs once Clay has logged in, each line and each `;` part
+    /// one command: after the connect line or LP/Diku's two lines, after FANSI's held-back
+    /// login, after a prompt login's last answer - and never when Clay doesn't log in.
+    #[test]
+    fn test_login_command_runs_after_the_auto_login() {
+        use crate::telnet::AutoConnectType;
+        let commands = "say hello;say goodbye\nlook somewhere".to_string();
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.login_command = commands.clone();
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["connect bob pw", "say hello", "say goodbye", "look somewhere"]);
+
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.auto_connect_type = AutoConnectType::Lines;
+        app.worlds[0].settings.login_command = "look".to_string();
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["bob", "pw", "look"]);
+
+        // A /command runs as typed (through TF), in its place.
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.login_command = "/send waves\nlook".to_string();
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["connect bob pw", "waves", "look"]);
+
+        // No login, nothing run: no password, /worlds -l, Auto Login None.
+        for case in 0..3 {
+            let mut app = client_connect_app(Encoding::Utf8);
+            app.worlds[0].settings.login_command = "look".to_string();
+            match case {
+                0 => app.worlds[0].settings.password.clear(),
+                1 => app.worlds[0].skip_auto_login = true,
+                _ => app.worlds[0].settings.auto_connect_type = AutoConnectType::NoLogin,
+            }
+            assert!(!connect_and_collect_sends(&mut app).contains(&"look".to_string()), "case {case}");
+        }
+
+        // FANSI holds the login back until its detection window is over; the Login
+        // Command follows it.
+        let mut app = client_connect_app(Encoding::Fansi);
+        app.worlds[0].settings.login_command = "look".to_string();
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(16);
+        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
+            Ok((tx, None, false, None, None)));
+        assert!(rx.try_recv().is_err(), "nothing yet");
+        app.finish_due_fansi_logins(std::time::Instant::now() + Duration::from_secs(5));
+        let mut sent = Vec::new();
+        while let Ok(WriteCommand::Text(t)) = rx.try_recv() {
+            sent.push(t);
+        }
+        assert_eq!(sent, vec!["connect bob pw", "look"]);
+
+        // A prompt login: after the password, the answer to its last prompt.
+        let mut app = timed_prompt_world(AutoConnectType::Prompt);
+        app.worlds[0].settings.login_command = commands;
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(16);
+        app.worlds[0].command_tx = Some(tx);
+        app.process_server_data(0, b"Name: ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        assert!(matches!(rx.try_recv(), Ok(WriteCommand::Text(t)) if t == "myname"));
+        assert!(rx.try_recv().is_err(), "not after the name");
+        app.process_server_data(0, b"Password: ", 24, 80, false);
+        guess_prompt(&mut app, 0);
+        let mut sent = Vec::new();
+        while let Ok(WriteCommand::Text(t)) = rx.try_recv() {
+            sent.push(t);
+        }
+        assert_eq!(sent, vec!["secret", "say hello", "say goodbye", "look somewhere"]);
+    }
+
     /// TF's connect sequence: the login style a world's type gives (one "connect" line, or
     /// LP/Diku's two lines), the DEFAULT world's character for a world without one, the
     /// mfile then the CONNECT hook then the LOGIN hook, and %login turning it all off.
@@ -22871,7 +23432,8 @@ fn the_web_world_editor_warns_and_sends_keep_alive_gag() {
 fn the_webview_page_asks_its_host_for_the_taskbar_and_notifications() {
     let js = include_str!("web/app.js");
     assert!(js.contains("if (!window.WEBVIEW_MODE || popupWindowMode || grepMode || noteMode) return;"));
-    assert!(js.contains("if (isFromServer && !isGapFill && !msg.gagged && msg.data) noteTaskbarAlert();"), "live, shown text only");
+    assert!(js.contains("const liveText = isFromServer && !isGapFill && !world.is_activity;"));
+    assert!(js.contains("if (liveText && !msg.gagged && msg.data) noteTaskbarAlert();"), "live, shown text only");
     assert!(js.contains("if (!taskbarAlert || taskbarAlertSent || document.hasFocus()) return;"));
     assert!(js.contains("desktopHostSend('badge:' + serverActivityCount);"));
     assert!(js.contains("desktopHostSend('notify:' + JSON.stringify({ title: msg.title || 'Clay', message: msg.message || '' }));"));
@@ -22911,6 +23473,20 @@ fn the_web_cold_start_merges_the_newest_lines_into_a_kept_buffer() {
 /// taken for the pre-1.5.23 corruption, the window sliding instead of stopping at
 /// RENDER_WINDOW_MAX, and a slid window never mistaken for the bottom. The native GUI's is
 /// `ClientCore::request_history`/`on_history`.
+/// app.js resumes a paused session on any use of the page (`ResumeSession`, once per
+/// pause, only to a server that says it takes it), and a login takes the badge down.
+#[test]
+fn the_web_client_resumes_a_paused_session_on_use() {
+    let js = include_str!("web/app.js");
+    assert!(js.contains("serverResumesSession = !!msg.resume_session;\n                setSessionPaused(false);"));
+    assert!(js.contains("if (!sessionPaused || !serverResumesSession || resumeAsked) return;"));
+    assert!(js.contains("send({ type: 'ResumeSession' })"));
+    // Its program, for /pause: two WebView GUIs on one machine share clientUid.
+    assert_eq!(js.matches("client_uid: clientUid, instance_id: clayInstanceId,").count(), 4, "every AuthRequest");
+    assert!(include_str!("webview_gui.rs").contains("window.CLAY_INSTANCE_ID = '{}';"));
+    assert!(js.contains("['keydown', 'pointerdown', 'touchstart', 'wheel'].forEach(function(type) {\n            window.addEventListener(type, noteUserActive, { capture: true, passive: true });"));
+}
+
 #[test]
 fn the_web_client_reads_history_on_demand() {
     let js = include_str!("web/app.js");
