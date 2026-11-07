@@ -2379,7 +2379,7 @@
     }
 
     #[test]
-    fn test_input_line_invisible_until_show_tags() {
+    fn test_input_line_never_shown_even_with_show_tags() {
         let mut app = App::new();
         app.worlds.clear();
         app.worlds.push(World::new("test"));
@@ -2401,9 +2401,78 @@
         assert!(!hidden.iter().any(|l| l.text.contains("secretcmd")),
             "captured input must not appear in normal display (show_tags: false)");
 
+        // F2 shows gagged lines, never what the user typed (user ruling 2026-11-06).
+        app.worlds[0].add_output("You smile.\n", true, &settings, 24, 80, false, true, false);
+        app.worlds[0].output_lines.last_mut().unwrap().gagged = true;
         let shown = build_display_lines(&app.worlds[0], &settings, 21, 80, true);
-        assert!(shown.iter().any(|l| l.text.contains("secretcmd")),
-            "captured input must appear when show_tags (F2) is on");
+        assert!(!shown.iter().any(|l| l.text.contains("secretcmd")),
+            "captured input must not appear when show_tags (F2) is on");
+        assert!(shown.iter().any(|l| l.text.contains("You smile.")), "F2 still shows a gagged line");
+        let input = app.worlds[0].output_lines.iter().find(|l| l.is_input).unwrap();
+        assert!(!search_line_visible(input, true), "F5 doesn't find it under F2 either");
+
+        // Still kept for /recall -i.
+        let opts = tf::RecallOptions { range: tf::RecallRange::All, source: tf::RecallSource::Input, ..tf::RecallOptions::default() };
+        let recalled: Vec<String> = app.recall_matches(&opts, 0).unwrap().into_iter().map(|(text, _)| text).collect();
+        assert!(recalled.iter().any(|t| t.contains("secretcmd")), "/recall -i still finds it: {:?}", recalled);
+    }
+
+    /// What the user typed reaches a client with no text: every path a stored line takes to
+    /// a client (the live broadcast, InitialState/scrollback, a more-mode release), so an
+    /// attached GUI's F2 has nothing to show and its cache nothing to keep.
+    #[test]
+    fn test_input_line_text_never_sent_to_clients() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let mut rx = tts_test_client(&server, 7);
+        app.ws_server = Some(server);
+        app.ws_client_worlds.insert(7, ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        });
+        let mut server_data = move || {
+            let mut out = Vec::new();
+            while let Ok(o) = rx.try_recv() {
+                let msg = match o {
+                    crate::websocket::Outbound::Message(m) => *m,
+                    crate::websocket::Outbound::Shared(json) => serde_json::from_str(&json).unwrap(),
+                };
+                if let WsMessage::ServerData { data, gagged, .. } = msg {
+                    out.push((data, gagged));
+                }
+            }
+            out
+        };
+
+        app.record_user_input(0, "secretcmd");
+        assert_eq!(server_data(), vec![("\n".to_string(), true)], "one empty gagged line, its seq kept");
+
+        let input = app.worlds[0].output_lines.iter().find(|l| l.is_input).unwrap().clone();
+        let wire = crate::websocket::TimestampedLine::from_output_line(&input);
+        assert!(wire.text.is_empty() && wire.gagged, "InitialState and scrollback replies carry no text");
+        assert_eq!(wire.seq, input.seq);
+
+        app.broadcast_released_lines(0, std::slice::from_ref(&input), None);
+        let released = server_data();
+        assert!(!released.is_empty() && released.iter().all(|(d, _)| !d.contains("secretcmd")), "a release sends no text either: {released:?}");
+    }
+
+    /// The console's rule for a client's empty gagged line (the SSH console draws its mirror
+    /// with it): hidden under F2 as well, as app.js `lineIsDrawn` and native `Line::is_hidden`.
+    #[test]
+    fn test_empty_gagged_line_hidden_under_show_tags() {
+        let mut line = OutputLine::new_client(String::new(), 1);
+        line.gagged = true;
+        assert!(line.is_hidden(true) && line.is_hidden(false));
+        line.text = "spam".into();
+        assert!(!line.is_hidden(true) && line.is_hidden(false));
+        line.gagged = false;
+        line.text = String::new();
+        assert!(!line.is_hidden(true) && !line.is_hidden(false), "an ordinary blank line still shows");
     }
 
     #[test]
@@ -2541,7 +2610,7 @@
 
         let tmp_path = std::env::temp_dir().join(format!("clay_test_echo_masked_log_{}.log", std::process::id()));
         let file = std::fs::File::create(&tmp_path).unwrap();
-        app.worlds[0].log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+        app.worlds[0].log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(file))));
 
         app.record_user_input(0, "hunter2");
 
@@ -2591,8 +2660,10 @@
 
         assert_eq!(app.worlds[0].output_lines.len(), 1);
         assert_eq!(app.worlds[0].output_lines[0].text, "look");
+        // Broadcast for its seq, with no text: clients never show what the user typed.
         let log = app.ws_broadcast_log.lock().unwrap();
-        assert!(log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("look"))));
+        assert!(log.iter().any(|m| matches!(m, WsMessage::ServerData { data, gagged: true, .. } if data == "\n")));
+        assert!(!log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("look"))));
     }
 
     /// Console rendering: `render_input` must substitute a fixed mask glyph for every
@@ -3311,7 +3382,7 @@
 
         let tmp_path = std::env::temp_dir().join(format!("clay_test_log_input_{}.log", std::process::id()));
         let file = std::fs::File::create(&tmp_path).unwrap();
-        world.log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+        world.log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(file))));
 
         // log_input: false - captured line must still land in output_lines (so /recall -i
         // still finds it), but must NOT be written to the log file.
@@ -8070,6 +8141,40 @@ third
         assert!(!app.worlds[0].showing_splash, "the splash must still be cleared by the packet");
     }
 
+    /// A run of gagged lines in one packet is one `ServerData` to the clients (seq to
+    /// end_seq, gagged), not one message per line: a message per gagged line multiplied what
+    /// a packet cost every client and could fill a slow client's channel, each drop then
+    /// costing a resync round trip (user report 2026-11-06, the GUI lagging behind a flood).
+    #[test]
+    fn test_a_run_of_gagged_lines_is_one_message_to_clients() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        let mut action = crate::actions::Action { name: "g".to_string(), command: "/gag".to_string(), ..Default::default() };
+        action.patterns = vec![crate::actions::MatchPattern { pattern: "^SPAM".to_string(), compiled_regex: None }];
+        action.compile_regex();
+        app.settings.actions = vec![action];
+        app.ws_broadcast_log.lock().unwrap().clear();
+
+        app.process_server_data(0, b"SPAM a\r\nSPAM b\r\nSPAM c\r\nvisible\r\n", 24, 80, false);
+
+        let stored: Vec<(u64, bool)> = app.worlds[0].output_lines.iter().map(|l| (l.seq, l.gagged)).collect();
+        assert_eq!(stored.iter().filter(|(_, g)| *g).count(), 3, "all three gagged lines are kept");
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let gagged: Vec<(String, u64, Option<u64>)> = log.iter()
+            .filter_map(|m| match m {
+                WsMessage::ServerData { data, seq, end_seq, gagged: true, .. } => Some((data.clone(), *seq, *end_seq)),
+                _ => None,
+            })
+            .collect();
+        let first = stored[0].0;
+        assert_eq!(gagged, vec![("SPAM a\nSPAM b\nSPAM c\n".to_string(), first, Some(first + 2))],
+            "one message for the run, spanning its seqs");
+        assert!(log.iter().any(|m| matches!(m, WsMessage::ServerData { data, gagged: false, .. } if data.contains("visible"))),
+            "the visible line still goes out on its own");
+    }
+
     /// `suppress_blanks` must survive a hot reload.
     ///
     /// The settings.dat round trip is already covered by persistence.rs's
@@ -11734,6 +11839,7 @@ third
             map: false,
             history_on_demand: false,
             resume_session: false,
+            info_report: false,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -13920,6 +14026,103 @@ third
         assert!(matches!(app.build_initial_state(0), WsMessage::InitialState { resume_session: true, .. }));
     }
 
+    /// `/info` (src/info.rs): a client's `RequestInfo` gets the report on the world it names,
+    /// through either handler, and only that client; an `/info` that reached the server as
+    /// text (an older client, an action, a macro) answers in text to the asker and is never
+    /// stored in the world's output. The server says it takes the message.
+    #[tokio::test]
+    async fn info_reports_go_to_the_asker_alone() {
+        fn received(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) -> Vec<WsMessage> {
+            let mut out = Vec::new();
+            while let Ok(o) = rx.try_recv() {
+                out.push(match o {
+                    crate::websocket::Outbound::Message(m) => *m,
+                    crate::websocket::Outbound::Shared(json) => serde_json::from_str(&json).unwrap(),
+                });
+            }
+            out
+        }
+        async fn send(app: &mut App, handler_b: bool, msg: WsMessage, event_tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+            if handler_b {
+                crate::daemon::handle_daemon_ws_message(app, 7, msg, event_tx).await;
+            } else {
+                let _ = app.handle_ws_client_msg(7, msg, event_tx);
+            }
+        }
+        let view = || ClientViewState {
+            world_index: 0, history: Vec::new(), visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        };
+        for handler_b in [false, true] {
+            let mut app = App::new();
+            app.worlds.clear();
+            app.worlds.push(World::new("Alpha"));
+            app.worlds.push(World::new("Beta"));
+            app.current_world_index = 0;
+            app.console_tui = !handler_b;
+            let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+            let mut asker = tts_test_client(&server, 7);
+            let mut other = tts_test_client(&server, 8);
+            app.ws_server = Some(server);
+            app.ws_client_worlds.insert(7, view());
+            app.ws_client_worlds.insert(8, view());
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+            let lines_before = app.worlds[0].output_lines.len();
+            send(&mut app, handler_b, WsMessage::RequestInfo { world_index: Some(1) }, &event_tx).await;
+            let got = received(&mut asker);
+            let report = got.iter().find_map(|m| match m {
+                WsMessage::InfoReport { world_index: 1, report } => Some(report.clone()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("B={handler_b}: no InfoReport for world 1 in {} messages", got.len()));
+            assert_eq!(report.title, "Info: Beta");
+            let titles: Vec<&str> = report.sections.iter().map(|s| s.title.as_str()).collect();
+            for wanted in ["World", "Telnet options", "Negotiation log", "Clay", "Memory", "Web server and clients"] {
+                assert!(titles.contains(&wanted), "B={handler_b}: no {wanted} section in {titles:?}");
+            }
+            let web = report.sections.iter().find(|s| s.title == "Web server and clients").unwrap();
+            assert!(web.rows.iter().any(|r| r.key == "Client 7" && r.value.ends_with("(this window)")), "{:?}", web.rows);
+            assert!(!received(&mut other).iter().any(|m| matches!(m, WsMessage::InfoReport { .. })), "B={handler_b}: only the asker");
+
+            send(&mut app, handler_b, WsMessage::SendCommand { world_index: 0, command: "/info Nowhere".into() }, &event_tx).await;
+            let text: String = received(&mut asker).into_iter().filter_map(|m| match m {
+                WsMessage::ServerData { data, .. } => Some(data),
+                _ => None,
+            }).collect();
+            assert!(text.contains("No world named 'Nowhere'."), "B={handler_b}: {text:?}");
+            send(&mut app, handler_b, WsMessage::SendCommand { world_index: 0, command: "/info".into() }, &event_tx).await;
+            let text: String = received(&mut asker).into_iter().filter_map(|m| match m {
+                WsMessage::ServerData { data, .. } => Some(data),
+                _ => None,
+            }).collect();
+            assert!(text.contains("Info: Alpha") && text.contains("Telnet options"), "B={handler_b}: {text:?}");
+            assert!(received(&mut other).iter().all(|m| !matches!(m, WsMessage::ServerData { data, .. } if data.contains("Info: "))), "B={handler_b}: the text went to the asker only");
+            assert_eq!(app.worlds[0].output_lines.len(), lines_before, "B={handler_b}: never stored");
+        }
+        assert!(matches!(App::new().build_initial_state(0), WsMessage::InitialState { info_report: true, .. }));
+    }
+
+    /// `/info` at the console prints the report into the current world's output.
+    #[test]
+    fn info_at_the_console_prints_the_report() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.current_world_index = 0;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let _ = commands::handle_command("/info", &mut app, event_tx.clone()).await;
+            let _ = commands::handle_command("/info Gone", &mut app, event_tx).await;
+        });
+        // A long report pages like any other output: some of it may be held by More.
+        let text: Vec<String> = app.worlds[0].output_lines.iter().chain(&app.worlds[0].pending_lines)
+            .map(|l| crate::util::strip_ansi_codes(&l.text)).collect();
+        assert!(text.iter().any(|l| l == "Info: Alpha"), "{text:?}");
+        assert!(text.iter().any(|l| l.is_empty()), "the sections are apart: {text:?}");
+        assert!(text.iter().any(|l| l == "Negotiation log"), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("No world named 'Gone'.")), "{text:?}");
+    }
+
     /// Two GUIs on one machine share their `client_uid` (one native-gui.dat, one WebView
     /// localStorage) but not their program (`AuthRequest.instance_id`; user report
     /// 2026-11-04: `/pause` in one left the other unpaused, "already paused"). They are two
@@ -14085,7 +14288,7 @@ third
         assert_eq!(draw(&mut app), (20, 1), "the bottom pane keeps one row");
         assert_eq!(app.split_command("-n1"), Ok(()));
         assert_eq!(draw(&mut app), (1, 20));
-        assert_eq!(app.split_command("-n 0"), Err("Usage: /split [-n <lines>] [world]".to_string()));
+        assert_eq!(app.split_command("-n 0"), Err("Usage: /split [-n <lines> | +<lines> | -<lines>] [world]".to_string()));
         assert_eq!(app.split_command("-n 7 Nowhere"), Err("World 'Nowhere' not found.".to_string()));
         assert_eq!(draw(&mut app), (1, 20), "a failed /split changes no size");
         app.split_close().unwrap();
@@ -14096,6 +14299,49 @@ third
         assert!(app.split.is_some());
         assert_eq!(draw(&mut app), (8, 13));
         assert_eq!(app.split_command(""), Err("The output is already split; /unsplit closes the pane without the focus.".to_string()));
+    }
+
+    /// `/split +<lines>`/`-<lines>`: that many more or fewer than the top pane shows, each
+    /// pane keeping a row, kept like `-n`; only while split (user request 2026-11-05).
+    #[test]
+    fn test_split_plus_minus_steps_the_top_pane() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["A", "B"] {
+            app.worlds.push(World::new(name));
+        }
+        app.current_world_index = 0;
+        app.input_height = 1;
+        // 24 rows: 22 for the output area, so the top pane has 20 at most.
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        let mut draw = |app: &mut App| {
+            terminal.draw(|f| rendering::ui(f, app)).unwrap();
+            app.pane_rows
+        };
+        assert_eq!(app.split_command("+3"), Err("The output isn't split.".to_string()), "not split: nothing to step");
+        assert!(app.split.is_none(), "+ never opens a split");
+        assert_eq!(app.split_command("-3 B"), Err("The output isn't split.".to_string()));
+        assert!(app.split.is_none());
+        assert_eq!(app.split_command(""), Ok(()));
+        assert_eq!(draw(&mut app), (10, 11));
+        assert_eq!(app.split_command("+3"), Ok(()), "from the half it shows");
+        assert_eq!(draw(&mut app), (13, 8));
+        assert_eq!(app.split_command("-5"), Ok(()));
+        assert_eq!(draw(&mut app), (8, 13));
+        assert_eq!(app.split_command("-50"), Ok(()));
+        assert_eq!(draw(&mut app), (1, 20), "the top pane keeps a row");
+        assert_eq!(app.split_command("+500"), Ok(()));
+        assert_eq!(draw(&mut app), (20, 1), "the bottom pane keeps a row");
+        assert_eq!(app.split_top_rows, Some(20), "a step keeps what fits, never more");
+        assert_eq!(app.split_command("-n 500"), Ok(()));
+        draw(&mut app);
+        assert_eq!(app.split_command("-1"), Ok(()), "from what shows, not the -n kept");
+        assert_eq!(draw(&mut app), (19, 2));
+        assert_eq!(app.split_command("+0"), Err("Usage: /split [-n <lines> | +<lines> | -<lines>] [world]".to_string()));
+        app.split_close().unwrap();
+        assert_eq!(app.split_command(""), Ok(()));
+        assert_eq!(draw(&mut app), (19, 2), "the next /split opens at the size kept");
     }
 
     /// Both panes' worlds are watched: their lines are born viewed and they are no activity;
@@ -15015,7 +15261,7 @@ third
                 out.push(format!(
                     "seq {} never broadcast (idx {}, gagged={}, input={}, text={:?})",
                     line.seq, i, line.gagged, line.is_input, line.text));
-            } else if !line.text.is_empty() && !ledger.saw_text(&line.text) {
+            } else if !line.wire_text().is_empty() && !ledger.saw_text(&line.wire_text()) {
                 out.push(format!(
                     "seq {} span was claimed but its TEXT was never sent (idx {}, text={:?})",
                     line.seq, i, line.text));
@@ -15025,7 +15271,7 @@ third
             // dropped as an already-seen duplicate - one line missing with its neighbours
             // present, which is the field symptom this whole check exists to catch.
             if let Some(client_text) = ledger.client_model.get(&line.seq) {
-                if client_text != &line.text.replace('\r', "") {
+                if client_text != &line.wire_text() {
                     out.push(format!(
                         "seq {} MISFILED on the client: server has {:?}, client model has {:?}",
                         line.seq, line.text, client_text));
@@ -20395,6 +20641,7 @@ third
             WriteCommand::Shutdown => panic!("expected a Raw wire write, got Shutdown"),
             WriteCommand::SetEncoding(_) => panic!("expected a Raw wire write, got SetEncoding"),
             WriteCommand::Chat(_) => panic!("expected a Raw wire write, got Chat"),
+            WriteCommand::CountInto(_) => panic!("expected a Raw wire write, got CountInto"),
         }
 
         let mut saw_negotiated = false;
@@ -20594,6 +20841,7 @@ third
             Ok(WriteCommand::Shutdown) => panic!("expected a Raw CHARSET ACCEPTED response, got Shutdown"),
             Ok(WriteCommand::SetEncoding(_)) => panic!("expected the Raw CHARSET ACCEPTED response first, got SetEncoding"),
             Ok(WriteCommand::Chat(_)) => panic!("expected the Raw CHARSET ACCEPTED response first, got Chat"),
+            Ok(WriteCommand::CountInto(_)) => panic!("expected the Raw CHARSET ACCEPTED response first, got CountInto"),
             Err(_) => panic!("expected a queued CHARSET ACCEPTED response, channel was empty"),
         }
         // Job 13 (plan Phase 4, 4.4): accepting now also switches the writer's

@@ -771,7 +771,7 @@ pub(crate) fn spawn_remote_ping_check(
             // path), so it keeps the simpler per-client form used before this step.
             for (&id, client) in &sorted {
                 if let Err(mpsc::error::TrySendError::Full(_)) = client.tx.try_send(crate::websocket::Outbound::Message(Box::new(WsMessage::PingCheck { nonce }))) {
-                    crate::http::log_remote_event("WS-CHANNEL-FULL", &client.ip_address,
+                    crate::websocket::log_channel_full(id, &client.ip_address,
                         &format!("client={} PingCheck dropped - outbound channel full (capacity {})",
                             id, crate::websocket::WS_CLIENT_CHANNEL_CAPACITY));
                 }
@@ -1125,6 +1125,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             // Spawn connection in background to avoid blocking the UI
             app.current_world_mut().connection_id += 1;
             let reader_conn_id = app.current_world().connection_id;
+            let diag = app.current_world_mut().protocol.new_diag();
             let world_name = app.current_world().name.clone();
             let connect_host = host.clone();
             let connect_fallback = fallback_host.clone();
@@ -1152,7 +1153,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     // FANSI detection and skip_auto_login, which the proxy helper doesn't).
                     match crate::daemon::connect_via_tls_proxy(
                         &world_name, &connect_host, &connect_port, &proxy_settings,
-                        event_tx_connect.clone(), reader_conn_id, true,
+                        event_tx_connect.clone(), reader_conn_id, true, Some(diag.clone()),
                     ).await {
                         Ok((cmd_tx, proxy_pid, proxy_path)) => {
                             let _ = event_tx_connect.send(AppEvent::WorldConnectResult(
@@ -1185,7 +1186,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         }
                         // Where a TLS failure happened, for TF's CONFAIL text.
                         let (peer_addr, peer_port) = match tcp_stream.peer_addr() {
-                            Ok(a) => (a.ip().to_string(), a.port().to_string()),
+                            Ok(a) => {
+                                diag.set_peer(a.to_string());
+                                (a.ip().to_string(), a.port().to_string())
+                            }
                             Err(_) => (connect_host.clone(), connect_port.clone()),
                         };
                         // Store the socket fd/handle for hot reload (before splitting)
@@ -1239,6 +1243,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                         if let Some(cipher) = crate::daemon::tls_cipher_name(tls_stream.get_ref().1) {
                                             let _ = event_tx_connect.send(AppEvent::TlsCipher(world_name.clone(), reader_conn_id, cipher)).await;
                                         }
+                                        if let Some(version) = crate::daemon::tls_version_name(tls_stream.get_ref().1) {
+                                            diag.set_tls_version(version);
+                                        }
                                         let (r, w) = tokio::io::split(tls_stream);
                                         Ok((StreamReader::Tls(r), StreamWriter::Tls(w), true))
                                     }
@@ -1279,6 +1286,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                     // connection_result match just destructured (true for the TLS
                                     // arm, false for the plain arm).
                                     is_tls,
+                                    diag: Some(diag.clone()),
                                     ..TelnetConfig::default()
                                 };
                                 spawn_telnet_reader(
@@ -1616,6 +1624,16 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         Command::Mssp => {
             let world_idx = app.current_world_index;
             execute_mssp_command(app, world_idx, false);
+        }
+        Command::Info { world } => {
+            let here = app.current_world_index;
+            match app.info_world(world.as_deref(), here) {
+                Ok(idx) => {
+                    let lines = crate::info::report_lines(&app.build_info_report(idx, None), true);
+                    app.emit_client_lines(here, &lines, false);
+                }
+                Err(e) => app.add_output(&e),
+            }
         }
         Command::Stats { show } => {
             let world_idx = app.current_world_index;

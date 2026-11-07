@@ -91,6 +91,8 @@ web page and the Android app.
   focused pane's bar keeps the bar colour, the other one turns grey.
 - **The panes' size.** `/split -n <lines>` makes the top pane that many lines high, in
   every interface: it splits the output if it isn't split, and only resizes it if it is.
+  `/split +<lines>` and `/split -<lines>` make the top pane that many lines higher or
+  lower than it is now; they only resize a split that is open.
   In the GUI and the web page (the Android app too) you can also drag the bar between the
   panes up or down, a line at a time, with a finger on a touch screen. Each pane keeps at
   least one line. A press on the bar also gives its pane the focus. The size is that

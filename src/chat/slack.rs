@@ -635,7 +635,7 @@ async fn writer(
             }
             WriteCommand::Chat(ChatOp::SendTo(mut t, text)) => send_text(&web, &dir, &mut t, &text, &sink).await,
             WriteCommand::Shutdown => return,
-            WriteCommand::Raw(_) | WriteCommand::SetEncoding(_) => {}
+            WriteCommand::Raw(_) | WriteCommand::SetEncoding(_) | WriteCommand::CountInto(_) => {}
         }
     }
 }

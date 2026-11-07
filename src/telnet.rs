@@ -119,6 +119,9 @@ pub enum WriteCommand {
     /// in-band for the same ordering reason as `SetEncoding`. The telnet writer
     /// ignores it. See `crate::chat`.
     Chat(crate::chat::ChatOp),
+    /// From the reader, first thing, when `/info` keeps a record of this connection: the
+    /// writer adds every byte it puts on the wire to it from then on.
+    CountInto(std::sync::Arc<crate::protocol_state::ConnDiag>),
 }
 
 /// Stream wrapper enums for supporting both plain TCP and TLS connections
@@ -1142,6 +1145,10 @@ pub struct TelnetConfig {
     /// The MTTS screen-reader bit: the user asked MUDs to be told a screen reader is in use
     /// (Settings > "MUDs: Screen Reader"; `set_announce_screen_reader`).
     pub screen_reader: bool,
+    /// Where `/info` reads this connection's negotiation and traffic from
+    /// (`protocol_state::ConnDiag`). `None` - every test, and any connection nobody made one
+    /// for - records nothing at all.
+    pub diag: Option<std::sync::Arc<crate::protocol_state::ConnDiag>>,
 }
 
 /// Settings > "MUDs: Screen Reader" (`Settings::announce_screen_reader`): one process-wide
@@ -1182,8 +1189,123 @@ impl Default for TelnetConfig {
             msp_enabled: true,
             mccp2_enabled: true,
             screen_reader: announce_screen_reader(),
+            diag: None,
         }
     }
+}
+
+/// One negotiation the session took part in, for `/info`'s log: what the server sent and
+/// what the session answered at once (empty when it sent nothing back), with the option's
+/// state on both sides afterwards. No time here - the session has no clock; the reader
+/// stamps it (`ConnDiag::note`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TelnetNote {
+    pub what: String,
+    pub reply: String,
+    /// The option and whether it is now on for the server and for Clay.
+    pub option: Option<(u8, bool, bool)>,
+}
+
+/// A telnet option's name as `/info` shows it: the common ones by name, any other by number.
+pub fn telnet_option_name(opt: u8) -> String {
+    let name = match opt {
+        0 => "BINARY",
+        TELNET_OPT_ECHO => "ECHO",
+        TELNET_OPT_SGA => "SGA",
+        5 => "STATUS",
+        6 => "TIMING-MARK",
+        TELNET_OPT_TTYPE => "TTYPE",
+        TELNET_OPT_EOR => "EOR",
+        TELNET_OPT_NAWS => "NAWS",
+        32 => "TSPEED",
+        33 => "LFLOW",
+        34 => "LINEMODE",
+        35 => "XDISPLOC",
+        36 => "ENVIRON",
+        39 => "NEW-ENVIRON",
+        TELNET_OPT_CHARSET => "CHARSET",
+        TELNET_OPT_MSDP => "MSDP",
+        TELNET_OPT_MSSP => "MSSP",
+        85 => "MCCP1",
+        TELNET_OPT_MCCP2 => "MCCP2",
+        87 => "MCCP3",
+        TELNET_OPT_MSP => "MSP",
+        91 => "MXP",
+        93 => "ZMP",
+        200 => "ATCP",
+        TELNET_OPT_GMCP => "GMCP",
+        _ => return format!("option {opt}"),
+    };
+    name.to_string()
+}
+
+/// Telnet commands in `bytes` as words - "DO GMCP", "SB TTYPE IS CLAY", "SB NAWS 120x40" -
+/// joined by ", ", for `/info`'s log. Text the MUD put in a subnegotiation is cut to
+/// printable ASCII and capped: it is shown to the user.
+pub fn describe_telnet(bytes: &[u8]) -> String {
+    fn shown(payload: &[u8]) -> String {
+        let text: String = payload.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { ' ' }).collect();
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.chars().count() > 60 { format!("{}...", text.chars().take(60).collect::<String>()) } else { text }
+    }
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != TELNET_IAC {
+            i += 1;
+            continue;
+        }
+        let cmd = bytes[i + 1];
+        match cmd {
+            TELNET_WILL | TELNET_WONT | TELNET_DO | TELNET_DONT if i + 2 < bytes.len() => {
+                let verb = match cmd { TELNET_WILL => "WILL", TELNET_WONT => "WONT", TELNET_DO => "DO", _ => "DONT" };
+                parts.push(format!("{verb} {}", telnet_option_name(bytes[i + 2])));
+                i += 3;
+            }
+            TELNET_SB if i + 2 < bytes.len() => {
+                let opt = bytes[i + 2];
+                let start = i + 3;
+                let mut end = start;
+                while end + 1 < bytes.len() && !(bytes[end] == TELNET_IAC && bytes[end + 1] == TELNET_SE) {
+                    end += if bytes[end] == TELNET_IAC { 2 } else { 1 };
+                }
+                let payload = &bytes[start..end.min(bytes.len())];
+                let name = telnet_option_name(opt);
+                let body = match (opt, payload.first()) {
+                    (TELNET_OPT_NAWS, _) if payload.len() == 4 => format!(
+                        "{}x{}",
+                        u16::from_be_bytes([payload[0], payload[1]]),
+                        u16::from_be_bytes([payload[2], payload[3]]),
+                    ),
+                    (TELNET_OPT_TTYPE, Some(0)) => format!("IS {}", shown(&payload[1..])),
+                    (TELNET_OPT_TTYPE, Some(1)) => "SEND".to_string(),
+                    // REQUEST <separator><name><separator><name>...
+                    (TELNET_OPT_CHARSET, Some(1)) if payload.len() > 1 => {
+                        let sep = payload[1];
+                        let names: Vec<u8> = payload[2..].iter().map(|&b| if b == sep { b' ' } else { b }).collect();
+                        format!("REQUEST {}", shown(&names))
+                    }
+                    (TELNET_OPT_CHARSET, Some(2)) => format!("ACCEPTED {}", shown(&payload[1..])),
+                    (TELNET_OPT_CHARSET, Some(3)) => "REJECTED".to_string(),
+                    (TELNET_OPT_GMCP, _) => shown(payload.split(|&b| b == b' ').next().unwrap_or(&[])),
+                    // VAR, VAL and MSDP's table/array marks (1-6) read as spaces.
+                    (TELNET_OPT_MSDP | TELNET_OPT_MSSP, _) => {
+                        let words: Vec<u8> = payload.iter().map(|&b| if (1..=6).contains(&b) { b' ' } else { b }).collect();
+                        shown(&words)
+                    }
+                    (TELNET_OPT_MCCP2, _) => "(compression starts)".to_string(),
+                    _ => format!("({} bytes)", payload.len()),
+                };
+                parts.push(format!("SB {name} {body}"));
+                i = end + 2;
+            }
+            TELNET_GA => { parts.push("GA".to_string()); i += 2; }
+            TELNET_EOR => { parts.push("EOR".to_string()); i += 2; }
+            TELNET_NOP => { parts.push("NOP".to_string()); i += 2; }
+            _ => i += 2,
+        }
+    }
+    parts.join(", ")
 }
 
 /// Events a `TelnetSession` can emit from `feed`/`flush_eof`.
@@ -1895,6 +2017,15 @@ pub struct TelnetSession {
     /// each option enabled, from the peer's `DO`/`DONT` requests. See
     /// `q_receive_do_dont`.
     options_us: Box<[OptionState; 256]>,
+    /// Whether the server last said WILL (true) or WONT ECHO - ECHO is outside the option
+    /// tables above. Only for `/info`.
+    echo_him: bool,
+    /// Negotiations not yet taken by the reader (`take_notes`); kept only while
+    /// `cfg.diag` is set, so a session nobody reads never grows this.
+    notes: Vec<TelnetNote>,
+    /// MCCP2 bytes consumed and produced since `take_mccp_counts` last asked.
+    mccp_in: u64,
+    mccp_out: u64,
 }
 
 impl TelnetSession {
@@ -1912,7 +2043,30 @@ impl TelnetSession {
             telnet_seen: false,
             options_him: Box::new([OptionState::default(); 256]),
             options_us: Box::new([OptionState::default(); 256]),
+            echo_him: false,
+            notes: Vec::new(),
+            mccp_in: 0,
+            mccp_out: 0,
         }
+    }
+
+    /// The negotiations since the last call, for `/info` (empty unless `cfg.diag` is set).
+    pub fn take_notes(&mut self) -> Vec<TelnetNote> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// MCCP2 (compressed bytes consumed, bytes they became) since the last call.
+    pub fn take_mccp_counts(&mut self) -> (u64, u64) {
+        (std::mem::take(&mut self.mccp_in), std::mem::take(&mut self.mccp_out))
+    }
+
+    fn option_sides(&self, opt: u8) -> (bool, bool) {
+        let server = if opt == TELNET_OPT_ECHO {
+            self.echo_him
+        } else {
+            self.options_him[opt as usize] == OptionState::Yes
+        };
+        (server, self.options_us[opt as usize] == OptionState::Yes)
     }
 
     /// Interpret one complete subnegotiation payload (the bytes strictly
@@ -2258,6 +2412,8 @@ impl TelnetSession {
             .as_mut()
             .expect("run_decompressor requires an active decompressor");
         let step = mccp2_decompress_capped(decomp, &raw);
+        self.mccp_in += step.consumed as u64;
+        self.mccp_out += step.output.len() as u64;
 
         if let Some(reason) = step.error {
             self.decomp = None;
@@ -2365,6 +2521,7 @@ impl TelnetSession {
                             break;
                         }
                         let option = buf[i + 2];
+                        let wire_before = wire.len();
                         // RFC 1143 Q method (finding 4 / Job 9): a reply
                         // goes out, and OptionEnabled/OptionDisabled fires,
                         // only on an actual state change — see
@@ -2414,6 +2571,17 @@ impl TelnetSession {
                             }
                             _ => {} // unreachable: the outer arm matches only these four
                         }
+                        if self.cfg.diag.is_some() {
+                            if option == TELNET_OPT_ECHO && (cmd == TELNET_WILL || cmd == TELNET_WONT) {
+                                self.echo_him = cmd == TELNET_WILL;
+                            }
+                            let (server, clay) = self.option_sides(option);
+                            self.notes.push(TelnetNote {
+                                what: describe_telnet(&buf[i..i + 3]),
+                                reply: describe_telnet(&wire[wire_before..]),
+                                option: Some((option, server, clay)),
+                            });
+                        }
                         i += 3;
                     }
                     TELNET_SB => {
@@ -2436,9 +2604,21 @@ impl TelnetSession {
                         match se_at {
                             Some(se) => {
                                 let sb_data = &buf[payload_start..se];
+                                let wire_before = wire.len();
                                 let is_mccp2 =
                                     self.handle_subnegotiation(sb_data, &mut wire, &mut events);
                                 let after_se = se + 2;
+                                // The subnegotiations worth a line in /info's log: not GMCP
+                                // or MSDP, which come by the hundred and are counted instead.
+                                if self.cfg.diag.is_some()
+                                    && matches!(buf.get(payload_start), Some(&(TELNET_OPT_TTYPE | TELNET_OPT_CHARSET | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP)))
+                                {
+                                    self.notes.push(TelnetNote {
+                                        what: describe_telnet(&buf[sb_start..after_se]),
+                                        reply: describe_telnet(&wire[wire_before..]),
+                                        option: None,
+                                    });
+                                }
                                 i = after_se;
                                 if is_mccp2 {
                                     // Job 3: activate right here. Create the
@@ -5343,5 +5523,97 @@ mod tests {
         let rest = s.feed(b"[47m!\n").text;
         assert_eq!(rest, b"\x1b[47m!\n".to_vec(),
             "the held ESC must be re-emitted with the rest of its sequence");
+    }
+
+    // ==================================================================
+    // /info's negotiation notes (TelnetSession::take_notes): recorded only for a session
+    // with a `diag`, one per negotiation, with the reply and both sides' state.
+    // ==================================================================
+
+    fn recording_session() -> TelnetSession {
+        TelnetSession::new(TelnetConfig {
+            diag: Some(std::sync::Arc::new(crate::protocol_state::ConnDiag::default())),
+            ..TelnetConfig::default()
+        })
+    }
+
+    #[test]
+    fn a_session_without_a_diag_records_no_notes() {
+        let mut s = TelnetSession::new(TelnetConfig::default());
+        s.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP]);
+        assert!(s.take_notes().is_empty());
+    }
+
+    #[test]
+    fn notes_carry_the_reply_and_both_sides_state() {
+        let mut s = recording_session();
+        s.feed(&[
+            TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP,
+            TELNET_IAC, TELNET_WILL, 99,
+            TELNET_IAC, TELNET_DO, TELNET_OPT_NAWS,
+            TELNET_IAC, TELNET_WILL, TELNET_OPT_ECHO,
+            TELNET_IAC, TELNET_WONT, TELNET_OPT_ECHO,
+        ]);
+        let notes = s.take_notes();
+        let pairs: Vec<(&str, &str)> = notes.iter().map(|n| (n.what.as_str(), n.reply.as_str())).collect();
+        assert_eq!(pairs, vec![
+            ("WILL GMCP", "DO GMCP"),
+            ("WILL option 99", "DONT option 99"),
+            ("DO NAWS", "WILL NAWS"),
+            ("WILL ECHO", "DO ECHO"),
+            ("WONT ECHO", "DONT ECHO"),
+        ]);
+        assert_eq!(notes[0].option, Some((TELNET_OPT_GMCP, true, false)));
+        assert_eq!(notes[1].option, Some((99, false, false)));
+        assert_eq!(notes[2].option, Some((TELNET_OPT_NAWS, false, true)));
+        assert_eq!(notes[3].option, Some((TELNET_OPT_ECHO, true, false)));
+        assert_eq!(notes[4].option, Some((TELNET_OPT_ECHO, false, false)));
+        assert!(s.take_notes().is_empty(), "taken once");
+    }
+
+    #[test]
+    fn a_ttype_send_is_noted_with_the_answer() {
+        let mut s = recording_session();
+        s.feed(&[TELNET_IAC, TELNET_DO, TELNET_OPT_TTYPE]);
+        s.feed(&[TELNET_IAC, TELNET_SB, TELNET_OPT_TTYPE, 1, TELNET_IAC, TELNET_SE]);
+        let notes = s.take_notes();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[1].what, "SB TTYPE SEND");
+        assert_eq!(notes[1].reply, "SB TTYPE IS CLAY");
+        assert_eq!(notes[1].option, None);
+    }
+
+    #[test]
+    fn notes_are_the_same_however_the_bytes_are_split() {
+        let whole: Vec<u8> = [
+            &[TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP][..],
+            b"hello\n",
+            &[TELNET_IAC, TELNET_DO, TELNET_OPT_TTYPE],
+            &[TELNET_IAC, TELNET_SB, TELNET_OPT_TTYPE, 1, TELNET_IAC, TELNET_SE],
+            &[TELNET_IAC, TELNET_WILL, TELNET_OPT_EOR],
+        ].concat();
+        let mut one = recording_session();
+        one.feed(&whole);
+        let expected = one.take_notes();
+        assert_eq!(expected.len(), 4);
+        for split in 1..whole.len() {
+            let mut s = recording_session();
+            s.feed(&whole[..split]);
+            s.feed(&whole[split..]);
+            assert_eq!(s.take_notes(), expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn describe_telnet_names_commands_and_subnegotiations() {
+        assert_eq!(describe_telnet(&build_naws_subnegotiation(120, 40)), "SB NAWS 120x40");
+        assert_eq!(describe_telnet(&build_charset_accepted("UTF-8")), "SB CHARSET ACCEPTED UTF-8");
+        assert_eq!(describe_telnet(&build_gmcp_message("Core.Hello", "{}")), "SB GMCP Core.Hello");
+        assert_eq!(describe_telnet(&build_msdp_set("LIST", "REPORTABLE_VARIABLES")), "SB MSDP LIST REPORTABLE_VARIABLES");
+        assert_eq!(describe_telnet(&[TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP, TELNET_IAC, TELNET_DONT, 91]), "DO GMCP, DONT MXP");
+        assert_eq!(
+            describe_telnet(&[TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, 1, b';', b'U', b'T', b'F', b'-', b'8', b';', b'A', TELNET_IAC, TELNET_SE]),
+            "SB CHARSET REQUEST UTF-8 A",
+        );
     }
 }

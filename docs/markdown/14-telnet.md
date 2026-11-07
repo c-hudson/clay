@@ -18,6 +18,9 @@ also means Clay never sends any telnet bytes at all on connect or on a hot `/rel
 live socket until the server sends something first; a `/reload` that reconnects the telnet
 reader mid-session produces no "Huh?"-style garbage on a world that isn't telnet-aware.
 
+To see what was negotiated on a connection, and when, use `/info` (see the **Commands**
+chapter): it lists every option's state on both sides and logs each negotiation.
+
 ## Supported Telnet Options
 
 | Option | Code | Direction |

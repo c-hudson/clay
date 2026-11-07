@@ -227,7 +227,19 @@ pub struct World {
     history_done: bool,
     /// The history request out: its id, the position it asked from, when it's given up.
     history_inflight: Option<(u64, HistoryPos, Instant)>,
+    /// The view is scrolled back in this world (`ClientCore::set_pinned`): nothing is
+    /// trimmed under the user.
+    pinned: bool,
 }
+
+/// How many lines a world keeps: the newest. Every frame walks the shown world's lines
+/// (and a day's output is hundreds of thousands), so the buffer is capped; what is
+/// dropped is still in the server's memory and archive, read again on demand when the
+/// user scrolls up (`request_history`). At least the server's one resume replay
+/// (`RESUME_REPLAY_MAX`, 10 000) and verify.rs's 5000-line window.
+pub const MAX_LINES: usize = 10_000;
+/// Lines past the cap before a trim, so one `drain` does many lines at once.
+const TRIM_SLACK: usize = MAX_LINES / 8;
 
 /// Where a world's history begins, as `RequestHistory` names it: `(before_seq,
 /// archive_before)`.
@@ -257,6 +269,31 @@ impl World {
     /// The last line held, if it has a real seq (for the order check).
     fn last_real_seq(&self) -> Option<u64> {
         self.lines.iter().rev().find_map(|l| l.seq)
+    }
+
+    /// Drop the oldest lines once more than `cap` plus the slack are held, down to `cap`;
+    /// how many went. Never while the view is scrolled back in this world (`pinned`) or a
+    /// history reply is on its way: the archive lines read on demand sit at the front and
+    /// would go first. Afterwards history starts at the oldest kept line and can be asked
+    /// for again, and any hole in the delivered seqs below it is closed - a gap fill for
+    /// lines this client would only drop again must never be asked for - while the ranges
+    /// above stay, so a late copy of a dropped line is still a duplicate.
+    fn trim(&mut self, cap: usize) -> usize {
+        if self.pinned || self.history_inflight.is_some() || self.lines.len() <= cap + TRIM_SLACK {
+            return 0;
+        }
+        let n = self.lines.len() - cap;
+        self.lines.drain(..n);
+        // The tail isn't guaranteed sorted (a mismatched seq is kept after being reported).
+        self.oldest_seq = self.lines.iter().filter_map(|l| l.seq).min();
+        self.history_done = false;
+        if let (Some(oldest), Some(&(first, _))) = (self.oldest_seq, self.seen.ranges().first()) {
+            if oldest > first {
+                self.seen.mark(first, oldest - 1);
+            }
+        }
+        self.touch();
+        n
     }
 
     fn touch(&mut self) {
@@ -303,6 +340,8 @@ pub struct ClientCore {
     pub initial_states: u64,
     /// Bumped whenever the settings may have changed (Settings windows redraw on it).
     pub settings_rev: u64,
+    /// Bumped whenever `actions` are assigned (the view rebuilds its matcher on it).
+    pub actions_rev: u64,
     creds: Credentials,
     client_uid: String,
     client_version: String,
@@ -345,6 +384,8 @@ pub struct ClientCore {
     /// The server takes `ResumeSession` (`InitialState.resume_session`): any use of a
     /// paused window resumes it, not only what it sends.
     server_resumes: bool,
+    /// The server takes `RequestInfo` (`InitialState.info_report`): `/info` opens a window.
+    pub server_info_report: bool,
     pub visible: bool,
     /// The ASCII splash shown before there's any world (multiuser, before connecting).
     pub splash_lines: Vec<String>,
@@ -399,6 +440,7 @@ impl ClientCore {
         ClientCore {
             initial_states: 0,
             settings_rev: 0,
+            actions_rev: 0,
             creds,
             client_uid,
             client_version: crate::VERSION.to_string(),
@@ -428,6 +470,7 @@ impl ClientCore {
             paused: false,
             resume_asked: false,
             server_resumes: false,
+            server_info_report: false,
             splash_lines: Vec::new(),
             cached: HashMap::new(),
             preferred_world: None,
@@ -700,6 +743,12 @@ impl ClientCore {
         fx
     }
 
+    /// `/info`: ask the server for its report on `world` (`None`: the world shown).
+    pub fn request_info(&mut self, world: Option<usize>) -> Vec<Effect> {
+        self.send(WsMessage::RequestInfo { world_index: world.or(Some(self.current)) });
+        self.take()
+    }
+
     /// A command was sent: the current world's prompt and splash go, as app.js clears
     /// them (the server sends the next prompt when there is one).
     pub fn command_sent(&mut self) -> Vec<Effect> {
@@ -745,6 +794,14 @@ impl ClientCore {
     }
 
     /// The output area holds this many rows and columns.
+    /// The worlds whose view is scrolled back in this window (the shown world, a split's
+    /// other pane): their buffers are never trimmed meanwhile (`World::trim`).
+    pub fn set_pinned(&mut self, worlds: &[usize]) {
+        for (i, w) in self.worlds.iter_mut().enumerate() {
+            w.pinned = worlds.contains(&i);
+        }
+    }
+
     pub fn set_view(&mut self, rows: usize, cols: usize) -> Vec<Effect> {
         if self.view != Some((rows, cols)) {
             self.view = Some((rows, cols));
@@ -1218,8 +1275,9 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, map, resume_session, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, map, resume_session, info_report, .. } => {
                 self.server_map = map;
+                self.server_info_report = info_report;
                 // A pause is a connection's: a new one starts unpaused, and a resync's
                 // `PausedState` follows if this one still is. Kept, the badge outlived a
                 // reconnect (a server's reload) and nothing ever took it down.
@@ -1233,6 +1291,7 @@ impl ClientCore {
                 self.server_history_on_demand = history_on_demand;
                 self.initial_states += 1;
                 self.actions = actions;
+                self.actions_rev = self.actions_rev.wrapping_add(1);
                 self.splash_lines = splash_lines;
                 self.on_initial_state(worlds, settings, current_world_index, your_display_id, now);
                 // Connected again after the server's /update reload: our own half now.
@@ -1432,6 +1491,7 @@ impl ClientCore {
             WsMessage::WorldSwitched { .. } => {}
             WsMessage::ActionsUpdated { actions } => {
                 self.actions = actions;
+                self.actions_rev = self.actions_rev.wrapping_add(1);
                 self.changed();
             }
             WsMessage::ActivityUpdate { count } => {
@@ -1837,7 +1897,8 @@ impl ClientCore {
         let has_real = d.seq > 0 || d.end_seq.is_some();
         let mut gap_fill = false;
         if has_real {
-            let approx_end = d.end_seq.unwrap_or(d.seq + split_lines(&d.data).len().saturating_sub(1) as u64);
+            // Only a server from before `end_seq` makes this count the lines here.
+            let approx_end = d.end_seq.unwrap_or_else(|| d.seq + split_lines(&d.data).len().saturating_sub(1) as u64);
             let w = &self.worlds[d.world_index];
             if !d.flush && w.seen.contains_range(d.seq, approx_end) {
                 let max_seq = w.seen.max_seen();
@@ -1915,15 +1976,19 @@ impl ClientCore {
             }
         } else {
             for line in fresh {
-                if let (true, Some(prev), Some(s)) = (d.seq > 0, self.worlds[d.world_index].last_real_seq(), line.seq) {
-                    if s <= prev {
-                        self.send(WsMessage::ReportSeqMismatch {
-                            world_index: d.world_index,
-                            expected_seq_gt: prev,
-                            actual_seq: s,
-                            line_text: line.text.chars().take(80).collect(),
-                            source: SOURCE.into(),
-                        });
+                // The order check only for numbered lines: `last_real_seq` walks back over
+                // every unnumbered line, the whole buffer in the Activity world.
+                if let (true, Some(s)) = (d.seq > 0, line.seq) {
+                    if let Some(prev) = self.worlds[d.world_index].last_real_seq() {
+                        if s <= prev {
+                            self.send(WsMessage::ReportSeqMismatch {
+                                world_index: d.world_index,
+                                expected_seq_gt: prev,
+                                actual_seq: s,
+                                line_text: line.text.chars().take(80).collect(),
+                                source: SOURCE.into(),
+                            });
+                        }
                     }
                 }
                 self.worlds[d.world_index].lines.push(line);
@@ -1937,6 +2002,7 @@ impl ClientCore {
                 w.seen.mark(d.seq, end);
             }
         }
+        w.trim(MAX_LINES);
         w.touch();
         self.changed();
     }
@@ -1988,6 +2054,7 @@ impl ClientCore {
                     appended = true;
                 }
                 if appended {
+                    w.trim(MAX_LINES);
                     w.touch();
                 }
                 w.gap_no_progress = if appended || clamped { 0 } else { w.gap_no_progress + 1 };
@@ -2433,6 +2500,16 @@ fn is_update_command(command: &str) -> bool {
 /// to hide it for good (user report 2026-11-01).
 pub fn hidden_line(text: &str) -> bool {
     is_ansi_only(text)
+}
+
+impl Line {
+    /// Whether the line is left out of the output: gagged unless F2 shows it, or
+    /// `hidden_line`. A gagged line with no text isn't shown under F2 either: what the user
+    /// typed comes as one, the server keeping the text for `/recall` alone (the console's
+    /// `OutputLine::is_hidden`).
+    pub fn is_hidden(&self, show_tags: bool) -> bool {
+        (self.gagged && (!show_tags || self.text.is_empty())) || hidden_line(&self.text)
+    }
 }
 
 fn is_ansi_only(line: &str) -> bool {

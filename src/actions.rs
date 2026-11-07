@@ -716,8 +716,16 @@ pub fn check_action_triggers(
     actions: &[Action],
 ) -> Option<ActionTriggerResult> {
     // Strip ANSI codes for pattern matching
-    let plain_line = strip_ansi_codes(line);
+    check_action_triggers_plain(&strip_ansi_codes(line), world_name, actions)
+}
 
+/// `check_action_triggers` for a line already stripped of its escape codes: the server
+/// strips each line once and hands the same text to the TF triggers (`process_triggers`).
+pub fn check_action_triggers_plain(
+    plain_line: &str,
+    world_name: &str,
+    actions: &[Action],
+) -> Option<ActionTriggerResult> {
     for action in actions {
         // Skip disabled actions
         if !action.enabled {
@@ -737,7 +745,7 @@ pub fn check_action_triggers(
         // Test each pattern in order; first match fires the action
         for mp in &action.patterns {
             if let Some(ref regex) = mp.compiled_regex {
-                if let Some(caps) = regex.captures(&plain_line) {
+                if let Some(caps) = regex.captures(plain_line) {
                     // Extract capture groups: $0 is full match, $1-$9 are groups
                     let captures: Vec<&str> = caps.iter()
                         .map(|m| m.map(|m| m.as_str()).unwrap_or(""))

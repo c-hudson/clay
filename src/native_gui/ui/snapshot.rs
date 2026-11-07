@@ -134,6 +134,7 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         "keybind" => super::windows::Kind::KeybindEditor,
         "action" => super::windows::Kind::ActionEditor,
         "emoji" => super::windows::Kind::Emoji,
+        "info" => super::windows::Kind::Info,
         other => fail(&format!("no window kind {other}")),
     };
     // CLAY_SNAPSHOT_INPUT: mouse and key events to replay before the capture, for
@@ -173,6 +174,21 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                             let find = |v: &mut ClayView| v.link_at_point(x, y).and_then(|(id, r)| v.styled.get(&id).map(|(_, s)| s.text[r].to_string()));
                             let link = if other { v.in_other_pane(find).flatten() } else { find(v) };
                             println!("snapshot-{verb}: {x},{y} {link:?}");
+                        })
+                    });
+                    Vec::new()
+                }
+                // The split's size as text: the top pane's lines kept, and the whole lines it
+                // shows with the most it can have (split.rs `split_lines_shown`).
+                "split" => {
+                    cx.run_until_parked();
+                    let _ = cx.update_window(window.into(), |_, w, app| {
+                        let _ = w.draw(app);
+                    });
+                    cx.update(|app| {
+                        view.update(app, |v, _| {
+                            let shown = v.split.is_some().then(|| v.split_lines_shown());
+                            println!("snapshot-split: kept {:?} shown {:?}", v.split_size.top_lines, shown);
                         })
                     });
                     Vec::new()
@@ -474,7 +490,11 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
         }
     }
     // CLAY_SNAPSHOT_BENCH=1: time frames scrolling the buffer and taking in 200 lines a
-    // second, and report memory (the CPU side of the phase 2 performance targets).
+    // second, and report memory (the CPU side of the phase 2 performance targets). With
+    // CLAY_SNAPSHOT_BENCH_PREFILL=N the shown world first takes N lines (a long session's
+    // buffer); CLAY_SNAPSHOT_BENCH_BG=1 sends every line to world 1 as well (a background
+    // world never switched to); CLAY_SNAPSHOT_BENCH_BURST=N ends with N lines arriving in
+    // one wake, as N messages and then as one (a flood).
     if std::env::var_os("CLAY_SNAPSHOT_BENCH").is_some() {
         bench(&mut cx, window.into(), &view);
     }
@@ -535,10 +555,7 @@ fn stats(mut ms: Vec<f64>) -> (f64, f64, f64) {
 }
 
 fn rss_mb() -> f64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()))
-        .map_or(0.0, |kb| kb / 1024.0)
+    crate::platform::process_stats().resident.map_or(0.0, |b| b as f64 / (1024.0 * 1024.0))
 }
 
 fn bench(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle, view: &gpui::Entity<ClayView>) {
@@ -556,6 +573,44 @@ fn bench(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle, view: &gpui
     let mut lines = 0;
     with_view(cx, &mut |v, _| lines = v.session.core.current_world().map_or(0, |w| w.lines.len()));
     println!("bench: {lines} lines in the current world, RSS {:.0} MB", rss_mb());
+    let env_n = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let background = env_n("CLAY_SNAPSHOT_BENCH_BG") > 0;
+    let targets = |v: &ClayView| -> Vec<usize> {
+        let mut t = vec![v.session.core.current];
+        if background && v.session.core.worlds.len() > 1 && v.session.core.current != 1 {
+            t.push(1);
+        }
+        t
+    };
+    // A long session's buffer: N lines, 100 to a message, before anything is timed.
+    let prefill = env_n("CLAY_SNAPSHOT_BENCH_PREFILL");
+    if prefill > 0 {
+        let t = Instant::now();
+        let (mut core_s, mut after_s) = (0.0f64, 0.0f64);
+        with_view(cx, &mut |v, cx| {
+            for w in targets(v) {
+                let mut sent = 0;
+                while sent < prefill {
+                    let n = (prefill - sent).min(100);
+                    let (c, a) = feed_lines(v, cx, w, n as usize, true);
+                    core_s += c;
+                    after_s += a;
+                    sent += n;
+                }
+            }
+        });
+        cx.run_until_parked();
+        let frame_ms = draw(cx);
+        with_view(cx, &mut |v, _| lines = v.session.core.current_world().map_or(0, |w| w.lines.len()));
+        println!(
+            "bench: prefill {prefill} lines{} took {:.0} ms (core {:.0} ms, follow-up {:.0} ms), first frame after {frame_ms:.2} ms, {lines} lines held, RSS {:.0} MB",
+            if background { " (and the background world)" } else { "" },
+            t.elapsed().as_secs_f64() * 1000.0,
+            core_s * 1000.0,
+            after_s * 1000.0,
+            rss_mb()
+        );
+    }
 
     // Scrolling: three rows a frame (a wheel notch) up through the buffer, then a page at a
     // time back down, 600 frames.
@@ -580,28 +635,12 @@ fn bench(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle, view: &gpui
     for frame in 0..600u64 {
         let due = ((frame + 1) * 200 / 60) - (frame * 200 / 60);
         with_view(cx, &mut |v, cx| {
-            let (world_index, next) = (v.session.core.current, v.session.core.current_world().map_or(0, |w| w.seen.max_seen() + 1));
-            for i in 0..due {
-                let seq = next + i;
-                let msg = crate::websocket::WsMessage::ServerData {
-                    world_index,
-                    data: format!("\x1b[1;32mbench\x1b[0m line {seq}: the quick brown fox jumps over the lazy dog, again and again until it wraps\n"),
-                    is_viewed: true,
-                    ts: 0,
-                    from_server: true,
-                    seq,
-                    end_seq: Some(seq),
-                    flush: false,
-                    gagged: false,
-                    archive_sourced: false,
-                    highlight_colors: Vec::new(),
-                };
-                let t0 = Instant::now();
-                let fx = v.session.handle(crate::native_gui::core::client::Input::Message(Box::new(msg)));
-                let t1 = Instant::now();
-                v.after(fx, cx);
-                core_s += (t1 - t0).as_secs_f64();
-                after_s += t1.elapsed().as_secs_f64();
+            for w in targets(v) {
+                for _ in 0..due {
+                    let (c, a) = feed_lines(v, cx, w, 1, false);
+                    core_s += c;
+                    after_s += a;
+                }
             }
         });
         // (The test executor's own turn isn't counted: the real event loop has none.)
@@ -618,7 +657,80 @@ fn bench(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle, view: &gpui
         started.elapsed().as_secs_f64()
     );
     println!("bench: of which the client core {:.0} ms and the view's follow-up {:.0} ms", core_s * 1000.0, after_s * 1000.0);
-    println!("bench: RSS {:.0} MB after", rss_mb());
+    // A flood: N lines in one wake, first as N messages, then as one message.
+    let burst = env_n("CLAY_SNAPSHOT_BENCH_BURST");
+    if burst > 0 {
+        for one_message in [false, true] {
+            let (mut core_s, mut after_s) = (0.0f64, 0.0f64);
+            let t = Instant::now();
+            with_view(cx, &mut |v, cx| {
+                for w in targets(v) {
+                    if one_message {
+                        let (c, a) = feed_lines(v, cx, w, burst as usize, true);
+                        core_s += c;
+                        after_s += a;
+                    } else {
+                        for _ in 0..burst {
+                            let (c, a) = feed_lines(v, cx, w, 1, false);
+                            core_s += c;
+                            after_s += a;
+                        }
+                    }
+                }
+            });
+            let handled_ms = t.elapsed().as_secs_f64() * 1000.0;
+            cx.run_until_parked();
+            let frame_ms = draw(cx);
+            println!(
+                "bench: burst of {burst} lines as {} handled in {handled_ms:.1} ms (core {:.1} ms, follow-up {:.1} ms), next frame {frame_ms:.2} ms",
+                if one_message { "one message" } else { "one message each" },
+                core_s * 1000.0,
+                after_s * 1000.0
+            );
+        }
+    }
+    with_view(cx, &mut |v, _| lines = v.session.core.current_world().map_or(0, |w| w.lines.len()));
+    println!("bench: {lines} lines held after, RSS {:.0} MB", rss_mb());
+}
+
+/// Feed `n` bench lines to world `world_index` through the view's own path, as one
+/// `ServerData` (`batch`) or one message each; the seconds the client core and the view's
+/// follow-up took.
+fn feed_lines(v: &mut ClayView, cx: &mut gpui::Context<ClayView>, world_index: usize, n: usize, batch: bool) -> (f64, f64) {
+    let (mut core_s, mut after_s) = (0.0f64, 0.0f64);
+    let mut send = |v: &mut ClayView, cx: &mut gpui::Context<ClayView>, count: usize| {
+        let next = v.session.core.worlds.get(world_index).map_or(1, |w| w.seen.max_seen() + 1);
+        let data: String = (0..count as u64)
+            .map(|i| format!("\x1b[1;32mbench\x1b[0m line {}: the quick brown fox jumps over the lazy dog, again and again until it wraps\n", next + i))
+            .collect();
+        let msg = crate::websocket::WsMessage::ServerData {
+            world_index,
+            data,
+            is_viewed: true,
+            ts: 0,
+            from_server: true,
+            seq: next,
+            end_seq: Some(next + count as u64 - 1),
+            flush: false,
+            gagged: false,
+            archive_sourced: false,
+            highlight_colors: Vec::new(),
+        };
+        let t0 = Instant::now();
+        let fx = v.session.handle(crate::native_gui::core::client::Input::Message(Box::new(msg)));
+        let t1 = Instant::now();
+        v.after(fx, cx);
+        core_s += (t1 - t0).as_secs_f64();
+        after_s += t1.elapsed().as_secs_f64();
+    };
+    if batch {
+        send(v, cx, n);
+    } else {
+        for _ in 0..n {
+            send(v, cx, 1);
+        }
+    }
+    (core_s, after_s)
 }
 
 fn fail(why: &str) -> ! {

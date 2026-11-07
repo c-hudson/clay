@@ -49,7 +49,7 @@ use gpui::{KeyBinding, Keystroke, SharedString};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 
-use crate::native_gui::core::client::{Credentials, Effect, Input as NetInput, Line, Status, hidden_line};
+use crate::native_gui::core::client::{Credentials, Effect, Input as NetInput, Line, Status};
 use crate::native_gui::core::keys::{Keys, Resolved};
 use crate::native_gui::core::session::Session;
 use crate::native_gui::core::decor::{ActionMatcher, DecorOptions, LineFacts, decorate};
@@ -143,8 +143,10 @@ pub struct ClayView {
     styled: HashMap<u64, (bool, Arc<StyledLine>)>,
     decor: DecorOptions,
     matcher: ActionMatcher,
-    /// What `matcher` was built from.
-    actions_sig: String,
+    /// The settings and actions revisions `apply_settings` last ran for.
+    applied_revs: Option<(u64, u64)>,
+    /// The actions revision `matcher` was built from.
+    matcher_rev: Option<u64>,
     /// Bumped whenever the same line would style differently (clears `styled`).
     style_epoch: u64,
     /// The worlds on screen in this program when the Activity world last dropped theirs
@@ -287,7 +289,8 @@ impl ClayView {
             styled: HashMap::new(),
             decor: DecorOptions { show_tags: false, new_markers: false, new_background: false, temp_convert: false, accent: [0, 0, 0], hover_bg: [0, 0, 0] },
             matcher: ActionMatcher::default(),
-            actions_sig: String::new(),
+            applied_revs: None,
+            matcher_rev: None,
             style_epoch: 0,
             activity_shown: Vec::new(),
             scroll: ScrollHandle::default(),
@@ -462,8 +465,20 @@ impl ClayView {
         self.keep_to_world(cx);
         self.watch_media();
         if changed {
-            self.apply_settings();
-            self.warm_kokoro_if_wanted();
+            // Settings and actions are applied when they change, never per line of
+            // output: run on every message, apply_settings re-read the font tables (a
+            // `monospace` font spawned fc-match twice a message) and serialized the actions
+            // to see whether they had changed - 15 ms a line in a flood.
+            let revs = (self.session.core.settings_rev, self.session.core.actions_rev);
+            if self.applied_revs != Some(revs) {
+                self.applied_revs = Some(revs);
+                let perf = crate::native_gui::core::perf::enabled().then(Instant::now);
+                self.apply_settings();
+                if let Some(t) = perf {
+                    crate::native_gui::core::perf::settings_applied(t.elapsed());
+                }
+                self.warm_kokoro_if_wanted();
+            }
             if std::mem::take(&mut self.surf.actions_changed) {
                 cx.emit(windows::MainEvent::Actions);
             }
@@ -474,7 +489,11 @@ impl ClayView {
                 self.bridged_theme = self.theme_json.clone();
                 self.restyled(cx);
             }
+            let perf = crate::native_gui::core::perf::enabled().then(Instant::now);
             self.follow_world();
+            if let Some(t) = perf {
+                crate::native_gui::core::perf::world_followed(t.elapsed());
+            }
             cx.notify();
         }
         self.relay_outbox(cx);
@@ -570,7 +589,7 @@ impl ClayView {
                 me: self.session.core.display_id,
             };
             let mut rows = |line: &Line| {
-                if (line.gagged && !show_tags) || hidden_line(&line.text) {
+                if line.is_hidden(show_tags) {
                     return 0;
                 }
                 let styled = styler.line(line);
@@ -641,15 +660,22 @@ impl ClayView {
                 .collect()
         });
         let mut anchors = HashMap::new();
-        for (id, _) in lines {
-            let own = self.reveal_at.get(id).filter(|at| fresh(at)).copied();
-            let shown = shown.filter(|_| unseen.as_ref().is_none_or(|u| u.contains(id)));
-            let at = match (own, shown) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-            if let Some(at) = at {
-                anchors.insert(*id, at);
+        if shown.is_none() {
+            // No recent switch: only the lines that arrived live are revealing, and there
+            // are at most a few hundred stamps - no need to walk every line of the world
+            // (an anchor for a line not on screen is never read).
+            anchors.extend(self.reveal_at.iter().filter(|(_, at)| fresh(at)).map(|(id, at)| (*id, *at)));
+        } else {
+            for (id, _) in lines {
+                let own = self.reveal_at.get(id).filter(|at| fresh(at)).copied();
+                let shown = shown.filter(|_| unseen.as_ref().is_none_or(|u| u.contains(id)));
+                let at = match (own, shown) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                if let Some(at) = at {
+                    anchors.insert(*id, at);
+                }
             }
         }
         Some(output::RevealSnapshot { reveal, anchors })
@@ -856,6 +882,9 @@ impl ClayView {
             self.chrome.clock = clock;
             cx.notify();
         }
+        if crate::native_gui::core::perf::enabled() {
+            crate::native_gui::core::perf::report();
+        }
     }
 
     /// Write the world cache once output has been quiet for two seconds (app.js's
@@ -996,10 +1025,10 @@ impl ClayView {
             self.decor = decor;
             restyle = true;
         }
-        let sig = serde_json::to_string(&self.session.core.actions).unwrap_or_default();
-        if sig != self.actions_sig {
+        // The actions, by the core's revision (every assignment of them bumps it).
+        if self.matcher_rev != Some(self.session.core.actions_rev) {
+            self.matcher_rev = Some(self.session.core.actions_rev);
             self.matcher = ActionMatcher::new(&self.session.core.actions);
-            self.actions_sig = sig;
             self.surf.actions_changed = true;
             restyle |= self.action_highlight;
         }
@@ -1048,9 +1077,11 @@ impl ClayView {
             return lines;
         };
         let mut out = Vec::with_capacity(world.lines.len());
-        let mut seqs = Vec::with_capacity(world.lines.len());
         // Find's filter is the focused pane's (`/split`).
         let filter = self.find.filtering().map(str::to_string).filter(|_| !self.drawing_other_pane);
+        // The seqs are only for placing TF's %textdiv divider: built while a visit is on.
+        let want_seqs = self.textdiv.visit.is_some() && filter.is_none();
+        let mut seqs = Vec::with_capacity(if want_seqs { world.lines.len() } else { 0 });
         let mut styler = Styler {
             styled: &mut self.styled,
             palette: &self.palette,
@@ -1063,10 +1094,10 @@ impl ClayView {
         // Nothing below a line more-mode holds back is drawn (more.rs): released lines
         // come out at the bottom, never in above something already shown.
         let mut holding = false;
-        let more = self.more.get(&world.name);
+        let more = self.more.get(&world.name).filter(|m| m.held() > 0);
         for line in &world.lines {
             holding |= more.is_some_and(|m| m.is_held(line.id));
-            if holding || (line.gagged && !self.show_tags) || hidden_line(&line.text) {
+            if holding || line.is_hidden(self.show_tags) {
                 continue;
             }
             // F4: only the lines containing Find's text.
@@ -1077,7 +1108,9 @@ impl ClayView {
             if self.mode.grep.as_ref().is_some_and(|g| !g.matches(&line.text)) {
                 continue;
             }
-            seqs.push(line.seq.filter(|_| !line.from_archive));
+            if want_seqs {
+                seqs.push(line.seq.filter(|_| !line.from_archive));
+            }
             out.push((line.id, styler.line(line)));
         }
         // The styled lines kept are those of the worlds on screen here: this one's and, split,
@@ -1093,7 +1126,7 @@ impl ClayView {
             self.styled.retain(|id, _| live.contains(id));
         }
         // TF's %textdiv divider for this visit (not in a filtered view).
-        if let Some(at) = self.textdiv.place(&seqs).filter(|_| filter.is_none()) {
+        if let Some(at) = self.textdiv.place(&seqs).filter(|_| want_seqs) {
             let settings = self.session.core.settings.as_ref();
             let rows: Vec<(u64, Arc<StyledLine>)> = match self.textdiv.visit.as_ref().map(|v| v.1.as_str()) {
                 Some("clear") => {
@@ -1280,6 +1313,22 @@ impl ClayView {
         }
     }
 
+    /// The worlds this window is scrolled back in - the shown one, a split's other pane -
+    /// which the core then leaves untrimmed (`World::trim`), so what the user is reading
+    /// (archive lines included) stays put.
+    fn report_pinned(&mut self) {
+        let mut pinned = Vec::new();
+        if !self.scroll.borrow().follow {
+            pinned.push(self.session.core.current);
+        }
+        if let (Some(pane), Some(other)) = (self.split.as_ref(), self.split_other()) {
+            if !pane.follows() {
+                pinned.push(other);
+            }
+        }
+        self.session.core.set_pinned(&pinned);
+    }
+
     fn report_view(&mut self) {
         // The rows and font cells the output held when last laid out - measured there, not
         // estimated from the window: a column count from the window's width and a nominal
@@ -1410,6 +1459,7 @@ impl Render for ClayView {
         }
         self.run_later(window, cx);
         self.report_view();
+        self.report_pinned();
         self.ask_history();
         // A `/window` takes its main window's, which a Transparency being previewed is on.
         let alpha = self.link.leader.as_ref().and_then(|l| l.upgrade()).map_or_else(|| self.transparency(), |l| l.read(cx).transparency());
@@ -1733,9 +1783,23 @@ pub(super) fn open_view_window(
     if let Some(mut events) = events {
         let event_view = weak.clone();
         cx.spawn(async move |cx| {
+            // Everything already queued is handled in this one wake, before GPUI draws
+            // (`next()` on an unbounded channel yields only when it's empty); the trace
+            // counts the wake and what it took.
             while let Some(ev) = events.next().await {
+                let perf = crate::native_gui::core::perf::enabled().then(Instant::now);
+                let mut handled = 1u64;
                 if event_view.update(cx, |v, cx| v.handle(ev, cx)).is_err() {
                     break;
+                }
+                while let Ok(ev) = events.try_recv() {
+                    handled += 1;
+                    if event_view.update(cx, |v, cx| v.handle(ev, cx)).is_err() {
+                        return;
+                    }
+                }
+                if let Some(t) = perf {
+                    crate::native_gui::core::perf::handled(handled, t.elapsed());
                 }
             }
         })

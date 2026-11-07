@@ -180,7 +180,7 @@ fn font_preview_js(payload: &str) -> Option<String> {
 }
 
 /// Popups the GUI opens as their own windows (app.js `openInPopupWindow`).
-const POPUP_KINDS: [&str; 4] = ["settings", "help", "actions", "worlds"];
+const POPUP_KINDS: [&str; 5] = ["settings", "help", "actions", "worlds", "info"];
 
 /// The popup kind from a `popup-window:` payload, if it is one we open.
 fn popup_kind(v: &serde_json::Value) -> Option<&'static str> {
@@ -194,6 +194,7 @@ fn popup_window_spec(kind: &str) -> (&'static str, f64, f64) {
         "settings" => ("Clay - Settings", 520.0, 680.0),
         "help" => ("Clay - Help", 640.0, 720.0),
         "actions" => ("Clay - Actions", 760.0, 620.0),
+        "info" => ("Clay - Info", 760.0, 760.0),
         _ => ("Clay - Worlds", 640.0, 680.0),
     }
 }
@@ -485,7 +486,10 @@ pub fn run_master_webgui() -> io::Result<()> {
     let handle = runtime.handle().clone();
 
     // Create bidirectional channels (required by run_app_headless API)
-    let (app_to_gui_tx, _app_to_gui_rx) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
+    let (app_to_gui_tx, app_to_gui_rx) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
+    // The page attaches over the WebSocket; nothing reads this, so it is dropped and the
+    // App skips the clone of every broadcast it used to queue here (`ws_broadcast`).
+    drop(app_to_gui_rx);
     let (gui_to_app_tx, gui_to_app_rx) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
 
     // Spawn the headless App with WS override (a failure to start it is reported fresh)
@@ -1897,12 +1901,21 @@ fn create_webview_window(
             }
             Event::UserEvent(WvEvent::PopupWindow { kind, ref arg, ref auth }) => {
                 let kind_json = serde_json::Value::String(kind.to_string()).to_string();
+                // /info's window: this process's own figures as of now, for an attached GUI
+                // (app.js shows them only when this GUI doesn't run Clay itself).
+                let host_info = if kind == "info" {
+                    serde_json::to_string(&crate::info::own_process_section("This GUI's process"))
+                        .map(|json| format!("window.CLAY_HOST_INFO = {json};"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 // One window per kind: a second request focuses it and hands it the new arg.
                 if let Some(id) = popup_windows.get(kind).copied() {
                     if let (Some(w), Some(wv)) = (windows.get(&id), webviews.get(&id)) {
                         w.set_focus();
                         let _ = wv.evaluate_script(&format!(
-                            "window.__clayPopupArg && window.__clayPopupArg({}, {});", kind_json, arg));
+                            "{host_info}window.__clayPopupArg && window.__clayPopupArg({}, {});", kind_json, arg));
                         return;
                     }
                     popup_windows.remove(kind);
@@ -1917,7 +1930,7 @@ fn create_webview_window(
                     Ok(w) => w,
                     Err(_) => return,
                 };
-                let popup_js = format!("window.POPUP_MODE = {{ kind: {}, arg: {} }};", kind_json, arg);
+                let popup_js = format!("{host_info}window.POPUP_MODE = {{ kind: {}, arg: {} }};", kind_json, arg);
                 let extra_js = spawned_window_js(Some(popup_js), auth);
                 // `popup=` lets index.html's <head> hide the chat UI before first paint.
                 let query = format!("popup={}", kind);

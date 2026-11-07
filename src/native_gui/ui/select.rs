@@ -44,9 +44,11 @@ pub struct Selection {
 #[derive(Default)]
 pub struct SelectState {
     pub sel: Option<Selection>,
-    /// The visible lines' ids in order, and each one's place, as of the last render.
+    /// The visible lines' ids in order, as of the last render, and each one's place -
+    /// built on first use (`order`): a map of every shown line per frame was most of what
+    /// a frame cost with a long buffer, and it is read only while there is a selection.
     pub ids: Vec<u64>,
-    pub order: HashMap<u64, usize>,
+    order: std::cell::OnceCell<HashMap<u64, usize>>,
     pub hover_link: Option<(u64, Range<usize>)>,
     /// Where the button went down on a link (a click there opens it).
     press_link: Option<(u64, Range<usize>)>,
@@ -105,6 +107,13 @@ pub fn link_at(line: &StyledLine, byte: usize) -> Option<Range<usize>> {
 }
 
 /// Where a link goes: `www.` gets https:// (app.js `linkifyUrls`).
+impl SelectState {
+    /// Each visible line's place, by id.
+    pub fn order(&self) -> &HashMap<u64, usize> {
+        self.order.get_or_init(|| self.ids.iter().enumerate().map(|(i, id)| (*id, i)).collect())
+    }
+}
+
 pub fn href(text: &str) -> String {
     if text.len() >= 4 && text[..4].eq_ignore_ascii_case("www.") { format!("https://{text}") } else { text.to_string() }
 }
@@ -141,14 +150,14 @@ impl ClayView {
 
     /// The selection as (start, end), in display order.
     fn selection_span(&self) -> Option<(Pos, Pos)> {
-        span(self.select.sel.as_ref()?, &self.select.order)
+        span(self.select.sel.as_ref()?, self.select.order())
     }
 
     /// The selected bytes of each visible line (a line's end, its newline, counts as one
     /// byte past its text).
     pub(super) fn selection_ranges(&self) -> HashMap<u64, Range<usize>> {
         match self.selection_span() {
-            Some(sp) => ranges(sp, &self.select.ids, &self.select.order, |id| self.styled_text(id).map_or(0, |s| s.text.len())),
+            Some(sp) => ranges(sp, &self.select.ids, self.select.order(), |id| self.styled_text(id).map_or(0, |s| s.text.len())),
             None => HashMap::new(),
         }
     }
@@ -158,7 +167,7 @@ impl ClayView {
         let ranges = self.selection_ranges();
         // The %textdiv divider is never copied.
         let mut ids: Vec<&u64> = ranges.keys().filter(|id| !super::textdiv::is_divider(**id)).collect();
-        ids.sort_by_key(|id| self.select.order[id]);
+        ids.sort_by_key(|id| self.select.order()[id]);
         let mut parts = Vec::new();
         for id in ids {
             let r = &ranges[id];
@@ -194,10 +203,11 @@ impl ClayView {
     /// The visible lines' order changed (a render): keep the map, and drop a selection
     /// whose lines are gone.
     pub(super) fn note_visible(&mut self, ids: Vec<u64>) {
-        self.select.order = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
         self.select.ids = ids;
+        self.select.order = std::cell::OnceCell::new();
         if let Some(sel) = self.select.sel {
-            let known = |p: Pos| self.select.order.contains_key(&p.id);
+            let order = self.select.order();
+            let known = |p: Pos| order.contains_key(&p.id);
             if !(known(sel.anchor.0) && known(sel.anchor.1) && known(sel.head)) {
                 self.select.sel = None;
             }
@@ -293,7 +303,7 @@ impl ClayView {
     fn extend_selection(&mut self, x: f32, y: f32) {
         let Some(mut sel) = self.select.sel else { return };
         let Some(pos) = self.scroll.borrow().hit(x, y) else { return };
-        let before = match (self.select.order.get(&pos.id), self.select.order.get(&sel.anchor.0.id)) {
+        let before = match (self.select.order().get(&pos.id), self.select.order().get(&sel.anchor.0.id)) {
             (Some(&p), Some(&a)) => (p, pos.byte) < (a, sel.anchor.0.byte),
             _ => false,
         };

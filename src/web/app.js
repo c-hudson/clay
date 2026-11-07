@@ -926,7 +926,7 @@
         ? { tab: popupWindowMode.arg || 'general' } : null;
     if (popupWindowMode) {
         document.title = { settings: 'Clay - Settings', help: 'Clay - Help',
-            actions: 'Clay - Actions', worlds: 'Clay - Worlds' }[popupWindowMode.kind] || 'Clay';
+            actions: 'Clay - Actions', worlds: 'Clay - Worlds', info: 'Clay - Info' }[popupWindowMode.kind] || 'Clay';
     }
     let popupWindowBooted = false;
 
@@ -975,6 +975,8 @@
     var sessionPaused = false;
     var serverResumesSession = false;
     var resumeAsked = false;
+    // The server answers RequestInfo (InitialState.info_report): /info opens a window.
+    var serverInfoReport = false;
     let pendingReconnectCommand = null;  // Command to resend after reconnect
     // T1.12/D3: the world to resend to is remembered by NAME, not index. Indices
     // shift across a reconnect exactly like the InitialState focus resolution below
@@ -1693,6 +1695,12 @@
     }
     // The server's font settings: this page's own fonts, or the shared ones, put in use.
     function receiveFontSettings(s) {
+        receiveFontSettingsImpl(s);
+        // The rows, columns and the font wrapEmoji measures against follow the fonts.
+        invalidateViewMetrics();
+        wrapEmojiFont = null;
+    }
+    function receiveFontSettingsImpl(s) {
         const dflt = function(v, d) { return v === undefined || v === null ? d : v; };
         sharedFont = {
             name: dflt(s.font_name, fontName), size_phone: dflt(s.web_font_size_phone, webFontSizePhone),
@@ -2576,7 +2584,7 @@
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'reach', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'server', 'import',
         'flush', 'menu', 'split', 'unsplit', 'send', 'remote', 'pause', 'ban', 'unban',
-        'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'notify', 'addworld', 'note', 'tag', 'tags',
+        'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'info', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say', 'tts',
         'log', 'unworld', 'chat', 'discord', 'slack',
         'cd', 'pwd', 'runtime', 'ismacro', 'isvar', 'features', 'restrict', 'sys',
@@ -3316,11 +3324,29 @@
     // clientHeight includes the container's padding, which holds no row - counting it
     // made a shell world's PTY a row taller than the view at some heights, its last row
     // cut off.
+    // The view's rows and columns, measured once per container and kept until the layout
+    // changes (the ResizeObserver below, a font change) or half a second passes: reading
+    // clientHeight right after an insert forces a layout, and this ran for every incoming
+    // line (handleIncomingLine), which was most of what a line cost the page.
+    const viewMetrics = new Map();
+    function invalidateViewMetrics() { viewMetrics.clear(); }
+    function viewMetricsFor(c) {
+        const now = performance.now();
+        let m = viewMetrics.get(c);
+        if (!m || now - m.at > 500) {
+            const cs = getComputedStyle(c);
+            const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+            m = {
+                at: now,
+                lines: Math.max(1, Math.floor((c.clientHeight - pad) / lineHeightPx())),
+                cols: Math.max(1, Math.floor(c.clientWidth / measuredCharWidth()))
+            };
+            viewMetrics.set(c, m);
+        }
+        return m;
+    }
     function getVisibleLineCount() {
-        const c = elements.outputContainer;
-        const cs = getComputedStyle(c);
-        const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
-        return Math.max(1, Math.floor((c.clientHeight - pad) / lineHeightPx()));
+        return viewMetricsFor(elements.outputContainer).lines;
     }
 
     // Get visible column count in output area (approximate from container width and font size)
@@ -3348,7 +3374,7 @@
     }
 
     function getVisibleColumnCount() {
-        return Math.max(1, Math.floor(elements.outputContainer.clientWidth / measuredCharWidth()));
+        return viewMetricsFor(elements.outputContainer).cols;
     }
 
     // Send UpdateViewState to server for synchronized more-mode
@@ -4327,6 +4353,7 @@
                 worlds = [];
                 currentWorldIndex = 0;
                 actions = [];
+                actionRegexCache.clear();
                 splashLines = [];
                 authenticated = false;
                 // Clear output display
@@ -4355,6 +4382,8 @@
                 // reconnect (a server's reload) and nothing ever took it down.
                 serverResumesSession = !!msg.resume_session;
                 setSessionPaused(false);
+                // The server answers RequestInfo: /info shows its report in a window.
+                serverInfoReport = !!msg.info_report;
                 // The server takes OtherViews (a split's other pane).
                 serverTakesOtherViews = !!msg.other_views;
                 lastOtherViewsSent = null;
@@ -4459,6 +4488,7 @@
                 currentWorldIndex = startWorldIndex(worlds, resolvedWorldIndex, msg.current_world_index, keepUnconnected);
 
                 actions = msg.actions || [];
+                actionRegexCache.clear();
                 // Emoji picker dataset (EMOJI-PICKER-ROADMAP.md Step 6/7): sent once as
                 // a top-level InitialState field, never re-sent on settings changes.
                 // Must never throw - file:// origins (Android) sanitize an uncaught
@@ -5334,6 +5364,8 @@
                         // line permanently drift _max_seq below the server's true high-water
                         // seq, which then produced phantom gaps and duplicate lines on the next
                         // reconnect (see PROTOCOL-ROADMAP.md's seq-drift fix).
+                        // The lines this message appends go into the DOM together (appendNewLine).
+                        const appendBatchPrev = beginAppendBatch();
                         rawLines.forEach((line, rawIdx) => {
                             // Skip lines that are ONLY ANSI codes with no visible content
                             // (e.g., trailing reset codes after newlines), but keep blank lines
@@ -5431,6 +5463,7 @@
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and sends UnseenUpdate messages to keep all clients in sync
                         });
+                        endAppendBatch(appendBatchPrev);
                         // Record the batch's TRUE delivered span - the server-authoritative
                         // end_seq when present, else rawLines.length (the full PRE-FILTER
                         // batch size, matching the rawIdx-based lineSeq above) rather than
@@ -5465,7 +5498,7 @@
                             }
                         }
                         if (msg.world_index !== currentWorldIndex) {
-                            updateStatusBar();
+                            scheduleStatusBar();
                         }
                         // After flush, force full re-render to ensure output is visible
                         // (handles case where splash image was re-rendered by WorldConnected)
@@ -5983,6 +6016,7 @@
 
             case 'ActionsUpdated':
                 actions = msg.actions || [];
+                actionRegexCache.clear();
                 if (actionsListPopupOpen) {
                     renderActionsList();
                 }
@@ -6347,6 +6381,10 @@
 
             case 'SpellSuggestions':
                 applySpellSuggestions(msg);
+                break;
+
+            case 'InfoReport':
+                showInfoReport(msg);
                 break;
 
             case 'ConnectionsListResponse':
@@ -6863,7 +6901,7 @@
         if (m.paused) {
             // Already paused, queue the line info
             m.held.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced, obj });
-            if (onScreen) updateStatusBar();
+            if (onScreen) scheduleStatusBar();
         } else if (pages && rows > 0 && m.rowsSincePause > 0 && m.rowsSincePause + rows > threshold) {
             // Trigger pause: this line would not fit in what's left of the screenful.
             m.paused = true;
@@ -8148,6 +8186,14 @@
             return;
         }
 
+        // /info: the server's report in a window, this page's own section after it; a
+        // server that doesn't answer RequestInfo gets the line, and prints its text.
+        if (serverInfoReport && /^\/info(\s|$)/i.test(cmdTrimmed)) {
+            elements.input.value = '';
+            infoCommand(cmdTrimmed.substring(5).trim());
+            return;
+        }
+
         // /version where this program has a build of its own: its build and the server's,
         // answered here (showVersionHere); else the server's one line, as before.
         const answeredHere = cmdTrimmed.split(/\s+/)[0].toLowerCase() === '/version' && showVersionHere();
@@ -9299,7 +9345,8 @@
     let serverTakesOtherViews = false;
     let splitRenderPending = false;
     // The panes' size (user requests 2026-11-05): dragging the bar between them moves it,
-    // as dragging the input's top edge resizes the input, and `/split -n <lines>` sets it.
+    // as dragging the input's top edge resizes the input, `/split -n <lines>` sets it and
+    // `/split +<lines>`/`-<lines>` steps it.
     // The top pane's lines (null: half each), this page's own, kept for its next /split and
     // across a relaunch (saveSplitState); each pane keeps one line.
     let splitTopLines = null;
@@ -9533,6 +9580,18 @@
         try { splitPane.bar.setPointerCapture(e.pointerId); } catch (err) { /* a mouse event without capture */ }
         e.preventDefault();
     }
+    // The whole lines the top pane shows, and the most it can have in this window (the
+    // bottom pane keeps one): what a drag and `/split +<lines>`/`-<lines>` move from.
+    function splitLinesShown() {
+        const top = splitPane.onTop ? splitPane.container : elements.outputContainer;
+        const bottom = splitPane.onTop ? elements.outputContainer : splitPane.container;
+        const row = lineHeightPx();
+        const pad = splitPaneHeight(top, 0);
+        const most = Math.max(1, Math.floor((top.offsetHeight + bottom.offsetHeight - splitPaneHeight(bottom, 1) - pad) / row));
+        // A hair over, so a pane exactly n lines high never reads as n - 1.
+        const shown = Math.min(most, Math.max(1, Math.floor((top.offsetHeight - pad) / row + 0.01)));
+        return { shown: shown, most: most };
+    }
     function moveSplitResize(e) {
         const d = splitResizeDrag;
         if (!d || !splitPane) return;
@@ -9540,10 +9599,9 @@
         if (!d.moved && Math.abs(dy) < 3) return;
         d.moved = true;
         const top = splitPane.onTop ? splitPane.container : elements.outputContainer;
-        const bottom = splitPane.onTop ? elements.outputContainer : splitPane.container;
         const row = lineHeightPx();
         const pad = splitPaneHeight(top, 0);
-        const most = Math.max(1, Math.floor((top.offsetHeight + bottom.offsetHeight - splitPaneHeight(bottom, 1) - pad) / row));
+        const most = splitLinesShown().most;
         const lines = Math.min(most, Math.max(1, Math.round((d.h + dy - pad) / row)));
         if (lines !== splitTopLines) {
             splitTopLines = lines;
@@ -9558,20 +9616,28 @@
         if (d && d.moved) saveSplitState();
     }
 
-    // What /split was given: `-n <lines>` (`-n10` too), then a world name. A port of
-    // util.rs parse_split_args; `error` is the line to say.
+    // What /split was given: `-n <lines>` (`-n10` too) as `lines`, or `+<lines>`/`-<lines>`
+    // as `by`, then a world name. A port of util.rs parse_split_args; `error` is the line to
+    // say. A `+` word that isn't a number is a world's name.
     function parseSplitArgs(args) {
         const words = args.trim().split(/\s+/).filter(Boolean);
-        let lines = null;
-        if (words.length && words[0].startsWith('-')) {
+        const usage = { error: 'Usage: /split [-n <lines> | +<lines> | -<lines>] [world]' };
+        const count = (number) => /^\d+$/.test(number) && parseInt(number, 10) >= 1 ? parseInt(number, 10) : null;
+        let lines = null, by = null;
+        if (words.length && words[0].startsWith('-n')) {
             const first = words.shift();
-            const usage = { error: 'Usage: /split [-n <lines>] [world]' };
-            if (!first.startsWith('-n')) return usage;
-            const number = first.length > 2 ? first.slice(2) : (words.shift() || '');
-            if (!/^\d+$/.test(number) || parseInt(number, 10) < 1) return usage;
-            lines = parseInt(number, 10);
+            lines = count(first.length > 2 ? first.slice(2) : (words.shift() || ''));
+            if (lines === null) return usage;
+        } else if (words.length && words[0].startsWith('-')) {
+            const n = count(words.shift().slice(1));
+            if (n === null) return usage;
+            by = -n;
+        } else if (words.length && /^\+\d+$/.test(words[0])) {
+            const n = count(words.shift().slice(1));
+            if (n === null) return usage;
+            by = n;
         }
-        return { lines: lines, world: words.join(' ') };
+        return { lines: lines, by: by, world: words.join(' ') };
     }
 
     function splitBuild() {
@@ -9733,8 +9799,10 @@
     }
 
     // `/unsplit`: the pane without the focus closes. Returns an error, or '' when it worked.
+    // util.rs SPLIT_NOT_SPLIT.
+    const SPLIT_NOT_SPLIT = "The output isn't split.";
     function splitClose() {
-        if (!splitPane) return "The output isn't split.";
+        if (!splitPane) return SPLIT_NOT_SPLIT;
         const pane = splitPane;
         const i = splitWorldIndex();
         if (pane.observer) pane.observer.disconnect();
@@ -9759,9 +9827,10 @@
     }
 
     // Quiet when it works (the panes show it); only an error is said.
-    // `-n` makes the top pane that many lines, kept for this page's next /split (user
-    // request 2026-11-05; the console's App::split_command); while split, `-n` alone only
-    // resizes.
+    // `-n` makes the top pane that many lines, `+`/`-` that many more or fewer than it
+    // shows, kept for this page's next /split (user requests 2026-11-05; the console's
+    // App::split_command); while split, a size alone only resizes, and `+`/`-` only resize
+    // a split.
     function splitCommand(cmd) {
         const parts = cmd.trim().split(/\s+/);
         let reply;
@@ -9769,10 +9838,18 @@
             reply = splitClose();
         } else {
             const args = parseSplitArgs(parts.slice(1).join(' '));
+            const sized = args.lines !== null || args.by !== null;
             reply = args.error || '';
-            if (!reply && !(args.lines && !args.world && splitPane)) reply = splitOpen(args.world);
-            if (!reply && args.lines) {
-                splitTopLines = args.lines;
+            if (!reply && args.by !== null && !splitPane) reply = SPLIT_NOT_SPLIT;
+            if (!reply && !(sized && !args.world && splitPane)) reply = splitOpen(args.world);
+            if (!reply && sized) {
+                if (args.by !== null) {
+                    // From what shows, within what fits now (util.rs SplitLines::resolve).
+                    const now = splitLinesShown();
+                    splitTopLines = Math.min(now.most, Math.max(1, now.shown + args.by));
+                } else {
+                    splitTopLines = args.lines;
+                }
                 applySplitSize();
                 saveSplitState();
             }
@@ -10085,6 +10162,7 @@
             { l: '/window --grep &lt;pattern&gt; [-w world] [--regexp]', r: 'Window of the matching lines' },
             { l: '/split [world]', r: 'Split the output: a second world above (Shift+Tab moves between them)' },
             { l: '/split -n <lines>', r: 'The top pane that many lines high (or drag the bar between the panes)' },
+            { l: '/split +<lines> | -<lines>', r: 'The top pane that many lines more or fewer (only while split)' },
             { l: '/split act', r: 'The Activity world above: the other worlds as lines arrive (or /world act)' },
             { l: '/unsplit', r: 'Close the pane without the focus' },
             { l: '/map [go|path|find|stop|...]', r: 'Show/hide the map; walk to a room' },
@@ -10092,6 +10170,7 @@
             { heading: 'System' },
             { l: '/help [topic]', r: 'Show help (topic = command)' },
             { l: '/version', r: 'Show version (this program and the server)' },
+            { l: '/info [world]', r: 'Behind the scenes: telnet, memory, clients' },
             { l: '/reload [--console|--gui]', r: 'Hot reload binary (switching interface)' },
             { l: '/update [-f]', r: 'Update the server, then this program' },
             { l: '/testmusic', r: 'Test ANSI music playback' },
@@ -10320,6 +10399,7 @@
                 help: helpPopupOpen,
                 actions: actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen,
                 worlds: worldSelectorPopupOpen || worldEditorPopupOpen || worldConfirmPopupOpen,
+                info: infoDialogOpen,
             }[popupWindowMode.kind];
             if (!open) sendIpc('close-window');
         }, 0);
@@ -10336,6 +10416,8 @@
             if (!helpPopupOpen) openHelpPopup();
         } else if (kind === 'actions') {
             if (!actionsEditorPopupOpen) openActionsListPopup(arg || null);
+        } else if (kind === 'info') {
+            infoPopupAsk(arg);
         } else if (kind === 'worlds') {
             const byName = (n) => n ? worlds.findIndex(w => (w.name || '').toLowerCase() === String(n).toLowerCase()) : -1;
             // The main window's world, so the selector highlights the right row.
@@ -10940,6 +11022,17 @@
     }
 
     // Check if a line matches any action pattern (for F8 highlighting)
+    // F8's patterns, compiled once per actions list (cleared wherever `actions` is assigned):
+    // a RegExp per pattern per line is what every line cost with F8 on.
+    const actionRegexCache = new Map();
+    function actionRegex(pat) {
+        let re = actionRegexCache.get(pat);
+        if (re === undefined) {
+            try { re = new RegExp(pat, 'i'); } catch (e) { re = null; }
+            actionRegexCache.set(pat, re);
+        }
+        return re;
+    }
     function lineMatchesAction(line, worldName) {
         const plainLine = stripAnsiForFilter(line).toLowerCase();
         for (const action of actions) {
@@ -10960,16 +11053,8 @@
             for (const mp of pats) {
                 const patText = typeof mp === 'string' ? mp : (mp.pattern || '');
                 if (!patText || patText.trim() === '') continue;
-                try {
-                    let pat = patText;
-                    if (matchType === 'Wildcard') {
-                        pat = actionWildcardToRegex(patText);
-                    }
-                    const regex = new RegExp(pat, 'i');
-                    if (regex.test(plainLine)) return true;
-                } catch (e) {
-                    // Invalid regex, skip
-                }
+                const regex = actionRegex(matchType === 'Wildcard' ? actionWildcardToRegex(patText) : patText);
+                if (regex && regex.test(plainLine)) return true;
             }
         }
         return false;
@@ -11297,9 +11382,11 @@
     }
 
     // Whether a stored line is drawn right now. One decision for a full render and a live
-    // append, so a line never looks different depending on how it arrived.
+    // append, so a line never looks different depending on how it arrived. A gagged line
+    // with no text isn't drawn under F2 either: what the user typed comes as one, the
+    // server keeping the text for /recall alone (OutputLine::is_hidden).
     function lineIsDrawn(cleanLine, gagged) {
-        if (gagged && !showTags) return false;
+        if (gagged && (!showTags || cleanLine.length === 0)) return false;
         if (isFillerLine(cleanLine)) return false;
         // Filter (F4, with * and ?) and grep: match the displayed text (no ANSI, no MUD tag for grep)
         // F4's filter is the focused pane's (/split).
@@ -11399,14 +11486,17 @@
     // and an outlined square, which read as one shape - and the font list wins over the
     // emoji fallback. Text between tags only, never an attribute (a link's href). And a
     // symbol whose glyph is not one cell wide, in its box (glyphFitStyle).
+    // The font glyphFitStyle measures against, read from the output's computed style once per
+    // font change (setFontSize, receiveFontSettings): reading it per line with the DOM just
+    // appended to forced a style recalculation per line.
+    let wrapEmojiFont = null;
     function wrapEmoji(html) {
         if (!/[^\x00-\xA0]/.test(html)) return html;
-        let font = null;
         const fit = (c, textForm) => {
-            if (font === null) {
-                font = elements.output ? getComputedStyle(elements.output).fontFamily + '|' + document.body.style.fontWeight : '';
+            if (wrapEmojiFont === null) {
+                wrapEmojiFont = elements.output ? getComputedStyle(elements.output).fontFamily + '|' + document.body.style.fontWeight : '';
             }
-            return charCells(c.codePointAt(0)) === 1 ? glyphFitStyle(c, textForm, font) : '';
+            return charCells(c.codePointAt(0)) === 1 ? glyphFitStyle(c, textForm, wrapEmojiFont) : '';
         };
         return html.split(/(<[^>]*>)/).map((part, i) =>
             i % 2 === 1 ? part : part.replace(EMOJI_TEXT_OR_FIT, (m, symbol, vs15, other) => {
@@ -12339,12 +12429,69 @@
         // hanging-indent CSS work; see renderOutput()'s comment).
         // Defense-in-depth: strip any event handler attributes that slipped through
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
-        elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(lineSpanHtml(html, lineIndex, lineObj, newGlow(o))));
-        if (revealFrameNext !== null) revealTrack(elements.output.lastElementChild, cleanText, lineObj, o);
+        const spanHtml = sanitizeHtml(lineSpanHtml(html, lineIndex, lineObj, newGlow(o)));
+        const track = revealFrameNext !== null;
         // Screen Reader mode: read out, once, as it's shown (the focused pane's lines).
-        if (screenReader && !drawingSplit && !gagged) announceLine(cleanText);
-
+        const announce = screenReader && !drawingSplit && !gagged;
+        // Within a ServerData message the lines are inserted together (endAppendBatch).
+        if (appendBatch && appendBatch.out === elements.output) {
+            appendBatch.items.push({ html: spanHtml, cleanText, lineObj, o, track, announce });
+            return;
+        }
+        elements.output.insertAdjacentHTML('beforeend', spanHtml);
+        if (track) revealTrack(elements.output.lastElementChild, cleanText, lineObj, o);
+        if (announce) announceLine(cleanText);
+        trimOutputDom(elements.output);
         scheduleScrollToBottom();
+    }
+
+    // The lines appended while a ServerData message is handled go into the DOM in one
+    // insertAdjacentHTML (one parse and one layout for the message) rather than one per
+    // line. Batches nest (a message handled while another is) and are per output element:
+    // a line for another pane's element is inserted on its own.
+    let appendBatch = null;
+    function beginAppendBatch() {
+        const prev = appendBatch;
+        appendBatch = { out: elements.output, items: [] };
+        return prev;
+    }
+    function endAppendBatch(prev) {
+        const b = appendBatch;
+        appendBatch = prev;
+        if (!b || !b.items.length) return;
+        const out = b.out;
+        out.insertAdjacentHTML('beforeend', b.items.map(it => it.html).join(''));
+        const kids = out.children;
+        const base = kids.length - b.items.length;
+        b.items.forEach((it, k) => {
+            if (it.track) revealTrack(kids[base + k], it.cleanText, it.lineObj, it.o);
+            if (it.announce) announceLine(it.cleanText);
+        });
+        trimOutputDom(out);
+        scheduleScrollToBottom();
+    }
+
+    // Following the bottom, the page keeps at most RENDER_WINDOW_MAX lines drawn: once a
+    // step more than that has been appended, the oldest go. Nothing trimmed the DOM before,
+    // so every layout in a long session cost the whole session's length. Never while the
+    // user is scrolled back - then the render window owns the DOM (scheduleRenderWindowCheck)
+    // - and the grow logic is told where the drawn lines now begin (renderStartIdx).
+    function trimOutputDom(out) {
+        if (!followBottom || renderSlid()) return;
+        if (out.childElementCount <= RENDER_WINDOW_MAX + RENDER_WINDOW_STEP) return;
+        const kids = out.children;
+        const n = out.childElementCount - RENDER_WINDOW_MAX;
+        const range = document.createRange();
+        range.setStartBefore(kids[0]);
+        range.setEndAfter(kids[n - 1]);
+        range.deleteContents();
+        const world = worlds[currentWorldIndex];
+        const first = out.firstElementChild;
+        if (world && world.output_lines && first && first.hasAttribute('data-lid')) {
+            const lid = Number(first.getAttribute('data-lid'));
+            const obj = world.output_lines.find(l => lineIds.get(l) === lid);
+            if (obj) world._renderStartObj = obj;
+        }
     }
 
     // Parse ANSI escape codes (supports 16, 256, and true color)
@@ -13178,9 +13325,10 @@
 
     // Escape HTML
     function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        // String replaces: this ran for every text segment of every line, and the DOM
+        // round trip (a div per call) was the slowest part of parseAnsi.
+        return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     // Defense-in-depth: strip any event handler attributes from parsed HTML
@@ -13192,6 +13340,7 @@
     // Break characters: [ ] ( ) , \ / - & = ? and spaces
     // Note: '.' is excluded because it breaks filenames (image.png) and domains awkwardly
     // Must be applied BEFORE parseAnsi (on raw text, not HTML)
+    const WORD_BREAK_WS = /\s/;
     function insertWordBreaks(text) {
         const ZWSP = '\u200B'; // Zero-width space
         const BREAK_CHARS = [']', ')', ',', '\\', '/', '-', '_', '&', '=', '?', ';', ' '];
@@ -13242,7 +13391,7 @@
                 }
             }
 
-            if (/\s/.test(c)) {
+            if (WORD_BREAK_WS.test(c)) {
                 wordLen = 0;
             } else {
                 wordLen++;
@@ -14128,6 +14277,18 @@
         worldOutputCache[act] = [];
         if (act === currentWorldIndex) setTimeout(renderOutput, 0);
         else if (splitShows(act)) scheduleSplitRender();
+    }
+
+    // updateStatusBar() once per frame, for the paths that ran it per event: every scroll
+    // event, every held line while paused, every message for a world off screen. It
+    // rebuilds the tabs ribbon and reads the layout each time.
+    let statusBarRaf = 0;
+    function scheduleStatusBar() {
+        if (statusBarRaf) return;
+        statusBarRaf = requestAnimationFrame(function() {
+            statusBarRaf = 0;
+            updateStatusBar();
+        });
     }
 
     function updateStatusBar() {
@@ -19771,6 +19932,8 @@
 
         // Update body font size
         document.body.style.fontSize = px + 'px';
+        invalidateViewMetrics();
+        wrapEmojiFont = null;
 
         // Sync both range sliders
         if (elements.fontSliderInput) {
@@ -20271,12 +20434,16 @@
         // following view thousands of lines up after a reflow.
         if (window.ResizeObserver) {
             const repinObserver = new ResizeObserver(function() {
+                invalidateViewMetrics();
                 // TF's %textdiv "clear" blank stays as tall as the output area. Set only on
-                // a change, so this can't feed back into itself.
-                const h = elements.outputContainer.clientHeight + 'px';
-                elements.output.querySelectorAll(':scope > .tf-textdiv-clear').forEach(function(el) {
-                    if (el.style.height !== h) el.style.height = h;
-                });
+                // a change, so this can't feed back into itself. (Only in that mode: this
+                // fires on every frame the output grows, and the query walked every line.)
+                if (textdivMode === 'clear') {
+                    const h = elements.outputContainer.clientHeight + 'px';
+                    elements.output.querySelectorAll(':scope > .tf-textdiv-clear').forEach(function(el) {
+                        if (el.style.height !== h) el.style.height = h;
+                    });
+                }
                 if (followBottom) scrollToBottom();
                 // The server sizes more-mode and a shell world's PTY by this view, and
                 // most of these changes are not a window resize (deduplicated: only a
@@ -20573,20 +20740,20 @@
 
         // Scroll event to update status bar (for Hist indicator)
         elements.outputContainer.onscroll = function() {
-            updateStatusBar();
+            scheduleStatusBar();
             // If the user scrolls up, trigger pause (like console behavior). followBottom,
             // not raw isAtBottom(): a late or code-caused scroll event on a following view
             // must never pause it - see followBottom's declaration.
             if (moreModeEnabled && !moreNow().paused && !followBottom && !isAtBottom()) {
                 moreNow().paused = true;
-                updateStatusBar();
+                scheduleStatusBar();
             }
             // If user scrolls to bottom, check pending state
             if (isAtBottom()) {
                 if (pendingTotal() === 0) {
                     moreNow().paused = false;
                     moreNow().rowsSincePause = 0;
-                    updateStatusBar();
+                    scheduleStatusBar();
                 }
                 // With pending held back we simply park here. This used to call releaseAll(),
                 // so merely scrolling back down from history dumped the entire backlog at once
@@ -22579,6 +22746,154 @@
     function isRemoteAccessDialogOpen() {
         const dlg = document.getElementById('remote-access-dialog');
         return !!(dlg && dlg.style.display !== 'none');
+    }
+
+    // /info (src/info.rs): the server's report on a world and on Clay, drawn here with
+    // this page's own section after it. A snapshot - /info again gives a new one. In the
+    // desktop WebView GUI it is a window of its own (POPUP_MODE 'info'), whose page asks
+    // on its own connection and is handed the main window's section in its arg.
+    const PAGE_LOADED_AT = Date.now();
+    var infoPageSection = null;
+    var infoDialogOpen = false;
+    var infoReportShown = null;
+
+    function infoFmtBytes(n) {
+        const k = 1024;
+        if (n < k) return n + ' B';
+        if (n < k * k) return (n / k).toFixed(1) + ' KB';
+        if (n < k * k * k) return (n / (k * k)).toFixed(1) + ' MB';
+        return (n / (k * k * k)).toFixed(2) + ' GB';
+    }
+
+    function infoFmtDuration(secs) {
+        const d = Math.floor(secs / 86400), h = Math.floor(secs / 3600) % 24,
+            m = Math.floor(secs / 60) % 60, s = secs % 60;
+        if (d > 0) return d + 'd ' + h + 'h';
+        if (secs >= 3600) return h + 'h ' + m + 'm';
+        if (secs >= 60) return m + 'm ' + s + 's';
+        return s + 's';
+    }
+
+    // What this page holds and costs - the server can't know it.
+    function infoThisPageSection() {
+        const rows = [];
+        const row = function(key, value) { rows.push({ key: key, value: String(value) }); };
+        let held = 0;
+        worlds.forEach(function(w) { held += (w.output_lines || []).length; });
+        row('Lines held', held + ' in ' + worlds.length + ' worlds');
+        row('Lines drawn', document.querySelectorAll('#output .line').length);
+        try { if (ws && ws.url) row('Connection', ws.url.replace(/[?#].*$/, '')); } catch (e) {}
+        row('Open for', infoFmtDuration(Math.floor((Date.now() - PAGE_LOADED_AT) / 1000)));
+        const mem = window.performance && performance.memory;
+        if (mem && mem.usedJSHeapSize) {
+            row('Script memory', infoFmtBytes(mem.usedJSHeapSize) + ' of ' + infoFmtBytes(mem.jsHeapSizeLimit));
+        } else {
+            row('Script memory', 'not reported by this browser engine');
+        }
+        row('Layout', deviceMode);
+        const title = window.WEBVIEW_MODE ? 'This GUI' : (window.Android ? 'This app' : 'This page');
+        return { title: title, rows: rows, lines: [] };
+    }
+
+    function infoCommand(args) {
+        let idx = currentWorldIndex;
+        if (args) {
+            const lower = args.toLowerCase();
+            idx = worlds.findIndex(function(w) { return (w.name || '').toLowerCase() === lower; });
+            if (idx < 0) {
+                appendClientLine("No world named '" + args + "'.");
+                return;
+            }
+        }
+        const page = infoThisPageSection();
+        const name = worlds[idx] ? worlds[idx].name : '';
+        if (openInPopupWindow('info', { world: name, page: page })) return;
+        infoPageSection = page;
+        send({ type: 'RequestInfo', world_index: idx });
+    }
+
+    // The Info window's own ask (a WebView popup window, at start-up and when the main
+    // window asks it again).
+    function infoPopupAsk(arg) {
+        infoPageSection = (arg && arg.page) || null;
+        const lower = String((arg && arg.world) || '').toLowerCase();
+        const idx = worlds.findIndex(function(w) { return (w.name || '').toLowerCase() === lower; });
+        send({ type: 'RequestInfo', world_index: idx >= 0 ? idx : null });
+    }
+
+    function showInfoReport(msg) {
+        const report = msg.report || { title: 'Info', sections: [] };
+        const sections = (report.sections || []).slice();
+        if (infoPageSection) sections.push(infoPageSection);
+        // An attached WebView GUI is its own process (webview_gui.rs injects its figures).
+        if (window.CLAY_HOST_INFO && !window.WEBVIEW_MASTER) sections.push(window.CLAY_HOST_INFO);
+        infoReportShown = { title: report.title || 'Info', sections: sections };
+        renderInfoDialog(infoReportShown);
+    }
+
+    // The report as text, as the console prints it, for Copy.
+    function infoReportText(report) {
+        const out = [report.title];
+        report.sections.forEach(function(s) {
+            out.push('', s.title);
+            const width = Math.min(24, Math.max(0, ...(s.rows || []).map(function(r) { return r.key.length; })));
+            (s.rows || []).forEach(function(r) { out.push('  ' + r.key.padEnd(width) + '  ' + r.value); });
+            (s.lines || []).forEach(function(l) { out.push('  ' + l); });
+        });
+        return out.join('\n');
+    }
+
+    function renderInfoDialog(report) {
+        let dlg = document.getElementById('info-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'info-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            dlg.tabIndex = -1;
+            dlg.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') { e.preventDefault(); hideInfoDialog(); }
+            });
+            document.body.appendChild(dlg);
+        }
+        const tones = { good: 'reach-good', bad: 'reach-bad', warn: 'reach-warn' };
+        const body = report.sections.map(function(s) {
+            const rows = (s.rows || []).map(function(r) {
+                const cls = tones[r.tone] ? ' ' + tones[r.tone] : '';
+                return '<div class="reach-row"><span class="reach-key info-key">' + escapeHtml(r.key) +
+                    '</span><span class="reach-val' + cls + '">' + escapeHtml(r.value) + '</span></div>';
+            }).join('');
+            const lines = (s.lines || []).length
+                ? '<pre class="info-log">' + escapeHtml(s.lines.join('\n')) + '</pre>' : '';
+            return '<div class="info-section-title">' + escapeHtml(s.title) + '</div>' +
+                '<div class="reach-report">' + rows + '</div>' + lines;
+        }).join('');
+        dlg.innerHTML = sanitizeHtml(`
+            <div class="modal-content js-dialog info-dialog">
+                <div class="js-dialog-title">${escapeHtml(report.title)}</div>
+                <div class="info-report">${body}</div>
+                <div id="info-status" class="info-status"></div>
+                <div class="info-buttons">
+                    <button id="info-copy" class="btn">Copy</button>
+                    <button id="info-close" class="btn btn-primary">Close</button>
+                </div>
+            </div>
+        `);
+        document.getElementById('info-close').onclick = hideInfoDialog;
+        document.getElementById('info-copy').onclick = function() {
+            copyTextToClipboard(infoReportText(report));
+            const st = document.getElementById('info-status');
+            if (st) st.textContent = 'Copied.';
+        };
+        dlg.style.display = 'flex';
+        infoDialogOpen = true;
+        dlg.focus();
+    }
+
+    function hideInfoDialog() {
+        const dlg = document.getElementById('info-dialog');
+        if (dlg) dlg.style.display = 'none';
+        infoDialogOpen = false;
+        popupWindowCloseIfIdle();
     }
 
     // /import dialogs (plan i-d-like-to-make-snuggly-rain.md, step 7). Same pattern as

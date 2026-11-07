@@ -996,6 +996,16 @@ impl ClayView {
             self.connection_lost(command, window, cx);
             return;
         }
+        // `/info [world]`: the server's report in the Info window, with this GUI's own
+        // section. A server that doesn't take RequestInfo gets the line and prints text.
+        if first.eq_ignore_ascii_case("/info") && self.session.core.server_info_report {
+            self.editor.remember(&trimmed, false);
+            self.editor.clear();
+            let name = trimmed[first.len()..].trim().to_string();
+            self.info_command(&name, cx);
+            self.input_touched(cx);
+            return;
+        }
         // Following the output: held lines come out and more-mode counts afresh. Scrolled
         // back: the place is kept, and the reply queues below.
         if self.scroll.borrow().at_bottom() {

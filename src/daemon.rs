@@ -56,7 +56,10 @@ pub async fn run_local_server(port_override: Option<u16>) -> io::Result<()> {
 
     // These channels satisfy run_app_headless's GUI-bridge API; nothing reads/writes them here
     // since the embedding client talks to the App over the WebSocket server, not this channel.
-    let (gui_tx, _gui_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let (gui_tx, gui_rx) = mpsc::unbounded_channel::<WsMessage>();
+    // Dropped at once: the App skips the clone of each broadcast once the receiver is
+    // gone (`ws_broadcast`); kept, every message queued here for the life of the process.
+    drop(gui_rx);
     let (_gui_to_app_tx, gui_to_app_rx) = mpsc::unbounded_channel::<WsMessage>();
 
     crate::run_app_headless(gui_tx, gui_to_app_rx, Some(crate::WsOverride::Session(password)), None, port_override).await
@@ -595,6 +598,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
         app.flush_shell_frames();
         // The mapper: changed rooms saved, map views told; the walk timer armed.
         app.flush_map();
+        app.flush_logs();
         if let Some(due) = app.next_walk_deadline() {
             walk_sleep.as_mut().reset(tokio::time::Instant::from_std(due));
         }
@@ -1038,6 +1042,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 Command::Mssp => {
                     execute_mssp_command(app, world_index, true);
                 }
+                Command::Info { world } => app.ws_info_text(client_id, world_index, world.as_deref()),
                 Command::Stats { show } => {
                     execute_stats_command(app, world_index, show, true);
                 }
@@ -1389,6 +1394,10 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::ClientVisibility { visible } => app.handle_client_visibility(client_id, visible),
         // A paused client was used (a key, a click, a menu): it resumes.
         WsMessage::ResumeSession => app.ws_resume_session(client_id),
+        WsMessage::RequestInfo { world_index } => {
+            let current = app.ws_client_worlds.get(&client_id).map(|v| v.world_index).unwrap_or(app.current_world_index);
+            app.ws_info_report(client_id, world_index, current);
+        }
         // Plan Job 13 (Phase 4, 4.4): folded into one shared function with main.rs's
         // App::handle_ws_client_msg and this file's other copy below - see
         // commands::execute_send_gmcp/execute_send_msdp.
@@ -2054,18 +2063,20 @@ keep_alive_type=Generic
                                 // ignored (the insert above returned false).
                                 let event_tx = event_tx.clone();
                                 tokio::spawn(async move {
+                                    let diag = Arc::new(crate::protocol_state::ConnDiag::default());
                                     let cmd_tx = connect_multiuser_world(
                                         world_index,
                                         requesting_username.clone(),
                                         &settings,
                                         event_tx.clone(),
+                                        Some(diag.clone()),
                                     ).await;
-                                    let _ = event_tx.send(AppEvent::MultiuserConnectResult(world_index, requesting_username, cmd_tx)).await;
+                                    let _ = event_tx.send(AppEvent::MultiuserConnectResult(world_index, requesting_username, cmd_tx, diag)).await;
                                 });
                             }
                         }
                     }
-                    AppEvent::MultiuserConnectResult(world_index, requesting_username, cmd_tx) => {
+                    AppEvent::MultiuserConnectResult(world_index, requesting_username, cmd_tx, diag) => {
                         let key = (world_index, requesting_username.clone());
                         app.multiuser_connecting.remove(&key);
                         let already_connected = app.user_connections.get(&key).map(|c| c.connected).unwrap_or(false);
@@ -2075,6 +2086,8 @@ keep_alive_type=Generic
                                 let mut conn = UserConnection::new();
                                 conn.connected = true;
                                 conn.command_tx = Some(cmd_tx);
+                                conn.protocol.diag = Some(diag);
+                                conn.connected_at = Some(std::time::SystemTime::now());
                                 conn.last_send_time = Some(std::time::Instant::now());
                                 conn.last_receive_time = Some(std::time::Instant::now());
                                 app.user_connections.insert(key, conn);
@@ -2289,6 +2302,7 @@ fn handle_multiuser_disconnect(app: &mut App, world_index: usize, username: &str
         conn.chat_target = None;
         let was_masked = conn.protocol.echo_masked;
         conn.protocol.clear();
+        conn.connected_at = None;
 
         // Send disconnect to this user only
         if let Some(ws) = &app.ws_server {
@@ -2313,6 +2327,7 @@ pub async fn connect_multiuser_world(
     username: String,
     settings: &WorldSettings,
     event_tx: mpsc::Sender<AppEvent>,
+    diag: Option<Arc<crate::protocol_state::ConnDiag>>,
 ) -> Option<mpsc::Sender<WriteCommand>> {
     let host = &settings.hostname;
     let port = &settings.port;
@@ -2325,6 +2340,9 @@ pub async fn connect_multiuser_world(
     match TcpStream::connect(format!("{}:{}", host, port)).await {
         Ok(tcp_stream) => {
             let _ = tcp_stream.set_nodelay(true);
+            if let (Some(d), Ok(addr)) = (&diag, tcp_stream.peer_addr()) {
+                d.set_peer(addr.to_string());
+            }
 
             // Enable TCP keepalive to detect dead connections faster
             enable_tcp_keepalive(&tcp_stream);
@@ -2352,6 +2370,9 @@ pub async fn connect_multiuser_world(
 
                     match connector.connect(server_name, tcp_stream).await {
                         Ok(tls_stream) => {
+                            if let (Some(d), Some(version)) = (&diag, tls_version_name(tls_stream.get_ref().1)) {
+                                d.set_tls_version(version);
+                            }
                             let (r, w) = tokio::io::split(tls_stream);
                             (StreamReader::Tls(r), StreamWriter::Tls(w))
                         }
@@ -2405,6 +2426,7 @@ pub async fn connect_multiuser_world(
                 msp_enabled: settings.msp_enabled,
                 mccp2_enabled: settings.mccp2_enabled,
                 is_tls: use_ssl, // Job 12 (plan Phase 4, 4.1)
+                diag,
                 ..TelnetConfig::default()
             };
             spawn_telnet_reader(
@@ -2435,6 +2457,7 @@ pub async fn connect_multiuser_world(
 /// `spawn_blocking`) for the proxy to reach the MUD, which against a down host takes
 /// seconds.
 #[cfg(not(target_os = "android"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_via_tls_proxy(
     world_name: &str,
     host: &str,
@@ -2443,6 +2466,7 @@ pub(crate) async fn connect_via_tls_proxy(
     event_tx: mpsc::Sender<AppEvent>,
     connection_id: u64,
     skip_auto_login: bool,
+    diag: Option<Arc<crate::protocol_state::ConnDiag>>,
 ) -> Result<(mpsc::Sender<WriteCommand>, u32, std::path::PathBuf), String> {
     let (proxy_pid, proxy_path) = {
         let (w, h, p) = (world_name.to_string(), host.to_string(), port.to_string());
@@ -2507,6 +2531,7 @@ pub(crate) async fn connect_via_tls_proxy(
         mccp2_enabled: settings.mccp2_enabled,
         // Job 12 (plan Phase 4, 4.1): the proxy path is only reached for TLS.
         is_tls: true,
+        diag,
         ..TelnetConfig::default()
     };
     spawn_telnet_reader(
@@ -2567,6 +2592,16 @@ impl ConnectFailure {
             .unwrap_or_else(|| self.last())
             .reason.as_str()
     }
+}
+
+/// The TLS version a connection settled on, "TLS 1.3" or "TLS 1.2", for `/info`.
+pub(crate) fn tls_version_name(conn: &rustls::ClientConnection) -> Option<String> {
+    let version = conn.protocol_version()?;
+    Some(match version {
+        rustls::ProtocolVersion::TLSv1_3 => "TLS 1.3".to_string(),
+        rustls::ProtocolVersion::TLSv1_2 => "TLS 1.2".to_string(),
+        other => format!("{:?}", other),
+    })
 }
 
 /// The cipher a TLS connection settled on, named as TF names it (its OpenSSL's names):
@@ -2664,6 +2699,7 @@ async fn connect_host(host: &str, port: &str, failures: &mut Vec<AddrFailure>) -
 /// or why it failed.
 pub type DaemonConnectResult = Result<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool, Option<u32>, Option<std::path::PathBuf>), ConnectFailure>;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_daemon_world(
     _world_index: usize,
     world_name: String,
@@ -2672,6 +2708,7 @@ pub async fn connect_daemon_world(
     connection_id: u64,
     skip_auto_login: bool,
     tls_proxy_enabled: bool,
+    diag: Option<Arc<crate::protocol_state::ConnDiag>>,
 ) -> DaemonConnectResult {
     #[cfg(target_os = "android")]
     let _ = tls_proxy_enabled;
@@ -2688,7 +2725,7 @@ pub async fn connect_daemon_world(
     #[cfg(not(target_os = "android"))]
     if use_ssl && tls_proxy_enabled {
         if let Ok((cmd_tx, proxy_pid, proxy_path)) = connect_via_tls_proxy(
-            &world_name, host, port, settings, event_tx.clone(), connection_id, skip_auto_login,
+            &world_name, host, port, settings, event_tx.clone(), connection_id, skip_auto_login, diag.clone(),
         ).await {
             return Ok((cmd_tx, None, true, Some(proxy_pid), Some(proxy_path)));
         }
@@ -2704,7 +2741,12 @@ pub async fn connect_daemon_world(
             }
             // Where a TLS failure happened, for TF's CONFAIL text.
             let (peer_addr, peer_port) = match tcp_stream.peer_addr() {
-                Ok(a) => (a.ip().to_string(), a.port().to_string()),
+                Ok(a) => {
+                    if let Some(d) = &diag {
+                        d.set_peer(a.to_string());
+                    }
+                    (a.ip().to_string(), a.port().to_string())
+                }
                 Err(_) => (host_name.clone(), port.clone()),
             };
             let tls_failure = |reason: String| ConnectFailure::at(peer_addr.as_str(), peer_port.as_str(), reason);
@@ -2754,6 +2796,9 @@ pub async fn connect_daemon_world(
                             // TF's CONNECT hook names the cipher.
                             if let Some(cipher) = tls_cipher_name(tls_stream.get_ref().1) {
                                 let _ = event_tx.send(AppEvent::TlsCipher(world_name.clone(), connection_id, cipher)).await;
+                            }
+                            if let (Some(d), Some(version)) = (&diag, tls_version_name(tls_stream.get_ref().1)) {
+                                d.set_tls_version(version);
                             }
                             let (r, w) = tokio::io::split(tls_stream);
                             (StreamReader::Tls(r), StreamWriter::Tls(w))
@@ -2805,6 +2850,7 @@ pub async fn connect_daemon_world(
                 msp_enabled: settings.msp_enabled,
                 mccp2_enabled: settings.mccp2_enabled,
                 is_tls, // Job 12 (plan Phase 4, 4.1): set above by the TLS/plain match
+                diag,
                 ..TelnetConfig::default()
             };
 
@@ -3075,6 +3121,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         history_on_demand: false,
         map: false,
         resume_session: false,
+        info_report: true,
         emoji_json: crate::emoji::emoji_json(),
         emoji_categories_json: crate::emoji::emoji_categories_json(),
         // Multiuser shows Clay's own status bar.
@@ -3734,6 +3781,20 @@ pub async fn handle_multiuser_ws_message(
                 app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
             }
         }
+        // `/info` in a client's window: the user's own connection only.
+        WsMessage::RequestInfo { world_index } => {
+            if let Some(ref uname) = username {
+                let current = app.ws_client_worlds.get(&client_id).map(|v| v.world_index);
+                match world_index.or(current) {
+                    Some(idx) if multiuser_owns(app, uname, idx) => {
+                        let report = app.build_multiuser_info_report(idx, uname);
+                        app.ws_send_to_client(client_id, WsMessage::InfoReport { world_index: idx, report });
+                    }
+                    Some(idx) => app.ws_tell(client_id, current.unwrap_or(idx), "That world is not yours."),
+                    None => {}
+                }
+            }
+        }
         // Esc-w: the console's rule (`calculate_oldest_pending_world_from`) over the user's
         // own worlds and connections - the one with unseen activity, else the last world
         // this client visited that is still connected.
@@ -4035,6 +4096,17 @@ async fn multiuser_typed_line(
         Command::Mssp => {
             let pairs = app.user_connections.get(&key).map(|c| c.protocol.mssp_data.clone()).unwrap_or_default();
             app.ws_tell(client_id, world_index, &crate::commands::mssp_lines(&pairs).join("\n"));
+        }
+        Command::Info { world } => {
+            let target = match world.as_deref() {
+                Some(name) => multiuser_owned_world(app, uname, name).ok_or_else(|| format!("No world of yours is named '{name}'.")),
+                None => Ok(world_index),
+            };
+            let text = match target {
+                Ok(idx) => crate::info::report_lines(&app.build_multiuser_info_report(idx, uname), true).join("\n"),
+                Err(e) => e,
+            };
+            app.ws_tell(client_id, world_index, &text);
         }
         Command::Msdp { verb, target } => {
             let conn = app.user_connections.get(&key);
@@ -5203,7 +5275,7 @@ mod multiuser_telnet_tests {
             ..Default::default()
         };
         let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(32);
-        let conn = connect_multiuser_world(0, "alice".to_string(), &settings, event_tx).await;
+        let conn = connect_multiuser_world(0, "alice".to_string(), &settings, event_tx, None).await;
         assert!(conn.is_some(), "connect_multiuser_world should have connected to the fake server");
 
         let mut saw_negotiated = false;
@@ -5349,6 +5421,7 @@ mod telnet_reader_migration_tests {
             1,     // connection_id
             true,  // skip_auto_login - no login needed for this scenario
             false, // tls_proxy_enabled - plain TCP, exercises the direct-connect loop
+            None,
         ).await;
         assert!(conn.is_ok(), "connect_daemon_world should have connected to the fake server");
 

@@ -75,9 +75,14 @@ impl Fonts {
             n => self.installed.iter().find(|i| i.eq_ignore_ascii_case(n)).map(|i| i.clone().into()),
         };
         let changed = user != self.user || weight != self.weight;
-        self.user_weights = if user.is_some() { weights_of(name) } else { Vec::new() };
-        self.user = user;
-        self.weight = weight;
+        // The font's faces are looked up when the choice changes, not on every call: this
+        // runs from apply_settings, and a scan of every installed face (or fc-match, for
+        // `monospace`) per line of output was what made the GUI lag.
+        if changed {
+            self.user_weights = if user.is_some() { weights_of(name) } else { Vec::new() };
+            self.user = user;
+            self.weight = weight;
+        }
         changed
     }
 
@@ -273,14 +278,20 @@ pub fn weights_of(name: &str) -> Vec<u16> {
 fn emoji_family() -> String {
     #[cfg(target_os = "linux")]
     {
-        // WebKitGTK asks fontconfig for "emoji".
-        if let Ok(out) = std::process::Command::new("fc-match").args(["-f", "%{family[0]}", "emoji"]).output() {
-            let family = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !family.is_empty() {
-                return family;
-            }
-        }
-        "Noto Color Emoji".to_string()
+        // WebKitGTK asks fontconfig for "emoji". Asked once: fontconfig's answer doesn't
+        // change while Clay runs, and fc-match is a process.
+        static FAMILY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        FAMILY
+            .get_or_init(|| {
+                if let Ok(out) = std::process::Command::new("fc-match").args(["-f", "%{family[0]}", "emoji"]).output() {
+                    let family = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !family.is_empty() {
+                        return family;
+                    }
+                }
+                "Noto Color Emoji".to_string()
+            })
+            .clone()
     }
     #[cfg(target_os = "macos")]
     {
@@ -296,14 +307,20 @@ fn emoji_family() -> String {
 fn system_monospace() -> String {
     #[cfg(target_os = "linux")]
     {
-        // WebKitGTK resolves `monospace` through fontconfig.
-        if let Ok(out) = std::process::Command::new("fc-match").args(["-f", "%{family[0]}", "monospace"]).output() {
-            let family = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !family.is_empty() {
-                return family;
-            }
-        }
-        "DejaVu Sans Mono".to_string()
+        // WebKitGTK resolves `monospace` through fontconfig. Asked once (see emoji_family):
+        // this is on the path of every settings application.
+        static FAMILY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        FAMILY
+            .get_or_init(|| {
+                if let Ok(out) = std::process::Command::new("fc-match").args(["-f", "%{family[0]}", "monospace"]).output() {
+                    let family = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !family.is_empty() {
+                        return family;
+                    }
+                }
+                "DejaVu Sans Mono".to_string()
+            })
+            .clone()
     }
     #[cfg(target_os = "macos")]
     {

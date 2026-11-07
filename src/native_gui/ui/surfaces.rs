@@ -266,6 +266,47 @@ impl ClayView {
         self.after(fx, cx);
     }
 
+    /// `/info [world]`: ask the server; its report opens the Info window (`show_info`).
+    pub(super) fn info_command(&mut self, name: &str, cx: &mut Context<Self>) {
+        let world = if name.is_empty() {
+            None
+        } else {
+            match self.session.core.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                Some(i) => Some(i),
+                None => {
+                    self.client_line(&format!("No world named '{name}'."), cx);
+                    return;
+                }
+            }
+        };
+        let fx = self.session.core.request_info(world);
+        self.after(fx, cx);
+    }
+
+    /// The server's `/info` report: this GUI's own section after it, in the Info window.
+    fn show_info(&mut self, mut report: crate::info::InfoReport, cx: &mut Context<Self>) {
+        let mut own = crate::info::InfoSection::new("This GUI");
+        let worlds = &self.session.core.worlds;
+        let held: usize = worlds.iter().map(|w| w.lines.len()).sum();
+        own.row("Lines held", format!("{held} in {} worlds", worlds.len()));
+        own.row("Emoji pictures", super::emoji::cached_count().to_string());
+        if let Some(started) = super::STARTED.get() {
+            own.row("Open for", crate::info::fmt_duration(started.elapsed().as_secs()));
+        }
+        report.sections.push(own);
+        // Attached to another machine's Clay: this process is not the server's.
+        if !crate::native_gui::runs_clay() {
+            report.sections.push(crate::info::own_process_section("This GUI's process"));
+        }
+        let again = report.clone();
+        self.open_window(
+            super::windows::Kind::Info,
+            move |main, _w, cx| cx.new(|cx| super::windows::info::InfoView::new(main, report, cx)),
+            move |view, _w, cx| view.update(cx, |v, cx| v.set(again, cx)),
+            cx,
+        );
+    }
+
     /// A line of our own in the current world (app.js `appendClientLine`).
     pub(super) fn client_line(&mut self, text: &str, cx: &mut Context<Self>) {
         let fx = self.session.core.client_line(text);
@@ -651,6 +692,7 @@ impl ClayView {
                     });
                 }
             }
+            WsMessage::InfoReport { report, .. } => self.show_info(report.clone(), cx),
             // /connections: lines of our own, unprefixed (app.js `addRawOutputLines`).
             WsMessage::ConnectionsListResponse { lines } => {
                 for line in lines {

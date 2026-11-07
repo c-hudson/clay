@@ -8,6 +8,7 @@ pub mod action_editor;
 pub mod actions;
 pub mod emoji;
 pub mod help;
+pub mod info;
 pub mod keybind_editor;
 pub mod notes;
 pub mod settings;
@@ -38,6 +39,8 @@ pub enum Kind {
     ActionEditor,
     /// The emoji picker (Esc-e): a window, so it can stay up while several are picked.
     Emoji,
+    /// `/info`'s report.
+    Info,
 }
 
 impl Kind {
@@ -54,6 +57,7 @@ impl Kind {
             Kind::KeybindEditor => ("Clay - Keybind Editor", 1000.0, 700.0),
             Kind::ActionEditor => ("Clay - Action Editor", 960.0, 700.0),
             Kind::Emoji => ("Clay - Emoji", emoji::WIDTH, emoji::height()),
+            Kind::Info => ("Clay - Info", 760.0, 760.0),
         }
     }
 }

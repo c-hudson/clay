@@ -3248,7 +3248,11 @@ pub(crate) fn process_cpu_time_secs() -> f64 {
         }
     }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn process_cpu_time_secs() -> f64 {
+    crate::platform::process_stats().cpu_secs.unwrap_or(-1.0)
+}
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn process_cpu_time_secs() -> f64 {
     -1.0
 }

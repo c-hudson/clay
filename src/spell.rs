@@ -142,6 +142,11 @@ impl SpellChecker {
         !self.words.is_empty()
     }
 
+    /// How many words the dictionary holds, for `/info`.
+    pub fn word_count(&self) -> usize {
+        self.words.len()
+    }
+
     pub fn is_valid(&self, word: &str) -> bool {
         // If no dictionary loaded, consider all words valid (don't mark anything as misspelled)
         if self.words.is_empty() {

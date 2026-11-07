@@ -131,6 +131,7 @@ impl H {
             history_on_demand: true,
             map: false,
             resume_session: true,
+            info_report: true,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -303,6 +304,28 @@ fn the_keepalives_gagged_reply_is_kept_from_a_connect_and_live() {
     let flags: Vec<(u64, bool)> = lines.iter().map(|l| (l.seq.unwrap(), l.gagged)).collect();
     assert_eq!(flags, vec![(0, false), (1, true), (2, false), (3, true), (4, false)]);
     assert!(lines.iter().all(|l| !hidden_line(&l.text)), "nothing is hidden for good");
+}
+
+#[test]
+fn what_the_user_typed_is_hidden_under_f2_too() {
+    // The server sends a typed line as an empty gagged line (OutputLine::wire_text): kept
+    // for its seq, never drawn, F2 or not (user ruling 2026-11-06). A gagged line with text
+    // still shows under F2.
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    for d in ["\n", "spam\n"] {
+        let mut m = data(0, if d == "\n" { 1 } else { 2 }, d);
+        if let WsMessage::ServerData { gagged, .. } = &mut m {
+            *gagged = true;
+        }
+        h.msg(m);
+    }
+    let lines = &h.core.worlds[0].lines;
+    assert_eq!(h.core.worlds[0].seen.ranges(), &[(0, 2)], "its seq is kept");
+    let under_f2: Vec<&str> = lines.iter().filter(|l| !l.is_hidden(true)).map(|l| l.text.as_str()).collect();
+    assert_eq!(under_f2, vec!["line 0", "spam"]);
+    let without: Vec<&str> = lines.iter().filter(|l| !l.is_hidden(false)).map(|l| l.text.as_str()).collect();
+    assert_eq!(without, vec!["line 0"]);
 }
 
 #[test]
@@ -1490,6 +1513,7 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
         history_on_demand: false,
         map: false,
         resume_session: false,
+        info_report: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1527,6 +1551,7 @@ fn the_map_view_is_told_at_login_and_on_each_change_and_only_to_a_server_with_th
         history_on_demand: true,
         map,
         resume_session: false,
+        info_report: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1589,6 +1614,7 @@ fn version_names_this_gui_and_the_server() {
         history_on_demand: true,
         map: false,
         resume_session: false,
+        info_report: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1620,6 +1646,7 @@ fn version_names_this_gui_and_the_server() {
         history_on_demand: true,
         map: false,
         resume_session: false,
+        info_report: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1804,6 +1831,7 @@ fn a_paused_session_asks_once_to_resume_and_a_login_takes_the_badge_down() {
         history_on_demand: true,
         map: false,
         resume_session: false,
+        info_report: false,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1814,4 +1842,130 @@ fn a_paused_session_asks_once_to_resume_and_a_login_takes_the_badge_down() {
     old.keep(e);
     assert_eq!(resumes(&old.sent()), 0, "an older server is never sent it");
     assert!(old.core.paused, "and its badge shows until it says otherwise");
+}
+
+/// `/info`: the server says it answers `RequestInfo`, and the core asks for the world named,
+/// or the one shown.
+#[test]
+fn info_is_asked_of_a_server_that_answers_it() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9), world_msg(1, "B", 0..1, 9)]);
+    assert!(h.core.server_info_report);
+    h.sent();
+    let e = h.core.request_info(Some(1));
+    h.keep(e);
+    assert!(matches!(h.sent().as_slice(), [WsMessage::RequestInfo { world_index: Some(1) }]));
+    let e = h.core.request_info(None);
+    h.keep(e);
+    assert!(matches!(h.sent().as_slice(), [WsMessage::RequestInfo { world_index: Some(0) }]));
+}
+
+// ---- the buffer cap (World::trim) ----
+
+/// `n` lines from seq `from`, 100 to a message, as the server batches a read.
+fn feed(h: &mut H, world: usize, from: u64, n: u64) {
+    let mut seq = from;
+    while seq < from + n {
+        let count = (from + n - seq).min(100);
+        let text: String = (seq..seq + count).map(|s| format!("l{s}\n")).collect();
+        h.msg(data(world, seq, &text));
+        seq += count;
+    }
+}
+
+/// Past the cap the oldest lines go: the newest are kept, every delivered seq stays
+/// recorded, history starts at the oldest kept line and can be asked for again.
+#[test]
+fn the_buffer_keeps_the_newest_lines_once_past_the_cap() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "a", 0..10, 1)]);
+    h.sent();
+    let total = (MAX_LINES + TRIM_SLACK + 1) as u64;
+    feed(&mut h, 0, 10, total - 10);
+    let w = &h.core.worlds[0];
+    assert_eq!(w.lines.len(), MAX_LINES);
+    let oldest_kept = total - MAX_LINES as u64;
+    assert_eq!(w.lines.first().and_then(|l| l.seq), Some(oldest_kept));
+    assert_eq!(w.lines.last().and_then(|l| l.seq), Some(total - 1));
+    assert_eq!(w.seen.ranges(), &[(0, total - 1)], "every delivered seq stays recorded");
+    assert_eq!(w.history_position().0, (Some(oldest_kept), None));
+    assert!(w.history_more());
+    assert!(h.core.cache_snapshot()[0].lines.len() < MAX_LINES, "the disk cache keeps its own, smaller, slice");
+    // Asked for history now, the request names the oldest kept line.
+    let e = h.core.request_history(0, h.now);
+    h.keep(e);
+    assert!(matches!(h.sent().as_slice(), [WsMessage::RequestHistory { before_seq: Some(s), archive_before: None, .. }] if *s == oldest_kept));
+}
+
+/// A world the user has scrolled back in is never trimmed under them; once the view
+/// follows the bottom again, the next line that comes trims it.
+#[test]
+fn a_world_the_user_has_scrolled_back_is_never_trimmed() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "a", 0..10, 1)]);
+    h.core.set_pinned(&[0]);
+    let total = (MAX_LINES + TRIM_SLACK + 1) as u64;
+    feed(&mut h, 0, 10, total - 10);
+    assert_eq!(h.core.worlds[0].lines.len(), total as usize);
+    h.core.set_pinned(&[]);
+    h.msg(data(0, total, "one more\n"));
+    assert_eq!(h.core.worlds[0].lines.len(), MAX_LINES);
+    assert_eq!(h.core.worlds[0].lines.last().map(|l| l.text.as_str()), Some("one more"));
+}
+
+/// A hole in the delivered seqs below the kept lines is closed by the trim - a gap fill
+/// for lines this client would only drop again is never asked for - while a late copy
+/// of a dropped line is still a duplicate.
+#[test]
+fn a_hole_below_the_kept_lines_is_closed_and_never_asked_for() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "a", 0..10, 1)]);
+    h.sent();
+    // Seqs 10..20 never arrive, then everything past them.
+    let total = (MAX_LINES + TRIM_SLACK + 30) as u64;
+    feed(&mut h, 0, 20, total - 20);
+    let w = &h.core.worlds[0];
+    assert_eq!(w.lines.len(), MAX_LINES);
+    assert_eq!(w.seen.ranges(), &[(0, total - 1)], "the hole below the kept lines is closed");
+    assert!(w.seen.oldest_hole().is_none());
+    // Nothing asks the server to fill it.
+    h.advance(Duration::from_secs(3));
+    assert!(!h.sent().iter().any(|m| matches!(m, WsMessage::RequestScrollback { .. })), "no gap fill for dropped lines");
+    // A late copy of a seq that was never held but is recorded: a duplicate, not a line.
+    h.msg(data(0, 15, "late\n"));
+    assert!(matches!(h.sent().as_slice(), [WsMessage::ReportDuplicate { line_seq: 15, .. }]));
+    assert_eq!(h.core.worlds[0].lines.len(), MAX_LINES);
+}
+
+/// Archive lines read on demand sit at the front, kept while the user is reading them
+/// (the view is scrolled back) and the first to go once it isn't; history then starts
+/// at the oldest kept live line again.
+#[test]
+fn archive_lines_go_first_and_only_when_unpinned() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "a", 0..10, 1)]);
+    h.sent();
+    h.core.set_pinned(&[0]);
+    let e = h.core.request_history(0, h.now);
+    h.keep(e);
+    let id = match h.sent().as_slice() {
+        [WsMessage::RequestHistory { request_id, before_seq: Some(0), .. }] => *request_id,
+        other => panic!("a history request, not {other:?}"),
+    };
+    let archive = (0..3)
+        .map(|k| crate::websocket::ArchiveLine { text: format!("old {k}"), ts_ms: 1000 + k, wseq: Some(k), gagged: false })
+        .collect();
+    h.msg(WsMessage::HistoryLines { world_index: 0, request_id: id, before_seq: Some(0), archive_before: None, lines: Vec::new(), archive, done: false });
+    assert_eq!(h.texts(0)[..3], ["old 0", "old 1", "old 2"]);
+    let total = (MAX_LINES + TRIM_SLACK + 1) as u64;
+    feed(&mut h, 0, 10, total - 10);
+    let w = &h.core.worlds[0];
+    assert_eq!(w.lines.len(), total as usize + 3, "pinned: nothing trimmed, the archive lines included");
+    assert!(w.lines[0].archive.is_some());
+    h.core.set_pinned(&[]);
+    h.msg(data(0, total, "one more\n"));
+    let w = &h.core.worlds[0];
+    assert_eq!(w.lines.len(), MAX_LINES);
+    assert!(w.lines[0].archive.is_none(), "the archive lead went first");
+    assert_eq!(w.history_position().0, (Some(total + 1 - MAX_LINES as u64), None));
 }

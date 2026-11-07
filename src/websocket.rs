@@ -35,14 +35,40 @@ const WS_PONG_TIMEOUT_SECS: u64 = 20;
 ///   - `InitialState`/`ScrollbackLines`: large but singular, sent once per connect/resume,
 ///     not part of a steady-state burst.
 ///
-/// 256 gives several seconds of headroom at typical MUD output rates before a client is
+/// 1024 gives tens of seconds of headroom at typical MUD output rates before a client is
 /// considered stuck, while capping worst-case per-client memory to a few hundred queued
 /// `WsMessage` clones (each typically well under 1 KiB for `ServerData`) — far short of the
 /// 2 MiB `max_message_size` that already bounds a single outbound frame (see `ws_config`
-/// below). A client that can't drain 256 messages' worth of backlog is meaningfully behind,
+/// below). A client that can't drain that much backlog is meaningfully behind,
 /// not just briefly bursty, and is exactly the case Step 3 wants to detect via
 /// `ResyncRequired` rather than let grow forever.
-pub(crate) const WS_CLIENT_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const WS_CLIENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// How many queued messages the writer task sends in one write (`feed`s, then one
+/// `flush`): a flush per message was a TLS record and a syscall per line in a flood.
+const WS_WRITE_BATCH_MAX: usize = 256;
+
+/// `WS-CHANNEL-FULL` in remote.log, at most once a second per client: a client that has
+/// fallen behind drops a message per broadcast, and each line opened and wrote the file
+/// from the event loop, slowing the server exactly when it was already behind.
+pub(crate) fn log_channel_full(client_id: u64, ip: &str, details: &str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<HashMap<u64, Instant>>> = Mutex::new(None);
+    if let Ok(mut guard) = LAST.lock() {
+        let last = guard.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        if last.get(&client_id).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(1)) {
+            return;
+        }
+        last.insert(client_id, now);
+        if last.len() > 1024 {
+            last.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
+        }
+    }
+    crate::http::log_remote_event("WS-CHANNEL-FULL", ip, details);
+}
 
 /// One world's TF status area, in `InitialState`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -215,7 +241,7 @@ fn try_send_local(
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Closed(_)) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
-            crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+            log_channel_full(client_id, ip,
                 &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
                     client_id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
             reconcile_resync(clients, world_index, &[client_id], &[]);
@@ -457,6 +483,10 @@ pub enum WsMessage {
         /// has no `/pause`, says false. `serde(default)` = false.
         #[serde(default)]
         resume_session: bool,
+        /// `true` = this server takes `RequestInfo` (`/info`'s report in a window). Gated
+        /// as `other_views` is. `serde(default)` = false.
+        #[serde(default)]
+        info_report: bool,
         /// The emoji picker's curated table, in the compact wire form
         /// `[[ch, name, "kw1 kw2", category_index], ...]` from `emoji::emoji_json()`. The
         /// table is static, so it is sent once per connection here rather than on every
@@ -563,6 +593,15 @@ pub enum WsMessage {
     /// PAUSED (client -> server; only to a server whose `InitialState.resume_session` is
     /// true). The server resumes it and answers `PausedState { paused: false }` either way.
     ResumeSession,
+    /// `/info` at a client: the report on `world_index` (`None`: the world the client
+    /// shows) for a window (client -> server; only to a server whose
+    /// `InitialState.info_report` is true).
+    RequestInfo {
+        #[serde(default)]
+        world_index: Option<usize>,
+    },
+    /// The answer to `RequestInfo`, to the asking client only (server -> client).
+    InfoReport { world_index: usize, report: crate::info::InfoReport },
     /// Broadcast when show_tags setting changes (F2 or /tag command)
     ShowTagsChanged { show_tags: bool },
     /// Server is about to reload - clients should auto-reconnect
@@ -1750,8 +1789,8 @@ impl TimestampedLine {
     pub(crate) fn from_output_line(line: &crate::OutputLine) -> Self {
         TimestampedLine {
             // Prefix-free, same as live ServerData broadcasts - the "✨ " client-line marker
-            // is added at display time only.
-            text: line.text.replace('\r', ""),
+            // is added at display time only. None for what the user typed.
+            text: line.wire_text(),
             ts: line.timestamp
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -2939,7 +2978,7 @@ impl WebSocketServer {
             }
         }
         for (id, ip) in &full {
-            crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+            log_channel_full(*id, ip,
                 &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
                     id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
         }
@@ -2977,7 +3016,7 @@ impl WebSocketServer {
             }
         }
         for (id, ip) in &full {
-            crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+            log_channel_full(*id, ip,
                 &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
                     id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
         }
@@ -3014,7 +3053,7 @@ impl WebSocketServer {
                 }
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                crate::http::log_remote_event("WS-CHANNEL-FULL", &ip,
+                log_channel_full(client_id, &ip,
                     &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
                         client_id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
                 reconcile_resync(&self.clients, world_index, &[client_id], &[]);
@@ -3035,7 +3074,7 @@ impl WebSocketServer {
             // timeout and reconnect, at which point it gets a fresh InitialState anyway.
             // Single-recipient send, so Outbound::Message (PROTOCOL-ROADMAP.md Step 8).
             if let Err(mpsc::error::TrySendError::Full(_)) = client.tx.try_send(Outbound::Message(Box::new(msg))) {
-                crate::http::log_remote_event("WS-CHANNEL-FULL", &client.ip_address,
+                log_channel_full(client_id, &client.ip_address,
                     &format!("client={} InitialState dropped - outbound channel full (capacity {})",
                         client_id, WS_CLIENT_CHANNEL_CAPACITY));
             }
@@ -3419,7 +3458,7 @@ impl WebSocketServer {
             }
         }
         for (id, ip) in &full {
-            crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+            log_channel_full(*id, ip,
                 &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
                     id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
         }
@@ -3943,71 +3982,96 @@ where
         };
 
         tokio::select! {
-            Some(outbound) = rx.recv() => {
-                // PROTOCOL-ROADMAP.md Step 8: `Outbound::Shared` carries JSON that was
-                // already successfully serialized once, up front, by whichever broadcast
-                // call site produced it (see `serialize_for_broadcast`) - so there is no
-                // serialization step (and no WS-SERIALIZE-FAIL path) here for it, unlike
-                // the `Message` arm below which still serializes individually exactly as
-                // every send did before this step.
-                let send_outcome: Result<(String, usize), ()> = match outbound {
-                    Outbound::Shared(json) => {
-                        let msg_len = json.len();
-                        Ok((json.to_string(), msg_len))
+            Some(first) = rx.recv() => {
+                // Everything queued goes out in one write: each message is fed to the
+                // sink and the socket flushed once at the end - one TLS record and one
+                // syscall per batch rather than per message, which is what a flood of a
+                // few hundred lines used to cost a remote client.
+                let mut batch = vec![first];
+                while batch.len() < WS_WRITE_BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(m) => batch.push(m),
+                        Err(_) => break,
                     }
-                    Outbound::Message(msg) => {
-                        match serde_json::to_string(&msg) {
-                            Ok(json) => {
-                                let msg_len = json.len();
-                                Ok((json, msg_len))
-                            }
-                            Err(e) => {
-                                // PROTOCOL-ROADMAP.md Step 4: was previously silent - a serialization
-                                // failure here (e.g. a NaN/Infinity float slipping into a settings
-                                // message) vanished with zero trace, right after successfully being
-                                // dequeued, as if the message had been delivered. Log which message
-                                // *variant* failed (never the full Debug dump - some variants, e.g.
-                                // UpdateWorldSettings/AuthRequest, carry a plaintext password field
-                                // per CLAUDE.md's password-handling rule, so only the part of the
-                                // Debug output before the first field list is kept). The message is
-                                // dropped (not retried - a value that can't serialize now won't
-                                // serialize later) but the connection stays up.
-                                let debug_str = format!("{:?}", msg);
-                                let variant = debug_str.split(['{', '(']).next().unwrap_or(&debug_str).trim();
-                                crate::http::log_remote_event("WS-SERIALIZE-FAIL", &client_ip,
-                                    &format!("variant={}: {}", variant, e));
-                                debug_log(true, &format!(
-                                    "WS-SERIALIZE-FAIL: client={} variant={}: {}", client_ip, variant, e));
-                                Err(())
+                }
+                let mut failed = false;
+                for outbound in batch {
+                    // PROTOCOL-ROADMAP.md Step 8: `Outbound::Shared` carries JSON that was
+                    // already successfully serialized once, up front, by whichever broadcast
+                    // call site produced it (see `serialize_for_broadcast`) - so there is no
+                    // serialization step (and no WS-SERIALIZE-FAIL path) here for it, unlike
+                    // the `Message` arm below which still serializes individually exactly as
+                    // every send did before this step.
+                    let send_outcome: Result<(String, usize), ()> = match outbound {
+                        Outbound::Shared(json) => {
+                            let msg_len = json.len();
+                            Ok((json.to_string(), msg_len))
+                        }
+                        Outbound::Message(msg) => {
+                            match serde_json::to_string(&msg) {
+                                Ok(json) => {
+                                    let msg_len = json.len();
+                                    Ok((json, msg_len))
+                                }
+                                Err(e) => {
+                                    // PROTOCOL-ROADMAP.md Step 4: was previously silent - a serialization
+                                    // failure here (e.g. a NaN/Infinity float slipping into a settings
+                                    // message) vanished with zero trace, right after successfully being
+                                    // dequeued, as if the message had been delivered. Log which message
+                                    // *variant* failed (never the full Debug dump - some variants, e.g.
+                                    // UpdateWorldSettings/AuthRequest, carry a plaintext password field
+                                    // per CLAUDE.md's password-handling rule, so only the part of the
+                                    // Debug output before the first field list is kept). The message is
+                                    // dropped (not retried - a value that can't serialize now won't
+                                    // serialize later) but the connection stays up.
+                                    let debug_str = format!("{:?}", msg);
+                                    let variant = debug_str.split(['{', '(']).next().unwrap_or(&debug_str).trim();
+                                    crate::http::log_remote_event("WS-SERIALIZE-FAIL", &client_ip,
+                                        &format!("variant={}: {}", variant, e));
+                                    debug_log(true, &format!(
+                                        "WS-SERIALIZE-FAIL: client={} variant={}: {}", client_ip, variant, e));
+                                    Err(())
+                                }
                             }
                         }
-                    }
-                };
-                if let Ok((json, msg_len)) = send_outcome {
-                    if let Err(e) = ws_sink.send(WsRawMessage::Text(json)).await {
-                        // Was previously silent - a send failure here (e.g. exceeding
-                        // ws_config's max_message_size above) killed the connection right
-                        // after a successful auth with zero trace in either log.
-                        crate::http::log_remote_event("WS-SEND-FAIL", &client_ip,
-                            &format!("{} bytes: {}", msg_len, e));
-                        debug_log(is_debug_enabled(), &format!(
-                            "WS-SEND-FAIL: client={} {} bytes: {}", client_ip, msg_len, e));
-                        break;
-                    }
-                    // PROTOCOL-ROADMAP.md Step 3: draining `outbound` out of `rx` just freed
-                    // a slot in this client's channel. If an earlier broadcast overflowed it
-                    // and left a `ResyncRequired` undelivered (`needs_resync`), this is
-                    // exactly the moment - right after a successful send, from the same
-                    // task that owns and drains this channel - to retry it, without any
-                    // risk of the lock-nesting/deadlock that ruled out doing this from
-                    // inside the sync fan-out functions themselves.
-                    let pending_worlds: Vec<usize> = {
-                        let guard = clients.read().unwrap();
-                        guard.get(&client_id).map(|c| c.needs_resync.iter().copied().collect()).unwrap_or_default()
                     };
-                    for wi in pending_worlds {
-                        reconcile_resync(&clients, Some(wi), &[], &[client_id]);
+                    if let Ok((json, msg_len)) = send_outcome {
+                        if let Err(e) = ws_sink.feed(WsRawMessage::Text(json)).await {
+                            // Was previously silent - a send failure here (e.g. exceeding
+                            // ws_config's max_message_size above) killed the connection right
+                            // after a successful auth with zero trace in either log.
+                            crate::http::log_remote_event("WS-SEND-FAIL", &client_ip,
+                                &format!("{} bytes: {}", msg_len, e));
+                            debug_log(is_debug_enabled(), &format!(
+                                "WS-SEND-FAIL: client={} {} bytes: {}", client_ip, msg_len, e));
+                            failed = true;
+                            break;
+                        }
                     }
+                }
+                if !failed {
+                    if let Err(e) = ws_sink.flush().await {
+                        crate::http::log_remote_event("WS-SEND-FAIL", &client_ip, &format!("flush: {}", e));
+                        debug_log(is_debug_enabled(), &format!("WS-SEND-FAIL: client={} flush: {}", client_ip, e));
+                        failed = true;
+                    }
+                }
+                if failed {
+                    break;
+                }
+                // PROTOCOL-ROADMAP.md Step 3: draining `outbound` out of `rx` just freed
+                // slots in this client's channel. If an earlier broadcast overflowed it
+                // and left a `ResyncRequired` undelivered (`needs_resync`), this is
+                // exactly the moment - right after a successful send, from the same
+                // task that owns and drains this channel - to retry it, without any
+                // risk of the lock-nesting/deadlock that ruled out doing this from
+                // inside the sync fan-out functions themselves.
+                let pending_worlds: Vec<usize> = {
+                    let guard = clients.read().unwrap();
+                    guard.get(&client_id).map(|c| c.needs_resync.iter().copied().collect()).unwrap_or_default()
+                };
+                for wi in pending_worlds {
+                    reconcile_resync(&clients, Some(wi), &[], &[client_id]);
                 }
             }
             msg_result = ws_source.next() => {

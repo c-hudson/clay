@@ -180,6 +180,13 @@ pub struct Scroll {
     /// row put the thumb of a world of wrapped prose far from where the view was, and
     /// moved it as the drag laid lines out. Kept the same way as `rows`.
     estimates: HashMap<u64, RowCount>,
+    /// The lines laid out at the current width, font and style, kept from frame to frame:
+    /// every line on screen used to be shaped, segmented and wrapped again each frame.
+    /// Validated like `rows` (the styled line's identity) and, for a line with a Discord
+    /// emoji, by the emoji store's generation (an image arriving changes its width).
+    laid: HashMap<u64, LaidEntry>,
+    /// Counts the layouts (`prepare` calls); `laid` entries are stamped with it for pruning.
+    frame: u64,
     /// After the last layout: the rows painted, top to bottom, and their height.
     pub hits: Vec<HitRow>,
     pub row_h: f32,
@@ -223,6 +230,44 @@ fn cached_rows(cache: &mut HashMap<u64, RowCount>, id: u64, line: &Arc<StyledLin
     rows
 }
 
+/// A line's layout kept between frames (`Scroll::laid`), with what it was laid out from.
+struct LaidEntry {
+    of: std::sync::Weak<StyledLine>,
+    laid: Rc<LaidLine>,
+    /// The frame it was last drawn in.
+    used: u64,
+    /// `emoji::generation()` when laid out, for a line holding a Discord emoji.
+    emoji_gen: Option<u64>,
+}
+
+impl Scroll {
+    /// The layout of line `id` when it was taken from this very styled line (and no emoji
+    /// it holds has changed since), else `lay`'d now and kept.
+    fn laid_line(&mut self, id: u64, line: &Arc<StyledLine>, lay: impl FnOnce() -> LaidLine) -> Rc<LaidLine> {
+        let frame = self.frame;
+        if let Some(e) = self.laid.get_mut(&id) {
+            let same = std::ptr::eq(e.of.as_ptr(), Arc::as_ptr(line));
+            let fresh = e.emoji_gen.is_none_or(|g| g == emoji::generation());
+            if same && fresh {
+                e.used = frame;
+                return e.laid.clone();
+            }
+        }
+        let laid = Rc::new(lay());
+        let emoji_gen = laid.styled.runs.iter().any(|r| r.emoji.is_some()).then(emoji::generation);
+        self.laid.insert(id, LaidEntry { of: Arc::downgrade(line), laid: laid.clone(), used: frame, emoji_gen });
+        laid
+    }
+
+    /// Forget the layouts not drawn for a few frames, once there are many more than drawn.
+    fn prune_laid(&mut self, drawn: usize) {
+        if self.laid.len() > 2 * drawn + 256 {
+            let keep_from = self.frame.saturating_sub(2);
+            self.laid.retain(|_, e| e.used >= keep_from);
+        }
+    }
+}
+
 impl Default for Scroll {
     fn default() -> Self {
         Scroll {
@@ -236,6 +281,8 @@ impl Default for Scroll {
             rows_cache: (0, 0, 0),
             rows: HashMap::new(),
             estimates: HashMap::new(),
+            laid: HashMap::new(),
+            frame: 0,
             hits: Vec::new(),
             row_h: 16.0,
             bar: None,
@@ -367,7 +414,7 @@ pub struct Prepared {
     reveal_next: Option<std::time::Duration>,
     snapshot: OutputSnapshot,
     metrics: Metrics,
-    lines: Vec<LaidLine>,
+    lines: Vec<Rc<LaidLine>>,
     rows: Vec<VisibleRow>,
     content: Bounds<Pixels>,
     /// Each laid-out line's id, parallel to `lines`.
@@ -674,7 +721,16 @@ fn sub_runs(runs: &[TextRun], range: &Range<usize>) -> Vec<TextRun> {
     out
 }
 
-fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) -> Prepared {
+fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) -> Prepared {
+    let perf = crate::native_gui::core::perf::enabled().then(|| (Instant::now(), snapshot.lines.len()));
+    let p = prepare_lines(snapshot, bounds, window, cx);
+    if let Some((t, lines)) = perf {
+        crate::native_gui::core::perf::frame_prepared(t.elapsed(), lines, p.lines.len());
+    }
+    p
+}
+
+fn prepare_lines(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) -> Prepared {
     let font_size = px(snapshot.font_size);
     let ts = window.text_system();
     let primary = ts.resolve_font(&snapshot.fonts.font(snapshot.fonts.base(), false, false));
@@ -699,11 +755,13 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     let n = snapshot.lines.len();
     let scroll = snapshot.scroll.clone();
     let mut st = scroll.borrow_mut();
+    st.frame = st.frame.wrapping_add(1);
     let key = (width.to_bits(), snapshot.font_size.to_bits(), snapshot.style_epoch);
     if st.rows_cache != key {
         st.rows_cache = key;
         st.rows.clear();
         st.estimates.clear();
+        st.laid.clear();
     }
     // Lines that left the buffer (or belong to another world) needn't be remembered
     // forever: past a margin, keep only what this snapshot shows.
@@ -713,16 +771,26 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         st.estimates.retain(|id, _| live.contains(id));
     }
 
-    // Lines are laid out only as far as the view (and the scroll) needs.
-    let mut laid: HashMap<usize, LaidLine> = HashMap::new();
-    let rows_of = |i: usize, st: &mut Scroll, laid: &mut HashMap<usize, LaidLine>| -> usize {
+    // Lines are laid out only as far as the view (and the scroll) needs, and a layout is
+    // kept from frame to frame (`Scroll::laid_line`): `laid` is this frame's, by index.
+    let mut laid: HashMap<usize, Rc<LaidLine>> = HashMap::new();
+    let laid_for = |i: usize, st: &mut Scroll, laid: &mut HashMap<usize, Rc<LaidLine>>| -> Rc<LaidLine> {
+        if let Some(l) = laid.get(&i) {
+            return l.clone();
+        }
         let (id, line) = &snapshot.lines[i];
-        cached_rows(&mut st.rows, *id, line, || {
-            let l = lay_out(line.clone(), &snapshot, &metrics, width, window);
-            let r = l.rows.len().max(1);
-            laid.insert(i, l);
-            r
-        })
+        let l = st.laid_line(*id, line, || lay_out(line.clone(), &snapshot, &metrics, width, window));
+        laid.insert(i, l.clone());
+        l
+    };
+    let rows_of = |i: usize, st: &mut Scroll, laid: &mut HashMap<usize, Rc<LaidLine>>| -> usize {
+        let (id, line) = &snapshot.lines[i];
+        if let Some(r) = st.rows.get(id).and_then(|c| c.for_line(line)) {
+            return r;
+        }
+        let r = laid_for(i, st, laid).rows.len().max(1);
+        st.rows.insert(*id, RowCount::new(line, r));
+        r
     };
 
     // A line asked for in the middle (F5's match): the top row is half the rows the view
@@ -802,10 +870,8 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     // The visible rows, top to bottom.
     let mut order: Vec<usize> = Vec::new();
     let mut rows = Vec::new();
-    let place = |i: usize, laid: &mut HashMap<usize, LaidLine>, order: &mut Vec<usize>| -> usize {
-        if let std::collections::hash_map::Entry::Vacant(e) = laid.entry(i) {
-            e.insert(lay_out(snapshot.lines[i].1.clone(), &snapshot, &metrics, width, window));
-        }
+    let place = |i: usize, st: &mut Scroll, laid: &mut HashMap<usize, Rc<LaidLine>>, order: &mut Vec<usize>| -> usize {
+        laid_for(i, st, laid);
         match order.iter().position(|&o| o == i) {
             Some(p) => p,
             None => {
@@ -818,7 +884,7 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         Some((ti, tr)) => {
             let (mut i, mut r, mut k) = (ti, tr, 0usize);
             while k <= view_rows && i < n {
-                let li = place(i, &mut laid, &mut order);
+                let li = place(i, &mut scroll.borrow_mut(), &mut laid, &mut order);
                 let count = laid[&i].rows.len().max(1);
                 while r < count && k <= view_rows {
                     rows.push(VisibleRow { line: li, row: r, top: f32::from(content.origin.y) + k as f32 * metrics.row });
@@ -848,7 +914,7 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
             let shown: Vec<(usize, usize)> = stack[skip..].to_vec();
             let count = shown.len();
             for (k, (i, r)) in shown.into_iter().enumerate() {
-                let li = place(i, &mut laid, &mut order);
+                let li = place(i, &mut scroll.borrow_mut(), &mut laid, &mut order);
                 let top = if fits {
                     f32::from(content.origin.y) + k as f32 * metrics.row
                 } else {
@@ -859,7 +925,8 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
         }
         None => {}
     }
-    let lines: Vec<LaidLine> = order.iter().map(|i| laid.remove(i).expect("laid out")).collect();
+    let lines: Vec<Rc<LaidLine>> = order.iter().map(|i| laid.remove(i).expect("laid out")).collect();
+    scroll.borrow_mut().prune_laid(lines.len());
     let ids: Vec<u64> = order.iter().map(|&i| snapshot.lines[i].0).collect();
     // Every pass below indexes a line's rows by `VisibleRow::row`: a row the layout doesn't
     // have (a count that went stale some way the caches above don't know) is dropped here,
@@ -925,7 +992,15 @@ fn note_dropped_rows(count: usize) {
     }
 }
 
-fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App) {
+fn paint(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, cx: &mut App) {
+    let perf = crate::native_gui::core::perf::enabled().then(Instant::now);
+    paint_lines(bounds, p, window, cx);
+    if let Some(t) = perf {
+        crate::native_gui::core::perf::frame_painted(t.elapsed());
+    }
+}
+
+fn paint_lines(bounds: Bounds<Pixels>, p: Prepared, window: &mut Window, _cx: &mut App) {
     window.paint_quad(fill(bounds, hsla(p.snapshot.background)));
     let m = &p.metrics;
     let indent = p.snapshot.wrapspace as f32 * m.ch;

@@ -66,6 +66,7 @@ fn is_reply(msg: &WsMessage) -> bool {
         | WsMessage::ChatLookupResult { .. }
         | WsMessage::BanListResponse { .. }
         | WsMessage::UnbanResult { .. }
+        | WsMessage::InfoReport { .. }
         | WsMessage::AnsiMusic { .. } => true,
         // This client's own notices (`/version`, a command's complaint): outside the
         // world's numbered output.

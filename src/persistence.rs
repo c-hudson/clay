@@ -2267,6 +2267,8 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
 
 #[cfg(not(target_os = "android"))]
 pub fn save_reload_state(app: &App) -> io::Result<()> {
+    // The exec that follows runs no destructors: the buffered log files go out now.
+    app.flush_logs();
     let path = get_reload_state_path();
     // B2 (security remediation): reload state holds world passwords/tokens and the
     // encrypted auth key — create it owner-only (0600 on Unix), like settings.dat.
@@ -2687,6 +2689,13 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
                 writeln!(file, "map_walk_json={}", json)?;
             }
         }
+        // `/info`'s record of the connection (negotiation log, option table, traffic) and
+        // when it came up: the new process's telnet session starts with every option off.
+        if world.connected {
+            if let Ok(json) = serde_json::to_string(&world.protocol.saved_diag(world.connected_at)) {
+                writeln!(file, "protocol_diag={}", json)?;
+            }
+        }
         if let Ok(json) = serde_json::to_string(&world.mcp) {
             // Always written (even for a fresh, all-default McpState) rather than
             // gated on "has data": unlike stats/mssp_data there's no cheap
@@ -3043,6 +3052,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         /// than overwrite it with an empty one.
         stats: Option<stats::WorldStats>,
         mcp: Option<mcp::McpState>,
+        info_diag: Option<crate::protocol_state::SavedDiag>,
         map_here: Option<String>,
         map_walk: Option<crate::map::walk::KeptWalk>,
     }
@@ -3208,6 +3218,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         mssp_values: std::collections::HashMap::new(),
                         stats: None,
                         mcp: None,
+                        info_diag: None,
                         map_here: None,
                         map_walk: None,
                     });
@@ -3824,6 +3835,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                                     tw.mcp = Some(m);
                                 }
                             }
+                            "protocol_diag" => {
+                                tw.info_diag = serde_json::from_str(value).ok();
+                            }
                             // Slack settings
                             "slack_token" => tw.settings.slack_token = unescape_string(value),
                             "slack_channel" => tw.settings.slack_channel = unescape_string(value),
@@ -4043,6 +4057,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         }
         if let Some(mcp) = tw.mcp {
             world.mcp = mcp;
+        }
+        if let Some(saved) = tw.info_diag {
+            world.connected_at = world.protocol.restore_diag(saved);
         }
         world.map.here = tw.map_here;
         if let Some(walk) = tw.map_walk {
@@ -4695,6 +4712,47 @@ mod tests {
             rw.mcp.key_for_test().as_deref(), Some(orig_mcp_key.as_str()),
             "the mcp session key (T3.4) must survive a reload"
         );
+    }
+
+    /// `/info`'s record of a connected world (negotiation log, options, traffic, GMCP
+    /// counts) and when it came up survive a reload, marked as negotiated before it.
+    #[test]
+    fn test_info_record_survives_reload_roundtrip() {
+        use crate::protocol_state::{NoteDir, OptionSides};
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Recorded"));
+        let connected_at = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        {
+            let w = &mut app.worlds[0];
+            w.connected = true;
+            w.connected_at = Some(connected_at);
+            let diag = w.protocol.new_diag();
+            diag.note(5, NoteDir::Server, "WILL GMCP".into(), "DO GMCP".into(), Some((201, OptionSides { server: true, clay: false })));
+            diag.add_in(300);
+            diag.add_out(40);
+            w.protocol.gmcp_received.insert("Char.Vitals".into(), 7);
+            w.protocol.msdp_updates = 3;
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).expect("reload state is valid UTF-8");
+        assert_eq!(content.matches("protocol_diag=").count(), 1);
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load_reload_state_from_str failed");
+        let rw = reloaded.worlds.iter_mut().find(|w| w.name == "Recorded").expect("world restored");
+        assert_eq!(rw.connected_at, Some(connected_at));
+        assert_eq!(rw.protocol.gmcp_received.get("Char.Vitals"), Some(&7));
+        assert_eq!(rw.protocol.msdp_updates, 3);
+        // The reader re-attached after the reload carries on with the same record.
+        let record = rw.protocol.diag_for_reader().snapshot();
+        assert!(record.reloaded);
+        assert_eq!(record.wire_in, 300);
+        assert_eq!(record.wire_out, 40);
+        assert_eq!(record.notes.len(), 1);
+        assert_eq!(record.notes[0].what, "WILL GMCP");
+        assert_eq!(record.options.get(&201), Some(&OptionSides { server: true, clay: false }));
     }
 
     /// A state file written before job 5 (no `echo_masked`/`naws_enabled`/

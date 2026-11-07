@@ -353,6 +353,23 @@ pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> 
 /// code point stays held (see `idle_release_len`), so a following read or a
 /// later idle flush can still complete it correctly instead of it having
 /// already been shown broken.
+/// Add one read's bytes, MCCP2 counts and negotiations to `/info`'s record.
+fn record_read(diag: &crate::protocol_state::ConnDiag, n: usize, session: &mut TelnetSession) {
+    use crate::protocol_state::{NoteDir, OptionSides};
+    diag.add_in(n);
+    let (compressed, plain) = session.take_mccp_counts();
+    diag.add_mccp(compressed, plain);
+    let notes = session.take_notes();
+    if notes.is_empty() {
+        return;
+    }
+    let at = crate::protocol_state::now_ms();
+    for note in notes {
+        let option = note.option.map(|(opt, server, clay)| (opt, OptionSides { server, clay }));
+        diag.note(at, NoteDir::Server, note.what, note.reply, option);
+    }
+}
+
 pub fn spawn_telnet_reader(
     mut read_half: StreamReader,
     cmd_tx: mpsc::Sender<WriteCommand>,
@@ -362,6 +379,12 @@ pub fn spawn_telnet_reader(
     cfg: TelnetConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // /info's record of this connection, when one was made: the writer counts into it
+        // from its first write, and every read adds its bytes and the session's notes.
+        let diag = cfg.diag.clone();
+        if let Some(d) = &diag {
+            let _ = cmd_tx.send(WriteCommand::CountInto(d.clone())).await;
+        }
         let mut session = TelnetSession::new(cfg);
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
 
@@ -402,6 +425,9 @@ pub fn spawn_telnet_reader(
                             // does not, and must not restart the idle window below.
                             let text_moved = !outcome.text.is_empty()
                                 || session.pending_text_len() != pending_before;
+                            if let Some(d) = &diag {
+                                record_read(d, n, &mut session);
+                            }
 
                             if !outcome.wire.is_empty() {
                                 let _ = cmd_tx.send(WriteCommand::Raw(outcome.wire)).await;
@@ -1557,5 +1583,33 @@ mod tests {
             h.next_event().await,
             AppEvent::ServerData(n, b) if n == "reactiveworld" && b == b"Welcome\r\n".to_vec()
         ));
+    }
+
+    /// `/info`'s record: with a `diag`, the writer is handed it first, and every read adds
+    /// its bytes and the session's negotiations. Without one (every test above) nothing.
+    #[tokio::test]
+    async fn a_reader_with_a_diag_counts_bytes_and_keeps_the_negotiations() {
+        use crate::protocol_state::{ConnDiag, NoteDir};
+        let diag = std::sync::Arc::new(ConnDiag::default());
+        let cfg = TelnetConfig { diag: Some(diag.clone()), ..test_cfg() };
+        let mut h = Harness::spawn_with_cfg(TelnetTarget::World("w".to_string()), 1, cfg);
+        match h.next_cmd().await {
+            WriteCommand::CountInto(d) => assert!(std::sync::Arc::ptr_eq(&d, &diag)),
+            other => panic!("expected CountInto first, got {other:?}"),
+        }
+        let bytes = [TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP];
+        h.send(&bytes).await;
+        match h.next_cmd().await {
+            WriteCommand::Raw(raw) => assert_eq!(raw, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP]),
+            other => panic!("expected the DO GMCP reply, got {other:?}"),
+        }
+        let record = diag.snapshot();
+        assert_eq!(record.wire_in, bytes.len() as u64);
+        assert_eq!(record.notes.len(), 1);
+        assert_eq!(record.notes[0].dir, NoteDir::Server);
+        assert_eq!(record.notes[0].what, "WILL GMCP");
+        assert_eq!(record.notes[0].reply, "DO GMCP");
+        assert!(record.notes[0].at_ms > 0, "the reader stamps the time");
+        assert_eq!(record.options.get(&TELNET_OPT_GMCP).map(|o| (o.server, o.clay)), Some((true, false)));
     }
 }

@@ -8,6 +8,7 @@ pub mod input;
 pub mod keys;
 pub mod media;
 pub mod net;
+pub mod perf;
 pub mod seq;
 pub mod session;
 pub mod spell;

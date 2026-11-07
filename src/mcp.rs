@@ -599,12 +599,10 @@ impl McpState {
         }
     }
 
-    /// Test/diagnostic-only: whether a session key has been established. Production
-    /// code never needs to ask this (`build_simpleedit_set` already fails closed when
-    /// there is no key), but integration tests in `tests.rs` exercising the real
-    /// `App::process_server_data` pipeline need a way to observe it from outside this
-    /// module.
-    #[cfg(test)]
+    /// Whether a session key has been established: `/info` reports it, and integration
+    /// tests in `tests.rs` exercising the real `App::process_server_data` pipeline observe
+    /// it from outside this module (`build_simpleedit_set` already fails closed when there
+    /// is no key).
     pub(crate) fn has_key(&self) -> bool {
         self.key.is_some()
     }

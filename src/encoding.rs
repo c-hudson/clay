@@ -1211,11 +1211,16 @@ pub fn wrap_urls_with_osc8(s: &str) -> String {
     let mut result = String::with_capacity(s.len() * 2);
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
+    // A URL starts here? Compared in place: collecting the rest of the line into a String
+    // at every character made this quadratic in the line's length, and it runs for every
+    // line that mentions "http" - the row measurement included (`RowMetrics::rows_as`).
+    const HTTP: &[char] = &['h', 't', 't', 'p', ':', '/', '/'];
+    const HTTPS: &[char] = &['h', 't', 't', 'p', 's', ':', '/', '/'];
+    let url_starts_at = |i: usize| chars[i..].starts_with(HTTP) || chars[i..].starts_with(HTTPS);
 
     while i < chars.len() {
         // Check for URL start (http:// or https://)
-        let remaining: String = chars[i..].iter().collect();
-        if remaining.starts_with("http://") || remaining.starts_with("https://") {
+        if url_starts_at(i) {
             // Find the end of the URL (whitespace, quotes, or certain punctuation at end)
             let url_start = i;
             let mut url_end = i;

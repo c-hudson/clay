@@ -35,6 +35,8 @@ Split the output in two, one pane above the other, to watch two worlds at once (
 /split act        # the Activity world above: the other worlds' new lines (or /split activity)
 /split -n 10      # the top pane 10 lines high: splits if not split, else only resizes it
 /split -n 10 rome # rome above, 10 lines high
+/split +3         # the top pane 3 lines higher (only while split)
+/split -3         # the top pane 3 lines lower (only while split)
 /unsplit          # close the pane without the focus
 ```
 
@@ -43,7 +45,9 @@ pane does too. Neither command connects or disconnects anything. From an action,
 or a TF key binding, `/split` splits the interface that ran it.
 
 Each pane always keeps at least one line: a `-n` too big for the window leaves the bottom
-pane its one line. The size you last set, with `-n` or by dragging the bar between the
+pane its one line. `+` and `-` count from the lines the top pane shows now and stop at
+one line for either pane; they only resize a split, so without one they say "The output
+isn't split." The size you last set, with `-n`, `+`, `-` or by dragging the bar between the
 panes in the GUI and the web client, belongs to that program (each console, GUI window or
 browser page has its own), and the next `/split` opens at it again; until then the panes
 are half and half. It survives `/reload`.
@@ -388,6 +392,51 @@ Useful in action commands:
 ## Telnet Protocol Commands
 
 See the **Telnet Features** chapter for background on MSSP/MSDP/GMCP.
+
+### /info
+Show what goes on behind the scenes: everything about a world's connection that is
+normally hidden, and about Clay itself.
+
+```
+/info              # the current world
+/info <world>      # another world
+```
+
+**What it covers:**
+- **The world:** the address actually connected to, the encryption (TLS version and
+  cipher) and certificate pin, how long it has been connected, the encoding in use, the
+  auto-login type (never the password), the keepalive, when text last came and went, the
+  bytes received and sent, and how much MCCP2 compression saved.
+- **Telnet options:** each option and its state on both sides, with what was agreed.
+  - NAWS shows the window size sent.
+  - TTYPE shows Clay's answers, with the MTTS bits named.
+  - CHARSET shows the agreed character set.
+  - GMCP shows the packages announced and the messages received.
+  - MSDP and MSSP show how many variables there are.
+- **Negotiation log:** every negotiation with the time it happened, what the server sent
+  (`<-`) and what Clay answered (`->`). It keeps the newest 200.
+- **Prompts:** how prompts are found (GA/EOR from the server, or Clay's guess on a Timed
+  Prompt world), and the current prompt.
+- **The world's buffers:** lines kept and held by More, roughly what they take, and the line
+  numbers used to keep clients in step.
+- **Clay:** the version, how long it has run (through reloads), the program and settings
+  files, CPU time.
+- **Memory:** what the process uses now and at its peak, threads and open files, the output
+  kept across worlds, TinyFugue's macros and variables, the archive (`scrollback.db`), the
+  map file and the media cache.
+- **Web server and clients:** the port and each client attached, with where it connects
+  from, how long it has been attached and what it shows.
+
+The console prints the report into the output area. The GUIs and the web page show it in a
+window of its own. Copy puts it on the clipboard as text.
+
+**Each interface adds a section about itself:**
+- **The GUIs, the web page and the Android app:** what that window holds, and the script
+  memory where the engine reports it.
+- **A GUI or console attached to another machine's Clay:** its own process and memory too.
+
+It is a snapshot: run `/info` again for a new one. A connection made before `/info` existed
+(an older Clay that was reloaded into this one) has no negotiation log.
 
 ### /mssp
 Show the current world's MSSP (MUD Server Status Protocol) data — name/value pairs the

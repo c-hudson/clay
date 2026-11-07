@@ -894,9 +894,10 @@ async fn reconnect_once(
 /// console's worlds, settings and view become the server's again. What belongs to the
 /// console - the input line, its history, an open editor - stays.
 fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSender<WsMessage>, version_mismatch_shown: &mut bool) {
-    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, other_views, map, .. } = msg else {
+    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, other_views, map, info_report, .. } = msg else {
         return;
     };
+    app.server_info_report = info_report;
     // The map (src/map): the server has one; tell it this console's pane again.
     app.server_map = map;
     app.map_watch_sent = None;
@@ -2981,6 +2982,20 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
             }
         }
         Command::Version => version_command(app),
+        // The server's report, then this console's own section (the InfoReport arm in
+        // handle_remote_ws_message); an older server gets the line and answers in text.
+        Command::Info { ref world } if app.server_info_report && !from_server => {
+            let index = match world.as_deref() {
+                Some(name) => app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)),
+                None => Some(app.current_world_index),
+            };
+            match index {
+                Some(i) => {
+                    let _ = ws_tx.send(WsMessage::RequestInfo { world_index: Some(i) });
+                }
+                None => app.add_output(&format!("No world named '{}'.", world.as_deref().unwrap_or(""))),
+            }
+        }
         Command::Menu => app.open_menu_popup_new(),
         // The map pane is this console's own (the server sends it what to draw); the rest
         // of /map is the world's, on the server.

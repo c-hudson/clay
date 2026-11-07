@@ -28,7 +28,9 @@
 //!    user's own WS clients (`App::user_min_dimensions`) so one user's window size can
 //!    never leak into another's NAWS.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -103,6 +105,224 @@ pub struct ProtocolState {
     pub mssp_data: Vec<(String, String)>,
     /// MCMP default URL from `Client.Media.Default`.
     pub mcmp_default_url: String,
+    /// GMCP messages received per package, for `/info` (at most `MAX_COUNTED_PACKAGES`
+    /// names; the rest count under "other").
+    #[serde(default)]
+    pub gmcp_received: BTreeMap<String, u64>,
+    /// MSDP variables received, for `/info`.
+    #[serde(default)]
+    pub msdp_updates: u64,
+    /// This connection's record for `/info`, shared with its reader and writer tasks
+    /// (`TelnetConfig::diag`). Made where the connection starts (`new_diag`), dropped by
+    /// `clear`, so a reader still running for an old connection writes only into its own.
+    #[serde(skip)]
+    pub diag: Option<Arc<ConnDiag>>,
+}
+
+/// How many GMCP package names `ProtocolState::gmcp_received` counts by name.
+const MAX_COUNTED_PACKAGES: usize = 64;
+
+/// How many negotiation notes a connection keeps for `/info` (the newest).
+pub const NOTES_KEPT: usize = 200;
+
+/// Which way a negotiation went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteDir {
+    /// The server sent it; `Note::reply` is what the session answered at once.
+    Server,
+    /// Clay sent it on its own: the NAWS size, the CHARSET answer, GMCP's Core.Hello...
+    Clay,
+}
+
+/// One line of `/info`'s negotiation log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Note {
+    pub at_ms: u64,
+    pub dir: NoteDir,
+    pub what: String,
+    #[serde(default)]
+    pub reply: String,
+    /// How many times in a row it happened (a MUD re-sending WILL EOR is one line).
+    #[serde(default = "one")]
+    pub repeats: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+/// One telnet option on both sides, as the session last left it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct OptionSides {
+    /// The server does it (it said WILL and Clay agreed).
+    pub server: bool,
+    /// Clay does it (the server asked DO and Clay agreed).
+    pub clay: bool,
+}
+
+/// What a connection's reader, writer and connect task saw, as `/info` shows it and as a
+/// reload carries it over (`protocol_diag=` in the reload state).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DiagRecord {
+    pub notes: VecDeque<Note>,
+    /// Notes older than the newest `NOTES_KEPT`, not kept.
+    #[serde(default)]
+    pub dropped: u64,
+    #[serde(default)]
+    pub options: BTreeMap<u8, OptionSides>,
+    /// The address actually connected to, "ip:port".
+    #[serde(default)]
+    pub peer: Option<String>,
+    /// "TLS 1.3" and the like, for a direct TLS connection.
+    #[serde(default)]
+    pub tls_version: Option<String>,
+    #[serde(default)]
+    pub wire_in: u64,
+    #[serde(default)]
+    pub wire_out: u64,
+    #[serde(default)]
+    pub mccp_in: u64,
+    #[serde(default)]
+    pub mccp_out: u64,
+    /// Restored by a reload: the options table is the one the old process negotiated
+    /// (the new process's telnet session starts with every option off).
+    #[serde(default)]
+    pub reloaded: bool,
+}
+
+/// One connection's record for `/info`. Shared by the App (`ProtocolState::diag`), the
+/// reader (bytes read, the session's notes and MCCP2 counts), the writer (bytes written,
+/// after `WriteCommand::CountInto`) and the connect task (peer, TLS version) - no event
+/// carries any of it, so no event loop or reader test changes for it.
+#[derive(Debug, Default)]
+pub struct ConnDiag {
+    wire_in: AtomicU64,
+    wire_out: AtomicU64,
+    mccp_in: AtomicU64,
+    mccp_out: AtomicU64,
+    record: Mutex<DiagRecord>,
+}
+
+impl ConnDiag {
+    /// A record to carry on with: a reload's saved copy.
+    pub fn restored(mut record: DiagRecord) -> Arc<Self> {
+        record.reloaded = true;
+        Arc::new(ConnDiag {
+            wire_in: AtomicU64::new(record.wire_in),
+            wire_out: AtomicU64::new(record.wire_out),
+            mccp_in: AtomicU64::new(record.mccp_in),
+            mccp_out: AtomicU64::new(record.mccp_out),
+            record: Mutex::new(record),
+        })
+    }
+
+    pub fn add_in(&self, n: usize) {
+        self.wire_in.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_out(&self, n: usize) {
+        self.wire_out.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_mccp(&self, compressed: u64, plain: u64) {
+        if compressed > 0 || plain > 0 {
+            self.mccp_in.fetch_add(compressed, Ordering::Relaxed);
+            self.mccp_out.fetch_add(plain, Ordering::Relaxed);
+        }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut DiagRecord) -> R) -> R {
+        let mut guard = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut guard)
+    }
+
+    pub fn set_peer(&self, peer: String) {
+        self.with(|r| r.peer = Some(peer));
+    }
+
+    pub fn set_tls_version(&self, version: String) {
+        self.with(|r| r.tls_version = Some(version));
+    }
+
+    /// Add a note (the same as the last one only counts it again) and, when it names an
+    /// option, that option's state.
+    pub fn note(&self, at_ms: u64, dir: NoteDir, what: String, reply: String, option: Option<(u8, OptionSides)>) {
+        if what.is_empty() && reply.is_empty() {
+            return;
+        }
+        self.with(|r| {
+            if let Some((opt, sides)) = option {
+                r.options.insert(opt, sides);
+            }
+            if let Some(last) = r.notes.back_mut() {
+                if last.dir == dir && last.what == what && last.reply == reply {
+                    last.repeats = last.repeats.saturating_add(1);
+                    return;
+                }
+            }
+            r.notes.push_back(Note { at_ms, dir, what, reply, repeats: 1 });
+            while r.notes.len() > NOTES_KEPT {
+                r.notes.pop_front();
+                r.dropped += 1;
+            }
+        });
+    }
+
+    /// Everything, counters included, as of now.
+    pub fn snapshot(&self) -> DiagRecord {
+        let mut record = self.with(|r| r.clone());
+        record.wire_in = self.wire_in.load(Ordering::Relaxed);
+        record.wire_out = self.wire_out.load(Ordering::Relaxed);
+        record.mccp_in = self.mccp_in.load(Ordering::Relaxed);
+        record.mccp_out = self.mccp_out.load(Ordering::Relaxed);
+        record
+    }
+}
+
+/// What a reload carries over for `/info` (the reload state's `protocol_diag=` line): the
+/// connection's record, its GMCP/MSDP counts and when it came up.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedDiag {
+    #[serde(default)]
+    pub connected_at_ms: Option<u64>,
+    #[serde(default)]
+    pub record: Option<DiagRecord>,
+    #[serde(default)]
+    pub gmcp_received: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub msdp_updates: u64,
+}
+
+impl ProtocolState {
+    /// This connection's `/info` state for the reload state.
+    pub fn saved_diag(&self, connected_at: Option<std::time::SystemTime>) -> SavedDiag {
+        SavedDiag {
+            connected_at_ms: connected_at
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64),
+            record: self.diag.as_ref().map(|d| d.snapshot()),
+            gmcp_received: self.gmcp_received.clone(),
+            msdp_updates: self.msdp_updates,
+        }
+    }
+
+    /// Take a reload's saved `/info` state back; returns when the connection came up.
+    pub fn restore_diag(&mut self, saved: SavedDiag) -> Option<std::time::SystemTime> {
+        if let Some(record) = saved.record {
+            self.diag = Some(ConnDiag::restored(record));
+        }
+        self.gmcp_received = saved.gmcp_received;
+        self.msdp_updates = saved.msdp_updates;
+        saved.connected_at_ms.map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+    }
+}
+
+/// Milliseconds since the Unix epoch, for a note's time.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Everything `ProtocolState::apply_telnet_event` needs from its caller but must not own
@@ -148,6 +368,27 @@ impl ProtocolState {
         self.negotiated_encoding.unwrap_or(settings.encoding)
     }
 
+    /// Start `/info`'s record for a connection being made: kept here and handed, cloned,
+    /// to the connection's tasks through `TelnetConfig::diag`.
+    pub fn new_diag(&mut self) -> Arc<ConnDiag> {
+        let diag = Arc::new(ConnDiag::default());
+        self.diag = Some(diag.clone());
+        diag
+    }
+
+    /// The record a connection's reader is given when a reload re-attaches it: the one the
+    /// reload state restored, or a fresh one.
+    pub fn diag_for_reader(&mut self) -> Arc<ConnDiag> {
+        self.diag.get_or_insert_with(|| Arc::new(ConnDiag::default())).clone()
+    }
+
+    /// Note something Clay sent on its own (`bytes` as written), for `/info`'s log.
+    fn note_sent(&self, bytes: &[u8]) {
+        if let Some(diag) = &self.diag {
+            diag.note(now_ms(), NoteDir::Clay, crate::telnet::describe_telnet(bytes), String::new(), None);
+        }
+    }
+
     /// Send a NAWS subnegotiation on `command_tx` iff NAWS is enabled on this connection
     /// and `size` differs from the last size actually sent. Shared by the core's own
     /// `NawsRequested` arm below and by both callers' "a client's window just changed"
@@ -166,7 +407,9 @@ impl ProtocolState {
             return false;
         }
         let Some(tx) = command_tx else { return false };
-        let _ = tx.try_send(WriteCommand::Raw(build_naws_subnegotiation(width, height)));
+        let naws = build_naws_subnegotiation(width, height);
+        self.note_sent(&naws);
+        let _ = tx.try_send(WriteCommand::Raw(naws));
         self.naws_sent_size = Some((width, height));
         true
     }
@@ -193,6 +436,9 @@ impl ProtocolState {
         self.mcmp_default_url.clear();
         self.gmcp_supported_packages.clear();
         self.seen_prompt_marker = false;
+        self.gmcp_received.clear();
+        self.msdp_updates = 0;
+        self.diag = None;
     }
 
     /// Apply one `TelnetEvent` to this connection's protocol mirrors. Exhaustive over
@@ -304,11 +550,14 @@ impl ProtocolState {
             if let Some(tx) = ctx.command_tx {
                 if offered {
                     let response = build_charset_accepted(explicit_encoding.iana_name());
+                    self.note_sent(&response);
                     let _ = tx.try_send(WriteCommand::Raw(response));
                     let _ = tx.try_send(WriteCommand::SetEncoding(explicit_encoding));
                     self.negotiated_encoding = Some(explicit_encoding);
                 } else {
-                    let _ = tx.try_send(WriteCommand::Raw(build_charset_rejected()));
+                    let response = build_charset_rejected();
+                    self.note_sent(&response);
+                    let _ = tx.try_send(WriteCommand::Raw(response));
                 }
             }
             return;
@@ -342,11 +591,13 @@ impl ProtocolState {
         if let Some(tx) = ctx.command_tx {
             if let Some((enc, iana_name)) = best {
                 let response = build_charset_accepted(iana_name);
+                self.note_sent(&response);
                 let _ = tx.try_send(WriteCommand::Raw(response));
                 let _ = tx.try_send(WriteCommand::SetEncoding(enc));
                 self.negotiated_encoding = Some(enc);
             } else {
                 let response = build_charset_rejected();
+                self.note_sent(&response);
                 let _ = tx.try_send(WriteCommand::Raw(response));
             }
         }
@@ -369,10 +620,12 @@ impl ProtocolState {
                 "Core.Hello",
                 &format!("{{\"client\":\"Clay\",\"version\":\"{}\"}}", VERSION),
             );
+            self.note_sent(&hello);
             let _ = tx.try_send(WriteCommand::Raw(hello));
             let json_list: Vec<String> = packages.iter().map(|p| format!("\"{}\"", p)).collect();
             let supports =
                 build_gmcp_message("Core.Supports.Set", &format!("[{}]", json_list.join(",")));
+            self.note_sent(&supports);
             let _ = tx.try_send(WriteCommand::Raw(supports));
         }
     }
@@ -382,7 +635,9 @@ impl ProtocolState {
     fn apply_msdp_negotiated(&mut self, ctx: &ProtocolCtx) {
         self.msdp_enabled = true;
         if let Some(tx) = ctx.command_tx {
-            let _ = tx.try_send(WriteCommand::Raw(build_msdp_set("LIST", "REPORTABLE_VARIABLES")));
+            let list = build_msdp_set("LIST", "REPORTABLE_VARIABLES");
+            self.note_sent(&list);
+            let _ = tx.try_send(WriteCommand::Raw(list));
         }
     }
 
@@ -391,6 +646,12 @@ impl ProtocolState {
     /// Job 9's per-variant table).
     fn apply_gmcp_message(&mut self, package: &str, json_data: &str, ctx: &ProtocolCtx) -> ProtocolOutcome {
         let mut out = ProtocolOutcome::default();
+        let counted = if self.gmcp_received.contains_key(package) || self.gmcp_received.len() < MAX_COUNTED_PACKAGES {
+            package
+        } else {
+            "other"
+        };
+        *self.gmcp_received.entry(counted.to_string()).or_insert(0) += 1;
         self.gmcp_data.insert(package.to_string(), json_data.to_string());
         self.stats.update_from_gmcp(package, json_data);
         if stats::package_has_prefix(package, "Char.") {
@@ -425,6 +686,7 @@ impl ProtocolState {
     /// (TF hook, `needs_output_redraw`).
     fn apply_msdp_variable(&mut self, variable: &str, value_json: &str, ctx: &ProtocolCtx) -> ProtocolOutcome {
         let mut out = ProtocolOutcome::default();
+        self.msdp_updates += 1;
         self.msdp_variables.insert(variable.to_string(), value_json.to_string());
         self.stats.update_from_msdp(variable, value_json);
         if !stats::is_msdp_meta_variable(variable) {

@@ -72,6 +72,11 @@ static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 static REPAINT: Mutex<Option<mpsc::UnboundedSender<()>>> = Mutex::new(None);
 static WAKE: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// How many emoji pictures are kept (loaded, loading or failed), for `/info`.
+pub fn cached_count() -> usize {
+    CACHE.lock().map(|c| c.len()).unwrap_or(0)
+}
+
 /// The runtime the GUI's network work runs on (emoji fetches, Edge's voices).
 pub fn runtime() -> Option<tokio::runtime::Handle> {
     RUNTIME.get().cloned()
@@ -123,9 +128,19 @@ pub fn lookup(e: &DiscordEmoji) -> Look {
             }
         };
         CACHE.lock().unwrap().insert(key, look);
+        GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         repaint();
     });
     Look::Loading
+}
+
+/// Bumped whenever an emoji's look changes (its image arrived, or failed): a line laid
+/// out with an emoji is only as good as the generation it was laid out at
+/// (`output::Scroll::laid_line`), since the emoji's width changes with its image.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How many emoji are still on their way (the offscreen snapshot waits for them).

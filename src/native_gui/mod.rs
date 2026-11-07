@@ -156,7 +156,11 @@ fn start_clay(runtime: &tokio::runtime::Handle) -> (core::net::Target, String) {
     // The app's GUI channels (run_app_headless's API): kept open for the whole run.
     let (to_gui, from_app) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
     let (to_app, from_gui) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
-    std::mem::forget((from_app, to_app));
+    // This window attaches over the WebSocket, so nothing reads `from_app`: dropped, the
+    // App skips the clone of every broadcast it used to queue there for good
+    // (`ws_broadcast`). `to_app` stays open so the App's own receiver never ends.
+    drop(from_app);
+    std::mem::forget(to_app);
     crate::GUI_HTTP_READY.store(false, std::sync::atomic::Ordering::SeqCst);
     *crate::GUI_HTTP_FAILED.lock().unwrap_or_else(|p| p.into_inner()) = None;
     runtime.spawn(async move {

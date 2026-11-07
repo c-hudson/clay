@@ -1590,7 +1590,7 @@ mod tests {
         app.worlds[0].paused = true;
         app.worlds[0].pending_lines = vec![crate::OutputLine::new("a".to_string(), 1), crate::OutputLine::new("b".to_string(), 2)];
         let log = std::env::temp_dir().join(format!("clay_nlog_{}", std::process::id()));
-        app.worlds[0].log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::create(&log).unwrap())));
+        app.worlds[0].log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(&log).unwrap()))));
         app.sync_tf_world_info();
         let world = app.worlds[0].name.clone();
         let mut eval = |expr: &str| crate::tf::expressions::evaluate(&mut app.tf_engine, expr).unwrap().to_string_value();

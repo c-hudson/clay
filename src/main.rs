@@ -47,6 +47,7 @@ pub mod scrollback;
 pub mod stats;
 pub mod map;
 pub mod protocol_state;
+pub mod info;
 pub mod tfrun;
 mod tfstartup;
 #[cfg(feature = "webview-gui")]
@@ -450,11 +451,11 @@ fn line_has_attrs(line: &OutputLine) -> bool {
 
 /// Returns true if an output line should appear in F5 search results.
 /// Mirrors the renderer's visibility predicate (process_output_line in rendering.rs):
-/// gagged lines are hidden unless show_tags (F2) is active, and ANSI-only lines
+/// gagged lines are hidden unless show_tags (F2) is active (`OutputLine::is_hidden`), and ANSI-only lines
 /// (cursor control garbage) are never visible. All other lines, including
 /// client-generated ones, are searchable while on screen.
 fn search_line_visible(line: &OutputLine, show_tags: bool) -> bool {
-    if line.gagged && !show_tags {
+    if line.is_hidden(show_tags) {
         return false;
     }
     if is_ansi_only_line(&line.text) {
@@ -1467,8 +1468,11 @@ fn process_triggers(
         line_attrs: None,
     };
 
+    // The escape codes come off once, for the actions and the TF triggers alike.
+    let plain = strip_ansi_codes(line);
+
     // Check Clay action triggers
-    if let Some(action_result) = check_action_triggers(line, world_name, actions) {
+    if let Some(action_result) = actions::check_action_triggers_plain(&plain, world_name, actions) {
         result.send_commands.extend(action_result.commands);
         result.is_gagged = action_result.should_gag;
         result.suppress_blanks = action_result.suppress_blanks;
@@ -1476,7 +1480,7 @@ fn process_triggers(
     }
 
     // Check TF triggers
-    let tf_result = tf::bridge::process_line(tf_engine, line, Some(world_name), Some(world_type));
+    let tf_result = tf::bridge::process_line_plain(tf_engine, &plain, Some(world_name), Some(world_type));
     result.tf_effects = tf_result.effects;
     result.is_gagged = result.is_gagged || tf_result.should_gag;
     result.tf_fired = tf_result.matched_non_quiet;
@@ -3066,6 +3070,11 @@ pub enum Command {
     /// /mssp - show the current world's MSSP (option 70) server status
     /// (plan Job 12 / 4.2). Read-only: MSSP is server -> client only.
     Mssp,
+    /// /info [world] - what goes on behind the scenes for a world (its connection, telnet
+    /// negotiation, buffers) and for Clay (process, memory, web clients): `src/info.rs`.
+    /// Text in a console; a GUI or the web page catches a typed `/info` and shows the
+    /// report in a window (`RequestInfo`).
+    Info { world: Option<String> },
     /// /stats - show the current world's full status display (mud-status-display.md
     /// Job 4, plan revision — the console status line shows only what fits on one
     /// row; this shows every entry `WorldStats::entries()` has, same as the web/GUI
@@ -3278,6 +3287,7 @@ pub fn parse_command(input: &str) -> Command {
         "/testmusic" => Command::TestMusic,
         "/dump" => Command::Dump { args: args.iter().map(|a| a.to_string()).collect() },
         "/mssp" => Command::Mssp,
+        "/info" => Command::Info { world: (!args.is_empty()).then(|| args.join(" ")) },
         "/stats" => Command::Stats {
             show: match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
                 Some("show" | "on") => Some(true),
@@ -3942,13 +3952,16 @@ pub struct OutputLine {
     /// (rendering::process_output_line, build_display_lines, search_line_visible,
     /// World::release_pending's budget loop, lines_from_bottom, take_visible_range, and
     /// app.js's gagged-skip) hides it from normal display for free - that is the whole
-    /// invisibility mechanism, `is_input` adds none of its own. `is_input` exists ONLY so
-    /// /recall's source filter and the per-world file log can tell "the user typed this"
+    /// invisibility mechanism, except that F2 never shows it either (`OutputLine::is_hidden`,
+    /// user ruling 2026-11-06). `is_input` also lets
+    /// /recall's source filter and the per-world file log tell "the user typed this"
     /// apart from "an action gagged this" / "Ctrl+L gagged this" (World::filter_to_server_output
     /// already sets gagged on every from_server:false line, so the gagged+!from_server pair
-    /// is not a usable discriminator on its own). Deliberately NOT on the WS wire: /recall
-    /// always runs server-side (remote consoles forward typed commands as SendCommand; web/
-    /// GUI/Android only ever send SendCommand), so no client needs to read it.
+    /// is not a usable discriminator on its own). Deliberately NOT on the WS wire, and its
+    /// text isn't either (`OutputLine::wire_text`: a client gets an empty gagged line, which
+    /// keeps its seq): /recall always runs server-side (remote consoles forward typed
+    /// commands as SendCommand; web/GUI/Android only ever send SendCommand), so no client
+    /// needs to read it.
     pub is_input: bool,
     pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
@@ -4252,6 +4265,21 @@ impl OutputLine {
         self.from_archive || self.archive_sourced
     }
 
+    /// Whether the line is left out of the output: gagged, unless F2 (`show_tags`) shows
+    /// it. What the user typed (`is_input`) is never shown, F2 or not (user ruling
+    /// 2026-11-06): it is kept for `/recall`, `/quote #` and the log only. Neither is a
+    /// gagged line with no text, which is how a typed line reaches a client
+    /// (`wire_text`), so every interface hides the same lines.
+    pub fn is_hidden(&self, show_tags: bool) -> bool {
+        self.gagged && (!show_tags || self.is_input || self.text.trim_matches('\r').is_empty())
+    }
+
+    /// The text a client is sent for this line: none for what the user typed, which only
+    /// the server's `/recall` and log read (see `is_hidden`).
+    pub fn wire_text(&self) -> String {
+        if self.is_input { String::new() } else { self.text.replace('\r', "") }
+    }
+
     pub fn new_client(text: String, seq: u64) -> Self {
         Self {
             text: Self::truncate_if_needed(text),
@@ -4354,6 +4382,8 @@ pub struct World {
     pub(crate) tf_line_attrs: Vec<(String, Box<LineAttrs>)>,
     /// The cipher the current TLS connection settled on, when known (TF's CONNECT hook).
     pub(crate) tls_cipher: Option<String>,
+    /// When the current connection came up, for `/info`; kept by a reload.
+    pub(crate) connected_at: Option<std::time::SystemTime>,
     /// The newest line this instance's console had shown of this world when it last
     /// left it (None: none yet) - what TF's %textdiv divides new text from. Runtime only.
     pub(crate) console_seen_seq: Option<u64>,
@@ -4376,7 +4406,11 @@ pub struct World {
     pub pending_count: usize, // For remote client mode: daemon's pending line count (not in pending_lines)
     pub lines_since_pause: usize,
     pub settings: WorldSettings,
-    log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
+    /// Buffered (`flush_log`): a bare `File` cost several write syscalls per line from the
+    /// event loop. Flushed once per event-loop turn (`App::flush_logs`), on close, on
+    /// `/quit` and before a reload's exec, so nothing is lost but the last turn's lines
+    /// in a crash.
+    log_handle: Option<std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>>,
     log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
     /// TF's `/log <file>` (finding: real tf logs to an arbitrary path, not Clay's normal
     /// auto-computed `logs/<name>.<date>.log`) - when set, `get_log_path` returns this
@@ -4755,6 +4789,7 @@ impl World {
             tf_nohistory: Vec::new(),
             tf_line_attrs: Vec::new(),
             tls_cipher: None,
+            connected_at: None,
             console_seen_seq: None,
             console_textdiv: None,
             console_shown_at: None,
@@ -4891,7 +4926,7 @@ impl World {
             .open(&log_path)
         {
             Ok(file) => {
-                self.log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+                self.log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(std::io::BufWriter::with_capacity(64 * 1024, file))));
                 self.log_date = Some(date_str);
                 true
             }
@@ -4899,10 +4934,22 @@ impl World {
         }
     }
 
-    /// Close the log file
+    /// Close the log file (dropping the writer flushes what it holds).
     fn close_log_file(&mut self) {
+        self.flush_log();
         self.log_handle = None;
         self.log_date = None;
+    }
+
+    /// Write out what the log file's buffer holds, if anything.
+    pub(crate) fn flush_log(&self) {
+        if let Some(handle) = &self.log_handle {
+            if let Ok(mut file) = handle.lock() {
+                if !file.buffer().is_empty() {
+                    let _ = file.flush();
+                }
+            }
+        }
     }
 
     /// The stat entries this `World` should render right now (plan Job 4). On the real
@@ -4956,6 +5003,7 @@ impl World {
         self.command_tx = None;
         self.connected = false;
         self.tls_cipher = None;
+        self.connected_at = None;
         self.socket_fd = None;
         self.telnet_mode = false;
         // Job 9 (T3.2): every telnet protocol mirror (negotiated_encoding, naws_enabled/
@@ -5077,8 +5125,8 @@ impl World {
     }
 
     /// Capture a user-typed command into this world's history. The line is invisible in
-    /// normal display (gagged - see `OutputLine::is_input`'s doc comment) and is surfaced
-    /// by F2/show_tags and by `/recall -i`/`-l`/`-g` UNCONDITIONALLY - `log_input` only
+    /// normal display and under F2 (see `OutputLine::is_input`'s doc comment) and is surfaced
+    /// by `/recall -i`/`-l`/`-g` UNCONDITIONALLY - `log_input` only
     /// controls whether it's ALSO written to the per-world log file immediately (with
     /// `INPUT_LINE_PREFIX` baked into the logged text, since the `[HH:MM:SS] line` log
     /// format has no other way to carry the distinction). Pass
@@ -6350,6 +6398,9 @@ pub struct App {
     pub remote_reachability_json: String,
     /// Remote console only: the server takes `ExpandLine` (its `InitialState.expand_line`).
     pub server_expands_line: bool,
+    /// Remote console only: the server takes `RequestInfo` (its `InitialState.info_report`):
+    /// `/info` prints the server's report, then this console's own section.
+    pub server_info_report: bool,
     /// Remote console only: the server takes `PictureUpload` (its `InitialState.picture_upload`).
     pub server_picture_upload: bool,
     /// Remote console only: the server takes `RequestHistory` (its
@@ -6694,6 +6745,7 @@ impl App {
             remote_ws_password_set: false,
             remote_reachability_json: String::new(),
             server_expands_line: false,
+            server_info_report: false,
             server_picture_upload: false,
             server_history_on_demand: false,
             server_takes_other_views: false,
@@ -8814,6 +8866,23 @@ impl App {
                 self.input.cursor_position = if cursor_start { 0 } else { self.input.buffer.len() };
                 self.needs_output_redraw = true;
             }
+            // `/info` (asked by `remote_client::run_remote_command`): the server's report,
+            // then this console's own process.
+            WsMessage::InfoReport { mut report, .. } => {
+                report.sections.push(crate::info::own_process_section("This console"));
+                // Stored as the connections list is: blank lines kept between the sections.
+                let was_at_bottom = self.current_world().is_at_bottom();
+                for line in crate::info::report_lines(&report, true) {
+                    let seq = self.current_world().next_seq;
+                    let world = self.current_world_mut();
+                    world.next_seq = seq + 1;
+                    world.output_lines.push(OutputLine::new_client(line, seq));
+                }
+                if was_at_bottom {
+                    self.current_world_mut().scroll_to_bottom();
+                }
+                self.needs_output_redraw = true;
+            }
             WsMessage::ConnectionsListResponse { lines } => {
                 // Display the connections list from server
                 let was_at_bottom = self.current_world().is_at_bottom();
@@ -10024,16 +10093,24 @@ impl App {
         Ok(())
     }
 
-    /// `/split [-n <lines>] [world]`, the console's and the SSH console's: `split_open`, and
-    /// with `-n` the top pane that many lines, kept for this console's next `/split` (user
-    /// request 2026-11-05). While split, `-n` alone only resizes.
+    /// `/split [-n <lines> | +<lines> | -<lines>] [world]`, the console's and the SSH
+    /// console's: `split_open`, and with `-n` the top pane that many lines, with `+`/`-` that
+    /// many more or fewer than it shows, kept for this console's next `/split` (user requests
+    /// 2026-11-05). While split, a size alone only resizes; `+`/`-` only resize a split.
     pub(crate) fn split_command(&mut self, args: &str) -> Result<(), String> {
         let (lines, world) = crate::util::parse_split_args(args)?;
+        if matches!(lines, Some(crate::util::SplitLines::By(_))) && self.split.is_none() {
+            return Err(crate::util::SPLIT_NOT_SPLIT.to_string());
+        }
         if !(lines.is_some() && world.is_none() && self.split.is_some()) {
             self.split_open(world.as_deref())?;
         }
-        if lines.is_some() {
-            self.split_top_rows = lines;
+        if let Some(lines) = lines {
+            // What the top pane shows now, in the area the last draw had.
+            let area = self.output_area_rows.saturating_sub(self.map_rows).max(1);
+            let shown = rendering::split_pane_rows(area, self.split_top_rows).0;
+            let most = rendering::split_most_top_rows(area);
+            self.split_top_rows = Some(lines.resolve(shown as usize, most as usize));
             self.needs_output_redraw = true;
             self.needs_terminal_clear = true;
         }
@@ -10043,7 +10120,7 @@ impl App {
     /// `/unsplit`: the pane without the focus closes, and the focused one has the output
     /// area again. Nothing disconnects. Says nothing when it works; the error otherwise.
     pub(crate) fn split_close(&mut self) -> Result<(), String> {
-        let Some(split) = self.split.take() else { return Err("The output isn't split.".to_string()) };
+        let Some(split) = self.split.take() else { return Err(crate::util::SPLIT_NOT_SPLIT.to_string()) };
         let closed = split.other;
         if closed != self.current_world_index {
             if self.console_tui {
@@ -11136,7 +11213,7 @@ impl App {
                 }
             }
             for (id, ip) in full {
-                crate::http::log_remote_event("WS-CHANNEL-FULL", &ip,
+                websocket::log_channel_full(id, &ip,
                     &format!("client={} ActivityUpdate dropped - outbound channel full (capacity {})",
                         id, websocket::WS_CLIENT_CHANNEL_CAPACITY));
             }
@@ -11468,7 +11545,7 @@ impl App {
         let data: String = world.output_lines.iter()
             .skip(skip)
             .take(count)
-            .map(|line| line.text.replace('\r', ""))
+            .map(OutputLine::wire_text)
             .collect::<Vec<_>>()
             .join("\n") + "\n";
         // Batch-level, so only a wholly archive-sourced batch is flagged — `all` rather than
@@ -11523,7 +11600,6 @@ impl App {
             return;
         }
         let is_current = self.world_watched(world_idx);
-        let settings = self.settings.clone();
         let console_height = self.output_height;
         let console_width = self.output_width;
         let (output_height, output_width) =
@@ -11549,7 +11625,7 @@ impl App {
         let text = lines.join("\n") + "\n";
         let show_tags = self.show_tags;
         self.worlds[world_idx]
-            .add_output(&text, is_current, &settings, output_height, output_width, false, false, show_tags);
+            .add_output(&text, is_current, &self.settings, output_height, output_width, false, false, show_tags);
 
         let output_after = self.worlds[world_idx].output_lines.len();
         let pending_after = self.worlds[world_idx].pending_lines.len();
@@ -12605,7 +12681,7 @@ impl App {
                 batch_start_seq = line.seq;
             }
             batch_end_seq = line.seq;
-            batch.push(line.text.replace('\r', ""));
+            batch.push(line.wire_text());
             prev_seq = Some(line.seq);
         }
         if !batch.is_empty() {
@@ -12883,12 +12959,13 @@ impl App {
 
     /// Add `line` to `world_idx`'s buffer without drawing it (it is made gagged): captured
     /// input, a /recordline. Broadcast like every line in `output_lines`, as gagged, so
-    /// clients keep it too and skip it unless F2 shows gagged lines.
+    /// clients keep it too and skip it unless F2 shows gagged lines (captured input goes
+    /// with no text, and F2 never shows it - `OutputLine::is_hidden`).
     pub(crate) fn push_hidden_line(&mut self, world_idx: usize, mut line: OutputLine) {
         let is_current = self.world_watched(world_idx);
         let was_at_bottom = self.worlds[world_idx].is_at_bottom();
         line.gagged = true;
-        let ws_data = line.text.replace('\r', "") + "\n";
+        let ws_data = line.wire_text() + "\n";
         let from_server = line.from_server;
         let ts = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let (seq, in_output) = self.worlds[world_idx].push_hidden_line(line);
@@ -13736,8 +13813,11 @@ impl App {
                 log.push(msg.clone());
             }
         }
-        // Send to embedded GUI channel (master GUI mode)
-        if let Some(ref tx) = self.gui_tx {
+        // Send to embedded GUI channel (master GUI mode). Nothing reads it in any
+        // current GUI (they attach over the WebSocket), so its receiver is dropped at
+        // start and the clone skipped: a clone of every broadcast used to queue up for
+        // the life of the process.
+        if let Some(tx) = self.gui_tx.as_ref().filter(|tx| !tx.is_closed()) {
             let _ = tx.send(msg.clone());
             // Wake the GUI for immediate repaint
             if let Some(ref repaint) = self.gui_repaint {
@@ -14101,8 +14181,9 @@ impl App {
                 log.push(msg.clone());
             }
         }
-        // Send to embedded GUI if it's viewing this world
-        if let Some(ref tx) = self.gui_tx {
+        // Send to embedded GUI if it's viewing this world (see ws_broadcast: skipped
+        // once nothing reads the channel).
+        if let Some(tx) = self.gui_tx.as_ref().filter(|tx| !tx.is_closed()) {
             // For embedded GUI, always send (it tracks its own current world)
             let _ = tx.send(msg.clone());
         }
@@ -14829,8 +14910,6 @@ impl App {
 
         // Add non-gagged output to world
         if !filtered_data.is_empty() {
-            let settings = self.settings.clone();
-
             let (output_height, output_width) =
                 self.viewer_output_dims(world_idx, console_height, console_width, is_daemon_mode);
 
@@ -14845,7 +14924,9 @@ impl App {
             let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
                 && !self.worlds[world_idx].partial_in_pending;
 
-            self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true, self.show_tags);
+            // The settings are borrowed, not cloned per run: a clone carried every
+            // action's compiled regex, each with an empty match cache to rebuild.
+            self.worlds[world_idx].add_output(&filtered_data, is_current, &self.settings, output_height, output_width, true, true, self.show_tags);
 
             // Check if splash was cleared (output_lines was reset)
             let splash_was_cleared = was_showing_splash && !self.worlds[world_idx].showing_splash;
@@ -14967,12 +15048,13 @@ impl App {
         // exactly `paused && !pending_lines.is_empty()` on its own.
         let hold_gagged_in_pending = self.worlds[world_idx].paused
             && !self.worlds[world_idx].pending_lines.is_empty();
-        for (run_pos, (line, highlight)) in run.iter().cloned().enumerate() {
-            let seq_is_first = run_pos == 0;
+        // The lines that land in output_lines, for one broadcast after the loop.
+        let mut batch: Vec<(u64, String, Option<String>)> = Vec::new();
+        for (line, highlight) in run.iter().cloned() {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
-            output_line.highlight_color = highlight;
+            output_line.highlight_color = highlight.clone();
             // Gagged or not, this is still text from the world: born viewed when someone's
             // watching, same as add_output does for non-gagged lines. Bypasses add_output
             // entirely so this must be set by hand.
@@ -14998,20 +15080,27 @@ impl App {
                 continue;
             }
             self.worlds[world_idx].output_lines.push(output_line);
-            // Broadcast gagged line to WebSocket clients
-            let ws_data = line.to_string().replace('\r', "") + "\n";
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
-                world_index: world_idx,
-                data: ws_data,
-                is_viewed: is_current,
-                ts: current_timestamp_secs(),
-                from_server: true,
-                seq, end_seq: Some(seq),
-                // Only ever true for the first line of a packet that cleared the splash.
-                flush: flush && seq_is_first,
-                gagged: true, highlight_colors: Vec::new(),
-            });
+            batch.push((seq, line.replace('\r', ""), highlight));
         }
+        // One ServerData for the run - consecutive seqs, all landing in output_lines
+        // together (the hold above is decided once per run). A message per gagged line
+        // used to multiply what a packet cost every client, and a flood of them could fill
+        // a slow client's channel, each drop then costing a resync round trip.
+        let Some((&(first, _, _), &(last, _, _))) = batch.first().zip(batch.last()) else { return };
+        let data = batch.iter().map(|(_, text, _)| text.as_str()).collect::<Vec<_>>().join("\n") + "\n";
+        let highlight_colors: Vec<Option<String>> =
+            if batch.iter().any(|(_, _, h)| h.is_some()) { batch.iter().map(|(_, _, h)| h.clone()).collect() } else { Vec::new() };
+        self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
+            world_index: world_idx,
+            data,
+            is_viewed: is_current,
+            ts: current_timestamp_secs(),
+            from_server: true,
+            seq: first, end_seq: Some(last),
+            // Only ever true for the first message of a packet that cleared the splash.
+            flush,
+            gagged: true, highlight_colors,
+        });
     }
 
     pub fn process_server_data(
@@ -15090,7 +15179,6 @@ impl App {
         }
 
         let world_name_for_triggers = self.worlds[world_idx].name.clone();
-        let actions = self.settings.actions.clone();
 
         // A timed guess (`World::prompt_timed`) is over once the server sends anything more
         // than an invisible fragment: the prompt clears, and its text - still parked - joins
@@ -15215,11 +15303,12 @@ impl App {
 
                 // Watchdog/watchname spam detection (before triggers)
                 let mut watchdog_gagged = false;
-                let stripped = strip_ansi_for_watchdog(line);
                 let (wd_enabled, wd_n1, wd_n2) = match self.tf_engine.watchdog_overrides.get(&world_name_for_triggers) {
                     Some(cfg) => (cfg.enabled, cfg.n1, cfg.n2),
                     None => (self.tf_engine.watchdog_enabled, self.tf_engine.watchdog_n1, self.tf_engine.watchdog_n2),
                 };
+                // Only when something reads it: this used to strip every line, watchdog or not.
+                let stripped = if wd_enabled || self.tf_engine.watchname_enabled { strip_ansi_for_watchdog(line) } else { String::new() };
                 if wd_enabled {
                     let count = self.worlds[world_idx].watchdog_history.iter()
                         .filter(|h| *h == &stripped)
@@ -15251,7 +15340,9 @@ impl App {
                 }
 
                 let world_type_for_triggers = self.worlds[world_idx].settings.world_type.name();
-                let tr = process_triggers(line, &world_name_for_triggers, world_type_for_triggers, &actions, &mut self.tf_engine);
+                // Borrowed, not cloned per packet: a cloned Regex starts with an empty
+                // match cache, so every action's was rebuilt for every read.
+                let tr = process_triggers(line, &world_name_for_triggers, world_type_for_triggers, &self.settings.actions, &mut self.tf_engine);
                 commands_to_execute.extend(tr.send_commands);
                 tf_effects.extend(tr.tf_effects);
                 tf_messages.extend(tr.messages);
@@ -16180,12 +16271,13 @@ impl App {
         let world_name = self.worlds[idx].name.clone();
         self.worlds[idx].connection_id += 1;
         let connection_id = self.worlds[idx].connection_id;
+        let diag = self.worlds[idx].protocol.new_diag();
         let tls_proxy_enabled = self.settings.tls_proxy_enabled;
         let event_tx = event_tx.clone();
         tokio::spawn(async move {
             let result = daemon::connect_daemon_world(
                 idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
-                tls_proxy_enabled,
+                tls_proxy_enabled, Some(diag),
             ).await;
             let _ = event_tx.send(AppEvent::WorldConnectResult(world_name, connection_id, origin, result)).await;
         });
@@ -17821,7 +17913,17 @@ impl App {
     /// lines to disk, the router's port back, and the TLS proxies ended. A proxy left
     /// running takes its client's going for a hot reload and waits a minute for it to
     /// come back, holding the MUD connection open.
+    /// Every world's log file written out (`World::flush_log`): once per event-loop turn,
+    /// at `/quit`, and before a reload's exec (`save_reload_state`), which runs no
+    /// destructors.
+    pub(crate) fn flush_logs(&self) {
+        for w in &self.worlds {
+            w.flush_log();
+        }
+    }
+
     pub async fn quit_cleanup(&mut self) {
+        self.flush_logs();
         // Drain the archive writer before tearing anything down, so the last
         // batch of output reaches disk rather than dying with the process.
         self.flush_scrollback();
@@ -18214,6 +18316,7 @@ impl App {
             #[cfg(any(unix, windows))]
             { self.worlds[world_idx].socket_fd = socket_fd; }
             self.worlds[world_idx].is_tls = is_tls;
+            self.worlds[world_idx].connected_at = Some(std::time::SystemTime::now());
 
             // Discard any unused initial world (may shift indices)
             self.discard_initial_world();
@@ -18659,6 +18762,7 @@ impl App {
             Command::Mssp => {
                 execute_mssp_command(self, world_index, false);
             }
+            Command::Info { world } => self.ws_info_text(client_id, world_index, world.as_deref()),
             Command::Stats { show } => {
                 execute_stats_command(self, world_index, show, false);
             }
@@ -18997,6 +19101,10 @@ impl App {
                 self.handle_client_visibility(client_id, visible);
             }
             WsMessage::ResumeSession => self.ws_resume_session(client_id),
+            WsMessage::RequestInfo { world_index } => {
+                let current = self.ws_client_worlds.get(&client_id).map(|v| v.world_index).unwrap_or(self.current_world_index);
+                self.ws_info_report(client_id, world_index, current);
+            }
             WsMessage::SendCommand { world_index, command } => {
                 // A live shell world: a line of text (not a Clay command) is typed at the
                 // shell, so a client's ordinary input box still works. A "/..." command
@@ -20034,6 +20142,7 @@ impl App {
             history_on_demand: true,
             map: true,
             resume_session: true,
+            info_report: true,
             emoji_json: crate::emoji::emoji_json(),
             emoji_categories_json: crate::emoji::emoji_categories_json(),
             tf_status: self.tf_status.iter()
@@ -20899,7 +21008,7 @@ pub enum AppEvent {
     ConnectWorldRequest(usize, String),  // world_index, requesting username
     /// Outcome of a multiuser per-user connect spawned by `ConnectWorldRequest`:
     /// world_index, username, the writer channel on success.
-    MultiuserConnectResult(usize, String, Option<mpsc::Sender<WriteCommand>>),
+    MultiuserConnectResult(usize, String, Option<mpsc::Sender<WriteCommand>>, std::sync::Arc<protocol_state::ConnDiag>),
     MultiuserServerData(usize, String, Vec<u8>),  // world_index, username, raw bytes
     MultiuserDisconnected(usize, String),         // world_index, username
     MultiuserTelnetDetected(usize, String),       // world_index, username
@@ -20975,6 +21084,8 @@ pub struct UserConnection {
     /// The session's id in `AppEvent::Chat` (events from an older session are stale).
     pub chat_conn_id: u64,
     pub chat_target: Option<chat::directory::ChatTarget>,
+    /// When this connection came up, for `/info`.
+    pub connected_at: Option<std::time::SystemTime>,
 }
 
 impl Default for UserConnection {
@@ -21004,6 +21115,7 @@ impl UserConnection {
             chat: None,
             chat_conn_id: 0,
             chat_target: None,
+            connected_at: None,
         }
     }
 }
@@ -24673,6 +24785,7 @@ pub async fn run_app_headless(
                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                     mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
+                    diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
                     ..TelnetConfig::default()
                 };
                 spawn_telnet_reader(
@@ -24727,6 +24840,7 @@ pub async fn run_app_headless(
                                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                                     mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
+                                    diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
                                     ..TelnetConfig::default()
                                 };
                                 spawn_telnet_reader(
@@ -24805,6 +24919,7 @@ pub async fn run_app_headless(
                                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                                     mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
+                                    diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
                                     ..TelnetConfig::default()
                                 };
                                 spawn_telnet_reader(
@@ -25514,6 +25629,7 @@ pub async fn run_app_headless(
         app.flush_shell_frames();
         // The mapper: changed rooms saved, map views told; the walk timer armed.
         app.flush_map();
+        app.flush_logs();
         if let Some(due) = app.next_walk_deadline() {
             walk_sleep.as_mut().reset(tokio::time::Instant::from_std(due));
         }
@@ -25798,6 +25914,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                     mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
+                    diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
                     ..TelnetConfig::default()
                 };
                 spawn_telnet_reader(
@@ -25910,6 +26027,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                             mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                             is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
+                            diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
                             ..TelnetConfig::default()
                         };
                         spawn_telnet_reader(
@@ -26000,6 +26118,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                             mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                             is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
+                            diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
                             ..TelnetConfig::default()
                         };
                         spawn_telnet_reader(
@@ -27596,6 +27715,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         app.flush_shell_frames();
         // The mapper: changed rooms saved, map views told (the console's pane redrawn); the
         // walk timer armed.
+        app.flush_logs();
         if app.flush_map() {
             needs_draw = true;
         }

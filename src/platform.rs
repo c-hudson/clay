@@ -4,7 +4,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 #[cfg(any(unix, windows))]
 use std::sync::Arc;
 
@@ -665,6 +665,170 @@ pub(crate) fn sync_crash_count_env() {
     }
 }
 
+/// When the first Clay of this run of reloads and crash restarts started, and how many of
+/// those there have been since: for `/info`. A restart execs a new process, so a
+/// process's own start time says only "since the last reload".
+const STARTED_AT_ENV: &str = "CLAY_STARTED_AT";
+const RESTARTS_ENV: &str = "CLAY_RESTARTS";
+static FIRST_STARTED: AtomicU64 = AtomicU64::new(0);
+static RESTARTS: AtomicU32 = AtomicU32::new(0);
+
+/// Read the run's start and restart count at start-up (`crashlog::install`). Only a
+/// `--reload`/`--crash` successor believes the environment - a `clay` started from a
+/// shell inside Clay inherits it too - and the variables are removed either way.
+pub(crate) fn note_process_start() {
+    let restarted = std::env::args().skip(1).any(|a| a == "--reload" || a == "--crash");
+    let env_u64 = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (started, restarts) = match (restarted, env_u64(STARTED_AT_ENV)) {
+        (true, Some(at)) if at <= now => (at, env_u64(RESTARTS_ENV).unwrap_or(0) as u32),
+        _ => (now, 0),
+    };
+    FIRST_STARTED.store(started, Ordering::Relaxed);
+    RESTARTS.store(restarts, Ordering::Relaxed);
+    std::env::remove_var(STARTED_AT_ENV);
+    std::env::remove_var(RESTARTS_ENV);
+}
+
+/// Before a reload or crash restart: the successor carries this run's start on.
+#[cfg_attr(target_os = "android", allow(dead_code))] // no reload or crash restart there
+pub(crate) fn pass_start_to_successor() {
+    std::env::set_var(STARTED_AT_ENV, FIRST_STARTED.load(Ordering::Relaxed).to_string());
+    std::env::set_var(RESTARTS_ENV, (RESTARTS.load(Ordering::Relaxed) + 1).to_string());
+}
+
+/// (Unix seconds the run started, reloads and crash restarts since), for `/info`.
+pub(crate) fn run_started() -> (u64, u32) {
+    (FIRST_STARTED.load(Ordering::Relaxed), RESTARTS.load(Ordering::Relaxed))
+}
+
+/// This process's own resources, for `/info`. A figure the platform doesn't give is `None`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessStats {
+    pub pid: u32,
+    /// Bytes in RAM now (resident set; the working set on Windows).
+    pub resident: Option<u64>,
+    /// The most it has been.
+    pub peak_resident: Option<u64>,
+    /// Address space reserved (Unix), or private bytes committed (Windows).
+    pub virtual_size: Option<u64>,
+    pub threads: Option<u64>,
+    /// Open file descriptors (Unix) or handles (Windows).
+    pub open_files: Option<u64>,
+    /// CPU time used, user plus system.
+    pub cpu_secs: Option<f64>,
+}
+
+pub fn process_stats() -> ProcessStats {
+    let mut stats = ProcessStats { pid: std::process::id(), ..ProcessStats::default() };
+    process_stats_fill(&mut stats);
+    stats
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_stats_fill(stats: &mut ProcessStats) {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        let number = |line: &str| line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                stats.resident = number(line).map(|kb| kb * 1024);
+            } else if line.starts_with("VmHWM:") {
+                stats.peak_resident = number(line).map(|kb| kb * 1024);
+            } else if line.starts_with("VmSize:") {
+                stats.virtual_size = number(line).map(|kb| kb * 1024);
+            } else if line.starts_with("Threads:") {
+                stats.threads = number(line);
+            }
+        }
+    }
+    // Less the one the listing itself holds open.
+    stats.open_files = std::fs::read_dir("/proc/self/fd").ok().map(|d| (d.count() as u64).saturating_sub(1));
+    stats.cpu_secs = Some(crate::tf::expressions::process_cpu_time_secs()).filter(|s| *s >= 0.0);
+}
+
+#[cfg(target_os = "macos")]
+fn process_stats_fill(stats: &mut ProcessStats) {
+    unsafe {
+        let pid = libc::getpid();
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        if libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut info as *mut _ as *mut libc::c_void, size) == size {
+            stats.resident = Some(info.pti_resident_size);
+            stats.virtual_size = Some(info.pti_virtual_size);
+            stats.threads = Some(info.pti_threadnum.max(0) as u64);
+        }
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+            // Bytes on macOS (kilobytes on Linux).
+            stats.peak_resident = Some(usage.ru_maxrss.max(0) as u64);
+        }
+        // With no buffer, the size the list of open descriptors needs.
+        let bytes = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
+        if bytes > 0 {
+            stats.open_files = Some(bytes as u64 / std::mem::size_of::<libc::proc_fdinfo>() as u64);
+        }
+    }
+    stats.cpu_secs = Some(crate::tf::expressions::process_cpu_time_secs()).filter(|s| *s >= 0.0);
+}
+
+#[cfg(windows)]
+fn process_stats_fill(stats: &mut ProcessStats) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryCounters {
+        cb: u32,
+        page_faults: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        quota_peak_paged: usize,
+        quota_paged: usize,
+        quota_peak_nonpaged: usize,
+        quota_nonpaged: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut MemoryCounters, cb: u32) -> i32;
+        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
+        fn GetProcessTimes(process: isize, creation: *mut FileTime, exit: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+    }
+    unsafe {
+        let process = GetCurrentProcess();
+        let mut counters = MemoryCounters { cb: std::mem::size_of::<MemoryCounters>() as u32, ..MemoryCounters::default() };
+        if K32GetProcessMemoryInfo(process, &mut counters, counters.cb) != 0 {
+            stats.resident = Some(counters.working_set as u64);
+            stats.peak_resident = Some(counters.peak_working_set as u64);
+            stats.virtual_size = Some(counters.pagefile as u64);
+        }
+        let mut handles = 0u32;
+        if GetProcessHandleCount(process, &mut handles) != 0 {
+            stats.open_files = Some(handles as u64);
+        }
+        let (mut created, mut exited) = (FileTime::default(), FileTime::default());
+        let (mut kernel, mut user) = (FileTime::default(), FileTime::default());
+        if GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) != 0 {
+            // 100 ns units.
+            let secs = |t: &FileTime| (((t.high as u64) << 32) | t.low as u64) as f64 / 10_000_000.0;
+            stats.cpu_secs = Some(secs(&kernel) + secs(&user));
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+fn process_stats_fill(stats: &mut ProcessStats) {
+    stats.cpu_secs = Some(crate::tf::expressions::process_cpu_time_secs()).filter(|s| *s >= 0.0);
+}
+
 /// Clear the crash count (called after successful operation)
 pub(crate) fn clear_crash_count() {
     std::env::remove_var(CRASH_COUNT_ENV);
@@ -729,6 +893,7 @@ pub(crate) fn crash_restart() {
     // Increment crash count in env
     let new_count = crash_count + 1;
     std::env::set_var(CRASH_COUNT_ENV, new_count.to_string());
+    pass_start_to_successor();
     // The restarted Clay says why it restarted (crashlog::restart_notice).
     if let Some(reason) = crate::crashlog::last_crash() {
         std::env::set_var(crate::crashlog::CRASH_REASON_ENV, reason);
@@ -835,6 +1000,7 @@ pub(crate) fn crash_restart() {
 
     let new_count = crash_count + 1;
     std::env::set_var(CRASH_COUNT_ENV, new_count.to_string());
+    pass_start_to_successor();
     if let Some(reason) = crate::crashlog::last_crash() {
         std::env::set_var(crate::crashlog::CRASH_REASON_ENV, reason);
     }
@@ -2212,6 +2378,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     pass_web_port_to_successor(app.web_listener_port());
 
     sync_crash_count_env();
+    pass_start_to_successor();
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
     // Without TinyFugue's startup options: a reload must not load the rc or connect again.
@@ -2329,6 +2496,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     args.push("--reload".to_string());
     debug_log(is_debug_enabled(), &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
     sync_crash_count_env();
+    pass_start_to_successor();
 
     // On Windows, disable raw mode and leave alternate screen BEFORE spawning
     let _ = crossterm::terminal::disable_raw_mode();

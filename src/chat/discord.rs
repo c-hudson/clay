@@ -877,7 +877,7 @@ async fn writer(
             WriteCommand::Chat(ChatOp::SendTo(mut t, text)) => send_text(&rest, &dir, &mut t, &text, &sink).await,
             WriteCommand::Shutdown => return,
             // Telnet-level (keepalive NOP) or encoding changes: never chat text.
-            WriteCommand::Raw(_) | WriteCommand::SetEncoding(_) => {}
+            WriteCommand::Raw(_) | WriteCommand::SetEncoding(_) | WriteCommand::CountInto(_) => {}
         }
     }
 }

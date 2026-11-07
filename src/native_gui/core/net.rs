@@ -279,6 +279,9 @@ async fn pump(mut ws: Ws, commands: &mut mpsc::UnboundedReceiver<Command>, event
                 };
                 match serde_json::from_str::<WsMessage>(&text) {
                     Ok(msg) => {
+                        if super::perf::enabled() {
+                            super::perf::received();
+                        }
                         if events.unbounded_send(Input::Message(Box::new(msg))).is_err() {
                             let _ = ws.close(None).await;
                             return "closed".into();

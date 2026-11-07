@@ -62,6 +62,7 @@ pub(crate) fn install() {
         std::env::remove_var(CRASH_REASON_ENV);
     }
     crate::platform::CRASH_COUNT.store(crate::platform::get_crash_count(), Ordering::SeqCst);
+    crate::platform::note_process_start();
     install_panic_hook();
     imp::install();
 }
@@ -137,6 +138,11 @@ pub(crate) fn restart_notice() -> String {
         Some(reason) => format!("Clay restarted after a crash: {}. {} has the details.", shorten(&reason, 200), log_path()),
         None => format!("Clay restarted after a crash. {} has the details.", log_path()),
     }
+}
+
+/// The mode `session` was told ("console", "daemon", ...), for `/info`.
+pub(crate) fn mode() -> Option<&'static str> {
+    MODE.get().map(|m| m.as_str())
 }
 
 /// A long-running mode starts (`mode`: "console", "gui attached to mini", "daemon", ...):

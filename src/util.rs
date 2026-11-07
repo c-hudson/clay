@@ -916,20 +916,51 @@ pub fn find_world_typed<'a>(worlds: impl IntoIterator<Item = (&'a str, bool)>, n
         .or_else(|| if is_activity_alias(name) { worlds.iter().position(|w| w.1) } else { None })
 }
 
-/// What `/split` was given: `-n <lines>` (the top pane's lines, user request 2026-11-05;
-/// `-n10` too) and a world name, in that order. The one parser for every interface (app.js
-/// `parseSplitArgs` is a port of it); `Err` is the line to say.
-pub fn parse_split_args(args: &str) -> Result<(Option<usize>, Option<String>), String> {
-    const USAGE: &str = "Usage: /split [-n <lines>] [world]";
+/// The top pane's size a `/split` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitLines {
+    /// `-n <lines>`: that many (user request 2026-11-05).
+    Set(usize),
+    /// `+<lines>` / `-<lines>`: that many more or fewer than the top pane shows now, only
+    /// while split (user request 2026-11-05).
+    By(isize),
+}
+
+impl SplitLines {
+    /// The top pane's lines to keep, given the lines it `shown` now and the `most` it can
+    /// have in this window (the bottom pane keeps one). `-n` is kept as given (the layout
+    /// clamps it, so a taller window shows it all); a step is clamped to what fits now.
+    pub fn resolve(self, shown: usize, most: usize) -> usize {
+        match self {
+            SplitLines::Set(n) => n,
+            SplitLines::By(by) => shown.saturating_add_signed(by).clamp(1, most.max(1)),
+        }
+    }
+}
+
+/// What `/unsplit`, and `/split +<lines>`/`-<lines>`, say with no split.
+pub const SPLIT_NOT_SPLIT: &str = "The output isn't split.";
+
+/// What `/split` was given: `-n <lines>` (`-n10` too) or `+<lines>`/`-<lines>`, then a world
+/// name. The one parser for every interface (app.js `parseSplitArgs` is a port of it); `Err`
+/// is the line to say. A `+` word that isn't a number is a world's name, as it always was.
+pub fn parse_split_args(args: &str) -> Result<(Option<SplitLines>, Option<String>), String> {
+    const USAGE: &str = "Usage: /split [-n <lines> | +<lines> | -<lines>] [world]";
+    let count = |number: &str| number.bytes().all(|b| b.is_ascii_digit()).then(|| number.parse::<usize>().ok()).flatten()
+        .filter(|&n| n >= 1 && n <= isize::MAX as usize);
     let mut words = args.split_whitespace().peekable();
     let mut lines = None;
-    if let Some(first) = words.peek().copied().filter(|w| w.starts_with('-')) {
-        words.next();
-        let Some(rest) = first.strip_prefix("-n") else { return Err(USAGE.to_string()) };
-        let number = if rest.is_empty() { words.next().unwrap_or("") } else { rest };
-        match number.parse::<usize>() {
-            Ok(n) if n >= 1 => lines = Some(n),
-            _ => return Err(USAGE.to_string()),
+    if let Some(first) = words.peek().copied() {
+        if let Some(rest) = first.strip_prefix("-n") {
+            words.next();
+            let number = if rest.is_empty() { words.next().unwrap_or("") } else { rest };
+            lines = Some(SplitLines::Set(count(number).ok_or(USAGE)?));
+        } else if let Some(number) = first.strip_prefix('-') {
+            words.next();
+            lines = Some(SplitLines::By(-(count(number).ok_or(USAGE)? as isize)));
+        } else if let Some(n) = first.strip_prefix('+').filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            words.next();
+            lines = Some(SplitLines::By(count(n).ok_or(USAGE)? as isize));
         }
     }
     let world: Vec<&str> = words.collect();
@@ -1776,14 +1807,28 @@ mod tests {
 
     #[test]
     fn parse_split_args_takes_n_lines_then_a_world() {
+        use SplitLines::{By, Set};
         assert_eq!(parse_split_args(""), Ok((None, None)));
         assert_eq!(parse_split_args("Big World"), Ok((None, Some("Big World".to_string()))));
-        assert_eq!(parse_split_args("-n 10"), Ok((Some(10), None)));
-        assert_eq!(parse_split_args("-n10 rome"), Ok((Some(10), Some("rome".to_string()))));
-        assert_eq!(parse_split_args("  -n  3   act "), Ok((Some(3), Some("act".to_string()))));
-        for bad in ["-n", "-n 0", "-n x", "-n -2", "-x rome", "-n 2.5"] {
-            assert_eq!(parse_split_args(bad), Err("Usage: /split [-n <lines>] [world]".to_string()), "{bad}");
+        assert_eq!(parse_split_args("-n 10"), Ok((Some(Set(10)), None)));
+        assert_eq!(parse_split_args("-n10 rome"), Ok((Some(Set(10)), Some("rome".to_string()))));
+        assert_eq!(parse_split_args("  -n  3   act "), Ok((Some(Set(3)), Some("act".to_string()))));
+        assert_eq!(parse_split_args("+3"), Ok((Some(By(3)), None)));
+        assert_eq!(parse_split_args("-2 rome"), Ok((Some(By(-2)), Some("rome".to_string()))));
+        assert_eq!(parse_split_args("+x"), Ok((None, Some("+x".to_string()))), "a world's name");
+        for bad in ["-n", "-n 0", "-n x", "-n -2", "-x rome", "-n 2.5", "-", "-0", "+0", "-2.5", "-n +2"] {
+            assert_eq!(parse_split_args(bad), Err("Usage: /split [-n <lines> | +<lines> | -<lines>] [world]".to_string()), "{bad}");
         }
+    }
+
+    #[test]
+    fn split_lines_steps_from_what_shows_within_the_window() {
+        assert_eq!(SplitLines::By(3).resolve(10, 19), 13);
+        assert_eq!(SplitLines::By(-4).resolve(10, 19), 6);
+        assert_eq!(SplitLines::By(-40).resolve(10, 19), 1, "each pane keeps a line");
+        assert_eq!(SplitLines::By(40).resolve(10, 19), 19);
+        assert_eq!(SplitLines::By(1).resolve(1, 0), 1);
+        assert_eq!(SplitLines::Set(50).resolve(10, 19), 50, "-n is kept as given");
     }
 
     #[test]

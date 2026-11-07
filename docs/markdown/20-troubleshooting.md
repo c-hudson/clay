@@ -298,5 +298,18 @@ The lines to look for:
 
 After a crash, the console restarts itself and says `Clay restarted after a crash: ...`.
 
+### The GUI Shows Text Late
+
+A native GUI (`clay --gui=<host>`) started with `CLAY_NATIVE_PERF=1` in its environment
+writes one line a second to its own `~/.clay/debug.log` while text arrives: how many
+messages it handled and what handling them cost, how many frames it drew and what each
+cost, how many lines it holds, and the time from a message leaving the socket to the first
+frame drawn after it (`latency recv->frame`). Send those lines with a report of lagging
+text. On the server, `grep WS-CHANNEL-FULL ~/.clay/remote.log` says whether a client fell
+so far behind that the server had to drop messages and resynchronise it.
+
+The GUI keeps the newest 10 000 lines of each world; scrolling up past them asks the server
+for older ones, from its memory and then its archive.
+
 \newpage
 

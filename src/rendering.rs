@@ -274,6 +274,23 @@ pub(crate) fn wrap_ansi_line(line: &str, max_width: usize, indent: usize) -> Vec
     result
 }
 
+/// The most rows the console's top split pane can have in an output area of `area_rows`
+/// (the bar between the panes takes one, the bottom pane keeps one).
+pub(crate) fn split_most_top_rows(area_rows: u16) -> u16 {
+    area_rows.saturating_sub(2).max(1)
+}
+
+/// The console's split panes' rows (top, bottom) in an output area of `area_rows`: the top
+/// pane `top_rows` (`/split -n`), else half with the bottom one taking any odd row, and
+/// each pane one row at least.
+pub(crate) fn split_pane_rows(area_rows: u16, top_rows: Option<usize>) -> (u16, u16) {
+    let top = match top_rows {
+        Some(n) => (n.min(split_most_top_rows(area_rows) as usize) as u16).max(1),
+        None => (area_rows.saturating_sub(1) / 2).max(1),
+    };
+    (top, area_rows.saturating_sub(top + 1).max(1))
+}
+
 pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let total_height = f.size().height.max(3);  // Minimum 3 lines for output + separator + input
 
@@ -316,14 +333,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let map_block = app.console_map_block(output_height);
     let area_rows = output_height.saturating_sub(map_block).max(1);
     let pane_rows = match app.split {
-        Some(_) => {
-            let most = area_rows.saturating_sub(2).max(1);
-            let top = match app.split_top_rows {
-                Some(n) => (n.min(most as usize) as u16).max(1),
-                None => (area_rows.saturating_sub(1) / 2).max(1),
-            };
-            (top, area_rows.saturating_sub(top + 1).max(1))
-        }
+        Some(_) => split_pane_rows(area_rows, app.split_top_rows),
         None => (0, area_rows),
     };
     let focused_rows = match app.split {
@@ -503,8 +513,8 @@ fn line_is_new(line: &OutputLine) -> bool {
 /// Process an output line for display. Returns None if the line should be skipped.
 /// Returns Some(processed_text) with emoji colorization, client prefix, timestamp/tags, and tab expansion applied.
 pub(crate) fn process_output_line(line: &OutputLine, show_tags: bool, temp_convert_enabled: bool, zwj_enabled: bool, cached_now: &CachedNow) -> Option<String> {
-    // Skip gagged lines unless show_tags (F2) is enabled
-    if line.gagged && !show_tags {
+    // Skip gagged lines unless show_tags (F2) is enabled; typed input never shows
+    if line.is_hidden(show_tags) {
         return None;
     }
     // Skip lines that are only ANSI codes (cursor control garbage)
@@ -1681,8 +1691,8 @@ fn compose_pane(app: &App, pane: ConsolePane, reveal: Option<&crate::reveal::Rev
         let mut last_seq: Option<u64> = None;
         for idx in check_start..=check_end {
             let line = &world.output_lines[idx];
-            if line.gagged && !show_tags {
-                continue; // Skip gagged lines when not showing tags
+            if line.is_hidden(show_tags) {
+                continue; // Skip lines not drawn
             }
             if let Some(prev_seq) = last_seq {
                 if line.seq <= prev_seq {

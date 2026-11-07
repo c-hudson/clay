@@ -26,7 +26,8 @@ pub(super) struct KeptSplit {
 }
 
 /// The panes' size (user requests 2026-11-05): dragging the bar between them moves it, as
-/// dragging the input's top edge resizes the input, and `/split -n <lines>` sets it. It is
+/// dragging the input's top edge resizes the input, `/split -n <lines>` sets it and `/split
+/// +<lines>`/`-<lines>` steps it from what the top pane shows. It is
 /// the top pane's lines, this window's own, kept for its next `/split` and across a relaunch
 /// (never in a file other windows read); each pane keeps one line.
 #[derive(Default)]
@@ -62,6 +63,13 @@ pub(super) struct OtherPane {
     shown_world: Option<usize>,
     history_check: bool,
     textdiv_visit: Option<(Option<u64>, String)>,
+}
+
+impl OtherPane {
+    /// Whether the pane follows the bottom (else the user has scrolled back in it).
+    pub(super) fn follows(&self) -> bool {
+        self.scroll.borrow().follow
+    }
 }
 
 impl ClayView {
@@ -114,10 +122,11 @@ impl ClayView {
         Ok(())
     }
 
-    /// `/split [-n <lines>] [world]` or `/unsplit`, typed here or sent back by the server
-    /// (an action): only an error is said in the output. `-n` makes the top pane that many
-    /// lines, kept for this window's next `/split` (user request 2026-11-05; the console's
-    /// `App::split_command`); while split, `-n` alone only resizes.
+    /// `/split [-n <lines> | +<lines> | -<lines>] [world]` or `/unsplit`, typed here or sent
+    /// back by the server (an action): only an error is said in the output. `-n` makes the
+    /// top pane that many lines, `+`/`-` that many more or fewer than it shows, kept for this
+    /// window's next `/split` (user requests 2026-11-05; the console's `App::split_command`);
+    /// while split, a size alone only resizes, and `+`/`-` only resize a split.
     pub(super) fn split_command(&mut self, command: &str, cx: &mut Context<Self>) {
         let mut words = command.split_whitespace();
         let first = words.next().unwrap_or("").to_lowercase();
@@ -126,11 +135,15 @@ impl ClayView {
             self.split_close()
         } else {
             crate::util::parse_split_args(&rest.join(" ")).and_then(|(lines, world)| {
+                if matches!(lines, Some(crate::util::SplitLines::By(_))) && self.split.is_none() {
+                    return Err(crate::util::SPLIT_NOT_SPLIT.to_string());
+                }
                 if !(lines.is_some() && world.is_none() && self.split.is_some()) {
                     self.split_open(world.as_deref())?;
                 }
-                if lines.is_some() {
-                    self.split_size.top_lines = lines;
+                if let Some(lines) = lines {
+                    let (shown, most) = self.split_lines_shown();
+                    self.split_size.top_lines = Some(lines.resolve(shown, most));
                 }
                 Ok(())
             })
@@ -144,7 +157,7 @@ impl ClayView {
 
     /// `/unsplit`: the pane without the focus closes.
     pub(super) fn split_close(&mut self) -> Result<(), String> {
-        let Some(pane) = self.split.take() else { return Err("The output isn't split.".to_string()) };
+        let Some(pane) = self.split.take() else { return Err(crate::util::SPLIT_NOT_SPLIT.to_string()) };
         if let Some(m) = self.more.get_mut(&pane.world).filter(|_| self.session.core.current_world().is_none_or(|w| w.name != pane.world)) {
             m.left();
         }
@@ -277,6 +290,22 @@ impl ClayView {
         lines as f32 * self.font_size + 2.0 * super::output::PAD_Y
     }
 
+    /// The whole lines the top pane shows as last laid out, and the most it can have there
+    /// (the bottom pane keeps one). Before the panes are first laid out: the size kept, and
+    /// no limit (the layout clamps it).
+    pub(super) fn split_lines_shown(&self) -> (usize, usize) {
+        let row = self.font_size.max(1.0);
+        let pad = self.pane_height(0);
+        let (top, area) = (self.split_size.top_h.get(), self.split_size.top_h.get() + self.split_size.bottom_h.get());
+        if area <= 0.0 {
+            return (self.split_size.top_lines.unwrap_or(1), usize::MAX);
+        }
+        let most = (((area - self.pane_height(1) - pad) / row).floor() as usize).max(1);
+        // A hair over, so a pane exactly n lines high never reads as n - 1.
+        let shown = (((top - pad) / row + 0.01).floor().max(1.0) as usize).min(most);
+        (shown, most)
+    }
+
     /// The mouse moved with the bar pressed (the root's mouse-move, wherever the mouse is):
     /// the bar follows it a line at a time, leaving each pane a line at least.
     pub(super) fn split_bar_drag(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -289,8 +318,7 @@ impl ClayView {
         }
         let row = self.font_size.max(1.0);
         let pad = self.pane_height(0);
-        let area = self.split_size.top_h.get() + self.split_size.bottom_h.get();
-        let most = (((area - self.pane_height(1) - pad) / row).floor() as usize).max(1);
+        let most = self.split_lines_shown().1;
         let Some(d) = self.split_size.drag.as_mut() else { return };
         let dy = f32::from(ev.position.y) - d.from_y;
         if !d.moved && dy.abs() < DRAG_SLOP {

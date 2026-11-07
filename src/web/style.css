@@ -4342,6 +4342,51 @@ body.device-phone .help-ref-table td:first-child {
 .reach-mono { font-family: monospace; }
 .reach-good { color: var(--theme-success); }
 .reach-bad { color: var(--theme-error); }
+.reach-warn { color: var(--theme-ansi-3); }
+
+/* /info's report (app.js renderInfoDialog): an overlay in a browser and the phone app,
+   the whole window in the desktop GUI's Info window (POPUP_MODE 'info'). */
+.info-dialog {
+    max-width: 780px;
+    width: 96%;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+}
+.info-report {
+    overflow: auto;
+    flex: 1 1 auto;
+    min-height: 0;
+    scrollbar-width: thin;
+    scrollbar-color: var(--theme-fg-muted) transparent;
+}
+/* Long values wrap between words here, not anywhere (.reach-val breaks anywhere). */
+.info-report .reach-val { word-break: normal; overflow-wrap: anywhere; }
+.info-key { flex-basis: 11em; }
+.info-section-title { font-weight: bold; margin: 14px 0 6px; color: var(--theme-accent); }
+.info-section-title:first-child { margin-top: 0; }
+.info-log {
+    font-family: monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 6px 0 0;
+    font-size: 0.9em;
+}
+.info-status { min-height: 1.2em; opacity: 0.85; margin: 8px 0; }
+.info-buttons { display: flex; gap: 10px; justify-content: flex-end; flex: none; }
+html.popup-window #info-dialog { background: var(--theme-bg) !important; }
+html.popup-window #info-dialog .info-dialog {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    max-width: none;
+    height: 100vh;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    box-sizing: border-box;
+}
 .reach-copy { padding: 2px 8px; font-size: 0.85em; }
 
 /* Import Picture: files dragged over the page (app.js picture-drag). */

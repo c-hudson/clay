@@ -16,6 +16,11 @@
 #            below that this server is willing to report.
 #   --mssp   answer DO MSSP with WILL MSSP and send one MSSP block on connect
 #   --quiet  suppress the numbered filler lines (structured data only)
+#   --flood=N        after the opening negotiation, send N numbered lines as fast as
+#                    --rate allows (performance work: a GUI that lags behind a flood)
+#   --rate=L         lines per second for --flood (0, the default: everything at once,
+#                    in 8 KiB writes)
+#   --flood-delay=S  seconds to wait after connecting before the flood (default 2)
 #
 # Bug-hunt scenario flags (plan: bug hunt after v1.6.1, Verification section). Each is a
 # one-shot hostile or awkward behaviour a real server could exhibit; default off.
@@ -65,6 +70,9 @@ ap.add_argument("--prompt-bang", action="store_true")
 ap.add_argument("--will-echo", action="store_true")
 ap.add_argument("--offer", action="store_true", help="server-INITIATED negotiation: send WILL/DO offers on connect (models a real MUD; lets a fully-reactive client respond)")
 ap.add_argument("--rxlog", default=None, metavar="PATH", help="append hex of every byte received from the client to PATH (to prove a reactive client sends nothing unsolicited)")
+ap.add_argument("--flood", type=int, default=0, metavar="N", help="send N numbered lines after connecting, as fast as --rate allows")
+ap.add_argument("--rate", type=float, default=0.0, metavar="L", help="lines per second for --flood (0: all at once)")
+ap.add_argument("--flood-delay", type=float, default=2.0, metavar="S", help="seconds between connecting and the flood")
 args = ap.parse_args()
 
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -303,6 +311,31 @@ def handle(c):
                         time.sleep(1.0)
                 return
 
+            # ---- the flood: N lines, paced or all at once, then the normal trickle ----
+            if args.flood and not state.get("flooded") and time.time() - state.setdefault("connected_at", time.time()) >= args.flood_delay:
+                state["flooded"] = True
+                if chunk:
+                    c.sendall(chunk)
+                    chunk = b""
+                started = time.time()
+                if args.rate > 0:
+                    # Paced: one write per line, so a client sees the trickle a real
+                    # combat spam is.
+                    for i in range(args.flood):
+                        n += 1
+                        c.sendall(f"FLOOD {n:05d} \x1b[1;32mthe quick brown fox\x1b[0m jumps over the lazy dog, again and again until it wraps\r\n".encode())
+                        due = started + (i + 1) / args.rate
+                        wait = due - time.time()
+                        if wait > 0:
+                            time.sleep(wait)
+                else:
+                    # All at once: the kernel splits it; Clay reads it 8 KiB at a time.
+                    lines = []
+                    for _ in range(args.flood):
+                        n += 1
+                        lines.append(f"FLOOD {n:05d} \x1b[1;32mthe quick brown fox\x1b[0m jumps over the lazy dog, again and again until it wraps\r\n")
+                    c.sendall("".join(lines).encode())
+                print(f"mud: flood of {args.flood} lines sent in {time.time() - started:.2f} s", flush=True)
             if not args.quiet:
                 for _ in range(5):
                     n += 1

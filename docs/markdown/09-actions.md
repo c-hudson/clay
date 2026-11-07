@@ -138,6 +138,7 @@ Command: /gag
 **Gagging behavior:**
 - Gagged lines are hidden from normal display
 - Gagged lines are still stored (visible with F2/Show tags)
+- What you type is kept too, for `/recall -i` and the log, but F2 never shows it
 - Useful for filtering spam while preserving history
 
 ### Combined Gag and Command

@@ -206,7 +206,7 @@ the full list of changed defaults.
 | Key | Action |
 |---|---|
 | `F1` | Help |
-| `F2` | Toggle MUD tag display (channel tags and timestamps) |
+| `F2` | Toggle MUD tag display (channel tags, timestamps and gagged lines; never what you typed, which only `/recall -i` shows) |
 | `F5` | Search the output: the newest match is shown in the middle of the output, Enter steps to older ones, and you can scroll back and forward from it. F5 or Esc closes the search and goes back to the newest lines |
 | `F8` | Toggle action-pattern highlighting |
 | `F9` | Toggle GMCP media audio |

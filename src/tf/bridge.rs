@@ -37,10 +37,14 @@ pub struct TfTriggerResult {
 /// Process a line of MUD output against all TF triggers
 /// Returns the combined results of all matching triggers
 pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>, world_type: Option<&str>) -> TfTriggerResult {
-    let mut result = TfTriggerResult::default();
+    // Strip ANSI codes for pattern matching (like Clay actions do)
+    process_line_plain(engine, &crate::util::strip_ansi_codes(line), world, world_type)
+}
 
-    // Strip ANSI codes and trailing whitespace for pattern matching (like Clay actions do)
-    let plain_line = crate::util::strip_ansi_codes(line);
+/// `process_line` for a line already stripped of its escape codes (the server strips each
+/// line once for the actions and the triggers alike). Trailing whitespace is dropped here.
+pub fn process_line_plain(engine: &mut TfEngine, plain_line: &str, world: Option<&str>, world_type: Option<&str>) -> TfTriggerResult {
+    let mut result = TfTriggerResult::default();
     let plain_line = plain_line.trim_end();
 
     // Run the matching triggers in their own frame, collecting what they did in order.

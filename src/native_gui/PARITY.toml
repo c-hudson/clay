@@ -90,6 +90,14 @@ feature = "handle ConnectionsListResponse"
 note = ""
 
 [[item]]
+id = "msg:InfoReport"
+section = "dialogs"
+phase = 0
+status = "done"
+feature = "handle InfoReport"
+note = "/info's report in the Info window (windows/info.rs), with a This GUI section and, attached, the GUI's own process"
+
+[[item]]
 id = "msg:EchoMaskChanged"
 section = "input"
 phase = 3
@@ -1946,6 +1954,22 @@ feature = "wire ConnectionsListResponse"
 note = "handled: see msg:ConnectionsListResponse"
 
 [[item]]
+id = "wire:RequestInfo"
+section = "wire"
+phase = 0
+status = "done"
+feature = "wire RequestInfo"
+note = "sent for a typed /info [world], only when InitialState.info_report"
+
+[[item]]
+id = "wire:InfoReport"
+section = "wire"
+phase = 0
+status = "see"
+feature = "wire InfoReport"
+note = "handled: see msg:InfoReport"
+
+[[item]]
 id = "wire:ReportSeqMismatch"
 section = "wire"
 phase = 1
@@ -2793,7 +2817,7 @@ section = "output"
 phase = 2
 status = "done"
 feature = "5k-line scroll at 60 fps, 200 lines/s incoming, idle CPU near 0, RSS, cold start measured"
-note = "release builds. Frame cost (offscreen, 5k lines): scroll 1.5 ms mean / 2.0 worst; 200 lines/s at 60 fps 8.8% of a core. Real windows, idle 60 s, corpus page (WebView GUI in brackets): Linux 0.26% (0.41%), 191 MB (439 MB); macOS 11 0.01% (0.15%), 31 MB (128 MB); Windows VM 0.69% (0.42%, GPUI's per-vsync repaint), 52 MB (367 MB). First frame: 186 ms Linux, 185 ms Windows, 791 ms macOS (runtime Metal shader compile)"
+note = "release builds. 2026-11-07 (CLAY_SNAPSHOT_BENCH with PREFILL/BG/BURST): 2k lines scroll 0.48 ms mean, 200 lines/s 0.75 ms a frame, 4.6% of a core; a 100k-line session (capped to 10k held) 1.39 ms a frame, 8.3% (was 18.4 ms and 101%); font `monospace` 200 lines/s handled in 3 ms over 10 s (was 30 s, fc-match twice a message). Earlier: frame cost (offscreen, 5k lines): scroll 1.5 ms mean / 2.0 worst; 200 lines/s at 60 fps 8.8% of a core. Real windows, idle 60 s, corpus page (WebView GUI in brackets): Linux 0.26% (0.41%), 191 MB (439 MB); macOS 11 0.01% (0.15%), 31 MB (128 MB); Windows VM 0.69% (0.42%, GPUI's per-vsync repaint), 52 MB (367 MB). First frame: 186 ms Linux, 185 ms Windows, 791 ms macOS (runtime Metal shader compile)"
 
 [[item]]
 id = "ui:dialog.connection_log"

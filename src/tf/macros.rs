@@ -1175,8 +1175,12 @@ pub fn process_triggers_outcome(engine: &mut TfEngine, line: &str, world: Option
     let tf_type = engine.world_types(world).map(|(t, _)| t).unwrap_or_default();
     let types = world_type.map(|clay| (tf_type.as_str(), clay));
 
-    // Sort macros by priority (higher first)
-    let mut macro_indices: Vec<usize> = (0..engine.macros.len()).collect();
+    // The macros with a trigger, by priority (higher first; a stable sort keeps definition
+    // order among equals). Only those: this runs for every line of output, and most macros
+    // are key bindings and commands - sorting all of them per line was most of its cost.
+    let mut macro_indices: Vec<usize> = (0..engine.macros.len())
+        .filter(|&i| engine.macros[i].trigger.as_ref().is_some_and(|t| !t.pattern.is_empty()))
+        .collect();
     macro_indices.sort_by(|&a, &b| {
         engine.macros[b].priority.cmp(&engine.macros[a].priority)
     });

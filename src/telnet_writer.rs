@@ -97,6 +97,7 @@ pub fn spawn_telnet_writer(
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(WRITE_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let mut encoding = initial_encoding;
+        let mut diag: Option<std::sync::Arc<crate::protocol_state::ConnDiag>> = None;
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 WriteCommand::Text(text) => {
@@ -116,6 +117,9 @@ pub fn spawn_telnet_writer(
                     if write_half.write_all(&bytes).await.is_err() {
                         break;
                     }
+                    if let Some(d) = &diag {
+                        d.add_out(bytes.len());
+                    }
                     let _ = write_half.flush().await;
                 }
                 WriteCommand::Raw(raw) => {
@@ -125,11 +129,15 @@ pub fn spawn_telnet_writer(
                     if write_half.write_all(&raw).await.is_err() {
                         break;
                     }
+                    if let Some(d) = &diag {
+                        d.add_out(raw.len());
+                    }
                     let _ = write_half.flush().await;
                 }
                 WriteCommand::SetEncoding(new_encoding) => {
                     encoding = new_encoding;
                 }
+                WriteCommand::CountInto(d) => diag = Some(d),
                 // Slack/Discord only (see crate::chat) - never reaches a telnet writer.
                 WriteCommand::Chat(_) => {}
                 WriteCommand::Shutdown => {
@@ -339,5 +347,19 @@ mod tests {
     fn spawn_telnet_writer_returns_sender_only() {
         fn assert_sender_only(_f: fn(StreamWriter, Encoding) -> mpsc::Sender<WriteCommand>) {}
         assert_sender_only(spawn_telnet_writer);
+    }
+
+    /// `/info`'s record: after `CountInto`, every byte written is counted - a line's CRLF too.
+    #[tokio::test]
+    async fn count_into_counts_every_byte_written() {
+        let diag = std::sync::Arc::new(crate::protocol_state::ConnDiag::default());
+        let (cmd_tx, mut server) = spawn(Encoding::Utf8);
+        cmd_tx.send(WriteCommand::Raw(b"ab".to_vec())).await.unwrap();
+        assert_eq!(read_n(&mut server, 2).await, b"ab".to_vec());
+        cmd_tx.send(WriteCommand::CountInto(diag.clone())).await.unwrap();
+        cmd_tx.send(WriteCommand::Text("look".to_string())).await.unwrap();
+        cmd_tx.send(WriteCommand::Raw(vec![255, 241])).await.unwrap();
+        assert_eq!(read_n(&mut server, 8).await, b"look\r\n\xff\xf1".to_vec());
+        assert_eq!(diag.snapshot().wire_out, 8, "only what came after CountInto");
     }
 }

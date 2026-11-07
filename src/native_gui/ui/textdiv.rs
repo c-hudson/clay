@@ -34,6 +34,10 @@ struct Mark {
     /// Set by the first switch to the world (or away from it). Until then, what the
     /// client catches up on counts as shown too.
     fixed: bool,
+    /// The newest seq `note_worlds` has looked at, so each call walks only the lines
+    /// that came since the last: before it, every message re-walked every live line of a
+    /// world never switched to.
+    scanned: Option<u64>,
 }
 
 #[derive(Default)]
@@ -55,21 +59,28 @@ impl Textdiv {
             match self.seen.get_mut(&w.name) {
                 Some(m) if m.epoch == w.epoch() => {
                     if !m.fixed {
-                        // The tail newer than the mark, newest first.
+                        // The tail newer than what was looked at last time, newest first.
+                        let floor = m.scanned.max(m.seq);
+                        let mut newest = None;
                         let caught_up = w.lines.iter().rev()
                             .filter(|l| !l.from_archive)
                             .filter_map(|l| l.seq.map(|seq| (seq, l.scrollback)))
-                            .take_while(|(seq, _)| m.seq.is_none_or(|s| *seq > s))
+                            .take_while(|(seq, _)| floor.is_none_or(|s| *seq > s))
+                            .inspect(|(seq, _)| newest = Some(newest.map_or(*seq, |n: u64| n.max(*seq))))
                             .filter(|(_, scrollback)| *scrollback)
                             .map(|(seq, _)| seq)
                             .max();
                         if caught_up.is_some() {
                             m.seq = caught_up;
                         }
+                        if newest.is_some() {
+                            m.scanned = newest.max(m.scanned);
+                        }
                     }
                 }
                 _ => {
-                    self.seen.insert(w.name.clone(), Mark { seq: last_seq(w), epoch: w.epoch(), fixed: false });
+                    let seq = last_seq(w);
+                    self.seen.insert(w.name.clone(), Mark { seq, epoch: w.epoch(), fixed: false, scanned: seq });
                 }
             }
         }
@@ -81,10 +92,16 @@ impl Textdiv {
         self.seen.get(name).and_then(|m| m.seq)
     }
 
+    /// The newest seq `note_worlds` has looked at for the world named `name`.
+    #[cfg(test)]
+    fn scanned(&self, name: &str) -> Option<u64> {
+        self.seen.get(name).and_then(|m| m.scanned)
+    }
+
     /// Leaving a world: shown up to here, and this visit's divider goes.
     pub fn leave(&mut self, w: &World) {
         let seq = last_seq(w);
-        let mark = self.seen.entry(w.name.clone()).or_insert(Mark { seq, epoch: w.epoch(), fixed: true });
+        let mark = self.seen.entry(w.name.clone()).or_insert(Mark { seq, epoch: w.epoch(), fixed: true, scanned: seq });
         if seq.is_some() {
             (mark.seq, mark.epoch) = (seq, w.epoch());
         }
@@ -199,6 +216,27 @@ mod tests {
         assert_eq!(t.seen("a"), Some(89), "after the first visit only leaving moves the mark");
         t.leave(&w);
         assert_eq!(t.seen("a"), Some(98));
+    }
+
+    /// Each call looks only at the lines that came since the last one: the mark of a
+    /// world never switched to used to cost a walk of all its live lines per message.
+    #[test]
+    fn a_live_tail_is_scanned_once() {
+        let mut t = Textdiv::default();
+        let mut w = world("a", 0..30);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!((t.seen("a"), t.scanned("a")), (Some(29), Some(29)));
+        append(&mut w, 30..90, true);
+        append(&mut w, 90..95, false);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!((t.seen("a"), t.scanned("a")), (Some(89), Some(94)), "the catch-up moved the mark, the live tail only the cursor");
+        // Nothing new: nothing looked at, nothing moved.
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!((t.seen("a"), t.scanned("a")), (Some(89), Some(94)));
+        // A later catch-up (the server's resume replay) still counts as shown.
+        append(&mut w, 95..99, true);
+        t.note_worlds(std::slice::from_ref(&w));
+        assert_eq!((t.seen("a"), t.scanned("a")), (Some(98), Some(98)));
     }
 
     /// A world that had nothing when first seen takes its catch-up too.
