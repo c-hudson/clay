@@ -1159,6 +1159,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
                     app.worlds[idx].settings.keep_alive_gag = settings.keep_alive_gag;
                     app.worlds[idx].settings.login_command = settings.login_command;
+                    app.worlds[idx].settings.first_command = settings.first_command;
                     app.worlds[idx].settings.status_panel = settings.status_panel;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages;
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
@@ -2403,6 +2404,9 @@ fn dispatch_action_impl(action: &str, app: &mut App) -> Option<KeyAction> {
         // TF /bg (= /fg -n): background every world / no foreground - a no-op in Clay's
         // single-pane console, exactly like cmd_fg's own -n handling (tf/parser.rs).
         "bg_all_worlds" => KeyAction::None,
+        // The GUI window's zoom (src/zoom.rs): a terminal has no window to zoom (and
+        // crossterm can't even name Ctrl+minus), so nothing here.
+        "zoom_in" | "zoom_out" | "zoom_reset" => KeyAction::None,
         // Shift+Tab: the focus moves to the split's other pane (`/split`).
         "split_focus" => {
             app.split_swap_focus();

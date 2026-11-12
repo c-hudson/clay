@@ -88,12 +88,19 @@ const CONTRACTION_SUFFIXES: &[&str] = &[
 ];
 
 pub struct SpellChecker {
-    words: HashSet<String>,
+    /// One dictionary per process, shared by every `App` (a server runs one per user or
+    /// visitor): the system word list is read once and never written.
+    words: std::sync::Arc<HashSet<String>>,
 }
 
-impl SpellChecker {
-    /// The system's dictionary: its word list, else LibreOffice's (Windows), else aspell's.
-    pub fn new() -> Self {
+/// The system's dictionary, loaded on the first `SpellChecker::new` of the process.
+fn shared_words() -> std::sync::Arc<HashSet<String>> {
+    static WORDS: std::sync::OnceLock<std::sync::Arc<HashSet<String>>> = std::sync::OnceLock::new();
+    WORDS.get_or_init(|| std::sync::Arc::new(load_words())).clone()
+}
+
+/// The system's dictionary: its word list, else LibreOffice's (Windows), else aspell's.
+fn load_words() -> HashSet<String> {
         let mut words = HashSet::new();
 
         // Try system dictionary paths
@@ -135,7 +142,12 @@ impl SpellChecker {
             }
         }
 
-        Self { words }
+        words
+}
+
+impl SpellChecker {
+    pub fn new() -> Self {
+        Self { words: shared_words() }
     }
 
     pub fn has_dictionary(&self) -> bool {
@@ -273,7 +285,7 @@ mod tests {
     use super::*;
 
     fn checker(words: &[&str]) -> SpellChecker {
-        SpellChecker { words: words.iter().map(|w| w.to_string()).collect() }
+        SpellChecker { words: std::sync::Arc::new(words.iter().map(|w| w.to_string()).collect()) }
     }
 
     #[test]

@@ -287,14 +287,14 @@ impl ClayView {
     /// The height a pane takes to show `lines` (output.rs: a row is the font size, with
     /// `PAD_Y` above and below).
     pub(super) fn pane_height(&self, lines: usize) -> f32 {
-        lines as f32 * self.font_size + 2.0 * super::output::PAD_Y
+        lines as f32 * self.text_size() + 2.0 * super::output::PAD_Y
     }
 
     /// The whole lines the top pane shows as last laid out, and the most it can have there
     /// (the bottom pane keeps one). Before the panes are first laid out: the size kept, and
     /// no limit (the layout clamps it).
     pub(super) fn split_lines_shown(&self) -> (usize, usize) {
-        let row = self.font_size.max(1.0);
+        let row = self.text_size().max(1.0);
         let pad = self.pane_height(0);
         let (top, area) = (self.split_size.top_h.get(), self.split_size.top_h.get() + self.split_size.bottom_h.get());
         if area <= 0.0 {
@@ -316,7 +316,7 @@ impl ClayView {
             self.split_size.drag = None;
             return;
         }
-        let row = self.font_size.max(1.0);
+        let row = self.text_size().max(1.0);
         let pad = self.pane_height(0);
         let most = self.split_lines_shown().1;
         let Some(d) = self.split_size.drag.as_mut() else { return };
@@ -376,10 +376,10 @@ impl ClayView {
     /// a row at a time.
     pub(super) fn wheel_scroll(&mut self, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
         // Positive is towards the user (down the page in GPUI: content moves up).
-        let dy = -f32::from(ev.delta.pixel_delta(px(self.font_size)).y);
+        let dy = -f32::from(ev.delta.pixel_delta(px(self.text_size())).y);
         let at_bottom = self.scroll.borrow().at_bottom();
         if dy > 0.0 && at_bottom && self.pending_total() > 0 {
-            let font_size = self.font_size;
+            let font_size = self.text_size();
             let more = self.more_mut();
             more.wheel_px += dy;
             let rows = (more.wheel_px / font_size).floor() as usize;
@@ -394,7 +394,7 @@ impl ClayView {
             // never scrolled up at all). Turning the other way starts afresh.
             let rows = {
                 let mut s = self.scroll.borrow_mut();
-                let turn = dy / self.font_size;
+                let turn = dy / self.text_size();
                 if s.wheel_rest * turn < 0.0 {
                     s.wheel_rest = 0.0;
                 }

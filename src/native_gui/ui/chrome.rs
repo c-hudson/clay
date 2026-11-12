@@ -189,15 +189,15 @@ pub(super) const MAIN_MENU: &[Option<MenuEntry>] = &[
     Some(("logout", "Logout", "")),
 ];
 
-/// Whether the hamburger shows `action`: Change Password and Logout only on a multiuser
-/// server, Edit World and Map only on a single-user one (multiuser has no world editing
-/// and no map), Import Picture only where the server uploads pictures (as app.js hides
-/// them).
-pub(super) fn menu_shows(action: &str, multiuser: bool, picture_upload: bool) -> bool {
+/// Whether the hamburger shows `action`: Logout only on a multiuser server, Change
+/// Password only where the server answers it (not clay_multi, whose password.dat is the
+/// operator's), Import Picture only where the server uploads pictures (as app.js hides
+/// them). A clay_multi user's worlds and map are their own, so Edit World and Map stay.
+pub(super) fn menu_shows(action: &str, shown: super::appmenu::Shown) -> bool {
     match action {
-        "change-password" | "logout" => multiuser,
-        "edit-world" | "map" => !multiuser,
-        "import-picture" => picture_upload,
+        "change-password" => shown.multiuser && shown.change_password,
+        "logout" => shown.multiuser,
+        "import-picture" => shown.picture_upload,
         _ => true,
     }
 }
@@ -206,13 +206,13 @@ pub(super) fn menu_shows(action: &str, multiuser: bool, picture_upload: bool) ->
 /// server lacks them).
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub(super) fn menu_always_shows(action: &str) -> bool {
-    [false, true].into_iter().all(|m| [false, true].into_iter().all(|p| menu_shows(action, m, p)))
+    super::appmenu::Shown::every().into_iter().all(|shown| menu_shows(action, shown))
 }
 
 /// The hamburger's items as they show, in the sections its separators make, none empty.
 /// The desktop's app menu (appmenu.rs) is the same.
-pub(super) fn menu_sections(multiuser: bool, picture_upload: bool) -> Vec<Vec<MenuEntry>> {
-    sections_of(|action| menu_shows(action, multiuser, picture_upload))
+pub(super) fn menu_sections(shown: super::appmenu::Shown) -> Vec<Vec<MenuEntry>> {
+    sections_of(|action| menu_shows(action, shown))
 }
 
 /// Every item the hamburger can show, whatever the server, in its sections.
@@ -714,7 +714,7 @@ impl ClayView {
         let core = &self.session.core;
         let t = &self.chrome.tokens;
         let mut items = Vec::new();
-        for (i, section) in menu_sections(core.is_multiuser(), core.server_picture_upload).into_iter().enumerate() {
+        for (i, section) in menu_sections(super::appmenu::Shown::of(core)).into_iter().enumerate() {
             if i > 0 {
                 items.push(div().h(px(1.0)).mx(px(8.0)).my(px(4.0)).bg(t.border).into_any_element());
             }
@@ -906,13 +906,17 @@ mod tests {
 
     /// The hamburger menu is index.html's `#menu-dropdown`, item for item and separator
     /// for separator (the web hides some per platform; this menu hides some per mode).
+    /// The clay_web page's own Light/Dark item (`menu-web-theme`) is no part of it: style.css
+    /// hides it everywhere but on that page, which the native GUI never is.
     #[test]
     fn the_main_menu_is_the_web_menu() {
         let html = include_str!("../../web/index.html");
         let start = html.find("<div id=\"menu-dropdown\"").expect("the web menu");
         let block = &html[start..start + html[start..].find("\n        </div>").expect("its end")];
+        assert!(include_str!("../../web/style.css").contains("body:not(.web-front) #menu-dropdown .menu-web-theme { display: none !important; }"));
         let web: Vec<String> = block
             .lines()
+            .filter(|l| !l.contains("menu-web-theme"))
             .filter_map(|l| {
                 if l.contains("class=\"menu-sep") {
                     Some("---".to_string())
@@ -930,9 +934,10 @@ mod tests {
     /// The items each kind of server shows, between the separators, with no empty section.
     #[test]
     fn menu_sections_hide_what_the_server_lacks() {
-        let ids = |m: bool, p: bool| -> Vec<Vec<&str>> { menu_sections(m, p).iter().map(|s| s.iter().map(|e| e.0).collect()).collect() };
+        use super::super::appmenu::Shown;
+        let ids = |shown: Shown| -> Vec<Vec<&str>> { menu_sections(shown).iter().map(|s| s.iter().map(|e| e.0).collect()).collect() };
         assert_eq!(
-            ids(false, false),
+            ids(Shown { multiuser: false, picture_upload: false, change_password: true }),
             vec![
                 vec!["help", "world-selector", "edit-world", "actions", "setup", "map", "emoji_picker"],
                 vec!["toggle-tags", "filter", "search"],
@@ -941,18 +946,23 @@ mod tests {
             "single-user without uploads: no Change Password, Import Picture or Logout, and no empty section after Resync"
         );
         assert_eq!(
-            ids(true, true),
+            ids(Shown { multiuser: true, picture_upload: true, change_password: false }),
             vec![
-                vec!["help", "world-selector", "actions", "setup", "emoji_picker", "import-picture"],
+                vec!["help", "world-selector", "edit-world", "actions", "setup", "map", "emoji_picker", "import-picture"],
                 vec!["toggle-tags", "filter", "search"],
-                vec!["change-password", "new-window", "resync"],
+                vec!["new-window", "resync"],
                 vec!["logout"],
             ],
-            "multiuser: no Edit World (no world editing there)"
+            "clay_multi: a user's own worlds and map, Logout, and no Change Password (password.dat is the operator's)"
+        );
+        assert_eq!(
+            ids(Shown { multiuser: true, picture_upload: true, change_password: true }).get(2).cloned(),
+            Some(vec!["change-password", "new-window", "resync"]),
+            "a multiuser server that answers Change Password shows it"
         );
         let every: Vec<&str> = every_menu_section().into_iter().flatten().map(|e| e.0).collect();
         assert_eq!(every.len(), MAIN_MENU.iter().flatten().count(), "every item, whatever the server");
         let sometimes: Vec<&str> = every.iter().copied().filter(|a| !menu_always_shows(a)).collect();
-        assert_eq!(sometimes, ["edit-world", "map", "import-picture", "change-password", "logout"]);
+        assert_eq!(sometimes, ["import-picture", "change-password", "logout"]);
     }
 }

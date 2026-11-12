@@ -299,7 +299,8 @@ See `docs/markdown/06-tf-commands.md`'s "Differences from TinyFugue" section for
 user-facing version, and `docs/markdown/22-switching-from-tinyfugue.md` for a TF user's.
 Summary: `^Q`/`^R` stay at their Clay meanings; `Tab` keeps paging/more-mode priority
 (`Esc-Tab` does TF-style completion); the kill ring's `^Y`, the F-keys,
-`Shift-Up/Down`, and `Alt-Up/Down` are Clay-only additions; `/recall -D`, `/world -e`,
+`Shift-Up/Down`, `Alt-Up/Down` and `^+`/`^-`/`^0` (the native GUI's window zoom) are
+Clay-only additions; `/recall -D`, `/world -e`,
 `/watchdog -w<world>`, `/trigger -d`, `/repeat -p<priority>`, long-form `/def -a"gag"`,
 `/quote -A`, and `/tfhelp` are Clay-only extras kept alongside TF's own behavior;
 `/limit`/`/unlimit`/`/relimit` and `/xtitle` are console-only (no remote-filter wire
@@ -518,6 +519,9 @@ only checked on a machine that has it. Changing a default means changing all thr
 | `Shift-Up` | `world_all_next` |
 | `Tab` | `tab_key` |
 | `Up` | `cursor_up` |
+| `^+` | `zoom_in` |
+| `^-` | `zoom_out` |
+| `^0` | `zoom_reset` |
 | `^A` | `cursor_home` |
 | `^B` | `cursor_left` |
 | `^D` | `delete_forward` |

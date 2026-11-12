@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
-use tokio::net::TcpListener;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use tokio_tungstenite::{accept_async_with_config, tungstenite::Message as WsRawMessage, tungstenite::protocol::WebSocketConfig};
@@ -487,6 +486,24 @@ pub enum WsMessage {
         /// as `other_views` is. `serde(default)` = false.
         #[serde(default)]
         info_report: bool,
+        /// This server is a clay_web page: no commands, one world, a Reconnect overlay.
+        /// `serde(default)` = false (any other server).
+        #[serde(default)]
+        web_front: bool,
+        /// The server plays sound and speech of its own (a single Clay); an instance of a
+        /// server never does, and Settings then offer only the device's voice. Defaults to
+        /// true: an older server does play locally.
+        #[serde(default = "default_true")]
+        server_sound: bool,
+        /// Change Password is answered here. False on clay_multi, whose password.dat is the
+        /// operator's and read-only, so the menu item is hidden.
+        #[serde(default = "default_true")]
+        change_password: bool,
+        /// `false` = this server can't run a shell world: it was built without the
+        /// `shell-worlds` feature (a multiuser server never has it), so every world editor
+        /// leaves the Shell type out. `serde(default)` = true: an older server always could.
+        #[serde(default = "default_true")]
+        shell_worlds: bool,
         /// The emoji picker's curated table, in the compact wire form
         /// `[[ch, name, "kw1 kw2", category_index], ...]` from `emoji::emoji_json()`. The
         /// table is static, so it is sent once per connection here rather than on every
@@ -893,6 +910,10 @@ pub enum WsMessage {
         /// `\n`). None - an older client that doesn't know it - leaves it; empty clears it.
         #[serde(default)]
         login_command: Option<String>,
+        /// Edit World's First Command (`WorldSettings::first_command`). None - an older
+        /// client - leaves it; empty clears it.
+        #[serde(default)]
+        first_command: Option<String>,
         /// Edit World's Status Panel (`WorldSettings::status_panel`). None - an older
         /// client, or an editor with no such switch - leaves it.
         #[serde(default)]
@@ -2057,6 +2078,9 @@ pub struct WorldSettingsMsg {
     /// Mirrors `WorldSettings::login_command` (lines joined by `\n`).
     #[serde(default)]
     pub login_command: String,
+    /// Mirrors `WorldSettings::first_command`.
+    #[serde(default)]
+    pub first_command: String,
     /// Mirror of `WorldSettings::slack_token`/`slack_channel`/`slack_workspace` and
     /// `discord_token`/`discord_guild`/`discord_channel`/`discord_dm_user`. Tokens
     /// follow the password precedent above: sent plaintext to authenticated clients,
@@ -2800,11 +2824,8 @@ pub(crate) struct PushWorld {
     pub done: bool,
 }
 
-/// User credential for multiuser authentication
-#[derive(Clone, Debug)]
-pub struct UserCredential {
-    pub password_hash: String,
-}
+
+
 
 /// WebSocket server state
 pub struct WebSocketServer {
@@ -2832,8 +2853,6 @@ pub struct WebSocketServer {
     pub whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
     /// True if server is running in multiuser mode
     pub multiuser_mode: bool,
-    /// User credentials for multiuser mode (username -> password_hash)
-    pub users: Arc<std::sync::RwLock<HashMap<String, UserCredential>>>,
     /// Ban list for security (shared with HTTP server)
     pub ban_list: BanList,
     pub tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
@@ -2865,61 +2884,35 @@ impl WebSocketServer {
             allow_list: Arc::new(std::sync::RwLock::new(allow_list_vec)),
             whitelisted_host: Arc::new(std::sync::RwLock::new(whitelisted_host)),
             multiuser_mode,
-            users: Arc::new(std::sync::RwLock::new(HashMap::new())),
             ban_list,
             tls_acceptor: None,
         }
+    }
+
+    /// An instance's client table shares the front's client ids, so a client's id is unique
+    /// across every Clay the process runs (`instance::InstanceManager`).
+    pub fn with_shared_client_ids(mut self, counter: Arc<std::sync::Mutex<u64>>) -> Self {
+        self.next_client_id = counter;
+        self
     }
 
     /// Extract shared connection state for the unified HTTP+WS server.
     /// The HTTP server uses this to hand off WebSocket upgrade requests.
     pub fn connection_state(&self, event_tx: mpsc::Sender<crate::AppEvent>) -> crate::http::WsConnectionState {
         crate::http::WsConnectionState {
-            clients: self.clients.clone(),
+            backend: crate::http::Backend::Single { clients: self.clients.clone(), event_tx },
             next_client_id: self.next_client_id.clone(),
             password_hash: self.password_hash.clone(),
             password_enabled: self.password_enabled.clone(),
             allow_list: self.allow_list.clone(),
             whitelisted_host: self.whitelisted_host.clone(),
-            event_tx,
-            multiuser_mode: self.multiuser_mode,
-            users: self.users.clone(),
             ban_list: self.ban_list.clone(),
         }
     }
 
-    /// Add a user for multiuser authentication, hashing the given plaintext password.
-    pub fn add_user(&self, username: &str, password: &str) {
-        let password_hash = hash_password(password);
-        let mut users = self.users.write().unwrap();
-        users.insert(username.to_string(), UserCredential { password_hash });
-    }
 
-    /// Set (or insert) a user's credential directly from an already-computed SHA-256
-    /// password hash (hex), without hashing it again. Used by the `ChangePassword`
-    /// handler (C1, security remediation): the client only ever sends
-    /// `SHA256(new_password)`, never the plaintext, so this is the only way to update
-    /// the live credential without breaking the invariant that `UserCredential.password_hash`
-    /// is exactly `hash_password(plaintext)` — re-hashing the already-hashed value here
-    /// would silently lock the user out.
-    pub fn set_user_password_hash(&self, username: &str, password_hash: String) {
-        let mut users = self.users.write().unwrap();
-        users.insert(username.to_string(), UserCredential { password_hash });
-    }
 
-    /// Set the username for a connected client
-    pub fn set_client_username(&self, client_id: u64, username: Option<String>) {
-        let mut clients = self.clients.write().unwrap();
-        if let Some(client) = clients.get_mut(&client_id) {
-            client.username = username;
-        }
-    }
 
-    /// Get the username of a connected client (multiuser mode)
-    pub fn get_client_username(&self, client_id: u64) -> Option<String> {
-        let clients = self.clients.read().unwrap();
-        clients.get(&client_id).and_then(|c| c.username.clone())
-    }
 
     /// Get the IP address of a connected client
     pub fn get_client_ip(&self, client_id: u64) -> Option<String> {
@@ -2927,64 +2920,7 @@ impl WebSocketServer {
         clients.get(&client_id).map(|c| c.ip_address.clone())
     }
 
-    /// Clear a client's authentication state (for logout)
-    pub fn clear_client_auth(&self, client_id: u64) {
-        let mut clients = self.clients.write().unwrap();
-        if let Some(client) = clients.get_mut(&client_id) {
-            client.authenticated = false;
-            client.username = None;
-        }
-    }
 
-    /// Broadcast a message to all clients owned by a specific user
-    pub fn broadcast_to_owner(&self, msg: WsMessage, owner: Option<&str>) {
-        let world_index = message_world_index(&msg);
-        // PROTOCOL-ROADMAP.md Step 8: serialize once for the whole broadcast, share the
-        // JSON via Arc<str> with every recipient instead of each recipient's own receive
-        // loop re-serializing an identical WsMessage clone. A failure here is logged once
-        // (inside serialize_for_broadcast) and nobody gets the message - same net effect
-        // as the old per-client failure, minus the duplicate log lines.
-        let Some(shared_json) = serialize_for_broadcast(&msg) else { return };
-        let mut full: Vec<(u64, String)> = Vec::new();
-        let mut flush_candidates: Vec<u64> = Vec::new();
-        {
-            let clients = self.clients.read().unwrap();
-            for (&id, client) in clients.iter() {
-                // Only broadcast to clients that are authenticated AND have received InitialState
-                // This prevents ServerData from reaching clients before InitialState,
-                // which causes SEQ MISMATCH errors and duplicate/flickering messages
-                if client.authenticated && client.received_initial_state {
-                    // In multiuser mode, only send to clients with matching username
-                    let eligible = !self.multiuser_mode || client.username.as_deref() == owner;
-                    if !eligible {
-                        continue;
-                    }
-                    // Bounded channel (PROTOCOL-ROADMAP.md Step 3) — try_send instead of
-                    // the old infallible unbounded send. See `reconcile_resync` for how a
-                    // `TrySendError::Full` here is turned into a `ResyncRequired`. The
-                    // Arc<str> clone below is cheap (refcount bump, no JSON re-copy).
-                    match client.tx.try_send(Outbound::Shared(shared_json.clone())) {
-                        Ok(()) => {
-                            if let Some(wi) = world_index {
-                                if client.needs_resync.contains(&wi) {
-                                    flush_candidates.push(id);
-                                }
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => full.push((id, client.ip_address.clone())),
-                        Err(mpsc::error::TrySendError::Closed(_)) => {}
-                    }
-                }
-            }
-        }
-        for (id, ip) in &full {
-            log_channel_full(*id, ip,
-                &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
-                    id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
-        }
-        let full_ids: Vec<u64> = full.into_iter().map(|(id, _)| id).collect();
-        reconcile_resync(&self.clients, world_index, &full_ids, &flush_candidates);
-    }
 
     /// Broadcast a message to all authenticated clients (regardless of owner)
     /// Only sends to clients that have received their InitialState to prevent duplicates
@@ -3670,145 +3606,57 @@ pub fn allow_list_has_wildcard(allow_list: &str) -> bool {
     allow_list.split(',').any(|s| s.trim() == "*")
 }
 
-/// Start the WebSocket server
-pub async fn start_websocket_server(
-    server: &mut WebSocketServer,
-    event_tx: mpsc::Sender<AppEvent>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = format!("{}:{}", server.bind_addr, server.port);
-    let listener = TcpListener::bind(&addr).await?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    server.shutdown_tx = Some(shutdown_tx);
-
-    let clients = Arc::clone(&server.clients);
-    let next_client_id = Arc::clone(&server.next_client_id);
-    let password_hash = server.password_hash.clone();
-    let password_enabled = server.password_enabled.clone();
-    let allow_list = server.allow_list.clone();
-    let whitelisted_host = server.whitelisted_host.clone();
-    let running = Arc::clone(&server.running);
-    let multiuser_mode = server.multiuser_mode;
-    let users = server.users.clone();
-    let ban_list = server.ban_list.clone();
-    let tls_acceptor = server.tls_acceptor.clone();
-
-    *running.write().await = true;
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, client_addr)) => {
-                            // Check if IP is banned
-                            let client_ip = client_addr.ip().to_string();
-                            if ban_list.is_banned(&client_ip) {
-                                // Silently drop connection for banned IPs
-                                continue;
-                            }
-
-                            // Disable Nagle's algorithm for lower latency
-                            let _ = stream.set_nodelay(true);
-
-                            let client_id = {
-                                let mut id = next_client_id.lock().unwrap();
-                                let current = *id;
-                                *id += 1;
-                                current
-                            };
-
-                            let clients = Arc::clone(&clients);
-                            let password_hash = password_hash.read().unwrap().clone();
-                            let allow_list = allow_list.clone();
-                            let whitelisted_host = whitelisted_host.clone();
-                            let event_tx = event_tx.clone();
-                            let multiuser_mode = multiuser_mode;
-                            let users = users.clone();
-                            let ban_list = ban_list.clone();
-                            let password_enabled = *password_enabled.read().unwrap();
-                            let tls_acceptor = tls_acceptor.clone();
-
-                            tokio::spawn(async move {
-                                // If TLS is enabled, wrap the stream
-                                if let Some(acceptor) = tls_acceptor {
-                                    match acceptor.accept(stream).await {
-                                        Ok(tls_stream) => {
-                                            if let Err(_e) = handle_ws_client(
-                                                tls_stream,
-                                                client_id,
-                                                clients,
-                                                password_hash,
-                                                password_enabled,
-                                                allow_list,
-                                                whitelisted_host,
-                                                client_addr,
-                                                event_tx,
-                                                multiuser_mode,
-                                                users,
-                                                ban_list,
-                                                false, // standalone WS-only server: no accept-time knock support
-                                            ).await {
-                                                // Connection error, client disconnected
-                                            }
-                                        }
-                                        Err(e) => {
-                                            // TLS handshake failed - log to remote log
-                                            crate::http::log_remote_event("WSS-TLS-ERROR",
-                                                &client_addr.ip().to_string(), &format!("{}", e));
-                                        }
-                                    }
-                                } else if let Err(_e) = handle_ws_client(
-                                    stream,
-                                    client_id,
-                                    clients,
-                                    password_hash,
-                                    password_enabled,
-                                    allow_list,
-                                    whitelisted_host,
-                                    client_addr,
-                                    event_tx,
-                                    multiuser_mode,
-                                    users,
-                                    ban_list,
-                                    false, // standalone WS-only server: no accept-time knock support
-                                ).await {
-                                    // Connection error, client disconnected
-                                }
-                            });
-                        }
-                        Err(_) => {
-                            // Accept error
-                            break;
-                        }
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    // Shutdown signal received
-                    break;
-                }
-            }
-        }
-        *running.write().await = false;
-    });
-
-    Ok(())
+/// A fresh client's entry in a Clay's client table.
+pub(crate) fn new_client_info(tx: mpsc::Sender<Outbound>, client_ip: &str, authenticated: bool, username: Option<String>) -> WsClientInfo {
+    WsClientInfo {
+        authenticated,
+        tx,
+        current_world: None,
+        username,
+        received_initial_state: false,
+        client_type: RemoteClientType::Web,  // Default, updated by ClientTypeDeclaration
+        viewport_height: 24,  // Default, updated by UpdateViewState
+        ip_address: client_ip.to_string(),
+        connected_at: std::time::Instant::now(),
+        last_activity: std::time::Instant::now(),
+        paused: false,
+        acked_seq: std::collections::HashMap::new(),
+        audit_prev_acked: std::collections::HashMap::new(),
+        audit_fired_at: std::collections::HashMap::new(),
+        audit_stall_ticks: std::collections::HashMap::new(),
+        push: None,
+        needs_resync: std::collections::HashSet::new(),
+    }
 }
 
-/// Handle a single WebSocket client connection
+/// Join an instance for a logged-in connection (`Backend::Multi`). The manager's `attach`
+/// may start the instance - a thread, an App, its files - so it runs off the async workers.
+async fn attach_to(attacher: &Arc<dyn crate::http::Attacher>, who: crate::http::Principal, client_id: u64) -> Result<crate::http::Attached, crate::http::Refused> {
+    let attacher = attacher.clone();
+    match tokio::task::spawn_blocking(move || attacher.attach(who, client_id)).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::http::Refused::InstanceFailed("the attach task failed".to_string())),
+    }
+}
+
+/// Handle a single WebSocket client connection.
+///
+/// Two phases. Before the login the connection belongs to nobody: with a
+/// `Backend::Single` it is already in the one Clay's client table (as it always was),
+/// with a `Backend::Multi` it has a table of its own with just itself in it. The login
+/// names the Clay - a password or key for a user, nothing at all for a clay_web visitor -
+/// and `attach` hands over that Clay's table and event channel; from then on the
+/// connection is an ordinary client of an ordinary Clay.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_ws_client<S>(
     stream: S,
     client_id: u64,
-    clients: Arc<std::sync::RwLock<HashMap<u64, WsClientInfo>>>,
+    backend: crate::http::Backend,
     password_hash: String,
     password_enabled: bool,
     allow_list: Arc<std::sync::RwLock<Vec<String>>>,
     whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
     client_addr: std::net::SocketAddr,
-    event_tx: mpsc::Sender<AppEvent>,
-    multiuser_mode: bool,
-    users: Arc<std::sync::RwLock<HashMap<String, UserCredential>>>,
     ban_list: BanList,
     // True when this connection already passed the CLAY-KNOCK v1 preamble (D4,
     // SECURITY-ROADMAP.md) at accept time. A knocked device has proven it holds a
@@ -3820,10 +3668,17 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use futures::{SinkExt, StreamExt};
+    use crate::http::{Backend, MultiLogin, Principal};
 
-    // Check if client IP is whitelisted (previously authenticated from an allow-list host)
+    let is_single = matches!(backend, Backend::Single { .. });
+    // The client is asked for a username (ServerHello.multiuser_mode) when the login is a
+    // user's; a visitor's page never is.
+    let multiuser_mode = matches!(backend, Backend::Multi { login: MultiLogin::Users, .. });
+
+    // Check if client IP is whitelisted (previously authenticated from an allow-list host).
+    // A single Clay's rule only: a server of many has no one user to let in by address.
     let client_ip = client_addr.ip().to_string();
-    let is_whitelisted = {
+    let is_whitelisted = is_single && {
         let whitelist_guard = whitelisted_host.read().unwrap();
         whitelist_guard.as_ref().map(|h| h == &client_ip).unwrap_or(false)
     };
@@ -3885,6 +3740,16 @@ where
     // Step 3) — see WS_CLIENT_CHANNEL_CAPACITY for sizing rationale.
     let (tx, mut rx) = mpsc::channel::<Outbound>(WS_CLIENT_CHANNEL_CAPACITY);
 
+    // The client table and event channel this connection belongs to: a single Clay's from
+    // the start; with a `Backend::Multi` the instance's, known only once the login names
+    // it (`attach`), and until then a table of this connection's own.
+    let (mut clients, mut event_tx) = match &backend {
+        Backend::Single { clients, event_tx } => (clients.clone(), Some(event_tx.clone())),
+        Backend::Multi { .. } => (Arc::new(std::sync::RwLock::new(HashMap::new())), None),
+    };
+    // What the instance handed out at the attach, given back when the connection ends.
+    let mut ticket: Option<crate::http::Ticket> = None;
+
     // Generate random challenge for challenge-response auth. Fail closed: an all-zero
     // (or otherwise predictable) challenge would let an attacker who knows a user's
     // password hash replay a precomputed response, so refuse the connection outright
@@ -3904,33 +3769,17 @@ where
     // Add client to clients map (auto-authenticated if whitelisted)
     {
         let mut clients_guard = clients.write().unwrap();
-        clients_guard.insert(client_id, WsClientInfo {
-            authenticated: is_whitelisted,
-            tx: tx.clone(),
-            current_world: None,
-            username: None,
-            received_initial_state: false,
-            client_type: RemoteClientType::Web,  // Default, updated by ClientTypeDeclaration
-            viewport_height: 24,  // Default, updated by UpdateViewState
-            ip_address: client_ip.clone(),
-            connected_at: std::time::Instant::now(),
-            last_activity: std::time::Instant::now(),
-            paused: false,
-            acked_seq: std::collections::HashMap::new(),
-            audit_prev_acked: std::collections::HashMap::new(),
-            audit_fired_at: std::collections::HashMap::new(),
-            audit_stall_ticks: std::collections::HashMap::new(),
-            push: None,
-            needs_resync: std::collections::HashSet::new(),
-        });
+        clients_guard.insert(client_id, new_client_info(tx.clone(), &client_ip, is_whitelisted, None));
     }
 
     // Log connection
     crate::http::log_remote_event("WS-CONNECT", &client_ip,
         &format!("whitelisted={}", is_whitelisted));
 
-    // Notify app of new connection
-    let _ = event_tx.send(AppEvent::WsClientConnected(client_id)).await;
+    // Notify app of new connection (a single Clay's; an instance hears at the attach)
+    if let Some(etx) = &event_tx {
+        let _ = etx.send(AppEvent::WsClientConnected(client_id)).await;
+    }
 
     // If auto-authenticated via whitelist, send success response and trigger initial state
     if is_whitelisted {
@@ -3942,7 +3791,9 @@ where
         };
         try_send_local(&clients, client_id, &tx, &client_ip, response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new() }))).await;
+        if let Some(etx) = &event_tx {
+            let _ = etx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new() }))).await;
+        }
     }
 
     // Combined receive/send/keepalive loop.
@@ -4106,11 +3957,66 @@ where
                             // Try auth_key first (device key authentication)
                             // auth_key validation must happen in the app since keys are stored there
                             // So we forward to app and let it respond (include challenge for verification)
-                            if auth_key.is_some() && !auth_key.as_ref().unwrap().is_empty() {
-                                // Forward to app for key validation
-                                // App will send AuthResponse directly
-                                let _ = event_tx.send(AppEvent::WsAuthKeyValidation(client_id, Box::new(ws_msg.clone()), client_ip.clone(), challenge.clone())).await;
-                                continue;
+                            if has_key {
+                                match &backend {
+                                    Backend::Single { .. } => {
+                                        // Forward to app for key validation
+                                        // App will send AuthResponse directly
+                                        if let Some(etx) = &event_tx {
+                                            let _ = etx.send(AppEvent::WsAuthKeyValidation(client_id, Box::new(ws_msg.clone()), client_ip.clone(), challenge.clone())).await;
+                                        }
+                                        continue;
+                                    }
+                                    Backend::Multi { attacher, login: MultiLogin::Users } => {
+                                        // The key names its user (every user's key compared);
+                                        // that user's own Clay then validates it and answers,
+                                        // exactly as a single Clay does.
+                                        let response = auth_key.as_deref().unwrap_or("");
+                                        let Some(user) = attacher.key_user(&challenge, response, *uses_challenge) else {
+                                            log_ws_auth(&client_ip, false, None);
+                                            ban_list.record_auth_failure(&client_ip, "WebSocket: failed key auth");
+                                            try_send_local(&clients, client_id, &tx, &client_ip, WsMessage::AuthResponse {
+                                                success: false,
+                                                error: Some("Authentication failed".to_string()),
+                                                username: None,
+                                                multiuser_mode,
+                                            });
+                                            continue;
+                                        };
+                                        match attach_to(attacher, Principal::User(user.clone()), client_id).await {
+                                            Ok(attached) => {
+                                                clients = attached.clients;
+                                                event_tx = Some(attached.event_tx);
+                                                ticket = Some(attached.ticket);
+                                                clients.write().unwrap().insert(client_id, new_client_info(tx.clone(), &client_ip, false, Some(user.clone())));
+                                                crate::http::log_remote_event("INSTANCE-ATTACH", &client_ip, &format!("user={user} (key)"));
+                                                if let Some(etx) = &event_tx {
+                                                    let _ = etx.send(AppEvent::WsClientConnected(client_id)).await;
+                                                    let _ = etx.send(AppEvent::WsAuthKeyValidation(client_id, Box::new(ws_msg.clone()), client_ip.clone(), challenge.clone())).await;
+                                                }
+                                                continue;
+                                            }
+                                            Err(refused) => {
+                                                crate::http::log_remote_event("WS-REJECT", &client_ip, &format!("attach refused: {refused:?}"));
+                                                // Written straight to the socket: `break` leaves the
+                                                // loop that drains `rx`, so a queued message would die
+                                                // with the connection and the client would see only EOF.
+                                                if let Ok(json) = serde_json::to_string(&WsMessage::AuthResponse {
+                                                    success: false,
+                                                    error: Some(refused.message()),
+                                                    username: None,
+                                                    multiuser_mode,
+                                                }) {
+                                                    let _ = ws_sink.send(WsRawMessage::Text(json)).await;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    // A visitor's page: a key means nothing; the login below
+                                    // takes anyone.
+                                    Backend::Multi { login: MultiLogin::Anonymous, .. } => {}
+                                }
                             }
 
                             // Password-based auth: reject if no password is configured.
@@ -4118,7 +4024,7 @@ where
                             // (the users map below), and never sets the global one - this
                             // check used to reject every multiuser login unless a stray
                             // global websocket_password happened to be in multiuser.dat.
-                            if !password_enabled && !multiuser_mode {
+                            if is_single && !password_enabled {
                                 crate::http::log_remote_event("WS-REJECT", &client_ip,
                                     "no password configured, auth key required");
                                 try_send_local(&clients, client_id, &tx, &client_ip, WsMessage::AuthResponse {
@@ -4160,46 +4066,70 @@ where
                             // Password-based authentication
                             // If challenge_response is true, client sent SHA256(SHA256(password) + challenge)
                             // We compare by computing SHA256(stored_hash + challenge) on our side
-                            let (auth_success, auth_error, auth_username) = if multiuser_mode {
-                                // Multiuser mode: require username and validate against users map
-                                match username {
-                                    Some(uname) if !uname.is_empty() => {
-                                        let users_guard = users.read().unwrap();
-                                        if let Some(user_cred) = users_guard.get(uname) {
-                                            let matches = if *uses_challenge {
-                                                hash_with_challenge(&user_cred.password_hash, &challenge) == *client_hash
-                                            } else {
-                                                // B3 (security remediation): constant-time compare — this is a
-                                                // static stored-secret vs. client-supplied-secret compare (no
-                                                // per-connection challenge salt), so a naive `==` could leak
-                                                // match-progress via timing.
-                                                crate::util::constant_time_eq(user_cred.password_hash.as_bytes(), client_hash.as_bytes())
-                                            };
-                                            if matches {
-                                                (true, None, Some(uname.clone()))
-                                            } else {
-                                                (false, Some("Authentication failed".to_string()), None)
+                            let (auth_success, auth_error, auth_username) = match &backend {
+                                Backend::Single { .. } => {
+                                    // Single-user mode: just validate password
+                                    let matches = if *uses_challenge {
+                                        hash_with_challenge(&password_hash, &challenge) == *client_hash
+                                    } else {
+                                        // B3 (security remediation): constant-time compare (see note above).
+                                        crate::util::constant_time_eq(client_hash.as_bytes(), password_hash.as_bytes())
+                                    };
+                                    if matches {
+                                        (true, None, None)
+                                    } else {
+                                        (false, Some("Authentication failed".to_string()), None)
+                                    }
+                                }
+                                // clay_multi: a username and its password.dat password; an
+                                // unknown user and a wrong password are one answer.
+                                Backend::Multi { attacher, login: MultiLogin::Users } => match username.as_deref().filter(|u| !u.is_empty()) {
+                                    Some(user) if attacher.check_user_password(user, client_hash, &challenge, *uses_challenge) => (true, None, Some(user.to_string())),
+                                    _ => (false, Some("Authentication failed".to_string()), None),
+                                },
+                                // clay_web: anyone who reached the page.
+                                Backend::Multi { login: MultiLogin::Anonymous, .. } => (true, None, None),
+                            };
+
+                            // A server of many Clays: join the one this login names, starting it
+                            // if need be. Refused (too many sessions from this address, the server
+                            // full, the instance failing to start) ends the connection with the
+                            // reason.
+                            if auth_success {
+                                if let Backend::Multi { attacher, login } = &backend {
+                                    let who = match login {
+                                        MultiLogin::Users => Principal::User(auth_username.clone().unwrap_or_default()),
+                                        MultiLogin::Anonymous => Principal::Visitor { ip: client_ip.clone() },
+                                    };
+                                    match attach_to(attacher, who, client_id).await {
+                                        Ok(attached) => {
+                                            clients = attached.clients;
+                                            event_tx = Some(attached.event_tx);
+                                            ticket = Some(attached.ticket);
+                                            clients.write().unwrap().insert(client_id, new_client_info(tx.clone(), &client_ip, true, auth_username.clone()));
+                                            crate::http::log_remote_event("INSTANCE-ATTACH", &client_ip,
+                                                &auth_username.as_deref().map(|u| format!("user={u}")).unwrap_or_else(|| "visitor".to_string()));
+                                            if let Some(etx) = &event_tx {
+                                                let _ = etx.send(AppEvent::WsClientConnected(client_id)).await;
                                             }
-                                        } else {
-                                            (false, Some("Authentication failed".to_string()), None)
+                                        }
+                                        Err(refused) => {
+                                            crate::http::log_remote_event("WS-REJECT", &client_ip, &format!("attach refused: {refused:?}"));
+                                            // Straight to the socket, as above: the refusal must
+                                            // reach the client before `break` ends the connection.
+                                            if let Ok(json) = serde_json::to_string(&WsMessage::AuthResponse {
+                                                success: false,
+                                                error: Some(refused.message()),
+                                                username: None,
+                                                multiuser_mode,
+                                            }) {
+                                                let _ = ws_sink.send(WsRawMessage::Text(json)).await;
+                                            }
+                                            break;
                                         }
                                     }
-                                    _ => (false, Some("Username required".to_string()), None),
                                 }
-                            } else {
-                                // Single-user mode: just validate password
-                                let matches = if *uses_challenge {
-                                    hash_with_challenge(&password_hash, &challenge) == *client_hash
-                                } else {
-                                    // B3 (security remediation): constant-time compare (see note above).
-                                    crate::util::constant_time_eq(client_hash.as_bytes(), password_hash.as_bytes())
-                                };
-                                if matches {
-                                    (true, None, None)
-                                } else {
-                                    (false, Some("Authentication failed".to_string()), None)
-                                }
-                            };
+                            }
 
                             if auth_success {
                                 // Log successful auth
@@ -4219,7 +4149,7 @@ where
 
                                 // If client IP is in allow list, whitelist this host (single-user mode only)
                                 // This clears any previously whitelisted host
-                                if !multiuser_mode {
+                                if is_single {
                                     let in_allow_list = {
                                         let allow_list_guard = allow_list.read().unwrap();
                                         is_ip_in_allow_list(&client_ip, &allow_list_guard)
@@ -4251,11 +4181,13 @@ where
                                 let wants_key = *request_key;
 
                                 // Forward to app to send initial state (and generate key if requested)
-                                let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
+                                if let Some(etx) = &event_tx {
+                                    let _ = etx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
 
-                                // If client requested a key, forward that info to app
-                                if wants_key {
-                                    let _ = event_tx.send(AppEvent::WsKeyRequest(client_id)).await;
+                                    // If client requested a key, forward that info to app
+                                    if wants_key {
+                                        let _ = etx.send(AppEvent::WsKeyRequest(client_id)).await;
+                                    }
                                 }
                             }
                         }
@@ -4277,12 +4209,19 @@ where
                                     }
                                 }
                                 // Handle RevokeKey and RegenerateAuthKey inside auth check
-                                if let WsMessage::RevokeKey { ref auth_key } = ws_msg {
-                                    let _ = event_tx.send(AppEvent::WsKeyRevoke(client_id, auth_key.clone())).await;
+                                let Some(etx) = event_tx.as_ref() else { break };
+                                let forwarded = if let WsMessage::RevokeKey { ref auth_key } = ws_msg {
+                                    etx.send(AppEvent::WsKeyRevoke(client_id, auth_key.clone())).await
                                 } else if let WsMessage::RegenerateAuthKey = ws_msg {
-                                    let _ = event_tx.send(AppEvent::WsKeyRequest(client_id)).await;
+                                    etx.send(AppEvent::WsKeyRequest(client_id)).await
                                 } else {
-                                    let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
+                                    etx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await
+                                };
+                                if forwarded.is_err() {
+                                    // The Clay this connection belongs to is gone (an instance
+                                    // that ended): nothing more can be done for the client.
+                                    crate::http::log_remote_event("WS-INSTANCE-GONE", &client_ip, "the connection's Clay has ended");
+                                    break;
                                 }
                             } else {
                                 // Unauthenticated client trying to send non-auth messages - disconnect but don't ban
@@ -4345,7 +4284,15 @@ where
         let mut clients_guard = clients.write().unwrap();
         clients_guard.remove(&client_id);
     }
-    let _ = event_tx.send(AppEvent::WsClientDisconnected(client_id)).await;
+    if let Some(etx) = &event_tx {
+        let _ = etx.send(AppEvent::WsClientDisconnected(client_id)).await;
+    }
+    // Give the instance its connection back (a visitor's instance ends with it; that join
+    // is bounded but blocking, so off the async workers).
+    if let (Backend::Multi { attacher, .. }, Some(ticket)) = (&backend, ticket) {
+        let attacher = attacher.clone();
+        let _ = tokio::task::spawn_blocking(move || attacher.release(&ticket, client_id)).await;
+    }
 
     Ok(())
 }

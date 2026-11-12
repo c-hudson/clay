@@ -60,6 +60,7 @@ pub const WORLD_FIELD_DISCORD_CHANNEL_PICK: FieldId = FieldId(46);
 pub const WORLD_FIELD_CHAT_STATUS: FieldId = FieldId(47);
 /// MUD worlds: the Login Command, three lines run after Clay's auto-login.
 pub const WORLD_FIELD_LOGIN_COMMAND: FieldId = FieldId(48);
+pub const WORLD_FIELD_FIRST_COMMAND: FieldId = FieldId(49);
 
 // Button IDs
 pub const WORLD_BTN_SAVE: ButtonId = ButtonId(1);
@@ -112,15 +113,21 @@ impl WorldType {
     }
 }
 
-/// World type options
-pub fn world_type_options() -> Vec<SelectOption> {
-    vec![
+/// World type options. Shell is offered only by a server that can run one (built with
+/// the `shell-worlds` feature) or for a world that already is a shell world, so editing
+/// it never changes its type behind the user's back. It is the last entry, so leaving it
+/// out moves no other index.
+pub fn world_type_options(offer_shell: bool) -> Vec<SelectOption> {
+    let mut options = vec![
         SelectOption::new("mud", "MUD"),
         SelectOption::new("mud_timed_prompt", "MUD - Timed Prompt"),
         SelectOption::new("slack", "Slack"),
         SelectOption::new("discord", "Discord"),
-        SelectOption::new("shell", "Shell"),
-    ]
+    ];
+    if offer_shell {
+        options.push(SelectOption::new("shell", "Shell"));
+    }
+    options
 }
 
 /// Encoding options
@@ -173,6 +180,9 @@ pub struct WorldSettings {
     pub keep_alive_gag: String,
     /// The Login Command (`WorldSettings::login_command` in main.rs).
     pub login_command: String,
+    /// The First Command (`WorldSettings::first_command` in main.rs): sent before the
+    /// login, `%host%` = the connecting client's address.
+    pub first_command: String,
     pub gmcp_packages: String,
     pub auto_reconnect_secs: String,
     pub msp_enabled: bool,
@@ -197,6 +207,8 @@ pub struct WorldSettings {
     pub discord_channel: String,
     pub discord_channels: String,
     pub discord_dm_user: String,
+    /// The server can run a shell world (`App::server_shell_worlds`).
+    pub offer_shell: bool,
 }
 
 /// Create the world editor popup definition with current values
@@ -242,7 +254,7 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
         .with_field(Field::new(
             WORLD_FIELD_TYPE,
             "Type",
-            FieldKind::select(world_type_options(), world_type_idx),
+            FieldKind::select(world_type_options(settings.offer_shell || world_type.is_shell()), world_type_idx),
         ))
         // MUD fields
         .with_field(Field::new(
@@ -353,6 +365,12 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             WORLD_FIELD_LOGIN_COMMAND,
             "Login Cmd",
             FieldKind::multiline(&settings.login_command, 3),
+        ))
+        // Sent first, before the login; %host% is the connecting client's address.
+        .with_field(Field::new(
+            WORLD_FIELD_FIRST_COMMAND,
+            "First Cmd",
+            FieldKind::multiline(&settings.first_command, 2),
         ))
         // Slack fields
         .with_field(Field::new(
@@ -607,7 +625,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_TF_TYPE, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
         WORLD_FIELD_MSP_ENABLED,
         WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_STATUS_LINE,
-        WORLD_FIELD_LOGIN_COMMAND,
+        WORLD_FIELD_LOGIN_COMMAND, WORLD_FIELD_FIRST_COMMAND,
     ];
 
     // Slack fields
@@ -872,6 +890,27 @@ mod tests {
 
     /// The ##rand## warning shows under a Custom keepalive's command without it, and KA
     /// Gag's checkbox is its label, flipped in place.
+    #[test]
+    fn test_world_editor_offers_shell_only_where_it_can_run() {
+        let types = |settings: &WorldSettings| -> Vec<String> {
+            let def = create_world_editor_popup(settings);
+            match &def.get_field(WORLD_FIELD_TYPE).unwrap().kind {
+                FieldKind::Select { options, .. } => options.iter().map(|o| o.value.clone()).collect(),
+                other => panic!("the type is a select: {other:?}"),
+            }
+        };
+        let mud = WorldSettings { world_type: "mud".to_string(), ..Default::default() };
+        assert!(!types(&mud).contains(&"shell".to_string()), "a server without shell worlds offers none");
+        assert_eq!(types(&WorldSettings { offer_shell: true, ..mud }).last().map(String::as_str), Some("shell"));
+        // A shell world keeps its type, selected, wherever it is edited.
+        let shell = WorldSettings { world_type: "shell".to_string(), ..Default::default() };
+        let def = create_world_editor_popup(&shell);
+        match &def.get_field(WORLD_FIELD_TYPE).unwrap().kind {
+            FieldKind::Select { options, selected_index } => assert_eq!(options[*selected_index].value, "shell"),
+            other => panic!("the type is a select: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_world_editor_keep_alive_warning_and_gag() {
         let settings = WorldSettings {

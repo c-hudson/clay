@@ -86,7 +86,6 @@ impl Endpoints {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatOwner {
     World(String),
-    Multiuser { world_index: usize, username: String },
 }
 
 /// Discord session resume data, kept across transient drops and hot reload.

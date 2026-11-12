@@ -675,6 +675,8 @@
         worldEditKeepAliveGag: document.getElementById('world-edit-keep-alive-gag'),
         worldEditLoginCommandField: document.getElementById('world-edit-login-command-field'),
         worldEditLoginCommand: document.getElementById('world-edit-login-command'),
+        worldEditFirstCommandField: document.getElementById('world-edit-first-command-field'),
+        worldEditFirstCommand: document.getElementById('world-edit-first-command'),
         worldEditEncodingField: document.getElementById('world-edit-encoding-field'),
         worldEditEncodingSelect: document.getElementById('world-edit-encoding-select'),
         worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
@@ -847,6 +849,12 @@
     let ws = null;
     let authenticated = false;
     let multiuserMode = false;  // True when server is in multiuser mode
+    // InitialState's view of the server: a clay_web page (no commands, one world), whether
+    // it plays sound of its own, whether Change Password is answered (never on clay_multi,
+    // whose password.dat is the operator's).
+    let serverWebFront = false;
+    let serverSound = true;
+    let serverChangePassword = true;
     let pendingAuthPassword = null;  // Password being authenticated (saved on success for Android auto-login)
     let pendingAuthUsername = null;  // Username being authenticated (saved on success for Android auto-login)
     let deferredAutoLoginPassword = null;  // Saved password waiting for ServerHello
@@ -863,6 +871,19 @@
     let currentWorldIndex = 0;
     let versionMismatchShown = false;  // Warn on client/server version drift once per session, not every reconnect
     let serverVersionDetail = '';  // The server's build, for /version's Remote line (InitialState.server_version_detail)
+
+    // clay_web (the web-front build): a page onto one MUD world - no password, no commands
+    // (every typed line is text for the world), a six-item menu, a one-button Reconnect
+    // overlay; the server says so in the page (window.WEB_FRONT) and in InitialState.
+    const WEB_FRONT = window.WEB_FRONT === true;
+    if (WEB_FRONT && document.body) document.body.classList.add('web-front');
+    // Key actions a visitor's page has no use for: other worlds, the server's reload or
+    // quit, TF's expansion. Everything else (editing, scrolling, the toggles) stays.
+    const WEB_FRONT_BLOCKED_ACTIONS = new Set([
+        'world_next', 'world_prev', 'world_all_next', 'world_all_prev', 'world_activity', 'recent_worlds',
+        'world_previous', 'world_forward', 'world_socket_prev', 'world_socket_next', 'split_focus', 'bg_all_worlds',
+        'reload', 'quit', 'suspend', 'expand_line', 'show_version',
+    ]);
 
     // Check for world lock parameter in URL or injected by WebView
     var urlParams = new URLSearchParams(window.location.search);
@@ -977,6 +998,9 @@
     var resumeAsked = false;
     // The server answers RequestInfo (InitialState.info_report): /info opens a window.
     var serverInfoReport = false;
+    // The server can run a shell world (InitialState.shell_worlds; absent from an older
+    // server, which always could). A build without the shell-worlds feature says false.
+    var serverShellWorlds = true;
     let pendingReconnectCommand = null;  // Command to resend after reconnect
     // T1.12/D3: the world to resend to is remembered by NAME, not index. Indices
     // shift across a reconnect exactly like the InitialState focus resolution below
@@ -2347,6 +2371,35 @@
         try { localStorage.setItem(GUI_THEME_KEY, name); } catch (e) {}
     }
 
+    // clay_web: the visitor's own choice between the two themes the page carries
+    // (window.WEB_FRONT_THEMES, from theme.rs web_front_themes_json: dark = Dark - New,
+    // light = Light - New; user ruling 2026-11-11), remembered in this browser like the text
+    // size. The server's theme is not applied on a web-front page (the InitialState and
+    // GlobalSettingsUpdated theme blocks skip it), so a settings broadcast can't undo it.
+    const WEB_FRONT_THEME_KEY = 'clay_web_front_theme';
+    let webFrontThemes = null;
+    try {
+        if (WEB_FRONT && window.WEB_FRONT_THEMES && window.WEB_FRONT_THEMES !== 'null') webFrontThemes = JSON.parse(window.WEB_FRONT_THEMES);
+    } catch (e) { webFrontThemes = null; }
+    function webFrontThemeChoice() {
+        let choice = 'dark';
+        try { choice = localStorage.getItem(WEB_FRONT_THEME_KEY) || 'dark'; } catch (e) {}
+        return choice === 'light' ? 'light' : 'dark';
+    }
+    function applyWebFrontTheme(choice) {
+        if (!webFrontThemes || !webFrontThemes[choice]) return false;
+        applyThemeColors(JSON.stringify(webFrontThemes[choice]));
+        markGuiTheme(choice === 'light' ? 'light-new' : 'dark-new');
+        applyThemeAppearance();
+        const item = document.querySelector('#menu-dropdown .menu-web-theme');
+        if (item) item.textContent = choice === 'light' ? 'Dark Theme' : 'Light Theme';
+        try { localStorage.setItem(WEB_FRONT_THEME_KEY, choice); } catch (e) {}
+        return true;
+    }
+    function toggleWebFrontTheme() {
+        applyWebFrontTheme(webFrontThemeChoice() === 'light' ? 'dark' : 'light');
+    }
+
     // Apply the theme's lightness to the page (style.css `body.theme-light`) and, in the
     // Android app, to the system bars around it. Call it after the theme variables have
     // been written (applyThemeColors, ThemeCssVarsUpdated), since it reads them back.
@@ -2952,6 +3005,21 @@
         }
     }
 
+    // The world editor offers Shell only where the server can run one, or for a world
+    // that already is a shell world (so editing never changes its type). The phone and
+    // tablet pages' custom dropdown is a copy of the select's items, hidden alike.
+    function offerShellWorldType(offer) {
+        const select = elements.worldEditTypeSelect;
+        if (!select) return;
+        const option = select.querySelector('option[value="shell"]');
+        if (option) {
+            option.hidden = !offer;
+            option.disabled = !offer;
+        }
+        const item = select._customMenu && select._customMenu.querySelector('.custom-dropdown-item[data-value="shell"]');
+        if (item) item.style.display = offer ? '' : 'none';
+    }
+
     // Destroy custom dropdowns (restore native selects)
     function destroyCustomDropdowns() {
         document.querySelectorAll('.custom-dropdown').forEach(wrapper => {
@@ -3249,6 +3317,8 @@
             if (cachedTheme) document.body.dataset.guiTheme = cachedTheme;
         } catch (e) {}
         applyThemeAppearance();
+        // clay_web: the visitor's remembered Light/Dark choice, before the first InitialState.
+        if (WEB_FRONT) applyWebFrontTheme(webFrontThemeChoice());
         const themeVarsEl = document.getElementById('theme-vars');
         if (themeVarsEl && window.MutationObserver) {
             new MutationObserver(function() { applyThemeAppearance(); })
@@ -3516,7 +3586,11 @@
             // tunnel's or the GUI proxy's local end). To anything else it would carry
             // the login and every settings message in cleartext - and a hostile network
             // can answer it in the server's place - so a remote host is wss-only.
-            var hostProtos = isLoopbackHost(h) ? protos : protos.filter(function(p) { return p !== 'ws'; });
+            // clay_web's page served over plain http (no certificate in web.dat) is the
+            // one exception: the page itself came in the clear and a visitor sends no
+            // password, so ws:// back to the server it came from gives nothing away.
+            var plainWebFront = WEB_FRONT && window.location.protocol === 'http:';
+            var hostProtos = (isLoopbackHost(h) || plainWebFront) ? protos : protos.filter(function(p) { return p !== 'ws'; });
             if (hostProtos.length === 0) hostProtos = ['wss'];
             hostProtos.forEach(function(p) {
                 paths.forEach(function(wsPath) {
@@ -3536,6 +3610,9 @@
         connectionFailures = 0;
         hideCertWarning();
         setTimeout(hideConnectionLog, 800);
+
+        // clay_web: no password; the login goes out when the ServerHello arrives.
+        if (WEB_FRONT) return;
 
         if (window.AUTO_PASSWORD) {
             ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid, instance_id: clayInstanceId, interface_key: fontProfileKey }));
@@ -3736,6 +3813,12 @@
                 clearTimeout(w._history.inflight.timer);
                 w._history.inflight = null;
             }
+        }
+
+        // clay_web: no retry loop; the page says so and offers Reconnect.
+        if (WEB_FRONT) {
+            webFrontDisconnected('The connection to the server was lost.');
+            return;
         }
 
         if (reloadReconnect) {
@@ -4211,9 +4294,13 @@
                     elements.authError.textContent = 'Server sent no authentication challenge - not sending credentials';
                     break;
                 }
-                // Try auth key first (if not multiuser mode - keys are single-user only)
+                if (WEB_FRONT) {
+                    authenticateAnonymously();
+                    break;
+                }
+                // Try auth key first (a clay_multi server names the user by the key).
                 // Skip if keyAuthFailed: key was rejected this session, go straight to password
-                if (!msg.multiuser_mode && authKey && !keyAuthFailed && tryAuthWithKey()) {
+                if (authKey && !keyAuthFailed && tryAuthWithKey()) {
                     // Key auth attempt sent, cancel any deferred password auth
                     deferredAutoLoginPassword = null;
                     break;
@@ -4384,6 +4471,21 @@
                 setSessionPaused(false);
                 // The server answers RequestInfo: /info shows its report in a window.
                 serverInfoReport = !!msg.info_report;
+                serverShellWorlds = msg.shell_worlds !== false;
+                serverWebFront = !!msg.web_front;
+                serverSound = msg.server_sound !== false;
+                serverChangePassword = msg.change_password !== false;
+                updateMultiuserUI();
+                if (WEB_FRONT) {
+                    // The page opens on its world connecting: no splash, and the text size
+                    // this browser chose last time.
+                    (msg.worlds || []).forEach(function(w) { if (w) w.showing_splash = false; });
+                    setTimeout(function() {
+                        let saved = null;
+                        try { saved = parseFloat(localStorage.getItem('clay_web_front_font')); } catch (e) {}
+                        if (saved && saved > 0) setFontSize(saved, false);
+                    }, 0);
+                }
                 // The server takes OtherViews (a split's other pane).
                 serverTakesOtherViews = !!msg.other_views;
                 lastOtherViewsSent = null;
@@ -4958,11 +5060,13 @@
                         separatorStyle = msg.settings.separator_style;
                         renderTfStatus();  // TF's line, if shown, takes the new look
                     }
-                    if (msg.settings.gui_theme !== undefined) {
+                    // clay_web: the page keeps the visitor's own Light/Dark choice
+                    // (applyWebFrontTheme); the server's theme is not applied.
+                    if (msg.settings.gui_theme !== undefined && !WEB_FRONT) {
                         guiTheme = msg.settings.gui_theme;
                         markGuiTheme(guiTheme);
                     }
-                    if (msg.settings.theme_colors_json) {
+                    if (msg.settings.theme_colors_json && !WEB_FRONT) {
                         applyThemeColors(msg.settings.theme_colors_json);
                         if (window.Android && window.Android.saveThemeCss) {
                             const el = document.getElementById('theme-vars');
@@ -5368,8 +5472,10 @@
                         const appendBatchPrev = beginAppendBatch();
                         rawLines.forEach((line, rawIdx) => {
                             // Skip lines that are ONLY ANSI codes with no visible content
-                            // (e.g., trailing reset codes after newlines), but keep blank lines
-                            if (line.length > 0 && line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0) {
+                            // (e.g., trailing reset codes after newlines), but keep blank
+                            // lines - and the ones a background colour makes a blank row,
+                            // as the console does (isFillerLine).
+                            if (isFillerLine(line)) {
                                 return;
                             }
                             // The keepalive's reply is a gagged line (the server sends it so;
@@ -5538,6 +5644,10 @@
                         if (msg.world_index === currentWorldIndex) renderOutput();
                     }
                     updateStatusBar();
+                    // clay_web: the one world ended (the game quit, or dropped the line).
+                    if (WEB_FRONT && msg.world_index === 0) {
+                        webFrontDisconnected('Disconnected from ' + (worlds[0].name || 'the game') + '.');
+                    }
                 }
                 break;
 
@@ -5879,11 +5989,13 @@
                         separatorStyle = msg.settings.separator_style;
                         renderTfStatus();  // TF's line, if shown, takes the new look
                     }
-                    if (msg.settings.gui_theme !== undefined) {
+                    // clay_web: the page keeps the visitor's own Light/Dark choice
+                    // (applyWebFrontTheme); the server's theme is not applied.
+                    if (msg.settings.gui_theme !== undefined && !WEB_FRONT) {
                         guiTheme = msg.settings.gui_theme;
                         markGuiTheme(guiTheme);
                     }
-                    if (msg.settings.theme_colors_json) {
+                    if (msg.settings.theme_colors_json && !WEB_FRONT) {
                         applyThemeColors(msg.settings.theme_colors_json);
                         if (window.Android && window.Android.saveThemeCss) {
                             const el = document.getElementById('theme-vars');
@@ -7758,6 +7870,48 @@
 
     // Authenticate - sends directly via ws.send since authenticated is still false
     // passwordOverride and usernameOverride are used for Android auto-login
+    // clay_web: every visitor is logged in without a password; the server attaches the
+    // page to a Clay of its own and connects its one world. Nothing of an earlier visit
+    // is resumed: a new Clay has a sequence space of its own (seq_epoch tells the page).
+    function authenticateAnonymously() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: '', username: null, request_key: false, challenge_response: true,
+            resume: [], resume_epochs: [], client_version: clientVersion(), client_uid: clientUid, instance_id: clayInstanceId, interface_key: fontProfileKey }));
+    }
+
+    // clay_web's one notice: the world or the connection ended. One button: Reconnect.
+    // Closing the page is the browser's own close.
+    function webFrontDisconnected(text) {
+        const title = elements.reconnectModal.querySelector('h2');
+        if (title) title.textContent = 'Disconnected';
+        const p = document.getElementById('reconnect-text');
+        if (p) p.textContent = text + ' Reconnect, or close the page.';
+        if (elements.reconnectCancelBtn) elements.reconnectCancelBtn.style.display = 'none';
+        pendingReconnectCommand = null;
+        pendingReconnectWorldName = null;
+        showReconnectModal();
+    }
+
+    // clay_web's Help: what the page does, nothing about commands or settings it has not.
+    function buildWebFrontHelpHtml() {
+        const touch = deviceMode !== 'desktop' && !desktopInputAttached();
+        const rows = [
+            ['Typing', 'Everything you type goes to the game as it is. Up and Down recall what you typed before' + (touch ? '; hold the arrow buttons for history' : '') + '.'],
+            ['Catching up', (touch ? 'PgUp and PgDn scroll; when output is held back, PgDn releases a screenful.' : 'Page Up and Page Down scroll; Tab or Page Down releases held-back output.')],
+            ['Find and Search', 'Find (F4) shows only the lines that match; Search History (F5) jumps to a line.'],
+            ['Tags and emoji', 'Toggle Tags (F2) shows or hides tagged lines; Emoji Picker inserts an emoji into what you are typing.'],
+            ['Theme', 'Light Theme / Dark Theme in the menu switches the page\'s colours; the choice is remembered here.'],
+            ['Text size', 'The slider on the bar sets the text size for this page; it is remembered here.'],
+            ['Disconnected', 'When the game or the connection ends, a notice offers Reconnect. Closing the page ends the session.'],
+        ];
+        let html = '<div class="help-quickstart">';
+        for (const [title, desc] of rows) {
+            html += '<div class="help-card"><div><h3>' + escapeHtml(title) + '</h3><p>' + escapeHtml(desc) + '</p></div></div>';
+        }
+        html += '</div>';
+        return html;
+    }
+
     function authenticate(passwordOverride, usernameOverride) {
         // Trim password to remove any trailing spaces from Android keyboard
         const rawPassword = passwordOverride || elements.authPassword.value;
@@ -8023,6 +8177,23 @@
         if (worlds[currentWorldIndex] && worlds[currentWorldIndex].showing_splash) {
             worlds[currentWorldIndex].showing_splash = false;
             renderOutput();
+        }
+
+        // clay_web: every typed line is text for the one world, a /command included.
+        if (WEB_FRONT) {
+            if (!send({ type: 'SendCommand', world_index: 0, command: cmd })) {
+                webFrontDisconnected('The connection to the server was lost.');
+                return;
+            }
+            const maskedWorld = worlds[0] && worlds[0].echo_masked;
+            if (cmd.length > 0 && !maskedWorld) {
+                commandHistory.push(cmd);
+                if (commandHistory.length > 1000) commandHistory.shift();
+            }
+            historyIndex = -1;
+            elements.input.value = '';
+            elements.prompt.textContent = '';
+            return;
         }
 
         // TF's "^old^new" (InputArea::substitute_history on the Rust side): re-run the
@@ -10605,6 +10776,12 @@
     function openHelpPopup() {
         if (openInPopupWindow('help', null)) return;
         helpPopupOpen = true;
+        if (WEB_FRONT) {
+            if (elements.helpTitle) elements.helpTitle.textContent = 'Help';
+            elements.helpContent.innerHTML = buildWebFrontHelpHtml();
+            elements.helpModal.classList.add('visible');
+            return;
+        }
         // Name the build in the title bar - on web/GUI/Android this is the only place the
         // client's own version is visible (the console has /version and its startup banner).
         if (elements.helpTitle) {
@@ -11364,6 +11541,9 @@
         w._optimisticClaim = guessed.size ? { seqs: guessed, at: Date.now() } : null;
     }
 
+    // Rust's char::is_whitespace (the White_Space property), which JS's \s is not quite.
+    const FILLER_SPACE = /[\t-\r \x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/;
+
     // A line that is only escape codes (a trailing reset after a newline) or an idler
     // keep-alive marker: never drawn, on any path. The live path drops these on arrival; one
     // that comes back through InitialState, a scrollback load or a resync is kept (its seq is
@@ -11371,9 +11551,60 @@
     // A line never drawn, F2 or not: one that is only escape codes. The keepalive's reply is
     // not one of these: it is a gagged line, shown under F2 like any other (it used to be
     // hidden here for good).
+    // The rule is the console's (encoding.rs is_ansi_only_line, a test pins the two): escape
+    // codes and spaces only, with at least one escape - unless one sets a background
+    // colour, which makes the line a blank row. This had a rule of its own with no such
+    // exception, so a MUD whose blank lines are colour codes ending in ESC[40m lost every
+    // one of them here while the console and telnet showed them, and the server - which
+    // counts rows as the console draws them - held one back for a More that then released
+    // nothing (user report 2026-11-11).
     function isFillerLine(text) {
         const line = String(text).replace(/[\r\n]+/g, '');
-        return line.length > 0 && line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0;
+        let hasAnsi = false, inEscape = false, inCsi = false;
+        for (const c of line) {
+            if (c === '\x1b') {
+                hasAnsi = true;
+                inEscape = true;
+                inCsi = false;
+            } else if (inEscape && !inCsi) {
+                if (c === '[') inCsi = true;
+                else inEscape = false;
+            } else if (inCsi) {
+                // A CSI sequence runs to its final byte (0x40-0x7E).
+                if (c >= '@' && c <= '~') {
+                    inEscape = false;
+                    inCsi = false;
+                }
+            } else if (!FILLER_SPACE.test(c)) {
+                return false;
+            }
+        }
+        return hasAnsi && !hasBackgroundColor(line);
+    }
+
+    // Whether a line sets a background colour (encoding.rs has_background_color, step for
+    // step): 40-47, 100-107, or a 48 (256-colour / true-colour) parameter after an ESC[.
+    function hasBackgroundColor(line) {
+        const chars = Array.from(line);
+        let i = 0;
+        while (i < chars.length) {
+            if (chars[i++] !== '\x1b') continue;
+            // What follows an ESC is taken whether it is the '[' or not.
+            if (chars[i++] !== '[') continue;
+            let params = '';
+            while (i < chars.length) {
+                const ch = chars[i];
+                if (ch === 'm') { i++; break; }
+                if ((ch >= '0' && ch <= '9') || ch === ';') { params += ch; i++; }
+                else break;
+            }
+            for (const param of params.split(';')) {
+                if (param === '48') return true;
+                const n = param.length > 0 ? Number(param) : NaN;
+                if ((n >= 40 && n <= 47) || (n >= 100 && n <= 107)) return true;
+            }
+        }
+        return false;
     }
 
     // The MUD's reply to a keepalive holding its marker (telnet.rs has_keep_alive_marker).
@@ -14216,9 +14447,9 @@
         }
 
         // × hides it for this world (its own switch, through /stats hide): only where the
-        // server has the switch, and never on a multiuser server (its worlds are its operator's).
+        // server has the switch (a clay_multi user's worlds are their own).
         if (elements.statsPanelHide) {
-            const canHide = typeof (world.settings && world.settings.status_panel) === 'boolean' && !multiuserMode;
+            const canHide = typeof (world.settings && world.settings.status_panel) === 'boolean';
             elements.statsPanelHide.style.display = canHide ? '' : 'none';
             if (canHide) {
                 const label = 'Hide for ' + (world.name || 'this world');
@@ -14799,6 +15030,10 @@
     }
 
     function showConnectionLog() {
+        if (WEB_FRONT) {
+            webFrontDisconnected('The server cannot be reached.');
+            return;
+        }
         var modal = document.getElementById('connection-log-modal');
         if (modal) modal.style.display = 'flex';
     }
@@ -15136,40 +15371,24 @@
         } catch(e) {}
     }
 
-    // Update UI based on multiuser mode
+    // Update UI based on multiuser mode. A clay_multi user has a full Clay of their own -
+    // worlds, the world editor and the map are theirs - so only what is the server
+    // operator's goes: Change Password (password.dat is read-only; InitialState says so)
+    // and the server's own web settings (/web; the Settings' Web tab keeps the user's Auth
+    // Key alone, see showOnlyThisInterfacesSettings).
     function updateMultiuserUI() {
-        // Show/hide change password menu item
         document.querySelectorAll('.menu-change-password').forEach(el => {
-            el.style.display = multiuserMode ? '' : 'none';
+            el.style.display = (multiuserMode && serverChangePassword) ? '' : 'none';
         });
-        // Edit World: multiuser has no world editing
-        document.querySelectorAll('.menu-edit-world').forEach(el => {
-            el.style.display = multiuserMode ? 'none' : '';
-        });
-        // Map: multiuser has no map
-        document.querySelectorAll('.menu-map').forEach(el => {
-            el.style.display = multiuserMode ? 'none' : '';
-        });
-
-        // Show/hide logout menu item and its divider
         document.querySelectorAll('.menu-logout').forEach(el => {
             el.style.display = multiuserMode ? '' : 'none';
         });
         document.querySelectorAll('.menu-logout-divider').forEach(el => {
             el.style.display = multiuserMode ? '' : 'none';
         });
-
-        // In multiuser mode, hide world editor buttons (Add, Edit, Delete)
-        if (multiuserMode) {
-            if (elements.worldAddBtn) elements.worldAddBtn.style.display = 'none';
-            if (elements.worldEditBtn) elements.worldEditBtn.style.display = 'none';
-            if (elements.worldEditDeleteBtn) elements.worldEditDeleteBtn.style.display = 'none';
-
-            // Hide web settings menu item
-            document.querySelectorAll('[data-action="web"]').forEach(el => {
-                el.style.display = 'none';
-            });
-        }
+        document.querySelectorAll('[data-action="web"]').forEach(el => {
+            el.style.display = multiuserMode ? 'none' : '';
+        });
     }
 
     // Enable multiuser mode UI (show username field in auth modal)
@@ -16188,10 +16407,6 @@
     }
 
     function openSettingsPopup(tab) {
-        if (tab === 'web' && multiuserMode) {
-            appendClientLine('Web settings are disabled in multiuser mode.', currentWorldIndex, 'system');
-            return;
-        }
         // The desktop GUI opens Settings in its own window (see popupWindowMode);
         // the Settings window itself shows the popup in place.
         if (openInPopupWindow('settings', tab || 'general')) return;
@@ -16454,6 +16669,14 @@
             const row = el && el.closest('.setting-row');
             if (row) row.style.display = r[1] ? '' : 'none';
         });
+        // A clay_multi user's Web tab is their Auth Key alone (and Modify Key beside it):
+        // the server's port, path, password, certificate, allow list and reachability are
+        // its operator's, and a save there changes none of them.
+        if (multiuserMode) {
+            document.querySelectorAll('#settings-web .setting-row').forEach(function(row) {
+                if (!row.querySelector('#web-auth-key')) row.style.display = 'none';
+            });
+        }
     }
 
     // Build an UpdateGlobalSettings message with current state
@@ -16553,6 +16776,8 @@
     // the server persists immediately, in ~/.clay/settings.dat). See CLAUDE.md /
     // settings-audit investigation for the incident this guards against.
     function sendGlobalSettings() {
+        // clay_web: the settings are the operator's; the page changes only its own text size.
+        if (WEB_FRONT) return;
         if (!settingsSynced) {
             console.warn('Clay: suppressed UpdateGlobalSettings push before initial settings sync');
             return;
@@ -17605,11 +17830,6 @@
     }
 
     function openWorldEditorPopup(worldIndex) {
-        // Block world editing in multiuser mode
-        if (multiuserMode) {
-            appendClientLine('World editing is disabled in multiuser mode.', currentWorldIndex, 'system');
-            return;
-        }
         if (worldIndex < 0 || worldIndex >= worlds.length) return;
         if (isActivityWorld(worldIndex)) {
             appendClientLine("The Activity world can't be edited.", currentWorldIndex, 'system');
@@ -17627,6 +17847,7 @@
         elements.worldEditorTitle.textContent = 'World Editor';
         elements.worldEditName.value = world.name || '';
         const worldType = world.settings?.world_type || 'mud';
+        offerShellWorldType(serverShellWorlds || worldType === 'shell');
         elements.worldEditTypeSelect.value = worldType;
         updateCustomDropdown(elements.worldEditTypeSelect);
         // Number.isFinite (not `|| 1000`) so an explicit 0 survives - 0 is a real,
@@ -17692,6 +17913,7 @@
         elements.worldEditKeepAliveGagEnabled.checked = !!world.settings?.keep_alive_gag_enabled;
         elements.worldEditKeepAliveGag.value = world.settings?.keep_alive_gag || '';
         elements.worldEditLoginCommand.value = world.settings?.login_command || '';
+        elements.worldEditFirstCommand.value = world.settings?.first_command || '';
         if (elements.worldEditGmcpPackages) {
             elements.worldEditGmcpPackages.value = world.settings?.gmcp_packages || '';
         }
@@ -17799,7 +18021,7 @@
         'worldEditKeepAliveField', 'worldEditEncodingField', 'worldEditGmcpField',
         'worldEditMspEnabledField',
         'worldEditMcpEnabledField', 'worldEditMccp2EnabledField', 'worldEditStatusPanelField',
-        'worldEditLoginCommandField'
+        'worldEditLoginCommandField', 'worldEditFirstCommandField'
     ];
     const WORLD_EDIT_SLACK_FIELD_IDS = [
         'worldEditSlackTokenField', 'worldEditSlackAppTokenField', 'worldEditSlackWorkspaceField',
@@ -17905,6 +18127,7 @@
             keep_alive_gag_enabled: elements.worldEditKeepAliveGagEnabled.checked,
             keep_alive_gag: elements.worldEditKeepAliveGag.value,
             login_command: elements.worldEditLoginCommand.value,
+            first_command: elements.worldEditFirstCommand.value,
             gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : '',
             auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0',
             msp_enabled: elements.worldEditMspEnabledToggle.classList.contains('active'),
@@ -17952,6 +18175,7 @@
         world.settings.keep_alive_gag_enabled = elements.worldEditKeepAliveGagEnabled.checked;
         world.settings.keep_alive_gag = elements.worldEditKeepAliveGag.value;
         world.settings.login_command = elements.worldEditLoginCommand.value;
+        world.settings.first_command = elements.worldEditFirstCommand.value;
         if (elements.worldEditGmcpPackages) {
             world.settings.gmcp_packages = elements.worldEditGmcpPackages.value;
         }
@@ -18763,7 +18987,12 @@
     // clears a pending kbnum, whether or not it actually consumed one (tf-help #kbnum) -
     // mirrors input_handler::dispatch_action's own wrapper exactly, and is what makes
     // bell/^G cancel a pending prefix without honoring it, with no special case in 'bell'.
+    // The actions a browser's own key handling must keep when Clay doesn't act on them:
+    // Ctrl+plus/minus/0 are the browser's page zoom (the native GUI zooms its window).
+    const ZOOM_ACTIONS = new Set(['zoom_in', 'zoom_out', 'zoom_reset']);
+
     function dispatchAction(actionId) {
+        if (WEB_FRONT && WEB_FRONT_BLOCKED_ACTIONS.has(actionId)) return true;
         try {
             const result = dispatchActionImpl(actionId);
             if (!KBNUM_SETTING_ACTIONS.has(actionId)) {
@@ -19276,6 +19505,15 @@
             case 'bg_all_worlds':
                 return true;
 
+            // Zoom (^+/^-/^0): the native GUI's window and its text together, per window
+            // (src/zoom.rs). Ruled out here 2026-11-10: a browser tab keeps its own page
+            // zoom (the key handlers leave the browser's default alone for these three,
+            // ZOOM_ACTIONS) and the WebView GUI does nothing.
+            case 'zoom_in':
+            case 'zoom_out':
+            case 'zoom_reset':
+                return false;
+
             // System
             case 'help':
                 if (helpPopupOpen) closeHelpPopup(); else openHelpPopup();
@@ -19358,6 +19596,13 @@
 
             // Clay Extensions
             case 'toggle_tags':
+                // clay_web: the page's own switch (a /tag typed there is text for the game).
+                if (WEB_FRONT) {
+                    showTags = !showTags;
+                    updateTagsTileState();
+                    renderOutput();
+                    return true;
+                }
                 // show_tags is server-owned state (broadcast to all clients on
                 // change) - send /tag rather than flipping it locally, so the
                 // ShowTagsChanged broadcast is the single source of truth.
@@ -19455,6 +19700,7 @@
     // position is moved rather than juggled via flex `order` on every sibling - simpler, and
     // it can't affect unrelated layout.
     function applyTabsMode(mode) {
+        if (WEB_FRONT) mode = 'none';
         tabsMode = mode;
         const ribbon = elements.tabsRibbon;
         if (!ribbon) return;
@@ -19511,6 +19757,7 @@
     // just above the status bar (below a bottom tab strip); left/right, the outermost column
     // of #main-row (.icon-bar-vertical). Moved in the DOM like the tabs ribbon (applyTabsMode).
     function applyIconBarPlace(place) {
+        if (WEB_FRONT) place = 'none';
         iconBarPlace = place;
         const bar = elements.iconBar;
         if (!bar) return;
@@ -19823,7 +20070,18 @@
             case 'keybind-editor':
                 openEditorPage('keybind-editor');
                 break;
+            case 'web-theme':
+                // clay_web: Dark - New / Light - New, this browser's choice.
+                toggleWebFrontTheme();
+                break;
             case 'toggle-tags':
+                // clay_web: the page's own switch (a /tag typed there is text for the game).
+                if (WEB_FRONT) {
+                    showTags = !showTags;
+                    updateTagsTileState();
+                    renderOutput();
+                    break;
+                }
                 // show_tags is server-owned state - route through /tag like the
                 // toggle_tags keybinding does, instead of mutating locally.
                 send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/tag' });
@@ -19958,7 +20216,10 @@
         updateStatusBar();
 
         // Save to server so it persists across sessions
-        if (sendToServer && authenticated) {
+        if (WEB_FRONT) {
+            try { localStorage.setItem('clay_web_front_font', String(px)); } catch (e) {}
+        }
+        if (sendToServer && authenticated && !WEB_FRONT) {
             sendGlobalSettings();
         }
 
@@ -21249,9 +21510,12 @@
                     }
                     const action = lookupBinding(name);
                     if (action) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        dispatchAction(action);
+                        const handled = dispatchAction(action);
+                        // A zoom key Clay doesn't act on here stays the browser's own.
+                        if (handled || !ZOOM_ACTIONS.has(action)) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                        }
                         // Same reasoning as above - dispatchAction('emoji_picker')
                         // synchronously opens the popup and focuses its search box;
                         // refocusing the command input here would immediately steal
@@ -21581,6 +21845,12 @@
         // Reconnect modal buttons (shown when send fails due to disconnection)
         elements.reconnectBtn.onclick = function() {
             hideReconnectModal();
+            // clay_web, still attached: the world ended, not the connection - connect it
+            // again (the server sends the First Command afresh).
+            if (WEB_FRONT && authenticated && ws && ws.readyState === WebSocket.OPEN) {
+                send({ type: 'ConnectWorld', world_index: 0 });
+                return;
+            }
             forceReconnect();
         };
         elements.reconnectCancelBtn.onclick = function() {
@@ -21765,7 +22035,6 @@
         document.querySelectorAll('.settings-tab-btn').forEach(function(btn) {
             btn.onclick = function() {
                 if (!btn.dataset.tab) return;
-                if (btn.dataset.tab === 'web' && multiuserMode) return;
                 switchSettingsTab(btn.dataset.tab);
             };
         });

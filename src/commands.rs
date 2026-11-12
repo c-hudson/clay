@@ -1065,8 +1065,11 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     return false;
                 }
                 WorldType::Shell => {
-                    // A local terminal (crate::shell); reports back via AppEvent::Shell.
-                    app.add_output("Starting shell...");
+                    // A local terminal (crate::shell); reports back via AppEvent::Shell. A
+                    // build without shell worlds says so instead (`spawn_shell_connect`).
+                    if cfg!(feature = "shell-worlds") {
+                        app.add_output("Starting shell...");
+                    }
                     let idx = app.current_world_index;
                     app.spawn_shell_connect(idx);
                     return false;
@@ -1122,7 +1125,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
             app.fire_tf_hook(Some(pending_world), tf::TfHookEvent::Pending, &pending_arg, false);
 
-            // Spawn connection in background to avoid blocking the UI
+            // Spawn connection in background to avoid blocking the UI. The console's own
+            // connect: a First Command's %host% is this machine.
+            app.current_world_mut().connect_ip = Some("127.0.0.1".to_string());
             app.current_world_mut().connection_id += 1;
             let reader_conn_id = app.current_world().connection_id;
             let diag = app.current_world_mut().protocol.new_diag();
@@ -1136,6 +1141,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             // `app` access - for TelnetConfig::msp_enabled.
             let msp_enabled = app.current_world().settings.msp_enabled;
             let mccp2_enabled = app.current_world().settings.mccp2_enabled;
+            let gmcp_enabled = app.policy.gmcp;
             // Job 13 (plan Phase 4, 4.4): same reasoning, for spawn_telnet_writer's
             // initial encoding.
             let initial_encoding = app.current_world().effective_encoding();
@@ -1153,7 +1159,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     // FANSI detection and skip_auto_login, which the proxy helper doesn't).
                     match crate::daemon::connect_via_tls_proxy(
                         &world_name, &connect_host, &connect_port, &proxy_settings,
-                        event_tx_connect.clone(), reader_conn_id, true, Some(diag.clone()),
+                        event_tx_connect.clone(), reader_conn_id, true, gmcp_enabled, Some(diag.clone()),
                     ).await {
                         Ok((cmd_tx, proxy_pid, proxy_path)) => {
                             let _ = event_tx_connect.send(AppEvent::WorldConnectResult(
@@ -1282,6 +1288,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                                     msp_enabled,
                                     mccp2_enabled,
+                                    gmcp_enabled,
                                     // Job 12 (plan Phase 4, 4.1): `is_tls` here is the bool the
                                     // connection_result match just destructured (true for the TLS
                                     // arm, false for the plain arm).
@@ -2230,11 +2237,7 @@ pub(crate) fn set_chat_send_to(app: &mut App, idx: usize, kind: crate::chat::Cha
         crate::chat::ChatKind::Discord => app.worlds[idx].settings.discord_channel = value,
         crate::chat::ChatKind::Slack => app.worlds[idx].settings.slack_channel = value,
     }
-    if app.multiuser_mode {
-        let _ = persistence::save_multiuser_settings(app);
-    } else {
-        let _ = persistence::save_settings(app);
-    }
+    let _ = persistence::save_settings(app);
 }
 
 /// Execute `/chat` (aliases `/discord`, `/slack`) for a single-user world - shared by

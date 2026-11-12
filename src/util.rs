@@ -2105,3 +2105,33 @@ mod tests {
         assert_eq!(super::format_local_time(&lt, "%H%"), "14%");
     }
 }
+
+/// A client's address as a First Command's `%host%` shows it: an IPv4 address mapped
+/// into IPv6 (`::ffff:1.2.3.4`, how a dual-stack listener reports an IPv4 peer) becomes
+/// `1.2.3.4`; anything else is kept as given.
+pub fn normalize_client_ip(ip: &str) -> String {
+    let trimmed = ip.trim();
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        Ok(addr) => addr.to_string(),
+        Err(_) => trimmed.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::normalize_client_ip;
+
+    #[test]
+    fn mapped_ipv4_is_shown_as_ipv4() {
+        assert_eq!(normalize_client_ip("::ffff:192.168.2.6"), "192.168.2.6");
+        assert_eq!(normalize_client_ip("::ffff:c0a8:206"), "192.168.2.6");
+        assert_eq!(normalize_client_ip("192.168.2.6"), "192.168.2.6");
+        assert_eq!(normalize_client_ip("fe80::1"), "fe80::1");
+        assert_eq!(normalize_client_ip(" 10.0.0.1 "), "10.0.0.1");
+        assert_eq!(normalize_client_ip("not-an-ip"), "not-an-ip");
+    }
+}

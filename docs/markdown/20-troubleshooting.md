@@ -249,7 +249,7 @@ Common issues and their solutions.
 **Symptoms:** Link errors
 
 **Solutions:**
-1. Use `--no-default-features --features ssh-transport` for minimal
+1. Use `--no-default-features --features ssh-transport,shell-worlds` for minimal
    deps (add `,ssh-transport` or `--ssh` silently stops working instead of erroring)
 2. Check platform-specific requirements
 3. Update Rust: `rustup update`
@@ -280,10 +280,12 @@ Or start fresh - Clay creates defaults on startup.
 
 ### Clay Closed Unexpectedly
 
-Every Clay - the console, a GUI, `-D`, `--multiuser` - writes how it ended to
+Every Clay - the console, a GUI, `-D`, `clay_multi` - writes how it ended to
 `~/.clay/debug.log` (`~/clay/debug.log` on Windows), whether Debug mode is on or not. When
 Clay closes without warning, send the log from the last `=== Clay` banner before that time,
 and on Linux the kernel's log around it (`journalctl -k --since "<the session's start>"`).
+`clay_web` keeps no debug.log: it reports the same lines on stderr, where its service
+manager keeps them (see the Web Gateway chapter).
 
 The lines to look for:
 

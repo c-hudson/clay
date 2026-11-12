@@ -62,10 +62,6 @@ pub enum TelnetTarget {
     /// Single-user (or daemon direct-connect) world, identified by name —
     /// mirrors `AppEvent::ServerData(String, ..)` and friends.
     World(String),
-    /// A multiuser server's per-user connection to a world, identified by
-    /// the world's global index plus the connecting username — mirrors
-    /// `AppEvent::MultiuserServerData(usize, String, ..)` and friends.
-    Multiuser { world_index: usize, username: String },
 }
 
 /// Build the `AppEvent` that carries plain server text for `target`. Not
@@ -74,12 +70,8 @@ pub enum TelnetTarget {
 /// per-target-shape branch, so it lives next to `to_app_event` rather than
 /// inline in the reader loop.
 fn make_server_data_event(target: &TelnetTarget, bytes: Vec<u8>) -> AppEvent {
-    match target {
-        TelnetTarget::World(name) => AppEvent::ServerData(name.clone(), bytes),
-        TelnetTarget::Multiuser { world_index, username } => {
-            AppEvent::MultiuserServerData(*world_index, username.clone(), bytes)
-        }
-    }
+    let TelnetTarget::World(name) = target;
+    AppEvent::ServerData(name.clone(), bytes)
 }
 
 /// Why a connection ended - carried to the App so TF's DISCONNECT hook gets its reason
@@ -147,19 +139,9 @@ pub fn error_text(e: &std::io::Error) -> String {
 /// Multiuser has no TF hooks and no connection id: its message goes out as plain server
 /// text, as it always has, except when the writer stopped (a disconnect asked for).
 async fn report_close(event_tx: &mpsc::Sender<AppEvent>, target: &TelnetTarget, conn_id: u64, reason: CloseReason) {
-    match target {
-        TelnetTarget::World(name) => {
-            let _ = event_tx.send(AppEvent::CloseNotice(name.clone(), conn_id, reason.clone())).await;
-            let _ = event_tx.send(AppEvent::Disconnected(name.clone(), conn_id, reason)).await;
-        }
-        TelnetTarget::Multiuser { world_index, username } => {
-            if reason != CloseReason::SendFailed {
-                let text = format!("{}\n", reason.message()).into_bytes();
-                let _ = event_tx.send(AppEvent::MultiuserServerData(*world_index, username.clone(), text)).await;
-            }
-            let _ = event_tx.send(AppEvent::MultiuserDisconnected(*world_index, username.clone())).await;
-        }
-    }
+    let TelnetTarget::World(name) = target;
+    let _ = event_tx.send(AppEvent::CloseNotice(name.clone(), conn_id, reason.clone())).await;
+    let _ = event_tx.send(AppEvent::Disconnected(name.clone(), conn_id, reason)).await;
 }
 
 /// Wrap `ev` as an `AppEvent::Telnet(target.clone(), ev)` - the "just forward it,
@@ -266,59 +248,6 @@ pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> 
             },
             TelnetEvent::EchoOff => forward_via_telnet(target, TelnetEvent::EchoOff),
             TelnetEvent::EchoOn => forward_via_telnet(target, TelnetEvent::EchoOn),
-            TelnetEvent::MspTrigger(trigger) => forward_via_telnet(target, TelnetEvent::MspTrigger(trigger)),
-        },
-        TelnetTarget::Multiuser { world_index, username } => match ev {
-            TelnetEvent::TelnetDetected => {
-                Some(AppEvent::MultiuserTelnetDetected(*world_index, username.clone()))
-            }
-            TelnetEvent::Prompt(bytes) => {
-                Some(AppEvent::MultiuserPrompt(*world_index, username.clone(), bytes))
-            }
-            // Job 9 (T3.2): every variant below now forwards exactly like the World arm
-            // above (identical OptionEnabled/OptionDisabled code filter included) -
-            // App::handle_multiuser_telnet_event resolves target into a
-            // UserConnection::protocol and calls the same ProtocolState core.
-            TelnetEvent::NawsRequested => forward_via_telnet(target, TelnetEvent::NawsRequested),
-            TelnetEvent::TtypeRequested => forward_via_telnet(target, TelnetEvent::TtypeRequested),
-            TelnetEvent::CharsetRequest(charsets) => {
-                forward_via_telnet(target, TelnetEvent::CharsetRequest(charsets))
-            }
-            TelnetEvent::GmcpMessage(package, json) => {
-                forward_via_telnet(target, TelnetEvent::GmcpMessage(package, json))
-            }
-            TelnetEvent::MsdpVariable(variable, value) => {
-                forward_via_telnet(target, TelnetEvent::MsdpVariable(variable, value))
-            }
-            TelnetEvent::MsspData(pairs) => forward_via_telnet(target, TelnetEvent::MsspData(pairs)),
-            TelnetEvent::CompressionStarted => forward_via_telnet(target, TelnetEvent::CompressionStarted),
-            TelnetEvent::CompressionEnded => forward_via_telnet(target, TelnetEvent::CompressionEnded),
-            TelnetEvent::CompressionFailed(reason) => {
-                forward_via_telnet(target, TelnetEvent::CompressionFailed(reason))
-            }
-            TelnetEvent::ProtocolError(_) => None,
-            TelnetEvent::OptionEnabled(opt) => match opt {
-                TELNET_OPT_GMCP | TELNET_OPT_MSDP => {
-                    forward_via_telnet(target, TelnetEvent::OptionEnabled(opt))
-                }
-                TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_NAWS | TELNET_OPT_TTYPE
-                | TELNET_OPT_CHARSET | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP | TELNET_OPT_MSP => None,
-                _ => None,
-            },
-            TelnetEvent::OptionDisabled(opt) => match opt {
-                TELNET_OPT_GMCP | TELNET_OPT_MSDP | TELNET_OPT_NAWS => {
-                    forward_via_telnet(target, TelnetEvent::OptionDisabled(opt))
-                }
-                TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_TTYPE | TELNET_OPT_CHARSET
-                | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP | TELNET_OPT_MSP => None,
-                _ => None,
-            },
-            TelnetEvent::EchoOff => forward_via_telnet(target, TelnetEvent::EchoOff),
-            TelnetEvent::EchoOn => forward_via_telnet(target, TelnetEvent::EchoOn),
-            // MspTrigger still forwards (the handler, not the reader, must own the
-            // "no per-connection host to play audio on" decision - plan Job 9's
-            // per-variant table) even though App::handle_multiuser_telnet_event's
-            // core call is followed by an explicit no-op for it.
             TelnetEvent::MspTrigger(trigger) => forward_via_telnet(target, TelnetEvent::MspTrigger(trigger)),
         },
     }
@@ -754,112 +683,6 @@ mod tests {
         }
     }
 
-    /// Job 9 (T3.2): rewritten from a "drops everything" table into a "forwards
-    /// everything" table — every variant below `TelnetDetected`/`Prompt` (which keep
-    /// their own `(usize, String)`-shaped `AppEvent`s) now maps to
-    /// `Some(Telnet(Multiuser{3,"bob"}, ev))`, exactly like the `World` target above,
-    /// including the identical `OptionEnabled`/`OptionDisabled` option-code filter.
-    #[test]
-    fn to_app_event_multiuser_target_mapping() {
-        let t = TelnetTarget::Multiuser { world_index: 3, username: "bob".to_string() };
-
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::TelnetDetected),
-            Some(AppEvent::MultiuserTelnetDetected(3, u)) if u == "bob"
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::Prompt(vec![9])),
-            Some(AppEvent::MultiuserPrompt(3, u, b)) if u == "bob" && b == vec![9]
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::NawsRequested),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, ref username }, TelnetEvent::NawsRequested)) if username == "bob"
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::TtypeRequested),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::TtypeRequested))
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::CharsetRequest(vec!["UTF-8".to_string()])),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::CharsetRequest(cs)))
-                if cs == vec!["UTF-8".to_string()]
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::GmcpMessage("Core.Hello".to_string(), "{}".to_string())),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::GmcpMessage(p, j)))
-                if p == "Core.Hello" && j == "{}"
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::MsdpVariable("HP".to_string(), "100".to_string())),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::MsdpVariable(v, val)))
-                if v == "HP" && val == "100"
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::MsspData(vec![("NAME".to_string(), "Test MUD".to_string())])),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::MsspData(pairs)))
-                if pairs == vec![("NAME".to_string(), "Test MUD".to_string())]
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::CompressionStarted),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::CompressionStarted))
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::CompressionEnded),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::CompressionEnded))
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::CompressionFailed("corrupt".to_string())),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::CompressionFailed(r)))
-                if r == "corrupt"
-        ));
-        // No AppEvent::Telnet payload built for ProtocolError, same as World.
-        assert!(to_app_event(&t, TelnetEvent::ProtocolError("boom".to_string())).is_none());
-
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::OptionEnabled(TELNET_OPT_GMCP)),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionEnabled(opt)))
-                if opt == TELNET_OPT_GMCP
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::OptionEnabled(TELNET_OPT_MSDP)),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionEnabled(opt)))
-                if opt == TELNET_OPT_MSDP
-        ));
-        for opt in [
-            TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_NAWS, TELNET_OPT_TTYPE,
-            TELNET_OPT_CHARSET, TELNET_OPT_MCCP2, TELNET_OPT_MSSP,
-        ] {
-            assert!(to_app_event(&t, TelnetEvent::OptionEnabled(opt)).is_none());
-        }
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::OptionDisabled(TELNET_OPT_GMCP)),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionDisabled(opt)))
-                if opt == TELNET_OPT_GMCP
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::OptionDisabled(TELNET_OPT_MSDP)),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionDisabled(opt)))
-                if opt == TELNET_OPT_MSDP
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::OptionDisabled(TELNET_OPT_NAWS)),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionDisabled(opt)))
-                if opt == TELNET_OPT_NAWS
-        ));
-        for opt in [
-            TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_TTYPE, TELNET_OPT_CHARSET, TELNET_OPT_MCCP2, TELNET_OPT_MSSP,
-        ] {
-            assert!(to_app_event(&t, TelnetEvent::OptionDisabled(opt)).is_none());
-        }
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::EchoOff),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::EchoOff))
-        ));
-        assert!(matches!(
-            to_app_event(&t, TelnetEvent::EchoOn),
-            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::EchoOn))
-        ));
-    }
 
     // ==================================================================
     // End-to-end over tokio::io::duplex: one canned script driving a real
@@ -917,82 +740,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn multiuser_target_forwards_events_like_world_does() {
-        // Job 9 (T3.2): inverted from "drops unsupported events" - after this job
-        // NawsRequested (and every other variant below TelnetDetected/Prompt) *is*
-        // forwarded on a Multiuser target, the exact opposite of what this test used to
-        // assert.
-        let mut h = Harness::spawn(TelnetTarget::Multiuser {
-            world_index: 5,
-            username: "alice".to_string(),
-        });
-        h.send(&canned_script()).await;
 
-        // The session negotiates identically regardless of target shape.
-        match h.next_cmd().await {
-            WriteCommand::Raw(bytes) => {
-                assert!(bytes.windows(3).any(|w| w == [TELNET_IAC, TELNET_DO, TELNET_OPT_SGA]));
-                assert!(bytes.windows(3).any(|w| w == [TELNET_IAC, TELNET_WILL, TELNET_OPT_NAWS]));
-            }
-            _ => panic!("expected a Raw wire write"),
-        }
-
-        // TelnetDetected keeps its own (usize, String)-shaped AppEvent...
-        assert!(matches!(
-            h.next_event().await,
-            AppEvent::MultiuserTelnetDetected(5, ref u) if u == "alice"
-        ));
-        // ...but NawsRequested now IS forwarded - the next event is
-        // Telnet(Multiuser{5,"alice"}, NawsRequested), not the Prompt.
-        assert!(matches!(
-            h.next_event().await,
-            AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 5, ref username }, TelnetEvent::NawsRequested)
-                if username == "alice"
-        ));
-        assert!(matches!(
-            h.next_event().await,
-            AppEvent::MultiuserPrompt(5, ref u, ref b) if u == "alice" && b == b"Login: "
-        ));
-        assert!(matches!(
-            h.next_event().await,
-            AppEvent::MultiuserServerData(5, ref u, ref b) if u == "alice" && b == b"Welcome\r\n"
-        ));
-
-        h.send(b"MARKER\n").await;
-        assert!(matches!(
-            h.next_event().await,
-            AppEvent::MultiuserServerData(5, ref u, ref b) if u == "alice" && b == b"MARKER\n"
-        ));
-    }
-
-    /// A `WILL GMCP` clone of `will_gmcp_emits_gmcp_negotiated` below, for the
-    /// `Multiuser` target (plan Job 9's test list): GMCP negotiation now reaches a
-    /// multiuser connection the same way it reaches a `World` one.
-    #[tokio::test]
-    async fn multiuser_will_gmcp_emits_option_enabled() {
-        let mut h = Harness::spawn(TelnetTarget::Multiuser {
-            world_index: 7,
-            username: "carol".to_string(),
-        });
-        h.send(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP]).await;
-
-        match h.next_cmd().await {
-            WriteCommand::Raw(bytes) => {
-                assert_eq!(bytes, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP]);
-            }
-            _ => panic!("expected a Raw wire write"),
-        }
-        assert!(matches!(
-            h.next_event().await,
-            AppEvent::MultiuserTelnetDetected(7, ref u) if u == "carol"
-        ));
-        assert!(matches!(
-            h.next_event().await,
-            AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 7, ref username }, TelnetEvent::OptionEnabled(opt))
-                if username == "carol" && opt == TELNET_OPT_GMCP
-        ));
-    }
 
     // ==================================================================
     // Job 4.5: the reader-level proof that migrating a production loop onto

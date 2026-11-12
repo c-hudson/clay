@@ -12,6 +12,11 @@ use super::TfEngine;
 
 /// The help file: %TFHELP, else `tf-help` in %TFLIBDIR - when it exists.
 pub fn help_file(engine: &TfEngine) -> Option<PathBuf> {
+    // Under /restrict file a script may not name a file to read, %TFHELP included: the
+    // built-in help text answers instead.
+    if engine.restrict_level >= super::RestrictLevel::File {
+        return None;
+    }
     let var = |name: &str| engine.get_var(name).map(|v| v.to_string_value()).filter(|s| !s.is_empty());
     if let Some(file) = var("TFHELP") {
         let path = PathBuf::from(engine.expand_tilde(&file));

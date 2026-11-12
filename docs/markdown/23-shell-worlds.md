@@ -75,9 +75,15 @@ A shell world hands a shell **as the user running Clay** to anyone who can conne
 that Clay — the local console, the desktop GUI, and every authenticated remote client
 (the web client, Android, a remote console over SSH). This is the same reach the `/sh`
 command already gives those clients, but it is worth stating plainly: **do not create a
-shell world on a Clay you expose to a network you do not trust.** Shell worlds are not
-allowed in multiuser mode at all, since there the shell would run as the server's user on
-behalf of whichever account owns the world.
+shell world on a Clay you expose to a network you do not trust.** The server builds,
+`clay_multi` and `clay_web`, contain no shell-world code at all: there a shell would run
+as the server's user on behalf of whoever is logged in.
+
+Shell worlds are built in to every release download except the Android app, whose
+on-device server never starts a program. A build without them (`./build.sh
+--no-shell-worlds`, or a cargo build that leaves out the `shell-worlds` feature) keeps a
+shell world in your settings, but connecting it says the build has none, and no world
+editor offers the Shell type.
 
 Surviving a reload: on Linux, a `/reload` keeps shell worlds running — the program you
 left open (your editor, `top`, an `ssh` session) is still there afterward, and repaints

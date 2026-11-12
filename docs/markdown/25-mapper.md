@@ -112,7 +112,8 @@ on the same game have a map each. A deleted world's map is kept for 30 days afte
 changed, in case the world comes back, then deleted. `/map forget <world>` deletes one
 straight away.
 
-A multiuser server has no map.
+On `clay_multi` each user has a map of their own, kept in their own directory on the
+server; `clay_web`'s visitors have none.
 
 ## With a screen reader
 

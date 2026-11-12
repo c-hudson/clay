@@ -4471,3 +4471,19 @@ body.device-phone .map-search { padding: 6px 10px; }
 body.device-phone .map-card { margin: 6px 10px 8px; padding: 8px 10px; gap: 5px; }
 body.device-phone .map-icon-btn { width: 40px; height: 40px; }
 body.device-phone .map-card-buttons .btn { flex: 1 1 auto; min-height: 40px; }
+
+/* clay_web (the web-front build, body.web-front): a page onto one world. The menu keeps
+   Help, Emoji Picker, Toggle Tags, Import Picture, Find and Search History (each still
+   under its own device rule); the bars lose what means nothing for one world without
+   commands: the activity count, the notes icon, the pause badge, the world arrows of the
+   phone row, the icon bar. */
+body.web-front #menu-dropdown .menu-item:not([data-action="help"]):not([data-action="emoji_picker"]):not([data-action="toggle-tags"]):not([data-action="import-picture"]):not([data-action="web-theme"]):not([data-action="filter"]):not([data-action="search"]) { display: none !important; }
+/* The Light/Dark Theme item is the web front's alone: every other page has Settings. */
+body:not(.web-front) #menu-dropdown .menu-web-theme { display: none !important; }
+body.web-front #menu-dropdown .menu-sep { display: none !important; }
+body.web-front #activity-indicator,
+body.web-front #status-note-btn,
+body.web-front #session-paused-indicator { display: none !important; }
+body.web-front #nav-up-btn,
+body.web-front #nav-down-btn { display: none !important; }
+body.web-front #icon-bar { display: none !important; }

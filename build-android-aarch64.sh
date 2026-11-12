@@ -62,6 +62,9 @@ export AR_aarch64_linux_android="$TOOLCHAIN/bin/llvm-ar"
 export CARGO_TARGET_DIR="$SCRIPT_DIR/target/android"
 
 echo "Building clay for aarch64-linux-android (API $API)..."
+# No shell-worlds (unlike every other build): the app's on-device server must never start
+# a subprocess, and a shell world is one. Its InitialState then says shell_worlds=false,
+# so the app's world editor offers no Shell type.
 cargo build --release --target aarch64-linux-android \
     --no-default-features --features ssh-transport
 

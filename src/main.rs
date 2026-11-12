@@ -19,12 +19,31 @@ pub mod actions;
 pub mod http;
 pub mod persistence;
 pub mod chat;
+/// Shell worlds. The module is in every build: clients draw a shell world another Clay
+/// runs (`ShellScreen`'s client half, `keys::classify`); only the PTY and the terminal
+/// emulator are behind the `shell-worlds` feature.
 pub mod shell;
+
+// A server must not contain shell worlds (user ruling 2026-11-07), so neither server
+// feature is ever built with `shell-worlds` (a default feature), and a binary is one
+// server or the other.
+#[cfg(all(feature = "multiuser", feature = "shell-worlds"))]
+compile_error!("The 'multiuser' and 'shell-worlds' features can't be built together: a multiuser server must not contain shell worlds. shell-worlds is a default feature, so build clay_multi with `cargo build --no-default-features --features multiuser,ssh-transport`, or `./build.sh --only multi`.");
+#[cfg(all(feature = "web-front", feature = "shell-worlds"))]
+compile_error!("The 'web-front' and 'shell-worlds' features can't be built together: a web gateway must not contain shell worlds. Build clay_web with `cargo build --no-default-features --features web-front,ssh-transport`, or `./build.sh --only web`.");
+#[cfg(all(feature = "web-front", feature = "multiuser"))]
+compile_error!("The 'web-front' and 'multiuser' features are two different servers: build one or the other.");
 
 /// Current `WorldSettings::chat_settings_version` (2 = the server-per-world model with
 /// Send To / Show Only; see `persistence::migrate_chat_settings`).
 pub const CHAT_SETTINGS_VERSION: u32 = 2;
 pub mod daemon;
+pub mod instance;
+pub mod apploop;
+#[cfg(any(feature = "multiuser", feature = "web-front"))]
+pub mod server;
+#[cfg(any(feature = "multiuser", feature = "web-front"))]
+pub mod webdat;
 pub mod theme;
 pub mod keynames;
 pub mod keybindings;
@@ -54,6 +73,7 @@ mod tfstartup;
 pub mod webview_gui;
 #[cfg(any(feature = "webview-gui", feature = "native-gui"))]
 pub mod desktop;
+pub mod zoom;
 pub mod selfupdate;
 #[cfg(feature = "native-gui")]
 pub mod native_gui;
@@ -263,14 +283,13 @@ pub use http::{HttpsServer, BanList, SecurityGate, start_https_server, log_http_
 pub use persistence::{
     encrypt_password, decrypt_password,
     save_settings, load_settings,
-    load_multiuser_settings, save_multiuser_settings,
     load_reload_state,
     unescape_string,
 };
 #[cfg(not(target_os = "android"))]
 pub use persistence::save_reload_state;
 pub use daemon::{
-    run_daemon_server, run_multiuser_server,
+    run_daemon_server,
     generate_splash_strings,
 };
 use input_handler::*;
@@ -1796,13 +1815,6 @@ pub(crate) fn apply_ws_override(app: &mut App, ws_override: Option<WsOverride>) 
     }
 }
 
-/// `resolve_web_cert_files` for `--multiuser`: same cert choice, but never writes
-/// settings.dat — that App's settings come from multiuser.dat, and saving them
-/// would overwrite this machine's single-user settings. Status goes to stdout: the
-/// multiuser server is headless and may have no world to `add_output` into.
-fn resolve_web_cert_files_multiuser(app: &mut App) -> Option<(String, String)> {
-    resolve_web_cert_files_inner(app, false)
-}
 
 /// Why the user's own certificate and key can't serve (missing, unreadable, or - with
 /// rustls - not a certificate and key it can load), or `None` when they can.
@@ -1821,9 +1833,11 @@ fn custom_cert_problem(cert: &str, key: &str) -> Option<String> {
     None
 }
 
-fn resolve_web_cert_files_inner(app: &mut App, persist: bool) -> Option<(String, String)> {
+pub(crate) fn resolve_web_cert_files_inner(app: &mut App, persist: bool) -> Option<(String, String)> {
     let report = |app: &mut App, msg: &str| {
-        if persist { app.add_output(msg) } else { println!("{}", msg) }
+        // A server's operator App (clay_multi, clay_web) may have no world to show a line
+        // in: its messages are printed, as -D's are before its loop starts.
+        if persist && !app.worlds.is_empty() { app.add_output(msg) } else { println!("{}", msg) }
     };
     if !app.settings.websocket_cert_file.is_empty() && !app.settings.websocket_key_file.is_empty() {
         let (cert, key) = (app.settings.websocket_cert_file.clone(), app.settings.websocket_key_file.clone());
@@ -1940,11 +1954,42 @@ pub fn clay_filename(name: &str) -> String {
     { name.to_string() }
 }
 
-/// Returns the path to the `~/.clay/` config directory, creating it if needed.
-/// On Windows the directory is `~/clay/` (no dot prefix).
+/// Returns the path to this Clay's config directory, creating it if needed: `~/.clay/`
+/// (`~/clay/` on Windows), or an instance's own directory when this thread runs one
+/// (`instance::config_dir_override`: a `clay_multi` user's `~/.clay/users/<name>/`).
+/// Everything a Clay reads or writes derives from this, so an instance's files land in
+/// its directory with no other code knowing; only the process-wide logs
+/// (`clay_root_config_path`) stay in `~/.clay` itself.
 pub fn clay_config_dir() -> PathBuf {
-    let home = get_home_dir();
-    let dir = PathBuf::from(home).join(clay_filename("clay"));
+    if let Some(dir) = instance::config_dir_override() {
+        let _ = std::fs::create_dir_all(&dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        return dir;
+    }
+    // A visitor (clay_web) has a context but no directory of its own: it reads the
+    // operator's `~/.clay` (the TLS pins of the world it is shown, above all) and its
+    // policy and template keep it from writing there (no settings save, no archive, no
+    // maps, no logs, no media cache). Only a thread with no context at all is the leak
+    // `note_unscoped_access` looks for.
+    if instance::is_main() {
+        instance::note_unscoped_access();
+    }
+    clay_root_config_dir()
+}
+
+/// The process's own `~/.clay/` (`~/clay/` on Windows), whatever Clay this thread runs:
+/// where the operator's settings, password.dat and the shared logs are.
+pub fn clay_root_config_dir() -> PathBuf {
+    // clay_web: web.dat's directory, the operator's own - never created, never chmod'ed,
+    // and ~/.clay never touched (instance::set_web_only).
+    if let Some(dir) = instance::web_only_dir() {
+        return dir.to_path_buf();
+    }
+    let dir = root_config_dir_path();
     let _ = std::fs::create_dir_all(&dir);
     // B2 (security remediation): the directory holds secure.key, settings.dat (encrypted
     // passwords/tokens), key.pem, etc. — restrict to owner-only. Applied unconditionally
@@ -1958,16 +2003,32 @@ pub fn clay_config_dir() -> PathBuf {
     dir
 }
 
+/// Where `~/.clay` is, as a path only: nothing is created. The crash log prepares its
+/// debug.log path from this at start, so that a `--version` makes no directory.
+pub(crate) fn root_config_dir_path() -> PathBuf {
+    PathBuf::from(get_home_dir()).join(clay_filename("clay"))
+}
+
 /// Returns the path to a named file inside the `~/.clay/` config directory.
 /// e.g. `clay_config_path("settings.dat")` → `~/.clay/settings.dat`
 pub fn clay_config_path(name: &str) -> PathBuf {
     clay_config_dir().join(name)
 }
 
+/// A file in the process's own `~/.clay/`, never an instance's directory: the shared
+/// debug.log, output.debug.log, remote.log and the `run/` markers.
+pub fn clay_root_config_path(name: &str) -> PathBuf {
+    clay_root_config_dir().join(name)
+}
+
 /// One-time migration: move legacy `~/.clay.*` dotfiles into `~/.clay/` config dir.
 /// Safe to call repeatedly — skips files that already exist at the new location.
 /// Must be called at startup before any config is loaded.
 pub fn migrate_legacy_config_files() {
+    // clay_web has no ~/.clay to migrate into.
+    if instance::is_web_only() {
+        return;
+    }
     let home = get_home_dir();
     let home_path = std::path::Path::new(&home);
     let config_dir = clay_config_dir();
@@ -2232,6 +2293,9 @@ pub struct Settings {
     web_key_pem: String,
     // Single persistent auth key for passwordless device authentication
     websocket_auth_key: Option<AuthKey>,
+    /// clay_web: visitor sessions the server holds at once (settings.dat
+    /// `web_front_max_sessions`); `instance::DEFAULT_MAX_VISITORS` unless set.
+    pub(crate) web_front_max_sessions: usize,
     // User-defined actions/triggers
     actions: Vec<Action>,
     // TLS proxy for connection preservation over hot reload
@@ -2377,6 +2441,31 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// A clay_web visitor's copy of the operator's settings: everything that shapes the
+    /// page and the connection, none of the operator's secrets - a visitor is logged in
+    /// without a password and gets `GlobalSettingsMsg` like any client, and
+    /// `RequestSettingsExport` would hand over the lot. The web server's own fields go too
+    /// (a visitor's Clay runs no server).
+    #[cfg_attr(not(feature = "web-front"), allow(dead_code))]
+    pub(crate) fn visitor_template(&self) -> Settings {
+        let mut s = self.clone();
+        s.websocket_password = String::new();
+        s.websocket_auth_key = None;
+        s.web_cert_pem = String::new();
+        s.web_key_pem = String::new();
+        s.websocket_cert_file = String::new();
+        s.websocket_key_file = String::new();
+        s.websocket_allow_list = String::new();
+        s.websocket_whitelisted_host = None;
+        s.debug_enabled = false;
+        // The TLS proxy exists for the hot reload a server never does, and its socket path
+        // (clay-tls-<pid>-<world>) would be one and the same for every visitor.
+        s.tls_proxy_enabled = false;
+        s
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -2416,6 +2505,7 @@ impl Default for Settings {
             web_path: "clay".to_string(),
             port_map_enabled: false,
             websocket_password: String::new(),
+            web_front_max_sessions: instance::DEFAULT_MAX_VISITORS,
             websocket_allow_list: String::new(),
             websocket_whitelisted_host: None,
             websocket_cert_file: String::new(),
@@ -2559,6 +2649,13 @@ pub struct WorldSettings {
     /// (`App::run_login_commands`), one command per line, `;` between commands on one line
     /// (`\;` a literal one) - `WorldSettings::login_commands`. Empty runs nothing.
     pub login_command: String,
+    /// Edit World's First Command: sent raw as the first line of every connection, the
+    /// moment it is up and before Clay's auto-login (`App::send_first_command`), never
+    /// through TF. `%host%` becomes the address of the client whose command connected the
+    /// world (`127.0.0.1` for the console) - `REMOTE_HOST %host%` tells a MUD who is
+    /// behind a shared Clay. One line usually; several are sent in order. Empty sends
+    /// nothing.
+    pub first_command: String,
     // Slack settings (see src/chat/). `slack_token` is the bot token (xoxb-),
     // `slack_app_token` the app-level Socket Mode token (xapp-). `slack_channel` is the
     // Send To spec, `slack_channels` the comma-separated "Show Only" filter (empty =
@@ -2651,6 +2748,7 @@ impl Default for WorldSettings {
             keep_alive_gag_enabled: false,
             keep_alive_gag: String::new(),
             login_command: String::new(),
+            first_command: String::new(),
             slack_token: String::new(),
             slack_app_token: String::new(),
             slack_channel: String::new(),
@@ -2682,6 +2780,36 @@ impl WorldSettings {
     /// `\;` is a literal `;`, blank parts are dropped).
     pub(crate) fn login_commands(&self) -> Vec<String> {
         self.login_command.lines().flat_map(split_action_commands).collect()
+    }
+
+    /// The First Command's lines as they go to the MUD: each line as typed with every
+    /// `%host%` replaced by `host`, blank lines dropped.
+    pub(crate) fn first_command_lines(&self, host: &str) -> Vec<String> {
+        self.first_command
+            .lines()
+            .map(|line| line.replace("%host%", host))
+            .filter(|line| !line.trim().is_empty())
+            .collect()
+    }
+
+    /// A clay_web visitor's copy of the operator's world: the address, the First Command
+    /// and the look, but not the operator's own character (a visitor logs into the MUD as
+    /// themself), no reconnect of Clay's own (the page's Reconnect button is the way back),
+    /// no session log, no chat tokens.
+    #[cfg_attr(not(feature = "web-front"), allow(dead_code))]
+    pub(crate) fn visitor_copy(&self) -> WorldSettings {
+        let mut w = self.clone();
+        w.user = String::new();
+        w.password = String::new();
+        w.login_command = String::new();
+        w.auto_connect_type = telnet::AutoConnectType::NoLogin;
+        w.auto_reconnect_secs = 0;
+        w.auto_reconnect_on_web = false;
+        w.log_enabled = false;
+        w.slack_token = String::new();
+        w.slack_app_token = String::new();
+        w.discord_token = String::new();
+        w
     }
 
     /// Check if this world has enough settings to attempt a connection
@@ -2761,34 +2889,7 @@ pub(crate) fn send_mccp2_toggle_if_changed(
 }
 
 
-/// User account for multiuser mode
-#[derive(Clone, Debug)]
-pub struct User {
-    pub name: String,
-    /// Stored encrypted in file, decrypted in memory. Meaning depends on
-    /// `password_is_hash` below.
-    pub password: String,
-    /// When `false` (the normal case): `password` is the plaintext password, and the
-    /// live `UserCredential.password_hash` used for WS auth is derived from it via
-    /// `hash_password()` at startup (see `WebSocketServer::add_user`).
-    /// When `true`: `password` already holds the final SHA-256 hash (hex) in the exact
-    /// form the WS client sends/compares — set by the `ChangePassword` handler
-    /// (`daemon.rs`), which only ever receives `SHA256(new_password)` from the client,
-    /// never the plaintext. Re-hashing that value at load (`SHA256(SHA256(pw))`) would
-    /// silently break every subsequent login (C1, security remediation) — so the loader
-    /// and `add_user` must treat it as already-final instead.
-    pub password_is_hash: bool,
-}
 
-impl User {
-    fn new(name: &str, password: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            password: password.to_string(),
-            password_is_hash: false,
-        }
-    }
-}
 
 /// How long a disconnected WS client's `ClientViewState` entry is kept (and still counts as
 /// "viewing" its world) after its socket drops, before being reaped.
@@ -4423,6 +4524,10 @@ pub struct World {
     /// reverted logging to the default auto-computed file for the rest of the
     /// connection with no user-visible signal that it had changed.
     pub log_custom_path: Option<std::path::PathBuf>,
+    /// What `%host%` stood for at this world's last connect: the address of the client
+    /// whose command connected it (`App::connect_origin_ip`), kept so an auto-reconnect
+    /// sends the same First Command and carried through a reload (`connect_ip=`).
+    pub(crate) connect_ip: Option<String>,
     pub scrollback_tx: Option<scrollback::ArchiveSender>,
     #[cfg(unix)]
     socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only)
@@ -4535,7 +4640,6 @@ pub struct World {
     pub first_unseen_at: Option<std::time::Instant>, // When unseen output first arrived (for Unseen First switching)
     last_pending_broadcast: Option<std::time::Instant>, // Last time pending count was broadcast (for 2s timer)
     last_pending_count_broadcast: usize, // Last pending count that was broadcast (to detect changes)
-    owner: Option<String>,       // Username who owns this world (multiuser mode)
     proxy_pid: Option<u32>,      // PID of TLS proxy process (if using TLS proxy)
     proxy_socket_path: Option<std::path::PathBuf>, // Unix socket path for TLS proxy
     pub next_seq: u64,               // Next sequence number for output lines (for debugging)
@@ -4804,6 +4908,7 @@ impl World {
             log_handle: None,
             log_date: None,
             log_custom_path: None,
+            connect_ip: None,
             scrollback_tx: None,
             socket_fd: None,
             proxy_socket_fd: None,
@@ -4849,7 +4954,6 @@ impl World {
             first_unseen_at: None,
             last_pending_broadcast: None,
             last_pending_count_broadcast: 0,
-            owner: None,
             proxy_pid: None,
             proxy_socket_path: None,
             next_seq,
@@ -5666,7 +5770,9 @@ impl World {
             // it and the ▶ prefix will then steal two columns.
             let visual_lines = metrics.rows_as(&new_line, will_be_marked_new);
 
-            // Use projected line count (current + this line's visual lines) for pause trigger
+            // Use projected line count (current + this line's visual lines) for pause trigger.
+            // A blank line is a line like any other here (user ruling 2026-11-11): it counts
+            // toward the page and is held behind a pause, even when it is all that is left.
             let triggers_pause = !goes_to_pending
                 && settings.more_mode_enabled
                 && (self.lines_since_pause + visual_lines) > max_lines;
@@ -6323,6 +6429,13 @@ pub struct App {
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     pub is_master: bool,
+    /// What this Clay may do (`instance::Policy::MAIN` for a regular Clay; a clay_multi
+    /// user's or a clay_web visitor's permissions otherwise). Checked in the shared `App`
+    /// methods both server handlers call, never in a handler's arm.
+    pub policy: instance::Policy,
+    /// A clay_multi user's Clay: the server's index of every user's auth key and this
+    /// user's name, told whenever this Clay's key changes (`publish_auth_key`).
+    pub(crate) key_index: Option<(std::sync::Arc<instance::KeyIndex>, String)>,
     /// TF effects that synchronous code (a hook, a trigger) could not finish because they
     /// reached a Clay command - run by the event loop, in order (see `tfrun`).
     pub(crate) deferred_tf: std::collections::VecDeque<(tfrun::TfEffectCtx, std::collections::VecDeque<tf::effects::TfEffect>)>,
@@ -6393,6 +6506,9 @@ pub struct App {
     /// it has a WebSocket password. The value itself is never sent, so the /web popup
     /// starts with a blank password field that means "keep the current one".
     pub remote_ws_password_set: bool,
+    /// The SSH console is attached to a clay_multi server: its /web is the user's Auth Key
+    /// alone (the server's own web settings are its operator's).
+    pub(crate) remote_multiuser: bool,
     /// Remote console only: the server's remote-access picture (GlobalSettingsMsg's
     /// `reachability_json`), which its Remote Access popup shows - never this machine's.
     pub remote_reachability_json: String,
@@ -6401,6 +6517,10 @@ pub struct App {
     /// Remote console only: the server takes `RequestInfo` (its `InitialState.info_report`):
     /// `/info` prints the server's report, then this console's own section.
     pub server_info_report: bool,
+    /// The server can run a shell world (its `InitialState.shell_worlds` in the remote
+    /// console; this build's `shell-worlds` feature on the master). World editors leave
+    /// the Shell type out otherwise.
+    pub server_shell_worlds: bool,
     /// Remote console only: the server takes `PictureUpload` (its `InitialState.picture_upload`).
     pub server_picture_upload: bool,
     /// Remote console only: the server takes `RequestHistory` (its
@@ -6458,19 +6578,8 @@ pub struct App {
     pub mouse_capture_active: bool,
     /// True if running in multiuser mode (--multiuser flag)
     pub multiuser_mode: bool,
-    /// User accounts (multiuser mode only)
-    pub users: Vec<User>,
     /// Ban list for HTTP/WebSocket security
     pub ban_list: BanList,
-    /// Per-user connections in multiuser mode: (world_index, username) -> UserConnection
-    pub user_connections: std::collections::HashMap<(usize, String), UserConnection>,
-    /// Multiuser connects in flight (`AppEvent::MultiuserConnectResult` not yet back).
-    /// A second request for the same key is ignored meanwhile: two live sockets for one
-    /// (world, user) would both feed that user's output and either one's EOF would mark
-    /// the survivor disconnected, since multiuser events carry no connection id.
-    pub multiuser_connecting: std::collections::HashSet<(usize, String)>,
-    /// Source of `UserConnection::chat_conn_id` values (unique per process).
-    pub multiuser_chat_seq: u64,
     /// TinyFugue scripting engine
     pub tf_engine: tf::TfEngine,
     /// Loaded theme colors from ~/.clay/theme.dat
@@ -6714,6 +6823,8 @@ impl App {
             ws_client_interface: std::collections::HashMap::new(),
             ws_client_instance: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
+            policy: instance::Policy::for_kind(&instance::kind()),
+            key_index: None,
             deferred_tf: std::collections::VecDeque::new(),
             last_temp_world: 0,
             tf_resize: None,
@@ -6743,9 +6854,11 @@ impl App {
             pending_terminal_ops: std::collections::VecDeque::new(),
             tf_event_tx: None,
             remote_ws_password_set: false,
+            remote_multiuser: false,
             remote_reachability_json: String::new(),
             server_expands_line: false,
             server_info_report: false,
+            server_shell_worlds: cfg!(feature = "shell-worlds"),
             server_picture_upload: false,
             server_history_on_demand: false,
             server_takes_other_views: false,
@@ -6768,11 +6881,7 @@ impl App {
             needs_terminal_clear: false, // Set to true by Ctrl+L in --console mode
             mouse_capture_active: false, // Toggled dynamically when popups open/close
             multiuser_mode: false, // Set to true in main if started with --multiuser
-            users: Vec::new(),
             ban_list: BanList::new(),
-            user_connections: std::collections::HashMap::new(),
-            multiuser_connecting: std::collections::HashSet::new(),
-            multiuser_chat_seq: 0,
             tf_engine: tf::TfEngine::new(),
             theme_file: theme::ThemeFile::with_defaults(),
             keybindings: keybindings::KeyBindings::defaults(),
@@ -6818,7 +6927,9 @@ impl App {
             msp_sound_counter: 0,
             remote_ping_responses: None,
             remote_ping_nonce: 0,
-            tts_backend: tts::init_tts(),
+            // An instance (a clay_multi user, a clay_web visitor) never speaks on this
+            // machine: no engine probe, no Edge task.
+            tts_backend: if instance::is_main() { tts::init_tts() } else { tts::TtsBackend::silent() },
             scrollback: None,
             #[cfg(test)]
             ws_broadcast_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -7044,7 +7155,7 @@ impl App {
         self.settings.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
         self.show_tags = settings.show_tags;
         self.settings.debug_enabled = settings.debug_enabled;
-        DEBUG_ENABLED.store(settings.debug_enabled, Ordering::Relaxed);
+        self.apply_debug_setting();
         self.settings.ansi_music_enabled = settings.ansi_music_enabled;
         self.settings.theme = Theme::from_name(&settings.console_theme);
         self.settings.separator_style = SeparatorStyle::from_name(&settings.separator_style);
@@ -7780,7 +7891,163 @@ impl App {
 
     /// A client's `/ban` (both server handlers): the list, to that client only (it used to
     /// land on every client's screen), and the list for its Banned Hosts popup.
+    /// Who this Clay's own `AuthResponse`s say logged in (the key-login path answers from
+    /// the App): a clay_multi user's name with `multiuser_mode` on, so the client shows
+    /// Logout and asks for a username next time; a single Clay says nobody.
+    pub(crate) fn auth_identity(&self) -> (Option<String>, bool) {
+        match instance::kind() {
+            instance::InstanceKind::User { name } => (Some(name), true),
+            _ => (None, false),
+        }
+    }
+
+    /// Tell the server's key index this Clay's auth key (a clay_multi user's; nothing in
+    /// any other Clay), after it was generated, deleted or loaded.
+    pub(crate) fn publish_auth_key(&self) {
+        if let Some((index, user)) = &self.key_index {
+            index.set(user, self.settings.websocket_auth_key.as_ref().map(|k| k.key.as_str()));
+        }
+    }
+
+    /// The process-wide debug flag follows the setting only in the main Clay: an
+    /// instance's Debug toggle is its own setting, never the server's.
+    pub(crate) fn apply_debug_setting(&self) {
+        if self.policy.process_globals {
+            DEBUG_ENABLED.store(self.settings.debug_enabled, Ordering::Relaxed);
+        }
+    }
+
+    /// May sound or speech be played on this machine by this Clay? False for every
+    /// instance of a server (a clay_multi user, a clay_web visitor): the MUD's music,
+    /// media and the voice reach only the user's own device (`AnsiMusic`, `McmpMedia`,
+    /// `ServerSpeak`).
+    pub(crate) fn sound_here(&self) -> bool {
+        self.policy.sound_here
+    }
+
+    /// What this Clay says to a client asking for something server-wide it may not have
+    /// (`Policy::server_wide`), or None when it may.
+    pub(crate) fn server_wide_refusal(&self) -> Option<&'static str> {
+        if self.policy.server_wide { None } else { Some("That is the server operator's to do, not available from a user's Clay.") }
+    }
+
+    /// A client's `/reload [--console|--gui]` (both server handlers): why it is refused, or
+    /// None to go ahead. Usage first, then a Clay that may not reload the server (a
+    /// clay_multi user: the operator reloads with a signal), then the interface switch
+    /// rules (`reload_switch_refusal`, and in handler B `reload_switch_problem`).
+    pub(crate) fn client_reload_refusal(&self, client_id: u64, ui: Option<platform::UiKind>, bad: &Option<String>, check_switch_problem: bool) -> Option<String> {
+        if bad.is_some() {
+            return Some(RELOAD_USAGE.to_string());
+        }
+        if !self.policy.server_wide {
+            return Some("Only this server's operator reloads it.".to_string());
+        }
+        if let Some(why) = ui.and_then(|_| self.reload_switch_refusal(client_id)) {
+            return Some(why.to_string());
+        }
+        if check_switch_problem {
+            return self.reload_switch_problem(ui);
+        }
+        None
+    }
+
+    /// A client's `/reach [-r] [-l]` (both server handlers): the reachability report, the
+    /// re-check and the public-IP lookup - the server operator's, refused from an instance.
+    pub(crate) fn ws_reach(&mut self, client_id: u64, world_index: usize, refresh: bool, lookup: bool, event_tx: &mpsc::Sender<AppEvent>) {
+        if let Some(why) = self.server_wide_refusal() {
+            self.ws_tell(client_id, world_index, why);
+            return;
+        }
+        let target = Some((client_id, world_index));
+        for line in reach::format_reach_lines(&self.build_reachability_info()) {
+            self.reply_reach_line(target, &line);
+        }
+        if refresh {
+            self.reply_reach_line(target, "Re-checking firewall and router status...");
+            self.request_reachability_refresh(target, event_tx.clone());
+        }
+        if lookup {
+            self.reply_reach_line(target, "Looking up public IP (checkip.amazonaws.com)...");
+            self.request_public_ip_lookup(target, event_tx.clone());
+        }
+    }
+
+    /// A client's Banned Hosts list (`BanListRequest`, both server handlers): the server's,
+    /// so an instance answers an empty list.
+    pub(crate) fn ws_ban_list_response(&mut self, client_id: u64) {
+        let bans = if self.policy.server_wide { self.ban_list.get_ban_info() } else { Vec::new() };
+        self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+    }
+
+    /// A client's Unban button (`UnbanRequest`, both server handlers).
+    pub(crate) fn ws_unban_request(&mut self, client_id: u64, host: String) {
+        if let Some(why) = self.server_wide_refusal() {
+            self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some(why.to_string()) });
+            return;
+        }
+        if self.ban_list.remove_ban(&host) {
+            let _ = persistence::save_settings(self);
+            self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
+            self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+        } else {
+            self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+        }
+    }
+
+    /// A client's Change Password (`ChangePassword`, both server handlers). A single-user
+    /// Clay has no accounts (its web password is set in Settings), and a clay_multi user's
+    /// password is the operator's password.dat, which Clay never writes: refused either way,
+    /// each with its reason.
+    pub(crate) fn ws_change_password(&mut self, client_id: u64) {
+        let error = if self.policy.change_password {
+            "This Clay has no accounts; its web password is set in Settings."
+        } else {
+            "Passwords are set by the server's operator in password.dat."
+        };
+        self.ws_send_to_client(client_id, WsMessage::PasswordChanged { success: false, error: Some(error.to_string()) });
+    }
+
+    /// The export half of `/import` (`RequestSettingsExport`, both server handlers): this
+    /// Clay's settings, theme and keybindings with every secret in the clear, to a peer that
+    /// logged in. Never from a Clay whose settings are not its own (a clay_web visitor's
+    /// are the operator's).
+    pub(crate) fn ws_settings_export(&mut self, client_id: u64) {
+        if !self.policy.settings_export {
+            self.ws_send_to_client(client_id, WsMessage::SettingsExport { settings_dat: String::new(), theme_dat: String::new(), keybindings_dat: String::new() });
+            return;
+        }
+        let settings_dat = persistence::serialize_settings_for_export(self);
+        let theme_dat = self.theme_file.generate_file_content();
+        let keybindings_dat = self.keybindings.to_dat_string();
+        self.ws_send_to_client(client_id, WsMessage::SettingsExport { settings_dat, theme_dat, keybindings_dat });
+    }
+
+    /// The trigger half of `/import` (`ImportSettings`, both server handlers): pull another
+    /// Clay's settings into this one's files - refused where this Clay has none of its own.
+    pub(crate) fn ws_import_settings(&mut self, client_id: u64, addr: String, password: Option<String>, auth_key: Option<String>, allow_insecure: bool, event_tx: &mpsc::Sender<AppEvent>) {
+        if !self.policy.settings_export {
+            self.ws_send_to_client(client_id, WsMessage::ImportResult { success: false, summary: "Import Settings is not available here.".to_string() });
+            return;
+        }
+        spawn_import_settings(event_tx.clone(), client_id, addr, password, auth_key, allow_insecure);
+    }
+
+    /// May this client's Trust Certificate (`TrustCertificate`, both server handlers) re-pin
+    /// a host? Not from a Clay that may not write its files (a clay_web visitor would rewrite
+    /// the operator's pins); the client is told.
+    pub(crate) fn can_trust_certificate(&mut self, client_id: u64, world_index: usize) -> bool {
+        if self.policy.save_files {
+            return true;
+        }
+        self.ws_tell(client_id, world_index, "Trusting a certificate is the server operator's to do.");
+        false
+    }
+
     pub(crate) fn ws_ban_list(&mut self, client_id: u64, world_index: usize) {
+        if let Some(why) = self.server_wide_refusal() {
+            self.ws_tell(client_id, world_index, why);
+            return;
+        }
         let bans = self.ban_list.get_ban_info();
         if bans.is_empty() {
             self.ws_tell(client_id, world_index, "No hosts are currently banned.");
@@ -7805,6 +8072,10 @@ impl App {
     /// A client's `/unban <host>` (both server handlers): the answer to that client; the
     /// new list to every client (their Banned Hosts popups).
     pub(crate) fn ws_unban(&mut self, client_id: u64, world_index: usize, host: String) {
+        if let Some(why) = self.server_wide_refusal() {
+            self.ws_tell(client_id, world_index, why);
+            return;
+        }
         if self.ban_list.remove_ban(&host) {
             // Save settings to persist the change
             let _ = persistence::save_settings(self);
@@ -7864,6 +8135,12 @@ impl App {
     /// A client's `/dump` (both server handlers): the dump file, and to that client only
     /// where it went (nothing broadcast: /dump must not disturb anyone's more-mode).
     pub(crate) fn ws_dump(&mut self, client_id: u64, world_index: usize, label: &str, args: &[String]) {
+        // A visitor's Clay (clay_web) has no files of its own; an operator trigger's /dump
+        // reaches here past the command gate.
+        if !self.policy.user_paths {
+            self.ws_tell(client_id, world_index, "/dump: this Clay keeps no files of its own.");
+            return;
+        }
         let text = match self.resolve_dump_scope(args) {
             Err(e) => e,
             Ok(scope) => match self.write_debug_dump(label, &scope) {
@@ -7886,6 +8163,10 @@ impl App {
     /// relaunch - any other client is refused, or one remote client could take the master's
     /// server away from everyone.
     pub(crate) fn ws_remote_attach(&mut self, client_id: u64, world_index: usize, addr: &str, close: bool, cancel: bool) {
+        if let Some(why) = self.server_wide_refusal() {
+            self.ws_tell(client_id, world_index, why);
+            return;
+        }
         let is_local_gui_master = self.gui_tx.is_some()
             && self.ws_server.as_ref()
                 .and_then(|s| s.get_client_ip(client_id))
@@ -8188,11 +8469,28 @@ impl App {
         if !self.is_master && self.settings.websocket_password.is_empty() && self.remote_ws_password_set {
             popup::definitions::web::mark_password_set_elsewhere(&mut def);
         }
+        // Attached to a clay_multi server: the user's Auth Key (and Modify Key) alone; the
+        // port, path, password, certificate, allow list and reachability are the operator's.
+        let key_only = !self.is_master && self.remote_multiuser;
+        if key_only {
+            use popup::definitions::web::*;
+            for id in [WEB_FIELD_PORT, WEB_FIELD_CUSTOM_PORT, WEB_FIELD_CUSTOM_CERT, WEB_FIELD_WS_PASSWORD, WEB_FIELD_WS_ALLOW_LIST,
+                       WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE, WEB_FIELD_WEB_PATH, WEB_FIELD_REMOTE_LINES, WEB_FIELD_VALIDATION_MSG] {
+                if let Some(field) = def.get_field_mut(id) {
+                    field.visible = false;
+                }
+            }
+            for id in [WEB_BTN_SAVE, WEB_BTN_REMOTE_ACCESS] {
+                if let Some(button) = def.get_button_mut(id) {
+                    button.enabled = false;
+                }
+            }
+        }
         self.popup_manager.open(def);
 
         // Select first field
         if let Some(state) = self.popup_manager.current_mut() {
-            state.select_field(WEB_FIELD_PORT);
+            state.select_field(if key_only { popup::definitions::web::WEB_FIELD_AUTH_KEY } else { WEB_FIELD_PORT });
         }
     }
 
@@ -8242,6 +8540,7 @@ impl App {
             keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
             keep_alive_gag: world.settings.keep_alive_gag.clone(),
             login_command: world.settings.login_command.clone(),
+            first_command: world.settings.first_command.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
             auto_reconnect_secs: world.settings.auto_reconnect_display(),
             msp_enabled: world.settings.msp_enabled,
@@ -8260,6 +8559,7 @@ impl App {
             discord_channels: world.settings.discord_channels.clone(),
             slack_app_token: world.settings.slack_app_token.clone(),
             slack_channels: world.settings.slack_channels.clone(),
+            offer_shell: self.server_shell_worlds,
         };
 
         let def = create_world_editor_popup(&settings);
@@ -9251,6 +9551,7 @@ impl App {
                     w.settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
                     w.settings.keep_alive_gag = settings.keep_alive_gag;
                     w.settings.login_command = settings.login_command;
+                    w.settings.first_command = settings.first_command;
                     w.settings.msp_enabled = settings.msp_enabled;
                     w.settings.mcp_enabled = settings.mcp_enabled;
                     w.settings.mccp2_enabled = settings.mccp2_enabled;
@@ -9605,6 +9906,7 @@ impl App {
             keep_alive_gag_enabled: w.settings.keep_alive_gag_enabled,
             keep_alive_gag: w.settings.keep_alive_gag,
             login_command: w.settings.login_command,
+            first_command: w.settings.first_command,
             msp_enabled: w.settings.msp_enabled,
             mcp_enabled: w.settings.mcp_enabled,
             mccp2_enabled: w.settings.mccp2_enabled,
@@ -10242,60 +10544,7 @@ impl App {
         }
     }
 
-    /// Per-user NAWS size source (plan Job 9, T3.2): mirrors `get_minimum_dimensions`,
-    /// but scoped to one multiuser user's own WS clients rather than App-wide - one
-    /// user's window size must never leak into another user's NAWS. Falls back to
-    /// `(visible_columns, visible_lines)` (from `WsMessage::UpdateViewState`) when a
-    /// client has reported a view state but never an explicit `UpdateDimensions` - the
-    /// plan's "decision taken": strictly better than the server's old implicit
-    /// 80-column default, and it is what the web client actually reports.
-    pub(crate) fn user_min_dimensions(&self, username: &str) -> Option<(u16, u16)> {
-        let server = self.ws_server.as_ref()?;
-        let mut min_width: Option<u16> = None;
-        let mut min_height: Option<u16> = None;
-        for (client_id, state) in &self.ws_client_worlds {
-            if server.get_client_username(*client_id).as_deref() != Some(username) {
-                continue;
-            }
-            let size = state.dimensions.or({
-                if state.visible_columns > 0 && state.visible_lines > 0 {
-                    Some((state.visible_columns as u16, state.visible_lines as u16))
-                } else {
-                    None
-                }
-            });
-            if let Some((w, h)) = size {
-                if w > 0 && h > 0 {
-                    min_width = Some(min_width.map_or(w, |mw| mw.min(w)));
-                    min_height = Some(min_height.map_or(h, |mh| mh.min(h)));
-                }
-            }
-        }
-        match (min_width, min_height) {
-            (Some(w), Some(h)) => Some((w, h)),
-            _ => None,
-        }
-    }
 
-    /// Resend NAWS to every one of `username`'s live multiuser connections whose
-    /// negotiated window size just changed (mirrors `send_naws_to_all_worlds`'s job,
-    /// scoped to one user - `get_minimum_dimensions`/`send_naws_if_changed` are App-wide
-    /// and must not be reused here for the same reason `user_min_dimensions` exists).
-    pub(crate) fn send_naws_to_all_multiuser_worlds(&mut self, username: &str) {
-        let size = self.user_min_dimensions(username);
-        let keys: Vec<(usize, String)> = self.user_connections.keys()
-            .filter(|(_, u)| u == username)
-            .cloned()
-            .collect();
-        for key in keys {
-            if let Some(conn) = self.user_connections.get_mut(&key) {
-                if conn.protocol.naws_enabled {
-                    let tx = conn.command_tx.clone();
-                    conn.protocol.send_naws_if_changed(size, tx.as_ref());
-                }
-            }
-        }
-    }
 
     /// The switch keys never land on the world in the console's other pane (`/split`).
     fn next_world(&mut self) {
@@ -10816,30 +11065,6 @@ impl App {
         });
     }
 
-    /// Owner-scoped wrapper around `handle_request_scrollback` for multiuser mode
-    /// (PROTOCOL-ROADMAP.md Step 6a). `handle_request_scrollback` itself has no
-    /// per-world owner check — its existing callers (master-WS, `-D` daemon) are all
-    /// single-user contexts where every `world_index` already belongs to the sole
-    /// local operator, so adding a check there would be pure overhead and risks
-    /// nothing being missed. Multiuser is different: a client-supplied `world_index`
-    /// (from `AuthRequest.resume` or `RequestScrollback`) could name another user's
-    /// world, and blindly delegating would leak that user's MUD output — the same
-    /// class of bug CLAUDE.md's D7 invariants call out for `ConnectWorld`/
-    /// `SwitchWorld` (`world.owner == username`). On a mismatch or a missing world
-    /// this silently no-ops (no reply at all) rather than sending an error — an error
-    /// reply would itself leak whether `world_index` exists, which a bare 404-style
-    /// silence avoids.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn handle_request_scrollback_owned(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>, request_id: Option<u64>, owner: &str) {
-        match self.worlds.get(world_index) {
-            Some(world) if world.owner.as_deref() == Some(owner) => {
-                self.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq, request_id);
-            }
-            _ => {
-                // Deliberate silent no-op — see doc comment above.
-            }
-        }
-    }
 
     /// `WsMessage::RequestHistory` handling, shared by both server handlers: a client
     /// scrolled up past everything it holds of a world. The next `count` older lines: live
@@ -11256,12 +11481,21 @@ impl App {
 
     /// Ensure audio backend is initialized (lazy init on first use)
     fn ensure_audio(&mut self) {
+        if !self.sound_here() {
+            return;
+        }
         if matches!(self.audio_backend, audio::AudioBackend::None) {
             self.audio_backend = audio::init_audio();
         }
     }
 
     fn add_output(&mut self, text: &str) {
+        // An App with no world at all (a server's operator App before any is loaded) has
+        // nowhere to put the line; debug.log keeps it rather than a panic losing it.
+        if self.worlds.is_empty() {
+            debug_log(true, &format!("output with no world: {}", text.trim_end()));
+            return;
+        }
         let is_current = true;
         let settings = self.settings.clone();
         let output_height = self.output_height;
@@ -11833,6 +12067,7 @@ impl App {
             keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
             keep_alive_gag: world.settings.keep_alive_gag.clone(),
             login_command: world.settings.login_command.clone(),
+            first_command: world.settings.first_command.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
             auto_reconnect_secs: world.settings.auto_reconnect_display(),
             has_notes: !world.settings.notes.is_empty(),
@@ -12102,6 +12337,7 @@ impl App {
         keep_alive_gag: Option<String>,
         status_panel: Option<bool>,
         login_command: Option<String>,
+        first_command: Option<String>,
     ) {
         // The Activity world has no settings (every editor refuses to open it).
         if world_index >= self.worlds.len() || self.worlds[world_index].is_activity {
@@ -12146,6 +12382,10 @@ impl App {
         // None: a client from before the Login Command - leave it. Lines end in \n only.
         if let Some(commands) = login_command {
             self.worlds[world_index].settings.login_command = commands.replace("\r\n", "\n").replace('\r', "\n");
+        }
+        // Same rule for the First Command: None from a client that predates it.
+        if let Some(command) = first_command {
+            self.worlds[world_index].settings.first_command = command.replace("\r\n", "\n").replace('\r', "\n");
         }
         // None: a client from before the Status Panel switch - leave it.
         if let Some(on) = status_panel {
@@ -12233,6 +12473,7 @@ impl App {
             keep_alive_gag_enabled: self.worlds[world_index].settings.keep_alive_gag_enabled,
             keep_alive_gag: self.worlds[world_index].settings.keep_alive_gag.clone(),
             login_command: self.worlds[world_index].settings.login_command.clone(),
+            first_command: self.worlds[world_index].settings.first_command.clone(),
             auto_reconnect_secs,
             has_notes,
             msp_enabled,
@@ -12364,7 +12605,7 @@ impl App {
         self.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
         self.show_tags = show_tags;
         self.settings.debug_enabled = debug_enabled;
-        DEBUG_ENABLED.store(debug_enabled, Ordering::Relaxed);
+        self.apply_debug_setting();
         self.settings.ansi_music_enabled = ansi_music_enabled;
         // Console theme affects the TUI on the server
         self.settings.theme = Theme::from_name(&console_theme);
@@ -12406,6 +12647,10 @@ impl App {
         if let Some(update) = font_profile {
             self.settings.set_font_profile(update);
         }
+        // The web server's own fields - the allow list, the password, the port and path,
+        // the certificate files, the TLS proxy - are the server operator's: a Clay that
+        // isn't the server (a clay_multi user's) keeps what it has and changes nothing.
+        if self.policy.web_fields {
         self.settings.websocket_allow_list = ws_allow_list.clone();
         // Update the running WebSocket server's allow list
         if let Some(ref server) = self.ws_server {
@@ -12448,6 +12693,7 @@ impl App {
             self.settings.websocket_key_file = ws_key_file;
         }
         self.settings.tls_proxy_enabled = tls_proxy_enabled;
+        } // policy.web_fields
         self.settings.zwj_enabled = zwj_enabled;
         // The style by name from a client that knows styles; an older client sends only
         // the bool, which must not knock New Background back to the character on one of its
@@ -13312,6 +13558,8 @@ impl App {
     /// Handle GMCP Client.Media.* messages (MCMP protocol)
     /// When play_audio is false, only tracks state in active_media without spawning processes
     fn handle_gmcp_media(&mut self, world_idx: usize, package: &str, json_data: &str, play_audio: bool) {
+        // Nothing is fetched or played on a machine this Clay may not sound on.
+        let play_audio = play_audio && self.sound_here();
         // GMCP package names are case-insensitive per spec; match on a lowercased
         // copy so a server spelling like `client.media.play` still works.
         let package_lc = package.to_ascii_lowercase();
@@ -13417,7 +13665,12 @@ impl App {
                             }
                         }
                         "Load" => {
-                            // Pre-cache only, no playback
+                            // Pre-cache only, no playback. A Clay that never plays here
+                            // (a server's instance) caches nothing either: the operator's
+                            // media directory is not a visitor's to fill.
+                            if !self.sound_here() {
+                                return;
+                            }
                             let full_url = if !url.is_empty() {
                                 format!("{}{}", url, name)
                             } else if !default_url.is_empty() {
@@ -13551,6 +13804,9 @@ impl App {
     /// effects, not a persistent background score), so a background trigger
     /// is simply dropped rather than queued for later.
     fn handle_msp_trigger(&mut self, world_idx: usize, trigger: &telnet::MspTrigger) {
+        if !self.sound_here() {
+            return;
+        }
         if trigger.off {
             if trigger.is_music {
                 if let Some((owner, key)) = self.media_music_key.clone() {
@@ -13761,6 +14017,9 @@ impl App {
     /// Play ANSI music notes on the console.
     /// Stops any currently playing ANSI music first to prevent overlapping playback.
     fn play_ansi_music_console(&mut self, notes: &[crate::ansi_music::MusicNote]) {
+        if !self.sound_here() {
+            return;
+        }
         // Stop any currently playing ANSI music
         if let Some(mut handle) = self.ansi_music_handle.take() {
             handle.stop();
@@ -14230,17 +14489,7 @@ impl App {
             }
             self.worlds[idx].protocol.stats_dirty = false;
             let entries = self.worlds[idx].protocol.stats.entries().to_vec();
-            if self.multiuser_mode {
-                if let Some(ref server) = self.ws_server {
-                    let owner = self.worlds[idx].owner.clone();
-                    server.broadcast_to_owner(
-                        WsMessage::StatsUpdate { world_index: idx, stats: entries },
-                        owner.as_deref(),
-                    );
-                }
-            } else {
-                self.ws_broadcast(WsMessage::StatsUpdate { world_index: idx, stats: entries });
-            }
+            self.ws_broadcast(WsMessage::StatsUpdate { world_index: idx, stats: entries });
         }
 
         // Job 9 (T3.2): the per-world loop above is the single-user path (and, in
@@ -14250,21 +14499,6 @@ impl App {
         // `stats_dirty` on `UserConnection::protocol`, fed by GMCP/MSDP events routed
         // through `App::handle_multiuser_telnet_event`. Owner-scoped via
         // `broadcast_to_owner`, same as the loop above.
-        if self.multiuser_mode {
-            if let Some(ref server) = self.ws_server {
-                for ((world_index, username), conn) in self.user_connections.iter_mut() {
-                    if !conn.protocol.stats_dirty {
-                        continue;
-                    }
-                    conn.protocol.stats_dirty = false;
-                    let entries = conn.protocol.stats.entries().to_vec();
-                    server.broadcast_to_owner(
-                        WsMessage::StatsUpdate { world_index: *world_index, stats: entries },
-                        Some(username.as_str()),
-                    );
-                }
-            }
-        }
     }
 
     /// Check if any non-paused WS client is currently viewing a specific world.
@@ -14727,11 +14961,12 @@ impl App {
 
     /// Get the minimum visible lines among all viewers of a world (for more-mode threshold)
     /// Returns None if no WS clients are viewing the world (use console output_height).
-    /// Disconnected clients are excluded even during their grace window: unlike
-    /// `ws_client_viewing` (which only needs a yes/no "is anyone still looking"),
-    /// more-mode's viewport budget must reflect only viewers who can actually see output
-    /// right now - counting a backgrounded phone's stale/smaller viewport here would
-    /// wrongly constrain pagination for every other, actually-present viewer.
+    /// A connection counts for as long as it is connected (user rulings 2026-11-11):
+    /// one paused by `/pause` or `/remote --pause` is still drawn, and a backgrounded
+    /// phone app "may technically not be live but until that connection is disconnected,
+    /// it should be treated as live". Only a disconnected client is left out, and at once,
+    /// even during its grace window: unlike `ws_client_viewing` (a yes/no "is anyone still
+    /// looking"), the page must not be sized by a viewport that is gone.
     fn min_viewer_lines(&self, world_index: usize) -> Option<usize> {
         let ws_min = self.ws_client_worlds
             .values()
@@ -14823,7 +15058,9 @@ impl App {
         is_daemon_mode: bool,
     ) -> (u16, u16) {
         // Calculate minimum visible lines among all viewers for synchronized more-mode
-        // Console counts as a viewer if it's viewing this world (unless daemon mode)
+        // Console counts as a viewer if it's viewing this world (unless daemon mode).
+        // `console_shows`, not `console_watching`, on purpose (user ruling 2026-11-11): a
+        // console paused by `/pause` is still drawn, so its screen still sizes the page.
         let console_viewing = !is_daemon_mode && self.console_shows(world_idx);
         // While split, each pane pages its own world at its own height.
         let console_height = if self.split.is_some() { self.console_rows_for(world_idx) } else { console_height };
@@ -15622,15 +15859,29 @@ impl App {
             // Show disconnection message
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
-            let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
+            // Born viewed while anybody - the console or an attached client - shows the
+            // world, as the prompt line above is: a line seen as it arrived is never ▶ for
+            // a later visitor.
+            let watched = self.world_watched(world_idx);
+            let mut disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
+            disconnect_msg.viewed = watched;
             let disconnect_msg_displayed = self.worlds[world_idx].push_line_respecting_pending(disconnect_msg.clone(), more_mode);
 
-            // If this is not the current world, increment unseen_lines for activity indicator
-            if world_idx != self.current_world_index {
+            // Unseen output only when nobody watches the world. This compared against the
+            // console's `current_world_index` alone, so a remote GUI that disconnected the
+            // world it was viewing - the console elsewhere, or the server headless - had the
+            // world counted as activity the moment it switched away, cleared only by a visit
+            // (user report 2026-11-08). The clients are told at once, as process_server_data
+            // tells them of every other unseen line: nothing more will arrive from a world
+            // that just disconnected to carry the count.
+            if !watched {
                 if self.worlds[world_idx].unseen_lines == 0 {
                     self.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
                 }
                 self.worlds[world_idx].unseen_lines += 1;
+                let count = self.worlds[world_idx].unseen_lines;
+                self.ws_broadcast(WsMessage::UnseenUpdate { world_index: world_idx, count });
+                self.broadcast_activity();
             }
 
             // Mark output for redraw if this is the current world
@@ -15672,7 +15923,8 @@ impl App {
             );
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
-            let msg = OutputLine::new_client(format!("Reconnecting in {} seconds...", secs), seq);
+            let mut msg = OutputLine::new_client(format!("Reconnecting in {} seconds...", secs), seq);
+            msg.viewed = self.world_watched(world_idx);
             let reconnect_msg_displayed = self.worlds[world_idx].push_line_respecting_pending(msg.clone(), more_mode);
             // Same reasoning as the "Disconnected." broadcast above: only send this now if it
             // was actually displayed, not deferred into pending_lines behind older content.
@@ -15861,7 +16113,7 @@ impl App {
     /// Re-attach shell worlds whose PTY was carried across a `/reload` exec (Linux; see
     /// `shell::adopt`). The grid starts empty, so a note is injected and the size nudged so
     /// a full-screen program repaints.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "shell-worlds"))]
     pub(crate) fn adopt_shell_worlds_after_reload(&mut self) {
         let Some(events) = self.event_tx.clone() else { return };
         for idx in 0..self.worlds.len() {
@@ -15894,6 +16146,22 @@ impl App {
                     self.add_output_to_world(idx, &format!("Shell world could not be re-attached after reload: {e}"));
                 }
             }
+        }
+    }
+
+    /// A build without shell worlds reloaded from one that had them: it can't run the
+    /// shell it inherited, so it closes the PTY master (the shell gets SIGHUP, as from a
+    /// closed terminal) rather than leave it running with nobody attached.
+    #[cfg(all(target_os = "linux", not(feature = "shell-worlds")))]
+    pub(crate) fn adopt_shell_worlds_after_reload(&mut self) {
+        for idx in 0..self.worlds.len() {
+            let Some(fd) = self.worlds[idx].shell_reload_fd.take() else { continue };
+            self.worlds[idx].shell_reload_pid = None;
+            unsafe {
+                libc::close(fd);
+            }
+            self.worlds[idx].connected = false;
+            self.add_output_to_world(idx, shell::NOT_IN_THIS_BUILD);
         }
     }
 
@@ -15992,12 +16260,7 @@ impl App {
     /// more-mode and the broadcast rules for free), a non-fatal close becomes
     /// `Disconnected` (so the loop re-arms its reconnect timer).
     pub(crate) fn handle_chat_event(&mut self, owner: chat::ChatOwner, conn_id: u64, ev: chat::ChatEvent) -> Option<AppEvent> {
-        let world_name = match owner {
-            chat::ChatOwner::World(name) => name,
-            chat::ChatOwner::Multiuser { world_index, username } => {
-                return self.handle_multiuser_chat_event(world_index, username, conn_id, ev);
-            }
-        };
+        let chat::ChatOwner::World(world_name) = owner;
         let idx = self.find_world_index(&world_name)?;
         if self.worlds[idx].connection_id != conn_id {
             return None; // a session we already replaced or shut down
@@ -16075,178 +16338,10 @@ impl App {
         }
     }
 
-    /// Multiuser: start `username`'s session for chat world `world_index`. A world has
-    /// exactly one owner in multiuser mode (ConnectWorld is owner-checked), so this is
-    /// the world's one session - no per-user duplicates of one bot token.
-    pub(crate) fn start_multiuser_chat(&mut self, world_index: usize, username: &str, event_tx: &mpsc::Sender<AppEvent>) {
-        let Some(kind) = chat::ChatKind::from_world_type(&self.worlds[world_index].settings.world_type) else { return };
-        let key = (world_index, username.to_string());
-        if let Some(conn) = self.user_connections.get(&key) {
-            if conn.connected || conn.chat.is_some() {
-                return; // connected, or a connect already in flight
-            }
-        }
-        self.multiuser_chat_seq += 1;
-        let conn_id = self.multiuser_chat_seq;
-        let cfg = chat::ChatConfig::from_settings(
-            kind,
-            chat::ChatOwner::Multiuser { world_index, username: username.to_string() },
-            conn_id,
-            &self.worlds[world_index].settings,
-            "",
-            None,
-        );
-        let handle = chat::start(cfg, event_tx.clone());
-        let conn = self.user_connections.entry(key).or_default();
-        conn.chat = Some(handle);
-        conn.chat_conn_id = conn_id;
-        self.multiuser_chat_line(world_index, username, &format!("Connecting to {}...", kind.name()));
-    }
 
-    /// A status line to one multiuser user's view of a world.
-    fn multiuser_chat_line(&mut self, world_index: usize, username: &str, text: &str) {
-        let key = (world_index, username.to_string());
-        if let Some(conn) = self.user_connections.get_mut(&key) {
-            for line in text.lines() {
-                let seq = conn.output_lines.len() as u64;
-                conn.output_lines.push(OutputLine::new_client(line.to_string(), seq));
-            }
-        }
-        if let Some(ws) = &self.ws_server {
-            ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
-                world_index,
-                data: format!("{}\n", text),
-                is_viewed: true,
-                ts: current_timestamp_secs(),
-                from_server: false,
-                seq: 0, end_seq: None,
-                flush: false, gagged: false, highlight_colors: Vec::new(),
-            }, Some(username));
-        }
-    }
 
-    fn multiuser_chat_prompt(&mut self, world_index: usize, username: &str) {
-        let key = (world_index, username.to_string());
-        let Some(conn) = self.user_connections.get_mut(&key) else { return };
-        conn.prompt = match &conn.chat_target {
-            Some(t) => format!("[{}] ", chat::render::sanitize_inline(&t.label)),
-            None => "[no target - /chat to <channel>] ".to_string(),
-        };
-        let prompt = conn.prompt.clone();
-        if let Some(ws) = &self.ws_server {
-            ws.broadcast_to_owner(WsMessage::PromptUpdate { world_index, prompt }, Some(username));
-        }
-    }
 
-    /// Multiuser half of `handle_chat_event`. Lines are handed back as
-    /// `MultiuserServerData` so they take the same per-user path as MUD text.
-    fn handle_multiuser_chat_event(&mut self, world_index: usize, username: String, conn_id: u64, ev: chat::ChatEvent) -> Option<AppEvent> {
-        let key = (world_index, username.clone());
-        let conn = self.user_connections.get(&key)?;
-        if conn.chat_conn_id != conn_id || conn.chat.is_none() {
-            return None;
-        }
-        let connected = conn.connected;
-        match ev {
-            chat::ChatEvent::Status(text) => {
-                self.multiuser_chat_line(world_index, &username, &text);
-                None
-            }
-            chat::ChatEvent::Ready { cmd_tx, summary } => {
-                let now = std::time::Instant::now();
-                if let Some(conn) = self.user_connections.get_mut(&key) {
-                    conn.connected = true;
-                    conn.command_tx = Some(cmd_tx);
-                    conn.last_send_time = Some(now);
-                    conn.last_receive_time = Some(now);
-                    conn.chat_target = summary.target.clone();
-                }
-                let name = self.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
-                if let Some(ws) = &self.ws_server {
-                    ws.broadcast_to_owner(WsMessage::WorldConnected { world_index, name }, Some(&username));
-                }
-                let kind = self.worlds.get(world_index).and_then(|w| chat::ChatKind::from_world_type(&w.settings.world_type)).map(|k| k.name()).unwrap_or("chat");
-                self.multiuser_chat_line(world_index, &username, &format!(
-                    "Connected to {} {} as {} ({} channels).", kind, summary.server_name, summary.bot_name, summary.channel_count));
-                let hint = match (&summary.target, &summary.target_error) {
-                    (Some(t), _) => format!("Typing sends to {}. Change with /chat to <channel>.", t.label),
-                    (None, Some(e)) => format!("Send To target not found: {} Pick one with /chat to <channel>.", e),
-                    (None, None) => "No Send To target set - pick one with /chat to <channel>.".to_string(),
-                };
-                self.multiuser_chat_line(world_index, &username, &hint);
-                self.multiuser_chat_prompt(world_index, &username);
-                None
-            }
-            chat::ChatEvent::Lines(lines) | chat::ChatEvent::SelfLines(lines) => {
-                if !connected || lines.is_empty() {
-                    return None;
-                }
-                if let Some(conn) = self.user_connections.get_mut(&key) {
-                    conn.last_receive_time = Some(std::time::Instant::now());
-                }
-                let mut data = lines.join("\n");
-                data.push('\n');
-                Some(AppEvent::MultiuserServerData(world_index, username, data.into_bytes()))
-            }
-            chat::ChatEvent::TargetChanged(t) => {
-                if let Some(conn) = self.user_connections.get_mut(&key) {
-                    conn.chat_target = Some(t);
-                }
-                self.multiuser_chat_prompt(world_index, &username);
-                None
-            }
-            chat::ChatEvent::Closed { reason, fatal: _ } => {
-                self.multiuser_chat_line(world_index, &username, &reason);
-                if connected {
-                    Some(AppEvent::MultiuserDisconnected(world_index, username))
-                } else {
-                    // Never connected: drop the failed attempt so a new connect can start.
-                    if let Some(conn) = self.user_connections.get_mut(&key) {
-                        conn.chat = None;
-                    }
-                    None
-                }
-            }
-        }
-    }
 
-    /// Multiuser `/chat ...` typed into a chat world (multiuser SendCommand otherwise
-    /// sends every line to the connection as-is). Returns false when `command` isn't a
-    /// /chat command for a chat world, so the caller sends it normally.
-    pub(crate) fn multiuser_chat_command(&mut self, world_index: usize, username: &str, command: &str) -> bool {
-        let trimmed = command.trim_start();
-        let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
-            Some((c, r)) => (c, r.trim()),
-            None => (trimmed, ""),
-        };
-        if !matches!(cmd.to_lowercase().as_str(), "/chat" | "/discord" | "/slack") {
-            return false;
-        }
-        let Some(world) = self.worlds.get(world_index) else { return false };
-        let Some(kind) = chat::ChatKind::from_world_type(&world.settings.world_type) else { return false };
-        let (send_to, filter) = commands::chat_send_to_and_filter(&world.settings, kind);
-        let key = (world_index, username.to_string());
-        let (text, save) = {
-            let conn = self.user_connections.get(&key);
-            let ctx = commands::ChatCmdCtx {
-                kind,
-                connected: conn.map(|c| c.connected).unwrap_or(false),
-                dir: conn.and_then(|c| c.chat.as_ref().map(|h| h.dir.clone())),
-                target: conn.and_then(|c| c.chat_target.as_ref()),
-                command_tx: conn.and_then(|c| c.command_tx.as_ref()),
-                send_to,
-                filter,
-            };
-            commands::run_chat_subcommand(&ctx, rest)
-        };
-        if let Some(value) = save {
-            commands::set_chat_send_to(self, world_index, kind, value);
-        }
-        if !text.is_empty() {
-            self.multiuser_chat_line(world_index, username, &text);
-        }
-        true
-    }
 
     /// Connect world `idx` (a MUD world with connection settings) in a spawned task via
     /// `daemon::connect_daemon_world`; the outcome comes back as
@@ -16260,6 +16355,7 @@ impl App {
     /// auto-login itself (honouring `World::skip_auto_login`, and deferring it for FANSI
     /// client detection), so `connect_daemon_world` is always told not to send one.
     pub(crate) fn spawn_world_connect(&mut self, idx: usize, origin: ConnectOrigin, event_tx: &mpsc::Sender<AppEvent>) {
+        self.worlds[idx].connect_ip = self.connect_origin_ip(idx, origin);
         let mut settings = self.worlds[idx].settings.clone();
         // TF's PENDING hook: a connection is being tried.
         let pending_arg = format!("{} {} {}", self.worlds[idx].name, settings.hostname, settings.port);
@@ -16273,14 +16369,65 @@ impl App {
         let connection_id = self.worlds[idx].connection_id;
         let diag = self.worlds[idx].protocol.new_diag();
         let tls_proxy_enabled = self.settings.tls_proxy_enabled;
+        let gmcp_enabled = self.policy.gmcp;
         let event_tx = event_tx.clone();
         tokio::spawn(async move {
             let result = daemon::connect_daemon_world(
                 idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
-                tls_proxy_enabled, Some(diag),
+                tls_proxy_enabled, gmcp_enabled, Some(diag),
             ).await;
             let _ = event_tx.send(AppEvent::WorldConnectResult(world_name, connection_id, origin, result)).await;
         });
+    }
+
+    /// What a First Command's `%host%` stands for at this connect: the address of the
+    /// client whose command connected the world (`util::normalize_client_ip`, so an IPv4
+    /// peer of a dual-stack listener reads `1.2.3.4`, not `::ffff:1.2.3.4`); `127.0.0.1`
+    /// for the console, the embedded GUI window (client 0) and TF or a trigger running on
+    /// the server; an auto-reconnect keeps the last connect's.
+    pub(crate) fn connect_origin_ip(&self, idx: usize, origin: ConnectOrigin) -> Option<String> {
+        const LOCAL: &str = "127.0.0.1";
+        match origin {
+            ConnectOrigin::AutoReconnect => self.worlds.get(idx).and_then(|w| w.connect_ip.clone()).or_else(|| Some(LOCAL.to_string())),
+            ConnectOrigin::Console => Some(LOCAL.to_string()),
+            ConnectOrigin::Client { client_id, .. } => {
+                let ip = if client_id == 0 { None } else { self.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)) };
+                Some(ip.map(|ip| util::normalize_client_ip(&ip)).unwrap_or_else(|| LOCAL.to_string()))
+            }
+        }
+    }
+
+    /// Send the world's First Command (`WorldSettings::first_command`), `%host%` replaced
+    /// by `World::connect_ip`, as the first thing on a fresh connection: raw text, before
+    /// Clay's auto-login, never through TF. Nothing for a world without one.
+    pub(crate) fn send_first_command(&mut self, world_idx: usize, cmd_tx: &mpsc::Sender<WriteCommand>) {
+        let host = self.worlds[world_idx].connect_ip.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+        let lines = self.worlds[world_idx].settings.first_command_lines(&host);
+        if lines.is_empty() {
+            return;
+        }
+        for line in lines {
+            let _ = cmd_tx.try_send(WriteCommand::Text(line));
+        }
+        self.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
+    }
+
+    /// A client just logged in (its `InitialState` is on its way). A visitor's page
+    /// (`Policy::auto_connect_on_login`) connects its one world now, as that client's own
+    /// connect, so a First Command's `%host%` is the visitor's address. Nothing for any
+    /// other Clay.
+    pub(crate) fn after_client_login(&mut self, client_id: u64, event_tx: &mpsc::Sender<AppEvent>) {
+        if !self.policy.auto_connect_on_login || self.worlds.is_empty() || self.worlds[0].connected {
+            return;
+        }
+        let settings = self.worlds[0].settings.clone();
+        if !settings.world_type.is_mud() || !settings.has_connection_settings() {
+            self.emit_client_text(0, "This page's world has no host and port set.", true);
+            return;
+        }
+        let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+        self.emit_client_text(0, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg), true);
+        self.spawn_world_connect(0, ConnectOrigin::Client { report_failure: true, client_id }, event_tx);
     }
 
     /// Apply the outcome of a `spawn_world_connect`. The caller must re-arm its reconnect
@@ -16329,7 +16476,7 @@ impl App {
             (ConnectOrigin::Console, Err(failure)) => {
                 self.report_connect_failure(idx, &failure, true, false);
             }
-            (ConnectOrigin::Client { report_failure }, Err(failure)) => {
+            (ConnectOrigin::Client { report_failure, .. }, Err(failure)) => {
                 self.worlds[idx].skip_auto_login = false;
                 self.report_connect_failure(idx, &failure, report_failure, false);
             }
@@ -16472,62 +16619,6 @@ impl App {
         }
     }
 
-    /// Handle one `TelnetEvent` for a multiuser per-user connection (plan Job 9, T3.2) -
-    /// `handle_telnet_event`'s sibling for `TelnetTarget::Multiuser`. Fixes the bug this
-    /// job exists for: before it, `telnet_reader::to_app_event` mapped every one of these
-    /// but `TelnetDetected`/`Prompt` to `None` for a `Multiuser` target, and
-    /// `run_multiuser_server` had no `AppEvent::Telnet` arm at all - so NAWS, TTYPE/MTTS,
-    /// CHARSET, GMCP (including the `Core.Hello` that makes servers send anything), MSDP,
-    /// MSSP, MSP, and ECHO masking (**passwords in cleartext**) were all dead for every
-    /// multiuser user.
-    ///
-    /// **Owner-gated** (CLAUDE.md's `world.owner == username` rule): a telnet event only
-    /// ever originates from `username`'s own live connection to `world_index`
-    /// (`connect_multiuser_world` is only ever spawned via `ConnectWorld`, which is
-    /// already owner-checked - see `handle_multiuser_ws_message`), so a mismatch here
-    /// would mean a stale/forged event; dropped with a `MU-TELNET-DROP` log line rather
-    /// than silently trusted.
-    ///
-    /// No audio, no TF hooks, no `needs_output_redraw` - multiuser has no console and no
-    /// per-user host to play a sound on (see the per-variant table in the plan).
-    /// `naws_size` comes from `user_min_dimensions`, not `get_minimum_dimensions` - a
-    /// multiuser user's window size must never leak into another user's NAWS.
-    pub(crate) fn handle_multiuser_telnet_event(&mut self, world_index: usize, username: String, ev: &TelnetEvent) {
-        let is_owner = self.worlds.get(world_index)
-            .map(|w| w.owner.as_deref() == Some(username.as_str()))
-            .unwrap_or(false);
-        if !is_owner {
-            crate::http::log_remote_event(
-                "MU-TELNET-DROP",
-                &username,
-                &format!("telnet event for world {world_index} not owned by this user"),
-            );
-            return;
-        }
-
-        let naws_size = self.user_min_dimensions(&username);
-        let key = (world_index, username.clone());
-        // Disjoint `App` fields (`self.worlds` vs `self.user_connections`), so borrowing
-        // one immutably and the other mutably at once is borrowck-clean (plan Job 9's
-        // handler-shape note).
-        let outcome = {
-            let settings = &self.worlds[world_index].settings;
-            let Some(conn) = self.user_connections.get_mut(&key) else { return };
-            let command_tx = conn.command_tx.clone();
-            let ctx = protocol_state::ProtocolCtx {
-                world_index,
-                command_tx: command_tx.as_ref(),
-                settings,
-                naws_size,
-            };
-            conn.protocol.apply_telnet_event(ev.clone(), &ctx)
-        };
-        if let Some(ref ws) = self.ws_server {
-            for msg in outcome.broadcasts {
-                ws.broadcast_to_owner(msg, Some(username.as_str()));
-            }
-        }
-    }
 
     /// How long a reload deferred by `should_defer_reload_for_mccp2` waits for every
     /// drained world's MCCP2 stream to actually end before giving up and exec'ing anyway -
@@ -16670,7 +16761,7 @@ impl App {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             self.worlds[world_idx].output_lines.push(OutputLine::new_client(mccp2_msg.to_string(), seq));
-            if world_idx != self.current_world_index {
+            if !self.world_watched(world_idx) {
                 if self.worlds[world_idx].unseen_lines == 0 {
                     self.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
                 }
@@ -17106,11 +17197,12 @@ impl App {
                 // Clear any accumulated violations so reconnect failures don't ban the client
                 self.ban_list.clear_violations(client_ip);
                 self.ws_set_client_authenticated(client_id, true);
+                let (username, multiuser_mode) = self.auth_identity();
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: true,
                     error: None,
-                    username: None,
-                    multiuser_mode: false,
+                    username,
+                    multiuser_mode,
                 });
                 crate::http::log_remote_event("CLIENT-VERSION", client_ip,
                     if client_version.is_empty() { "-" } else { client_version.as_str() });
@@ -17130,11 +17222,12 @@ impl App {
                 // devices with stored keys. Reconnect races after a server restart would
                 // otherwise accumulate violations and ban the device unfairly.
                 // Password brute-force (handled in handle_ws_client) still triggers bans.
+                let (_, multiuser_mode) = self.auth_identity();
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: false,
                     error: Some("Invalid auth key".to_string()),
                     username: None,
-                    multiuser_mode: false,
+                    multiuser_mode,
                 });
             }
         }
@@ -17142,6 +17235,9 @@ impl App {
 
     /// Handle WsKeyRequest event — generate a new single auth key (replaces any existing).
     fn handle_ws_key_request(&mut self, _client_id: u64) {
+        if !self.policy.auth_key {
+            return;
+        }
         let Some(key) = App::generate_auth_key() else {
             // RNG failure (C2, fail closed): don't replace the existing key with a weak
             // one — leave settings untouched and tell the requesting UI it failed.
@@ -17154,15 +17250,20 @@ impl App {
         self.settings.websocket_auth_key = Some(AuthKey::new(key.clone()));
         *self.ws_auth_key_shared.write().unwrap() = Some(key.clone());
         let _ = persistence::save_settings(self);
+        self.publish_auth_key();
         // Broadcast to ALL clients so every web UI updates its displayed key
         self.ws_broadcast(WsMessage::KeyGenerated { auth_key: key });
     }
 
     /// Handle WsKeyRevoke event — clear the single auth key.
     fn handle_ws_key_revoke(&mut self, _key: &str) {
+        if !self.policy.auth_key {
+            return;
+        }
         self.settings.websocket_auth_key = None;
         *self.ws_auth_key_shared.write().unwrap() = None;
         let _ = persistence::save_settings(self);
+        self.publish_auth_key();
     }
 
     // ── Remote access / reachability (reach.rs) ─────────────────────────────
@@ -17281,6 +17382,9 @@ impl App {
     /// Speak `text` with the current engine (`Settings::tts_mode`), and say so - once -
     /// when that is Kokoro but its files are not here, so the Local engine spoke instead.
     pub(crate) fn speak_text(&mut self, text: &str) {
+        if !self.sound_here() {
+            return;
+        }
         if tts::speak(&self.tts_backend, text, self.settings.tts_mode, &self.settings.tts_voice) {
             self.note_kokoro_missing(false);
         }
@@ -17324,6 +17428,9 @@ impl App {
     /// Kokoro is the engine here: load its model in the background now (at startup, after
     /// an install, when the GUI's window logs in), not on the first line spoken.
     pub(crate) fn warm_kokoro(&mut self) {
+        if !self.sound_here() {
+            return;
+        }
         if let Some(voice) = self.local_kokoro_voice() {
             tts::warm_kokoro(&self.tts_backend, &voice);
         }
@@ -17484,8 +17591,8 @@ impl App {
                 }
                 v
             }
-            "install" | "remove" | "test" if self.multiuser_mode => {
-                vec!["Kokoro: a multiuser server has no voice of its own; run /tts on your own Clay.".to_string()]
+            "install" | "remove" | "test" if !self.policy.sound_here => {
+                vec!["Kokoro: this server has no voice of its own; run /tts on your own Clay.".to_string()]
             }
             "install" => match kokoro::install_check() {
                 Err(why) => vec![why],
@@ -17583,7 +17690,7 @@ impl App {
     /// comes back as `AppEvent::UpdateResult`. `reply_to` None = the console asked.
     /// The multiuser server refuses: its users aren't its operator.
     pub(crate) fn start_server_update(&mut self, force: bool, reply_to: Option<(u64, usize)>, event_tx: &mpsc::Sender<AppEvent>) {
-        if self.multiuser_mode {
+        if !self.policy.server_wide {
             self.reply_update_line(reply_to, &selfupdate::multiuser_refused());
             self.send_update_outcome(reply_to, false, false, "");
             return;
@@ -17680,6 +17787,9 @@ impl App {
     /// checkip.amazonaws.com for our public address. Never called automatically —
     /// it contacts a third party. The answer arrives as `AppEvent::PublicIpResult`.
     pub fn request_public_ip_lookup(&mut self, reply_to: Option<(u64, usize)>, event_tx: mpsc::Sender<AppEvent>) {
+        if !self.policy.server_wide {
+            return;
+        }
         tokio::spawn(async move {
             let result = reach::lookup_public_ip().await;
             let _ = event_tx.send(AppEvent::PublicIpResult(result, reply_to)).await;
@@ -17753,6 +17863,9 @@ impl App {
     /// prompt on *this* machine's desktop, then a fresh query so the verdict shown
     /// is what Windows actually enforces. Off Windows it just reports `NotApplicable`.
     pub fn request_firewall_rule(&mut self, reply_to: Option<(u64, usize)>, event_tx: mpsc::Sender<AppEvent>) {
+        if !self.policy.server_wide {
+            return;
+        }
         if !cfg!(windows) {
             self.firewall_status = reach::FirewallStatus::NotApplicable;
             let line = self.apply_firewall_result(reach::FirewallStatus::NotApplicable, None);
@@ -17803,6 +17916,9 @@ impl App {
 
     /// Re-query the firewall and, when the toggle is on, re-add the router mapping.
     pub fn request_reachability_refresh(&mut self, reply_to: Option<(u64, usize)>, event_tx: mpsc::Sender<AppEvent>) {
+        if !self.policy.server_wide {
+            return;
+        }
         self.spawn_firewall_check(reply_to, event_tx.clone());
         self.start_port_mapping(reply_to, event_tx);
     }
@@ -17952,6 +18068,9 @@ impl App {
     /// field can't silently reset it. Starting/stopping the mapping itself hooks in
     /// here once portmap.rs exists.
     pub fn set_port_map_enabled(&mut self, enabled: bool, source: &str) {
+        if !self.policy.server_wide {
+            return;
+        }
         if self.settings.port_map_enabled != enabled {
             self.settings.port_map_enabled = enabled;
             let _ = persistence::save_settings_with_source(self, source);
@@ -18358,6 +18477,8 @@ impl App {
                 self.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: self.worlds[world_idx].name.clone() });
                 return;
             }
+            // The First Command goes before anything else, the login included.
+            self.send_first_command(world_idx, &cmd_tx);
             // Send auto-login if configured. TF's %login (on unless a script turns it off)
             // gates it, prompt-answering styles included.
             let login_enabled = self.tf_engine.get_var("login").is_none_or(tf::special_vars::flag_is_on);
@@ -18806,13 +18927,8 @@ impl App {
                 // A client's /reload reloads the console it is attached to; `--console` and
                 // `--gui` switch only the Clay they're typed in, and no client of the console
                 // is that (an attached GUI or console restarts itself instead).
-                let refusal = if bad.is_some() {
-                    Some(RELOAD_USAGE)
-                } else {
-                    ui.and_then(|_| self.reload_switch_refusal(client_id))
-                };
-                if let Some(why) = refusal {
-                    self.ws_tell(client_id, world_index, why);
+                if let Some(why) = self.client_reload_refusal(client_id, ui, &bad, false) {
+                    self.ws_tell(client_id, world_index, &why);
                     return WsAsyncAction::Done;
                 }
                 self.reload_ui = None;
@@ -18840,20 +18956,7 @@ impl App {
                     flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
             }
-            Command::Reach { refresh, lookup } => {
-                let target = Some((client_id, world_index));
-                for line in reach::format_reach_lines(&self.build_reachability_info()) {
-                    self.reply_reach_line(target, &line);
-                }
-                if refresh {
-                    self.reply_reach_line(target, "Re-checking firewall and router status...");
-                    self.request_reachability_refresh(target, event_tx.clone());
-                }
-                if lookup {
-                    self.reply_reach_line(target, "Looking up public IP (checkip.amazonaws.com)...");
-                    self.request_public_ip_lookup(target, event_tx.clone());
-                }
-            }
+            Command::Reach { refresh, lookup } => self.ws_reach(client_id, world_index, refresh, lookup, event_tx),
             // AddWorld - add or update world definition
             Command::RemoveWorld { names } => {
                 execute_remove_world_command(self, &names, world_index, false);
@@ -19241,7 +19344,7 @@ impl App {
             WsMessage::TrustCertificate { world_index, host, new_fingerprint } => {
                 // User explicitly accepted a changed TLS certificate after a pin
                 // mismatch (see platform::danger). Re-pin and reconnect.
-                if world_index < self.worlds.len() {
+                if world_index < self.worlds.len() && self.can_trust_certificate(client_id, world_index) {
                     persistence::replace_pin(&host, &new_fingerprint);
                     self.add_output_to_world(world_index, &format!("Trusting new certificate for {}, reconnecting...", host));
                     if !self.worlds[world_index].connected {
@@ -19316,14 +19419,14 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                     msp_enabled, mcp_enabled, mccp2_enabled,
                     world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
-                    keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command,
+                    keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command,
                 );
             }
             WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } => {
@@ -19363,33 +19466,15 @@ impl App {
             WsMessage::RequestWorldState { world_index } => {
                 self.handle_request_world_state(client_id, world_index);
             }
-            WsMessage::BanListRequest => {
-                // Send current ban list to client
-                let bans = self.ban_list.get_ban_info();
-                self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
-            }
-            WsMessage::UnbanRequest { host } => {
-                if self.ban_list.remove_ban(&host) {
-                    // Save settings to persist the change
-                    let _ = persistence::save_settings(self);
-                    // Broadcast updated ban list to all clients
-                    self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
-                    self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
-                } else {
-                    self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
-                }
-            }
+            WsMessage::BanListRequest => self.ws_ban_list_response(client_id),
+            WsMessage::UnbanRequest { host } => self.ws_unban_request(client_id, host),
+            WsMessage::ChangePassword { .. } => self.ws_change_password(client_id),
             // /import export side: an authenticated peer (another Clay instance running
             // /import) is requesting this instance's settings/theme/keybindings with all
             // secrets decrypted. Gating is the same as every other Request* handler here —
             // reaching this match arm at all already implies a valid WS auth (password or
             // auth-key). See plan `i-d-like-to-make-snuggly-rain.md`.
-            WsMessage::RequestSettingsExport => {
-                let settings_dat = persistence::serialize_settings_for_export(self);
-                let theme_dat = self.theme_file.generate_file_content();
-                let keybindings_dat = self.keybindings.to_dat_string();
-                self.ws_send_to_client(client_id, WsMessage::SettingsExport { settings_dat, theme_dat, keybindings_dat });
-            }
+            WsMessage::RequestSettingsExport => self.ws_settings_export(client_id),
             // /import trigger side: a client (web/Android/remote-console dialog, or the TUI's
             // own in-process path for the master) asked us to pull settings from `addr`. The
             // network round-trip can't block this handler, so it runs in a spawned task and
@@ -19397,7 +19482,7 @@ impl App {
             // receive a WsClientMessage (run_app's two loops, run_app_headless) — see
             // handle_import_result. See plan `i-d-like-to-make-snuggly-rain.md`.
             WsMessage::ImportSettings { addr, password, auth_key, allow_insecure } => {
-                spawn_import_settings(event_tx.clone(), client_id, addr, password, auth_key, allow_insecure);
+                self.ws_import_settings(client_id, addr, password, auth_key, allow_insecure, event_tx);
             }
             // Theme editor messages
             WsMessage::RequestThemeEditorState => {
@@ -20043,6 +20128,7 @@ impl App {
                     keep_alive_gag_enabled: world.settings.keep_alive_gag_enabled,
                     keep_alive_gag: world.settings.keep_alive_gag.clone(),
                     login_command: world.settings.login_command.clone(),
+                    first_command: world.settings.first_command.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
                     has_notes: !world.settings.notes.is_empty(),
@@ -20126,7 +20212,8 @@ impl App {
             worlds,
             settings,
             current_world_index: self.current_world_index,
-            actions: self.settings.actions.clone(),
+            // A visitor's page never sees the operator's actions (they still run here).
+            actions: if self.policy.parse_commands { self.settings.actions.clone() } else { Vec::new() },
             splash_lines: generate_splash_strings(),
             server_version: crate::VERSION.to_string(),
             server_version_detail: crate::version_detail(),
@@ -20138,11 +20225,17 @@ impl App {
             scrollback_push: false,
             other_views: true,
             expand_line: true,
-            picture_upload: true,
-            history_on_demand: true,
-            map: true,
+            // Import Picture is off for a clay_web visitor (user ruling 2026-11-11).
+            picture_upload: self.policy.pictures,
+            // The archive and the map are a Clay's own files: none for a visitor.
+            history_on_demand: self.policy.user_paths,
+            map: self.policy.user_paths,
             resume_session: true,
             info_report: true,
+            web_front: !self.policy.parse_commands,
+            server_sound: self.policy.sound_here,
+            change_password: self.policy.change_password,
+            shell_worlds: cfg!(feature = "shell-worlds"),
             emoji_json: crate::emoji::emoji_json(),
             emoji_categories_json: crate::emoji::emoji_categories_json(),
             tf_status: self.tf_status.iter()
@@ -20931,8 +21024,9 @@ pub enum ConnectOrigin {
     AutoReconnect,
     /// A web/GUI/`-D` client request handled by `daemon::handle_daemon_ws_message`.
     /// `report_failure` is false for `/worlds -b` (background connect), which never
-    /// reported a failure.
-    Client { report_failure: bool },
+    /// reported a failure. `client_id` is the asking client (0 = the embedded GUI
+    /// window), whose address a First Command's `%host%` becomes.
+    Client { report_failure: bool, client_id: u64 },
     /// The console's `/worlds` connect task, TLS-proxy branch (commands.rs). Only ever
     /// sent on success - a proxy failure falls back to a direct connect in that task.
     Console,
@@ -21006,13 +21100,6 @@ pub enum AppEvent {
     WsKeyRevoke(u64, String),                  // client_id, auth_key to revoke
     // Multiuser mode events (include username for per-user connection isolation)
     ConnectWorldRequest(usize, String),  // world_index, requesting username
-    /// Outcome of a multiuser per-user connect spawned by `ConnectWorldRequest`:
-    /// world_index, username, the writer channel on success.
-    MultiuserConnectResult(usize, String, Option<mpsc::Sender<WriteCommand>>, std::sync::Arc<protocol_state::ConnDiag>),
-    MultiuserServerData(usize, String, Vec<u8>),  // world_index, username, raw bytes
-    MultiuserDisconnected(usize, String),         // world_index, username
-    MultiuserTelnetDetected(usize, String),       // world_index, username
-    MultiuserPrompt(usize, String, Vec<u8>),      // world_index, username, prompt bytes
     // Media file downloaded and ready to play
     MediaFileReady(usize, String, std::path::PathBuf, i64, i64, bool),  // world_idx, key, path, volume, loops, is_music
     // API lookup result (dict/urban/translate) from spawned task
@@ -21055,85 +21142,23 @@ pub struct UpdateSuccess {
     pub temp_path: std::path::PathBuf,
 }
 
-/// Per-user connection state for multiuser mode
-/// Each user has their own independent connection to each world
-#[derive(Clone)]
-pub struct UserConnection {
-    pub connected: bool,
-    pub command_tx: Option<mpsc::Sender<WriteCommand>>,
-    output_lines: Vec<OutputLine>,
-    pub scroll_offset: usize,
-    pub unseen_lines: usize,
-    pub paused: bool,
-    pub lines_since_pause: usize,
-    pub telnet_mode: bool,
-    pub prompt: String,
-    pub prompt_count: usize,
-    pub last_send_time: Option<std::time::Instant>,
-    pub last_receive_time: Option<std::time::Instant>,
-    pub partial_line: String,
-    pub partial_in_pending: bool,
-    /// Job 9 (T3.2): this connection's own telnet protocol mirrors (NAWS, GMCP, MSDP,
-    /// MSSP, ECHO masking, ...) - see `protocol_state::ProtocolState`'s doc comment for
-    /// the full list and why multiuser needed its own copy (`World` embeds one too).
-    pub protocol: protocol_state::ProtocolState,
-    /// Slack/Discord: this user's session for a chat world (see `crate::chat`). Some
-    /// from connect start; dropping it ends the session. In multiuser mode a world has
-    /// one owner, so this is the world's one session.
-    pub chat: Option<chat::ChatHandle>,
-    /// The session's id in `AppEvent::Chat` (events from an older session are stale).
-    pub chat_conn_id: u64,
-    pub chat_target: Option<chat::directory::ChatTarget>,
-    /// When this connection came up, for `/info`.
-    pub connected_at: Option<std::time::SystemTime>,
-}
 
-impl Default for UserConnection {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
-impl UserConnection {
-    pub fn new() -> Self {
-        Self {
-            connected: false,
-            command_tx: None,
-            output_lines: Vec::new(),
-            scroll_offset: 0,
-            unseen_lines: 0,
-            paused: false,
-            lines_since_pause: 0,
-            telnet_mode: false,
-            prompt: String::new(),
-            prompt_count: 0,
-            last_send_time: None,
-            last_receive_time: None,
-            partial_line: String::new(),
-            partial_in_pending: false,
-            protocol: protocol_state::ProtocolState::default(),
-            chat: None,
-            chat_conn_id: 0,
-            chat_target: None,
-            connected_at: None,
-        }
-    }
-}
 
 pub fn get_settings_path() -> PathBuf {
-    // Use custom config path if set via --conf=<path>
-    if let Some(custom_path) = get_custom_config_path() {
-        return custom_path.clone();
+    // Use custom config path if set via --conf=<path>. It names the operator's file: an
+    // instance (a clay_multi user) always reads its own directory's settings.dat.
+    if instance::is_main() {
+        if let Some(custom_path) = get_custom_config_path() {
+            return custom_path.clone();
+        }
     }
     clay_config_path("settings.dat")
 }
 
-pub fn get_multiuser_settings_path() -> PathBuf {
-    clay_config_path("multiuser.dat")
-}
 
 fn get_debug_log_path() -> PathBuf {
-    clay_config_path("debug.log")
+    clay_root_config_path("debug.log")
 }
 
 /// Write a session startup header to a debug log file.
@@ -21151,9 +21176,10 @@ fn write_debug_header(file: &mut std::fs::File) {
     let _ = writeln!(file, "=== {} — started {} ===", get_version_string(), startup_ts);
 }
 
-/// Write a debug message to ~/.clay/debug.log if debug is enabled
+/// Write a debug message to ~/.clay/debug.log if debug is enabled. clay_web keeps no
+/// debug.log at all (user request 2026-11-10): the crash log speaks on stderr there.
 fn debug_log(debug_enabled: bool, message: &str) {
-    if !debug_enabled {
+    if !debug_enabled || instance::is_web_only() {
         return;
     }
     use std::io::Write;
@@ -21174,7 +21200,12 @@ fn debug_log(debug_enabled: bool, message: &str) {
                 lt.year, lt.month, lt.day,
                 lt.hour, lt.minute, lt.second
             );
-            let _ = writeln!(file, "[{}] {}", timestamp, message);
+            // One write per line: a `File` is unbuffered, so `writeln!` would issue a
+            // write per format piece, and with many instance threads logging to the one
+            // debug.log their pieces interleaved mid-line (seen 2026-11-09). An O_APPEND
+            // write of a whole line is atomic.
+            let line = format!("[{}] {}{}\n", timestamp, instance::log_prefix(), message);
+            let _ = file.write_all(line.as_bytes());
         }
         Err(e) => {
             eprintln!("Failed to open debug log {:?}: {}", path, e);
@@ -21184,20 +21215,21 @@ fn debug_log(debug_enabled: bool, message: &str) {
 
 /// Write a debug message to ~/.clay/output.debug.log (output/seq debugging)
 pub(crate) fn output_debug_log(message: &str) {
-    if !is_debug_enabled() {
+    if !is_debug_enabled() || instance::is_web_only() {
         return;
     }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(clay_config_path("output.debug.log"))
+        .open(clay_root_config_path("output.debug.log"))
     {
         // Write session header on first log entry
         if !OUTPUT_DEBUG_HEADER_WRITTEN.swap(true, Ordering::Relaxed) {
             write_debug_header(&mut f);
         }
-        let _ = writeln!(f, "{}", message);
+        // One write per line, as in `debug_log` (instance threads share this file too).
+        let _ = f.write_all(format!("{}\n", message).as_bytes());
     }
 }
 
@@ -21410,6 +21442,7 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) keep_alive_gag_enabled: bool,
     pub(crate) keep_alive_gag: String,
     pub(crate) login_command: String,
+    pub(crate) first_command: String,
     pub(crate) gmcp_packages: String,
     pub(crate) auto_reconnect_secs: String,
     pub(crate) msp_enabled: bool,
@@ -21511,7 +21544,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
-        WORLD_FIELD_KEEP_ALIVE_GAG, WORLD_FIELD_LOGIN_COMMAND,
+        WORLD_FIELD_KEEP_ALIVE_GAG, WORLD_FIELD_LOGIN_COMMAND, WORLD_FIELD_FIRST_COMMAND,
         WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_PROMPT_WAIT_MS,
         WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_TF_TYPE,
         WORLD_FIELD_STATUS_LINE,
@@ -23062,7 +23095,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 match_type: action_match_type,
                                 patterns,
                                 command,
-                                owner: None,
                                 enabled,
                                 startup,
                                 gui_shortcut,
@@ -23244,7 +23276,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 match_type: action_match_type,
                                 patterns,
                                 command,
-                                owner: None,
                                 enabled,
                                 startup,
                                 gui_shortcut,
@@ -23302,6 +23333,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     keep_alive_gag_enabled: popup::definitions::world_editor::keep_alive_gag_enabled(&state.definition),
                     keep_alive_gag: state.get_text(WORLD_FIELD_KEEP_ALIVE_GAG).unwrap_or("").to_string(),
                     login_command: state.get_text(WORLD_FIELD_LOGIN_COMMAND).unwrap_or("").to_string(),
+                    first_command: state.get_text(WORLD_FIELD_FIRST_COMMAND).unwrap_or("").to_string(),
                     gmcp_packages: state.get_text(WORLD_FIELD_GMCP_PACKAGES).unwrap_or(DEFAULT_GMCP_PACKAGES).to_string(),
                     auto_reconnect_secs: state.get_text(WORLD_FIELD_AUTO_RECONNECT).unwrap_or("0").to_string(),
                     msp_enabled: state.get_bool(WORLD_FIELD_MSP_ENABLED).unwrap_or(true),
@@ -23714,6 +23746,7 @@ async fn main() -> io::Result<()> {
     let mut conf_path: Option<String> = None;
     let mut daemon_mode = false;
     let mut multiuser_mode = false;
+    let mut web_front_mode = false;
     let mut local_server_mode = false;
     let mut tts_install_mode = false;
     let mut upgrade_mode = false;
@@ -23765,6 +23798,7 @@ async fn main() -> io::Result<()> {
                 "-h" | "--help" => show_help = true,
                 "-D" => daemon_mode = true,
                 "--multiuser" => multiuser_mode = true,
+                "--web-front" => web_front_mode = true,
                 "--local-server" => local_server_mode = true,
                 "--tts-install" => tts_install_mode = true,
                 "--upgrade" => upgrade_mode = true,
@@ -23882,7 +23916,8 @@ async fn main() -> io::Result<()> {
         println!("    --listen-port=<N>    Local port to accept on (with --ssh-proxy)");
         println!("                         Credentials via CLAY_SSH_KEY/CLAY_SSH_KEY_PASSPHRASE/");
         println!("                         CLAY_SSH_PASSWORD env vars (at least one required).");
-        println!("    --conf=<path>        Use custom config file (default: ~/.clay/settings.dat)");
+        println!("    --conf=<path>        Use custom config file (default: ~/.clay/settings.dat;");
+        println!("                         for clay_web the web.dat to read, default ./web.dat)");
         println!("    --grep=host[:port] <pattern>  Search world output (default port: 9000)");
         println!("      -w <world>              Limit to specific world");
         println!("      --regexp                Use regex (default: glob with * and ? wildcards)");
@@ -23926,6 +23961,9 @@ async fn main() -> io::Result<()> {
         if cfg!(feature = "webview-gui") { features.push("webview-gui"); }
         if cfg!(feature = "native-audio") { features.push("native-audio"); }
         if cfg!(feature = "ssh-transport") { features.push("ssh-transport"); }
+        if cfg!(feature = "shell-worlds") { features.push("shell-worlds"); }
+        if cfg!(feature = "multiuser") { features.push("multiuser"); }
+        if cfg!(feature = "web-front") { features.push("web-front"); }
         let features_str = if features.is_empty() {
             "none".to_string()
         } else {
@@ -24033,6 +24071,23 @@ async fn main() -> io::Result<()> {
     DEBUG_LOG_HEADER_WRITTEN.store(false, Ordering::Relaxed);
     OUTPUT_DEBUG_HEADER_WRITTEN.store(false, Ordering::Relaxed);
 
+    // The two server builds run their server when started with no interface (the dispatch
+    // after the one-shot modes below). clay_web's must be known here, before anything
+    // touches ~/.clay: it runs from web.dat's directory alone (instance::set_web_only).
+    #[cfg(any(feature = "multiuser", feature = "web-front"))]
+    let runs_server = {
+        let attaches = matches!(console_arg, Some(Some(_))) || matches!(web_gui_arg, Some(Some(_))) || matches!(gui_arg, Some(Some(_)));
+        let one_shot = tls_proxy_config.is_some() || grep_arg.is_some() || grep_archive_mode || dump_mode || ssh_proxy_mode;
+        !(attaches || one_shot || daemon_mode || console_arg.is_some() || web_gui_arg.is_some() || gui_arg.is_some())
+    };
+    #[cfg(feature = "web-front")]
+    if runs_server {
+        if let Err(e) = server::init_web_only(conf_path.as_deref()) {
+            eprintln!("clay_web: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // Migrate legacy ~/.clay.* dotfiles into ~/.clay/ before any config is loaded
     migrate_legacy_config_files();
 
@@ -24119,6 +24174,18 @@ async fn main() -> io::Result<()> {
     if ssh_mode {
         eprintln!("clay: --ssh requires the 'ssh-transport' feature.");
         eprintln!("clay: rebuild with: cargo build --features ssh-transport");
+        std::process::exit(1);
+    }
+    // The two server builds are features of their own (never with shell worlds; release
+    // builds have shell worlds instead): clay_multi has `multiuser`, clay_web `web-front`.
+    if multiuser_mode && !cfg!(feature = "multiuser") {
+        eprintln!("clay: --multiuser requires the 'multiuser' feature (the clay_multi build).");
+        eprintln!("clay: build it with: ./build.sh --only multi");
+        std::process::exit(1);
+    }
+    if web_front_mode && !cfg!(feature = "web-front") {
+        eprintln!("clay: --web-front requires the 'web-front' feature (the clay_web build).");
+        eprintln!("clay: build it with: ./build.sh --only web");
         std::process::exit(1);
     }
     if ssh_proxy_mode && (console_arg.is_some() || web_gui_arg.is_some() || ssh_mode || daemon_mode
@@ -24270,13 +24337,24 @@ async fn main() -> io::Result<()> {
         }
     }
 
-    // Handle --multiuser mode
-    if multiuser_mode {
-        crashlog::session("multiuser");
-        // It has no SIGTERM/SIGHUP handling of its own: an exit line rather than none.
-        crashlog::record_ending_signals();
-        return run_multiuser_server().await;
+    // The server builds (clay_multi, clay_web): a start naming no interface and no one-shot
+    // tool runs the server, as `--multiuser`/`--web-front` do; `--console=host:port` and
+    // `--gui=host:port` still attach to another Clay. A build that is a server has no
+    // console, GUI or -D of its own.
+    #[cfg(any(feature = "multiuser", feature = "web-front"))]
+    {
+        let attaches = matches!(console_arg, Some(Some(_))) || matches!(web_gui_arg, Some(Some(_))) || matches!(gui_arg, Some(Some(_)));
+        if !attaches {
+            if !runs_server {
+                eprintln!("clay: this build is a server; it has no console, GUI or -D of its own.");
+                eprintln!("clay: run it with no options to start the server, or attach a client with --console=host:port or --gui=host:port.");
+                std::process::exit(1);
+            }
+            let kind = if cfg!(feature = "multiuser") { server::ServerKind::Multi } else { server::ServerKind::WebFront };
+            return server::run(kind).await;
+        }
     }
+    let _ = (multiuser_mode, web_front_mode);
 
     // Handle -D (daemon mode)
     if daemon_mode {
@@ -24472,7 +24550,7 @@ async fn start_web_server_at_startup(app: &mut App, ws_state: Option<Arc<crate::
     };
     let mut https_server = HttpsServer::new(port);
     https_server.bind_retry = bind_retry;
-    match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), gate).await {
+    match start_https_server(&mut https_server, Some((cert_file.as_str(), key_file.as_str())), ws_state, app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), gate).await {
         Ok(()) => {
             app.web_port_override = (port != configured).then_some(port);
             if !app.is_reload {
@@ -24513,7 +24591,7 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
         SecurityGate {
             allow_list: server.allow_list.clone(),
             whitelisted_host: server.whitelisted_host.clone(),
-            auth_key: app.ws_auth_key_shared.clone(),
+            auth_key: crate::http::KeySource::Single(app.ws_auth_key_shared.clone()),
             web_path: app.settings.web_path.clone(),
             ban_list: app.ban_list.clone(),
         }
@@ -24523,7 +24601,7 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
                 websocket::parse_allow_list_csv(&app.settings.websocket_allow_list)
             )),
             whitelisted_host: Arc::new(std::sync::RwLock::new(app.settings.websocket_whitelisted_host.clone())),
-            auth_key: app.ws_auth_key_shared.clone(),
+            auth_key: crate::http::KeySource::Single(app.ws_auth_key_shared.clone()),
             web_path: app.settings.web_path.clone(),
             ban_list: app.ban_list.clone(),
         }
@@ -24552,7 +24630,7 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
             Some((cert_file, key_file)) => {
                 let mut https_server = HttpsServer::new(http_port);
                 https_server.bind_retry = bind_retry;
-                match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, ban_list, theme_css, gate.clone()).await {
+                match start_https_server(&mut https_server, Some((cert_file.as_str(), key_file.as_str())), ws_state, ban_list, theme_css, gate.clone()).await {
                     Ok(()) => {
                         app.web_port_override = (http_port != app.settings.http_port).then_some(http_port);
                         app.add_output(&format!("HTTPS web interface restarted on port {http_port}"));
@@ -24589,1094 +24667,47 @@ fn pull_in_deadline(mut sleep: std::pin::Pin<&mut tokio::time::Sleep>, at: std::
 }
 
 /// Run the App headlessly (no terminal UI) for master GUI mode.
-/// The App communicates with the embedded GUI via channels.
+/// The App communicates with the embedded GUI via channels. The setup and the loop are
+/// `apploop`'s, shared with `-D` and the server builds' instances.
 pub async fn run_app_headless(
     gui_tx: mpsc::UnboundedSender<WsMessage>,
-    mut gui_rx: mpsc::UnboundedReceiver<WsMessage>,
+    gui_rx: mpsc::UnboundedReceiver<WsMessage>,
     ws_override: Option<WsOverride>,  // the GUI's/Android app's web password (`apply_ws_override`)
     gui_repaint: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     port_override: Option<u16>,   // force http_port (e.g. --local-server on Android)
 ) -> io::Result<()> {
-    let mut app = App::new();
-    app.gui_tx = Some(gui_tx.clone());
-    let gui_repaint_clone = gui_repaint.clone();
-    app.gui_repaint = gui_repaint;
-
-    // Check if we're in reload mode (via --reload command line argument)
-    let is_reload = std::env::args().any(|a| a == "--reload");
-    app.is_reload = is_reload;
-    let is_crash = std::env::args().any(|a| a == "--crash");
-
-    // Initialize crash count from environment variable
-    let crash_count = get_crash_count();
-    CRASH_COUNT.store(crash_count, Ordering::SeqCst);
-
-    let should_load_state = is_reload || is_crash;
-
-    if should_load_state {
-        debug_log(is_debug_enabled(), "HEADLESS STARTUP: Loading reload state...");
-        match persistence::load_reload_state(&mut app) {
-            Ok(true) => {
-                debug_log(is_debug_enabled(), "HEADLESS STARTUP: Reload state loaded successfully");
-                for (idx, world) in app.worlds.iter().enumerate() {
-                    debug_log(is_debug_enabled(), &format!(
-                        "HEADLESS RELOAD STATE: World[{}] '{}' showing_splash={} output_lines={} connected={}",
-                        idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
-                    ));
-                }
-            }
-            Ok(false) => {
-                debug_log(is_debug_enabled(), "HEADLESS STARTUP: No reload state found");
-                if let Err(e) = persistence::load_settings(&mut app) {
-                    eprintln!("Warning: Could not load settings: {}", e);
-                }
-            }
-            Err(e) => {
-                debug_log(is_debug_enabled(), &format!("HEADLESS STARTUP: Failed to load reload state: {}", e));
-                if let Err(e) = persistence::load_settings(&mut app) {
-                    eprintln!("Warning: Could not load settings: {}", e);
-                }
-            }
-        }
-    } else {
-        // Normal startup - load settings
-        if let Err(e) = persistence::load_settings(&mut app) {
-            eprintln!("Warning: Could not load settings: {}", e);
-        }
-        // Clear runtime state on fresh start
-        for world in &mut app.worlds {
-            world.connected = false;
-            world.command_tx = None;
-            world.socket_fd = None;
-            world.pending_lines.clear();
-            world.pending_since = None;
-            world.paused = false;
-            world.unseen_lines = 0;
-            world.first_unseen_at = None;
-            world.lines_since_pause = 0;
-        }
-    }
-
-    // Sync global debug flag from loaded settings
-    DEBUG_ENABLED.store(app.settings.debug_enabled, Ordering::Relaxed);
-
-    // Pre-compile action regexes after loading settings or reload state
-    compile_all_action_regexes(&mut app.settings.actions);
-    // Kokoro as the engine: load its model now, not on the first line spoken.
-    app.warm_kokoro();
-
-    // Load theme file (~/.clay/theme.dat)
-    load_theme_file(&mut app);
-
-    // Load keyboard bindings (~/.clay/keybindings.dat)
-    {
-        let key_path = clay_config_path("keybindings.dat");
-        app.keybindings = keybindings::KeyBindings::load(&key_path);
-    }
-
-    app.ensure_has_world();
-    app.ensure_activity_world();
-
-    // Open scrollback archive if enabled
-    app.init_scrollback();
-
-    let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
-    app.event_tx = Some(event_tx.clone());
-    app.tf_event_tx = Some(event_tx.clone());
-    // TF's SIGTERM/SIGHUP/SIGUSR2 hooks (and a clean end on TERM/HUP).
-    #[cfg(all(unix, not(target_os = "android")))]
-    spawn_tf_signal_handlers(&event_tx);
-
-    // Reconstruct connections from saved fds if in reload/crash mode
-    #[cfg(any(unix, windows))]
-    if should_load_state {
-        // Log world state for debugging (always-on)
-        for (idx, world) in app.worlds.iter().enumerate() {
-            if world.connected || world.socket_fd.is_some() {
-                debug_log(is_debug_enabled(), &format!(
-                    "HEADLESS RELOAD: World[{}] '{}' connected={} is_tls={} socket_fd={:?} proxy_pid={:?}",
-                    idx, world.name, world.connected, world.is_tls, world.socket_fd, world.proxy_pid
-                ));
-            }
-        }
-        debug_log(is_debug_enabled(), "HEADLESS STARTUP: Reconstructing connections...");
-        // First pass: disconnect TLS worlds without proxy
-        let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
-        for (world_idx, world) in app.worlds.iter().enumerate() {
-            if world.connected && world.is_tls && world.proxy_pid.is_none() {
-                tls_disconnect_worlds.push(world_idx);
-            }
-        }
-        let tls_msg = if is_crash {
-            "TLS connection was closed during crash recovery. Use /worlds to reconnect."
-        } else {
-            "TLS connection was closed during reload. Use /worlds to reconnect."
-        };
-        for world_idx in tls_disconnect_worlds {
-            app.worlds[world_idx].connected = false;
-            app.worlds[world_idx].command_tx = None;
-            app.worlds[world_idx].socket_fd = None;
-            let seq = app.worlds[world_idx].next_seq;
-            app.worlds[world_idx].next_seq += 1;
-            app.worlds[world_idx].output_lines.push(OutputLine::new_client(tls_msg.to_string(), seq));
-            if world_idx != app.current_world_index {
-                if app.worlds[world_idx].unseen_lines == 0 {
-                    app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
-                }
-                app.worlds[world_idx].unseen_lines += 1;
-            }
-        }
-
-        // MCCP2 hot-reload guard (plan Phase 3, step 3.3, "the serious one, found by the
-        // design review"'s second bug): see `App::apply_mccp2_reload_bailout`'s doc comment.
-        // Runs after the TLS-without-proxy pass above so a world already disconnected there
-        // isn't double-counted here.
-        app.apply_mccp2_reload_bailout(is_crash);
-
-        // Second pass: reconstruct plain TCP connections
-        for world_idx in 0..app.worlds.len() {
-            let world = &app.worlds[world_idx];
-            if let Some(fd) = world.socket_fd.filter(|_| world.connected && !world.is_tls) {
-                debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: Reconstructing plain TCP for '{}' fd={}", world.name, fd));
-                #[cfg(unix)]
-                let tcp_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-                #[cfg(windows)]
-                let tcp_stream = unsafe { std::net::TcpStream::from_raw_socket(fd as u64) };
-                tcp_stream.set_nonblocking(true)?;
-                let tcp_stream = TcpStream::from_std(tcp_stream)?;
-                let (r, w) = tcp_stream.into_split();
-                let read_half = StreamReader::Plain(r);
-                let write_half = StreamWriter::Plain(w);
-                // Plan Job 13 (Phase 4, 4.4): migrated onto spawn_telnet_writer. This is a
-                // reload *reconstruction* of an already-connected world, not a fresh
-                // connect, so effective_encoding() (not the bare settings default) is the
-                // right initial encoding - it already reflects a CHARSET negotiated before
-                // the reload (negotiated_encoding survives reload/crash recovery, see
-                // persistence.rs), same class of state as mccp2_active.
-                let initial_encoding = app.worlds[world_idx].effective_encoding();
-                let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
-                app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
-                app.worlds[world_idx].skip_auto_login = true;
-                // MCCP2 hot-reload drain (job 2 of 2): resume compression if this world
-                // was marked before the exec - see resume_mccp2_after_reload's doc comment.
-                app.worlds[world_idx].resume_mccp2_after_reload();
-                app.worlds[world_idx].open_log_file();
-                let world_name = app.worlds[world_idx].name.clone();
-                app.worlds[world_idx].connection_id += 1;
-                app.worlds[world_idx].reader_name = Some(world_name.clone());
-
-                // Spawn reader task.
-                //
-                // Plan Job 7, Part A (investigate-differences-between-tinyfugu-fluffy-
-                // stallman.md — "the serious one, found by the design review"): this loop
-                // used to do zero telnet processing. It piped raw socket bytes straight
-                // into AppEvent::ServerData with cmd_tx captured into a `_telnet_tx`
-                // binding and never written to, so after a hot reload this reconstructed
-                // world had no telnet handling at all — IAC bytes rendered as literal
-                // text, GA/EOR prompts stopped working, GMCP/MSDP stopped arriving, and
-                // no negotiation was ever answered. That was the default reload path on
-                // Windows and macOS. Migrated onto spawn_telnet_reader, which now answers
-                // negotiation on this same cmd_tx instead of it being silenced.
-                let reader_tx = event_tx.clone();
-                let reader_world_name = world_name.clone();
-                let reader_conn_id = app.worlds[world_idx].connection_id;
-                let telnet_cfg = TelnetConfig {
-                    term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                    msp_enabled: app.worlds[world_idx].settings.msp_enabled,
-                    mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
-                    is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
-                    diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
-                    ..TelnetConfig::default()
-                };
-                spawn_telnet_reader(
-                    read_half,
-                    cmd_tx,
-                    reader_tx,
-                    TelnetTarget::World(reader_world_name),
-                    reader_conn_id,
-                    telnet_cfg,
-                );
-
-            }
-
-            // Reconstruct TLS proxy connections
-            #[cfg(all(unix, not(target_os = "android")))]
-            {
-                let world = &app.worlds[world_idx];
-                if world.connected && world.is_tls && world.proxy_pid.is_some() {
-                    if let Some(ref socket_path) = world.proxy_socket_path {
-                        match tokio::net::UnixStream::connect(socket_path).await {
-                            Ok(unix_stream) => {
-                                let (r, w) = unix_stream.into_split();
-                                let read_half = StreamReader::Proxy(r);
-                                let write_half = StreamWriter::Proxy(w);
-
-                                // Plan Job 13 (Phase 4, 4.4): migrated onto
-                                // spawn_telnet_writer - see the plain-TCP block above for
-                                // why effective_encoding() (a reload reconstruction, not a
-                                // fresh connect).
-                                let initial_encoding = app.worlds[world_idx].effective_encoding();
-                                let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
-                                app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
-                                app.worlds[world_idx].skip_auto_login = true;
-                                // MCCP2 hot-reload drain (job 2 of 2): resume compression
-                                // if this world was marked before the exec - see
-                                // resume_mccp2_after_reload's doc comment.
-                                app.worlds[world_idx].resume_mccp2_after_reload();
-                                app.worlds[world_idx].open_log_file();
-                                let world_name = app.worlds[world_idx].name.clone();
-                                app.worlds[world_idx].connection_id += 1;
-                                app.worlds[world_idx].reader_name = Some(world_name.clone());
-
-                                // Plan Job 7, Part A: this loop was one of the three
-                                // telnet-blind reload reconstructions — see the plain-TCP
-                                // block above for the full explanation. Migrated onto
-                                // spawn_telnet_reader.
-                                let reader_tx = event_tx.clone();
-                                let reader_world_name = world_name.clone();
-                                let reader_conn_id = app.worlds[world_idx].connection_id;
-                                let telnet_cfg = TelnetConfig {
-                                    term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    msp_enabled: app.worlds[world_idx].settings.msp_enabled,
-                                    mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
-                                    is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
-                                    diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
-                                    ..TelnetConfig::default()
-                                };
-                                spawn_telnet_reader(
-                                    read_half,
-                                    cmd_tx,
-                                    reader_tx,
-                                    TelnetTarget::World(reader_world_name),
-                                    reader_conn_id,
-                                    telnet_cfg,
-                                );
-                            }
-                            Err(e) => {
-                                debug_log(is_debug_enabled(), &format!("HEADLESS: Failed to reconnect proxy for {}: {}", app.worlds[world_idx].name, e));
-                                app.worlds[world_idx].clear_connection_state(false, false);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Reconstruct TLS proxy connections on Windows via Named Pipe
-            #[cfg(windows)]
-            {
-                let world = &app.worlds[world_idx];
-                if let Some(proxy_pid) = world.proxy_pid.filter(|_| world.connected && world.is_tls) {
-                    let pipe_path = world.proxy_socket_path.clone();
-
-                    let alive = crate::platform::is_process_alive(proxy_pid);
-                    debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: proxy pid={} alive={} path={:?}", proxy_pid, alive, pipe_path));
-
-                    if !alive {
-                        app.worlds[world_idx].clear_connection_state(false, false);
-                        let seq = app.worlds[world_idx].next_seq;
-                        app.worlds[world_idx].next_seq += 1;
-                        app.worlds[world_idx].output_lines.push(OutputLine::new_client(
-                            "TLS proxy terminated during reload. Use /worlds to reconnect.".to_string(), seq
-                        ));
-                    } else if let Some(ref path) = pipe_path {
-                        let client_opt = crate::platform::connect_to_proxy_pipe(path, 5).await;
-                        debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: pipe connect result: {}", client_opt.is_some()));
-                        match client_opt {
-                            Some(pipe_client) => {
-                                let (r, w) = tokio::io::split(pipe_client);
-                                let read_half = StreamReader::NamedPipeProxy(r);
-                                let write_half = StreamWriter::NamedPipeProxy(w);
-                                // Plan Job 13 (Phase 4, 4.4): migrated onto
-                                // spawn_telnet_writer - mirrors the two blocks above;
-                                // unverified in this sandbox (no mingw toolchain).
-                                let initial_encoding = app.worlds[world_idx].effective_encoding();
-                                let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
-                                app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
-                                app.worlds[world_idx].skip_auto_login = true;
-                                // MCCP2 hot-reload drain (job 2 of 2): resume compression
-                                // if this world was marked before the exec - see
-                                // resume_mccp2_after_reload's doc comment.
-                                app.worlds[world_idx].resume_mccp2_after_reload();
-                                app.worlds[world_idx].open_log_file();
-                                let world_name = app.worlds[world_idx].name.clone();
-                                app.worlds[world_idx].connection_id += 1;
-                                app.worlds[world_idx].reader_name = Some(world_name.clone());
-
-                                // Plan Job 7, Part A: the third of the three telnet-blind
-                                // reload reconstructions — see the plain-TCP block above
-                                // for the full explanation. This is the default reload
-                                // path on Windows. Migrated onto spawn_telnet_reader,
-                                // mirroring Job 5's daemon.rs named-pipe migration
-                                // (unverified in this sandbox — no mingw toolchain to
-                                // cross-check a #[cfg(windows)] path; re-checked on the
-                                // Windows VM after Job 7 per the plan's Windows
-                                // verification note).
-                                let reader_tx = event_tx.clone();
-                                let reader_world_name = world_name.clone();
-                                let reader_conn_id = app.worlds[world_idx].connection_id;
-                                let telnet_cfg = TelnetConfig {
-                                    term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    msp_enabled: app.worlds[world_idx].settings.msp_enabled,
-                                    mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
-                                    is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
-                                    diag: Some(app.worlds[world_idx].protocol.diag_for_reader()),
-                                    ..TelnetConfig::default()
-                                };
-                                spawn_telnet_reader(
-                                    read_half,
-                                    cmd_tx,
-                                    reader_tx,
-                                    TelnetTarget::World(reader_world_name),
-                                    reader_conn_id,
-                                    telnet_cfg,
-                                );
-                            }
-                            None => {
-                                debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: failed to reconnect Windows proxy for '{}'", app.worlds[world_idx].name));
-                                app.worlds[world_idx].clear_connection_state(false, false);
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                app.worlds[world_idx].output_lines.push(OutputLine::new_client(
-                                    "TLS proxy pipe unavailable after reload. Use /worlds to reconnect.".to_string(), seq
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        app.resume_chat_worlds_after_reload(&event_tx);
-        #[cfg(target_os = "linux")]
-        app.adopt_shell_worlds_after_reload();
-        // Cleanup: mark disconnected worlds that claim to be connected but have no command channel
-        // (a re-adopted shell world has none - its session is its connection)
-        for world in &mut app.worlds {
-            if world.connected && world.command_tx.is_none() && world.shell.is_none() {
-                debug_log(is_debug_enabled(), &format!(
-                    "HEADLESS RELOAD CLEANUP: World '{}' connected but no command_tx — marking disconnected (socket_fd={:?})",
-                    world.name, world.socket_fd
-                ));
-                world.connected = false;
-                world.socket_fd = None;
-                world.pending_lines.clear();
-                world.paused = false;
-                let seq = world.next_seq;
-                world.next_seq += 1;
-                world.output_lines.push(OutputLine::new_client(
-                    "Connection was not restored during reload. Use /worlds to reconnect.".to_string(), seq
-                ));
-            }
-        }
-
-        // The current world may be on its splash (restored, or regenerated by
-        // ensure_has_world for an empty one) and stays there: the splash renderer draws
-        // the output lines centred under the art, so the message shows. Forcing the splash
-        // off here left the regenerated art at column 0 after every reload.
-        let reload_msg = if is_crash {
-            crashlog::restart_notice()
-        } else {
-            selfupdate::RELOADED.to_string()
-        };
-        app.add_output(&reload_msg);
-        if let Some(note) = platform::restart_fallback_note() {
-            app.add_output(note);
-        }
-    }
-
-    // In GUI master mode, enable the web interface with the GUI's password: the one the
-    // user saved, or a session one that is never written to settings.dat (WsOverride).
-    // The server always runs TLS-capable now (see http::route_connection's loopback
-    // branch): localhost — where the WebView connects — is served plain regardless,
-    // so there's no cert prompt for the desktop GUI; remote clients get TLS.
-    apply_ws_override(&mut app, ws_override);
-    if let Some(port) = port_override {
-        app.settings.http_port = port;
-    }
-
-    // Create WebSocket server state (for client management, no standalone listener).
-    // Needed when a password is set OR when an auth key is set (auth-key-only mode).
-    let ws_state = if !app.settings.websocket_password.is_empty() || app.settings.websocket_auth_key.is_some() {
-        let server = WebSocketServer::new(
-            &app.settings.websocket_password,
-            app.settings.http_port,
-            &app.settings.websocket_allow_list,
-            app.settings.websocket_whitelisted_host.clone(),
-            false,
-            app.ban_list.clone(),
-        );
-        let state = Arc::new(server.connection_state(event_tx.clone()));
-        app.ws_server = Some(server);
-        Some(state)
-    } else {
-        None
-    };
-    let gate = if let Some(server) = app.ws_server.as_ref() {
-        SecurityGate {
-            allow_list: server.allow_list.clone(),
-            whitelisted_host: server.whitelisted_host.clone(),
-            auth_key: app.ws_auth_key_shared.clone(),
-            web_path: app.settings.web_path.clone(),
-            ban_list: app.ban_list.clone(),
-        }
-    } else {
-        SecurityGate {
-            allow_list: Arc::new(std::sync::RwLock::new(
-                websocket::parse_allow_list_csv(&app.settings.websocket_allow_list)
-            )),
-            whitelisted_host: Arc::new(std::sync::RwLock::new(app.settings.websocket_whitelisted_host.clone())),
-            auth_key: app.ws_auth_key_shared.clone(),
-            web_path: app.settings.web_path.clone(),
-            ban_list: app.ban_list.clone(),
-        }
-    };
-
-    // The web server, if enabled: one function for both loops (the plain HTTP listener
-    // and its CLAY_HTTP_LISTENER handle-passing are gone; a hot reload relies on
-    // start_https_server's bind retry).
-    start_web_server_at_startup(&mut app, ws_state.clone(), gate.clone()).await;
-
-    // Re-set gui_tx and repaint callback after potential reload state load (reload clears them)
-    app.gui_tx = Some(gui_tx);
-    app.gui_repaint = gui_repaint_clone;
+    let prepared = apploop::prepare_app(apploop::SetupOptions {
+        load_reload_state: true,
+        ws_override,
+        port_override,
+        web_server: apploop::WebServer::Headless,
+        template: None,
+        signals: true,
+        gui_tx: Some(gui_tx),
+        gui_repaint,
+        ws_server: None,
+    }).await?;
+    let apploop::Prepared { mut app, event_tx, event_rx, .. } = prepared;
 
     // Send initial state to the GUI
     // The embedded GUI is client id 0 - its own ▶ ownership id.
     let initial_state = app.build_initial_state(app.display_owner_id(0));
     app.ws_broadcast(initial_state);
 
-    // Keepalive interval
-    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(60));
-    keepalive_interval.tick().await;
+    apploop::tf_startup(&mut app, &event_tx, apploop::TfStartup::Headless).await;
 
-    // Conditional timers: sleep far-future when inactive, reset to short interval when needed.
-    const FAR_FUTURE: Duration = Duration::from_secs(86400);
-
-    // FANSI login timeouts, dirty stats and timed-prompt deadlines (`App::next_timed_prompt_deadline`)
-    let prompt_check_sleep = tokio::time::sleep(FAR_FUTURE);
-    tokio::pin!(prompt_check_sleep);
-
-    // Timed-prompt inference: a restored partial from a hot-reload/crash-recovery
-    // Timed Prompt world needs its deadline picked up immediately, or it would sit
-    // parked until some unrelated event happens to rearm this timer.
-    if let Some(deadline) = app.next_timed_prompt_deadline() {
-        pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
-    }
-
-    // TF repeat process ticks — only active when processes exist
-    let process_tick_sleep = tokio::time::sleep(FAR_FUTURE);
-    tokio::pin!(process_tick_sleep);
-
-    // Pending count broadcast — only active when worlds have pending lines
-    let pending_update_sleep = tokio::time::sleep(FAR_FUTURE);
-    tokio::pin!(pending_update_sleep);
-
-    // Auto-reconnect timer — fires when a world is due for reconnection
-    let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
-    tokio::pin!(reconnect_sleep);
-    // The mapper's walks (src/map): a step whose room the game hasn't reported in time ends
-    // its walk. Armed at the bottom of every iteration from `next_walk_deadline`.
-    let walk_sleep = tokio::time::sleep(FAR_FUTURE);
-    tokio::pin!(walk_sleep);
-    // Job 5 (T2.7): a hot reload restores `World::reconnect_at` from the state file,
-    // but this timer always starts at FAR_FUTURE and is only ever re-armed by later
-    // events (a disconnect, a web-triggered reconnect) or by firing once - nothing
-    // else looks at a freshly-restored deadline, so a scheduled auto-reconnect that
-    // survived the reload would otherwise silently never fire. Arm it here, once,
-    // from whatever `load_reload_state` just restored.
-    if let Some(next) = app.next_reconnect_instant() {
-        let dur = next.saturating_duration_since(std::time::Instant::now());
-        reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
-    }
-
-    // GUI reload check — polls atomic flag set by IPC handler (100ms interval)
-    let mut gui_reload_check = tokio::time::interval(Duration::from_millis(100));
-    gui_reload_check.tick().await; // consume first immediate tick
-
-    // SIGUSR1 handler for hot reload
-    #[cfg(all(unix, not(target_os = "android")))]
-    {
-        let sigusr1_tx = event_tx.clone();
-        tokio::spawn(async move {
-            let mut sigusr1 = match signal(SignalKind::user_defined1()) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to set up SIGUSR1 handler: {}", e);
-                    return;
-                }
-            };
-            loop {
-                sigusr1.recv().await;
-                let _ = sigusr1_tx.send(AppEvent::Sigusr1Received).await;
-            }
-        });
-    }
-
-    // TinyFugue's startup (the rc, -c, the world named on the command line) and Clay's
-    // startup actions - not again after a reload or crash restart that carried the TF
-    // state over (tf::snapshot): that would define every unnamed trigger a second time.
-    // An embedded --local-server only runs the startup actions, as before.
-    let local_server = LOCAL_SERVER_LOOPBACK_ONLY.load(Ordering::SeqCst);
-    tfstartup::run_tf_startup_daemon(&mut app, &event_tx, true, !local_server).await;
-
-    debug_log(is_debug_enabled(), "HEADLESS: Entering main event loop");
     IN_PROCESS_CLAY.store(true, Ordering::SeqCst);
-
-    // Main event loop
-    loop {
-        #[cfg(all(unix, not(target_os = "android")))]
-        reap_zombie_children();
-
-        tokio::select! {
-            // The GUI this Clay runs in is closing (quit_in_process_clay): /quit's
-            // cleanup, then nothing more - the process ends with the GUI.
-            _ = GUI_QUIT.notified() => {
-                debug_log(is_debug_enabled(), "HEADLESS: GUI quitting, running /quit's cleanup");
-                app.quit_cleanup().await;
-                GUI_QUIT_DONE.store(true, Ordering::SeqCst);
-                return Ok(());
-            }
-
-            // App events (server data, disconnects, WS client messages)
-            Some(event) = event_rx.recv() => {
-                // Slack/Discord events and connection-close notices: handled once, for every
-                // loop (App::preprocess_event). What comes back - chat lines or a close message
-                // as ServerData, a lost chat session as Disconnected - is handled below exactly
-                // as if it had arrived by itself.
-                // A fully-handled event (None) must still fall through to the draw/flush at
-                // the bottom (NOT `continue`): a shell world's Wakeup is handled here and
-                // its frame is flushed to clients below, which `continue` would skip.
-                if let Some(event) = app.preprocess_event(event) {
-                match event {
-                    AppEvent::ServerData(ref world_name, ref bytes) => {
-                        if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Use large width in daemon mode so text is not pre-wrapped —
-                            // GUI/web clients handle wrapping via CSS
-                            let commands = app.process_server_data(
-                                world_idx, bytes, 24, 1000, true,
-                            );
-                            // Activate timer for FANSI login timeout
-                            if app.worlds[world_idx].fansi_detect_until.is_some() {
-                                prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
-                            }
-                            // Activate pending update if lines were paused
-                            if !app.worlds[world_idx].pending_lines.is_empty() {
-                                pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
-                            }
-                            let saved_current_world = app.current_world_index;
-                            app.current_world_index = world_idx;
-                            for cmd in commands {
-                                if cmd.starts_with('/') {
-                                    // Route through the TF parser and apply what the command
-                                    // did, in order (see tfrun): every Clay command now runs,
-                                    // not just /send, /notify and /say.
-                                    app.sync_tf_world_info();
-                                    let effects = app.run_tf_in_world(world_idx, &cmd);
-                                    let ctx = tfrun::TfEffectCtx::for_world(world_idx, true);
-                                    tfrun::run_tf_effects_daemon(&mut app, 0, effects, ctx, &event_tx).await;
-                                } else {
-                                    // Plain text - send to MUD (captured via send_to_world)
-                                    app.send_to_world(world_idx, cmd);
-                                }
-                            }
-                            app.current_world_index = saved_current_world;
-                        }
-                    }
-                    AppEvent::Chat(..) | AppEvent::Shell(..) | AppEvent::CloseNotice(..) | AppEvent::ConnectAttemptsFailed(..) | AppEvent::TlsCipher(..) => {} // handled by the prelude above
-                    AppEvent::ChatLookupResult(client_id, request_id, world_index, result) => {
-                        app.apply_chat_lookup_result(client_id, request_id, world_index, result);
-                    }
-                    AppEvent::WorldNotice(world_name, text) => {
-                        if let Some(world_idx) = app.find_world_index(&world_name) {
-                            app.add_output_to_world(world_idx, &text);
-                        }
-                    }
-                    AppEvent::WorldConnectResult(world_name, connection_id, origin, result) => {
-                        app.handle_world_connect_result(&world_name, connection_id, origin, result);
-                        if let Some(next) = app.next_reconnect_instant() {
-                            let dur = next.saturating_duration_since(std::time::Instant::now());
-                            reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
-                        }
-                    }
-                    AppEvent::Disconnected(ref world_name, conn_id, ref reason) => {
-                        if let Some(world_idx) = app.find_world_index(world_name) {
-                            if conn_id != app.worlds[world_idx].connection_id { continue; }
-                            app.handle_disconnected(world_idx, reason);
-                            if let Some(next) = app.next_reconnect_instant() {
-                                let dur = next.saturating_duration_since(std::time::Instant::now());
-                                reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
-                            }
-                        }
-                    }
-                    AppEvent::WsClientMessage(client_id, msg) => {
-                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, client_uid, interface_key, instance_id, .. } = &*msg {
-                            // The stable ownership id first, as the console master does: the
-                            // InitialState's your_display_id must match what claims stamp,
-                            // or a password login loses its ▶ markers on every reconnect.
-                            app.set_display_owner_id(client_id, client_uid);
-                            app.set_client_interface(client_id, interface_key);
-                            app.set_client_instance(client_id, instance_id);
-                            app.handle_ws_auth_initial_state(client_id, *current_world, resume.clone(), resume_epochs.clone());
-                            if app.web_reconnect_needed {
-                                app.web_reconnect_needed = false;
-                                if app.trigger_web_reconnects() {
-                                    if let Some(next) = app.next_reconnect_instant() {
-                                        let dur = next.saturating_duration_since(std::time::Instant::now());
-                                        reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
-                                    }
-                                }
-                            }
-                        } else {
-                            daemon::handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
-                            if app.web_restart_needed {
-                                app.web_restart_needed = false;
-                                restart_http_server(&mut app, event_tx.clone()).await;
-                            }
-                        }
-                    }
-                    AppEvent::WsClientConnected(_client_id) => {}
-                    AppEvent::WsClientDisconnected(client_id) => {
-                        app.handle_ws_client_disconnected(client_id);
-                    }
-                    AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
-                        app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
-                        if app.web_reconnect_needed {
-                            app.web_reconnect_needed = false;
-                            if app.trigger_web_reconnects() {
-                                if let Some(next) = app.next_reconnect_instant() {
-                                    let dur = next.saturating_duration_since(std::time::Instant::now());
-                                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
-                                }
-                            }
-                        }
-                    }
-                    AppEvent::WsKeyRequest(client_id) => {
-                        app.handle_ws_key_request(client_id);
-                    }
-                    AppEvent::WsKeyRevoke(_client_id, key) => {
-                        app.handle_ws_key_revoke(&key);
-                    }
-                    AppEvent::TfShellDone(world_idx, output, status) => {
-                        app.finish_tf_shell(world_idx, &output, status, true);
-                    }
-                    // SIGTERM/SIGHUP: TF's hook of that name, then Clay ends (after a
-                    // moment for anything the hook sent to reach its world); SIGUSR2: the
-                    // hook only.
-                    AppEvent::TfSignal(event) => {
-                        app.fire_tf_hook(None, event, "", true);
-                        tfrun::drain_deferred_tf_daemon(&mut app, &event_tx).await;
-                        if event != tf::TfHookEvent::Sigusr2 {
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                            crashlog::exit_process(0, if event == tf::TfHookEvent::Sighup { "SIGHUP" } else { "SIGTERM" });
-                        }
-                    }
-                    AppEvent::SystemMessage(msg) => {
-                        // Add to current world's output and broadcast. Routed through
-                        // push_and_broadcast_line so the broadcast carries the line's REAL
-                        // seq: it used to store a real seq server-side but send `seq: 0,
-                        // end_seq: None`, so the client never recorded that seq as delivered
-                        // and the Phase C ack audit saw a permanent gap there forever.
-                        let world_idx = app.current_world_index;
-                        let seq = app.worlds[world_idx].next_seq;
-                        app.worlds[world_idx].next_seq += 1;
-                        let more_mode = app.settings.more_mode_enabled;
-                        let line = OutputLine::new_client(msg.clone(), seq);
-                        app.push_and_broadcast_line(world_idx, line, more_mode);
-                    }
-                    AppEvent::Sigusr1Received => {
-                        #[cfg(not(target_os = "android"))]
-                        {
-                            // Always log reload trigger (not gated by debug flag)
-                            debug_log(is_debug_enabled(), "HEADLESS: Reload triggered, calling exec_reload");
-                            for (idx, world) in app.worlds.iter().enumerate() {
-                                debug_log(is_debug_enabled(), &format!(
-                                    "HEADLESS PRE-RELOAD: World[{}] '{}' showing_splash={} output_lines={} connected={}",
-                                    idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
-                                ));
-                            }
-                            app.ws_broadcast(WsMessage::ServerReloading);
-                            // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's
-                            // hot-reload notes): defer instead of exec'ing now if any
-                            // connected world is compressed - the bottom-of-loop poll
-                            // fires the real exec once every drained world's stream ends,
-                            // or the drain deadline passes.
-                            if !app.should_defer_reload_for_mccp2() {
-                                exec_reload(&mut app)?;
-                                return Ok(());
-                            }
-                        }
-                    }
-                    AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
-                        app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
-                    }
-                    AppEvent::ConnectionFailed(world_name, conn_id, failure) => {
-                        // CONFAIL (and ICONFAIL) hooks, the message and the reconnect; a
-                        // certificate mismatch is offered through the CertMismatch dialog
-                        // report_connect_failure broadcasts.
-                        if let Some(world_idx) = app.find_world_index(&world_name) {
-                            if app.worlds[world_idx].connection_id == conn_id {
-                                app.report_connect_failure(world_idx, &failure, true, true);
-                            }
-                        }
-                    }
-                    // Consolidated telnet dispatch (plan Phase 2, Step 2.7). This site
-                    // (run_app_headless's reload/reconnect loop) used to have no
-                    // CharsetRequested arm at all - finding 2's "console reload loop"
-                    // gap - fixed here simply by no longer being able to omit an event
-                    // kind: handle_telnet_event is exhaustive over TelnetEvent.
-                    AppEvent::Telnet(ref target, ref ev) => {
-                        match target {
-                            TelnetTarget::World(world_name) => {
-                                if let Some(world_idx) = app.find_world_index(world_name) {
-                                    app.handle_telnet_event(world_idx, ev);
-                                }
-                            }
-                            TelnetTarget::Multiuser { world_index, username } => {
-                                app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
-                            }
-                        }
-                    }
-                    AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
-                        app.on_media_file_ready(world_idx, key, path, volume, loops, is_music);
-                    }
-                    AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
-                        app.apply_api_lookup_result(client_id, world_index, result, cursor_start);
-                    }
-                    AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
-                        app.remote_ping_responses = None;
-                        if requesting_client_id == 0 {
-                            for line in &lines {
-                                app.add_output(line);
-                            }
-                        } else {
-                            for line in &lines {
-                                app.ws_send_to_client(requesting_client_id, WsMessage::ServerData { archive_sourced: false,
-                                    world_index,
-                                    data: line.clone(),
-                                    is_viewed: false,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0, end_seq: None,
-                                    flush: false, gagged: false, highlight_colors: Vec::new(),
-                                });
-                            }
-                        }
-                    }
-                    AppEvent::PublicIpResult(result, reply_to) => {
-                        let line = app.apply_public_ip_result(result);
-                        app.reply_reach_line(reply_to, &line);
-                    }
-                    AppEvent::FirewallResult(status, action_error, reply_to) => {
-                        let line = app.apply_firewall_result(status, action_error);
-                        app.reply_reach_line(reply_to, &line);
-                    }
-                    AppEvent::PortMapResult(status, reply_to) => {
-                        let line = app.apply_port_map_result(status);
-                        app.reply_reach_line(reply_to, &line);
-                    }
-                    AppEvent::UpdateResult { result, reply_to } => {
-                        // src/selfupdate.rs: install + answer whoever asked; on a new
-                        // binary, hot reload (deferred by the MCCP2 drain when a
-                        // connected world is compressed - see the Sigusr1Received arm
-                        // above and the bottom-of-loop poll).
-                        #[cfg(not(target_os = "android"))]
-                        {
-                            if app.finish_server_update(result, reply_to) {
-                                exec_reload(&mut app)?;
-                                return Ok(());
-                            }
-                        }
-                        #[cfg(target_os = "android")]
-                        {
-                            // No hot reload on Android; the install is refused upstream.
-                            let _ = app.finish_server_update(result, reply_to);
-                        }
-                    }
-                    // Consumed by App::preprocess_event above; never reaches here.
-                    AppEvent::TtsLine { .. } => {}
-                    AppEvent::UpdateLine { .. } => {}
-                    AppEvent::PictureUploaded { .. } => {}
-                    AppEvent::ImportResult(client_id, addr, result) => {
-                        app.handle_import_result(client_id, addr, result);
-                    }
-                    AppEvent::Prompt(ref world_name, ref prompt_bytes) => {
-                        if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.handle_prompt(world_idx, prompt_bytes, PromptSource::Marker);
-                        }
-                    }
-                    _ => {}
-                }
-                }
-            }
-
-            // GUI messages (same format as WsMessage - reuse daemon handler)
-            Some(msg) = gui_rx.recv() => {
-                // Use client_id 0 for the embedded GUI (not a real WS client)
-                daemon::handle_daemon_ws_message(&mut app, 0, msg, &event_tx).await;
-            }
-
-            // Keepalive timer
-            _ = keepalive_interval.tick() => {
-                // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE);
-                // piggybacking on this existing once-a-minute tick rather than a new timer.
-                app.reap_stale_ws_client_worlds();
-                app.note_crash_context();
-                app.maybe_renew_port_mapping();
-                for world in &mut app.worlds {
-                    if world.connected && world.wants_keepalive() {
-                        // Only check last_send_time: server kicks us when WE go idle.
-                        let should_send = match world.last_send_time {
-                            Some(t) => t.elapsed() >= KEEPALIVE_INTERVAL,
-                            None => true,
-                        };
-                        if should_send {
-                            if let Some(tx) = &world.command_tx {
-                                let now = std::time::Instant::now();
-                                match world.settings.keep_alive_type {
-                                    KeepAliveType::None => {}
-                                    KeepAliveType::Nop => {
-                                        let nop = vec![TELNET_IAC, TELNET_NOP];
-                                        let _ = tx.try_send(WriteCommand::Raw(nop));
-                                        world.last_send_time = Some(now);
-                                        world.last_nop_time = Some(now);
-                                    }
-                                    KeepAliveType::Custom => {
-                                        let rand_num = (std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_nanos() % 1000 + 1) as u32;
-                                        let idler_tag = crate::telnet::keep_alive_marker(rand_num);
-                                        let cmd = world.settings.keep_alive_cmd
-                                            .replace(crate::telnet::KEEP_ALIVE_RAND, &idler_tag);
-                                        let _ = tx.try_send(WriteCommand::Text(cmd));
-                                        world.last_send_time = Some(now);
-                                        world.last_nop_time = Some(now);
-                                    }
-                                    KeepAliveType::Generic => {
-                                        let rand_num = (std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_nanos() % 1000 + 1) as u32;
-                                        let cmd = format!("help commands {}", crate::telnet::keep_alive_marker(rand_num));
-                                        let _ = tx.try_send(WriteCommand::Text(cmd));
-                                        world.last_send_time = Some(now);
-                                        world.last_nop_time = Some(now);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Check proxy health
-                #[cfg(all(unix, not(target_os = "android")))]
-                {
-                    // Collect first: the notice has to be emitted through `app`
-                    // (push_and_broadcast_line + WorldDisconnected), which can't be called
-                    // while `app.worlds` is mutably borrowed by this loop. Previously this
-                    // just pushed a line and broadcast nothing at all - the TUI reported the
-                    // dead proxy while every client kept showing the world as connected.
-                    let mut proxy_died: Vec<usize> = Vec::new();
-                    for (world_idx, world) in app.worlds.iter_mut().enumerate() {
-                        if world.connected {
-                            if let Some(proxy_pid) = world.proxy_pid {
-                                if !is_process_alive(proxy_pid) {
-                                    world.clear_connection_state(false, false);
-                                    proxy_died.push(world_idx);
-                                }
-                            }
-                        }
-                    }
-                    let more_mode = app.settings.more_mode_enabled;
-                    for world_idx in proxy_died {
-                        let seq = app.worlds[world_idx].next_seq;
-                        app.worlds[world_idx].next_seq += 1;
-                        let line = OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq);
-                        app.push_and_broadcast_line(world_idx, line, more_mode);
-                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
-                    }
-                }
-            }
-
-            // FANSI login timeouts, dirty stats and timed-prompt deadlines
-            _ = &mut prompt_check_sleep => {
-                let now = std::time::Instant::now();
-                // mud-status-display.md Job 2 (plan D4): flush any world whose stats
-                // changed since the last tick. Reuses this existing 150ms timer instead of
-                // adding a second one - see the bottom-of-loop block below for how this
-                // timer gets rearmed while a world stays dirty.
-                app.flush_dirty_stats();
-                // Check for expired FANSI detection windows
-                app.finish_due_fansi_logins(std::time::Instant::now());
-                // Timed-prompt inference: promote any WorldType::MudTimedPrompt world
-                // whose parked partial has waited past prompt_wait_ms.
-                app.promote_due_timed_prompts(now);
-                // Re-arm: check again in 150ms if any world still needs it
-                let any_pending = app.worlds.iter().any(|w| w.fansi_detect_until.is_some());
-                if any_pending {
-                    prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
-                } else {
-                    prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
-                }
-                // Clamp to the next timed-prompt deadline if one is sooner than whatever
-                // was just armed above (pull_in_deadline never pushes it later).
-                if let Some(deadline) = app.next_timed_prompt_deadline() {
-                    pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
-                }
-            }
-
-            // TF repeat process tick — only fires when processes exist
-            _ = &mut process_tick_sleep => {
-                for (ctx, effects) in app.tick_tf_processes(std::time::Instant::now(), true) {
-                    tfrun::run_tf_effects_daemon(&mut app, 0, effects, ctx, &event_tx).await;
-                }
-                // Re-arm for the next process due, if any remain
-                let next = app.next_tf_process_due()
-                    .map(tokio::time::Instant::from_std)
-                    .unwrap_or_else(|| tokio::time::Instant::now() + FAR_FUTURE);
-                process_tick_sleep.as_mut().reset(next);
-            }
-
-            // GUI reload check — polls atomic flag set by WebView IPC handler
-            _ = gui_reload_check.tick() => {
-                if GUI_RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
-                    #[cfg(not(target_os = "android"))]
-                    {
-                        debug_log(is_debug_enabled(), "HEADLESS: GUI reload flag detected, calling exec_reload");
-                        for (idx, world) in app.worlds.iter().enumerate() {
-                            debug_log(is_debug_enabled(), &format!(
-                                "HEADLESS GUI-RELOAD: World[{}] '{}' showing_splash={} output_lines={} connected={}",
-                                idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
-                            ));
-                        }
-                        app.ws_broadcast(WsMessage::ServerReloading);
-                        // MCCP2 hot-reload drain (job 2 of 2): defer instead of exec'ing
-                        // now if any connected world is compressed - see the
-                        // Sigusr1Received arm above and the bottom-of-loop poll.
-                        if !app.should_defer_reload_for_mccp2() {
-                            exec_reload(&mut app)?;
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-
-            // Pending count update — only fires when worlds have pending lines
-            _ = &mut pending_update_sleep => {
-                let now = std::time::Instant::now();
-                for world in app.worlds.iter_mut() {
-                    // Only send updates if world has pending lines and count has changed
-                    let current_count = world.pending_lines.len();
-                    if current_count > 0 && current_count != world.last_pending_count_broadcast {
-                        // Check if 2 seconds have passed since last broadcast for this world
-                        let should_broadcast = world.last_pending_broadcast
-                            .map(|t| now.duration_since(t) >= Duration::from_secs(2))
-                            .unwrap_or(true);
-                        if should_broadcast {
-                            world.last_pending_broadcast = Some(now);
-                            world.last_pending_count_broadcast = current_count;
-                        }
-                    } else if current_count == 0 && world.last_pending_count_broadcast > 0 {
-                        // Pending was cleared - reset tracking
-                        world.last_pending_count_broadcast = 0;
-                        world.last_pending_broadcast = None;
-                    }
-                }
-                // Broadcast pending updates for worlds that need it
-                for idx in 0..app.worlds.len() {
-                    let current_count = app.worlds[idx].pending_lines.len();
-                    if current_count > 0 {
-                        app.ws_broadcast_to_world(idx, WsMessage::PendingCountUpdate {
-                            world_index: idx,
-                            count: current_count,
-                        });
-                    }
-                }
-                // Re-arm: check again in 2s if any world still has pending lines
-                let any_pending = app.worlds.iter().any(|w| !w.pending_lines.is_empty());
-                if any_pending {
-                    pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
-                } else {
-                    pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
-                }
-            }
-
-            // Auto-reconnect timer
-            _ = &mut walk_sleep => {
-                app.map_expire_walks();
-                walk_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
-            }
-            _ = &mut reconnect_sleep => {
-                app.start_due_reconnects(&event_tx);
-                // Re-arm timer for next scheduled reconnect
-                if let Some(next) = app.next_reconnect_instant() {
-                    let dur = next.saturating_duration_since(std::time::Instant::now());
-                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
-                } else {
-                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
-                }
-            }
-        }
-
-        // TF effects that synchronous code (hooks, triggers) left for the loop
-        tfrun::drain_deferred_tf_daemon(&mut app, &event_tx).await;
-        // TF's mail check, and its status area when a script has it, to the clients
-        app.check_tf_mail();
-        app.refresh_tf_status();
-        // Shell worlds (src/shell): send any live PTY's screen change to clients now, every
-        // iteration, so a shell world's output isn't stranded waiting on a timer.
-        app.flush_shell_frames();
-        // The mapper: changed rooms saved, map views told; the walk timer armed.
-        app.flush_map();
-        app.flush_logs();
-        if let Some(due) = app.next_walk_deadline() {
-            walk_sleep.as_mut().reset(tokio::time::Instant::from_std(due));
-        }
-
-        // Arm the process timer for the next process due (processes may have been added
-        // during this iteration)
-        if let Some(due) = app.next_tf_process_due() {
-            let due = tokio::time::Instant::from_std(due);
-            if process_tick_sleep.deadline() > due {
-                process_tick_sleep.as_mut().reset(due);
-            }
-        }
-
-        // mud-status-display.md Job 2 (plan D4): pull prompt_check_sleep's deadline in to
-        // ~150ms out if some world went dirty this iteration (a GMCP/MSDP update via
-        // AppEvent::Telnet, or a clear on disconnect) and nothing sooner is already
-        // scheduled. Checked once per iteration here (covering every event kind that could
-        // have marked a world dirty) rather than at each individual call site, the same way
-        // the process-tick rearm above covers every way a process could have been added.
-        // Never push the deadline *later* - a steady stream of updates must still flush
-        // roughly every 150ms instead of debouncing forever.
-        if app.worlds.iter().any(|w| w.protocol.stats_dirty)
-            && prompt_check_sleep.deadline() > tokio::time::Instant::now() + Duration::from_millis(150)
-        {
-            prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
-        }
-
-        // Same pull-in, for a timed-prompt deadline that just became sooner than
-        // whatever prompt_check_sleep already had armed (covers this loop's own
-        // batch-drain loop above, same as the stats pull-in just above it).
-        if let Some(deadline) = app.next_timed_prompt_deadline() {
-            pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
-        }
-
-        // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): fire a
-        // reload deferred by should_defer_reload_for_mccp2 (any of this loop's three
-        // trigger sites above) once every drained world's stream has ended, or the
-        // deadline passes - see mccp2_reload_ready_to_exec's doc comment. Checked once
-        // per loop pass (a cheap no-op whenever no reload is pending) rather than at each
-        // trigger site, exactly like the process-tick/prompt-check rearms just above.
-        #[cfg(not(target_os = "android"))]
-        if app.mccp2_reload_ready_to_exec() {
-            debug_log(is_debug_enabled(), "HEADLESS: MCCP2 drain complete (or deadline hit), calling exec_reload");
-            exec_reload(&mut app)?;
-            return Ok(());
-        }
+    let exit = apploop::run_app_loop(&mut app, event_rx, event_tx, apploop::LoopOptions {
+        gui_rx: Some(gui_rx),
+        gui_quit: true,
+        cmd_rx: None,
+        system_message: apploop::SystemMessageSink::Output,
+        hot_reload: true,
+    }).await?;
+    if let apploop::LoopExit::Signal(event) = exit {
+        crashlog::exit_process(0, if event == tf::TfHookEvent::Sighup { "SIGHUP" } else { "SIGTERM" });
     }
+    Ok(())
 }
 
 /// Full terminal teardown/rebuild shared by `KeyAction::Redraw` and `KeyAction::Refresh`
@@ -25773,7 +24804,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     }
 
     // Sync global debug flag from loaded settings
-    DEBUG_ENABLED.store(app.settings.debug_enabled, Ordering::Relaxed);
+    app.apply_debug_setting();
 
     // Pre-compile action regexes after loading settings or reload state
     compile_all_action_regexes(&mut app.settings.actions);
@@ -25841,8 +24872,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             let seq = app.worlds[world_idx].next_seq;
             app.worlds[world_idx].next_seq += 1;
             app.worlds[world_idx].output_lines.push(OutputLine::new_client(tls_msg.to_string(), seq));
-            // If not the current world, set unseen_lines for activity indicator
-            if world_idx != app.current_world_index {
+            // Unseen unless somebody watches it (one rule, `world_watched`).
+            if !app.world_watched(world_idx) {
                 if app.worlds[world_idx].unseen_lines == 0 {
                     app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
                 }
@@ -26265,7 +25296,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         SecurityGate {
             allow_list: server.allow_list.clone(),
             whitelisted_host: server.whitelisted_host.clone(),
-            auth_key: app.ws_auth_key_shared.clone(),
+            auth_key: crate::http::KeySource::Single(app.ws_auth_key_shared.clone()),
             web_path: app.settings.web_path.clone(),
             ban_list: app.ban_list.clone(),
         }
@@ -26275,7 +25306,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 websocket::parse_allow_list_csv(&app.settings.websocket_allow_list)
             )),
             whitelisted_host: Arc::new(std::sync::RwLock::new(app.settings.websocket_whitelisted_host.clone())),
-            auth_key: app.ws_auth_key_shared.clone(),
+            auth_key: crate::http::KeySource::Single(app.ws_auth_key_shared.clone()),
             web_path: app.settings.web_path.clone(),
             ban_list: app.ban_list.clone(),
         }
@@ -26895,9 +25926,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.handle_telnet_event(world_idx, ev);
                                 }
                             }
-                            TelnetTarget::Multiuser { world_index, username } => {
-                                app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
-                            }
                         }
                     }
                     AppEvent::Prompt(ref world_name, prompt_bytes) => {
@@ -26955,11 +25983,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                     // Multiuser events are only used in multiuser mode, ignore in normal mode
-                    AppEvent::MultiuserServerData(_, _, _) => {}
-                    AppEvent::MultiuserConnectResult(..) => {} // multiuser-only (daemon.rs)
-                    AppEvent::MultiuserDisconnected(_, _) => {}
-                    AppEvent::MultiuserTelnetDetected(_, _) => {}
-                    AppEvent::MultiuserPrompt(_, _, _) => {}
                     AppEvent::WsClientConnected(_client_id) => {}
                     AppEvent::WsClientDisconnected(client_id) => {
                         app.handle_ws_client_disconnected(client_id);
@@ -27443,9 +26466,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.handle_telnet_event(world_idx, ev);
                             }
                         }
-                        TelnetTarget::Multiuser { world_index, username } => {
-                            app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
-                        }
                     }
                 }
                 AppEvent::Prompt(ref world_name, prompt_bytes) => {
@@ -27479,11 +26499,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                 }
                 // Multiuser events are only used in multiuser mode, ignore in normal mode
-                AppEvent::MultiuserServerData(_, _, _) => {}
-                AppEvent::MultiuserConnectResult(..) => {} // multiuser-only (daemon.rs)
-                AppEvent::MultiuserDisconnected(_, _) => {}
-                AppEvent::MultiuserTelnetDetected(_, _) => {}
-                AppEvent::MultiuserPrompt(_, _, _) => {}
                 AppEvent::Sigusr1Received => {}
                 // Handled by the main select arm; a batch never holds one long.
                 AppEvent::TfSignal(event) => {

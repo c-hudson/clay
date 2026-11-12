@@ -68,7 +68,7 @@ export CARGO_TARGET_DIR="$SCRIPT_DIR/target/termux-gui"
 
 echo "Building clay (webview GUI) for aarch64-linux-android (API $API)..."
 cargo build --release --target aarch64-linux-android \
-    --no-default-features --features webview-gui,ssh-transport
+    --no-default-features --features webview-gui,ssh-transport,shell-worlds
 
 BIN="$CARGO_TARGET_DIR/aarch64-linux-android/release/clay"
 OUT="/tmp/clay-termux-aarch64"

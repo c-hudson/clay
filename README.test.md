@@ -36,7 +36,7 @@ ANSI true color support, multi-world support, and connection sharing between int
 - Searchable Long-term SQLite scrollback archive
 - Self-update from GitHub releases
 - Grep-mode output search (live and SQL archvie)
-- Headless daemon and multiuser server modes
+- Headless daemon (`-D`), and two server builds: `clay_multi` (a full Clay per user) and `clay_web` (a web page onto one world)
 
 ## Installation
 
@@ -60,7 +60,7 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 ```bash
 # Static binary for any Linux (console only, no GUI)
 rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend,ssh-transport
+cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend,ssh-transport,shell-worlds
 
 # Build with WebView GUI + audio (requires GTK/WebKit dev libraries)
 sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev
@@ -96,7 +96,7 @@ cargo build --release --features webview-gui
 pkg install rust
 
 # Build console only (no GUI on Android)
-cargo build --release --no-default-features --features rustls-backend,ssh-transport
+cargo build --release --no-default-features --features rustls-backend,ssh-transport,shell-worlds
 ```
 
 ## Usage
@@ -109,7 +109,8 @@ cargo build --release --no-default-features --features rustls-backend,ssh-transp
 | `--web-gui[=host[:port]]` | WebView GUI, or attach to a remote server (port 9000) |
 | `--ssh` | Tunnel `--console=`/`--gui=`/`--web-gui=` through SSH: `[user@]host[:clayport[:sshport]]` |
 | `-D` | Headless daemon server |
-| `--multiuser` | Multiuser server |
+| `--multiuser` | The multiuser server (the `clay_multi` build) |
+| `--web-front` | The web gateway (the `clay_web` build) |
 | `--local-server` | Headless, loopback-only, for an embedding client (needs `CLAY_WS_PASSWORD`); `--port=<N>` overrides the port |
 | `--ssh-proxy` | Headless SSH-forward proxy for an embedding client (`--target=`, `--listen-port=`) |
 | `--conf=<path>` | Custom config file (default `~/.clay/settings.dat`) |

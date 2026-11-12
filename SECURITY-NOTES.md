@@ -72,7 +72,28 @@ login itself is rejected, so the device isn't banned out of its own recovery pat
 | Configured, address matches | Accepted | Accepted |
 | Configured, address doesn't match | Rejected | Accepted (knock → WebSocket only) |
 
-Multiuser mode has no auth key, so unlisted addresses cannot connect there at all.
+On `clay_multi` every user's own auth key answers a knock (each is tried, in constant
+time), so a user's phone knocks as it would at their own Clay. `clay_web` has no auth key
+and no allow list: everyone may reach its page, and the stealth path, the bans and the
+flood limit are what gate it.
+
+### Connection floods
+
+Every server variant counts new connections per address: more than 30 within 10 seconds
+is a strike (`CONN-FLOOD` in `remote.log`), and strikes ban as described below. Loopback
+and allow-listed addresses are never banned for it.
+
+### clay_web has no password
+
+The web gateway (`clay_web`) logs every visitor in without a password: the page connects
+them to the one MUD world, which does its own login, and tells the MUD who they are with
+the world's First Command (`REMOTE_HOST %host%`, `%host%` being the visitor's address).
+What protects it is the stealth path, the bans and the flood limit above, and a cap of
+five sessions per address (200 in all); its `web.dat` has no allow list. Every typed line
+is text for the game: no Clay command, no settings, no files of the server's, no picture
+upload, no GMCP. `clay_web` never makes a self-signed certificate: name a real one in
+web.dat (`cert_file`, `key_file`) or it serves plain, unencrypted http to everyone -
+fine for a game that is itself plain telnet on your own network, not for a public page.
 
 ## Ban rules
 
@@ -170,6 +191,10 @@ now always TLS-encrypted for anyone connecting from outside this machine, automa
 - **A plain web browser** connecting remotely will show a one-time "not secure" warning
   the first time, same as any self-signed certificate — that's expected. If you'd rather
   not see that, set **Custom Cert File** to Yes and point it at a CA-signed certificate.
+- **`clay_web` is the one exception.** It never makes a self-signed certificate (its
+  visitors are strangers' browsers, which warn about one, and in-app browsers refuse it):
+  with `cert_file` and `key_file` in its web.dat it serves https; without them it serves
+  plain http to everyone, unencrypted (its first start-up line says `http`).
 - **The Auth Key field is now read-only** in `/web` settings; use the new **Modify Key**
   button to copy, regenerate, or delete it. Regenerating or deleting takes effect
   immediately, same as before.
@@ -247,8 +272,8 @@ the existing `/sh` command gives those clients, but it bears repeating:
 
 - **Do not create a shell world on a Clay instance you expose to a network you do not
   fully trust.** Anyone who gets past the login (or shares the session) has a shell as you.
-- Shell worlds are refused outright in multiuser mode — there the shell would run as the
-  server operator on behalf of whichever account owns the world, which is never wanted.
+- Shell worlds are not in the server builds (`clay_multi`, `clay_web`) at all — there a
+  shell would run as the server operator on behalf of whoever is logged in.
 - A shell world never reads or writes your clipboard through the terminal (OSC 52 is
   disabled), and its output is never logged or archived.
 

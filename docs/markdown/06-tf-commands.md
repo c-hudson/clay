@@ -570,8 +570,9 @@ per-key/per-command ruling tables this was decided from.
   server output" (TF's plain repaint is the unbound `refresh_line` action). `Tab` keeps Clay's own more-mode/paging priority
   (`Esc-Tab` does TF-style completion instead). The kill ring (`^Y` to
   yank), the F-keys (help/tags/filter/history-search/highlights/GMCP
-  media), `Shift-Up/Down` (cycle all worlds) and `Alt-Up/Down` (resize
-  input) are Clay-only additions with no TF equivalent.
+  media), `Shift-Up/Down` (cycle all worlds), `Alt-Up/Down` (resize
+  input) and `^+`/`^-`/`^0` (zoom the native GUI's window) are Clay-only
+  additions with no TF equivalent.
 - **`%lp`**: as in TF, while it is on, a line the world leaves unfinished becomes the
   prompt after `%prompt_wait`, on every MUD world. Unlike TF, the line also stays in the
   output (see [Telnet](14-telnet.md#timed-prompts-mud---timed-prompt-worlds)). For one

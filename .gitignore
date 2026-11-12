@@ -1,6 +1,9 @@
-# Build artifacts
+# Build artifacts (build.sh copies the three binaries here; none belongs in git)
 /target/
 /output/
+/clay
+/clay_multi
+/clay_web
 clay.exe
 clay.sent.exe
 
@@ -9,6 +12,7 @@ clay.sent.exe
 # SKILL.md holds the actual build and shutdown commands, so tracking only one of
 # the pair lets them silently diverge.
 .claude/*
+!.claude/rules/
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/release/

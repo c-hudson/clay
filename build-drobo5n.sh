@@ -78,7 +78,7 @@ export RUSTFLAGS="-C link-self-contained=no"
 
 echo "Building clay for armv7-unknown-linux-musleabi (Drobo 5N)..."
 cargo build --release --target armv7-unknown-linux-musleabi \
-    --no-default-features --features rustls-backend,ssh-transport
+    --no-default-features --features rustls-backend,ssh-transport,shell-worlds
 
 BIN="target/armv7-unknown-linux-musleabi/release/clay"
 OUT="/tmp/clay-drobo5n-armv7"

@@ -317,6 +317,19 @@ impl ThemeColors {
         }
     }
 
+    /// clay_web's page carries the two themes a visitor may switch between on the page
+    /// itself (index.html `WEB_FRONT_THEMES`, app.js `applyWebFrontTheme`; user ruling
+    /// 2026-11-11: Dark - New and Light - New, nothing else, chosen on the page, never in
+    /// web.dat): `{"dark":{..},"light":{..}}` in `to_json`'s shape, or `null` on any other
+    /// Clay's page.
+    pub fn web_front_themes_json() -> String {
+        if cfg!(feature = "web-front") {
+            format!("{{\"dark\":{},\"light\":{}}}", Self::dark_new().to_json(), Self::light_new().to_json())
+        } else {
+            "null".to_string()
+        }
+    }
+
     /// Whether this is a light theme (a light window background): what used to be decided
     /// by the theme's name being "light", so a custom or new theme gets the right
     /// light-theme treatment (tile mix, the WebView's window theme, `body.theme-light`).
@@ -574,6 +587,10 @@ impl ThemeFile {
                         file.themes.insert(name.clone(), ThemeColors::builtin(&name).unwrap_or_else(ThemeColors::dark_default));
                     }
                     current_theme = Some(name);
+                } else {
+                    // Another grammar's section (clay_web's web.dat holds [global] and
+                    // [world:] beside its themes): what follows is not a theme's colours.
+                    current_theme = None;
                 }
                 continue;
             }
@@ -912,5 +929,15 @@ ansi.15 = #eeeeee
         assert_eq!(parsed.ansi[15], original.ansi[15]);
         assert_eq!(parsed.status_bar_bg, original.status_bar_bg);
         assert_eq!(parsed.button_selected_bg, original.button_selected_bg);
+    }
+
+    /// clay_web's web.dat holds [global] and [world:] sections beside its themes: a header
+    /// of another grammar ends the theme section, so its keys are never read as colours.
+    #[test]
+    fn another_grammars_section_ends_a_theme_section() {
+        let f = ThemeFile::parse("[theme:custom]\nbg=#101418\n[world:Gate]\nbg=#ffffff\naccent=#ff0000\n");
+        let custom = f.get("custom");
+        assert_eq!(custom.bg, ThemeColor::from_hex("#101418").unwrap());
+        assert_eq!(custom.accent, ThemeColors::builtin("dark").unwrap().accent, "keys after [world:] are not colours");
     }
 }

@@ -724,8 +724,15 @@ fn cmd_setenv(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     engine.set_global(name, value);
     engine.env_vars.insert(name.to_string());
 
-    // Also set in actual environment
-    std::env::set_var(name, if parts.len() > 1 { parts[1] } else { "" });
+    // Also set in the actual environment - the main Clay's, unrestricted. The process
+    // environment is one for every Clay a server runs, and under /restrict file a script
+    // may not change what the server's processes see; TF's own copy of the environment
+    // (`env_imported`, what %{VAR} reads) is updated either way.
+    let value_str = if parts.len() > 1 { parts[1] } else { "" };
+    if engine.restrict_level < crate::tf::RestrictLevel::File && crate::instance::is_main() {
+        std::env::set_var(name, value_str);
+    }
+    engine.env_imported.insert(name.to_string(), value_str.to_string());
 
     TfCommandResult::Success(None)
 }
@@ -6524,5 +6531,33 @@ mod tests {
             TfCommandResult::Success(Some(ref s)) => assert!(s.contains("/limit")),
             other => panic!("got {:?}", other),
         }
+    }
+
+    /// `/restrict file` closes the file functions, the help file and the process
+    /// environment too: `fwrite()`/`tfopen()` refuse, `%TFHELP` is not read, `/setenv`
+    /// changes TF's copy of the environment and never the process's.
+    #[test]
+    fn test_restrict_file_closes_file_functions_help_file_and_setenv() {
+        let mut engine = TfEngine::new();
+        assert!(matches!(execute_command(&mut engine, "/restrict FILE"), TfCommandResult::Success(None)));
+        let tmp = std::env::temp_dir().join(format!("clay-restrict-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let r = crate::tf::expressions::evaluate(&mut engine, &format!("fwrite(\"{}\", \"x\")", tmp.display()));
+        assert!(matches!(r, Err(ref e) if e.contains("restricted")), "{r:?}");
+        let r = crate::tf::expressions::evaluate(&mut engine, &format!("tfopen(\"{}\", \"w\")", tmp.display()));
+        assert!(matches!(r, Err(ref e) if e.contains("restricted")), "{r:?}");
+        assert!(!tmp.exists(), "nothing was created");
+
+        std::fs::write(&tmp, "help text\n").unwrap();
+        engine.set_global("TFHELP", TfValue::from(tmp.to_string_lossy().as_ref()));
+        assert!(crate::tf::help::help_file(&engine).is_none(), "the help file is not read under /restrict file");
+        let _ = std::fs::remove_file(&tmp);
+
+        let var = "CLAY_RESTRICT_SETENV_TEST";
+        assert!(std::env::var(var).is_err(), "the test's variable starts unset");
+        assert!(matches!(cmd_setenv(&mut engine, &format!("{var} shown")), TfCommandResult::Success(None)));
+        assert!(std::env::var(var).is_err(), "the process environment is untouched");
+        assert_eq!(engine.env_imported.get(var).map(String::as_str), Some("shown"), "TF's own copy has it");
+        assert_eq!(engine.get_var(var).map(|v| v.to_string_value()), Some("shown".to_string()));
     }
 }

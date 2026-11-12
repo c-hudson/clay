@@ -442,50 +442,6 @@ impl App {
         report
     }
 
-    /// The report for a multiuser user: only their own connection to world `idx` - the
-    /// process, its memory and the other users' clients are the operator's.
-    pub(crate) fn build_multiuser_info_report(&self, idx: usize, username: &str) -> InfoReport {
-        let world = &self.worlds[idx];
-        let conn = self.user_connections.get(&(idx, username.to_string()));
-        let mut report = InfoReport { title: format!("Info: {}", world.name), sections: Vec::new() };
-        let mut s = InfoSection::new("World");
-        s.row("Type", world_type_label(&world.settings.world_type));
-        let connected = conn.is_some_and(|c| c.connected);
-        if connected {
-            s.toned("State", "connected", "good");
-        } else {
-            s.row("State", "not connected");
-        }
-        s.row("Server", format!("{}:{}{}", world.settings.hostname, world.settings.port, if world.settings.use_ssl { " (TLS)" } else { "" }));
-        if let Some(c) = conn {
-            let record = c.protocol.diag.as_ref().map(|d| d.snapshot());
-            if let Some(r) = &record {
-                if let Some(peer) = &r.peer {
-                    s.row("Address", peer.clone());
-                }
-                if let Some(v) = &r.tls_version {
-                    s.row("Encryption", v.clone());
-                }
-                s.row("Traffic", format!("received {}, sent {}", fmt_bytes(r.wire_in), fmt_bytes(r.wire_out)));
-            }
-            if let Some(at) = c.connected_at.filter(|_| c.connected) {
-                s.row("Connected for", fmt_duration(since(at)));
-            }
-            s.row("Last received", ago(c.last_receive_time));
-            s.row("Last sent", ago(c.last_send_time));
-            report.sections.push(s);
-            if world.settings.world_type.is_mud() {
-                report.sections.extend(telnet_sections(&c.protocol, record.as_ref(), None, &world.settings));
-                report.sections.push(prompt_section(&c.protocol, &c.prompt, false, c.prompt_count, &world.settings));
-            }
-        } else {
-            report.sections.push(s);
-        }
-        let mut clay = InfoSection::new("Clay");
-        clay.row("Version", crate::version_detail());
-        report.sections.push(clay);
-        report
-    }
 
     fn world_section(&self, world: &World) -> InfoSection {
         let mut s = InfoSection::new("World");
@@ -567,6 +523,9 @@ impl App {
         s.row("Auto login", login);
         if !settings.login_command.trim().is_empty() {
             s.row("Login command", format!("{} line(s)", settings.login_commands().len()));
+        }
+        if !settings.first_command.trim().is_empty() {
+            s.row("First command", settings.first_command.lines().collect::<Vec<_>>().join(" | "));
         }
         if world.connected {
             let keepalive = settings.keep_alive_type.name();
@@ -858,17 +817,4 @@ mod tests {
         assert!(stats.cpu_secs.is_some(), "{stats:?}");
     }
 
-    #[test]
-    fn a_multiuser_report_leaves_out_the_operators_sections() {
-        let mut app = App::new();
-        app.worlds.push(crate::World::new("Somewhere"));
-        app.worlds[0].settings.hostname = "mud.example".into();
-        app.worlds[0].settings.port = "4000".into();
-        let report = app.build_multiuser_info_report(0, "alice");
-        let titles: Vec<&str> = report.sections.iter().map(|s| s.title.as_str()).collect();
-        assert!(titles.contains(&"World"), "{titles:?}");
-        for hidden in ["Memory", "Web server and clients", "This world's buffers"] {
-            assert!(!titles.contains(&hidden), "{hidden} in {titles:?}");
-        }
-    }
 }

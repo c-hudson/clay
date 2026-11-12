@@ -894,10 +894,11 @@ async fn reconnect_once(
 /// console's worlds, settings and view become the server's again. What belongs to the
 /// console - the input line, its history, an open editor - stays.
 fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSender<WsMessage>, version_mismatch_shown: &mut bool) {
-    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, other_views, map, info_report, .. } = msg else {
+    let WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, server_version_detail, tf_status, expand_line, picture_upload, history_on_demand, other_views, map, info_report, shell_worlds, .. } = msg else {
         return;
     };
     app.server_info_report = info_report;
+    app.server_shell_worlds = shell_worlds;
     // The map (src/map): the server has one; tell it this console's pane again.
     app.server_map = map;
     app.map_watch_sent = None;
@@ -1230,6 +1231,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 
     // Create App struct and set it up for remote client mode
     let mut app = App::new();
+    // Attached to a clay_multi server: /web is the user's Auth Key alone (App::open_web_popup_new).
+    app.remote_multiuser = multiuser_mode;
     app.ws_client_tx = Some(ws_tx.clone());
     app.is_master = false;
 
@@ -2666,6 +2669,7 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.keep_alive_gag_enabled = settings.keep_alive_gag_enabled;
                     app.worlds[idx].settings.keep_alive_gag = settings.keep_alive_gag.clone();
                     app.worlds[idx].settings.login_command = settings.login_command.clone();
+                    app.worlds[idx].settings.first_command = settings.first_command.clone();
                     app.worlds[idx].settings.status_panel = settings.status_panel;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages.clone();
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
@@ -2714,6 +2718,7 @@ pub(crate) fn handle_remote_client_key(
                         keep_alive_gag: Some(settings.keep_alive_gag),
                         status_panel: Some(settings.status_panel),
                         login_command: Some(settings.login_command),
+                        first_command: Some(settings.first_command),
                     });
                 }
             }
@@ -3470,6 +3475,8 @@ pub(crate) fn dispatch_remote_action(
         // TF /bg (= /fg -n): no-op in Clay's single-pane console (Job 19; see
         // dispatch_action's own version for the full rationale).
         "bg_all_worlds" => {}
+        // The GUI window's zoom (src/zoom.rs): no window here.
+        "zoom_in" | "zoom_out" | "zoom_reset" => {}
         // world_socket_prev/world_socket_next (TF SOCKETB/SOCKETF): cycle CONNECTED worlds
         // only, in list order - TF-parity plan Job 22a, finding 38. This client already
         // caches the full world list with each world's `connected` flag kept current by

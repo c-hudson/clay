@@ -14,10 +14,10 @@ socket2 = { version = "0.5", features = ["all"] }
 unicode-width = "0.1"
 # Shell worlds (src/shell): the PTY and terminal emulator. No serde: the screen crosses
 # the wire as Clay's own ShellScreen rows, never as alacritty's types.
-alacritty_terminal = { version = "0.26", default-features = false }
+alacritty_terminal = { version = "0.26", default-features = false, optional = true }
 # alacritty_terminal reports PTY failures only through `log`; src/shell installs a logger
 # that forwards them to debug.log.
-log = "0.4"
+log = { version = "0.4", optional = true }
 regex = "1"
 futures = "0.3"
 aes-gcm = "0.10"
@@ -140,7 +140,7 @@ gtk = { version = "0.18", optional = true }
 # EventedPty, whose trait methods take `polling` types - so we reference the same crate
 # alacritty resolves (already in the tree; this just names it). Linux-only (uses pidfd to
 # watch the adopted child); other platforms close shell worlds on reload.
-polling = "3"
+polling = { version = "3", optional = true }
 # Used only to probe whether the AT-SPI accessibility bus is reachable before
 # GTK's atk-bridge loads (see webview_gui.rs::disable_a11y_bridge_if_broken) -
 # both already resolved transitively via gtk, this just lets us call them
@@ -151,7 +151,7 @@ glib = { version = "0.18", optional = true }
 # resolves the address primarily from an X11 root-window property, not from
 # asking the session D-Bus - see webview_gui.rs::a11y_bus_address_x11. Pure
 # Rust XCB client, no libX11 linkage needed.
-x11rb = { version = "0.14", optional = true }
+x11rb = { version = "0.14", optional = true, features = ["randr"] }
 # The native GUI's app menu for a desktop panel applet (src/native_gui/ui/appmenu.rs):
 # GTK's org.gtk.Menus/org.gtk.Actions on the session bus. gpui already builds zbus
 # (through ashpd) with async-io, so this adds no crate. Both GUIs' taskbar badge and
@@ -168,8 +168,9 @@ core-foundation = { version = "0.10", optional = true }
 core-foundation-sys = { version = "0.8", optional = true }
 # The native GUI's spell checking on macOS (the same AppKit versions GPUI uses).
 # Both GUIs' Dock badge (src/desktop.rs): NSApplication, NSDockTile.
-objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSSpellChecker", "NSResponder", "NSApplication", "NSDockTile"] }
-objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSString", "NSArray", "NSRange"] }
+# The native GUI's window zoom (ui/zoom.rs): NSView, NSWindow, NSScreen (GPUI has no move).
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSSpellChecker", "NSResponder", "NSApplication", "NSDockTile", "NSView", "NSWindow", "NSScreen"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSString", "NSArray", "NSRange", "NSGeometry"] }
 # Audio playback (uses CoreAudio on macOS automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav", "mp3", "vorbis", "flac"] }
 # WebView GUI (native WebView window using system browser engine)
@@ -201,7 +202,18 @@ winres = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 
 [features]
-default = ["native-audio", "ssh-transport"]
+default = ["native-audio", "ssh-transport", "shell-worlds"]
+# Shell worlds (src/shell): a world that is a local terminal. Without it a build has no
+# PTY or terminal emulator; it still shows a shell world another Clay runs. In `default`,
+# so every `--no-default-features` command line must add it back.
+shell-worlds = ["alacritty_terminal", "log", "polling"]
+# The two server builds, each a binary of its own made by build.sh and in no release
+# asset. Off by default, never with shell-worlds and never together (main.rs refuses the
+# pairs): a server must not contain shell worlds.
+# `clay_multi`: every user a full Clay of their own (src/server.rs, src/instance.rs).
+multiuser = []
+# `clay_web`: an anonymous web gateway to one MUD world.
+web-front = []
 # TLS is built in (rustls, always). The name is kept, doing nothing, so every command
 # line and script that says `--features rustls-backend,...` still builds.
 rustls-backend = []

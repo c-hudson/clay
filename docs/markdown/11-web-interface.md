@@ -106,7 +106,7 @@ Click the hamburger icon for:
 |--------|-------------|
 | Help | Keyboard shortcuts and commands (F1) |
 | World Selector | Open the world selector (`/worlds`) |
-| Edit World | Edit the current world's settings (`/worlds -e`; not on a multiuser server) |
+| Edit World | Edit the current world's settings (`/worlds -e`) |
 | Actions | Open the actions editor (`/actions`) |
 | Settings | Open Settings (`/setup`) |
 | Emoji Picker | Insert an emoji (not on a phone or tablet, whose keyboard has its own, unless the Android app has a keyboard and mouse; `Esc-e` still opens it) |
@@ -114,7 +114,7 @@ Click the hamburger icon for:
 | Toggle Tags | Show/hide MUD tags (F2) |
 | Find | Show only matching lines (F4) |
 | Search History | Find text in the output (F5) |
-| Change Password | (multiuser) Change your password |
+| Change Password | (multiuser servers that answer it; not `clay_multi`, whose password.dat is the operator's) Change your password |
 | New Window | Another window on the same connection (not on Android) |
 | Resync | Request full state refresh |
 | Logout | (multiuser) Log out |
@@ -228,6 +228,7 @@ and the Android app since all three run the same interface code.
 | `F8` | Toggle action highlighting |
 | `Enter` | Send command |
 | `Escape` | Close popup |
+| `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | In a browser, the browser's own page zoom: Clay leaves these keys alone here (the native GUI zooms its window with them; see the Desktop GUI chapter) |
 
 These clients share the console's keymap, so the full table in
 `07-keyboard-shortcuts.md` applies: chords (`^X^R`), the numeric repeat prefix

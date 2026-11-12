@@ -386,6 +386,17 @@ from the *previous* release is still sitting at that path, so nothing looks brok
 compare timestamps. Skip any asset whose target was deliberately skipped. This check does not
 depend on how good the release marker is, so run it even when the greps all pass.
 
+**Check the features of each binary that runs here** (machines.md: every asset has shell
+worlds, none has multiuser):
+```bash
+for f in /tmp/clay-linux-x86_64-musl /tmp/clay-linux-x86_64-gui; do
+  "$f" --version | grep '^Features:' | grep -q 'shell-worlds' && ! "$f" --version | grep -q multiuser \
+    && echo "  $(basename "$f"): features OK" || echo "  $(basename "$f"): WRONG FEATURES"
+done
+```
+For the binaries that don't run here, `strings <asset> | grep -c alacritty_terminal` must be
+above 0 (shell worlds are in) - except the APK's `libclay.so`, where it must be 0.
+
 **Also verify the Android APK bundles the standalone-mode native server** — `android.sh` already
 asserts this before signing, but if the APK was produced some other way, check it here too:
 ```bash

@@ -319,10 +319,10 @@ impl ClayView {
                 Input::new(input)
                     .flex_1()
                     // A browser's text input is 20 characters wide by default.
-                    .min_w(px(20.0 * 0.6 * self.font_size + 18.0))
+                    .min_w(px(20.0 * 0.6 * self.text_size() + 18.0))
                     .text_color(t.fg)
                     .font_family(mono.clone())
-                    .text_size(px(self.font_size))
+                    .text_size(px(self.text_size()))
                     .bg(super::output::hsla([self.theme.bg.r, self.theme.bg.g, self.theme.bg.b]))
                     .rounded(px(0.0)),
             );
@@ -339,7 +339,7 @@ impl ClayView {
             .rounded(px(4.0))
             .font_family(mono)
             .line_height(relative(1.2))
-            .text_size(px(self.font_size))
+            .text_size(px(self.text_size()))
             .child(
                 div()
                     .flex()

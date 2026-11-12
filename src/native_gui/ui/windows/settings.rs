@@ -633,6 +633,26 @@ impl SettingsView {
     }
 
     fn web(&mut self, k: &Kit, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // A clay_multi user's Web tab is their Auth Key alone (and Modify Key): the server's
+        // port, path, password, certificate, allow list and reachability are its operator's.
+        let multiuser = self.main.upgrade().is_some_and(|m| m.read(cx).session.core.is_multiuser());
+        if multiuser {
+            let f = &self.fields;
+            let card = k.card().flex().flex_col().gap(px(6.0))
+                .child(div().text_size(px(12.0)).text_color(k.t.fg2).child("The server's own settings are its operator's. Your auth key logs this device in without the password."))
+                .child(row(
+                    k,
+                    "Auth Key",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(div().flex_1().min_w_0().child(k.input(&f.auth_key).disabled(true).font_family(k.fonts.primary.clone()).text_size(px(10.5))))
+                        .child(k.button("web-modify-key", "Modify Key", Btn::Plain, Some(Box::new(cx.listener(|this, _, w, cx| this.open_dialog("modify-key", w, cx))))).px(px(8.0)).py(px(2.0)))
+                        .into_any_element(),
+                ));
+            return div().flex().flex_col().gap(px(10.0)).child(card).into_any_element();
+        }
         let f = &self.fields;
         let input = |e: &Entity<InputState>| k.input(e).font_family(k.fonts.ui.clone()).text_size(px(12.0)).into_any_element();
         let custom_port = self.port_mode.value(cx) == "custom";

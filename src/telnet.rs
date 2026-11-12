@@ -1142,6 +1142,10 @@ pub struct TelnetConfig {
     /// `DONT` instead of `DO`), so compression is never turned on for this
     /// session at all — see `support_him`'s doc comment.
     pub mccp2_enabled: bool,
+    /// Whether GMCP is accepted at all (`WILL GMCP` answered `DO`): a clay_web visitor's
+    /// Clay answers `DONT` (`instance::Policy::gmcp`, user ruling 2026-11-11). Like
+    /// `mccp2_enabled` it gates `support_him` and nothing else; MSDP is unaffected.
+    pub gmcp_enabled: bool,
     /// The MTTS screen-reader bit: the user asked MUDs to be told a screen reader is in use
     /// (Settings > "MUDs: Screen Reader"; `set_announce_screen_reader`).
     pub screen_reader: bool,
@@ -1188,6 +1192,7 @@ impl Default for TelnetConfig {
             is_tls: false,
             msp_enabled: true,
             mccp2_enabled: true,
+            gmcp_enabled: true,
             screen_reader: announce_screen_reader(),
             diag: None,
         }
@@ -1547,10 +1552,13 @@ enum OptionState {
 /// makes `TELNET_OPT_MCCP2` the one entry in this list that isn't an
 /// unconditional accept: when `false` the server's `WILL MCCP2` is answered
 /// `DONT` instead, so compression is never negotiated on for this session at
-/// all — every other option's acceptance is unaffected.
-fn support_him(opt: u8, mccp2_enabled: bool) -> bool {
+/// all — every other option's acceptance is unaffected. `gmcp_enabled` is the
+/// same switch for GMCP (`TelnetConfig::gmcp_enabled`, a clay_web visitor's
+/// `Policy::gmcp`).
+fn support_him(opt: u8, mccp2_enabled: bool, gmcp_enabled: bool) -> bool {
     match opt {
         TELNET_OPT_MCCP2 => mccp2_enabled,
+        TELNET_OPT_GMCP => gmcp_enabled,
         _ => matches!(
             opt,
             TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_GMCP | TELNET_OPT_MSDP
@@ -2260,7 +2268,7 @@ impl TelnetSession {
         if enable {
             match *st {
                 OptionState::No => {
-                    if support_him(opt, self.cfg.mccp2_enabled) {
+                    if support_him(opt, self.cfg.mccp2_enabled, self.cfg.gmcp_enabled) {
                         *st = OptionState::Yes;
                         wire.extend_from_slice(&[TELNET_IAC, TELNET_DO, opt]);
                         events.push(TelnetEvent::OptionEnabled(opt));
@@ -4074,7 +4082,7 @@ mod tests {
             TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_GMCP, TELNET_OPT_MSDP,
             TELNET_OPT_MCCP2, TELNET_OPT_CHARSET,
         ] {
-            assert!(support_him(opt, true), "support_him({opt}, true) should accept");
+            assert!(support_him(opt, true, true), "support_him({opt}, true) should accept");
         }
         for opt in [TELNET_OPT_NAWS, TELNET_OPT_TTYPE, TELNET_OPT_EOR] {
             assert!(support_us(opt), "support_us({opt}) should accept");
@@ -4082,14 +4090,14 @@ mod tests {
         // Cross-checks: NAWS/TTYPE are "us"-only, GMCP/MSDP/MCCP2/CHARSET/SGA
         // are "him"-only (EOR is the one option in both lists).
         for opt in [TELNET_OPT_NAWS, TELNET_OPT_TTYPE] {
-            assert!(!support_him(opt, true), "support_him({opt}, true) should refuse");
+            assert!(!support_him(opt, true, true), "support_him({opt}, true) should refuse");
         }
         for opt in [TELNET_OPT_SGA, TELNET_OPT_GMCP, TELNET_OPT_MSDP, TELNET_OPT_MCCP2, TELNET_OPT_CHARSET] {
             assert!(!support_us(opt), "support_us({opt}) should refuse");
         }
         // Unknown/unlisted option codes: refused by both.
         for opt in [0u8, 1, 2, 5, 99, 200, 255] {
-            assert!(!support_him(opt, true), "support_him({opt}, true) should refuse (unlisted)");
+            assert!(!support_him(opt, true, true), "support_him({opt}, true) should refuse (unlisted)");
             assert!(!support_us(opt), "support_us({opt}) should refuse (unlisted)");
         }
     }
@@ -4099,12 +4107,24 @@ mod tests {
     /// unaffected by the flag.
     #[test]
     fn test_support_him_mccp2_gated_by_config() {
-        assert!(support_him(TELNET_OPT_MCCP2, true), "mccp2_enabled=true must accept MCCP2");
-        assert!(!support_him(TELNET_OPT_MCCP2, false), "mccp2_enabled=false must refuse MCCP2");
+        assert!(support_him(TELNET_OPT_MCCP2, true, true), "mccp2_enabled=true must accept MCCP2");
+        assert!(!support_him(TELNET_OPT_MCCP2, false, true), "mccp2_enabled=false must refuse MCCP2");
         // Unaffected by the flag either way.
         for opt in [TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_GMCP, TELNET_OPT_MSDP, TELNET_OPT_CHARSET, TELNET_OPT_MSSP, TELNET_OPT_MSP] {
-            assert_eq!(support_him(opt, true), support_him(opt, false), "support_him({opt}) must not depend on mccp2_enabled");
+            assert_eq!(support_him(opt, true, true), support_him(opt, false, true), "support_him({opt}) must not depend on mccp2_enabled");
         }
+    }
+
+    /// `gmcp_enabled: false` (a clay_web visitor's Clay, `Policy::gmcp`) refuses GMCP and
+    /// nothing else: MSDP, MCCP2 and the rest are unaffected.
+    #[test]
+    fn test_support_him_gmcp_gated_by_policy() {
+        assert!(support_him(TELNET_OPT_GMCP, true, true), "gmcp_enabled=true must accept GMCP");
+        assert!(!support_him(TELNET_OPT_GMCP, true, false), "gmcp_enabled=false must refuse GMCP");
+        for opt in [TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_MSDP, TELNET_OPT_MCCP2, TELNET_OPT_CHARSET, TELNET_OPT_MSSP, TELNET_OPT_MSP] {
+            assert_eq!(support_him(opt, true, true), support_him(opt, true, false), "support_him({opt}) must not depend on gmcp_enabled");
+        }
+        assert!(TelnetConfig::default().gmcp_enabled, "every Clay but a visitor's accepts GMCP");
     }
 
     #[test]

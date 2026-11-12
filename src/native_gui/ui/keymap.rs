@@ -41,13 +41,20 @@ pub fn console_key(ks: &gpui::Keystroke) -> Option<(KeyCode, KeyModifiers)> {
         k if k.len() > 1 && k.starts_with('f') && k[1..].parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)) => {
             KeyCode::F(k[1..].parse().expect("checked"))
         }
+        // The keypad's + and -, which GPUI names apart: with Ctrl or Alt the same keys as
+        // the main row's, as app.js reads them (`e.key` is "+"), so Ctrl+keypad-plus zooms.
+        "add" if m.control || m.alt => KeyCode::Char('+'),
+        "subtract" if m.control || m.alt => KeyCode::Char('-'),
         k if k.chars().count() == 1 => {
             let c = k.chars().next().expect("one char");
             // With Ctrl or Alt the base key is the name (Alt-j is Esc-j, and Option-j on
             // a Mac would otherwise type ∆); otherwise the character as typed, so a
             // shifted one keeps its case (Esc-J is not Esc-j).
             let ch = if m.control || m.alt {
-                if m.shift { c.to_ascii_uppercase() } else { c }
+                // Ctrl+Shift+= is Ctrl+plus (`^+`, the zoom key): GPUI names the shifted
+                // character with Shift cleared, and a platform that reports `=` with
+                // Shift held still means the same key.
+                if m.shift && c == '=' { '+' } else if m.shift { c.to_ascii_uppercase() } else { c }
             } else {
                 ks.key_char.as_deref().and_then(|s| s.chars().next()).unwrap_or(c)
             };
@@ -80,5 +87,19 @@ mod tests {
         assert_eq!(name("ctrl-pagedown").as_deref(), Some("Ctrl-PageDown"));
         assert_eq!(name("a"), None, "a plain letter is typed input");
         assert_eq!(console_key(&ks("cmd-c")), None, "Cmd/Win combinations stay the system's");
+    }
+
+    /// The zoom keys (src/zoom.rs): Ctrl+Shift+= is `^+` however the platform spells it,
+    /// and the keypad's + and - are the main row's under Ctrl.
+    #[test]
+    fn the_zoom_keys_have_their_console_names() {
+        let name = |s: &str| console_key(&ks(s)).and_then(|(c, m)| crate::keybindings::key_event_to_name(c, m));
+        assert_eq!(name("ctrl-+").as_deref(), Some("^+"));
+        assert_eq!(name("ctrl-shift-=").as_deref(), Some("^+"));
+        assert_eq!(name("ctrl--").as_deref(), Some("^-"));
+        assert_eq!(name("ctrl-0").as_deref(), Some("^0"));
+        assert_eq!(name("ctrl-add").as_deref(), Some("^+"), "the keypad's plus");
+        assert_eq!(name("ctrl-subtract").as_deref(), Some("^-"), "the keypad's minus");
+        assert_eq!(name("add"), None, "unmodified, the keypad types");
     }
 }

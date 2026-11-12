@@ -1,0 +1,41 @@
+# web.dat - clay_web's settings. Read when clay_web starts, never written; nothing else is
+# read (nothing under ~/.clay). key=value, one per line; true or false; a comment is a line
+# starting with #. A key that is not in this file stops clay_web at start. Beside this file
+# Clay keeps known_hosts.dat (an SSL game's certificate pin) and remote.log (connections
+# and bans). A sample like this one is written where no web.dat is found.
+
+# The web server. The page is at http(s)://<this machine>:<http_port>/clay/
+http_port=9000
+# Your certificate and key, PEM files (Let's Encrypt: fullchain.pem and privkey.pem; a
+# relative path is from this directory). Both set: visitors get https. Both empty: plain
+# http, open to all - everything visitors type crosses the network unencrypted.
+cert_file=
+key_file=
+
+# The game. world_name is shown on the page. first_command is sent to the game first thing
+# on every visitor's connection, before anything else, with %host% replaced by the
+# visitor's address; \n separates lines. encoding is utf8, latin1 or fansi; ssl=true for a
+# game that speaks TLS on this port.
+world_name=MyMUD
+hostname=mud.example.org
+port=4000
+ssl=false
+encoding=utf8
+first_command=REMOTE_HOST %host%
+
+# Rarely needed; these defaults suit most games.
+# world_type is mud, or mud_timed_prompt: a prompt is inferred when the game falls silent
+# for prompt_wait_ms milliseconds after a line without a newline.
+world_type=mud
+prompt_wait_ms=1000
+# While a visitor is idle: NOP (a telnet no-op), None, Generic, or Custom: keep_alive_cmd is
+# sent (with ##rand## a random number) and, when keep_alive_gag_enabled is true, a reply
+# containing keep_alive_gag is hidden.
+keep_alive_type=NOP
+keep_alive_cmd=
+keep_alive_gag_enabled=false
+keep_alive_gag=
+# Telnet options: MSP sounds, MCP, MCCP2 compression.
+msp_enabled=true
+mcp_enabled=true
+mccp2_enabled=true

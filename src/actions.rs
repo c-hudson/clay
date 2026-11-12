@@ -70,8 +70,6 @@ pub struct Action {
     pub pattern: String,
 
     pub command: String,        // Command(s) to execute, semicolon-separated
-    #[serde(default)]
-    pub owner: Option<String>,  // Username who owns this action (multiuser mode)
     #[serde(default = "default_enabled")]
     pub enabled: bool,          // If false, action will not fire
     #[serde(default)]
@@ -100,7 +98,6 @@ impl Default for Action {
             match_type: MatchType::Regexp,
             pattern: String::new(),
             command: String::new(),
-            owner: None,
             enabled: true,
             startup: false,
             gui_shortcut: false,

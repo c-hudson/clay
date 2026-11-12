@@ -179,6 +179,13 @@ pub const ACTIONS: &[ActionInfo] = &[
     ActionInfo { id: "kbnum_8", name: "Numeric Prefix 8", category: "Numeric prefix" },
     ActionInfo { id: "kbnum_9", name: "Numeric Prefix 9", category: "Numeric prefix" },
     ActionInfo { id: "kbnum_negative", name: "Numeric Prefix Negative", category: "Numeric prefix" },
+
+    // The native GUI's window zoom (src/zoom.rs; user request 2026-11-10): the text and
+    // the window together, per window, in memory. The console has no window and a
+    // browser keeps its own zoom on these keys, so only the native GUI acts.
+    ActionInfo { id: "zoom_in", name: "Zoom In (GUI window)", category: "Clay" },
+    ActionInfo { id: "zoom_out", name: "Zoom Out (GUI window)", category: "Clay" },
+    ActionInfo { id: "zoom_reset", name: "Zoom Reset (GUI window)", category: "Clay" },
 ];
 
 /// Keyboard binding map: canonical key name -> action ID.
@@ -327,6 +334,12 @@ impl KeyBindings {
         b.insert("Esc-}".into(), "world_next".into());
         // TF /bg (= /fg -n).
         b.insert("^]".into(), "bg_all_worlds".into());
+        // The native GUI's window zoom (src/zoom.rs), on xfce4-terminal's keys:
+        // Ctrl+Shift+= reaches both GUIs as `^+`. Never `^=`: a key with `=` in it can't
+        // be saved (keybindings.dat splits a line at its first `=`) or `/bind`-ed.
+        b.insert("^+".into(), "zoom_in".into());
+        b.insert("^-".into(), "zoom_out".into());
+        b.insert("^0".into(), "zoom_reset".into());
 
         // System. ^L keeps Clay's own meaning - repaint AND drop client-generated lines
         // (user ruling, same call as ^Q/^R). TF's plain REFRESH is the `refresh_line`
@@ -960,6 +973,9 @@ mod tests {
         ("Esc-{", "world_prev"),
         ("Esc-}", "world_next"),
         ("^]", "bg_all_worlds"),
+        ("^+", "zoom_in"),
+        ("^-", "zoom_out"),
+        ("^0", "zoom_reset"),
         // System
         ("F1", "help"),
         ("^L", "redraw"),

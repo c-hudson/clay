@@ -12,17 +12,25 @@
 //! only when a cell gained a non-space character it didn't have. A cursor move, a colour
 //! change or a clear is not activity; neither is `top` rewriting the same digits.
 
-use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
+// Reading the emulator (`render_rows`, `mode_msg`) is the server's half, built only with
+// the `shell-worlds` feature; `ShellScreen` itself is plain data that clients use too.
+#[cfg(feature = "shell-worlds")]
+use alacritty_terminal::{
+    event::EventListener,
+    grid::Dimensions,
+    term::cell::{Cell, Flags},
+    term::color::Colors,
+    term::{Term, TermMode},
+    vte::ansi::{Color, CursorShape, NamedColor, Rgb},
+};
 
-use crate::websocket::{ShellCursorMsg, ShellModeMsg, ShellScreenMsg, WsMessage};
+use crate::websocket::{ShellCursorMsg, ShellModeMsg, ShellScreenMsg};
+#[cfg(feature = "shell-worlds")]
+use crate::websocket::WsMessage;
 
 /// The whole visible screen, as `render_rows` reads it off a `Term`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "shell-worlds")]
 pub struct RowsSnapshot {
     pub cols: u16,
     pub rows: u16,
@@ -37,6 +45,7 @@ pub struct RowsSnapshot {
 
 /// A cell's appearance, as SGR codes say it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg(feature = "shell-worlds")]
 struct Attrs {
     fg: Col,
     bg: Col,
@@ -49,6 +58,7 @@ struct Attrs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg(feature = "shell-worlds")]
 enum Col {
     #[default]
     Default,
@@ -60,6 +70,7 @@ enum Col {
     Rgb(Rgb),
 }
 
+#[cfg(feature = "shell-worlds")]
 impl Attrs {
     fn of(cell: &Cell, colors: &Colors) -> Attrs {
         let flags = cell.flags;
@@ -127,6 +138,7 @@ impl Attrs {
 
 /// A cell colour as SGR, honouring a palette entry the program changed (OSC 4). The
 /// bool: alacritty's "dim" named colours, which SGR spells as dim + the colour.
+#[cfg(feature = "shell-worlds")]
 fn col(color: Color, colors: &Colors) -> (Col, bool) {
     match color {
         Color::Spec(rgb) => (Col::Rgb(rgb), false),
@@ -170,6 +182,7 @@ fn col(color: Color, colors: &Colors) -> (Col, bool) {
 }
 
 /// The emulator's modes a client (or the key encoder) needs to know.
+#[cfg(feature = "shell-worlds")]
 pub fn mode_msg(mode: TermMode) -> ShellModeMsg {
     ShellModeMsg {
         mouse_click: mode.contains(TermMode::MOUSE_REPORT_CLICK),
@@ -186,6 +199,7 @@ pub fn mode_msg(mode: TermMode) -> ShellModeMsg {
 }
 
 /// Read the visible screen off the emulator.
+#[cfg(feature = "shell-worlds")]
 pub fn render_rows<T: EventListener>(term: &Term<T>) -> RowsSnapshot {
     let cols = term.columns();
     let rows = term.screen_lines();
@@ -253,6 +267,7 @@ pub fn render_rows<T: EventListener>(term: &Term<T>) -> RowsSnapshot {
     RowsSnapshot { cols: cols as u16, rows: rows as u16, lines, plain, cursor, mode: mode_msg(*term.mode()) }
 }
 
+#[cfg(feature = "shell-worlds")]
 fn shape_code(shape: CursorShape) -> u8 {
     match shape {
         CursorShape::Block => 0,
@@ -270,6 +285,7 @@ pub struct ShellScreen {
     pub cols: u16,
     pub rows: u16,
     pub lines: Vec<String>,
+    #[cfg(feature = "shell-worlds")]
     plain: Vec<Vec<char>>,
     pub cursor: ShellCursorMsg,
     pub mode: ShellModeMsg,
@@ -283,19 +299,23 @@ pub struct ShellScreen {
     /// `base_frame` and carries `frame + 1`.
     pub frame: u64,
     /// The rows that changed since the last delta.
+    #[cfg(feature = "shell-worlds")]
     dirty: Vec<bool>,
     /// Something a viewer would see changed since the last delta (rows, cursor, mode,
     /// title or liveness) - a delta is due.
     changed: bool,
     /// No frame has been broadcast for this screen yet, so the first one is sent full (not
     /// a delta a viewing client with no screen would have to reject and re-request).
+    #[cfg(feature = "shell-worlds")]
     fresh: bool,
     /// A resize just happened: suppress the reflow as activity for one rendering.
+    #[cfg(feature = "shell-worlds")]
     resized: bool,
     /// Until this instant, what appears on the screen is not activity: the repaint a
     /// program does after a `/reload` re-attaches it (the size nudge, the injected note)
     /// is Clay's doing, not news from the program, and used to light the world's activity
     /// indicator on every reload.
+    #[cfg(feature = "shell-worlds")]
     quiet_until: Option<std::time::Instant>,
     /// Client side: a delta didn't build on the frame held and the whole screen has been
     /// asked for. Until it arrives every delta is stale, so none of them asks again.
@@ -303,6 +323,7 @@ pub struct ShellScreen {
 }
 
 /// What applying a rendering did.
+#[cfg(feature = "shell-worlds")]
 pub struct Applied {
     /// A row gained a printable character: activity, for a world nobody is viewing.
     pub gained_printable: bool,
@@ -317,6 +338,7 @@ impl ShellScreen {
             cols,
             rows,
             lines: vec![String::new(); rows as usize],
+            #[cfg(feature = "shell-worlds")]
             plain: vec![vec![' '; cols as usize]; rows as usize],
             cursor: ShellCursorMsg::default(),
             mode: ShellModeMsg::default(),
@@ -324,21 +346,27 @@ impl ShellScreen {
             bell: false,
             live: true,
             frame: 1,
+            #[cfg(feature = "shell-worlds")]
             dirty: vec![true; rows as usize],
             changed: true,
+            #[cfg(feature = "shell-worlds")]
             fresh: true,
+            #[cfg(feature = "shell-worlds")]
             resized: false,
+            #[cfg(feature = "shell-worlds")]
             quiet_until: None,
             awaiting_full: false,
         }
     }
 
     /// Nothing that appears before `until` counts as activity (see `quiet_until`).
+    #[cfg(feature = "shell-worlds")]
     pub fn ignore_activity_until(&mut self, until: std::time::Instant) {
         self.quiet_until = Some(until);
     }
 
     /// The next rendering of the emulator. Returns what changed (activity, repaint).
+    #[cfg(feature = "shell-worlds")]
     pub fn apply(&mut self, snap: RowsSnapshot) -> Applied {
         let resized = snap.cols != self.cols || snap.rows != self.rows;
         let quiet = match self.quiet_until {
@@ -390,6 +418,7 @@ impl ShellScreen {
     }
 
     /// Note the program set or cleared the title.
+    #[cfg(feature = "shell-worlds")]
     pub fn set_title(&mut self, title: Option<String>) {
         if self.title != title {
             self.title = title;
@@ -404,12 +433,14 @@ impl ShellScreen {
     }
 
     /// A viewer would see a change that hasn't been broadcast yet.
+    #[cfg(feature = "shell-worlds")]
     pub fn has_changes(&self) -> bool {
         self.changed
     }
 
     /// A full frame: every row, no base, at the frame clients hold now (not advanced).
     /// For a client that just switched in, reconnected, or fell behind.
+    #[cfg(feature = "shell-worlds")]
     pub fn full_msg(&self, world_index: usize) -> WsMessage {
         let lines = self.lines.iter().cloned().enumerate().map(|(i, s)| (i as u16, s)).collect();
         self.msg(world_index, None, lines)
@@ -418,6 +449,7 @@ impl ShellScreen {
     /// A delta of the rows changed since the last delta, built on the frame clients hold,
     /// then advancing that frame. Clears the dirty/changed state. Broadcast to every
     /// viewer at once, so they stay in lockstep.
+    #[cfg(feature = "shell-worlds")]
     pub fn delta_msg(&mut self, world_index: usize) -> WsMessage {
         // The very first frame for a screen is sent full: a client already viewing the
         // world when its shell connects has no screen yet and would otherwise have to
@@ -441,6 +473,7 @@ impl ShellScreen {
         self.msg(world_index, Some(base), lines)
     }
 
+    #[cfg(feature = "shell-worlds")]
     fn msg(&self, world_index: usize, base_frame: Option<u64>, lines: Vec<(u16, String)>) -> WsMessage {
         WsMessage::ShellScreen {
             world_index,
@@ -481,6 +514,7 @@ impl ShellScreen {
             cols: msg.cols,
             rows: msg.rows,
             lines,
+            #[cfg(feature = "shell-worlds")]
             plain: Vec::new(),
             cursor: msg.cursor,
             mode: msg.mode,
@@ -488,10 +522,14 @@ impl ShellScreen {
             bell: false,
             live: msg.live,
             frame: msg.frame,
+            #[cfg(feature = "shell-worlds")]
             dirty: Vec::new(),
             changed: false,
+            #[cfg(feature = "shell-worlds")]
             fresh: false,
+            #[cfg(feature = "shell-worlds")]
             resized: false,
+            #[cfg(feature = "shell-worlds")]
             quiet_until: None,
             awaiting_full: false,
         }

@@ -27,7 +27,8 @@ use polling::{Event, PollMode, Poller};
 const PTY_READ_WRITE_TOKEN: usize = 0;
 const PTY_CHILD_EVENT_TOKEN: usize = 1;
 
-use super::{spawn_loop, ShellSession, Size};
+use super::session::spawn_loop;
+use super::{ShellSession, Size};
 
 /// A PTY master inherited across a reload, plus a pidfd watching its (still-running) child.
 pub struct AdoptedPty {
@@ -123,8 +124,8 @@ impl OnResize for AdoptedPty {
 
 impl Drop for AdoptedPty {
     fn drop(&mut self) {
-        // Mirror tty::Pty::drop: hang the child up and collect it, bounded (super::end_child).
-        super::end_child(self.pid);
+        // Mirror tty::Pty::drop: hang the child up and collect it, bounded (session::end_child).
+        super::session::end_child(self.pid);
     }
 }
 
@@ -140,7 +141,7 @@ impl ShellSession {
         size: Size,
         events: tokio::sync::mpsc::Sender<crate::AppEvent>,
     ) -> io::Result<ShellSession> {
-        super::install_logger();
+        super::session::install_logger();
         let size = size.clamped();
         let pty = AdoptedPty::new(fd, pid)?;
         let mut session = spawn_loop(world, conn_id, pty, size, events, Some(pid))?;

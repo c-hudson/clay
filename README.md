@@ -107,6 +107,8 @@ Clay has built-in help (F1, or `/help <topic>`) and a manual:
 [Shell worlds](docs/markdown/23-shell-worlds.md) ·
 [Accessibility](docs/markdown/24-accessibility.md) ·
 [The map](docs/markdown/25-mapper.md) ·
+[The web gateway (clay_web)](docs/markdown/26-web-front.md) ·
+[The multiuser server (clay_multi)](docs/markdown/27-multiuser.md) ·
 [Remote access](docs/markdown/11-web-interface.md#reaching-clay-from-outside-your-network) ·
 [Troubleshooting](docs/markdown/20-troubleshooting.md) ·
 [all chapters](docs/markdown)

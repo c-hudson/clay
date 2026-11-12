@@ -74,6 +74,10 @@ wrapper), plus three files that aren't source:
 
 ## Also noted
 
+Added after this snapshot (2026-11-08): `.claude/rules/*.md`, the per-area rules Claude
+Code loads path-scoped when it works on matching files (CLAUDE.md names the convention).
+Instructions for Claude Code, not build inputs; tracked like the release skill.
+
 The manual itself has broken pictures: `03-quickstart.md` and `08-settings.md` show
 screenshots from `docs/images/`, and none of those images are in the repo, so they don't appear
 on GitHub.

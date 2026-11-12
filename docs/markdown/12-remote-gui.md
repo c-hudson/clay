@@ -169,9 +169,23 @@ These clients share the console's keymap, so the full table in
 `key_<name>` macro. Rebind anything in `~/.clay/keybindings.dat` or the browser
 keybind editor.
 
-There are no GUI-only menu shortcuts beyond what's listed in the Web Interface
-chapter's table. Use the commands themselves (`/worlds`, `/worlds -e`, `/setup`,
-`/disconnect`) or the hamburger menu.
+The native GUI (`--gui`) has one set of keys of its own: `Ctrl+Shift+=` (Ctrl+plus) and
+`Ctrl+minus` zoom the window the way xfce4-terminal does - the text and the window grow or
+shrink together, 20% a step and seven steps each way - and `Ctrl+0` returns to 1:1. A
+window that would outgrow its monitor becomes the size of the screen instead - the whole
+usable area, title bar and borders included, whichever edge it reached first - and
+further steps do nothing until you zoom out again; zooming back to 1:1 restores the
+window's original size and place. The zoom is this window's alone and lives in memory: it is never
+saved, a `/window` zooms by itself, and another Clay is not affected. The chrome (status
+bar, menus, tabs) keeps its size; the font slider still shows the saved text size, and the
+text is drawn at that size times the zoom. If you drag the window to a new size while
+zoomed, later steps scale that size. On Wayland a program cannot move its window, so a
+window grown to the screen's size may need a nudge back on screen. The WebView GUI and a
+browser tab have no window zoom (a browser's Ctrl+plus/minus stay its own page zoom).
+
+There are no other GUI-only shortcuts beyond what's listed in the Web Interface chapter's
+table. Use the commands themselves (`/worlds`, `/worlds -e`, `/setup`, `/disconnect`) or
+the hamburger menu.
 
 ## Filter Popup
 

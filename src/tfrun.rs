@@ -551,6 +551,11 @@ impl App {
     /// Clay checks only once a script asks for it - a MAIL hook, @mail on a status line
     /// that is the script's, or a mail path it set - not merely because $MAIL is set.
     pub(crate) fn check_tf_mail(&mut self) {
+        // Under /restrict file the mail check would stat whatever file %MAIL or
+        // %TFMAILPATH names: a way to probe the server's files, so none is made.
+        if self.tf_engine.restrict_level >= crate::tf::RestrictLevel::File {
+            return;
+        }
         let now = std::time::Instant::now();
         if self.tf_mail_due.is_some_and(|due| now < due) {
             return;
@@ -670,6 +675,12 @@ impl App {
     /// give: a command runs in the background and its output is shown when it is done
     /// (`AppEvent::TfShellDone`), and an interactive shell can't be had at all.
     fn start_tf_shell(&mut self, command: Option<String>, world_idx: usize, ctx: &TfEffectCtx) {
+        // A Clay that may not start processes (a clay_multi user): the engine's own
+        // /restrict refuses /sh first; this is the guard behind it.
+        if !self.policy.processes {
+            self.emit_tf_error(world_idx, "SH: restricted", ctx.daemon_mode);
+            return;
+        }
         if self.console_tui && !ctx.from_client {
             self.pending_terminal_ops.push_back(crate::TerminalOp::Shell { command, world_idx });
             return;
@@ -1339,7 +1350,7 @@ mod tests {
             AddrFailure::new("::1", "4000", "Network is unreachable"),
         ] };
         let id = app.worlds[0].connection_id;
-        app.handle_world_connect_result("Test", id, crate::ConnectOrigin::Client { report_failure: true }, Err(failure.clone()));
+        app.handle_world_connect_result("Test", id, crate::ConnectOrigin::Client { report_failure: true, client_id: 0 }, Err(failure.clone()));
         let t = texts(&app);
         let hooks: Vec<&String> = t.iter().filter(|t| t.contains("CONFAIL=")).collect();
         assert_eq!(hooks, ["ICONFAIL=[Test 127.0.0.1 4000: Connection refused]", "CONFAIL=[Test ::1 4000: Network is unreachable]"]);

@@ -1289,7 +1289,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn library_stderr_goes_to_the_debug_log_while_guarded() {
-        let log = crate::clay_config_path("debug.log");
+        let log = crate::clay_root_config_path("debug.log");
         let before = std::fs::read_to_string(&log).unwrap_or_default();
         let line = b"kokoro-stderr-guard-test\n";
         {

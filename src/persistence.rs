@@ -12,8 +12,8 @@ use std::os::unix::io::RawFd;
 
 use crate::*;
 use crate::{
-    App, World, WorldSettings, WorldType, User,
-    get_settings_path, get_multiuser_settings_path, get_reload_state_path, debug_log,
+    App, World, WorldSettings, WorldType,
+    get_settings_path, get_reload_state_path, debug_log,
 };
 
 /// Legacy encryption key — only used for decrypting old .clay.dat files. Decrypt-only:
@@ -23,13 +23,16 @@ use crate::{
 /// `machine_key()` on the next save.
 const LEGACY_ENCRYPTION_KEY: &[u8; 32] = b"nonsupersecretpassword#\0\0\0\0\0\0\0\0\0";
 
-/// Per-machine encryption key, loaded from ~/.clay/secure.key (generated on first run)
-static MACHINE_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+/// Per-machine encryption keys, loaded from `secure.key` (generated on first run), one
+/// per config directory: a clay_multi user's directory has its own, so the map is keyed
+/// by the file's path rather than being one process-wide value.
+static MACHINE_KEYS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, [u8; 32]>>> = std::sync::Mutex::new(None);
 
-fn machine_key() -> &'static [u8; 32] {
-    MACHINE_KEY.get_or_init(|| {
-        load_or_generate_key()
-    })
+fn machine_key() -> [u8; 32] {
+    let path = key_file_path();
+    let mut guard = MACHINE_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = guard.get_or_insert_with(std::collections::HashMap::new);
+    *keys.entry(path).or_insert_with(load_or_generate_key)
 }
 
 fn key_file_path() -> PathBuf {
@@ -46,6 +49,12 @@ fn load_or_generate_key() -> [u8; 32] {
             key.copy_from_slice(&data);
             return key;
         }
+    }
+
+    // clay_web makes no secure.key (nothing it has is encrypted at rest; an ENC: value in
+    // web.dat then reads as empty, and a visitor never sees a password anyway).
+    if crate::instance::is_web_only() {
+        return [0u8; 32];
     }
 
     // Generate new random key
@@ -66,7 +75,8 @@ pub fn encrypt_password(password: &str) -> String {
         return String::new();
     }
 
-    let cipher = Aes256Gcm::new(machine_key().into());
+    let key = machine_key();
+    let cipher = Aes256Gcm::new((&key).into());
 
     // Generate random 12-byte nonce
     let mut nonce_bytes = [0u8; 12];
@@ -115,7 +125,8 @@ pub fn decrypt_password(stored: &str) -> String {
     let nonce = Nonce::from_slice(nonce_bytes);
 
     // Try machine key first
-    let cipher = Aes256Gcm::new(machine_key().into());
+    let key = machine_key();
+    let cipher = Aes256Gcm::new((&key).into());
     if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
         return String::from_utf8_lossy(&plaintext).to_string();
     }
@@ -149,11 +160,18 @@ fn known_hosts_path() -> PathBuf {
     crate::clay_config_path("known_hosts.dat")
 }
 
-static KNOWN_HOSTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-    std::sync::OnceLock::new();
+/// The pins of every known_hosts.dat this process has read, keyed by the file's path: a
+/// clay_multi user's directory has its own file, read on that user's first lookup.
+static KNOWN_HOSTS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>>> =
+    std::sync::Mutex::new(None);
 
-fn known_hosts() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    KNOWN_HOSTS.get_or_init(|| std::sync::Mutex::new(load_known_hosts_from(&known_hosts_path())))
+/// Run `f` on this Clay's pins (loading its known_hosts.dat the first time).
+fn with_known_hosts<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) -> R) -> R {
+    let path = known_hosts_path();
+    let mut guard = KNOWN_HOSTS.lock().unwrap_or_else(|e| e.into_inner());
+    let files = guard.get_or_insert_with(std::collections::HashMap::new);
+    let map = files.entry(path.clone()).or_insert_with(|| load_known_hosts_from(&path));
+    f(map)
 }
 
 fn load_known_hosts_from(path: &std::path::Path) -> std::collections::HashMap<String, String> {
@@ -220,36 +238,39 @@ fn normalize_pin_host(host_port: &str) -> String {
 
 /// Look up the pinned fingerprint for a `host:port`, if one has been recorded.
 pub fn get_pin(host_port: &str) -> Option<String> {
-    known_hosts().lock().ok()?.get(&normalize_pin_host(host_port)).cloned()
+    with_known_hosts(|map| map.get(&normalize_pin_host(host_port)).cloned())
 }
 
 /// Pin a fingerprint for `host_port` only if no pin exists yet (first-connect,
 /// silent). Returns `true` if a new pin was written.
 pub fn add_pin(host_port: &str, fingerprint: &str) -> bool {
-    let Ok(mut map) = known_hosts().lock() else { return false };
-    let key = normalize_pin_host(host_port);
-    if map.contains_key(&key) {
-        return false;
-    }
-    map.insert(key, fingerprint.to_lowercase());
-    save_known_hosts_to(&known_hosts_path(), &map);
-    true
+    with_known_hosts(|map| {
+        let key = normalize_pin_host(host_port);
+        if map.contains_key(&key) {
+            return false;
+        }
+        map.insert(key, fingerprint.to_lowercase());
+        save_known_hosts_to(&known_hosts_path(), map);
+        true
+    })
 }
 
 /// Overwrite the pin for `host_port` (user explicitly chose to trust a new
 /// certificate after a mismatch warning).
 pub fn replace_pin(host_port: &str, fingerprint: &str) {
-    let Ok(mut map) = known_hosts().lock() else { return };
-    map.insert(normalize_pin_host(host_port), fingerprint.to_lowercase());
-    save_known_hosts_to(&known_hosts_path(), &map);
+    with_known_hosts(|map| {
+        map.insert(normalize_pin_host(host_port), fingerprint.to_lowercase());
+        save_known_hosts_to(&known_hosts_path(), map);
+    })
 }
 
 /// Remove a pin (e.g. so the next connect re-pins silently). Mostly useful for tests.
 #[cfg(test)]
 pub fn remove_pin(host_port: &str) {
-    let Ok(mut map) = known_hosts().lock() else { return };
-    map.remove(&normalize_pin_host(host_port));
-    save_known_hosts_to(&known_hosts_path(), &map);
+    with_known_hosts(|map| {
+        map.remove(&normalize_pin_host(host_port));
+        save_known_hosts_to(&known_hosts_path(), map);
+    })
 }
 
 /// Fingerprint of settings.dat as of the last time *Clay itself* read or wrote it, carried
@@ -257,7 +278,25 @@ pub fn remove_pin(host_port: &str) {
 /// compares it against the file on disk to tell a hand edit apart from an in-memory
 /// setting that was simply never saved. None = no baseline (fresh process that has not
 /// touched settings.dat yet, or a reload state written by a build predating the key).
-static SETTINGS_FILE_FINGERPRINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// One per settings.dat path: a clay_multi user's file has its own baseline.
+static SETTINGS_FILE_FINGERPRINT: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, String>>> = std::sync::Mutex::new(None);
+
+/// The recorded fingerprint of this Clay's settings.dat.
+fn settings_fingerprint() -> Option<String> {
+    let path = get_settings_path();
+    SETTINGS_FILE_FINGERPRINT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&path).cloned())
+}
+
+/// Record (or, with `None`, forget) the fingerprint of this Clay's settings.dat.
+fn set_settings_fingerprint(fp: Option<String>) {
+    let path = get_settings_path();
+    let mut guard = SETTINGS_FILE_FINGERPRINT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    match fp {
+        Some(fp) => { map.insert(path, fp); }
+        None => { map.remove(&path); }
+    }
+}
 
 /// Content hash of settings.dat bytes. Length is prefixed only to make the value
 /// eyeball-comparable in a reload-state file; the hash is what actually decides.
@@ -283,7 +322,7 @@ fn record_settings_fingerprint(path: &std::path::Path) {
         return;
     }
     let fp = std::fs::read(path).ok().map(|b| fingerprint_settings_bytes(&b));
-    *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = fp;
+    set_settings_fingerprint(fp);
 }
 
 /// Re-apply `path` over `app`'s already-restored settings iff its content differs from
@@ -321,7 +360,7 @@ fn reapply_settings_from_path(app: &mut App, path: &std::path::Path, recorded: O
 /// connections, seq counters) is untouched and a hand-added world simply appears.
 pub fn reapply_externally_edited_settings(app: &mut App) -> bool {
     let path = get_settings_path();
-    let recorded = SETTINGS_FILE_FINGERPRINT.lock().unwrap().clone();
+    let recorded = settings_fingerprint();
     let applied = reapply_settings_from_path(app, &path, recorded.as_deref());
     if applied {
         record_settings_fingerprint(&path);
@@ -338,8 +377,9 @@ pub fn save_settings(app: &App) -> io::Result<()> {
 /// client's UpdateGlobalSettings push (see the handlers in main.rs/daemon.rs), or
 /// "local" for TUI/lifecycle saves. Only master client saves.
 pub fn save_settings_with_source(app: &App, source: &str) -> io::Result<()> {
-    // Only master client should save settings
-    if !app.is_master {
+    // Only master client should save settings - and only a Clay allowed to write its
+    // files (a clay_web visitor's App is the operator's settings in memory, never saved).
+    if !app.is_master || !app.policy.save_files {
         return Ok(());
     }
     save_settings_to_path_with_source(app, &get_settings_path(), source)
@@ -353,6 +393,11 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
 /// Save settings to a specific path, tagging the debug-mode audit log (if enabled) with
 /// `source` — see `save_settings_with_source`.
 pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, source: &str) -> io::Result<()> {
+    // clay_web reads its web.dat and never writes it (nor anything else but its
+    // certificate, pins and remote.log).
+    if crate::instance::is_web_only() {
+        return Ok(());
+    }
     // Snapshot the previous [global] section (debug mode only) so we can log exactly
     // which keys changed after the full-file rewrite below. Settings loss has bitten
     // silently before (a remote client pushing a stale/default snapshot clobbers globals
@@ -428,6 +473,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
     writeln!(file, "remote_initial_lines={}", app.settings.remote_initial_lines)?;
+    if app.settings.web_front_max_sessions != crate::instance::DEFAULT_MAX_VISITORS {
+        writeln!(file, "web_front_max_sessions={}", app.settings.web_front_max_sessions)?;
+    }
     // Hidden setting (no UI anywhere): which services /url shortens through, in order.
     // Written unconditionally so the list is visible and hand-editable in the file; a
     // settings.dat predating the key gets it seeded on load (see load_settings).
@@ -577,6 +625,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         // Lines escaped as notes are (`unescape_string` reads them back).
         if !world.settings.login_command.is_empty() {
             writeln!(file, "login_command={}", escape_multiline(&world.settings.login_command))?;
+        }
+        if !world.settings.first_command.is_empty() {
+            writeln!(file, "first_command={}", escape_multiline(&world.settings.first_command))?;
         }
         if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
@@ -934,12 +985,25 @@ fn migrate_gmcp_packages(value: &str) -> String {
     }
 }
 
+/// `load_settings_from_str_reporting` with the unknown keys dropped.
 pub fn load_settings_from_str(app: &mut App, content: &str) {
+    let _ = load_settings_from_str_reporting(app, content);
+}
+
+/// Parse settings.dat text into `app` and return the keys it did not know, as
+/// `[section] key`, so a hand-written file (clay_web's web.dat) can be told about a typo
+/// the parser would otherwise drop in silence. A line starting with `#` is a comment (no
+/// key or header starts with one; the theme and keybinding readers skip them too), and a
+/// `[theme:name]` section is theme.dat's grammar - `ThemeFile::parse` reads it from the
+/// same text - so its keys are skipped here.
+pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<String> {
+    let mut unknown: Vec<String> = Vec::new();
     let mut current_world: Option<String> = None;
     let mut current_action: Option<usize> = None;
     let mut in_banned_hosts = false;
     let mut in_tf_globals = false;
     let mut in_world_default = false;
+    let mut in_theme = false;
     // [global] precedes [tf_globals], but a pre-scan keeps this independent of order.
     let tf_globals_v2 = content.lines()
         .filter_map(|l| l.trim().strip_prefix("tf_globals_version="))
@@ -953,8 +1017,25 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
     for line in content.lines() {
         let line = line.trim();
 
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+
+        if line.starts_with("[theme:") {
+            in_theme = true;
+            current_world = None;
+            current_action = None;
+            in_banned_hosts = false;
+            in_tf_globals = false;
+            in_world_default = false;
+            continue;
+        }
+        if in_theme {
+            if line.starts_with('[') {
+                in_theme = false;
+            } else {
+                continue;
+            }
         }
 
         if line.starts_with("[global]") {
@@ -1134,7 +1215,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                                 }
                             }
                         }
-                        _ => {}
+                        _ => unknown.push(format!("[action:{}] {key}", action.name)),
                     }
                 }
             } else if current_world.is_none() {
@@ -1264,6 +1345,11 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         // at render time, so any u8 value is safe to store as-is.
                         if let Ok(p) = value.parse::<u8>() {
                             app.settings.wrapspace = p;
+                        }
+                    }
+                    "web_front_max_sessions" => {
+                        if let Ok(n) = value.parse::<usize>() {
+                            app.settings.web_front_max_sessions = n.max(1);
                         }
                     }
                     "remote_initial_lines" => {
@@ -1485,7 +1571,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
-                    _ => {}
+                    // Read by the pre-scan above.
+                    "tf_globals_version" => {}
+                    _ => unknown.push(format!("[global] {key}")),
                 }
             } else if let Some(ref world_name) = current_world {
                 // Find the world and update its settings
@@ -1538,6 +1626,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "login_command" => {
                             world.settings.login_command = unescape_string(value);
                         }
+                        "first_command" => {
+                            world.settings.first_command = unescape_string(value);
+                        }
                         "gmcp_packages" => {
                             world.settings.gmcp_packages = migrate_gmcp_packages(value);
                         }
@@ -1561,7 +1652,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "chat_settings_version" => world.settings.chat_settings_version = value.parse().unwrap_or(0),
                         // Notes
                         "notes" => world.settings.notes = unescape_string(value),
-                        _ => {}
+                        _ => unknown.push(format!("[world:{world_name}] {key}")),
                     }
                 }
             }
@@ -1590,6 +1681,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
             "settings: dropped {} environment/seed entries from an old [tf_globals] section: {}",
             dropped_tf_globals.len(), dropped_tf_globals.join(", ")));
     }
+    unknown
 }
 
 /// `[tf_globals]` format version written to `[global]` (see `TfEngine::persistable_globals`).
@@ -1717,553 +1809,7 @@ pub fn count_import_entities(settings_dat: &str, theme_dat: &str, keybindings_da
     ImportCounts { worlds, actions, settings, themes, keybindings }
 }
 
-/// Load settings for multiuser mode from ~/.clay/multiuser.dat
-pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
-    let path = get_multiuser_settings_path();
-    if !path.exists() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "Multiuser settings file not found"));
-    }
 
-    let file = std::fs::File::open(&path)?;
-    let reader = std::io::BufReader::new(file);
-
-    let mut current_world: Option<String> = None;
-    let mut current_action: Option<usize> = None;
-    let mut current_user: Option<String> = None;
-    let mut in_banned_hosts = false;
-
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.starts_with("[global]") {
-            current_world = None;
-            current_action = None;
-            current_user = None;
-            in_banned_hosts = false;
-            continue;
-        }
-
-        if line.starts_with("[banned_hosts]") {
-            current_world = None;
-            current_action = None;
-            current_user = None;
-            in_banned_hosts = true;
-            continue;
-        }
-
-        // Parse [user:NAME] sections
-        if line.starts_with("[user:") && line.ends_with(']') {
-            let name = &line[6..line.len() - 1];
-            // Unescape the name
-            let unescaped = name
-                .replace("\\]", "]")
-                .replace("\\[", "[")
-                .replace("\\e", "=")
-                .replace("\\\\", "\\");
-
-            // Create new user or find existing
-            if !app.users.iter().any(|u| u.name == unescaped) {
-                app.users.push(User::new(&unescaped, ""));
-            }
-            current_user = Some(unescaped);
-            current_world = None;
-            current_action = None;
-            in_banned_hosts = false;
-            continue;
-        }
-
-        // Parse [world:NAME:OWNER] sections
-        if line.starts_with("[world:") && line.ends_with(']') {
-            let content = &line[7..line.len() - 1];
-            // Find the last colon to split name:owner
-            if let Some(last_colon) = content.rfind(':') {
-                let name = &content[..last_colon];
-                let owner = &content[last_colon + 1..];
-
-                // Unescape both
-                let name_unescaped = name
-                    .replace("\\:", ":")
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-                let owner_unescaped = owner
-                    .replace("\\:", ":")
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-
-                // Find or create world
-                let idx = app.find_or_create_world(&name_unescaped);
-                app.worlds[idx].owner = Some(owner_unescaped);
-                app.worlds[idx].settings.chat_settings_version = 0;
-                current_world = Some(app.worlds[idx].name.clone());
-            } else {
-                // No owner specified - this will fail validation later
-                let name_unescaped = content
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-                let idx = app.find_or_create_world(&name_unescaped);
-                current_world = Some(app.worlds[idx].name.clone());
-            }
-            current_action = None;
-            current_user = None;
-            in_banned_hosts = false;
-            continue;
-        }
-
-        // Parse [action:NAME:OWNER] sections
-        if line.starts_with("[action:") && line.ends_with(']') {
-            let content = &line[8..line.len() - 1];
-            // Find the last colon to split name:owner
-            if let Some(last_colon) = content.rfind(':') {
-                let name = &content[..last_colon];
-                let owner = &content[last_colon + 1..];
-
-                // Unescape both
-                let name_unescaped = name
-                    .replace("\\:", ":")
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-                let owner_unescaped = owner
-                    .replace("\\:", ":")
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-
-                // Find or create action
-                if let Some(idx) = app.settings.actions.iter().position(|a| a.name == name_unescaped) {
-                    app.settings.actions[idx].owner = Some(owner_unescaped);
-                    current_action = Some(idx);
-                } else {
-                    let mut new_action = Action::new();
-                    new_action.name = name_unescaped;
-                    new_action.owner = Some(owner_unescaped);
-                    app.settings.actions.push(new_action);
-                    current_action = Some(app.settings.actions.len() - 1);
-                }
-            } else {
-                // No owner specified - this will fail validation later
-                let name_unescaped = content
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-
-                if let Some(idx) = app.settings.actions.iter().position(|a| a.name == name_unescaped) {
-                    current_action = Some(idx);
-                } else {
-                    let mut new_action = Action::new();
-                    new_action.name = name_unescaped;
-                    app.settings.actions.push(new_action);
-                    current_action = Some(app.settings.actions.len() - 1);
-                }
-            }
-            current_world = None;
-            current_user = None;
-            in_banned_hosts = false;
-            continue;
-        }
-
-        if let Some(eq_pos) = line.find('=') {
-            let key = &line[..eq_pos];
-            let value = &line[eq_pos + 1..];
-
-            // Bans are in-memory only — skip any [banned_hosts] entries in old files
-            if in_banned_hosts {
-                continue;
-            }
-
-            // User settings
-            if let Some(ref user_name) = current_user {
-                if let Some(user) = app.users.iter_mut().find(|u| &u.name == user_name) {
-                    match key {
-                        "password" => user.password = decrypt_password(value),
-                        // C1 (security remediation): set by ChangePassword when it
-                        // stores an already-hashed value in `password` instead of a
-                        // plaintext one — see the `User::password_is_hash` doc comment.
-                        "password_is_hash" => user.password_is_hash = value == "true",
-                        _ => {}
-                    }
-                }
-            }
-            // Action settings
-            else if let Some(action_idx) = current_action {
-                if let Some(action) = app.settings.actions.get_mut(action_idx) {
-                    fn unescape_action_value(s: &str) -> String {
-                        s.replace("\\\\", "\x00").replace("\\n", "\n").replace("\\e", "=").replace("\x00", "\\")
-                    }
-                    match key {
-                        "name" => action.name = value.to_string(),
-                        "world" => action.world = value.to_string(),
-                        // Action-level match type (also handles legacy single-pattern files)
-                        "match_type" => action.match_type = MatchType::parse(value),
-                        "pattern" => action.pattern = unescape_action_value(value),
-                        "command" => action.command = unescape_action_value(value),
-                        "enabled" => action.enabled = value != "false",
-                        "startup" => action.startup = value == "true",
-                        "gui_shortcut" => action.gui_shortcut = value == "true",
-                        "suppress_blanks" => action.suppress_blanks = value == "true",
-                        _ if key.starts_with("pattern.") => {
-                            // Multi-pattern keys: "pattern.N.text" (and legacy "pattern.N.type")
-                            let parts: Vec<&str> = key.splitn(3, '.').collect();
-                            if parts.len() == 3 {
-                                if let Ok(idx) = parts[1].parse::<usize>() {
-                                    while action.patterns.len() <= idx {
-                                        action.patterns.push(MatchPattern::default());
-                                    }
-                                    match parts[2] {
-                                        // Back-compat: fold any per-pattern wildcard into action-level type
-                                        "type" => {
-                                            let mt = MatchType::parse(value);
-                                            if mt == MatchType::Wildcard {
-                                                action.match_type = MatchType::Wildcard;
-                                            }
-                                        }
-                                        "text" => action.patterns[idx].pattern = unescape_action_value(value),
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // World settings
-            else if let Some(ref world_name) = current_world {
-                if let Some(world) = app.worlds.iter_mut().find(|w| &w.name == world_name) {
-                    match key {
-                        "world_id" => world.world_id = value.to_string(),
-                        "world_type" => world.settings.world_type = WorldType::from_name(value),
-                        "hostname" => world.settings.hostname = value.to_string(),
-                        "port" => world.settings.port = value.to_string(),
-                        "user" => world.settings.user = value.to_string(),
-                        "password" => world.settings.password = decrypt_password(value),
-                        "use_ssl" => world.settings.use_ssl = value == "true",
-                        "log_enabled" => world.settings.log_enabled = value == "true",
-                        // "initiate_negotiation" was removed (Clay is now fully reactive) -
-                        // an old state file carrying this key falls through to the
-                        // `_ => {}` wildcard below and is silently ignored.
-                        "msp_enabled" => world.settings.msp_enabled = value == "true",
-                        "mcp_enabled" => world.settings.mcp_enabled = value == "true",
-                        "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
-                        "status_panel" => world.settings.status_panel = value == "true",
-                        "prompt_wait_ms" => {
-                            world.settings.prompt_wait_ms =
-                                value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
-                        }
-                        "tf_type" => world.settings.tf_type = value.to_string(),
-                        "encoding" => {
-                            world.settings.encoding = match value {
-                                "latin1" => Encoding::Latin1,
-                                "fansi" => Encoding::Fansi,
-                                _ => Encoding::Utf8,
-                            };
-                        }
-                        "auto_connect_type" => {
-                            world.settings.auto_connect_type = AutoConnectType::from_name(value);
-                        }
-                        "keep_alive_type" => {
-                            world.settings.keep_alive_type = KeepAliveType::from_name(value);
-                        }
-                        "keep_alive_cmd" => {
-                            world.settings.keep_alive_cmd = value.to_string();
-                        }
-                        "keep_alive_gag_enabled" => {
-                            world.settings.keep_alive_gag_enabled = value == "true";
-                        }
-                        "keep_alive_gag" => {
-                            world.settings.keep_alive_gag = value.to_string();
-                        }
-                        "gmcp_packages" => {
-                            world.settings.gmcp_packages = migrate_gmcp_packages(value);
-                        }
-                        "auto_reconnect_secs" => {
-                            let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
-                            world.settings.auto_reconnect_secs = secs;
-                            world.settings.auto_reconnect_on_web = on_web;
-                        }
-                        // Chat worlds - save_multiuser_settings writes these, and without
-                        // these arms a multiuser restart silently dropped them.
-                        "slack_token" => world.settings.slack_token = decrypt_password(value),
-                        "slack_channel" => world.settings.slack_channel = value.to_string(),
-                        "slack_workspace" => world.settings.slack_workspace = value.to_string(),
-                        "discord_token" => world.settings.discord_token = decrypt_password(value),
-                        "discord_guild" => world.settings.discord_guild = value.to_string(),
-                        "discord_channel" => world.settings.discord_channel = value.to_string(),
-                        "discord_dm_user" => world.settings.discord_dm_user = value.to_string(),
-                        "discord_channels" => world.settings.discord_channels = value.to_string(),
-                        "slack_app_token" => world.settings.slack_app_token = decrypt_password(value),
-                        "slack_channels" => world.settings.slack_channels = value.to_string(),
-                        "chat_settings_version" => world.settings.chat_settings_version = value.parse().unwrap_or(0),
-                        _ => {}
-                    }
-                }
-            }
-            // Global settings
-            else {
-                match key {
-                    // Legacy: ws_enabled/ws_port — silently ignored
-                    "ws_enabled" | "ws_port" => {}
-                    "websocket_password" => app.settings.websocket_password = decrypt_password(value),
-                    "websocket_allow_list" => app.settings.websocket_allow_list = value.to_string(),
-                    "websocket_cert_file" => app.settings.websocket_cert_file = value.to_string(),
-                    "websocket_key_file" => app.settings.websocket_key_file = value.to_string(),
-                    "web_cert_pem" => {
-                        if let Ok(bytes) = BASE64.decode(value) {
-                            if let Ok(pem) = String::from_utf8(bytes) {
-                                app.settings.web_cert_pem = pem;
-                            }
-                        }
-                    }
-                    "web_key_pem" => {
-                        if let Ok(bytes) = BASE64.decode(decrypt_password(value)) {
-                            if let Ok(pem) = String::from_utf8(bytes) {
-                                app.settings.web_key_pem = pem;
-                            }
-                        }
-                    }
-                    "web_secure" => app.settings.web_secure = value == "true",
-                    "http_enabled" => app.settings.http_enabled = value == "true",
-                    "http_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.http_port = p;
-                        }
-                    }
-                    "web_path" => app.settings.web_path = sanitize_web_path(value),
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    for world in &mut app.worlds {
-        migrate_chat_settings(&mut world.settings);
-    }
-    Ok(())
-}
-
-/// Save settings for multiuser mode to ~/.clay/multiuser.dat
-pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
-    let path = get_multiuser_settings_path();
-    // B2 (security remediation): holds encrypted user/world passwords — owner-only perms.
-    let mut file = crate::util::secure_create_file(&path)?;
-
-    // [global] section
-    writeln!(file, "[global]")?;
-    if !app.settings.websocket_password.is_empty() {
-        writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
-    }
-    if !app.settings.websocket_allow_list.is_empty() {
-        writeln!(file, "websocket_allow_list={}", app.settings.websocket_allow_list)?;
-    }
-    if !app.settings.websocket_cert_file.is_empty() {
-        writeln!(file, "websocket_cert_file={}", app.settings.websocket_cert_file)?;
-    }
-    if !app.settings.websocket_key_file.is_empty() {
-        writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
-    }
-    if !app.settings.web_cert_pem.is_empty() {
-        writeln!(file, "web_cert_pem={}", BASE64.encode(app.settings.web_cert_pem.as_bytes()))?;
-    }
-    if !app.settings.web_key_pem.is_empty() {
-        writeln!(file, "web_key_pem={}", encrypt_password(&BASE64.encode(app.settings.web_key_pem.as_bytes())))?;
-    }
-    writeln!(file, "web_secure={}", app.settings.web_secure)?;
-    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
-    writeln!(file, "http_port={}", app.settings.http_port)?;
-    // Written unconditionally (even when empty): key-absent (old settings file) means
-    // default "clay"; present-but-empty means legacy mode (UI served at "/").
-    writeln!(file, "web_path={}", app.settings.web_path)?;
-
-    // [user:NAME] sections
-    for user in &app.users {
-        writeln!(file)?;
-        let escaped_name = user.name
-            .replace('\\', "\\\\")
-            .replace(']', "\\]")
-            .replace('[', "\\[")
-            .replace('=', "\\e")
-            .replace(':', "\\:");
-        writeln!(file, "[user:{}]", escaped_name)?;
-        writeln!(file, "password={}", encrypt_password(&user.password))?;
-        // Only written when true (keeps old-format files/diffs minimal); absent means
-        // false, matching User::new's default. See User::password_is_hash doc comment.
-        if user.password_is_hash {
-            writeln!(file, "password_is_hash=true")?;
-        }
-    }
-
-    // [world:NAME:OWNER] sections
-    for world in &app.worlds {
-        if let Some(ref owner) = world.owner {
-            writeln!(file)?;
-            let escaped_name = world.name
-                .replace('\\', "\\\\")
-                .replace(']', "\\]")
-                .replace('[', "\\[")
-                .replace('=', "\\e")
-                .replace(':', "\\:");
-            let escaped_owner = owner
-                .replace('\\', "\\\\")
-                .replace(']', "\\]")
-                .replace('[', "\\[")
-                .replace('=', "\\e")
-                .replace(':', "\\:");
-            writeln!(file, "[world:{}:{}]", escaped_name, escaped_owner)?;
-            if !world.world_id.is_empty() {
-                writeln!(file, "world_id={}", world.world_id)?;
-            }
-            writeln!(file, "world_type={}", world.settings.world_type.name())?;
-            writeln!(file, "hostname={}", world.settings.hostname)?;
-            writeln!(file, "port={}", world.settings.port)?;
-            if !world.settings.user.is_empty() {
-                writeln!(file, "user={}", world.settings.user)?;
-            }
-            if !world.settings.password.is_empty() {
-                writeln!(file, "password={}", encrypt_password(&world.settings.password))?;
-            }
-            writeln!(file, "use_ssl={}", world.settings.use_ssl)?;
-            writeln!(file, "log_enabled={}", world.settings.log_enabled)?;
-            // Job 14 (plan Phase 4).
-            writeln!(file, "msp_enabled={}", world.settings.msp_enabled)?;
-            // Job 15 (plan Phase 4).
-            writeln!(file, "mcp_enabled={}", world.settings.mcp_enabled)?;
-            writeln!(file, "mccp2_enabled={}", world.settings.mccp2_enabled)?;
-            writeln!(file, "status_panel={}", world.settings.status_panel)?;
-            writeln!(file, "prompt_wait_ms={}", world.settings.prompt_wait_ms)?;
-            if !world.settings.tf_type.is_empty() {
-                writeln!(file, "tf_type={}", world.settings.tf_type)?;
-            }
-            writeln!(file, "encoding={}", world.settings.encoding.name())?;
-            writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
-            writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
-            if !world.settings.keep_alive_cmd.is_empty() {
-                writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
-            }
-            if world.settings.keep_alive_gag_enabled {
-                writeln!(file, "keep_alive_gag_enabled=true")?;
-            }
-            if !world.settings.keep_alive_gag.is_empty() {
-                writeln!(file, "keep_alive_gag={}", world.settings.keep_alive_gag)?;
-            }
-            if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
-                writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
-            }
-            let ar = world.settings.auto_reconnect_display();
-            if ar != "0" {
-                writeln!(file, "auto_reconnect_secs={}", ar)?;
-            }
-            // Slack settings
-            if !world.settings.slack_token.is_empty() {
-                writeln!(file, "slack_token={}", encrypt_password(&world.settings.slack_token))?;
-            }
-            if !world.settings.slack_channel.is_empty() {
-                writeln!(file, "slack_channel={}", world.settings.slack_channel)?;
-            }
-            if !world.settings.slack_workspace.is_empty() {
-                writeln!(file, "slack_workspace={}", world.settings.slack_workspace)?;
-            }
-            // Discord settings
-            if !world.settings.discord_token.is_empty() {
-                writeln!(file, "discord_token={}", encrypt_password(&world.settings.discord_token))?;
-            }
-            if !world.settings.discord_guild.is_empty() {
-                writeln!(file, "discord_guild={}", world.settings.discord_guild)?;
-            }
-            if !world.settings.discord_channel.is_empty() {
-                writeln!(file, "discord_channel={}", world.settings.discord_channel)?;
-            }
-            if !world.settings.discord_dm_user.is_empty() {
-                writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user)?;
-            }
-            if !world.settings.discord_channels.is_empty() {
-                writeln!(file, "discord_channels={}", world.settings.discord_channels)?;
-            }
-            if !world.settings.slack_app_token.is_empty() {
-                writeln!(file, "slack_app_token={}", encrypt_password(&world.settings.slack_app_token))?;
-            }
-            if !world.settings.slack_channels.is_empty() {
-                writeln!(file, "slack_channels={}", world.settings.slack_channels)?;
-            }
-            writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
-            // Notes (escaped as settings.dat's are): the Note editor's `UpdateNote` saves here;
-            // it used to call `save_settings`, which wrote them to settings.dat.
-            if !world.settings.notes.is_empty() {
-                let escaped_notes = world.settings.notes
-                    .replace('\\', "\\\\")
-                    .replace('\n', "\\n")
-                    .replace('=', "\\e");
-                writeln!(file, "notes={}", escaped_notes)?;
-            }
-        }
-    }
-
-    // [action:NAME:OWNER] sections
-    for action in &app.settings.actions {
-        if let Some(ref owner) = action.owner {
-            writeln!(file)?;
-            let escaped_name = action.name
-                .replace('\\', "\\\\")
-                .replace(']', "\\]")
-                .replace('[', "\\[")
-                .replace('=', "\\e")
-                .replace(':', "\\:");
-            let escaped_owner = owner
-                .replace('\\', "\\\\")
-                .replace(']', "\\]")
-                .replace('[', "\\[")
-                .replace('=', "\\e")
-                .replace(':', "\\:");
-            writeln!(file, "[action:{}:{}]", escaped_name, escaped_owner)?;
-            if !action.world.is_empty() {
-                writeln!(file, "world={}", action.world)?;
-            }
-            // Save action-level match type (only when not the default Regexp)
-            if action.match_type != MatchType::Regexp {
-                writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
-            }
-            // Save patterns as pattern.N.text (no per-pattern type; type is action-level)
-            for (i, mp) in action.patterns.iter().enumerate() {
-                if mp.pattern.is_empty() { continue; }
-                writeln!(file, "pattern.{}.text={}", i, mp.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
-            }
-            let escaped_command = action.command
-                .replace('\\', "\\\\")
-                .replace('=', "\\e")
-                .replace('\n', "\\n");
-            writeln!(file, "command={}", escaped_command)?;
-            if !action.enabled {
-                writeln!(file, "enabled=false")?;
-            }
-            if action.startup {
-                writeln!(file, "startup=true")?;
-            }
-            if action.gui_shortcut {
-                writeln!(file, "gui_shortcut=true")?;
-            }
-            if action.suppress_blanks {
-                writeln!(file, "suppress_blanks=true")?;
-            }
-        }
-    }
-
-    // Note: bans are in-memory only and not persisted
-
-    Ok(())
-}
 
 #[cfg(not(target_os = "android"))]
 pub fn save_reload_state(app: &App) -> io::Result<()> {
@@ -2341,6 +1887,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
     writeln!(file, "remote_initial_lines={}", app.settings.remote_initial_lines)?;
+    if app.settings.web_front_max_sessions != crate::instance::DEFAULT_MAX_VISITORS {
+        writeln!(file, "web_front_max_sessions={}", app.settings.web_front_max_sessions)?;
+    }
     writeln!(file, "url_shorteners={}", crate::encoding::UrlShortener::list_to_string(&app.settings.url_shorteners))?;
     // The TF engine's own state - macros, bindings, hooks, /repeats, variables - so a
     // reload doesn't lose a .tfrc's worth of definitions (see tf::snapshot). A key of
@@ -2349,7 +1898,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     // Fingerprint of settings.dat as we last read/wrote it. The restore compares it
     // against the file on disk so a hand edit made while Clay was running survives the
     // reload - see reapply_externally_edited_settings.
-    if let Some(ref fp) = *SETTINGS_FILE_FINGERPRINT.lock().unwrap() {
+    if let Some(fp) = settings_fingerprint() {
         writeln!(file, "settings_fingerprint={}", fp)?;
     }
     writeln!(file, "font_name={}", app.settings.font_name)?;
@@ -2563,6 +2112,11 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             let escaped = p.to_string_lossy().replace('=', "\\e");
             writeln!(file, "log_custom_path={}", escaped)?;
         }
+        // The address the First Command's %host% stood for, so a reconnect after the
+        // reload sends the same one.
+        if let Some(ref ip) = world.connect_ip {
+            writeln!(file, "connect_ip={}", ip)?;
+        }
         // Job 5 (T2.7): buffer for an incomplete line still being watched for a
         // trigger match - see `World::trigger_partial_line`. Without this, a
         // trigger on a line split exactly across the reload's exec never fires.
@@ -2627,6 +2181,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         }
         if !world.settings.login_command.is_empty() {
             writeln!(file, "login_command={}", escape_multiline(&world.settings.login_command))?;
+        }
+        if !world.settings.first_command.is_empty() {
+            writeln!(file, "first_command={}", escape_multiline(&world.settings.first_command))?;
         }
         if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages.replace('=', "\\e"))?;
@@ -3039,6 +2596,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         /// itself cannot be parsed from a saved value.
         reconnect_in_ms: Option<u64>,
         log_custom_path: Option<PathBuf>,
+        connect_ip: Option<String>,
         trigger_partial_line: String,
         answered_prompt: String,
         /// Keyed by index (see `mssp_name_N`/`mssp_value_N` in save_reload_state_to)
@@ -3212,6 +2770,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         naws_sent_size: None,
                         reconnect_in_ms: None,
                         log_custom_path: None,
+                        connect_ip: None,
                         trigger_partial_line: String::new(),
                         answered_prompt: String::new(),
                         mssp_names: std::collections::HashMap::new(),
@@ -3434,6 +2993,11 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             app.settings.wrapspace = p;
                         }
                     }
+                    "web_front_max_sessions" => {
+                        if let Ok(n) = value.parse::<usize>() {
+                            app.settings.web_front_max_sessions = n.max(1);
+                        }
+                    }
                     "remote_initial_lines" => {
                         if let Ok(n) = value.parse::<u16>() {
                             app.settings.remote_initial_lines = n.clamp(10, 5000);
@@ -3459,7 +3023,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "settings_fingerprint" => {
                         // What settings.dat looked like when we last read/wrote it, so
                         // load_reload_state can spot a hand edit made while we ran.
-                        *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = Some(value.to_string());
+                        set_settings_fingerprint(Some(value.to_string()));
                     }
                     "web_secure" => {
                         app.settings.web_secure = value == "true";
@@ -3719,6 +3283,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             // "now" means "when this process actually started".
                             "reconnect_in_ms" => tw.reconnect_in_ms = value.parse().ok(),
                             "log_custom_path" => tw.log_custom_path = Some(PathBuf::from(unescape_string(value))),
+                            "connect_ip" => tw.connect_ip = Some(value.to_string()),
                             "trigger_partial_line" => tw.trigger_partial_line = unescape_string(value),
                             "answered_prompt" => tw.answered_prompt = unescape_string(value),
                             "prompt" => {
@@ -3783,6 +3348,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                                 tw.settings.keep_alive_gag = value.replace("\\e", "=");
                             }
                             "login_command" => tw.settings.login_command = unescape_string(value),
+                            "first_command" => tw.settings.first_command = unescape_string(value),
                             "gmcp_packages" => {
                                 tw.settings.gmcp_packages = migrate_gmcp_packages(&unescape_string(value));
                             }
@@ -4020,6 +3586,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.reconnect_at = tw.reconnect_in_ms
             .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
         world.log_custom_path = tw.log_custom_path;
+        world.connect_ip = tw.connect_ip;
         world.trigger_partial_line = tw.trigger_partial_line;
         world.answered_prompt = tw.answered_prompt;
         // Job (investigate-differences-between-tinyfugu-fluffy-stallman.md): `Instant`
@@ -4192,6 +3759,7 @@ mod tests {
             textdiv: String::new(),            // not saved: %textdiv is a TF variable
             textdiv_str: "=====".to_string(),
             remote_initial_lines: 250,         // default: 100
+            web_front_max_sessions: 50,        // default: 200
             // default: [IsGd, VGd, TinyUrl] — different services AND different order
             url_shorteners: vec![
                 crate::encoding::UrlShortener::DaGd,
@@ -4329,6 +3897,7 @@ mod tests {
             keep_alive_gag_enabled: true,              // default: false
             keep_alive_gag: "keepalive gag".to_string(), // default: ""
             login_command: "say a=b;say c\\;d\nlook\\there".to_string(), // default: ""
+            first_command: "REMOTE_HOST %host%".to_string(), // default: ""
             slack_token: "slack_tok".to_string(),
             slack_channel: "slack_chan".to_string(),
             slack_workspace: "slack_ws".to_string(),
@@ -4369,6 +3938,7 @@ mod tests {
         assert_eq!(a.color_offset_percent, b.color_offset_percent, "{context}: color_offset_percent");
         assert_eq!(a.wrapspace, b.wrapspace, "{context}: wrapspace");
         assert_eq!(a.remote_initial_lines, b.remote_initial_lines, "{context}: remote_initial_lines");
+        assert_eq!(a.web_front_max_sessions, b.web_front_max_sessions, "{context}: web_front_max_sessions");
         assert_eq!(a.url_shorteners, b.url_shorteners, "{context}: url_shorteners");
         assert_eq!(a.font_name, b.font_name, "{context}: font_name");
         assert_eq!(a.font_size, b.font_size, "{context}: font_size");
@@ -4452,6 +4022,7 @@ mod tests {
         assert_eq!(a.keep_alive_gag_enabled, b.keep_alive_gag_enabled, "{context}: keep_alive_gag_enabled");
         assert_eq!(a.keep_alive_gag, b.keep_alive_gag, "{context}: keep_alive_gag");
         assert_eq!(a.login_command, b.login_command, "{context}: login_command");
+        assert_eq!(a.first_command, b.first_command, "{context}: first_command");
         assert_eq!(a.slack_token, b.slack_token, "{context}: slack_token");
         assert_eq!(a.slack_channel, b.slack_channel, "{context}: slack_channel");
         assert_eq!(a.slack_workspace, b.slack_workspace, "{context}: slack_workspace");
@@ -4585,7 +4156,7 @@ mod tests {
     #[test]
     fn test_settings_fingerprint_survives_reload_state_roundtrip() {
         let fp = fingerprint_settings_bytes(b"[global]\nhttp_port=9000\n");
-        *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = Some(fp.clone());
+        set_settings_fingerprint(Some(fp.clone()));
 
         let app = App::new();
         let mut buf: Vec<u8> = Vec::new();
@@ -4593,14 +4164,14 @@ mod tests {
         let content = String::from_utf8(buf).unwrap();
         assert!(content.contains(&format!("settings_fingerprint={fp}")), "reload state must carry the fingerprint");
 
-        *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = None;
+        set_settings_fingerprint(None);
         let mut reloaded = App::new();
         load_reload_state_from_str(&mut reloaded, &content).expect("load failed");
         assert_eq!(
-            *SETTINGS_FILE_FINGERPRINT.lock().unwrap(), Some(fp),
+            settings_fingerprint(), Some(fp),
             "fingerprint must be restored on the far side of the exec"
         );
-        *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = None;
+        set_settings_fingerprint(None);
     }
 
     /// A hot reload never calls `load_settings` (see main.rs's `should_load_state` branch):
@@ -5178,7 +4749,7 @@ mod tests {
             String::new(), "0".to_string(), true, true, true,
             "discord".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), "Guild".to_string(), "#dev".to_string(), String::new(),
-            Some(chat), None, None, None, None,
+            Some(chat), None, None, None, None, None,
         );
         let s = &app.worlds[0].settings;
         assert_eq!(s.discord_channel, "#dev");
@@ -5245,6 +4816,39 @@ mod tests {
         let w = reloaded.worlds.iter().find(|w| w.name == "Login").expect("world restored");
         assert_eq!(w.settings.login_command, commands);
         assert_eq!(w.settings.login_commands(), ["say hello", "say goodbye", "look = here;there", "say a\\b"]);
+    }
+
+    /// Edit World's First Command survives settings.dat and a reload, and the reload keeps
+    /// the address its %host% stood for (a runtime value, never a setting).
+    #[test]
+    fn test_first_command_and_connect_ip_round_trip() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = crate::World::new("Gateway");
+        w.settings.first_command = "REMOTE_HOST %host%\nsecond = line".to_string();
+        w.connect_ip = Some("192.168.2.6".to_string());
+        app.worlds.push(w);
+        app.worlds.push(crate::World::new("Plain"));
+
+        let mut buf = Vec::new();
+        write_settings_dat(&app, &mut buf, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches("first_command=").count(), 1, "only the world with one: {text}");
+        assert!(!text.contains("connect_ip"), "a runtime value, not a setting: {text}");
+        let mut fresh = App::new();
+        load_settings_from_str(&mut fresh, &text);
+        let w = fresh.worlds.iter().find(|w| w.name == "Gateway").expect("world loaded");
+        assert_eq!(w.settings.first_command, "REMOTE_HOST %host%\nsecond = line", "{text}");
+        assert_eq!(w.settings.first_command_lines("1.2.3.4"), ["REMOTE_HOST 1.2.3.4", "second = line"]);
+        assert!(w.connect_ip.is_none());
+
+        let mut buf = Vec::new();
+        save_reload_state_to(&app, &mut buf).unwrap();
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &String::from_utf8(buf).unwrap()).unwrap();
+        let w = reloaded.worlds.iter().find(|w| w.name == "Gateway").expect("world restored");
+        assert_eq!(w.settings.first_command, "REMOTE_HOST %host%\nsecond = line");
+        assert_eq!(w.connect_ip, Some("192.168.2.6".to_string()));
     }
 
     /// A Custom keepalive's Gag (checkbox and text) survives settings.dat and a reload.
@@ -5875,6 +5479,7 @@ pattern=foo
         assert_ne!(non_default.color_offset_percent, default.color_offset_percent, "color_offset_percent should differ");
         assert_ne!(non_default.wrapspace, default.wrapspace, "wrapspace should differ");
         assert_ne!(non_default.remote_initial_lines, default.remote_initial_lines, "remote_initial_lines should differ");
+        assert_ne!(non_default.web_front_max_sessions, default.web_front_max_sessions, "web_front_max_sessions should differ");
         assert_ne!(non_default.url_shorteners, default.url_shorteners, "url_shorteners should differ");
         assert_ne!(non_default.font_name, default.font_name, "font_name should differ");
         assert_ne!(non_default.font_size, default.font_size, "font_size should differ");
@@ -5950,6 +5555,7 @@ pattern=foo
         assert_ne!(non_default.keep_alive_gag_enabled, default.keep_alive_gag_enabled, "keep_alive_gag_enabled should differ");
         assert_ne!(non_default.keep_alive_gag, default.keep_alive_gag, "keep_alive_gag should differ");
         assert_ne!(non_default.login_command, default.login_command, "login_command should differ");
+        assert_ne!(non_default.first_command, default.first_command, "first_command should differ");
         assert_ne!(non_default.slack_token, default.slack_token, "slack_token should differ");
         assert_ne!(non_default.slack_channel, default.slack_channel, "slack_channel should differ");
         assert_ne!(non_default.slack_workspace, default.slack_workspace, "slack_workspace should differ");
@@ -6279,5 +5885,88 @@ MyHost.Example:9000=AABBCC
         let mut app2 = App::new();
         load_settings_from_str(&mut app2, &content);
         assert_eq!(app2.tf_engine.get_var("pad").map(|v| v.to_string_value()), Some("  a b  ".to_string()));
+    }
+
+    /// Each instance's directory has its own secure.key and known_hosts.dat: the two
+    /// process-wide caches are keyed by the file's path, so a clay_multi user's pins and
+    /// key never leak into another user's.
+    #[test]
+    fn instances_have_their_own_machine_key_and_pins() {
+        use crate::instance::{with_scoped, InstanceCtx};
+        let base = crate::test_home_dir().join("instance-keyed-caches");
+        let a = base.join("a");
+        let b = base.join("b");
+        let key_a = with_scoped(InstanceCtx::user("a", a.clone()), machine_key);
+        let key_b = with_scoped(InstanceCtx::user("b", b.clone()), machine_key);
+        assert_ne!(key_a, key_b, "two directories, two random keys");
+        assert_eq!(with_scoped(InstanceCtx::user("a", a.clone()), machine_key), key_a, "cached per directory");
+        assert!(a.join("secure.key").exists() && b.join("secure.key").exists());
+
+        with_scoped(InstanceCtx::user("a", a.clone()), || assert!(add_pin("Mud.Example:4000", "AA")));
+        assert_eq!(with_scoped(InstanceCtx::user("a", a.clone()), || get_pin("mud.example:4000")), Some("aa".to_string()));
+        assert_eq!(with_scoped(InstanceCtx::user("b", b.clone()), || get_pin("mud.example:4000")), None, "b never saw a's pin");
+        assert!(a.join("known_hosts.dat").exists());
+        assert!(!b.join("known_hosts.dat").exists(), "b wrote nothing");
+    }
+
+    /// A Clay whose policy forbids saving (a clay_web visitor) never writes settings.dat,
+    /// however often something asks.
+    #[test]
+    fn a_policy_without_save_files_writes_no_settings() {
+        use crate::instance::{with_scoped, InstanceCtx};
+        let dir = crate::test_home_dir().join("instance-no-save");
+        with_scoped(InstanceCtx::user("nosave", dir.clone()), || {
+            let mut app = App::new();
+            app.policy = crate::instance::Policy::visitor();
+            save_settings(&app).expect("a refused save is not an error");
+            assert!(!dir.join("settings.dat").exists(), "nothing written under a visitor's policy");
+            app.policy = crate::instance::Policy::user();
+            save_settings(&app).expect("save");
+            assert!(dir.join("settings.dat").exists(), "a user's policy saves into its own directory");
+        });
+    }
+
+    /// A hand-written settings file (clay_web's web.dat): `#` lines are comments, a
+    /// `[theme:name]` section is the theme parser's, and the parser names what it did not
+    /// know instead of dropping it in silence.
+    #[test]
+    fn comments_theme_sections_and_unknown_keys_in_a_hand_written_file() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "# a=b\n[global]\nhttp_port=9123\n# web_path=nope\nno_such_key=1\n\
+                       [theme:custom]\nbg=#101418\nhostname=not-a-colour\n\
+                       [world:Gate]\nhostname=mud.example.org\nport=4000\nfirst_cmd=typo\n\
+                       [action:Hi]\npattern.0.text=x\ncolour=red\n";
+        let unknown = load_settings_from_str_reporting(&mut app, content);
+        assert_eq!(app.settings.http_port, 9123);
+        assert_eq!(app.settings.web_path, "clay", "a commented-out key is not read");
+        assert_eq!(unknown, vec!["[global] no_such_key", "[world:Gate] first_cmd", "[action:Hi] colour"],
+            "the theme section's keys are not settings");
+        let w = app.worlds.iter().find(|w| w.name == "Gate").expect("world");
+        assert_eq!(w.settings.hostname, "mud.example.org");
+        assert_eq!(app.settings.actions.len(), 1);
+    }
+
+    /// What Clay writes, Clay reads: no key of a written settings.dat is unknown to the
+    /// parser (the report would otherwise name a writer-only key to a clay_web operator).
+    #[test]
+    fn a_written_settings_dat_has_no_unknown_keys() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let idx = app.find_or_create_world("Round");
+        app.worlds[idx].settings.hostname = "mud.example.org".into();
+        app.worlds[idx].settings.port = "4000".into();
+        let mut action = Action::new();
+        action.name = "Hi".into();
+        action.patterns.push(MatchPattern { pattern: "x".into(), ..Default::default() });
+        action.command = "/echo hi".into();
+        app.settings.actions.push(action);
+        let mut out = Vec::new();
+        write_settings_dat(&app, &mut out, true).expect("write");
+        let text = String::from_utf8(out).unwrap();
+        let mut back = App::new();
+        back.worlds.clear();
+        let unknown = load_settings_from_str_reporting(&mut back, &text);
+        assert!(unknown.is_empty(), "writer keys the parser does not know: {unknown:?}");
     }
 }

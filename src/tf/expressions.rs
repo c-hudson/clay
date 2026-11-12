@@ -2220,6 +2220,11 @@ impl<'a> Evaluator<'a> {
                 if args.len() != 2 {
                     return Err("fwrite requires 2 arguments (filename, text)".to_string());
                 }
+                // /restrict file covers the file functions too (tf's does not say so,
+                // but a restriction that left them open restricted nothing).
+                if self.engine.restrict_level >= super::RestrictLevel::File {
+                    return Err("fwrite: restricted".to_string());
+                }
                 let filename = self.eval(&args[0])?.to_string_value();
                 let text = self.eval(&args[1])?.to_string_value();
 
@@ -2417,6 +2422,9 @@ impl<'a> Evaluator<'a> {
             "tfopen" => {
                 if args.len() < 2 {
                     return Err("tfopen requires 2 arguments (filename, mode)".to_string());
+                }
+                if self.engine.restrict_level >= super::RestrictLevel::File {
+                    return Err("tfopen: restricted".to_string());
                 }
                 let filename = self.eval(&args[0])?.to_string_value();
                 let mode_str = self.eval(&args[1])?.to_string_value();

@@ -126,6 +126,8 @@ impl ClayView {
                 }
             }
             "bg_all_worlds" | "suspend" | "bell" => {}
+            // Ctrl+plus / Ctrl+minus / Ctrl+0: this window's text and size together (ui/zoom.rs).
+            "zoom_in" | "zoom_out" | "zoom_reset" => self.zoom_step(action, window, cx),
             "completion" => {
                 self.complete_input();
                 self.input_touched(cx);

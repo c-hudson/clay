@@ -120,8 +120,8 @@ indented two spaces. Your own messages never fire triggers.
 - Problems retrying can't fix end the connection with instructions instead of
   retrying: an invalid token, the Message Content intent being off, or a missing Slack
   token. The world's Reconnect setting does not apply to these.
-- In `--multiuser` mode a chat world belongs to its owner, and the owner's session is
-  the world's one connection. `/chat` works there too.
+- On `clay_multi` a chat world is the user's own, as every world there is; `/chat` works
+  as anywhere.
 
 ## Troubleshooting
 

@@ -88,7 +88,8 @@ then the status bar says PAUSED); in an SSH console, a line sent, a world switch
 text released. A pause is a connection's: one that reconnects (after the server's
 `/reload`, say) starts unpaused. The other windows and tabs of the interface you typed it
 in are left alone; two GUIs running on one computer are two interfaces. `/remote` lists
-every interface and whether it is paused. Not available on a multiuser server.
+every interface and whether it is paused. On `clay_multi` it reaches only your own
+interfaces.
 
 ## World Management
 

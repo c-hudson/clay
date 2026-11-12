@@ -216,6 +216,7 @@ the full list of changed defaults.
 | `^R` / `^X^R` | Hot reload (same as `/reload`). Clay keeps this on `^R`; TF's own `^R` is "refresh line", available as the unbound `refresh_line` action or `/dokey REFRESH` |
 | `^X^V` | Show version (same as `/version`) |
 | `^Z` | Suspend (resume with `fg` in your shell) |
+| `^+` / `^-` / `^0` | Zoom the native GUI's window (`--gui`), as xfce4-terminal does: the text and the window grow or shrink together, 20% a step and seven steps each way; a window that would outgrow its monitor becomes the size of the screen instead (the whole usable area, frame included), and further steps do nothing; `^0` returns to 1:1 and the window's original size and place. The zoom is that window's alone and never saved. The console has no window, and in a browser these keys stay the browser's own page zoom |
 | `Ctrl-C` (twice within 15 seconds) | Quit |
 | `Enter` | Send the current input line |
 
@@ -444,6 +445,9 @@ you change a default, update both.
 | `Shift-Up` | `world_all_next` |
 | `Tab` | `tab_key` |
 | `Up` | `cursor_up` |
+| `^+` | `zoom_in` |
+| `^-` | `zoom_out` |
+| `^0` | `zoom_reset` |
 | `^A` | `cursor_home` |
 | `^B` | `cursor_left` |
 | `^D` | `delete_forward` |

@@ -31,6 +31,7 @@ mod titlebar;
 mod taskbar;
 mod viewmode;
 mod windows;
+mod zoom;
 #[cfg(feature = "native-gui-snapshot")]
 pub mod snapshot;
 
@@ -134,6 +135,9 @@ pub struct ClayView {
     style: StyleOptions,
     show_tags: bool,
     font_size: f32,
+    /// This window's zoom (Ctrl+plus/minus/0, ui/zoom.rs): the text is drawn at
+    /// `font_size` times its scale (`text_size()`); in memory, this window's alone.
+    zoom: crate::zoom::ZoomState,
     wrapspace: usize,
     wrap_columns: usize,
     letter_spacing: f32,
@@ -263,6 +267,9 @@ impl ClayView {
             this.after(rest, cx);
         })
         .detach();
+        // The window's bounds changed (ours, or the user's resize or move): the zoom
+        // (ui/zoom.rs) learns which, so a dragged size is what later steps scale.
+        cx.observe_window_bounds(window, |this, window, _cx| this.zoom_observe_bounds(window)).detach();
         // The system's light/dark changed: GPUI has just put the title bar back to the
         // system's choice, so draw again to put the theme's back (titlebar.rs).
         cx.observe_window_appearance(window, |_, _window, cx| cx.notify()).detach();
@@ -282,6 +289,7 @@ impl ClayView {
             style: StyleOptions::default(),
             show_tags: false,
             font_size: DEFAULT_FONT_SIZE,
+            zoom: crate::zoom::ZoomState::default(),
             wrapspace: 0,
             wrap_columns: 0,
             letter_spacing: 0.0,
@@ -1205,7 +1213,7 @@ impl ClayView {
         let snapshot = OutputSnapshot {
             lines,
             background: self.palette.bg,
-            font_size: self.font_size,
+            font_size: self.text_size(),
             fonts: self.fonts.clone(),
             wrapspace: if is_shell { 0 } else { self.wrapspace },
             wrap_columns: if is_shell { 0 } else { self.wrap_columns },
@@ -1353,7 +1361,7 @@ impl ClayView {
             .justify_center()
             .gap(px(5.0))
             .font_family(self.fonts.primary.clone())
-            .text_size(px(self.font_size))
+            .text_size(px(self.text_size()))
             .line_height(gpui::relative(1.0))
             .child(gpui::img(assets::LOGO).size(px(200.0)))
             .child(div().italic().text_color(hsla([0xff, 0x87, 0xff])).child("A 90dies mud client written today"))
@@ -1465,7 +1473,7 @@ impl Render for ClayView {
         let alpha = self.link.leader.as_ref().and_then(|l| l.upgrade()).map_or_else(|| self.transparency(), |l| l.read(cx).transparency());
         self.opacity.apply(window, alpha);
         self.titlebar.apply(window, !self.chrome.tokens.light);
-        let shown = appmenu::Shown { multiuser: self.session.core.is_multiuser(), picture_upload: self.session.core.server_picture_upload };
+        let shown = appmenu::Shown::of(&self.session.core);
         let owns_connection = self.link.leader.is_none();
         self.app_menu.apply(window, shown, owns_connection, cx);
         if owns_connection {

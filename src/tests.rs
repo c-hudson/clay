@@ -921,6 +921,41 @@
         assert!(!is_ansi_only_line("\x1b[44m   \x1b[0m"));  // Standard blue bg
         assert!(!is_ansi_only_line("\x1b[100m\x1b[0m"));  // Bright background
         assert!(!is_ansi_only_line("\x1b[48;2;255;255;255m  \x1b[0m"));  // True color bg
+
+        // The Chatting Zone's blank lines (user report 2026-11-11): colour codes ending in a
+        // black background are a blank row; the bare colour fragment its prompt leaves is not.
+        assert!(!is_ansi_only_line("\x1b[0;36m\x1b[1m\x1b[0;37m\x1b[40m"));
+        assert!(is_ansi_only_line("\x1b[0;36m\x1b[1m"));
+    }
+
+    /// The web client (and so the WebView GUI and the Android app) hides the same lines the
+    /// console does: app.js `isFillerLine`/`hasBackgroundColor` are `is_ansi_only_line`/
+    /// `has_background_color` step for step, and the live path asks `isFillerLine` rather
+    /// than a rule of its own. The native GUI calls the Rust function itself
+    /// (`native_gui::core::client::hidden_line`). With a rule of their own the GUIs hid a
+    /// MUD's blank lines that the console drew and the server counted (2026-11-11).
+    #[test]
+    fn app_js_hides_the_lines_the_console_hides() {
+        let js = include_str!("web/app.js");
+        for part in [
+            "function isFillerLine(text) {",
+            "let hasAnsi = false, inEscape = false, inCsi = false;",
+            "if (c >= '@' && c <= '~') {",
+            "} else if (!FILLER_SPACE.test(c)) {",
+            "return hasAnsi && !hasBackgroundColor(line);",
+            // char::is_whitespace's set.
+            r"const FILLER_SPACE = /[\t-\r \x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/;",
+            "if (chars[i++] !== '[') continue;",
+            "if (param === '48') return true;",
+            "if ((n >= 40 && n <= 47) || (n >= 100 && n <= 107)) return true;",
+            // The live path and the stored-line path are the one rule.
+            "if (isFillerLine(line)) {",
+            "if (isFillerLine(cleanLine)) return false;",
+        ] {
+            assert!(js.contains(part), "app.js no longer has {part:?}: keep isFillerLine and encoding::is_ansi_only_line in step");
+        }
+        // No second rule left behind: the old test for "escape codes only".
+        assert!(!js.contains(r"replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0"), "app.js has its own escape-only test again");
     }
 
     #[test]
@@ -1071,8 +1106,6 @@
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
-        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
-            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
         // Spawn server handler
         let server_clients = Arc::clone(&clients);
@@ -1080,18 +1113,15 @@
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
                 stream,
-                1, // client_id
-                server_clients,
+                1,
+                crate::http::Backend::Single { clients: server_clients, event_tx: event_tx },
                 password_hash,
-                true, // password_enabled
+                true,
                 allow_list,
                 whitelisted,
                 client_addr,
-                event_tx,
-                false, // not multiuser
-                users,
                 ban_list,
-                false, // knocked: not exercised by this test
+                false,
             ).await.ok();
         });
 
@@ -1151,17 +1181,21 @@
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
-        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
-            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
         let server_clients = Arc::clone(&clients);
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, password_hash, true,
-                allow_list, whitelisted, client_addr, event_tx,
-                false, users, ban_list,
-                false, // knocked: not exercised by this test
+                stream,
+                1,
+                crate::http::Backend::Single { clients: server_clients, event_tx: event_tx },
+                password_hash,
+                true,
+                allow_list,
+                whitelisted,
+                client_addr,
+                ban_list,
+                false,
             ).await.ok();
         });
 
@@ -1215,17 +1249,21 @@
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
-        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
-            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
         let server_clients = Arc::clone(&clients);
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, password_hash, true,
-                allow_list, whitelisted, client_addr, event_tx,
-                false, users, ban_list,
-                false, // knocked: not exercised by this test
+                stream,
+                1,
+                crate::http::Backend::Single { clients: server_clients, event_tx: event_tx },
+                password_hash,
+                true,
+                allow_list,
+                whitelisted,
+                client_addr,
+                ban_list,
+                false,
             ).await.ok();
         });
 
@@ -1267,37 +1305,78 @@
         server_task.abort();
     }
 
-    /// Regression: a multiuser server has no global password (password_enabled=false,
-    /// the real multiuser.dat state), and its users must still be able to log in.
-    /// Every other multiuser test passes password_enabled=true, which hid a check
-    /// that rejected all multiuser logins with "Password auth not available".
+    /// A stand-in for the servers' `Attacher` (`instance::InstanceManager`): one user
+    /// table, one Clay for every user (a shared client map and event channel), the
+    /// attaches recorded.
+    struct MockAttacher {
+        creds: crate::instance::Credentials,
+        clients: Arc<std::sync::RwLock<std::collections::HashMap<u64, crate::websocket::WsClientInfo>>>,
+        event_tx: tokio::sync::mpsc::Sender<AppEvent>,
+        attached: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Turn every visitor away (`Refused::TooManyFromIp`), standing in for a full server.
+        refuse_visitors: bool,
+    }
+
+    impl crate::http::Attacher for MockAttacher {
+        fn key_user(&self, _challenge: &str, _response: &str, _uses_challenge: bool) -> Option<String> {
+            None
+        }
+        fn check_user_password(&self, username: &str, client_hash: &str, challenge: &str, uses_challenge: bool) -> bool {
+            self.creds.check(username, client_hash, challenge, uses_challenge)
+        }
+        fn attach(&self, who: crate::http::Principal, _client_id: u64) -> Result<crate::http::Attached, crate::http::Refused> {
+            let name = match who {
+                crate::http::Principal::User(name) => name,
+                crate::http::Principal::Visitor { ip } => format!("visitor@{ip}"),
+            };
+            // The one principal this mock turns away, standing in for a full server.
+            if name == "visitor@127.0.0.1" && self.creds.check("refuse-visitors", "", "", false) {
+                return Err(crate::http::Refused::TooManyFromIp);
+            }
+            if self.refuse_visitors && name.starts_with("visitor@") {
+                return Err(crate::http::Refused::TooManyFromIp);
+            }
+            self.attached.lock().unwrap().push(name.clone());
+            Ok(crate::http::Attached {
+                clients: self.clients.clone(),
+                event_tx: self.event_tx.clone(),
+                username: Some(name.clone()),
+                ticket: crate::http::Ticket::User(name),
+            })
+        }
+        fn release(&self, _ticket: &crate::http::Ticket, _client_id: u64) {}
+    }
+
+    /// clay_multi's login (`Backend::Multi`, `MultiLogin::Users`): a password.dat user with
+    /// the right password is attached to their Clay - the answer names the user, the
+    /// instance hears of the connection and then gets the login - with no server-wide
+    /// password at all.
     #[tokio::test]
     async fn test_multiuser_login_without_global_password() {
         use tokio::net::TcpListener;
         use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
         use futures::{SinkExt, StreamExt};
-        use crate::websocket::{WsMessage, WsClientInfo, UserCredential, hash_with_challenge};
+        use crate::websocket::{WsMessage, WsClientInfo, hash_with_challenge};
         use std::sync::Arc;
         use std::sync::RwLock;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
         let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
-        let mut users_map = std::collections::HashMap::new();
-        users_map.insert("star".to_string(), UserCredential { password_hash: hash_password("xyzzy") });
-        let users = Arc::new(std::sync::RwLock::new(users_map));
+        let (creds, _) = crate::instance::Credentials::parse("star xyzzy\n");
+        let attached = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = Arc::new(MockAttacher { creds, clients: clients.clone(), event_tx, attached: attached.clone(), refuse_visitors: false });
+        let backend = crate::http::Backend::Multi { attacher: mock, login: crate::http::MultiLogin::Users };
 
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, clients, hash_password(""), false, // no global password
+                stream, 1, backend, hash_password(""), false, // no global password
                 Arc::new(std::sync::RwLock::new(Vec::new())),
                 Arc::new(std::sync::RwLock::new(None)),
-                client_addr, event_tx,
-                true, // multiuser mode
-                users, BanList::new(),
+                client_addr, BanList::new(),
                 false,
             ).await.ok();
         });
@@ -1307,7 +1386,10 @@
         let (mut sink, mut source) = ws.split();
         let challenge = match source.next().await {
             Some(Ok(WsRawMessage::Text(t))) => match serde_json::from_str::<WsMessage>(&t).unwrap() {
-                WsMessage::ServerHello { challenge, .. } => challenge,
+                WsMessage::ServerHello { challenge, multiuser_mode } => {
+                    assert!(multiuser_mode, "the client is asked for a username");
+                    challenge
+                }
                 other => panic!("expected ServerHello, got {:?}", other),
             },
             other => panic!("expected ServerHello, got {:?}", other),
@@ -1322,12 +1404,19 @@
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
         match source.next().await {
             Some(Ok(WsRawMessage::Text(t))) => match serde_json::from_str::<WsMessage>(&t).unwrap() {
-                WsMessage::AuthResponse { success, error, .. } =>
-                    assert!(success, "multiuser login rejected: {:?}", error),
+                WsMessage::AuthResponse { success, error, username, multiuser_mode } => {
+                    assert!(success, "multiuser login rejected: {:?}", error);
+                    assert_eq!(username, Some("star".to_string()));
+                    assert!(multiuser_mode);
+                }
                 other => panic!("expected AuthResponse, got {:?}", other),
             },
             other => panic!("expected AuthResponse, got {:?}", other),
         }
+        assert_eq!(*attached.lock().unwrap(), vec!["star".to_string()], "attached once, as star");
+        assert!(matches!(event_rx.recv().await, Some(AppEvent::WsClientConnected(1))), "the instance hears of the connection first");
+        assert!(matches!(event_rx.recv().await, Some(AppEvent::WsClientMessage(1, msg)) if matches!(*msg, WsMessage::AuthRequest { .. })), "then gets the login");
+        assert!(clients.read().unwrap().get(&1).is_some_and(|c| c.authenticated && c.username.as_deref() == Some("star")), "in the instance's client table");
         server_task.abort();
     }
 
@@ -1338,67 +1427,48 @@
         use tokio::net::TcpListener;
         use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
         use futures::{SinkExt, StreamExt};
-        use crate::websocket::{WsMessage, WsClientInfo, UserCredential};
+        use crate::websocket::{WsMessage, WsClientInfo};
         use std::sync::Arc;
         use std::sync::RwLock;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let port = addr.port();
+        let port = listener.local_addr().unwrap().port();
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
 
         let password_hash = hash_password("serverpass");
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
         let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
-        let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
-        let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
-            Arc::new(std::sync::RwLock::new(None));
-        let ban_list = BanList::new();
-
-        // Set up multiuser mode with one user
-        let mut users_map = std::collections::HashMap::new();
-        users_map.insert("admin".to_string(), UserCredential {
-            password_hash: hash_password("adminpass"),
-        });
-        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, UserCredential>>> =
-            Arc::new(std::sync::RwLock::new(users_map));
-
-        // We need two connections to test both error cases
-        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port2 = listener2.local_addr().unwrap().port();
-
-        let clients2 = Arc::clone(&clients);
-        let users2 = Arc::clone(&users);
-        let ban_list2 = ban_list.clone();
-        let (event_tx2, _) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let (creds, _) = crate::instance::Credentials::parse("admin adminpass\n");
+        let attached = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock: Arc<dyn crate::http::Attacher> = Arc::new(MockAttacher { creds, clients, event_tx, attached: attached.clone(), refuse_visitors: false });
+        let backend = crate::http::Backend::Multi { attacher: mock, login: crate::http::MultiLogin::Users };
+        let backend2 = backend.clone();
         let password_hash2 = password_hash.clone();
-
-        let server_clients = Arc::clone(&clients);
+        let ban_list = BanList::new();
+        let ban_list2 = ban_list.clone();
 
         // Server 1: test invalid username
         let server_task1 = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, password_hash, true,
-                allow_list, whitelisted, client_addr, event_tx,
-                true, // multiuser mode
-                users, ban_list,
+                stream, 1, backend, password_hash, true,
+                Arc::new(std::sync::RwLock::new(vec!["*".to_string()])),
+                Arc::new(std::sync::RwLock::new(None)),
+                client_addr, ban_list,
                 false, // knocked: not exercised by this test
             ).await.ok();
         });
 
         // Server 2: test wrong password for valid user
-        let allow_list2: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
-        let whitelisted2: Arc<std::sync::RwLock<Option<String>>> =
-            Arc::new(std::sync::RwLock::new(None));
         let server_task2 = tokio::spawn(async move {
             let (stream, client_addr) = listener2.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 2, clients2, password_hash2, true,
-                allow_list2, whitelisted2, client_addr, event_tx2,
-                true, users2, ban_list2,
+                stream, 2, backend2, password_hash2, true,
+                Arc::new(std::sync::RwLock::new(vec!["*".to_string()])),
+                Arc::new(std::sync::RwLock::new(None)),
+                client_addr, ban_list2,
                 false, // knocked: not exercised by this test
             ).await.ok();
         });
@@ -1455,9 +1525,82 @@
         // Verify the error is generic
         assert_eq!(error1, Some("Authentication failed".to_string()),
             "Error message should be generic 'Authentication failed'");
+        assert!(attached.lock().unwrap().is_empty(), "nobody was attached");
 
         server_task1.abort();
         server_task2.abort();
+    }
+
+    /// A refused attach (the sixth visitor from one address, a full server) is ANSWERED:
+    /// the `AuthResponse` with the reason reaches the client before the connection ends.
+    /// It used to be queued on the outbound channel and then dropped by the `break` that
+    /// left the loop draining that channel, so the page saw only EOF (found end to end,
+    /// 2026-11-09).
+    #[tokio::test]
+    async fn a_refused_attach_is_answered_before_the_connection_closes() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
+        use futures::{SinkExt, StreamExt};
+        use crate::websocket::{WsMessage, WsClientInfo};
+        use std::sync::Arc;
+        use std::sync::RwLock;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let (creds, _) = crate::instance::Credentials::parse("");
+        let attached = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock: Arc<dyn crate::http::Attacher> = Arc::new(MockAttacher { creds, clients, event_tx, attached: attached.clone(), refuse_visitors: true });
+        let backend = crate::http::Backend::Multi { attacher: mock, login: crate::http::MultiLogin::Anonymous };
+        let ban_list = BanList::new();
+        let server_task = tokio::spawn(async move {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream, 7, backend, String::new(), false,
+                Arc::new(std::sync::RwLock::new(Vec::new())),
+                Arc::new(std::sync::RwLock::new(None)),
+                client_addr, ban_list,
+                false,
+            ).await.ok();
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let (ws, _) = connect_async(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let (mut sink, mut source) = ws.split();
+        let _ = source.next().await; // ServerHello
+        let auth = WsMessage::AuthRequest {
+            password_hash: String::new(),
+            username: None,
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+            challenge_response: false,
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: String::new(),
+        };
+        sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), source.next()).await
+            .expect("an answer within 5 s");
+        let Some(Ok(WsRawMessage::Text(text))) = answer else {
+            panic!("the refusal must arrive as a message, not EOF: {answer:?}");
+        };
+        let resp: WsMessage = serde_json::from_str(&text).unwrap();
+        let WsMessage::AuthResponse { success, error, .. } = resp else { panic!("{text}") };
+        assert!(!success);
+        assert_eq!(error.as_deref(), Some("Too many sessions from your address"));
+        // ...and then the connection ends (the server breaks out after the refusal).
+        let after = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match source.next().await {
+                    None | Some(Ok(WsRawMessage::Close(_))) | Some(Err(_)) => break,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        }).await;
+        assert!(after.is_ok(), "the connection closes after the refusal");
+        assert!(attached.lock().unwrap().is_empty(), "nobody was attached");
+        server_task.abort();
     }
 
     /// Test: Host header sanitization strips JS injection characters
@@ -1602,18 +1745,22 @@
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
-        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
-            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
         let server_clients = Arc::clone(&clients);
         let ph = password_hash.clone();
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, ph, true,
-                allow_list, whitelisted, client_addr, event_tx,
-                false, users, ban_list,
-                false, // knocked: not exercised by this test
+                stream,
+                1,
+                crate::http::Backend::Single { clients: server_clients, event_tx: event_tx },
+                ph,
+                true,
+                allow_list,
+                whitelisted,
+                client_addr,
+                ban_list,
+                false,
             ).await.ok();
         });
 
@@ -1738,18 +1885,22 @@
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
-        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
-            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
         let server_clients = Arc::clone(&clients);
         let ph = hash_password("test");
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, ph, true,
-                allow_list, whitelisted, client_addr, event_tx,
-                false, users, ban_list,
-                false, // knocked: not exercised by this test
+                stream,
+                1,
+                crate::http::Backend::Single { clients: server_clients, event_tx: event_tx },
+                ph,
+                true,
+                allow_list,
+                whitelisted,
+                client_addr,
+                ban_list,
+                false,
             ).await.ok();
         });
 
@@ -10086,6 +10237,7 @@ third
             keep_alive_gag_enabled: true,
             keep_alive_gag: "Huh?".to_string(),
             login_command: "say hi\nlook".to_string(),
+            first_command: "REMOTE_HOST %host%".to_string(),
             gmcp_packages: String::new(),
             auto_reconnect_secs: "0".to_string(),
             has_notes: true,
@@ -10265,7 +10417,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Slack,
@@ -10291,7 +10443,7 @@ third
                 String::new(), "0".to_string(), true, true, true,
                 String::new(), 1000, None, String::new(), String::new(), String::new(),
                 String::new(), String::new(), String::new(), String::new(),
-                None, on, gag, None, None,
+                None, on, gag, None, None, None,
             );
         };
         save(&mut app, None, None);
@@ -10323,7 +10475,7 @@ third
                 String::new(), "0".to_string(), true, true, true,
                 String::new(), 1000, None, String::new(), String::new(), String::new(),
                 String::new(), String::new(), String::new(), String::new(),
-                None, None, None, None, commands,
+                None, None, None, None, commands, None,
             );
         };
         save(&mut app, None);
@@ -10356,7 +10508,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud_timed_prompt".to_string(), 2500, None, "xoxb-new".to_string(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt);
@@ -10380,7 +10532,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "shell".to_string(), 0, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Shell);
@@ -10409,7 +10561,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Mud);
@@ -10580,7 +10732,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10601,7 +10753,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10622,7 +10774,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -10701,7 +10853,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
         assert!(!app.worlds[0].settings.mccp2_enabled);
         match rx.try_recv() {
@@ -10720,7 +10872,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
         assert!(rx.try_recv().is_err(), "an unchanged save must not re-send the toggle");
     }
@@ -10748,6 +10900,76 @@ third
             "off".to_string(), "off".to_string(), String::new(), false, false, clear_input_on_send, true,
             "none".to_string(), "app_tablet".to_string(), None, None, None, None, None, taskbar_alert, Default::default(),
         );
+    }
+
+    /// A server's operator App (clay_multi with no `[world:]` of its own) has no world:
+    /// a line reported to it must not panic (`resolve_web_cert_files` reported the
+    /// generated certificate this way and clay_multi crashed at start, 2026-11-09).
+    #[test]
+    fn output_to_an_app_with_no_world_does_not_panic() {
+        let mut app = App::new();
+        assert!(app.worlds.is_empty());
+        app.add_output("Generated a self-signed certificate");
+        app.add_tf_output("% nothing to show it in");
+        assert!(crate::resolve_web_cert_files(&mut app).is_some(), "a certificate is still resolved");
+    }
+
+    /// A Clay that isn't the web server (a clay_multi user's: `Policy::web_fields` off)
+    /// keeps its own web fields through a settings save - the port, path, password, allow
+    /// list and TLS proxy a client sends are the operator's business - and its Debug
+    /// switch never touches the process-wide flag; everything else in the save applies.
+    #[test]
+    fn test_update_global_settings_web_fields_follow_the_policy() {
+        let mut app = App::new();
+        app.policy = crate::instance::Policy::user();
+        app.settings.http_port = 7777;
+        app.settings.web_path = "mine".to_string();
+        app.settings.websocket_password = "keep".to_string();
+        app.settings.websocket_allow_list = "10.0.0.*".to_string();
+        app.settings.tls_proxy_enabled = true;
+        let debug_before = is_debug_enabled();
+        app.settings.debug_enabled = !debug_before;
+        app.update_global_settings(
+            0, true, true, true,
+            "unseen".to_string(), false, !debug_before, true,
+            "dark".to_string(), "dark".to_string(),
+            1.0, 0, 0, 500,
+            3, None, None, None, "monospace".to_string(), 14.0,
+            14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
+            String::new(), false, false, 9000, "clay".to_string(),
+            String::new(), String::new(), "newpw".to_string(),
+            false, true, false, None,
+            "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None, None, None, Default::default(),
+        );
+        assert_eq!(app.settings.http_port, 7777, "the port is the operator's");
+        assert_eq!(app.settings.web_path, "mine");
+        assert_eq!(app.settings.websocket_password, "keep");
+        assert_eq!(app.settings.websocket_allow_list, "10.0.0.*");
+        assert!(app.settings.tls_proxy_enabled);
+        assert!(!app.web_restart_needed, "nothing to restart");
+        assert_eq!(app.settings.debug_enabled, !debug_before, "the user's own setting");
+        assert_eq!(is_debug_enabled(), debug_before, "the process flag is the main Clay's");
+        assert_eq!(app.settings.font_size, 14.0, "the rest of the save applies");
+
+        // A regular Clay takes the same save whole.
+        let mut app = App::new();
+        app.settings.http_port = 7777;
+        app.update_global_settings(
+            0, true, true, true,
+            "unseen".to_string(), false, false, true,
+            "dark".to_string(), "dark".to_string(),
+            1.0, 0, 0, 500,
+            3, None, None, None, "monospace".to_string(), 14.0,
+            14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
+            String::new(), false, false, 9000, "clay".to_string(),
+            String::new(), String::new(), "newpw".to_string(),
+            false, true, false, None,
+            "off".to_string(), "off".to_string(), String::new(), false, false, None, true,
+            "none".to_string(), "app_tablet".to_string(), None, None, None, None, None, None, Default::default(),
+        );
+        assert_eq!(app.settings.http_port, 9000);
+        assert_eq!(app.settings.websocket_password, "newpw");
     }
 
     /// Text Reveal is per interface: a client's save sets only its own key, an older
@@ -11161,7 +11383,7 @@ third
                 "utf8".to_string(), "connect".to_string(), "nop".to_string(), String::new(),
                 String::new(), "0".to_string(), true, true, true, String::new(), 1000, None,
                 String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), String::new(),
-                None, None, None, None, None,
+                None, None, None, None, None, None,
             );
             assert!(!app.worlds[0].settings.status_panel, "B={handler_b}: None leaves it");
             assert!(app.set_world_status_panel(0, true).contains("shown"));
@@ -11827,6 +12049,9 @@ third
             settings: App::new().build_global_settings_msg(),
             current_world_index: 0,
             actions: Vec::new(),
+            web_front: false,
+            server_sound: true,
+            change_password: true,
             splash_lines: Vec::new(),
             server_version: "1.7.8".into(),
             server_version_detail: "x".into(),
@@ -11840,6 +12065,7 @@ third
             history_on_demand: false,
             resume_session: false,
             info_report: false,
+            shell_worlds: true,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -15102,79 +15328,6 @@ third
             "seq 5 is >= the pending backlog's floor (3) and must be excluded from the gap-fill reply: {seqs:?}");
     }
 
-    #[tokio::test]
-    async fn test_multiuser_release_pending_broadcasts_content_not_just_count() {
-        use crate::websocket::{WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
-
-        // Fix 6 regression guard: multiuser's ReleasePending handler used to drain
-        // pending_lines into output_lines and broadcast only PendingReleased's count -
-        // never the actual text via ServerData. A client seeing only the count-only
-        // broadcast would clear its "More" indicator with no matching content ever having
-        // arrived - the same "indicator clears, no output appears" symptom this whole
-        // audit round is about, just scoped to multiuser mode.
-        let mut app = App::new();
-        app.worlds.clear();
-        let mut world = World::new("test");
-        world.owner = Some("alice".to_string());
-        world.paused = true;
-        for i in 0..3u64 {
-            world.pending_lines.push(OutputLine::new(format!("backlog {i}"), i));
-        }
-        world.next_seq = 3;
-        app.worlds.push(world);
-
-        let server = WebSocketServer::new("", 0, "*", None, true /* multiuser */, BanList::new());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
-        let client_id = 1u64;
-        {
-            let mut clients = server.clients.write().unwrap();
-            clients.insert(client_id, WsClientInfo {
-                authenticated: true, tx, current_world: None, username: Some("alice".to_string()),
-                received_initial_state: true, client_type: RemoteClientType::Web,
-                viewport_height: 24, ip_address: "127.0.0.1".to_string(),
-                connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
-                paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
-            audit_stall_ticks: std::collections::HashMap::new(),
-            push: None,
-                needs_resync: std::collections::HashSet::new(),
-            });
-        }
-        app.ws_server = Some(server);
-
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
-        crate::daemon::handle_multiuser_ws_message(
-            &mut app, client_id,
-            WsMessage::ReleasePending { world_index: 0, count: 0 },
-            &event_tx,
-        ).await;
-
-        let mut server_data_texts: Vec<String> = Vec::new();
-        let mut saw_pending_released_count = None;
-        while let Ok(item) = rx.try_recv() {
-            // broadcast_to_owner sends pre-serialized JSON (Outbound::Shared), not a boxed
-            // WsMessage (Outbound::Message) - unlike the single-recipient ws_send_to_client
-            // path the other tests in this file exercise.
-            let parsed: Option<WsMessage> = match item {
-                Outbound::Message(msg) => Some(*msg),
-                Outbound::Shared(json) => serde_json::from_str(&json).ok(),
-            };
-            match parsed {
-                Some(WsMessage::ServerData { data, .. }) => server_data_texts.push(data),
-                Some(WsMessage::PendingReleased { count, .. }) => saw_pending_released_count = Some(count),
-                _ => {}
-            }
-        }
-        assert!(!server_data_texts.is_empty(),
-            "released pending content must be broadcast as ServerData, not just a count");
-        let combined: String = server_data_texts.concat();
-        for i in 0..3 {
-            assert!(combined.contains(&format!("backlog {i}")),
-                "released line {i} missing from broadcast content: {combined:?}");
-        }
-        assert_eq!(saw_pending_released_count, Some(3), "PendingReleased count broadcast must still be sent");
-        assert_eq!(app.worlds[0].output_lines.len(), 3);
-        assert!(app.worlds[0].pending_lines.is_empty());
-    }
 
 
     // ==========================================================================
@@ -20770,15 +20923,6 @@ third
                     app.handle_telnet_event(world_idx, ev);
                 }
             }
-            // Job 9 (T3.2): route through the per-user sibling, same as every
-            // production AppEvent::Telnet dispatch site now does - this suite itself
-            // only ever drives World targets (see daemon.rs's multiuser_telnet_tests
-            // for the Multiuser-target regression net), but this helper claims to be
-            // "the exact resolution every dispatch arm performs," so it must not still
-            // silently drop a Multiuser target the way production code used to.
-            TelnetTarget::Multiuser { world_index, username } => {
-                app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
-            }
         }
     }
 
@@ -21513,9 +21657,6 @@ third
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         app.handle_telnet_event(world_idx, ev);
                     }
-                }
-                TelnetTarget::Multiuser { world_index, username } => {
-                    app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
                 }
             },
             _ => panic!("constructed an AppEvent::Telnet above"),
@@ -22720,49 +22861,6 @@ third
         assert_eq!(app.worlds[0].connection_id, 7);
     }
 
-    #[tokio::test]
-    async fn test_multiuser_chat_session_is_owner_scoped() {
-        let mut app = App::new();
-        app.multiuser_mode = true;
-        app.worlds.clear();
-        let mut w = World::new("Disc");
-        w.settings.world_type = WorldType::Discord;
-        w.settings.discord_token = "tok".to_string();
-        w.owner = Some("alice".to_string());
-        app.worlds.push(w);
-        let (tx, _erx) = tokio::sync::mpsc::channel(8);
-        app.start_multiuser_chat(0, "alice", &tx);
-        let key = (0usize, "alice".to_string());
-        let conn_id = app.user_connections[&key].chat_conn_id;
-        assert!(app.user_connections[&key].chat.is_some());
-        // A second connect while one is in flight is ignored (one session per world).
-        app.start_multiuser_chat(0, "alice", &tx);
-        assert_eq!(app.user_connections[&key].chat_conn_id, conn_id);
-
-        let owner = chat::ChatOwner::Multiuser { world_index: 0, username: "alice".into() };
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
-        assert!(app.handle_chat_event(owner.clone(), conn_id, ready(cmd_tx)).is_none());
-        assert!(app.user_connections[&key].connected);
-        assert_eq!(app.user_connections[&key].prompt, "[#general] ");
-        // A stale session id is ignored.
-        assert!(app.handle_chat_event(owner.clone(), conn_id + 99, chat::ChatEvent::Lines(vec!["x".into()])).is_none());
-        match app.handle_chat_event(owner.clone(), conn_id, chat::ChatEvent::Lines(vec!["#g <b> hi".into()])) {
-            Some(AppEvent::MultiuserServerData(0, u, bytes)) => {
-                assert_eq!(u, "alice");
-                assert_eq!(bytes, b"#g <b> hi\n");
-            }
-            _ => panic!("expected MultiuserServerData"),
-        }
-        // /chat is intercepted (not sent as chat text); plain text is not.
-        assert!(app.multiuser_chat_command(0, "alice", "/chat status"));
-        assert!(!app.multiuser_chat_command(0, "alice", "hello there"));
-        assert!(cmd_rx.try_recv().is_err(), "/chat status sent nothing to the chat");
-        // Losing the session while connected hands back MultiuserDisconnected.
-        assert!(matches!(
-            app.handle_chat_event(owner, conn_id, chat::ChatEvent::Closed { reason: "lost".into(), fatal: false }),
-            Some(AppEvent::MultiuserDisconnected(0, _))
-        ));
-    }
 
     /// A client-connected (web/GUI/-D) MUD world, as `spawn_world_connect` leaves it
     /// just before its connect task reports back.
@@ -22786,7 +22884,7 @@ third
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(16);
         let name = app.worlds[0].name.clone();
         let id = app.worlds[0].connection_id;
-        app.handle_world_connect_result(&name, id, ConnectOrigin::Client { report_failure: true },
+        app.handle_world_connect_result(&name, id, ConnectOrigin::Client { report_failure: true, client_id: 0 },
             Ok((tx, None, false, None, None)));
         let mut sent = Vec::new();
         while let Ok(cmd) = rx.try_recv() {
@@ -22795,6 +22893,79 @@ third
             }
         }
         sent
+    }
+
+    /// Edit World's First Command goes out before anything else - the login included -
+    /// with every `%host%` replaced by the connecting client's address, raw (never through
+    /// TF); nothing without one; at once for a FANSI world whose login waits.
+    #[test]
+    fn test_first_command_is_sent_before_the_login() {
+        use crate::telnet::AutoConnectType;
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.first_command = "REMOTE_HOST %host%".to_string();
+        app.worlds[0].connect_ip = Some("192.168.2.6".to_string());
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["REMOTE_HOST 192.168.2.6", "connect bob pw"]);
+
+        // Several lines, %host% twice, blank lines dropped, then a Lines login.
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.auto_connect_type = AutoConnectType::Lines;
+        app.worlds[0].settings.first_command = "HELLO %host% %host%\n\nSECOND".to_string();
+        app.worlds[0].connect_ip = Some("10.0.0.9".to_string());
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["HELLO 10.0.0.9 10.0.0.9", "SECOND", "bob", "pw"]);
+
+        // No address recorded: the local machine.
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.first_command = "REMOTE_HOST %host%".to_string();
+        assert_eq!(connect_and_collect_sends(&mut app)[0], "REMOTE_HOST 127.0.0.1");
+
+        // Nothing extra without one; a FANSI world sends it while its login is held back.
+        let mut app = client_connect_app(Encoding::Utf8);
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["connect bob pw"]);
+        let mut app = client_connect_app(Encoding::Fansi);
+        app.worlds[0].settings.first_command = "FIRST".to_string();
+        assert_eq!(connect_and_collect_sends(&mut app), vec!["FIRST"]);
+
+        // Not through TF: anything but %host% is sent as typed.
+        let mut app = client_connect_app(Encoding::Utf8);
+        app.worlds[0].settings.first_command = "say %{foo} and %host%".to_string();
+        app.worlds[0].connect_ip = Some("1.2.3.4".to_string());
+        assert_eq!(connect_and_collect_sends(&mut app)[0], "say %{foo} and 1.2.3.4");
+    }
+
+    /// `%host%` is the connecting client's address (`App::connect_origin_ip`): the client's
+    /// for a client's connect, IPv4-mapped shown as IPv4; the local machine for the
+    /// console, the embedded GUI (client 0), an unknown client and the server's own
+    /// connects; the last connect's for an auto-reconnect.
+    #[tokio::test]
+    async fn test_connect_origin_ip() {
+        let local = Some("127.0.0.1".to_string());
+        let mut app = client_connect_app(Encoding::Utf8);
+        assert_eq!(app.connect_origin_ip(0, ConnectOrigin::Console), local);
+        assert_eq!(app.connect_origin_ip(0, ConnectOrigin::Client { report_failure: true, client_id: 0 }), local);
+        assert_eq!(app.connect_origin_ip(0, ConnectOrigin::Client { report_failure: true, client_id: 42 }), local, "no server");
+        assert_eq!(app.connect_origin_ip(0, ConnectOrigin::AutoReconnect), local, "never connected");
+
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::websocket::Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        server.clients.write().unwrap().insert(7, WsClientInfo {
+            authenticated: true, tx, current_world: None, username: None,
+            received_initial_state: true, client_type: crate::websocket::RemoteClientType::Web,
+            viewport_height: 24, ip_address: "::ffff:192.168.2.6".to_string(),
+            connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
+            paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(), audit_stall_ticks: std::collections::HashMap::new(),
+            push: None, needs_resync: std::collections::HashSet::new(),
+        });
+        app.ws_server = Some(server);
+        let client = ConnectOrigin::Client { report_failure: true, client_id: 7 };
+        assert_eq!(app.connect_origin_ip(0, client), Some("192.168.2.6".to_string()), "the client's address, as IPv4");
+        assert_eq!(app.connect_origin_ip(0, ConnectOrigin::Client { report_failure: true, client_id: 8 }), local, "a client that is gone");
+
+        // spawn_world_connect records it, and an auto-reconnect reads it back.
+        let (event_tx, _event_rx) = mpsc::channel::<AppEvent>(4);
+        app.spawn_world_connect(0, client, &event_tx);
+        assert_eq!(app.worlds[0].connect_ip, Some("192.168.2.6".to_string()));
+        assert_eq!(app.connect_origin_ip(0, ConnectOrigin::AutoReconnect), Some("192.168.2.6".to_string()));
     }
 
     /// Edit World's Login Command runs once Clay has logged in, each line and each `;` part
@@ -22835,7 +23006,7 @@ third
         let mut app = client_connect_app(Encoding::Fansi);
         app.worlds[0].settings.login_command = "look".to_string();
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(16);
-        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
+        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true, client_id: 0 },
             Ok((tx, None, false, None, None)));
         assert!(rx.try_recv().is_err(), "nothing yet");
         app.finish_due_fansi_logins(std::time::Instant::now() + Duration::from_secs(5));
@@ -22999,7 +23170,7 @@ third
         // answered "Detecting client..." with CLIENT WEBCLIENT2, while --console did.
         let mut app = client_connect_app(Encoding::Fansi);
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
-        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
+        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true, client_id: 0 },
             Ok((tx, None, false, None, None)));
         assert!(app.worlds[0].connected);
         assert!(app.worlds[0].fansi_detect_until.is_some(), "detection window opened");
@@ -23020,7 +23191,7 @@ third
         // handle_connection_success does, exactly once.
         let mut app = client_connect_app(Encoding::Utf8);
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
-        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
+        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true, client_id: 0 },
             Ok((tx, None, false, None, None)));
         match rx.try_recv() {
             Ok(WriteCommand::Text(t)) => assert_eq!(t, "connect bob pw"),
@@ -23032,7 +23203,7 @@ third
         let mut app = client_connect_app(Encoding::Utf8);
         app.worlds[0].skip_auto_login = true;
         let (tx, mut rx) = mpsc::channel::<WriteCommand>(8);
-        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true },
+        app.handle_world_connect_result("Fansi", 3, ConnectOrigin::Client { report_failure: true, client_id: 0 },
             Ok((tx, None, false, None, None)));
         assert!(rx.try_recv().is_err(), "no login with -l");
     }
@@ -23058,7 +23229,7 @@ fn a_custom_certificate_that_cannot_serve_is_named_and_clays_own_serves_instead(
     let mut app = App::new();
     app.settings.websocket_cert_file = path("gone.pem");
     app.settings.websocket_key_file = path("gone-key.pem");
-    let (own_cert, own_key) = resolve_web_cert_files_multiuser(&mut app).expect("Clay's own certificate");
+    let (own_cert, own_key) = resolve_web_cert_files_inner(&mut app, false).expect("Clay's own certificate");
     assert!(own_cert.ends_with("cert.pem") && own_key.ends_with("key.pem"), "{own_cert} {own_key}");
     assert_eq!(custom_cert_problem(&own_cert, &own_key), None);
     let _ = std::fs::remove_dir_all(&dir);
@@ -23730,7 +23901,7 @@ fn the_web_client_resumes_a_paused_session_on_use() {
     assert!(js.contains("if (!sessionPaused || !serverResumesSession || resumeAsked) return;"));
     assert!(js.contains("send({ type: 'ResumeSession' })"));
     // Its program, for /pause: two WebView GUIs on one machine share clientUid.
-    assert_eq!(js.matches("client_uid: clientUid, instance_id: clayInstanceId,").count(), 4, "every AuthRequest");
+    assert_eq!(js.matches("client_uid: clientUid, instance_id: clayInstanceId,").count(), 5, "every AuthRequest (clay_web's anonymous one included)");
     assert!(include_str!("webview_gui.rs").contains("window.CLAY_INSTANCE_ID = '{}';"));
     assert!(js.contains("['keydown', 'pointerdown', 'touchstart', 'wheel'].forEach(function(type) {\n            window.addEventListener(type, noteUserActive, { capture: true, passive: true });"));
 }
@@ -23920,8 +24091,13 @@ fn the_web_page_announces_shown_lines_once_in_screen_reader_mode() {
     assert!(html.contains(r#"aria-label="Command" aria-describedby="prompt""#));
     assert!(html.contains(r#"<div id="sr-announcer" class="sr-only" aria-live="polite" aria-atomic="false"></div>"#));
     let js = include_str!("web/app.js");
+    // appendNewLine announces a line it inserts itself; one it leaves to a ServerData
+    // message's batch is announced by endAppendBatch as that inserts it - once either way.
     assert_eq!(js.matches("announceLine(cleanText)").count(), 1, "announced from appendNewLine only");
-    assert!(js.contains("if (screenReader && !drawingSplit && !gagged) announceLine(cleanText);"));
+    assert!(js.contains("const announce = screenReader && !drawingSplit && !gagged;"));
+    assert_eq!(js.matches("announceLine(it.cleanText)").count(), 1, "and from the batch appendNewLine filled");
+    let batch = js[js.find("function endAppendBatch(").unwrap()..].split("\n    function ").next().unwrap();
+    assert!(batch.contains("if (it.announce) announceLine(it.cleanText);"));
     assert!(!js[js.find("function renderOutput(").unwrap()..].split("\n    function ").next().unwrap().contains("announceLine"), "never from a redraw");
     assert!(js.contains("screen_reader_profile: (screenReaderProfiles && fontProfileKey in screenReaderProfiles)"));
     assert!(js.contains("if (screenReader) return 0;"), "no Text Reveal in Screen Reader mode");
@@ -24255,4 +24431,142 @@ fn the_web_port_is_the_bound_one_until_the_setting_changes() {
     apply_web_settings(&mut app, &new_port);
     assert_eq!(app.settings.http_port, 9005);
     assert_eq!(app.web_port(), 9005, "a changed setting drops the override");
+}
+
+/// CLAUDE.md is loaded whole into every Claude Code session, so it holds only the build
+/// commands, the critical rules, the file map and one-to-three-sentence rules with a pointer;
+/// the detail behind each rule lives in `.claude/rules/<area>.md`, path-scoped files Claude
+/// Code loads only when a matching file is touched (the split of 2026-11-08, when CLAUDE.md had
+/// grown to 161k chars, ~40k tokens a session). This pins the budget so the file can't silently
+/// regrow, and checks that every rules file is well-formed and every pointer to one resolves.
+/// Read from disk via `CARGO_MANIFEST_DIR` (the recipe `test_docs_key_table_matches_defaults`
+/// uses), never `include_str!`, so a checkout missing a file fails this test, not the build.
+#[test]
+fn claude_md_and_rules_stay_within_budget() {
+    const MAX_CHARS: usize = 60_000;
+    const MAX_LINES: usize = 200;
+    // The per-file cap for an on-demand file on a 200K context window: a rules file under it is
+    // never truncated when it loads.
+    const MAX_RULE_CHARS: usize = 40_000;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let claude_md = std::fs::read_to_string(root.join("CLAUDE.md")).expect("CLAUDE.md is tracked in git");
+    let chars = claude_md.chars().count();
+    let lines = claude_md.lines().count();
+    assert!(
+        chars <= MAX_CHARS && lines <= MAX_LINES,
+        "CLAUDE.md is {chars} chars / {lines} lines; the budget is {MAX_CHARS} chars / {MAX_LINES} lines. \
+         Keep only the rule and a pointer there; the detail goes in .claude/rules/<area>.md \
+         (path-scoped, see the convention at the top of CLAUDE.md)."
+    );
+
+    let rules_dir = root.join(".claude/rules");
+    let mut names = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&rules_dir).expect(".claude/rules exists (un-ignored in .gitignore)") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("---\npaths:\n"),
+            "{name}: a rules file starts with `---\\npaths:` frontmatter listing the files it applies to"
+        );
+        let rule_chars = text.chars().count();
+        assert!(
+            rule_chars <= MAX_RULE_CHARS,
+            "{name} is {rule_chars} chars; a rules file stays under {MAX_RULE_CHARS} so it is never truncated when loaded - split the area"
+        );
+        names.insert(name);
+    }
+    assert!(!names.is_empty(), ".claude/rules holds no rules files");
+
+    // Every `.claude/rules/<name>.md` CLAUDE.md points at exists.
+    let mut missing = Vec::new();
+    for (i, _) in claude_md.match_indices(".claude/rules/") {
+        let rest = &claude_md[i + ".claude/rules/".len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'))
+            .unwrap_or(rest.len());
+        let name = rest[..end].trim_end_matches('.');
+        if name.ends_with(".md") && !names.contains(name) {
+            missing.push(name.to_string());
+        }
+    }
+    assert!(missing.is_empty(), "CLAUDE.md points at rules files that don't exist: {missing:?}");
+}
+
+/// `handle_disconnected`'s "Disconnected." counted as unseen whenever the world wasn't the
+/// console's current one. A remote GUI that disconnected the world it was viewing, with the
+/// console on another world (or the server headless), had that world flagged as activity
+/// the moment it switched away, and the badge cleared only by a visit (user report
+/// 2026-11-08). The rule is `world_watched`: any viewer, console or client.
+#[test]
+fn disconnect_seen_by_an_attached_client_is_not_activity() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("console-here"));
+    let mut w = World::new("gui-here");
+    w.connected = true;
+    app.worlds.push(w);
+    app.current_world_index = 0;
+    // An attached client viewing world 1 while the console shows world 0.
+    let client_id = 5;
+    app.ws_client_worlds.insert(client_id, ClientViewState {
+        world_index: 1,
+        history: Vec::new(),
+        visible_lines: 24,
+        visible_columns: 80,
+        dimensions: None,
+        paused: false,
+        visible: true,
+        disconnected_at: None,
+    });
+    app.ws_broadcast_log.lock().unwrap().clear();
+
+    app.handle_disconnected(1, &crate::telnet_reader::CloseReason::ByServer);
+
+    assert_eq!(app.worlds[1].unseen_lines, 0, "the client saw the line as it arrived");
+    assert!(!app.worlds[1].has_activity());
+    let line = app.worlds[1].output_lines.last().unwrap().clone();
+    assert_eq!(line.text, "Disconnected.");
+    assert!(line.viewed, "born viewed, so no later visitor gets a ▶ on it");
+    assert!(
+        !app.ws_broadcast_log.lock().unwrap().iter().any(|m| matches!(m, WsMessage::UnseenUpdate { world_index: 1, .. })),
+        "nothing unseen to report"
+    );
+
+    // The user's sequence: the client switches away. The world it left must not become
+    // activity for anybody - the console's own count stays at zero too.
+    app.ws_broadcast_log.lock().unwrap().clear();
+    app.handle_mark_world_seen(client_id, 0, Some(1), None);
+    assert_eq!(app.activity_count_excluding(&[0]), 0, "nothing to read in world 1");
+    let log = app.ws_broadcast_log.lock().unwrap();
+    assert!(
+        log.iter().any(|m| matches!(m, WsMessage::ActivityUpdate { count: 0 })),
+        "the switch's activity broadcast says zero: {log:?}"
+    );
+}
+
+/// With nobody watching, the line is unseen output like any other, and the clients hear of it
+/// at once: nothing more arrives from a world that just disconnected to carry the count.
+#[test]
+fn disconnect_nobody_watches_is_activity_and_told_at_once() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("console-here"));
+    let mut w = World::new("unwatched");
+    w.connected = true;
+    app.worlds.push(w);
+    app.current_world_index = 0;
+    app.ws_broadcast_log.lock().unwrap().clear();
+
+    app.handle_disconnected(1, &crate::telnet_reader::CloseReason::ByServer);
+
+    assert_eq!(app.worlds[1].unseen_lines, 1);
+    assert!(app.worlds[1].first_unseen_at.is_some());
+    assert!(!app.worlds[1].output_lines.last().unwrap().viewed, "the first visitor's ▶");
+    let log = app.ws_broadcast_log.lock().unwrap();
+    assert!(log.iter().any(|m| matches!(m, WsMessage::UnseenUpdate { world_index: 1, count: 1 })), "{log:?}");
+    assert!(log.iter().any(|m| matches!(m, WsMessage::ActivityUpdate { count: 1 })), "{log:?}");
 }

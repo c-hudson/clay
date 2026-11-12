@@ -54,25 +54,28 @@ pub mod danger {
         pub new_fingerprint: String,
     }
 
-    static CERT_MISMATCH: OnceLock<Mutex<Option<CertMismatch>>> = OnceLock::new();
+    /// One slot per Clay in the process, keyed by `instance::label()`: the verifier runs
+    /// on the connect task, which on an instance's own runtime is the instance's thread,
+    /// so a clay_multi user's mismatch is never read by another user's App.
+    static CERT_MISMATCH: OnceLock<Mutex<std::collections::HashMap<String, CertMismatch>>> = OnceLock::new();
 
-    fn cert_mismatch_slot() -> &'static Mutex<Option<CertMismatch>> {
-        CERT_MISMATCH.get_or_init(|| Mutex::new(None))
+    fn cert_mismatch_slots() -> &'static Mutex<std::collections::HashMap<String, CertMismatch>> {
+        CERT_MISMATCH.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
     }
 
     /// Record a pin mismatch for a later UI read (called by the `TofuVerifier` below).
     pub fn record_cert_mismatch(host: String, old_fingerprint: String, new_fingerprint: String) {
-        if let Ok(mut slot) = cert_mismatch_slot().lock() {
-            *slot = Some(CertMismatch { host, old_fingerprint, new_fingerprint });
+        if let Ok(mut slots) = cert_mismatch_slots().lock() {
+            slots.insert(crate::instance::label(), CertMismatch { host, old_fingerprint, new_fingerprint });
         }
     }
 
-    /// Take (and clear) the most recently recorded cert mismatch, if any.
+    /// Take (and clear) the most recently recorded cert mismatch of this Clay, if any.
     /// Connection-failure handlers call this after a TLS connect fails to learn
     /// whether it was a pin mismatch (vs. an ordinary network error) and, if so,
     /// what the old/new fingerprints were.
     pub fn take_cert_mismatch() -> Option<CertMismatch> {
-        cert_mismatch_slot().lock().ok().and_then(|mut g| g.take())
+        cert_mismatch_slots().lock().ok().and_then(|mut g| g.remove(&crate::instance::label()))
     }
 
     pub fn sha256_hex(data: &[u8]) -> String {
@@ -2300,6 +2303,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // restore path (persistence::save_reload_state_to reads world.shell_reload_fd/pid).
     // Elsewhere a shell world cannot be carried across, so hang the child up now (the
     // wrapper thread that would do it is wiped by the exec) and it comes back disconnected.
+    #[cfg(feature = "shell-worlds")]
     for world in &mut app.worlds {
         #[cfg(target_os = "linux")]
         {
@@ -2394,6 +2398,39 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
 
     // If we get here, exec failed
     Err(io::Error::other(format!("exec failed: {} (path: {})", err, exe.display())))
+}
+
+/// The server builds' reload (clay_multi, clay_web on SIGUSR1): every instance has been
+/// flushed and ended, nothing is carried over but the port (`RELOAD_WEB_PORT_ENV`, so the
+/// successor's bind retries while this listener closes), and this process becomes a
+/// fresh one with the same command line. Returns only if the exec failed.
+#[cfg(all(unix, not(target_os = "android")))]
+#[cfg_attr(not(any(feature = "multiuser", feature = "web-front")), allow(dead_code))]
+pub(crate) fn exec_cold_restart(web_port: Option<u16>) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    pass_web_port_to_successor(web_port);
+    sync_crash_count_env();
+    pass_start_to_successor();
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
+    debug_log(true, &format!("COLD RELOAD: exec {} with args={:?}", exe.display(), args));
+    crate::crashlog::replacing("cold reload");
+    give_back_stderr();
+    let err = std::process::Command::new(&exe).args(&args).exec();
+    Err(io::Error::other(format!("exec failed: {} (path: {})", err, exe.display())))
+}
+
+/// Windows has no exec: the successor is spawned and this process ends.
+#[cfg(windows)]
+#[cfg_attr(not(any(feature = "multiuser", feature = "web-front")), allow(dead_code))]
+pub(crate) fn exec_cold_restart(web_port: Option<u16>) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    pass_web_port_to_successor(web_port);
+    sync_crash_count_env();
+    pass_start_to_successor();
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
+    std::process::Command::new(&exe).args(&args).spawn()?;
+    crate::crashlog::exit_process(0, "cold reload");
 }
 
 /// The native GUI sends stderr to debug.log (native_gui/quiet.rs): the process that
@@ -2683,7 +2720,7 @@ impl StderrToLog {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let log = crate::clay_config_path("debug.log");
+            let log = crate::clay_root_config_path("debug.log");
             let file = std::fs::OpenOptions::new().append(true).create(true).open(&log)
                 .or_else(|_| std::fs::OpenOptions::new().write(true).open("/dev/null"));
             if let Ok(file) = file {

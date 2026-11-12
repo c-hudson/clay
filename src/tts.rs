@@ -191,6 +191,20 @@ pub fn init_tts() -> TtsBackend {
     }
 }
 
+impl TtsBackend {
+    /// A backend with no engine at all, for a Clay that never speaks on this machine (a
+    /// clay_multi user's or a clay_web visitor's instance): no `which` probe, no Edge
+    /// queue task, no Kokoro. Clients are still spoken to by `ServerSpeak`.
+    pub fn silent() -> TtsBackend {
+        TtsBackend {
+            local_command: None,
+            current_process: Arc::new(Mutex::new(None)),
+            edge_queue_tx: None,
+            kokoro: OnceLock::new(),
+        }
+    }
+}
+
 /// Detect which local TTS command is available on this system.
 fn detect_tts_command() -> Option<String> {
     #[cfg(target_os = "macos")]

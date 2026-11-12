@@ -44,7 +44,7 @@ rustup target add x86_64-unknown-linux-musl
 
 # Build
 cargo build --target x86_64-unknown-linux-musl \
-    --no-default-features --features ssh-transport
+    --no-default-features --features ssh-transport,shell-worlds
 
 # Binary location
 ./target/x86_64-unknown-linux-musl/debug/clay
@@ -80,7 +80,7 @@ macOS builds use the native toolchain (no musl needed):
 
 ```bash
 # Terminal client only
-cargo build --no-default-features --features ssh-transport
+cargo build --no-default-features --features ssh-transport,shell-worlds
 
 # With WebView GUI (audio included by default, no extra deps)
 cargo build --features webview-gui
@@ -99,7 +99,7 @@ ships a universal binary combining both via `lipo`.
 pkg install rust
 
 # Build TUI only (no GUI dependencies)
-cargo build --no-default-features --features ssh-transport
+cargo build --no-default-features --features ssh-transport,shell-worlds
 
 # Binary location
 ./target/debug/clay
@@ -138,6 +138,24 @@ cargo build --release --features webview-gui
 | `webview-gui` | Build the WebView GUI client (requires display; `--web-gui`, and `--gui` in a build without `native-gui`) |
 | `native-audio` | ANSI music / MSP sound playback via rodio (on by default) |
 | `ssh-transport` | SSH-tunneled `--console`/`--gui`/`--web-gui` and Android's SSH proxy (on by default) |
+| `shell-worlds` | Shell worlds, a world that is a local terminal (on by default; in every release build except the Android app) |
+| `multiuser` | The multiuser server, the `clay_multi` binary (off by default; in no release build). Never together with `shell-worlds` or `web-front` |
+| `web-front` | The web gateway, the `clay_web` binary (off by default; in no release build). Never together with `shell-worlds` or `multiuser` |
+
+`build.sh` builds three binaries into the repository directory: `./clay` (with shell
+worlds), `./clay_multi` and `./clay_web`. `./build.sh --only clay|multi|web` builds one of
+them, and `./build.sh --no-shell-worlds` leaves shell worlds out of `./clay`. With cargo, a
+build that names `--no-default-features` must add `shell-worlds` back itself; the servers
+are `cargo build --release --no-default-features --features multiuser,ssh-transport` and
+`cargo build --release --no-default-features --features web-front,ssh-transport` (cargo
+names every binary `clay`; build.sh builds the servers in their own `target/servers`
+directory and copies them under their own names, so cargo's usual `target/release/clay`
+is always the client).
+
+A build without shell worlds still loads, shows and saves a shell world from your
+settings; connecting it says the build has none, and the world editor offers no Shell type.
+A server build started with no options runs its server; `clay --multiuser` or
+`clay --web-front` in a build without that server says which feature it needs.
 
 ## Verifying the Installation
 
@@ -170,7 +188,8 @@ GUI chapter.
 | `--web-gui[=host[:port]]` | WebView GUI mode (requires the `webview-gui` feature); same local-vs-remote distinction as `--console` |
 | `--ssh` | Tunnel `--console=`/`--gui=`/`--web-gui=` through SSH instead of connecting directly (requires the `ssh-transport` feature) |
 | `-D` | Run as a headless daemon server |
-| `--multiuser` | Run as a multiuser server (separate config, one process serves several independent accounts) |
+| `--multiuser` | Run the multiuser server (the `clay_multi` build runs it with no options too; see the Multiuser Server chapter) |
+| `--web-front` | Run the web gateway (the `clay_web` build runs it with no options too; see the Web Gateway chapter) |
 | `--local-server` | Run headless, loopback-only, for an embedding client (e.g. the Android app); with `CLAY_LOCAL_SERVER_LAN=1` in the environment it listens on every interface (the app's Allow Other Devices) |
 | `--port=<N>` | Override the listen port (used with `--local-server`) |
 | `--upgrade` | Download the newest release from GitHub, install it over this binary and exit, without starting the console or a GUI (`/update`'s install, from the command line). A Clay already running from the same file keeps its version until it restarts or `/reload`s. Not on Termux |

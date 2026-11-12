@@ -28,32 +28,34 @@ No special build features required - works with the standard musl build.
 - Run Clay on a server, connect from anywhere
 - Have multiple terminal views of the same sessions
 
-## What "Master Instance" Means: -D vs --multiuser
+## What "Master Instance" Means: -D, clay_multi and clay_web
 
 A remote console/GUI/web client always connects to some other Clay process's
-WebSocket server. That process is one of two things:
+WebSocket server. That process is one of three things:
 
 - **`-D` (headless daemon)**: an ordinary Clay instance — the same worlds, settings,
   and single-user config file (`~/.clay/settings.dat`) as running `./clay` normally —
   just without a local terminal UI. Every connecting client shares the one account and
   the one set of worlds.
-- **`--multiuser`**: a genuinely multi-account server with its own config file
-  (`~/.clay/multiuser.dat`, `[user:name]`/`[world:name:owner]`/`[action:name:owner]`
-  sections). Each user authenticates with their own username and password and sees
-  only worlds/actions they own; per-user telnet negotiation, character encoding,
-  GMCP/MSDP/MSSP, and echo-based password masking are all tracked separately per
-  connection, not shared globally. It is not a bare or output-only mode — it runs the
-  same protocol handling as a single-user instance, just scoped per account. A line you
-  type is parsed as on any Clay server: text goes to your MUD (`///x` sends the text `/x`),
-  and a command about your own worlds or window works (`/worlds`, `/connect`, `/dc`,
-  `/send`, `/flush`, `/stats`, `/mssp`, `/msdp`, `/help`, `/version`, `/dict`, `/url`,
-  your own actions, `/note`), finding a named world among yours only. Anything
-  server-wide — `/reload`, `/update`, `/setup`, bans, logs, `/note <file>`, TinyFugue
-  scripting (the engine is one for every user) — is refused with a line.
+- **`clay_multi`** (a binary of its own, `./build.sh --only multi`): a server where every
+  user gets a full Clay of their own. You log in with a username and password from the
+  operator's `~/.clay/password.dat`; your settings, worlds, actions, TinyFugue scripts,
+  scrollback archive, maps, notes, theme and keybindings live in `~/.clay/users/<you>/`
+  on the server and are yours alone. Everything a Clay does works there, with these
+  exceptions: no command may read or write the server's files or start a process (`/sh`,
+  `/sys`, `/quote 'file` and `/quote !cmd`, `/load`, `/save`, `/lcd`, `/log <file>`,
+  `/note <file>`, `fwrite()`, `tfopen()`; `/quote #` of your history works), `/reload`,
+  `/update` and `/web` are the operator's, as are bans, the port mapping and the firewall,
+  and nothing is played on the server's speakers (sound and speech go to your own device).
+  Change Password is not offered: the operator edits password.dat. See the Multiuser
+  Server chapter.
+- **`clay_web`** (`./build.sh --only web`): a web page onto one MUD world with no login at
+  all - see the Web Gateway chapter. Not a server to attach a console or GUI to.
 
 ```bash
-./clay -D           # headless daemon, single account
-./clay --multiuser  # headless multiuser server, many accounts
+./clay -D       # headless daemon, single account
+./clay_multi    # the multiuser server (accounts in ~/.clay/password.dat)
+./clay_web      # the web gateway (its ./web.dat; nothing under ~/.clay)
 ```
 
 ## Interface
@@ -213,7 +215,7 @@ No GUI features needed — the standard build in the **Installation** chapter wo
 
 ```bash
 cargo build --target x86_64-unknown-linux-musl \
-    --no-default-features --features ssh-transport
+    --no-default-features --features ssh-transport,shell-worlds
 ```
 
 ## Example Setup

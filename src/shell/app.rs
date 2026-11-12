@@ -5,12 +5,18 @@
 //! `output_lines`, the log, the archive, TF or the triggers - it lives entirely in the
 //! emulator (`ShellSession`) and the screen cache (`World::shell_screen`).
 
+#[cfg(feature = "shell-worlds")]
 use std::time::Instant;
 
-use crate::shell::{self, screen, ShellEvent, ShellScreen, ShellSession, Size};
-use crate::websocket::{ShellKey, WsMessage};
-use crate::{tf, AppEvent};
+#[cfg(feature = "shell-worlds")]
+use crate::shell::{screen, ShellScreen, ShellSession, Size};
+use crate::shell::{self, ShellEvent};
+use crate::websocket::ShellKey;
+#[cfg(feature = "shell-worlds")]
+use crate::{tf, websocket::WsMessage};
+use crate::AppEvent;
 
+// Every build: a client draws a shell world another Clay runs, and asks this.
 impl crate::App {
     /// True if world `idx` is a live shell world: a running session on the server, or (on
     /// a client that has no session of its own, like the SSH remote console) a screen the
@@ -25,7 +31,11 @@ impl crate::App {
     pub(crate) fn shell_live_current(&self) -> bool {
         self.shell_live(self.current_world_index)
     }
+}
 
+// The server's half: only a build with the `shell-worlds` feature runs a shell.
+#[cfg(feature = "shell-worlds")]
+impl crate::App {
     /// Start a shell for world `idx`. Reports back as `AppEvent::Shell`.
     pub(crate) fn spawn_shell_connect(&mut self, idx: usize) {
         let Some(events) = self.event_tx.clone() else { return };
@@ -248,4 +258,28 @@ impl crate::App {
             session.write(bytes);
         }
     }
+}
+
+// A build without the `shell-worlds` feature: no session can exist (`ShellSession` has no
+// values), so there is nothing to read, size or send. Connecting a shell world says so.
+#[cfg(not(feature = "shell-worlds"))]
+impl crate::App {
+    pub(crate) fn spawn_shell_connect(&mut self, idx: usize) {
+        self.add_output_to_world(idx, shell::NOT_IN_THIS_BUILD);
+    }
+
+    pub(crate) fn handle_shell_event(&mut self, _world_name: String, _conn_id: u64, _ev: ShellEvent) -> Option<AppEvent> {
+        None
+    }
+
+    pub(crate) fn resize_shell_worlds(&mut self) {}
+
+    pub(crate) fn flush_shell_frames(&mut self) {}
+
+    pub(crate) fn send_shell_full_frame(&mut self, _client_id: u64, _idx: usize) {}
+
+    pub(crate) fn shell_input(&mut self, _idx: usize, _key: Option<ShellKey>, _text: Option<String>, _paste: bool) {}
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn shell_mouse(&mut self, _idx: usize, _kind: &str, _button: u8, _col: u16, _row: u16, _ctrl: bool, _alt: bool, _shift: bool) {}
 }

@@ -386,6 +386,9 @@ pub struct ClientCore {
     server_resumes: bool,
     /// The server takes `RequestInfo` (`InitialState.info_report`): `/info` opens a window.
     pub server_info_report: bool,
+    /// The server can run a shell world (`InitialState.shell_worlds`): the world editor
+    /// offers the Shell type only then, or for a world that already is one.
+    pub server_shell_worlds: bool,
     pub visible: bool,
     /// The ASCII splash shown before there's any world (multiuser, before connecting).
     pub splash_lines: Vec<String>,
@@ -410,6 +413,11 @@ pub struct ClientCore {
     pub server_expands_line: bool,
     /// The server takes `PictureUpload` (`InitialState.picture_upload`): Import Picture.
     pub server_picture_upload: bool,
+    /// InitialState: the server is a clay_web page; it plays sound of its own; it answers
+    /// Change Password (not clay_multi, whose password.dat is the operator's).
+    pub server_web_front: bool,
+    pub server_sound: bool,
+    pub server_change_password: bool,
     /// The server takes `RequestHistory` (`InitialState.history_on_demand`): scrolling up
     /// past everything held asks it for older lines, then its archive's.
     pub server_history_on_demand: bool,
@@ -471,6 +479,7 @@ impl ClientCore {
             resume_asked: false,
             server_resumes: false,
             server_info_report: false,
+            server_shell_worlds: true,
             splash_lines: Vec::new(),
             cached: HashMap::new(),
             preferred_world: None,
@@ -483,6 +492,9 @@ impl ClientCore {
             server_takes_other_views: false,
             server_expands_line: false,
             server_picture_upload: false,
+            server_web_front: false,
+            server_sound: true,
+            server_change_password: true,
             server_history_on_demand: false,
             server_map: false,
             map_views: Vec::new(),
@@ -515,6 +527,7 @@ impl ClientCore {
     pub fn is_multiuser(&self) -> bool {
         self.multiuser
     }
+
 
     /// Worlds from the disk cache, to stand in for what a fresh connect would download.
     pub fn set_cache(&mut self, worlds: Vec<CachedWorld>) {
@@ -1275,9 +1288,13 @@ impl ClientCore {
                 self.set_status(Status::NeedLogin { multiuser: self.multiuser, error: None });
                 self.changed();
             }
-            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, map, resume_session, info_report, .. } => {
+            WsMessage::InitialState { worlds, settings, current_world_index, your_display_id, actions, tf_status, splash_lines, other_views, expand_line, picture_upload, history_on_demand, server_version, server_version_detail, map, resume_session, info_report, shell_worlds, web_front, server_sound, change_password, .. } => {
                 self.server_map = map;
+                self.server_web_front = web_front;
+                self.server_sound = server_sound;
+                self.server_change_password = change_password;
                 self.server_info_report = info_report;
+                self.server_shell_worlds = shell_worlds;
                 // A pause is a connection's: a new one starts unpaused, and a resync's
                 // `PausedState` follows if this one still is. Kept, the badge outlived a
                 // reconnect (a server's reload) and nothing ever took it down.
@@ -1612,7 +1629,8 @@ impl ClientCore {
             interface_key: crate::font_profile::native_key().to_string(),
         };
         let key = self.creds.auth_key.clone().filter(|k| !k.is_empty());
-        if let (Some(key), false, false) = (key, self.multiuser, self.key_failed) {
+        // A key logs in on a clay_multi server too: the server names the user by it.
+        if let (Some(key), false) = (key, self.key_failed) {
             let msg = base(String::new(), Some(hash_with_challenge(&key, &self.challenge)), None);
             self.phase = Phase::AwaitAuth { with_key: true };
             self.send(msg);
@@ -2402,12 +2420,6 @@ fn split_lines(s: &str) -> Vec<&str> {
     out
 }
 
-/// A line the output never shows: nothing but escape sequences (a trailing reset after a
-/// newline), or a keep-alive idler marker. Blank lines do show.
-///
-/// app.js drops these only as they arrive live, so the same line shows as a blank row
-/// when it comes back in history after a reconnect. Here every line is kept, so the
-/// buffer matches the server's, and this decides at display time on every path.
 /// Save the server's global settings with whatever this client changed in `s` (the
 /// font slider): every field echoed back as the server sent it, so nothing else moves.
 /// The shared font fields too: this GUI's own fonts go as its profile.
@@ -2494,12 +2506,18 @@ fn is_update_command(command: &str) -> bool {
     command.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/update"))
 }
 
-/// A line never drawn, F2 or not: one that is only escape codes (the console's
-/// `is_ansi_only_line`). The keepalive's reply is not one of these: it is a gagged line
-/// (`Line::gagged`, set on arrival), shown under F2 as the console shows it - the GUI used
-/// to hide it for good (user report 2026-11-01).
+/// A line never drawn, F2 or not: the console's own rule, `encoding::is_ansi_only_line` -
+/// nothing but escape codes (and spaces), unless one of them sets a background colour,
+/// which makes it a blank row. The GUI had a rule of its own with no such exception, so a
+/// MUD whose blank lines are colour codes ending in `ESC[40m` lost every one of them here
+/// while the console and telnet showed them, and the server - which counts rows as the
+/// console draws them - held one back for a More the GUI then released as nothing (user
+/// report 2026-11-11). app.js `isFillerLine` is the same rule, pinned by a test.
+/// The keepalive's reply is not one of these: it is a gagged line (`Line::gagged`, set on
+/// arrival), shown under F2 as the console shows it - the GUI used to hide it for good
+/// (user report 2026-11-01).
 pub fn hidden_line(text: &str) -> bool {
-    is_ansi_only(text)
+    crate::encoding::is_ansi_only_line(text)
 }
 
 impl Line {
@@ -2510,28 +2528,6 @@ impl Line {
     pub fn is_hidden(&self, show_tags: bool) -> bool {
         (self.gagged && (!show_tags || self.text.is_empty())) || hidden_line(&self.text)
     }
-}
-
-fn is_ansi_only(line: &str) -> bool {
-    if line.is_empty() {
-        return false;
-    }
-    let b = line.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == 0x1b && b.get(i + 1) == Some(&b'[') {
-            let mut j = i + 2;
-            while j < b.len() && (b[j].is_ascii_digit() || b[j] == b';') {
-                j += 1;
-            }
-            if j < b.len() && b[j].is_ascii_alphabetic() {
-                i = j + 1;
-                continue;
-            }
-        }
-        return false;
-    }
-    true
 }
 
 /// Insert lines (ascending by seq) after the last held line with a lower seq (app.js

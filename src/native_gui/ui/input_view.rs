@@ -516,7 +516,7 @@ impl ClayView {
             marked: self.editor.marked.clone(),
             misspelled: self.input.misspelled.clone(),
             masked,
-            font_size: self.font_size,
+            font_size: self.text_size(),
             row_h,
             fonts: self.fonts.clone(),
             fg: self.palette.fg,
@@ -542,7 +542,7 @@ impl ClayView {
             .border_t_1()
             .border_color(border)
             .font_family(mono.clone())
-            .text_size(px(self.font_size))
+            .text_size(px(self.text_size()))
             .line_height(px(row_h))
             .text_color(hsla(self.palette.fg))
             // A right-click anywhere in the input bar opens its menu: the lines sent above
@@ -563,7 +563,7 @@ impl ClayView {
             let sent = Sent {
                 lines: self.input.sent.iter().flat_map(|e| sent_lines(e, self)).collect(),
                 rows: sent_rows,
-                font_size: self.font_size,
+                font_size: self.text_size(),
                 row_h,
                 fonts: self.fonts.clone(),
             };
@@ -607,7 +607,7 @@ impl ClayView {
 
     /// The rows one sent line fills at `width`.
     fn sent_entry_rows(&self, entry: &crate::input::SentEntry, width: f32, window: &Window) -> usize {
-        sent_lines(entry, self).iter().map(|l| wrap_styled(l, None, self.font_size, width, &self.fonts, window).1.len()).sum::<usize>().max(1)
+        sent_lines(entry, self).iter().map(|l| wrap_styled(l, None, self.text_size(), width, &self.fonts, window).1.len()).sum::<usize>().max(1)
     }
 
     /// How many rows of the lines sent show above the field this frame, in an input `rows`
@@ -629,7 +629,7 @@ impl ClayView {
             let w = f32::from(layout.bounds.size.width) - 2.0 * PAD;
             if w > 1.0 { w } else { bar_w }
         };
-        let live = field_rows(&self.editor.text, masked, self.palette.fg, self.font_size, field_w, &self.fonts, window, rows + 1);
+        let live = field_rows(&self.editor.text, masked, self.palette.fg, self.text_size(), field_w, &self.fonts, window, rows + 1);
         let want = self.input.sent_rows.min(rows.saturating_sub(live));
         let (mut got, mut keep) = (0, 0);
         for entry in self.input.sent.iter().rev() {
@@ -667,7 +667,7 @@ impl ClayView {
     /// output's rows stay at 1.0.
     pub(super) fn input_row_h(&self) -> f32 {
         let line_height = self.session.core.settings.as_ref().map_or(1.2, |s| s.font_for(crate::font_profile::native_key()).line_height).clamp(0.5, 3.0);
-        line_height * self.font_size
+        line_height * self.text_size()
     }
 
     /// The mouse, dragging the input's top edge, is at window `y` now: a row more for

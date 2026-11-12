@@ -14,6 +14,11 @@
 //! - at the next start, one line for each earlier session that ended with none of these:
 //!   a marker file per running process (`~/.clay/run/<pid>`) that only an orderly exit
 //!   removes. A session that crashed is also told to the user ([`take_notices`]).
+//!
+//! clay_web keeps no debug.log (user request 2026-11-10): there every record above goes to
+//! stderr ([`record`]) and there is no marker. The fatal handlers' debug.log is opened at
+//! the crash, from a path prepared at start, so no mode makes `~/.clay/debug.log` just by
+//! starting (`--version`), and clay_web never does.
 
 // Android: the bundled server is started and stopped by the app, so no session markers.
 #![cfg_attr(target_os = "android", allow(dead_code))]
@@ -67,6 +72,15 @@ pub(crate) fn install() {
     imp::install();
 }
 
+/// Where this module's records go: debug.log, or stderr for clay_web, which has none.
+fn record(line: &str) {
+    if crate::instance::is_web_only() {
+        eprintln!("[{}] {line}", format_time(now_secs()));
+    } else {
+        crate::debug_log(true, line);
+    }
+}
+
 /// The console paths (the console, `--console`, `--web-gui`): after a panic is logged, the
 /// terminal is put back and Clay restarts (`platform::crash_restart`), and a fatal signal
 /// puts the terminal back too.
@@ -81,11 +95,11 @@ fn install_panic_hook() {
         CRASHED.store(true, Ordering::SeqCst);
         let thread = std::thread::current();
         let name = thread.name().unwrap_or("unnamed").to_string();
-        crate::debug_log(true, &format!("CRASH (pid {}, thread {name}): {info}", pid()));
+        record(&format!("CRASH (pid {}, thread {name}): {info}", pid()));
         if let Some(context) = context_line() {
-            crate::debug_log(true, &format!("CRASH CONTEXT: {context}"));
+            record(&format!("CRASH CONTEXT: {context}"));
         }
-        crate::debug_log(true, &format!("BACKTRACE:\n{}", std::backtrace::Backtrace::force_capture()));
+        record(&format!("BACKTRACE:\n{}", std::backtrace::Backtrace::force_capture()));
         if let Ok(mut last) = LAST_CRASH.try_lock() {
             *last = Some(one_line(&info.to_string()));
         }
@@ -156,16 +170,26 @@ pub(crate) fn session(mode: &str) {
     let note = if std::env::var_os(crate::platform::GUI_SOFTWARE_FALLBACK_ENV).is_some() { " (software rendering: the hardware rendering aborted)" } else { "" };
     #[cfg(not(target_os = "linux"))]
     let note = "";
-    crate::debug_log(true, &format!("session pid={} mode={mode}{note}", pid()));
+    // clay_web's records go to stderr, where its start-up report already marks the session
+    // (the user's three-line format, 2026-11-11); the exit and crash records still go there.
+    if !crate::instance::is_web_only() {
+        record(&format!("session pid={} mode={mode}{note}", pid()));
+    }
     #[cfg(not(target_os = "android"))]
     {
-        let dir = crate::clay_config_path("run");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            report_ended_sessions(&dir);
-            let marker = Marker { pid: pid(), version: crate::VERSION.to_string(), mode: mode.to_string(), started: format_time(now_secs()) };
-            let path = dir.join(pid().to_string());
-            if std::fs::write(&path, marker.to_text()).is_ok() {
-                imp::remember_marker(&path);
+        if crate::instance::is_web_only() {
+            // clay_web: the fatal handlers speak on stderr, and no marker - it would only
+            // ever be reported through a debug.log clay_web doesn't keep.
+            imp::log_to_stderr();
+        } else {
+            let dir = crate::clay_root_config_path("run");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                report_ended_sessions(&dir);
+                let marker = Marker { pid: pid(), version: crate::VERSION.to_string(), mode: mode.to_string(), started: format_time(now_secs()) };
+                let path = dir.join(pid().to_string());
+                if std::fs::write(&path, marker.to_text()).is_ok() {
+                    imp::remember_marker(&path);
+                }
             }
         }
         imp::finish_at_exit();
@@ -218,11 +242,13 @@ pub(crate) fn finish() {
     }
     let reason = EXIT_REASON.lock().ok().and_then(|mut r| r.take()).unwrap_or_else(|| "normal".to_string());
     if CRASHED.load(Ordering::SeqCst) {
-        crate::debug_log(true, &format!("exit ({reason}, after the crash above) (pid {})", pid()));
+        record(&format!("exit ({reason}, after the crash above) (pid {})", pid()));
     } else {
-        crate::debug_log(true, &format!("exit ({reason}) (pid {})", pid()));
+        record(&format!("exit ({reason}) (pid {})", pid()));
         #[cfg(not(target_os = "android"))]
-        let _ = std::fs::remove_file(crate::clay_config_path("run").join(pid().to_string()));
+        if !crate::instance::is_web_only() {
+            let _ = std::fs::remove_file(crate::clay_root_config_path("run").join(pid().to_string()));
+        }
     }
 }
 
@@ -240,7 +266,7 @@ pub(crate) fn exit_process(code: i32, reason: &str) -> ! {
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn replacing(reason: &str) {
     if SESSION_PID.load(Ordering::SeqCst) == pid() {
-        crate::debug_log(true, &format!("replacing this process: {reason} (pid {})", pid()));
+        record(&format!("replacing this process: {reason} (pid {})", pid()));
     }
 }
 
@@ -284,7 +310,7 @@ fn report_ended_sessions(dir: &std::path::Path) {
             continue;
         }
         let (line, notice) = ended_report(&marker, crash_line_for(&tail, marker.pid, &marker.started).as_deref());
-        crate::debug_log(true, &line);
+        record(&line);
         if let Some(notice) = notice {
             if let Ok(mut n) = NOTICES.lock() {
                 n.push(notice);
@@ -478,8 +504,12 @@ mod imp {
     ];
     const ENDING: [(libc::c_int, &str); 2] = [(libc::SIGTERM, "SIGTERM"), (libc::SIGHUP, "SIGHUP")];
 
-    /// debug.log, opened at start for the handlers (which may not open files).
+    /// Where the handlers write: -1 = debug.log, opened at the crash from `LOG_PATH`;
+    /// 2 = stderr (clay_web).
     static LOG_FD: AtomicI32 = AtomicI32::new(-1);
+    /// debug.log's path, prepared at start (the handlers may not allocate). Nothing is
+    /// made at start: a `--version` leaves no ~/.clay/debug.log behind.
+    static LOG_PATH: OnceLock<CString> = OnceLock::new();
     static RESTORE_TERMINAL: AtomicBool = AtomicBool::new(false);
     static STDOUT_TTY: AtomicBool = AtomicBool::new(false);
     static TERMIOS: OnceLock<libc::termios> = OnceLock::new();
@@ -492,9 +522,8 @@ mod imp {
     static PREVIOUS: Previous = Previous(UnsafeCell::new([MaybeUninit::uninit(); 5]));
 
     pub(super) fn install() {
-        if let Ok(path) = CString::new(crate::get_debug_log_path().into_os_string().into_encoded_bytes()) {
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_CLOEXEC, 0o644) };
-            LOG_FD.store(fd, Ordering::SeqCst);
+        if let Ok(path) = CString::new(crate::root_config_dir_path().join("debug.log").into_os_string().into_encoded_bytes()) {
+            let _ = LOG_PATH.set(path);
         }
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
@@ -532,6 +561,11 @@ mod imp {
         RESTORE_TERMINAL.store(true, Ordering::SeqCst);
     }
 
+    /// clay_web: the handlers write to stderr, never to a debug.log.
+    pub(super) fn log_to_stderr() {
+        LOG_FD.store(2, Ordering::SeqCst);
+    }
+
     pub(super) fn remember_marker(path: &std::path::Path) {
         if let Ok(c) = CString::new(path.as_os_str().as_encoded_bytes()) {
             let _ = MARKER.set(c);
@@ -559,6 +593,18 @@ mod imp {
         if fd >= 0 {
             unsafe {
                 libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+            }
+            return;
+        }
+        // debug.log is opened here, at the crash: open(2) is async-signal-safe, and the
+        // path was prepared at start. Without its directory the open fails and nothing is
+        // written - the same as when the open at start used to fail.
+        let Some(path) = LOG_PATH.get() else { return };
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_CLOEXEC, 0o644) };
+        if fd >= 0 {
+            unsafe {
+                libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                libc::close(fd);
             }
         }
     }
@@ -659,10 +705,21 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::{fatal_line, pid, UTC_OFFSET};
-    use std::os::windows::io::IntoRawHandle;
     use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::OnceLock;
 
+    /// Where the filter writes: 0 = debug.log, opened at the crash from `LOG_PATH`; else
+    /// a handle (stderr's for clay_web).
     static LOG: AtomicIsize = AtomicIsize::new(0);
+    /// debug.log's path, UTF-16 and NUL-terminated, prepared at start (the filter does not
+    /// allocate); nothing is made at start.
+    static LOG_PATH: OnceLock<Vec<u16>> = OnceLock::new();
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const FILE_APPEND_DATA: u32 = 0x4;
+    const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+    const OPEN_ALWAYS: u32 = 4;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 
     #[repr(C)]
     struct ExceptionRecord {
@@ -688,12 +745,15 @@ mod imp {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
         fn GetExitCodeProcess(process: isize, code: *mut u32) -> i32;
         fn CloseHandle(handle: isize) -> i32;
+        fn CreateFileW(name: *const u16, access: u32, share: u32, security: *const std::ffi::c_void, disposition: u32, flags: u32, template: isize) -> isize;
+        fn GetStdHandle(which: u32) -> isize;
     }
 
     pub(super) fn install() {
-        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(crate::get_debug_log_path()) {
-            LOG.store(f.into_raw_handle() as isize, Ordering::SeqCst);
-        }
+        use std::os::windows::ffi::OsStrExt;
+        let path = crate::root_config_dir_path().join("debug.log");
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let _ = LOG_PATH.set(wide);
         unsafe {
             SetUnhandledExceptionFilter(Some(on_exception));
         }
@@ -703,13 +763,28 @@ mod imp {
         let code = if pointers.is_null() || (*pointers).record.is_null() { 0 } else { (*(*pointers).record).code };
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let line = fatal_line(now + UTC_OFFSET.load(Ordering::Relaxed), b"EXCEPTION", Some((code as u64, 8)), pid());
+        let bytes = line.bytes();
+        let mut written = 0u32;
         let log = LOG.load(Ordering::SeqCst);
         if log != 0 {
-            let bytes = line.bytes();
-            let mut written = 0u32;
             WriteFile(log, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut());
+        } else if let Some(path) = LOG_PATH.get() {
+            // debug.log is opened at the crash, from the path prepared at start.
+            let h = CreateFileW(path.as_ptr(), FILE_APPEND_DATA, FILE_SHARE_READ_WRITE, std::ptr::null(), OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+            if h != INVALID_HANDLE_VALUE && h != 0 {
+                WriteFile(h, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut());
+                CloseHandle(h);
+            }
         }
         0 // EXCEPTION_CONTINUE_SEARCH: Windows Error Reporting still runs
+    }
+
+    /// clay_web: the filter writes to stderr, never to a debug.log.
+    pub(super) fn log_to_stderr() {
+        let h = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        if h != INVALID_HANDLE_VALUE && h != 0 {
+            LOG.store(h, Ordering::SeqCst);
+        }
     }
 
     pub(super) fn restore_terminal_on_signal() {}
@@ -738,6 +813,8 @@ mod imp {
 mod imp {
     pub(super) fn install() {}
     pub(super) fn restore_terminal_on_signal() {}
+    #[allow(dead_code)]
+    pub(super) fn log_to_stderr() {}
     #[allow(dead_code)]
     pub(crate) fn install_fatal() {}
     #[allow(dead_code)]

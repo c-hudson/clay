@@ -131,6 +131,17 @@ action); anything else goes to the MUD. Nothing runs when Clay doesn't log in: n
 or Password, Auto Login set to None, `/worlds -l`, or TinyFugue's `%login` off. In
 `settings.dat`: `login_command` (newlines written as `\n`).
 
+### First Command
+
+The **First Command** (the console's **First Cmd**) is sent the moment the connection is
+up, before anything else - before the auto-login, whatever its type - exactly as typed,
+never through TinyFugue. `%host%` in it becomes the address of the client whose command
+connected the world: `REMOTE_HOST %host%` tells a MUD who is behind a shared Clay (the
+web gateway, `clay_web`, exists for this). From the console, or when a trigger or script
+connects, `%host%` is `127.0.0.1`; an auto-reconnect sends the address of the last
+connect again. Several lines are sent in order; blank lines are skipped. In
+`settings.dat`: `first_command`.
+
 ### Prompt Detection
 
 Clay normally recognises a prompt only when the server marks it with telnet GA/EOR. Some

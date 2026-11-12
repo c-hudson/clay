@@ -27,13 +27,41 @@ use gpui::{Context, Window};
 
 use super::ClayView;
 
-/// What the menu's items depend on: the server's (Change Password and Logout only on a
-/// multiuser server, Import Picture only where it uploads pictures).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
+/// What the menu's items depend on: the server's (Logout only on a multiuser server,
+/// Change Password only where the server answers it, Import Picture only where it uploads
+/// pictures).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Shown {
     pub multiuser: bool,
     pub picture_upload: bool,
+    pub change_password: bool,
+}
+
+impl Default for Shown {
+    /// A single-user Clay before its InitialState: everything a single user has.
+    fn default() -> Self {
+        Shown { multiuser: false, picture_upload: false, change_password: true }
+    }
+}
+
+impl Shown {
+    /// What the menus depend on, from a connection's server.
+    pub(super) fn of(core: &crate::native_gui::core::client::ClientCore) -> Shown {
+        Shown { multiuser: core.is_multiuser(), picture_upload: core.server_picture_upload, change_password: core.server_change_password }
+    }
+
+    /// Every combination a server can be.
+    pub(super) fn every() -> Vec<Shown> {
+        let mut all = Vec::new();
+        for multiuser in [false, true] {
+            for picture_upload in [false, true] {
+                for change_password in [false, true] {
+                    all.push(Shown { multiuser, picture_upload, change_password });
+                }
+            }
+        }
+        all
+    }
 }
 
 /// A window's app menu, kept up to date as it draws (`ClayView::render`).
@@ -153,7 +181,7 @@ mod items {
     /// have a Quit or a Close of their own.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn without_quit(shown: Shown) -> Vec<Vec<MenuEntry>> {
-        menu_sections(shown.multiuser, shown.picture_upload)
+        menu_sections(shown)
     }
 
     /// Every item that can be in the Windows window menu, whatever the server.
@@ -181,13 +209,14 @@ mod items {
 
         #[test]
         fn the_dock_and_window_menus_are_the_hamburgers_without_quit() {
-            let all = without_quit(Shown { multiuser: true, picture_upload: true });
+            let all = without_quit(Shown { multiuser: true, picture_upload: true, change_password: false });
             assert!(all.iter().flatten().all(|(a, _, _)| *a != "quit"));
             assert_eq!(sections(Shown::default()).last().map(|s| s[0].0), Some("quit"), "the app menu ends with Quit");
             let single = without_quit(Shown::default());
             assert!(single.iter().flatten().all(|(a, _, _)| !matches!(*a, "logout" | "change-password" | "import-picture")));
             assert!(single.iter().flatten().any(|(a, _, _)| *a == "edit-world"));
-            assert!(all.iter().flatten().all(|(a, _, _)| *a != "edit-world"), "not on a multiuser server");
+            assert!(all.iter().flatten().any(|(a, _, _)| *a == "edit-world"), "a clay_multi user's own worlds");
+            assert!(all.iter().flatten().all(|(a, _, _)| *a != "change-password"), "password.dat is the operator's");
             assert!(command_id("edit-world").is_some(), "the Windows menu has an id for it whatever the server");
         }
 
@@ -359,7 +388,7 @@ mod linux {
 
     impl Shown {
         fn shows(self, action: &str) -> bool {
-            action == items::QUIT.0 || menu_shows(action, self.multiuser, self.picture_upload)
+            action == items::QUIT.0 || menu_shows(action, self)
         }
     }
 
@@ -626,7 +655,10 @@ mod linux {
             assert_eq!(text(&help["accel"]), "F1");
             assert!(!group[1].2[1].contains_key("accel"), "a command isn't a key");
             let hidden: Vec<String> = group[1..].iter().flat_map(|(_, _, items)| items.iter().filter(|i| i.contains_key("hidden-when")).map(|i| text(&i["action"]))).collect();
-            assert_eq!(hidden, ["win.edit-world", "win.map", "win.import-picture", "win.change-password", "win.logout"]);
+            // Edit World and Map are always shown since the clay_multi redesign (2026-11-09:
+            // a user's worlds are their own); Import Picture, Change Password and Logout
+            // still depend on the server.
+            assert_eq!(hidden, ["win.import-picture", "win.change-password", "win.logout"]);
         }
 
         /// A server that lacks something disables its actions, and a change says which.
@@ -637,13 +669,13 @@ mod linux {
             assert!(!actions.description("logout").0);
             assert!(actions.description("quit").0);
             assert!(actions.description("edit-world").0);
-            let changes = actions.show(Shown { multiuser: true, picture_upload: false });
-            assert_eq!(changes.len(), 4);
+            let changes = actions.show(Shown { multiuser: true, picture_upload: false, change_password: true });
+            assert_eq!(changes.len(), 2, "{changes:?}");
             assert_eq!(changes.get("logout"), Some(&true));
             assert_eq!(changes.get("change-password"), Some(&true));
-            assert_eq!(changes.get("edit-world"), Some(&false), "multiuser has no world editing");
-            assert_eq!(changes.get("map"), Some(&false), "nor a map");
-            assert!(actions.show(Shown { multiuser: true, picture_upload: false }).is_empty(), "no change, nothing to say");
+            assert!(actions.show(Shown { multiuser: true, picture_upload: false, change_password: true }).is_empty(), "no change, nothing to say");
+            let changes = actions.show(Shown { multiuser: true, picture_upload: false, change_password: false });
+            assert_eq!(changes.get("change-password"), Some(&false), "clay_multi: password.dat is the operator's");
         }
     }
 }

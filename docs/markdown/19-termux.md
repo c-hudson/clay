@@ -25,7 +25,7 @@ git clone https://github.com/your-repo/clay
 cd clay
 
 # Build (no GUI features)
-cargo build --no-default-features --features ssh-transport
+cargo build --no-default-features --features ssh-transport,shell-worlds
 
 # Run
 ./target/debug/clay
@@ -155,7 +155,7 @@ termux-wake-unlock
 Termux has limited memory. If build fails:
 ```bash
 # Reduce parallel jobs
-cargo build -j 1 --no-default-features --features ssh-transport
+cargo build -j 1 --no-default-features --features ssh-transport,shell-worlds
 ```
 
 ### Storage Space
@@ -214,7 +214,7 @@ termux-setup-storage
 # Clone and build
 git clone https://github.com/your-repo/clay
 cd clay
-cargo build --no-default-features --features ssh-transport
+cargo build --no-default-features --features ssh-transport,shell-worlds
 
 # Run in tmux for persistence
 tmux new -s clay

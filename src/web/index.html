@@ -277,6 +277,9 @@
             <div class="menu-item menu-map" data-action="map">Map<span class="shortcut">/map</span></div>
             <div class="menu-item" data-action="emoji_picker">Emoji Picker</div>
             <div class="menu-item" data-action="import-picture" style="display: none;">Import Picture</div>
+            <!-- clay_web only (style.css body.web-front): the visitor's Dark - New / Light - New
+                 switch, remembered in this browser (app.js applyWebFrontTheme). -->
+            <div class="menu-item menu-web-theme" data-action="web-theme">Light Theme</div>
             <div class="menu-sep"></div>
             <div class="menu-item" data-action="toggle-tags">Toggle Tags<span class="shortcut">F2</span></div>
             <div class="menu-item" data-action="filter">Find<span class="shortcut">F4</span></div>
@@ -870,6 +873,13 @@
                                 <label class="we-login-command-title" for="world-edit-login-command">Login Command</label>
                                 <textarea id="world-edit-login-command" class="editor-input" rows="3" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="say hello;say goodbye&#10;look"></textarea>
                                 <div class="we-login-command-hint">Run after Clay logs in: one command per line, ; between commands.</div>
+                            </div>
+                            <!-- First Command: sent as the first line once connected, before the login
+                                 (WorldSettings::first_command); %host% = the connecting client's address. -->
+                            <div class="setting-row type-gated we-login-command" id="world-edit-first-command-field">
+                                <label class="we-login-command-title" for="world-edit-first-command">First Command</label>
+                                <textarea id="world-edit-first-command" class="editor-input" rows="2" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="REMOTE_HOST %host%"></textarea>
+                                <div class="we-login-command-hint">Sent first, before the login. %host% = the connecting client's address.</div>
                             </div>
                         </div>
                         </div>
@@ -1644,6 +1654,10 @@
         window.CONNECTION_MODE = '{{CONNECTION_MODE}}';
         window.SHOW_CONNECTION_WINDOW = '{{SHOW_CONNECTION_WINDOW}}';
         window.CLIENT_VERSION = '{{CLIENT_VERSION}}';
+        // clay_web (the web-front build) serves 'true': one world, no commands (app.js WEB_FRONT).
+        window.WEB_FRONT = '{{WEB_FRONT}}' === 'true';
+        // clay_web: the two themes a visitor may choose between, as JSON (null elsewhere).
+        window.WEB_FRONT_THEMES = '{{WEB_FRONT_THEMES}}';
     </script>
     <!-- Screen Reader mode (app.js announceLine): each new line, as plain text, once, as
          it is shown. Off the screen, read by screen readers only. -->

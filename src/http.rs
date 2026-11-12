@@ -85,7 +85,7 @@ pub fn log_remote_event(event_type: &str, ip: &str, details: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(crate::clay_config_path("remote.log"))
+        .open(crate::clay_root_config_path("remote.log"))
     {
         let _ = file.write_all(log_line.as_bytes());
     }
@@ -556,6 +556,14 @@ fn handle_http_routes(
                 .replace("{{WS_REMOTE_HOST}}", "")
                 .replace("{{CONNECTION_MODE}}", "auto")
                 .replace("{{SHOW_CONNECTION_WINDOW}}", "false")
+                // The web-front build's page (clay_web): no password, one world, a reduced
+                // menu, a Reconnect overlay (app.js WEB_FRONT). A string, so a copy of the
+                // page served without the substitution stays valid.
+                .replace("{{WEB_FRONT}}", if cfg!(feature = "web-front") { "true" } else { "false" })
+                // The two themes a visitor may choose between, on the page itself (app.js
+                // applyWebFrontTheme); a visitor's Clay takes no theme message. `null` on
+                // every other Clay. A string in the page, like WEB_FRONT.
+                .replace("{{WEB_FRONT_THEMES}}", &crate::theme::ThemeColors::web_front_themes_json())
                 .replace("{{THEME_CSS_VARS}}", theme_css_vars)
                 // A browser fetches this page directly from the server it's about to
                 // connect to over WS, so "local" and "remote" are the same binary here
@@ -728,21 +736,26 @@ async fn run_knock_handshake(
         }
     }
 
-    // No stored key (unset, or multiuser mode where the Arc is always None) => every
-    // knock fails. Documented limitation (D4): multiuser hosts cannot be reached by a
-    // non-allow-listed IP at all.
-    let key = gate.auth_key.read().unwrap().clone();
-    let key = match key {
-        Some(k) if !k.is_empty() => k,
-        _ => {
-            log_remote_event("KNOCK-FAIL", client_ip, "no auth key configured");
-            gate.strike(client_ip, "knock-no-key").await;
-            return KnockOutcome::Fail;
+    // The single Clay's key, or any clay_multi user's (every key compared, in constant
+    // time). No key at all => every knock fails.
+    let matched = match &gate.auth_key {
+        KeySource::Single(slot) => {
+            let key = slot.read().unwrap().clone();
+            match key {
+                Some(k) if !k.is_empty() => {
+                    let expected = knock_expected_response(&k, &challenge);
+                    crate::util::constant_time_eq(&response, &expected)
+                }
+                _ => {
+                    log_remote_event("KNOCK-FAIL", client_ip, "no auth key configured");
+                    gate.strike(client_ip, "knock-no-key").await;
+                    return KnockOutcome::Fail;
+                }
+            }
         }
+        KeySource::Index(index) => index.knock_user(&challenge, &response).is_some(),
     };
-
-    let expected = knock_expected_response(&key, &challenge);
-    if !crate::util::constant_time_eq(&response, &expected) {
+    if !matched {
         log_remote_event("KNOCK-FAIL", client_ip, "digest mismatch");
         gate.strike(client_ip, "knock-bad-digest").await;
         return KnockOutcome::Fail;
@@ -974,15 +987,12 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let _ = crate::websocket::handle_ws_client(
                 prefixed,
                 client_id,
-                ws_state.clients.clone(),
+                ws_state.backend.clone(),
                 pw_hash,
                 pw_enabled,
                 ws_state.allow_list.clone(),
                 ws_state.whitelisted_host.clone(),
                 client_addr,
-                ws_state.event_tx.clone(),
-                ws_state.multiuser_mode,
-                ws_state.users.clone(),
                 ws_state.ban_list.clone(),
                 knocked,
             ).await;
@@ -1055,17 +1065,109 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
 }
 
+/// Where an authenticated WebSocket connection's messages go, and whose client table it
+/// joins.
+#[derive(Clone)]
+pub enum Backend {
+    /// One Clay (every single-user mode): its client table and event channel, known
+    /// before the login.
+    Single {
+        clients: Arc<std::sync::RwLock<HashMap<u64, crate::websocket::WsClientInfo>>>,
+        event_tx: tokio::sync::mpsc::Sender<crate::AppEvent>,
+    },
+    /// A server of many Clays (`clay_multi`, `clay_web`): the login names the instance,
+    /// and `Attacher::attach` hands the connection that instance's table and channel.
+    Multi {
+        attacher: Arc<dyn Attacher>,
+        login: MultiLogin,
+    },
+}
+
+/// How a `Backend::Multi` logs a connection in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MultiLogin {
+    /// `clay_multi`: a username and password from password.dat, or a user's auth key.
+    Users,
+    /// `clay_web`: no password at all; every connection is a visitor.
+    Anonymous,
+}
+
+/// Who a `Backend::Multi` login turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Principal {
+    User(String),
+    Visitor { ip: String },
+}
+
+/// What `Attacher::attach` handed out, to give back to `release` when the connection ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ticket {
+    User(String),
+    Visitor(u64),
+}
+
+/// A connection's place in an instance.
+pub struct Attached {
+    pub clients: Arc<std::sync::RwLock<HashMap<u64, crate::websocket::WsClientInfo>>>,
+    pub event_tx: tokio::sync::mpsc::Sender<crate::AppEvent>,
+    /// What `AuthResponse.username` says.
+    pub username: Option<String>,
+    pub ticket: Ticket,
+}
+
+/// Why an instance would not take a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    TooManyFromIp,
+    ServerFull,
+    InstanceFailed(String),
+    UnknownUser,
+}
+
+impl Refused {
+    /// The `AuthResponse.error` the client is shown.
+    pub fn message(&self) -> String {
+        match self {
+            Refused::TooManyFromIp => "Too many sessions from your address".to_string(),
+            Refused::ServerFull => "The server is full".to_string(),
+            Refused::InstanceFailed(why) => format!("Your Clay could not be started: {why}"),
+            Refused::UnknownUser => "Authentication failed".to_string(),
+        }
+    }
+}
+
+/// The server of many Clays behind a `Backend::Multi` (`instance::InstanceManager`):
+/// who a credential names, and the instance a logged-in connection joins. `attach` may
+/// start an instance (a thread, an App, its files), so `handle_ws_client` runs it off the
+/// async workers.
+pub trait Attacher: Send + Sync {
+    /// The user whose auth key answered `response` to `challenge` (`KeyIndex`).
+    fn key_user(&self, challenge: &str, response: &str, uses_challenge: bool) -> Option<String>;
+    /// Does `client_hash` answer for `username` (password.dat, re-read each time)?
+    fn check_user_password(&self, username: &str, client_hash: &str, challenge: &str, uses_challenge: bool) -> bool;
+    /// Join `who`'s instance, starting it if need be.
+    fn attach(&self, who: Principal, client_id: u64) -> Result<Attached, Refused>;
+    /// The connection with `ticket` ended.
+    fn release(&self, ticket: &Ticket, client_id: u64);
+}
+
+/// Which auth key a CLAY-KNOCK answer is checked against: the single Clay's, or every
+/// clay_multi user's (`instance::KeyIndex`).
+#[derive(Clone)]
+pub enum KeySource {
+    Single(Arc<std::sync::RwLock<Option<String>>>),
+    Index(Arc<crate::instance::KeyIndex>),
+}
+
 /// Shared WebSocket connection state passed from WebSocketServer to the unified HTTP+WS server.
 pub struct WsConnectionState {
-    pub clients: Arc<std::sync::RwLock<HashMap<u64, crate::websocket::WsClientInfo>>>,
+    /// The Clay (or the many Clays) behind this listener.
+    pub backend: Backend,
     pub next_client_id: Arc<std::sync::Mutex<u64>>,
     pub password_hash: Arc<std::sync::RwLock<String>>,
     pub password_enabled: Arc<std::sync::RwLock<bool>>,
     pub allow_list: Arc<std::sync::RwLock<Vec<String>>>,
     pub whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
-    pub event_tx: tokio::sync::mpsc::Sender<crate::AppEvent>,
-    pub multiuser_mode: bool,
-    pub users: Arc<std::sync::RwLock<HashMap<String, crate::websocket::UserCredential>>>,
     pub ban_list: BanList,
 }
 
@@ -1091,7 +1193,7 @@ impl WsConnectionState {
 pub struct SecurityGate {
     pub allow_list: Arc<std::sync::RwLock<Vec<String>>>,
     pub whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
-    pub auth_key: Arc<std::sync::RwLock<Option<String>>>,
+    pub auth_key: KeySource,
     pub web_path: String,
     pub ban_list: BanList,
 }
@@ -1181,27 +1283,32 @@ impl HttpsServer {
     }
 }
 
-/// Start the HTTPS server (unified HTTP+WS)
+/// Start the web server (unified HTTP+WS). `tls` is the certificate and key files: every
+/// Clay has one (its own self-signed one if no other) except clay_web without a `cert_file`
+/// in web.dat, which serves plain http to everyone (user ruling 2026-11-11, the one
+/// exception to D8). With `None` there is no TLS acceptor: a remote plain request is served,
+/// not redirected, and a TLS ClientHello is `TLS-ON-PLAIN` (`route_connection`).
 pub async fn start_https_server(
     server: &mut HttpsServer,
-    cert_file: &str,
-    key_file: &str,
+    tls: Option<(&str, &str)>,
     ws_state: Option<Arc<WsConnectionState>>,
     ban_list: BanList,
     theme_css_vars: String,
     gate: SecurityGate,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (certs, key) = crate::websocket::load_pem_cert_and_key(cert_file, key_file)?;
+    let tls_acceptor = match tls {
+        Some((cert_file, key_file)) => {
+            let (certs, key) = crate::websocket::load_pem_cert_and_key(cert_file, key_file)?;
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| format!("Failed to build TLS config: {}", e))?;
+            Some(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+        }
+        None => None,
+    };
 
-    // Build TLS config
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("Failed to build TLS config: {}", e))?;
-
-    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-
-    let listener = bind_listener("HTTPS", server.port, server.bind_retry).await?;
+    let listener = bind_listener(if tls_acceptor.is_some() { "HTTPS" } else { "HTTP" }, server.port, server.bind_retry).await?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
@@ -1213,6 +1320,7 @@ pub async fn start_https_server(
     let theme_css_vars = Arc::new(theme_css_vars);
     let conn_counter = ConnectionCounter::new();
     let ws_counter = ConnectionCounter::new();
+    let conn_rate = ConnRateLimiter::new(CONN_RATE_MAX, CONN_RATE_WINDOW);
     tokio::spawn(async move {
         // Signal ready INSIDE the spawned task — ensures the accept loop is actually
         // running (this is the one server-start path; webview_gui.rs's startup wait
@@ -1226,6 +1334,16 @@ pub async fn start_https_server(
                         Ok((mut stream, addr)) => {
                             let client_ip = addr.ip().to_string();
                             if ban_list.is_banned(&client_ip) {
+                                continue;
+                            }
+                            // A flood of new connections from one address (a DoS, a
+                            // broken client in a tight loop) is a probe like any other:
+                            // it strikes, and the usual ban follows. `strike` keeps the
+                            // D6 exemptions, so an allow-listed address is only logged.
+                            if conn_rate.note(&client_ip) == RateVerdict::Flooding {
+                                log_remote_event("CONN-FLOOD", &client_ip,
+                                    &format!("more than {CONN_RATE_MAX} connections in {} s", CONN_RATE_WINDOW.as_secs()));
+                                gate.strike(&client_ip, "connection flood").await;
                                 continue;
                             }
                             let guard = match conn_counter.try_acquire(&client_ip, MAX_HTTP_CONNECTIONS_PER_IP) {
@@ -1256,11 +1374,13 @@ pub async fn start_https_server(
                                             Ok(Ok(1)) if peek[0] != 0x16 => {
                                                 // Not a TLS ClientHello. Localhost is always
                                                 // served plain — no TLS handshake, no cert
-                                                // prompt (desktop GUI WebView, local browser).
-                                                // Remote clients get redirected to HTTPS (D2/D6:
-                                                // reuses decide_route via gate/in_allow_list, see
-                                                // redirect_http_to_https doc comment).
-                                                if addr.ip().is_loopback() {
+                                                // prompt (desktop GUI WebView, local browser) -
+                                                // and so is everyone on a server with no
+                                                // certificate (clay_web, plain http). Remote
+                                                // clients of a TLS server get redirected to
+                                                // HTTPS (D2/D6: reuses decide_route via
+                                                // gate/in_allow_list, see redirect_http_to_https).
+                                                if addr.ip().is_loopback() || tls_acceptor.is_none() {
                                                     route_connection(stream, ws_state, false, &theme_css_vars, addr, false, guard, &ws_counter, &gate, knocked, in_allow_list).await;
                                                 } else {
                                                     redirect_http_to_https(stream, server_port, false, in_allow_list, knocked, &gate, &client_ip).await;
@@ -1270,6 +1390,12 @@ pub async fn start_https_server(
                                             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
                                             _ => {}
                                         }
+                                        let Some(tls_acceptor) = tls_acceptor else {
+                                            // A ClientHello on a plain server: route_connection
+                                            // sees the 0x16, logs TLS-ON-PLAIN and ends it.
+                                            route_connection(stream, ws_state, false, &theme_css_vars, addr, false, guard, &ws_counter, &gate, knocked, in_allow_list).await;
+                                            return;
+                                        };
                                         match tokio::time::timeout(
                                             std::time::Duration::from_secs(TLS_TIMEOUT_SECS),
                                             tls_acceptor.accept(stream),
@@ -1452,6 +1578,61 @@ impl ConnectionCounter {
             counter: Some(self.counts.clone()),
             ip: ip.to_string(),
         })
+    }
+}
+
+/// New connections one address may open within `CONN_RATE_WINDOW` before it is flooding
+/// (`ConnRateLimiter`): a browser opening a page, its WebSocket and a few assets is well
+/// under it; a connect loop is over it within a second.
+pub const CONN_RATE_MAX: usize = 30;
+pub const CONN_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateVerdict {
+    Ok,
+    /// Over `max` connections within the window: the connection is dropped and struck.
+    Flooding,
+}
+
+/// A sliding window of accepted connections per address, for every server variant's
+/// accept loop (clay, `-D`, `clay_multi`, `clay_web` share `start_https_server`).
+/// Loopback is never counted: the local GUI and the SSH tunnel's end connect as they like.
+#[derive(Clone, Default)]
+pub struct ConnRateLimiter {
+    hits: Arc<std::sync::Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>>,
+    max: usize,
+    window: std::time::Duration,
+}
+
+impl ConnRateLimiter {
+    pub fn new(max: usize, window: std::time::Duration) -> Self {
+        Self { hits: Arc::new(std::sync::Mutex::new(HashMap::new())), max, window }
+    }
+
+    /// Count a new connection from `ip` now.
+    pub fn note(&self, ip: &str) -> RateVerdict {
+        self.note_at(ip, std::time::Instant::now())
+    }
+
+    /// `note` at a given instant (tests).
+    pub fn note_at(&self, ip: &str, now: std::time::Instant) -> RateVerdict {
+        if ip == "127.0.0.1" || ip == "::1" || ip == "::ffff:127.0.0.1" {
+            return RateVerdict::Ok;
+        }
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        let times = hits.entry(ip.to_string()).or_default();
+        while times.front().is_some_and(|t| now.duration_since(*t) >= self.window) {
+            times.pop_front();
+        }
+        times.push_back(now);
+        let verdict = if times.len() > self.max { RateVerdict::Flooding } else { RateVerdict::Ok };
+        // An address that floods is about to be struck and dropped; forget its history so
+        // the map doesn't grow with every scanner that comes by, and so a banned address
+        // that comes back after a restart is judged afresh.
+        if verdict == RateVerdict::Flooding {
+            hits.remove(ip);
+        }
+        verdict
     }
 }
 
@@ -1957,7 +2138,7 @@ mod ban_exempt_tests {
         SecurityGate {
             allow_list: Arc::new(std::sync::RwLock::new(allow_list)),
             whitelisted_host: Arc::new(std::sync::RwLock::new(whitelisted.map(|s| s.to_string()))),
-            auth_key: Arc::new(std::sync::RwLock::new(None)),
+            auth_key: KeySource::Single(Arc::new(std::sync::RwLock::new(None))),
             web_path: "clay".to_string(),
             ban_list: BanList::new(),
         }
@@ -2091,7 +2272,7 @@ mod redirect_parity_tests {
         SecurityGate {
             allow_list: Arc::new(std::sync::RwLock::new(allow_list)),
             whitelisted_host: Arc::new(std::sync::RwLock::new(None)),
-            auth_key: Arc::new(std::sync::RwLock::new(None)),
+            auth_key: KeySource::Single(Arc::new(std::sync::RwLock::new(None))),
             web_path: "clay".to_string(),
             ban_list: BanList::new(),
         }
@@ -2301,7 +2482,7 @@ mod knock_tests {
         SecurityGate {
             allow_list: Arc::new(std::sync::RwLock::new(Vec::new())),
             whitelisted_host: Arc::new(std::sync::RwLock::new(None)),
-            auth_key: Arc::new(std::sync::RwLock::new(auth_key.map(|s| s.to_string()))),
+            auth_key: KeySource::Single(Arc::new(std::sync::RwLock::new(auth_key.map(|s| s.to_string())))),
             web_path: "clay".to_string(),
             ban_list: BanList::new(),
         }
@@ -2536,5 +2717,47 @@ mod bind_tests {
                 assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod conn_rate_tests {
+    use super::{ConnRateLimiter, RateVerdict};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_burst_over_the_limit_floods_and_the_window_slides() {
+        let limiter = ConnRateLimiter::new(3, Duration::from_secs(10));
+        let t0 = Instant::now();
+        for i in 0..3 {
+            assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(i)), RateVerdict::Ok, "connection {i}");
+        }
+        assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(3)), RateVerdict::Flooding, "the fourth within 10 s");
+        // Struck and forgotten: it starts over, and stays under the limit when spread out.
+        assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(4)), RateVerdict::Ok);
+        assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(5)), RateVerdict::Ok);
+        assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(6)), RateVerdict::Ok);
+        // At 15 s the ones at 4 and 5 are 10 s old and fall out; only 6 remains, so two
+        // more fit and the third is the fourth within the window.
+        assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(15)), RateVerdict::Ok);
+        assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(15)), RateVerdict::Ok);
+        assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(15)), RateVerdict::Flooding, "6, 15, 15, 15 is four");
+        assert_eq!(limiter.note_at("10.0.0.5", t0 + Duration::from_secs(16)), RateVerdict::Ok, "forgotten after the strike");
+    }
+
+    #[test]
+    fn addresses_are_counted_apart_and_loopback_never() {
+        let limiter = ConnRateLimiter::new(2, Duration::from_secs(10));
+        let t0 = Instant::now();
+        assert_eq!(limiter.note_at("10.0.0.1", t0), RateVerdict::Ok);
+        assert_eq!(limiter.note_at("10.0.0.1", t0), RateVerdict::Ok);
+        assert_eq!(limiter.note_at("10.0.0.2", t0), RateVerdict::Ok, "another address has its own count");
+        assert_eq!(limiter.note_at("10.0.0.1", t0), RateVerdict::Flooding);
+        for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            for _ in 0..100 {
+                assert_eq!(limiter.note_at(ip, t0), RateVerdict::Ok, "{ip} is never limited");
+            }
+        }
+        assert_eq!(limiter.hits.lock().unwrap().len(), 1, "only 10.0.0.2 is remembered: loopback is never recorded, a flooder is forgotten");
     }
 }

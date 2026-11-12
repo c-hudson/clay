@@ -9,7 +9,11 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::keybindings::KeyBindings;
-use crate::websocket::{ShellKey, ShellModeMsg};
+use crate::websocket::ShellKey;
+// Turning keys into the bytes a program reads is the server's half (`shell-worlds`);
+// `classify` is what every client asks.
+#[cfg(feature = "shell-worlds")]
+use crate::websocket::ShellModeMsg;
 
 /// The only Clay actions a key keeps in a shell world: switching between worlds.
 pub const WORLD_SWITCH_ACTIONS: [&str; 10] = [
@@ -108,6 +112,7 @@ pub fn classify(code: KeyCode, mods: KeyModifiers, bindings: &KeyBindings, esc_a
 }
 
 /// The bytes a program expects for `key`, given its current modes.
+#[cfg(feature = "shell-worlds")]
 pub fn encode(key: &ShellKey, mode: &ShellModeMsg) -> Vec<u8> {
     let name = key.key.as_str();
     // A single printable character (possibly with Ctrl/Alt).
@@ -160,6 +165,7 @@ pub fn encode(key: &ShellKey, mode: &ShellModeMsg) -> Vec<u8> {
     }
 }
 
+#[cfg(feature = "shell-worlds")]
 fn modified_csi_applies(name: &str) -> bool {
     // Keys whose modified form is a CSI with a modifier parameter already carry Alt in
     // that parameter, so no ESC prefix is added for them.
@@ -170,6 +176,7 @@ fn modified_csi_applies(name: &str) -> bool {
     )
 }
 
+#[cfg(feature = "shell-worlds")]
 fn cursor_key(final_byte: u8, m: u8, app_cursor: bool) -> Vec<u8> {
     if m != 1 {
         format!("\x1b[1;{m}{}", final_byte as char).into_bytes()
@@ -180,6 +187,7 @@ fn cursor_key(final_byte: u8, m: u8, app_cursor: bool) -> Vec<u8> {
     }
 }
 
+#[cfg(feature = "shell-worlds")]
 fn tilde_key(n: u8, m: u8) -> Vec<u8> {
     if m != 1 {
         format!("\x1b[{n};{m}~").into_bytes()
@@ -188,6 +196,7 @@ fn tilde_key(n: u8, m: u8) -> Vec<u8> {
     }
 }
 
+#[cfg(feature = "shell-worlds")]
 fn fkey(ss3: u8, m: u8) -> Vec<u8> {
     if m != 1 {
         format!("\x1b[1;{m}{}", ss3 as char).into_bytes()
@@ -196,6 +205,7 @@ fn fkey(ss3: u8, m: u8) -> Vec<u8> {
     }
 }
 
+#[cfg(feature = "shell-worlds")]
 fn encode_char(c: char, key: &ShellKey, _mode: &ShellModeMsg) -> Vec<u8> {
     if key.ctrl {
         let upper = c.to_ascii_uppercase();
@@ -228,6 +238,7 @@ fn encode_char(c: char, key: &ShellKey, _mode: &ShellModeMsg) -> Vec<u8> {
 /// Typed or pasted text as bytes. A paste is bracketed when the program asked for it;
 /// otherwise its newlines become carriage returns. A literal end-of-paste marker in the
 /// text is always removed (paste injection).
+#[cfg(feature = "shell-worlds")]
 pub fn text_bytes(text: &str, paste: bool, mode: &ShellModeMsg) -> Vec<u8> {
     let cleaned = text.replace("\x1b[201~", "");
     if paste {
@@ -247,6 +258,7 @@ pub fn text_bytes(text: &str, paste: bool, mode: &ShellModeMsg) -> Vec<u8> {
 /// zero-based cells. None when the program isn't tracking the mouse (or this kind of it),
 /// or when a wheel on the alt screen should instead become arrow keys (`wheel_arrows`).
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "shell-worlds")]
 pub fn mouse(
     kind: &str,
     button: u8,
@@ -304,6 +316,7 @@ pub fn mouse(
 
 /// When the program doesn't track the mouse but the alt screen is up with alternate
 /// scroll on, a wheel notch is three arrow keys. Returns the bytes, or None.
+#[cfg(feature = "shell-worlds")]
 pub fn wheel_arrows(kind: &str, mode: &ShellModeMsg) -> Option<Vec<u8>> {
     if mode.mouse_click || !mode.alt_screen || !mode.alternate_scroll {
         return None;

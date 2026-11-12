@@ -112,7 +112,7 @@ The Activity world is only for watching:
   focus goes nowhere, as in any world that isn't connected.
 
 Every interface has it: the console, the SSH console, the GUIs, the web page and the
-Android app. A multiuser server has none. If you already have a world of your own named
+Android app, and each user of `clay_multi` has their own. If you already have a world of your own named
 Activity, that world keeps the name and there is no Activity world; a new world can't
 take the name.
 

@@ -2964,6 +2964,14 @@ feature = "The keepalive's gagged reply (the ###_idler_message_ marker) is kept 
 note = "client.rs on_server_data/line_from_ts set gagged on the marker, hidden_line hides escape-only lines only; app.js isKeepAliveMarker/lineGagged"
 
 [[item]]
+id = "ui:output.escape_only_lines"
+section = "output"
+phase = 4
+status = "done"
+feature = "A line of only escape codes is hidden unless it sets a background colour, which makes it a blank row: the console's rule, so a MUD's colour-coded blank lines show as they do on the console and in telnet"
+note = "client.rs hidden_line calls encoding::is_ansi_only_line; app.js isFillerLine/hasBackgroundColor are its port (tests.rs app_js_hides_the_lines_the_console_hides)"
+
+[[item]]
 id = "ui:dialog.world_confirm"
 section = "dialogs"
 phase = 4
@@ -3474,3 +3482,27 @@ phase = 0
 status = "done"
 feature = "handle MapSearchResult"
 note = "the map pane's search results"
+
+[[item]]
+id = "action:zoom_in"
+section = "windows"
+phase = 0
+status = "done"
+feature = "action zoom_in"
+note = "ui/zoom.rs: Ctrl+plus zooms this window's text and size together (src/zoom.rs), per window, in memory. app.js returns false by ruling 2026-11-10: a browser keeps its own zoom, the WebView GUI none"
+
+[[item]]
+id = "action:zoom_out"
+section = "windows"
+phase = 0
+status = "done"
+feature = "action zoom_out"
+note = "ui/zoom.rs: Ctrl+minus; see action:zoom_in"
+
+[[item]]
+id = "action:zoom_reset"
+section = "windows"
+phase = 0
+status = "done"
+feature = "action zoom_reset"
+note = "ui/zoom.rs: Ctrl+0 back to 1:1 and the window's original bounds; see action:zoom_in"

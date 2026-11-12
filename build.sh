@@ -2,8 +2,48 @@
 
 # Build script for Clay MUD Client
 # Automatically detects available features and falls back gracefully
+#
+# Usage: ./build.sh [--only clay|multi|web] [--no-shell-worlds]
+#
+# Three binaries come out, copied to this directory (and kept out of git by .gitignore):
+#   ./clay        the client, with shell worlds (the one the releases ship)
+#   ./clay_multi  the multiuser server: every user a full Clay of their own
+#   ./clay_web    the web gateway: an anonymous page onto one MUD world
+# The two servers never contain shell worlds and are never a release asset. cargo names
+# every binary `clay`, so the servers are built in their own target directory
+# (target/servers): cargo's usual target/release/clay (and the musl path) is always the
+# client, as it was before the servers existed - release.sh and a plain `cargo build`
+# read it (a server left there once made `--gui` say "this build is a server").
 
 set -e
+
+# --- Options ---
+WORLD_FEATURE="shell-worlds"
+ONLY=""
+usage() {
+    echo "Usage: ./build.sh [--only clay|multi|web] [--no-shell-worlds]"
+    echo "  (no option)        build ./clay (with shell worlds), ./clay_multi and ./clay_web"
+    echo "  --only clay        build only ./clay"
+    echo "  --only multi       build only ./clay_multi (the multiuser server)"
+    echo "  --only web         build only ./clay_web (the web gateway)"
+    echo "  --multiuser        the same as --only multi"
+    echo "  --no-shell-worlds  build ./clay without shell worlds"
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --only) shift; ONLY="$1" ;;
+        --only=*) ONLY="${1#--only=}" ;;
+        --multiuser) ONLY="multi" ;;
+        --no-shell-worlds) WORLD_FEATURE="" ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+    shift
+done
+case "$ONLY" in
+    ""|clay|multi|web) ;;
+    *) echo "Unknown --only target: $ONLY (clay, multi or web)"; usage; exit 1 ;;
+esac
 
 # The minimum is Cargo.toml's rust-version (read from it, so the two can't drift apart).
 REQUIRED_RUST_VERSION=$(grep -m1 '^rust-version' Cargo.toml 2>/dev/null | cut -d'"' -f2)
@@ -83,8 +123,13 @@ echo "  [+] rustls (TLS, built in)"
 # --- SSH-tunneled transport (--ssh) ---
 # Pure Rust (russh + RustCrypto), no system library dependencies - unlike
 # webview-gui/native-audio below, always included.
-FEATURES="ssh-transport"
+BASE_FEATURES="ssh-transport${WORLD_FEATURE:+,$WORLD_FEATURE}"
+FEATURES="$BASE_FEATURES"
 echo "  [+] ssh-transport (--ssh tunneling)"
+case "$WORLD_FEATURE" in
+    shell-worlds) echo "  [+] shell-worlds (local terminal worlds; the servers are built without them)" ;;
+    *) echo "  [-] shell-worlds (left out by --no-shell-worlds)" ;;
+esac
 
 # --- musl static linking (Linux only) ---
 if [ "$OS" = "linux" ]; then
@@ -345,6 +390,61 @@ if [ "$OS" = "windows" ]; then
     echo "  [+] Static CRT linking (no vcruntime140.dll dependency)"
 fi
 
+# Where cargo puts the binary for the chosen target, under the target directory given
+# (cargo's own `target` by default).
+find_built_binary() {
+    local dir="${1:-target}"
+    if echo "$BUILD_TARGET" | grep -q "musl"; then
+        echo "$dir/x86_64-unknown-linux-musl/release/clay"
+    elif [ -f "$dir/release/clay" ] || [ -f "$dir/release/clay.exe" ]; then
+        if [ -f "$dir/release/clay.exe" ]; then echo "$dir/release/clay.exe"; else echo "$dir/release/clay"; fi
+    else
+        local native_target
+        native_target=$(rustc -vV | grep host | cut -d' ' -f2)
+        echo "$dir/$native_target/release/clay"
+    fi
+}
+
+# --- The two server builds: clay_multi and clay_web ---
+# Headless (no GUI or audio features), with ssh-transport so a server binary can still
+# attach as a client (`--console=host --ssh`). cargo names every binary `clay`, so they
+# are built in their own target directory, leaving cargo's target/release/clay the client
+# (see the top of this file); each is then copied here under its own name.
+SERVER_TARGET_DIR="target/servers"
+
+# Put a built binary in place under its name. A running ./clay_web (or ./clay) keeps the
+# file it was started from busy, so cp over it fails with "Text file busy"; a copy beside
+# it moved into place replaces the name while the running program keeps its own file -
+# and a server's `kill -USR1` cold reload then starts the new build.
+install_binary() {
+    local built="$1" dest="$2"
+    cp "$built" "$dest.new" && mv -f "$dest.new" "$dest"
+}
+
+build_server() {
+    local name="$1" feature="$2"
+    echo ""
+    echo "Building $name (features: ssh-transport,$feature) in $SERVER_TARGET_DIR..."
+    if ! RUSTFLAGS="$EXTRA_RUSTFLAGS" cargo build --release $BUILD_TARGET --target-dir "$SERVER_TARGET_DIR" --features "ssh-transport,$feature" 2>&1; then
+        echo "Error: $name failed to build"
+        return 1
+    fi
+    local built
+    built=$(find_built_binary "$SERVER_TARGET_DIR")
+    install_binary "$built" "./$name"
+    echo "  -> ./$name ($(du -h "./$name" | cut -f1))"
+}
+
+if [ "$ONLY" = "multi" ] || [ "$ONLY" = "web" ]; then
+    case "$ONLY" in
+        multi) build_server clay_multi multiuser ;;
+        web) build_server clay_web web-front ;;
+    esac
+    echo ""
+    echo "Done."
+    exit 0
+fi
+
 echo ""
 echo "Features: $FEATURES"
 echo ""
@@ -420,9 +520,9 @@ fi
 if ! $BUILD_OK && [ "$OS" = "linux" ] && $HAS_MUSL; then
     echo ""
     echo "Build failed. Retrying with musl static build..."
-    if build_with_fallback "ssh-transport" "--target x86_64-unknown-linux-musl --no-default-features" "" "musl static (ssh-transport only)"; then
+    if build_with_fallback "$BASE_FEATURES" "--target x86_64-unknown-linux-musl --no-default-features" "" "musl static ($BASE_FEATURES)"; then
         BUILD_OK=true
-        FEATURES="ssh-transport"
+        FEATURES="$BASE_FEATURES"
         BUILD_TARGET="--target x86_64-unknown-linux-musl --no-default-features"
     fi
 fi
@@ -431,9 +531,9 @@ fi
 if ! $BUILD_OK; then
     echo ""
     echo "All attempts failed. Trying minimal build..."
-    if build_with_fallback "ssh-transport" "--no-default-features" "" "minimal (ssh-transport only)"; then
+    if build_with_fallback "$BASE_FEATURES" "--no-default-features" "" "minimal ($BASE_FEATURES)"; then
         BUILD_OK=true
-        FEATURES="ssh-transport"
+        FEATURES="$BASE_FEATURES"
     fi
 fi
 
@@ -495,8 +595,13 @@ echo ""
 echo "Binary:   $BINARY_PATH ($SIZE)"
 echo "Features: $FEATURES"
 echo ""
+# The client's binary at ./clay too, beside the servers built below; $BINARY_PATH stays
+# the client as well (the servers build in their own target directory).
+install_binary "$BINARY_PATH" ./clay
+echo "Copied to ./clay"
+echo ""
 echo "Run Clay:"
-echo "  ./$BINARY_PATH"
+echo "  ./clay"
 if echo "$FEATURES" | grep -q "webview-gui"; then
     echo ""
     echo "Run the WebView GUI, or attach it to a running Clay:"
@@ -510,3 +615,15 @@ if echo "$FEATURES" | grep -q "native-gui"; then
     echo "  ./$BINARY_PATH --gui=hostname:port"
 fi
 echo ""
+
+# --- The servers, unless only the client was asked for ---
+if [ "$ONLY" = "" ]; then
+    build_server clay_multi multiuser
+    build_server clay_web web-front
+    echo ""
+    echo "Run the multiuser server (accounts in ~/.clay/password.dat):"
+    echo "  ./clay_multi"
+    echo "Run the web gateway (the first world of ~/.clay/settings.dat):"
+    echo "  ./clay_web"
+    echo ""
+fi

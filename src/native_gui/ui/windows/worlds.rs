@@ -219,6 +219,7 @@ impl WorldsView {
             let _ = self.main.update(cx, |v, cx| v.client_line("World editing is disabled in multiuser mode.", cx));
             return;
         }
+        let offer_shell = self.main.upgrade().is_none_or(|m| m.read(cx).session.core.server_shell_worlds);
         let Some(w) = self.worlds(cx).get(index).cloned() else { return };
         let s = w.settings.clone().unwrap_or_else(empty_settings);
         let mut fields = std::collections::HashMap::new();
@@ -247,12 +248,13 @@ impl WorldsView {
         field("auto_reconnect", if s.auto_reconnect_secs.is_empty() { "0" } else { &s.auto_reconnect_secs }, "0, 30, web, web,30", cx);
         field("keep_alive_cmd", &s.keep_alive_cmd, "help ##rand##", cx);
         field("keep_alive_gag", &s.keep_alive_gag, "text in the MUD's reply", cx);
+        field("first_command", &s.first_command, "REMOTE_HOST %host%", cx);
         field("gmcp", &s.gmcp_packages, "", cx);
         let editor = Editor {
             index,
             from_selector,
             section: Section::Server,
-            world_type: Pick::new(&[("mud", "MUD"), ("mud_timed_prompt", "MUD - Timed Prompt"), ("slack", "Slack"), ("discord", "Discord"), ("shell", "Shell")], &s.world_type, window, cx),
+            world_type: Pick::new(&world_types(offer_shell, &s.world_type), &s.world_type, window, cx),
             auto_login: Pick::new(&[("Connect", "Connect"), ("Prompt", "Prompt"), ("MOO_prompt", "MOO_prompt"), ("Lines", "Lines"), ("None", "None")], &s.auto_connect_type, window, cx),
             keep_alive: Pick::new(&[("NOP", "NOP"), ("Custom", "Custom"), ("Generic", "Generic"), ("None", "None")], &s.keep_alive_type, window, cx),
             encoding: Pick::new(&[("utf8", "UTF-8"), ("latin1", "Latin1"), ("fansi", "Fansi")], &s.encoding, window, cx),
@@ -345,6 +347,7 @@ impl WorldsView {
             keep_alive_gag_enabled: Some(ed.ka_gag),
             keep_alive_gag: Some(t("keep_alive_gag")),
             login_command: Some(ed.login_command.read(cx).value().to_string()),
+            first_command: Some(t("first_command")),
             status_panel: ed.status_panel,
             chat: Some(ChatSettingsUpdate {
                 discord_guild: t("discord_guild").trim().to_string(),
@@ -813,6 +816,22 @@ impl WorldsView {
                     .child(Textarea::new(&ed.login_command).w_full().bg(k.field_bg).text_color(t.fg).font_family(mono.clone()).text_size(px(13.0)))
                     .child(div().text_size(px(11.0)).text_color(t.muted).child("Run after Clay logs in: one command per line, ; between commands.")),
             );
+            // The First Command: sent before the login (app.js #world-edit-first-command-field).
+            options = options.child(
+                div()
+                    .mt(px(6.0))
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .border_1()
+                    .border_color(t.border_subtle)
+                    .rounded(px(6.0))
+                    .child(div().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(t.fg2).child("First Command"))
+                    .child(input("first_command"))
+                    .child(div().text_size(px(11.0)).text_color(t.muted).child("Sent first, before the login. %host% = the connecting client's address.")),
+            );
         }
         let section_title = |s: &'static str| div().text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(t.accent).pt(px(6.0)).pb(px(2.0)).child(s.to_uppercase());
         let body: gpui::AnyElement = if wide {
@@ -916,6 +935,18 @@ pub fn chat_spec_matches(text: &str, item: &ChatPickItem) -> bool {
     t == item.id || t.trim_start_matches(['#', '@']).eq_ignore_ascii_case(&item.name)
 }
 
+/// The world types the editor offers. Shell only when the server can run one
+/// (`InitialState.shell_worlds`), or for a world that already is a shell world, so
+/// editing it never changes its type. It is the last entry, as in the console's and the
+/// web page's lists.
+fn world_types(offer_shell: bool, current: &str) -> Vec<(&'static str, &'static str)> {
+    let mut types = vec![("mud", "MUD"), ("mud_timed_prompt", "MUD - Timed Prompt"), ("slack", "Slack"), ("discord", "Discord")];
+    if offer_shell || current == "shell" {
+        types.push(("shell", "Shell"));
+    }
+    types
+}
+
 /// A world's settings when the server sent none (a fresh world).
 fn empty_settings() -> crate::websocket::WorldSettingsMsg {
     serde_json::from_value(serde_json::json!({
@@ -976,6 +1007,15 @@ mod tests {
 
     fn item(id: &str, name: &str) -> ChatPickItem {
         ChatPickItem { id: id.into(), name: name.into(), label: format!("{name} ({id})"), value: format!("{name} ({id})"), kind: String::new(), can_send: None }
+    }
+
+    #[test]
+    fn shell_is_offered_only_where_it_can_run_or_already_is() {
+        let ids = |offer: bool, current: &str| world_types(offer, current).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        assert_eq!(ids(true, "mud").last(), Some(&"shell"));
+        assert!(!ids(false, "mud").contains(&"shell"), "a server without shell worlds offers none");
+        assert_eq!(ids(false, "shell").last(), Some(&"shell"), "a shell world keeps its type in the editor");
+        assert_eq!(ids(false, "mud")[..4], ["mud", "mud_timed_prompt", "slack", "discord"]);
     }
 
     #[test]

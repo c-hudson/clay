@@ -446,6 +446,16 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     std::thread::sleep(Duration::from_millis(nums.first().copied().unwrap_or(0.0) as u64));
                     Vec::new()
                 }
+                // The main view's zoom (Ctrl+plus/minus/0, ui/zoom.rs): its level, the text
+                // size it draws at and the target window's content size, without drawing.
+                "zoom" => {
+                    let _ = cx.update_window(target, |_, w, app| {
+                        let v = view.read(app);
+                        let vs = w.viewport_size();
+                        println!("snapshot-zoom: {arg} level={} text={:.2} viewport={}x{}", v.zoom.level(), v.text_size(), f32::from(vs.width), f32::from(vs.height));
+                    });
+                    Vec::new()
+                }
                 // The connection and its dialog as they stand, without drawing (`state:`
                 // draws first, which runs what the view queued for its next frame).
                 "peek" => {

@@ -132,6 +132,10 @@ impl H {
             map: false,
             resume_session: true,
             info_report: true,
+            shell_worlds: true,
+            web_front: false,
+            server_sound: true,
+            change_password: true,
             emoji_json: String::new(),
             emoji_categories_json: String::new(),
             tf_status: Vec::new(),
@@ -734,9 +738,29 @@ fn split_lines_matches_the_web_clients_split() {
     assert_eq!(split_lines("a\r\nb\nc\rd"), vec!["a", "b", "c", "d"]);
     assert_eq!(split_lines("a\n"), vec!["a", ""]);
     assert_eq!(split_lines(""), vec![""]);
-    assert!(is_ansi_only("\x1b[0m\x1b[1;31m"));
-    assert!(!is_ansi_only(""));
-    assert!(!is_ansi_only("\x1b[0mx"));
+    assert!(hidden_line("\x1b[0m\x1b[1;31m"));
+    assert!(!hidden_line(""));
+    assert!(!hidden_line("\x1b[0mx"));
+}
+
+#[test]
+fn a_colour_only_line_with_a_background_is_a_blank_row_as_on_the_console() {
+    // The Chatting Zone's look, as the server sent it (user report 2026-11-11): its blank
+    // lines are colour codes ending in a black background. The console draws each as a
+    // blank row and the server counts it as one; the GUI hid them all, so the look had no
+    // gaps and a More held for the last one released nothing.
+    let blank = "\x1b[0;36m\x1b[1m\x1b[0;37m\x1b[40m";
+    let prompt_line = "\x1b[0;36m\x1b[1m";
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    h.msg(data(0, 1, &format!("{prompt_line}\nThe Swan Pub\n{blank}\nObvious exits:\n{blank}\n")));
+    let shown: Vec<&str> = h.core.worlds[0].lines.iter().filter(|l| !l.is_hidden(false)).map(|l| l.text.as_str()).collect();
+    assert_eq!(shown, vec!["line 0", "The Swan Pub", blank, "Obvious exits:", blank]);
+    // One rule with the console: what it hides is hidden here, and nothing else.
+    for text in [blank, prompt_line, "", "   ", "\x1b[0m", "\x1b[0m  ", "\x1b[44m   \x1b[0m", "\x1b[48;5;15m", "\x1b[2J\x1b[H", "\x1b[0mx"] {
+        assert_eq!(hidden_line(text), crate::encoding::is_ansi_only_line(text), "{text:?}");
+    }
+    assert!(!hidden_line(blank) && hidden_line(prompt_line));
 }
 
 #[test]
@@ -1514,6 +1538,10 @@ fn the_worlds_other_windows_show_are_told_once_per_change_and_again_after_a_logi
         map: false,
         resume_session: false,
         info_report: false,
+        shell_worlds: true,
+        web_front: false,
+        server_sound: true,
+        change_password: true,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1552,6 +1580,10 @@ fn the_map_view_is_told_at_login_and_on_each_change_and_only_to_a_server_with_th
         map,
         resume_session: false,
         info_report: false,
+        shell_worlds: true,
+        web_front: false,
+        server_sound: true,
+        change_password: true,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1615,6 +1647,10 @@ fn version_names_this_gui_and_the_server() {
         map: false,
         resume_session: false,
         info_report: false,
+        shell_worlds: true,
+        web_front: false,
+        server_sound: true,
+        change_password: true,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1647,6 +1683,10 @@ fn version_names_this_gui_and_the_server() {
         map: false,
         resume_session: false,
         info_report: false,
+        shell_worlds: true,
+        web_front: false,
+        server_sound: true,
+        change_password: true,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
@@ -1832,6 +1872,10 @@ fn a_paused_session_asks_once_to_resume_and_a_login_takes_the_badge_down() {
         map: false,
         resume_session: false,
         info_report: false,
+        shell_worlds: true,
+        web_front: false,
+        server_sound: true,
+        change_password: true,
         emoji_json: String::new(),
         emoji_categories_json: String::new(),
         tf_status: Vec::new(),
