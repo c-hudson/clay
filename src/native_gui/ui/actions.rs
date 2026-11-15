@@ -176,7 +176,8 @@ impl ClayView {
             return true;
         }
         let mut cmds: Vec<String> = crate::native_gui::core::input::internal_commands().to_vec();
-        cmds.extend(self.session.core.actions.iter().filter(|a| a.pattern.trim().is_empty()).map(|a| format!("/{}", a.name)));
+        // Manual actions: no patterns, as the console's completion has it.
+        cmds.extend(self.session.core.actions.iter().filter(|a| a.patterns.is_empty()).map(|a| format!("/{}", a.name)));
         self.editor.complete(&cmds)
     }
 

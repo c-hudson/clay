@@ -168,10 +168,7 @@ impl ActionEditor {
     }
 
     /// A list from the server: taken unless this one has unsaved changes.
-    fn received(&mut self, mut actions: Vec<Action>, say: &str, window: &mut Window, cx: &mut Context<Self>) {
-        for a in &mut actions {
-            a.normalize();
-        }
+    fn received(&mut self, actions: Vec<Action>, say: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.unsaved() || json(&actions) == self.saved {
             return;
         }
@@ -182,10 +179,7 @@ impl ActionEditor {
     }
 
     /// Take `actions` as the saved list, keeping the selection by name.
-    fn adopt(&mut self, mut actions: Vec<Action>, window: &mut Window, cx: &mut Context<Self>) {
-        for a in &mut actions {
-            a.normalize();
-        }
+    fn adopt(&mut self, actions: Vec<Action>, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.selected.and_then(|i| self.actions.get(i)).map(|a| a.name.clone());
         self.saved = json(&actions);
         self.actions = actions;

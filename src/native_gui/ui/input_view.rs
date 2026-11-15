@@ -1054,7 +1054,7 @@ impl ClayView {
             self.editor.remember(&cmd, masked);
             self.editor.clear();
             // As for any sent command: the splash goes, or the replies would sit behind it.
-            let fx = self.session.core.command_sent();
+            let fx = self.session.core.command_sent(&cmd);
             let rest = self.session.apply(fx);
             self.after(rest, cx);
             self.input_touched(cx);
@@ -1068,7 +1068,7 @@ impl ClayView {
             if self.tts_command(&args, cx) {
                 self.editor.remember(&cmd, masked);
                 self.editor.clear();
-                let fx = self.session.core.command_sent();
+                let fx = self.session.core.command_sent(&cmd);
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
                 self.input_touched(cx);
@@ -1098,7 +1098,7 @@ impl ClayView {
         self.after(fx, cx);
         self.editor.remember(&cmd, masked);
         self.editor.clear();
-        let fx = self.session.core.command_sent();
+        let fx = self.session.core.command_sent(&cmd);
         let rest = self.session.apply(fx);
         self.after(rest, cx);
         self.input_touched(cx);

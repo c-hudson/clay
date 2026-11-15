@@ -421,6 +421,21 @@ impl QuoteDisposition {
     }
 }
 
+/// A background `/quote ... !<command>`'s source, run by the App (`App::start_quote`)
+/// rather than the engine: its lines are quoted as the command prints them, so a long
+/// command never holds Clay up (real TF reads the pipe from its main loop too). `-S` runs
+/// it here and now with `run_blocking`, as TF does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteShell {
+    /// The shell command (the source text after `!`).
+    pub command: String,
+    /// `<pre>` and `<suf>`, put round every line (`/help quote`).
+    pub prefix: String,
+    pub suffix: String,
+    /// Strip ANSI from each line (default; `-A` keeps it).
+    pub strip_ansi: bool,
+}
+
 /// When a /quote's lines are done (`/help quote`, `/help processes`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QuoteTiming {
@@ -462,6 +477,9 @@ pub enum TfCommandResult {
         pid: Option<u32>,
         /// What /ps shows for it.
         label: String,
+        /// A background quote of a shell command: the command to run, `lines` empty
+        /// (boxed: the variant is the enum's largest as it is).
+        shell: Option<Box<QuoteShell>>,
     },
     /// Return from macro execution with optional value for %?
     Return(String),

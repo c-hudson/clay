@@ -1117,9 +1117,9 @@ impl ClayView {
                 if index != self.session.core.current {
                     self.switch_to(index, cx);
                 }
-                let fx = self.session.send(WsMessage::SendCommand { world_index: index, command });
+                let fx = self.session.send(WsMessage::SendCommand { world_index: index, command: command.clone() });
                 self.after(fx, cx);
-                let fx = self.session.core.command_sent();
+                let fx = self.session.core.command_sent(&command);
                 let rest = self.session.apply(fx);
                 self.after(rest, cx);
             }

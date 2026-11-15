@@ -762,11 +762,17 @@ impl ClientCore {
         self.take()
     }
 
-    /// A command was sent: the current world's prompt and splash go, as app.js clears
-    /// them (the server sends the next prompt when there is one).
-    pub fn command_sent(&mut self) -> Vec<Effect> {
+    /// `line` was sent: the current world's splash goes, and its prompt too when the line
+    /// answers it (`tfrun::typed_line_answers_prompt`: text for a MUD world, as the server
+    /// clears its own; the MUD sends the next one). A command that stays on the server
+    /// (`/url`, `/set`...) keeps the prompt - nothing would bring it back - and so does a
+    /// chat world, whose prompt is its send target.
+    pub fn command_sent(&mut self, line: &str) -> Vec<Effect> {
         if let Some(w) = self.worlds.get_mut(self.current) {
-            w.prompt.clear();
+            let world_type = w.settings.as_ref().map_or("mud", |s| s.world_type.as_str());
+            if crate::tfrun::typed_line_answers_prompt(line, world_type, w.echo_masked) {
+                w.prompt.clear();
+            }
             w.showing_splash = false;
             self.changed();
         }
@@ -1766,7 +1772,7 @@ impl ClientCore {
             pending_count: m.pending_count,
             unseen: m.unseen_lines,
             epoch: m.seq_epoch,
-            total_visible: m.total_visible_lines.unwrap_or(m.total_output_lines),
+            total_visible: m.total_visible_lines.unwrap_or_default(),
             settings: Some(m.settings.clone()),
             gmcp_user_enabled: m.gmcp_user_enabled,
             echo_masked: m.echo_masked,
@@ -2458,8 +2464,6 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         http_enabled: s.http_enabled,
         http_port: s.http_port,
         web_path: s.web_path.clone(),
-        ws_enabled: s.ws_enabled,
-        ws_port: s.ws_port,
         ws_cert_file: s.ws_cert_file.clone(),
         ws_key_file: s.ws_key_file.clone(),
         ws_password: String::new(),
@@ -2481,8 +2485,7 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         icon_bar: s.icon_bar.clone(),
         // Empty: a server from before Import Picture sent none.
         picture_host: (!s.picture_host.is_empty()).then(|| s.picture_host.clone()),
-        // Empty: a server from before the separator style was on the wire.
-        separator_style: (!s.separator_style.is_empty()).then(|| s.separator_style.clone()),
+        separator_style: Some(s.separator_style.clone()),
         // This GUI's own Text Reveal on this OS, once it has one (the Settings window
         // puts it under the GUI's key).
         text_reveal_profile: s.text_reveal_profiles.get(crate::font_profile::native_key()).map(|value| {
@@ -2603,10 +2606,6 @@ fn is_corrupted(lines: &[Line]) -> bool {
         if l.archive.is_some() {
             // Read from the archive on demand: older than everything, and seq-less.
             continue;
-        }
-        if l.from_archive {
-            // Only a pre-1.5.23 server put archive lines in the seq stream.
-            return true;
         }
         if l.ts > 0 {
             if prev_ts.is_some_and(|p| l.ts + CORRUPT_TS_REGRESSION < p) {

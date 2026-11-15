@@ -85,6 +85,52 @@ pub(crate) fn typed_slash_form(line: &str) -> TypedSlashForm<'_> {
     }
 }
 
+/// Whether a line typed in a world of type `world_type` (its settings name) answers that
+/// world's prompt: text going to a MUD world, as both handlers and the console route it -
+/// a line not starting with `/`, or `///x` (sent as `/x`) while echo isn't masked. Only
+/// then does the server clear the prompt (`World::clear_prompt_after_send`), so it is the
+/// only line a client clears its own for: a command that stays here (`/url`, `/dict`,
+/// `/set`) brings no new prompt, and a chat world's prompt is its send target. The native
+/// GUI calls it (`ClientCore::command_sent`); app.js `typedLineAnswersPrompt` is its port.
+#[cfg(any(feature = "native-gui", test))]
+pub(crate) fn typed_line_answers_prompt(line: &str, world_type: &str, masked: bool) -> bool {
+    crate::WorldType::from_name(world_type).is_mud()
+        && (!line.starts_with('/') || (!masked && matches!(typed_slash_form(line), TypedSlashForm::SendText(_))))
+}
+
+/// A background `/quote ... !<command>`'s command, still running (`App::quote_sources`).
+/// Dropping it stops the reader, and the command with it (`kill_on_drop`).
+pub(crate) struct QuoteSource {
+    shell: crate::tf::QuoteShell,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for QuoteSource {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The complete lines at the front of `pending` (a command's output so far), taken out
+/// as `str::lines` splits them: at `\n`, with a `\r` before it dropped. At the end of the
+/// output (`eof`) what is left is a last line too.
+fn take_quote_lines(pending: &mut Vec<u8>, eof: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while let Some(i) = pending[start..].iter().position(|&b| b == b'\n') {
+        let line = &pending[start..start + i];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        lines.push(String::from_utf8_lossy(line).into_owned());
+        start += i + 1;
+    }
+    pending.drain(..start);
+    if eof && !pending.is_empty() {
+        lines.push(String::from_utf8_lossy(pending).into_owned());
+        pending.clear();
+    }
+    lines
+}
+
 impl App {
     /// Apply effects from the front of `queue` in order, until one is a Clay command;
     /// that command is returned for the host to run - with where it was in a file being
@@ -720,6 +766,98 @@ impl App {
         self.emit_client_text(idx, output, daemon_mode);
     }
 
+    /// Start a background `/quote ... !<command>`'s command for process `pid`
+    /// (`App::start_quote`): what it prints comes back a read at a time as
+    /// `AppEvent::TfQuoteOutput`, then `TfQuoteEnded`, and the quote runs at its own pace
+    /// meanwhile. `Ok(Some(lines))`: there is no loop to report back to, so it ran to the
+    /// end here. An error is TF's message.
+    pub(crate) fn start_quote_source(&mut self, pid: u32, shell: crate::tf::QuoteShell) -> Result<Option<Vec<String>>, String> {
+        use tokio::io::AsyncReadExt;
+        let Some(tx) = self.tf_event_tx.clone() else {
+            return shell.run_blocking(&self.tf_engine).map(|(lines, _status)| Some(lines));
+        };
+        let mut cmd = tokio::process::Command::from(shell.process(&self.tf_engine));
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| shell.spawn_error(&e))?;
+        let stdout = child.stdout.take();
+        let task = tokio::spawn(async move {
+            if let Some(mut out) = stdout {
+                let mut pending = Vec::new();
+                let mut chunk = vec![0u8; 8192];
+                loop {
+                    match out.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            pending.extend_from_slice(&chunk[..n]);
+                            // One event per read, not per line: a build prints thousands.
+                            let lines = take_quote_lines(&mut pending, false);
+                            if !lines.is_empty() && tx.send(AppEvent::TfQuoteOutput(pid, lines)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                let lines = take_quote_lines(&mut pending, true);
+                if !lines.is_empty() {
+                    let _ = tx.send(AppEvent::TfQuoteOutput(pid, lines)).await;
+                }
+            }
+            let _ = child.wait().await;
+            let _ = tx.send(AppEvent::TfQuoteEnded(pid)).await;
+        });
+        self.quote_sources.insert(pid, QuoteSource { shell, task: task.abort_handle() });
+        Ok(None)
+    }
+
+    /// Lines a background quote's command printed (`AppEvent::TfQuoteOutput`): they join
+    /// its process, decorated, to be done at its pace. A quote that was /kill'ed loses its
+    /// command here too, as TF's closed pipe ends it.
+    pub(crate) fn quote_source_output(&mut self, pid: u32, lines: Vec<String>) {
+        if !self.quote_sources.contains_key(&pid) {
+            return;
+        }
+        let alive = self.tf_engine.processes.iter().any(|p| p.id == pid && p.kind == crate::tf::ProcessKind::Quote);
+        if !alive {
+            self.quote_sources.remove(&pid);
+            return;
+        }
+        let shell = &self.quote_sources[&pid].shell;
+        if let Some(p) = self.tf_engine.processes.iter_mut().find(|p| p.id == pid) {
+            if p.lines.is_empty() {
+                // It was waiting, not running: an interval quote doesn't make up for the
+                // runs it had nothing for by doing them all now.
+                p.next_run = p.next_run.max(std::time::Instant::now());
+            }
+            p.lines.extend(lines.iter().map(|line| shell.decorate(line)));
+        }
+    }
+
+    /// A background quote's command ended (`AppEvent::TfQuoteEnded`): the quote ends
+    /// once its lines are done - now, if none are left.
+    pub(crate) fn quote_source_ended(&mut self, pid: u32) {
+        if self.quote_sources.remove(&pid).is_none() {
+            return;
+        }
+        self.tf_engine.processes.retain(|p| !(p.id == pid && p.kind == crate::tf::ProcessKind::Quote && p.lines.is_empty()));
+    }
+
+    /// Stop the command of every background quote that is gone (`/kill`), as TF's closed
+    /// pipe ends it - at once, not at its next output, which may never come. Each loop
+    /// calls it where it arms the process timer.
+    pub(crate) fn drop_killed_quote_sources(&mut self) {
+        if self.quote_sources.is_empty() {
+            return;
+        }
+        let processes = &self.tf_engine.processes;
+        self.quote_sources.retain(|pid, _| processes.iter().any(|p| p.id == *pid));
+    }
+
+    /// A quote with no lines left whose command is still running: it waits, and is
+    /// neither due nor done.
+    fn quote_waiting(&self, p: &crate::tf::TfProcess) -> bool {
+        p.kind == crate::tf::ProcessKind::Quote && p.lines.is_empty() && self.quote_sources.contains_key(&p.id)
+    }
+
     /// Run every process that is due, once: a /repeat's body as a macro body, a /quote's
     /// next line (or all of them, for a quote with no interval). With %lpquote on, none
     /// runs on its timer - they all wait for prompts (`run_prompt_processes`). Returns
@@ -731,7 +869,7 @@ impl App {
         }
         // Ids, not indices: a body can /kill or start processes while this runs.
         let due: Vec<u32> = self.tf_engine.processes.iter()
-            .filter(|p| !p.on_prompt && p.next_run <= now)
+            .filter(|p| !p.on_prompt && p.next_run <= now && !self.quote_waiting(p))
             .map(|p| p.id)
             .collect();
         self.run_tf_processes(&due, false, daemon_mode)
@@ -744,7 +882,7 @@ impl App {
         let lpquote = self.tf_lpquote();
         let Some(name) = self.worlds.get(world_idx).map(|w| w.name.clone()) else { return Vec::new() };
         let due: Vec<u32> = self.tf_engine.processes.iter()
-            .filter(|p| p.on_prompt || lpquote)
+            .filter(|p| (p.on_prompt || lpquote) && !self.quote_waiting(p))
             .filter(|p| p.world.as_deref().is_none_or(|w| w.is_empty() || w.eq_ignore_ascii_case(&name)))
             .map(|p| p.id)
             .collect();
@@ -784,6 +922,7 @@ impl App {
                         strip_ansi: false,
                         pid: None,
                         label: String::new(),
+                        shell: None,
                     })]
                 }
                 crate::tf::ProcessKind::Repeat => {
@@ -795,8 +934,11 @@ impl App {
             };
             runs.push((TfEffectCtx::for_world(world_idx, daemon_mode), effects));
         }
+        // A quote is done when its lines are, unless its command is still printing more.
+        let sources = &self.quote_sources;
         self.tf_engine.processes.retain(|p| {
-            p.remaining != Some(0) && !(p.kind == crate::tf::ProcessKind::Quote && p.lines.is_empty())
+            p.remaining != Some(0)
+                && !(p.kind == crate::tf::ProcessKind::Quote && p.lines.is_empty() && !sources.contains_key(&p.id))
         });
         runs
     }
@@ -806,8 +948,10 @@ impl App {
         if self.tf_lpquote() {
             return None;
         }
+        // Not a quote waiting on its command: its next_run passes while it waits, and the
+        // loop would spin on it.
         self.tf_engine.processes.iter()
-            .filter(|p| !p.on_prompt)
+            .filter(|p| !p.on_prompt && !self.quote_waiting(p))
             .map(|p| p.next_run)
             .min()
     }
@@ -1431,6 +1575,25 @@ mod tests {
         assert_eq!(typed_slash_form("say http://x"), TypedSlashForm::Line("say http://x"));
     }
 
+    /// Only text for a MUD world answers its prompt: a command that stays here (the
+    /// user's report: `/url` lost a world's prompt in the GUIs for good) doesn't, nor does
+    /// anything typed in a chat world, whose prompt is its send target.
+    #[test]
+    fn only_text_for_a_mud_world_answers_its_prompt() {
+        for mud in ["mud", "mud_timed_prompt"] {
+            assert!(typed_line_answers_prompt("look", mud, false));
+            assert!(typed_line_answers_prompt("", mud, false), "a bare Enter goes to the world too");
+            assert!(typed_line_answers_prompt("///look", mud, false), "sent as /look");
+            assert!(typed_line_answers_prompt("secret", mud, true), "a password answers its prompt");
+            assert!(!typed_line_answers_prompt("/url https://example.com/a/long/path", mud, false));
+            assert!(!typed_line_answers_prompt("//echo hi", mud, false), "runs /echo");
+            assert!(!typed_line_answers_prompt("///x", mud, true), "masked: no slash forms, a command");
+        }
+        for chat in ["discord", "slack"] {
+            assert!(!typed_line_answers_prompt("hello", chat, false));
+        }
+    }
+
     /// A client's "///look" goes to the world as "/look"; "//echo hi" runs /echo.
     #[test]
     fn test_client_slash_forms_follow_tf() {
@@ -1665,6 +1828,114 @@ mod tests {
         assert!(texts(&app).iter().any(|t| t.contains("interactive shell needs Clay's own console")), "{:?}", texts(&app));
         let _ = app.handle_ws_send_command_impl(1, 0, "/suspend", &event_tx);
         assert!(app.pending_terminal_ops.is_empty());
+    }
+
+    /// Hand every event a background quote's command sends to the App, as the loops do,
+    /// until it ends (or `limit` passes).
+    async fn follow_quote_source(app: &mut App, rx: &mut mpsc::Receiver<AppEvent>, limit: std::time::Duration) {
+        let until = tokio::time::Instant::now() + limit;
+        while let Ok(Some(event)) = tokio::time::timeout_at(until, rx.recv()).await {
+            match event {
+                AppEvent::TfQuoteOutput(pid, lines) => app.quote_source_output(pid, lines),
+                AppEvent::TfQuoteEnded(pid) => {
+                    app.quote_source_ended(pid);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("the quote's command never ended");
+    }
+
+    /// The user's report (2026-11-13): `/quote -0 think !~/clay/copy.sh` froze Clay for the
+    /// whole build. A background quote's command runs beside Clay, as in real TF (a
+    /// /repeat keeps ticking through `/quote -0 !sleep 3`): the /quote returns at once, the
+    /// quote waits without being due (no spin), and its lines are done once printed.
+    #[tokio::test]
+    async fn a_background_shell_quote_never_holds_clay_up() {
+        let mut app = app_with_world();
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+        app.tf_event_tx = Some(event_tx);
+
+        let started = std::time::Instant::now();
+        let effects = app.tf_engine.run_typed("/quote -0 -decho !sleep 2; echo first; echo second");
+        app.apply_tf_effects_now(effects, TfEffectCtx::typed(0));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "the /quote waited for its command");
+        assert_eq!(app.tf_engine.processes.len(), 1, "the quote runs as a process meanwhile");
+        assert!(app.tf_engine.processes[0].lines.is_empty());
+        assert_eq!(app.next_tf_process_due(), None, "a quote waiting on its command is never due");
+        assert!(app.tick_tf_processes(std::time::Instant::now() + std::time::Duration::from_secs(60), false).is_empty());
+
+        follow_quote_source(&mut app, &mut event_rx, std::time::Duration::from_secs(20)).await;
+        for (ctx, effects) in app.tick_tf_processes(std::time::Instant::now(), false) {
+            app.apply_tf_effects_now(effects, ctx);
+        }
+        let shown = texts(&app);
+        assert!(shown.ends_with(&["first".to_string(), "second".to_string()]), "{shown:?}");
+        assert!(app.tf_engine.processes.is_empty(), "done with its command's last line");
+        assert!(app.quote_sources.is_empty());
+    }
+
+    /// `/kill` ends a background quote's command at once (TF's closed pipe ends it at its
+    /// next write; one that prints nothing would run on). An interval quote whose lines come
+    /// late does one per interval from then, not all the runs it had nothing for.
+    #[tokio::test]
+    async fn a_killed_shell_quote_stops_its_command_and_a_late_one_keeps_its_pace() {
+        let mut app = app_with_world();
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+        app.tf_event_tx = Some(event_tx);
+
+        let marker = std::env::temp_dir().join(format!("clay-quote-kill-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let effects = app.tf_engine.run_typed(&format!("/quote -0 -decho !sleep 1; touch {}", marker.display()));
+        app.apply_tf_effects_now(effects, TfEffectCtx::typed(0));
+        let pid = app.tf_engine.processes[0].id;
+        let effects = app.tf_engine.run_typed(&format!("/kill {pid}"));
+        app.apply_tf_effects_now(effects, TfEffectCtx::typed(0));
+        app.drop_killed_quote_sources();
+        assert!(app.quote_sources.is_empty());
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(!marker.exists(), "the killed quote's command ran on");
+
+        let effects = app.tf_engine.run_typed("/quote -1 -decho !printf 'a\\nb\\n'");
+        app.apply_tf_effects_now(effects, TfEffectCtx::typed(0));
+        // Long overdue by the time its lines come.
+        app.tf_engine.processes[0].next_run = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        follow_quote_source(&mut app, &mut event_rx, std::time::Duration::from_secs(20)).await;
+        let now = std::time::Instant::now();
+        assert_eq!(app.tick_tf_processes(now, false).len(), 1, "one line now");
+        assert!(app.tick_tf_processes(now, false).is_empty(), "the next an interval later, not at once");
+        assert_eq!(app.tf_engine.processes[0].lines, ["b"]);
+    }
+
+    /// A command's output is split into lines as `str::lines` would split it, wherever its
+    /// reads end - mid-line, mid-character, between a `\r` and its `\n`.
+    #[test]
+    fn a_commands_output_is_split_into_lines_across_reads() {
+        let mut pending = Vec::new();
+        let mut lines = Vec::new();
+        let text = "one\r\ntwo é\nthree".as_bytes();
+        for chunk in [&text[..2], &text[2..4], &text[4..9], &text[9..10], &text[10..]] {
+            pending.extend_from_slice(chunk);
+            lines.extend(take_quote_lines(&mut pending, false));
+        }
+        assert_eq!(lines, ["one", "two é"]);
+        lines.extend(take_quote_lines(&mut pending, true));
+        assert_eq!(lines, "one\r\ntwo é\nthree".lines().collect::<Vec<_>>());
+        assert!(pending.is_empty());
+    }
+
+    /// A Clay that may not start processes refuses a background quote's command too.
+    #[tokio::test]
+    async fn a_shell_quote_is_refused_where_processes_are() {
+        let mut app = app_with_world();
+        let (event_tx, _event_rx) = mpsc::channel::<AppEvent>(16);
+        app.tf_event_tx = Some(event_tx);
+        app.policy.processes = false;
+        let effects = app.tf_engine.run_typed("/quote -0 -decho !echo hi");
+        app.apply_tf_effects_now(effects, TfEffectCtx::typed(0));
+        assert!(app.tf_engine.processes.is_empty() && app.quote_sources.is_empty());
+        assert!(texts(&app).iter().any(|t| t.contains("Operation not permitted")), "{:?}", texts(&app));
     }
 
     /// A client's /help on a topic only TinyFugue's help file has gets that help, to that

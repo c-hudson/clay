@@ -350,7 +350,8 @@ webpki's cert-chain/name-constraint/CRL path, and the server uses `no_client_aut
 
 **Not changed (documented tradeoffs):** unsalted SHA-256 password hashing (the hash is a
 bearer credential by design for the JS client), `LEGACY_ENCRYPTION_KEY` (kept as a
-decrypt-only fallback, now logged when it fires so stale blobs get re-encrypted), and
+decrypt-only fallback, now logged when it fires so stale blobs get re-encrypted;
+removed 2026-11-14, once every settings.dat had been re-encrypted under its machine key), and
 `with_no_client_auth()` on Clay's own server (correct — Clay authenticates by
 password/knock, not client certs).
 

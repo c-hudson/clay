@@ -92,7 +92,9 @@ included), a TF command (`` ` ``) or `/recall` (`#`), put an optional
 sent when there is no <pre>, run as commands (never expanded) when there is.
 Unless `-S`, a quote is a background process: one line every `%ptime` (1
 second; `-<time>` to change it, `-0` for all at once), or one per prompt with
-`-P`. `/ps` lists it and `/kill` stops it.
+`-P`. `/ps` lists it and `/kill` stops it. A background quote's shell command
+runs beside Clay, its lines quoted as it prints them, so a long one (a build) holds
+nothing up, and `/kill` stops the command too; with `-S`, Clay waits for it, as TF does.
 
 ```
 /quote -S '"/tmp/lines.txt"        Send each line of the file, now
@@ -590,6 +592,8 @@ per-key/per-command ruling tables this was decided from.
 - **No non-visual mode**: `/visual off` is refused; `%visual` is always `on`.
 - **Histories**: Clay keeps a world's whole output (and archives it), so
   `/histsize` has nothing to change.
+- **`/more`** with no argument says whether more-paging is on (TF gives an
+  invalid-value error). `/more on|off|1|0` sets it as in TF.
 - **Off until asked for**: `%wrapsize` (Clay wraps at the window's edge until a
   script sets it) and mail checking (until a MAIL hook, `@mail` on a changed
   status line, or a mail path set by the user).

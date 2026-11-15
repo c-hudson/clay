@@ -1,12 +1,10 @@
 # WebView GUI
 
-Clay's graphical client is not a separate native toolkit application — it is a native
-window (built with [wry](https://github.com/tauri-apps/wry)/[tao](https://github.com/tauri-apps/tao))
-that hosts the exact same HTML/CSS/JS interface the browser-based **Web Interface**
-chapter describes. Building the `webview-gui` feature gives you a `--web-gui` flag that opens
-this window instead of (or alongside) the terminal UI. An earlier, different Rust GUI
-toolkit and Cargo feature name are no longer part of the codebase — if you find a build
-instruction or dependency list elsewhere referring to one, it's stale.
+The WebView GUI is a native window (built with
+[wry](https://github.com/tauri-apps/wry)/[tao](https://github.com/tauri-apps/tao)) that hosts
+the exact same HTML/CSS/JS interface the browser-based **Web Interface** chapter describes.
+Building the `webview-gui` feature gives you a `--web-gui` flag that opens this window instead
+of (or alongside) the terminal UI.
 
 ## Two GUIs
 

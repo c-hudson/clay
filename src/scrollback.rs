@@ -12,15 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use rusqlite::{Connection, params};
 
-/// Current archive schema. 0 means "any pre-v2 shape" (with or without the
-/// `gagged` column); those are distinguished with `PRAGMA table_info`. 1 is
-/// deliberately skipped so a stamped legacy file can never be mistaken for an
-/// unstamped one.
+/// Current archive schema (since v1.5.41). A file in any other shape is refused,
+/// never converted: see `ArchiveState`.
 const SCHEMA_VERSION: i32 = 2;
-
-/// Rows copied per migration transaction. Small enough to keep the WAL bounded
-/// on a multi-GB archive, large enough that the per-transaction overhead is noise.
-const MIGRATE_CHUNK: usize = 50_000;
 
 /// Sequence numbers reserved per allocation. A restart burns the unused
 /// remainder, which is harmless because every consumer compares with `<`, never
@@ -53,7 +47,8 @@ pub struct ScrollbackLine {
     pub ts_ms: i64,
     pub world: String,
     pub text: String,
-    /// Durable archive sequence, when the row has one (v2 schema).
+    /// Durable archive sequence, when the reader selected it (`search` and
+    /// `load_before_path` do not).
     pub wseq: Option<i64>,
     /// The line was gagged when it arrived. Filled only by the Page Up readers
     /// (`load_before_wseq`/`load_before_path`), which show it the way it was shown live;
@@ -94,31 +89,23 @@ pub struct ArchiveQuery<'a> {
     pub newest_first: bool,
 }
 
-/// A world's stable identity as the archive knows it. Passed into `open` so the
-/// migration can attribute legacy rows (which recorded only a name) to the world
-/// that currently claims that name.
-#[derive(Clone, Debug)]
-pub struct WorldRef {
-    pub world_uuid: String,
-    pub name: String,
-}
-
 /// What `open` found on disk.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ArchiveState {
     /// Schema is current and usable.
     Ready,
-    /// A pre-v2 file that still needs converting; reads use the legacy SQL.
-    NeedsMigration,
-    /// `user_version` is ahead of this build. Refuse to migrate or write: a newer
-    /// Clay owns the file and guessing at its shape risks destroying it. Readers
-    /// report this rather than returning an empty result, which would look
-    /// exactly like an empty archive.
+    /// No archive yet: `open` creates the v2 schema.
+    Empty,
+    /// An archive in the layout before v1.5.41's, which no 1.7 Clay can have left
+    /// behind (each upgraded it on first open). Refused like `TooNew`.
+    Old,
+    /// `user_version` is ahead of this build. Refused: a newer Clay owns the file
+    /// and guessing at its shape risks destroying it.
     TooNew,
 }
 
-/// The v2 schema. Written verbatim for a fresh database and created alongside
-/// the legacy table during a migration.
+/// The v2 schema. Written verbatim for a fresh database, and re-run on open to
+/// put back any auxiliary object a file is missing.
 const SCHEMA_V2: &str = "
     CREATE TABLE IF NOT EXISTS worlds (
         wid        INTEGER PRIMARY KEY,
@@ -134,20 +121,19 @@ const SCHEMA_V2: &str = "
     );
 ";
 
-/// `output_log` in its v2 shape. Parameterised by name so the migration can build
-/// it under a temporary name alongside the legacy table.
-fn output_log_v2_ddl(table: &str) -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {table} (
-             id       INTEGER PRIMARY KEY,
-             wid      INTEGER NOT NULL,
-             wseq     INTEGER NOT NULL,
-             ts_ms    INTEGER NOT NULL,
-             line_raw TEXT NOT NULL,
-             gagged   INTEGER NOT NULL DEFAULT 0
-         );"
-    )
-}
+/// `output_log` in its v2 shape, with its two indexes.
+const OUTPUT_LOG_V2: &str = "
+    CREATE TABLE IF NOT EXISTS output_log (
+        id       INTEGER PRIMARY KEY,
+        wid      INTEGER NOT NULL,
+        wseq     INTEGER NOT NULL,
+        ts_ms    INTEGER NOT NULL,
+        line_raw TEXT NOT NULL,
+        gagged   INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_log_wid_wseq ON output_log(wid, wseq);
+    CREATE INDEX IF NOT EXISTS idx_log_wid_ts ON output_log(wid, ts_ms);
+";
 
 fn meta_get(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row("SELECT v FROM archive_meta WHERE k = ?1", params![key], |r| r.get(0))
@@ -166,8 +152,7 @@ fn user_version(conn: &Connection) -> i32 {
     conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0)
 }
 
-/// Does `table` have a column called `column`? Generalises the `PRAGMA table_info`
-/// check `export_csv` already used to cope with pre-`gagged` databases.
+/// Does `table` have a column called `column`?
 fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
     let mut stmt = match conn.prepare(&format!("PRAGMA table_info({table})")) {
         Ok(s) => s,
@@ -195,13 +180,11 @@ fn archive_state(conn: &Connection) -> ArchiveState {
     match user_version(conn) {
         v if v == SCHEMA_VERSION => ArchiveState::Ready,
         v if v > SCHEMA_VERSION => ArchiveState::TooNew,
-        _ => {
-            if table_exists(conn, "output_log") && has_column(conn, "output_log", "wid") {
-                ArchiveState::Ready
-            } else {
-                ArchiveState::NeedsMigration
-            }
-        }
+        _ if !table_exists(conn, "output_log") => ArchiveState::Empty,
+        // A v2 file whose stamp never landed (an upgrade killed after its table swap)
+        // is still a v2 file.
+        _ if has_column(conn, "output_log", "wid") => ArchiveState::Ready,
+        _ => ArchiveState::Old,
     }
 }
 
@@ -299,8 +282,8 @@ pub struct ArchiveStats {
 ///
 /// Wraps an UNBOUNDED channel. The previous `SyncSender` + `try_send` pair
 /// dropped lines on the floor with the `Result` discarded whenever the buffer
-/// filled — and a long schema migration running on the writer thread would fill
-/// it within seconds.
+/// filled — and a writer held up for a few seconds (a lock, a slow disk) would
+/// fill it.
 #[derive(Clone)]
 pub struct ArchiveSender {
     tx: mpsc::Sender<ArchiveEntry>,
@@ -389,224 +372,6 @@ impl ScrollbackDb {
     }
 }
 
-/// Convert a pre-v2 archive in place. Idempotent and resumable: killing the
-/// process at any point and re-running reaches the same final state.
-///
-/// The ordering rule that matters: nothing in the legacy table is touched until
-/// M6, and M6 is a single transaction. A reader therefore never observes a torn
-/// pair — it sees either the whole legacy shape or the whole v2 shape.
-fn migrate_to_v2(conn: &Connection, worlds: &[WorldRef]) -> Result<(), String> {
-    // ---- M2: build the new objects alongside the old ones -----------------
-    conn.execute_batch(SCHEMA_V2).map_err(|e| format!("create v2 objects: {e}"))?;
-    conn.execute_batch(&output_log_v2_ddl("output_log_v2"))
-        .map_err(|e| format!("create output_log_v2: {e}"))?;
-    meta_set(conn, "migration_state", "copying");
-
-    let legacy_has_gagged = has_column(conn, "output_log", "gagged");
-
-    // ---- M3: attribute every legacy world name ----------------------------
-    let names: Vec<String> = {
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT world FROM output_log")
-            .map_err(|e| format!("list worlds: {e}"))?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| format!("list worlds: {e}"))?;
-        rows.flatten().collect()
-    };
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-
-    for name in &names {
-        // Case-insensitive, because in-memory lookup is case-insensitive while
-        // SQLite `world = ?` is not: "Zmc" and "zmc" are one world to the user.
-        let claimed = worlds
-            .iter()
-            .find(|w| w.name.eq_ignore_ascii_case(name) && !w.world_uuid.is_empty());
-        let (uuid, orphan) = match claimed {
-            Some(w) => (w.world_uuid.clone(), 0),
-            // No live world answers to this name — it was renamed or deleted
-            // before this migration existed, and the legacy schema recorded only
-            // the name, so there is nothing to match on. Keep the rows under a
-            // minted id rather than dropping them.
-            None => (uuid::Uuid::new_v4().simple().to_string(), 1),
-        };
-        conn.execute(
-            "INSERT INTO worlds (world_uuid, name, next_wseq, orphan, created_ms)
-             VALUES (?1, ?2, 0, ?3, ?4)
-             ON CONFLICT(world_uuid) DO UPDATE SET name = excluded.name",
-            params![uuid, name, orphan, now_ms],
-        )
-        .map_err(|e| format!("record world {name}: {e}"))?;
-    }
-
-    // ---- M4: copy in resumable chunks -------------------------------------
-    for name in &names {
-        let wid: i64 = conn
-            .query_row(
-                "SELECT wid FROM worlds WHERE name = ?1 ORDER BY wid LIMIT 1",
-                params![name],
-                |r| r.get(0),
-            )
-            .map_err(|e| format!("resolve wid for {name}: {e}"))?;
-
-        loop {
-            let last: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(id), 0) FROM output_log_v2 WHERE wid = ?1",
-                    params![wid],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let base: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(wseq), -1) + 1 FROM output_log_v2 WHERE wid = ?1",
-                    params![wid],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-
-            // `id` is the true insertion order and is unique; ts_ms is neither
-            // (timestamps collide, which is what made the old boundary unsound).
-            let gagged_expr = if legacy_has_gagged { "COALESCE(o.gagged, 0)" } else { "0" };
-            let sql = format!(
-                "INSERT INTO output_log_v2 (id, wid, wseq, ts_ms, line_raw, gagged)
-                 SELECT o.id, ?1, ?2 + row_number() OVER (ORDER BY o.id) - 1,
-                        o.ts_ms, o.line_raw, {gagged_expr}
-                 FROM output_log o
-                 WHERE o.world = ?3 AND o.id > ?4
-                 ORDER BY o.id LIMIT ?5"
-            );
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| format!("begin copy chunk: {e}"))?;
-            let n = tx
-                .execute(&sql, params![wid, base, name, last, MIGRATE_CHUNK as i64])
-                .map_err(|e| format!("copy chunk for {name}: {e}"))?;
-            tx.commit().map_err(|e| format!("commit copy chunk: {e}"))?;
-            if n == 0 {
-                break;
-            }
-        }
-
-        // Seed the durable allocator past everything just copied.
-        conn.execute(
-            "UPDATE worlds SET next_wseq =
-               (SELECT COALESCE(MAX(wseq), -1) + 1 FROM output_log_v2 WHERE wid = ?1)
-             WHERE wid = ?1",
-            params![wid],
-        )
-        .map_err(|e| format!("seed next_wseq: {e}"))?;
-    }
-
-    // ---- M5: the no-loss gate ---------------------------------------------
-    let old_n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM output_log", [], |r| r.get(0))
-        .map_err(|e| format!("count legacy rows: {e}"))?;
-    let new_n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM output_log_v2", [], |r| r.get(0))
-        .map_err(|e| format!("count copied rows: {e}"))?;
-    if old_n != new_n {
-        return Err(format!(
-            "row count mismatch after copy ({old_n} legacy vs {new_n} copied); \
-             leaving the archive on the legacy schema"
-        ));
-    }
-
-    // ---- M6: atomic swap ---------------------------------------------------
-    // Drop the old FTS table FIRST. It is external-content over `output_log` and
-    // stores that linkage in its own config table, which ALTER TABLE RENAME does
-    // not rewrite — renaming first would leave it silently pointing at the legacy
-    // table. It has never been populated, so nothing is lost.
-    let tx = conn.unchecked_transaction().map_err(|e| format!("begin swap: {e}"))?;
-    tx.execute_batch(
-        // The legacy external-content FTS table must go BEFORE the rename: it
-        // records its `content='output_log'` link in its own config table, which
-        // ALTER TABLE RENAME does not rewrite. It was never populated, so nothing
-        // is lost. The contentless replacement is created after the swap.
-        "DROP TABLE IF EXISTS output_fts;
-         DROP INDEX IF EXISTS idx_world_ts;
-         ALTER TABLE output_log    RENAME TO output_log_legacy;
-         ALTER TABLE output_log_v2 RENAME TO output_log;
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_log_wid_wseq ON output_log(wid, wseq);
-         CREATE INDEX IF NOT EXISTS idx_log_wid_ts ON output_log(wid, ts_ms);",
-    )
-    .map_err(|e| format!("swap tables: {e}"))?;
-    // Written inside the swap so readers have a single committed signal; the
-    // PRAGMA below cannot participate in a transaction on every build.
-    tx.execute(
-        "INSERT INTO archive_meta (k, v) VALUES ('migration_state', 'swapped')
-         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        [],
-    )
-    .map_err(|e| format!("mark swapped: {e}"))?;
-    tx.commit().map_err(|e| format!("commit swap: {e}"))?;
-
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
-        .map_err(|e| format!("stamp user_version: {e}"))?;
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS output_fts USING fts5(
-             txt, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2');",
-    )
-    .map_err(|e| format!("create fts table: {e}"))?;
-
-    // ---- M7: build the FTS index, resumably --------------------------------
-    // `INSERT INTO output_fts(output_fts) VALUES('rebuild')` does NOT work on a
-    // contentless table — there is no content to read back — so this is a
-    // row-by-row pass, chunked so a kill mid-build resumes rather than restarts.
-    meta_set(conn, "migration_state", "fts");
-    loop {
-        let last: i64 = meta_get(conn, "fts_last_id")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let rows: Vec<(i64, String)> = {
-            let mut stmt = conn
-                .prepare("SELECT id, line_raw FROM output_log WHERE id > ?1 ORDER BY id LIMIT ?2")
-                .map_err(|e| format!("prepare fts scan: {e}"))?;
-            let it = stmt
-                .query_map(params![last, MIGRATE_CHUNK as i64], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                })
-                .map_err(|e| format!("fts scan: {e}"))?;
-            it.flatten().collect()
-        };
-        if rows.is_empty() {
-            break;
-        }
-        let tx = conn.unchecked_transaction().map_err(|e| format!("begin fts chunk: {e}"))?;
-        let mut high = last;
-        for (id, raw) in &rows {
-            tx.execute(
-                "INSERT INTO output_fts (rowid, txt) VALUES (?1, ?2)",
-                params![id, crate::util::strip_ansi_codes(raw)],
-            )
-            .map_err(|e| format!("index row {id}: {e}"))?;
-            high = high.max(*id);
-        }
-        tx.execute(
-            "INSERT INTO archive_meta (k, v) VALUES ('fts_last_id', ?1)
-             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            params![high.to_string()],
-        )
-        .map_err(|e| format!("record fts progress: {e}"))?;
-        tx.commit().map_err(|e| format!("commit fts chunk: {e}"))?;
-    }
-    let _ = conn.execute("INSERT INTO output_fts(output_fts) VALUES('optimize')", []);
-
-    // ---- M8: reclaim (best effort) ----------------------------------------
-    meta_set(conn, "migration_state", "done");
-    let _ = conn.execute_batch("DROP TABLE IF EXISTS output_log_legacy;");
-    // VACUUM needs roughly the database size in free space and rewrites the whole
-    // file; a failure leaves a correct, merely larger, archive.
-    if let Err(e) = conn.execute_batch("VACUUM;") {
-        crate::debug_log(true, &format!("SCROLLBACK: VACUUM after migration failed: {e}"));
-    }
-    Ok(())
-}
-
 /// Apply the pragmas every connection in this module needs. `busy_timeout` is
 /// the important one; see BUSY_TIMEOUT_MS.
 fn tune_connection(conn: &Connection) {
@@ -625,34 +390,44 @@ fn open_reader(path: &Path) -> Option<Connection> {
 
 impl ScrollbackDb {
     /// Open (or create) the archive database and start the background writer thread.
-    pub fn open(path: &Path, worlds: &[WorldRef]) -> rusqlite::Result<Self> {
+    ///
+    /// A file that is not a v2 archive (`ArchiveState::Old` or `TooNew`) is refused:
+    /// it is left exactly as it is (not even switched to WAL), and every line sent
+    /// to it is counted in `ArchiveStats::write_failed`, so `/info` says so.
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         tune_connection(&conn);
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
         let state = archive_state(&conn);
-        if state == ArchiveState::TooNew {
-            crate::debug_log(true, &format!(
+        match state {
+            ArchiveState::TooNew => crate::debug_log(true, &format!(
                 "SCROLLBACK: {} was written by a newer Clay (user_version {}); \
-                 not migrating and not writing to it",
+                 not reading or writing it",
                 path.display(), user_version(&conn)
-            ));
-        } else if !table_exists(&conn, "output_log") {
-            // Fresh database: create v2 directly, no migration to run.
-            conn.execute_batch(SCHEMA_V2)?;
-            conn.execute_batch(&output_log_v2_ddl("output_log"))?;
-            conn.execute_batch(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_log_wid_wseq ON output_log(wid, wseq);
-                 CREATE INDEX IF NOT EXISTS idx_log_wid_ts ON output_log(wid, ts_ms);",
-            )?;
-            meta_set(&conn, "migration_state", "done");
-            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-        } else if state == ArchiveState::Ready {
-            // Already v2; make sure the auxiliary objects exist (a file half-built
-            // by an older interrupted run).
-            conn.execute_batch(SCHEMA_V2)?;
+            )),
+            ArchiveState::Old => crate::debug_log(true, &format!(
+                "SCROLLBACK: {} is an archive from before Clay 1.5.41; not reading or \
+                 writing it (move it aside to start a new one)",
+                path.display()
+            )),
+            ArchiveState::Empty => {
+                conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+                conn.execute_batch(SCHEMA_V2)?;
+                conn.execute_batch(OUTPUT_LOG_V2)?;
+                // Says the FTS index covers every row (see `query`); an archive whose
+                // index is incomplete lacks it and is searched without the index.
+                meta_set(&conn, "migration_state", "done");
+                conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            }
+            ArchiveState::Ready => {
+                // Put back any auxiliary object the file is missing.
+                conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+                conn.execute_batch(SCHEMA_V2)?;
+                conn.execute_batch(OUTPUT_LOG_V2)?;
+            }
         }
         drop(conn);
+        let writable = matches!(state, ArchiveState::Empty | ArchiveState::Ready);
 
         let db_path = path.to_path_buf();
         let (tx, rx) = mpsc::channel::<ArchiveEntry>();
@@ -661,7 +436,6 @@ impl ScrollbackDb {
         let shutdown = Arc::new(AtomicBool::new(false));
         let writer_stats = Arc::clone(&stats);
         let writer_shutdown = Arc::clone(&shutdown);
-        let writer_worlds: Vec<WorldRef> = worlds.to_vec();
 
         let writer = std::thread::Builder::new()
             .name("scrollback-writer".to_string())
@@ -676,25 +450,6 @@ impl ScrollbackDb {
                     }
                 };
                 tune_connection(&conn);
-
-                // Convert before serving the queue. Entries pile up in the
-                // (unbounded) channel meanwhile — which is exactly why the bounded
-                // try_send channel had to go first: it would have dropped every
-                // line after the first few thousand.
-                if archive_state(&conn) == ArchiveState::NeedsMigration {
-                    let t0 = Instant::now();
-                    crate::debug_log(true, "SCROLLBACK: migrating archive to schema v2...");
-                    match migrate_to_v2(&conn, &writer_worlds) {
-                        Ok(()) => crate::debug_log(true, &format!(
-                            "SCROLLBACK: migration finished in {:?}", t0.elapsed()
-                        )),
-                        Err(e) => crate::debug_log(true, &format!(
-                            "SCROLLBACK: migration aborted ({e}); continuing on the legacy schema"
-                        )),
-                    }
-                }
-                let schema_ready = archive_state(&conn) == ArchiveState::Ready;
-                let too_new = archive_state(&conn) == ArchiveState::TooNew;
                 let mut wid_cache: std::collections::HashMap<String, (i64, i64)> =
                     std::collections::HashMap::new();
 
@@ -713,10 +468,10 @@ impl ScrollbackDb {
                             // there will ever be — drain it rather than one batch.
                             while !batch.is_empty() {
                                 let before = batch.len();
-                                flush_batch(&conn, &mut batch, &writer_stats, schema_ready && !too_new, &mut wid_cache);
+                                flush_batch(&conn, &mut batch, &writer_stats, writable, &mut wid_cache);
                                 if batch.len() == before {
                                     std::thread::sleep(Duration::from_millis(20));
-                                    flush_batch(&conn, &mut batch, &writer_stats, schema_ready && !too_new, &mut wid_cache);
+                                    flush_batch(&conn, &mut batch, &writer_stats, writable, &mut wid_cache);
                                     if batch.len() == before {
                                         writer_stats
                                             .write_failed
@@ -762,12 +517,12 @@ impl ScrollbackDb {
                                 break;
                             }
                             let before = batch.len();
-                            flush_batch(&conn, &mut batch, &writer_stats, schema_ready && !too_new, &mut wid_cache);
+                            flush_batch(&conn, &mut batch, &writer_stats, writable, &mut wid_cache);
                             if batch.len() == before {
                                 // Could not write; retrying immediately would spin.
                                 // Give the lock a moment, then try once more.
                                 std::thread::sleep(Duration::from_millis(20));
-                                flush_batch(&conn, &mut batch, &writer_stats, schema_ready && !too_new, &mut wid_cache);
+                                flush_batch(&conn, &mut batch, &writer_stats, writable, &mut wid_cache);
                                 if batch.len() == before {
                                     writer_stats
                                         .write_failed
@@ -788,7 +543,7 @@ impl ScrollbackDb {
 
                     if should_flush {
                         let before = batch.len();
-                        flush_batch(&conn, &mut batch, &writer_stats, schema_ready && !too_new, &mut wid_cache);
+                        flush_batch(&conn, &mut batch, &writer_stats, writable, &mut wid_cache);
                         last_flush = Instant::now();
                         // flush_batch RETAINS the batch when the transaction could
                         // not even be started (a transient lock). Back off instead
@@ -805,7 +560,8 @@ impl ScrollbackDb {
 
         // Control connection for sequence allocation. Separate from the writer's
         // so a long batch commit never blocks a producer needing a number.
-        let alloc = Connection::open(path).ok().map(|c| {
+        // None for a refused file, so nothing reserves numbers in it either.
+        let alloc = Connection::open(path).ok().filter(|_| writable).map(|c| {
             tune_connection(&c);
             WseqAllocator { conn: c, blocks: std::collections::HashMap::new() }
         });
@@ -831,56 +587,31 @@ impl ScrollbackDb {
             Some(c) => c,
             None => return Vec::new(),
         };
+        if archive_state(&conn) != ArchiveState::Ready {
+            return Vec::new();
+        }
 
-        // Build WHERE clause
-        let mut conditions: Vec<String> = Vec::new();
+        // Worlds are a dimension table, and the stripped text is recomputed below.
+        let mut conds: Vec<String> = Vec::new();
         if let Some(w) = world {
-            conditions.push(format!("world = '{}'", w.replace('\'', "''")));
+            conds.push(format!("w.name = '{}' COLLATE NOCASE", w.replace('\'', "''")));
         }
         if let Some(since) = since_ms {
-            conditions.push(format!("ts_ms >= {}", since));
+            conds.push(format!("o.ts_ms >= {}", since));
         }
         if let Some(until) = until_ms {
-            conditions.push(format!("ts_ms <= {}", until));
+            conds.push(format!("o.ts_ms <= {}", until));
         }
-
-        // For FTS we search on line_text; for regex we do it in Rust after fetching
-        let where_clause = if conditions.is_empty() {
+        let where_clause = if conds.is_empty() {
             String::new()
         } else {
-            format!("WHERE {}", conditions.join(" AND "))
+            format!("WHERE {}", conds.join(" AND "))
         };
-
-        // The v2 table has no `world` column (worlds are a dimension table) and no
-        // `line_text` (it is recomputed). Both shapes must be readable: the
-        // migration runs on the writer thread, so a read can land before it.
-        let sql = if archive_state(&conn) == ArchiveState::Ready {
-            let mut conds: Vec<String> = Vec::new();
-            if let Some(w) = world {
-                conds.push(format!("w.name = '{}' COLLATE NOCASE", w.replace('\'', "''")));
-            }
-            if let Some(since) = since_ms {
-                conds.push(format!("o.ts_ms >= {}", since));
-            }
-            if let Some(until) = until_ms {
-                conds.push(format!("o.ts_ms <= {}", until));
-            }
-            let where_v2 = if conds.is_empty() {
-                String::new()
-            } else {
-                format!("WHERE {}", conds.join(" AND "))
-            };
-            format!(
-                "SELECT o.ts_ms, w.name, o.line_raw FROM output_log o
-                 JOIN worlds w ON w.wid = o.wid {} ORDER BY o.ts_ms ASC",
-                where_v2
-            )
-        } else {
-            format!(
-                "SELECT ts_ms, world, line_raw FROM output_log {} ORDER BY ts_ms ASC",
-                where_clause
-            )
-        };
+        let sql = format!(
+            "SELECT o.ts_ms, w.name, o.line_raw FROM output_log o
+             JOIN worlds w ON w.wid = o.wid {} ORDER BY o.ts_ms ASC",
+            where_clause
+        );
 
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
@@ -1002,19 +733,15 @@ pub fn query(path: &Path, q: &ArchiveQuery) -> Vec<ScrollbackLine> {
         None => return Vec::new(),
     };
     if archive_state(&conn) != ArchiveState::Ready {
-        // Pre-migration file: fall back to the legacy path so the first run after
-        // an upgrade still answers, just without the sequence boundary.
-        return ScrollbackDb::search(
-            path, q.world, q.pattern, q.since_ms, q.until_ms, q.limit,
-            q.kind == PatternKind::Regex,
-        );
+        return Vec::new();
     }
 
     let regex = build_pattern_regex(q.pattern, q.kind);
     // FTS is a CANDIDATE FILTER only: every surviving row is still matched by the
     // regex above. Over-matching from tokenisation is harmless; under-matching is
     // a silent wrong answer, which is why `fts_match_expr` refuses anything it
-    // cannot represent exactly.
+    // cannot represent exactly. `migration_state = done` says the index covers
+    // every row (the key keeps its name from the old upgrade, which set it last).
     let mut fts_expr = if meta_get(&conn, "migration_state").as_deref() == Some("done") {
         fts_match_expr(q.pattern, q.kind)
     } else {
@@ -1207,21 +934,15 @@ pub fn load_before_path(path: &Path, world: &str, before_ts_ms: i64, count: usiz
         None => return Vec::new(),
     };
 
+    if archive_state(&conn) != ArchiveState::Ready {
+        return Vec::new();
+    }
+
     // Fetch the N rows just before the timestamp, then reverse to get oldest-first
-    let sql = if archive_state(&conn) == ArchiveState::Ready {
-        "SELECT o.ts_ms, w.name, o.line_raw, o.gagged FROM output_log o \
+    let sql = "SELECT o.ts_ms, w.name, o.line_raw, o.gagged FROM output_log o \
          JOIN worlds w ON w.wid = o.wid \
          WHERE w.name = ?1 COLLATE NOCASE AND o.ts_ms < ?2 \
-         ORDER BY o.ts_ms DESC LIMIT ?3"
-    } else if has_column(&conn, "output_log", "gagged") {
-        "SELECT ts_ms, world, line_raw, gagged FROM output_log \
-         WHERE world = ?1 AND ts_ms < ?2 \
-         ORDER BY ts_ms DESC LIMIT ?3"
-    } else {
-        "SELECT ts_ms, world, line_raw, 0 FROM output_log \
-         WHERE world = ?1 AND ts_ms < ?2 \
-         ORDER BY ts_ms DESC LIMIT ?3"
-    };
+         ORDER BY o.ts_ms DESC LIMIT ?3";
 
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
@@ -1268,8 +989,8 @@ fn resolve_wid(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    // Match on name for a world the migration never saw. Phase 4 replaces this
-    // with a uuid-keyed lookup driven by the producer.
+    // The producer had no number for this line (allocator unreachable), so all
+    // there is to go on is the world's name.
     let wid: i64 = conn
         .query_row("SELECT wid FROM worlds WHERE name = ?1 ORDER BY wid LIMIT 1", params![world], |r| r.get(0))
         .or_else(|_| {
@@ -1300,14 +1021,22 @@ fn resolve_wid(
 /// up to a full batch of real MUD output on a transient SQLITE_BUSY — the exact
 /// "no record loss" violation this archive is supposed to prevent. The caller
 /// detects the retained batch and backs off.
+///
+/// `writable` is false for a refused file (see `ScrollbackDb::open`): the batch is
+/// counted as failed and dropped, never written.
 fn flush_batch(
     conn: &Connection,
     batch: &mut Vec<ArchiveEntry>,
     stats: &Arc<ArchiveStats>,
-    v2: bool,
+    writable: bool,
     wid_cache: &mut std::collections::HashMap<String, (i64, i64)>,
 ) {
     if batch.is_empty() {
+        return;
+    }
+    if !writable {
+        stats.write_failed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        batch.clear();
         return;
     }
     let tx = match conn.unchecked_transaction() {
@@ -1323,44 +1052,31 @@ fn flush_batch(
 
     let mut failed: Vec<ArchiveEntry> = Vec::new();
     for row in batch.drain(..) {
-        let res = if v2 {
-            // Prefer the producer's number; fall back to writer-side assignment
-            // so a line is never dropped just because the allocator was busy.
-            let slot = match (row.wid, row.wseq) {
-                (Some(wid), Some(wseq)) => Some((wid, wseq)),
-                _ => resolve_wid(&tx, &row.world, wid_cache),
-            };
-            match slot {
-                Some((wid, wseq)) => {
-                    let r = tx.execute(
-                        "INSERT INTO output_log (wid, wseq, ts_ms, line_raw, gagged)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![wid, wseq, row.ts_ms, row.text, row.gagged as i32],
-                    );
-                    if r.is_ok() {
-                        // Index the ANSI-stripped form, in the same transaction, so
-                        // the index can never disagree with the table. There are no
-                        // triggers because a trigger cannot strip ANSI.
-                        let rowid = tx.last_insert_rowid();
-                        let _ = tx.execute(
-                            "INSERT INTO output_fts (rowid, txt) VALUES (?1, ?2)",
-                            params![rowid, crate::util::strip_ansi_codes(&row.text)],
-                        );
-                    }
-                    r
-                }
-                None => {
-                    failed.push(row);
-                    continue;
-                }
-            }
-        } else {
-            let line_text = crate::util::strip_ansi_codes(&row.text);
-            tx.execute(
-                "INSERT INTO output_log (ts_ms, world, line_raw, line_text, gagged) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![row.ts_ms, row.world, row.text, line_text, row.gagged as i32],
-            )
+        // Prefer the producer's number; fall back to writer-side assignment
+        // so a line is never dropped just because the allocator was busy.
+        let slot = match (row.wid, row.wseq) {
+            (Some(wid), Some(wseq)) => Some((wid, wseq)),
+            _ => resolve_wid(&tx, &row.world, wid_cache),
         };
+        let Some((wid, wseq)) = slot else {
+            failed.push(row);
+            continue;
+        };
+        let res = tx.execute(
+            "INSERT INTO output_log (wid, wseq, ts_ms, line_raw, gagged)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![wid, wseq, row.ts_ms, row.text, row.gagged as i32],
+        );
+        if res.is_ok() {
+            // Index the ANSI-stripped form, in the same transaction, so
+            // the index can never disagree with the table. There are no
+            // triggers because a trigger cannot strip ANSI.
+            let rowid = tx.last_insert_rowid();
+            let _ = tx.execute(
+                "INSERT INTO output_fts (rowid, txt) VALUES (?1, ?2)",
+                params![rowid, crate::util::strip_ansi_codes(&row.text)],
+            );
+        }
         if let Err(e) = res {
             crate::debug_log(true, &format!(
                 "SCROLLBACK: insert failed ({e}) for [{}] {}", row.world, row.text
@@ -1384,90 +1100,24 @@ fn flush_batch(
 
 /// Export the entire archive to a CSV file.  Returns the number of data rows written.
 ///
-/// Columns: id, world, datetime_local, ts_epoch_ms, gagged, text, raw
-/// Rows sorted by world ascending then timestamp ascending.
+/// Columns: id, world, datetime_local, ts_epoch_ms, gagged, text, raw, wseq. `text`
+/// is the ANSI-stripped form, derived as `search` derives it for matching.
+/// Rows sorted by world ascending then archive sequence ascending.
 /// Returns `Err(String)` with a human-readable message on failure.
 pub fn export_csv(db_path: &Path, out_path: &Path) -> Result<usize, String> {
+    use std::io::Write;
     let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("cannot open database: {}", e))?;
     tune_connection(&conn);
-
-    // Check whether the gagged column exists (absent in DBs before this migration).
-    let has_gagged: bool = {
-        let mut stmt = conn.prepare("PRAGMA table_info(output_log)")
-            .map_err(|e| format!("PRAGMA table_info failed: {}", e))?;
-        let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("query_map failed: {}", e))?
-            .flatten()
-            .collect();
-        cols.iter().any(|c| c == "gagged")
-    };
-
-    if archive_state(&conn) == ArchiveState::Ready {
-        return export_csv_v2(&conn, out_path);
-    }
-    let sql = if has_gagged {
-        "SELECT id, ts_ms, world, line_raw, line_text, gagged \
-         FROM output_log ORDER BY world ASC, ts_ms ASC"
-    } else {
-        "SELECT id, ts_ms, world, line_raw, line_text, 0 \
-         FROM output_log ORDER BY world ASC, ts_ms ASC"
-    };
-
-    let mut stmt = conn.prepare(sql)
-        .map_err(|e| format!("prepare failed: {}", e))?;
-
-    use std::io::Write as _;
-    let mut file = std::fs::File::create(out_path)
-        .map_err(|e| format!("cannot create {}: {}", out_path.display(), e))?;
-
-    // Header row
-    writeln!(file, "id,world,datetime_local,ts_epoch_ms,gagged,text,raw")
-        .map_err(|e| format!("write error: {}", e))?;
-
-    let mut count = 0usize;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,    // id
-            row.get::<_, i64>(1)?,    // ts_ms
-            row.get::<_, String>(2)?, // world
-            row.get::<_, String>(3)?, // line_raw
-            row.get::<_, String>(4)?, // line_text
-            row.get::<_, i32>(5)?,    // gagged
-        ))
-    }).map_err(|e| format!("query failed: {}", e))?;
-
-    for row in rows.flatten() {
-        let (id, ts_ms, world, line_raw, line_text, gagged_int) = row;
-        let ts_secs = ts_ms / 1000;
-        let lt = crate::util::local_time_from_epoch(ts_secs);
-        let datetime_str = format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second
-        );
-        let gagged_str = if gagged_int != 0 { "true" } else { "false" };
-        writeln!(
-            file,
-            "{},{},{},{},{},{},{}",
-            id,
-            csv_escape(&world),
-            csv_escape(&datetime_str),
-            ts_ms,
-            gagged_str,
-            csv_escape(&line_text),
-            csv_escape(&line_raw),
-        ).map_err(|e| format!("write error: {}", e))?;
-        count += 1;
+    match archive_state(&conn) {
+        ArchiveState::Ready => {}
+        ArchiveState::Empty => return Err("the archive is empty".to_string()),
+        ArchiveState::Old => return Err(format!(
+            "{} is an archive from before Clay 1.5.41, which this Clay does not read", db_path.display())),
+        ArchiveState::TooNew => return Err(format!(
+            "{} was written by a newer Clay", db_path.display())),
     }
 
-    Ok(count)
-}
-
-/// v2 export. `line_text` is no longer stored, so the stripped column is derived
-/// the same way `search` already derives it for matching. The six legacy columns
-/// keep their exact names, order and formatting; `wseq` is appended.
-fn export_csv_v2(conn: &Connection, out_path: &Path) -> Result<usize, String> {
-    use std::io::Write;
     let mut file = std::fs::File::create(out_path)
         .map_err(|e| format!("cannot create {}: {}", out_path.display(), e))?;
     writeln!(file, "id,world,datetime_local,ts_epoch_ms,gagged,text,raw,wseq")
@@ -1533,14 +1183,10 @@ fn csv_escape(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 //
-// This module had none before the schema work, and nothing anywhere else in the
-// crate opens a rusqlite `Connection` in a test. Every function here takes an
-// explicit `&Path`, so a test can never reach the developer's real
-// `~/.clay/scrollback.db` — but that only holds as long as new code keeps taking
-// the path as a parameter rather than calling `clay_config_path` internally.
-//
-// The point of this module is to pin CURRENT behaviour before the v2 schema
-// lands, so the migration can be shown to preserve it.
+// Every function here takes an explicit `&Path`, so a test can never reach the
+// developer's real `~/.clay/scrollback.db` — but that only holds as long as new
+// code keeps taking the path as a parameter rather than calling
+// `clay_config_path` internally.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
@@ -1585,58 +1231,15 @@ mod tests {
         }
     }
 
-    /// Build a database in the pre-v2 schema. `with_gagged` reproduces the two
-    /// legacy shapes in the wild: databases created before the `gagged` column
-    /// existed, and those created after.
-    ///
-    /// Rows are `(ts_ms, world, line_raw, gagged)`; `line_text` is derived the
-    /// same way the writer thread derives it.
-    fn write_legacy_db(path: &Path, with_gagged: bool, rows: &[(i64, &str, &str, bool)]) {
-        let conn = Connection::open(path).expect("open legacy db");
-        if with_gagged {
-            conn.execute_batch(
-                "CREATE TABLE output_log (
-                     id        INTEGER PRIMARY KEY,
-                     ts_ms     INTEGER NOT NULL,
-                     world     TEXT NOT NULL,
-                     line_raw  TEXT NOT NULL,
-                     line_text TEXT NOT NULL,
-                     gagged    INTEGER NOT NULL DEFAULT 0
-                 );
-                 CREATE INDEX idx_world_ts ON output_log(world, ts_ms);",
-            )
-            .expect("create legacy schema");
-        } else {
-            conn.execute_batch(
-                "CREATE TABLE output_log (
-                     id        INTEGER PRIMARY KEY,
-                     ts_ms     INTEGER NOT NULL,
-                     world     TEXT NOT NULL,
-                     line_raw  TEXT NOT NULL,
-                     line_text TEXT NOT NULL
-                 );
-                 CREATE INDEX idx_world_ts ON output_log(world, ts_ms);",
-            )
-            .expect("create pre-gagged legacy schema");
-        }
+    /// Build an archive holding `rows` (`(ts_ms, world, line_raw, gagged)`), written
+    /// through the real writer, in order.
+    fn write_db(path: &Path, rows: &[(i64, &str, &str, bool)]) {
+        let mut sdb = ScrollbackDb::open(path).expect("open");
+        let tx = sdb.sender();
         for (ts_ms, world, line_raw, gagged) in rows {
-            let line_text = crate::util::strip_ansi_codes(line_raw);
-            if with_gagged {
-                conn.execute(
-                    "INSERT INTO output_log (ts_ms, world, line_raw, line_text, gagged)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![ts_ms, world, line_raw, line_text, *gagged as i32],
-                )
-                .expect("insert legacy row");
-            } else {
-                conn.execute(
-                    "INSERT INTO output_log (ts_ms, world, line_raw, line_text)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![ts_ms, world, line_raw, line_text],
-                )
-                .expect("insert pre-gagged legacy row");
-            }
+            assert!(tx.send(ArchiveEntry::new(world.to_string(), *ts_ms, line_raw.to_string(), *gagged)));
         }
+        sdb.flush_and_close();
     }
 
     /// Representative fixture: two worlds, ANSI colour, a name needing SQL
@@ -1657,7 +1260,7 @@ mod tests {
     #[test]
     fn test_search_filters_by_world_and_glob_pattern() {
         let db = TempDb::new("search_world");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let hits = ScrollbackDb::search(db.path(), Some("Zmc"), "*dragon*", None, None, 100, false);
         let texts: Vec<&str> = hits.iter().map(|l| l.text.as_str()).collect();
@@ -1675,7 +1278,7 @@ mod tests {
     #[test]
     fn test_search_matches_against_ansi_stripped_text() {
         let db = TempDb::new("search_ansi");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         // "the dragon flees" only reads contiguously once the SGR codes between
         // "dragon" and "flees" are stripped.
@@ -1692,7 +1295,7 @@ mod tests {
     #[test]
     fn test_search_world_name_containing_a_quote() {
         let db = TempDb::new("search_quote");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let hits = ScrollbackDb::search(db.path(), Some("O'Brien"), "*", None, None, 100, false);
         assert_eq!(hits.len(), 1, "an apostrophe in a world name must not break the query");
@@ -1702,7 +1305,7 @@ mod tests {
     #[test]
     fn test_search_all_worlds_when_world_is_none() {
         let db = TempDb::new("search_all");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let hits = ScrollbackDb::search(db.path(), None, "*dragon*", None, None, 100, false);
         assert_eq!(hits.len(), 5, "no world filter searches every world");
@@ -1711,7 +1314,7 @@ mod tests {
     #[test]
     fn test_search_regex_mode() {
         let db = TempDb::new("search_regex");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let hits = ScrollbackDb::search(
             db.path(), Some("Zmc"), r"^a \w+ (roars|appears)", None, None, 100, true,
@@ -1722,7 +1325,7 @@ mod tests {
     #[test]
     fn test_search_time_bounds() {
         let db = TempDb::new("search_time");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let hits = ScrollbackDb::search(
             db.path(), Some("Zmc"), "*", Some(2_000), Some(3_000), 100, false,
@@ -1734,13 +1337,13 @@ mod tests {
     #[test]
     fn test_search_returns_ascending_and_limit_keeps_the_oldest() {
         let db = TempDb::new("search_limit");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let hits = ScrollbackDb::search(db.path(), Some("Zmc"), "*", None, None, 2, false);
         let ts: Vec<i64> = hits.iter().map(|l| l.ts_ms).collect();
         // Pinning today's behaviour deliberately: results come back oldest-first
         // and the limit therefore keeps the OLDEST matches, hiding recent history
-        // on a large archive. The v2 query reverses this on purpose.
+        // on a large archive. `query`'s `newest_first` reverses this on purpose.
         assert_eq!(ts, vec![1_000, 2_000]);
     }
 
@@ -1751,24 +1354,12 @@ mod tests {
         assert!(hits.is_empty(), "a missing file must not panic");
     }
 
-    #[test]
-    fn test_search_reads_a_pre_gagged_database() {
-        let db = TempDb::new("search_nogagged");
-        write_legacy_db(db.path(), false, &fixture());
-
-        let hits = ScrollbackDb::search(db.path(), Some("Zmc"), "*dragon*", None, None, 100, false);
-        assert_eq!(
-            hits.len(), 3,
-            "search never selects `gagged`, so it works on a database predating that column"
-        );
-    }
-
     // -- load_before_path --------------------------------------------------
 
     #[test]
     fn test_load_before_path_returns_oldest_first_and_excludes_the_boundary() {
         let db = TempDb::new("loadbefore");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let lines = load_before_path(db.path(), "Zmc", 4_000, 10);
         let ts: Vec<i64> = lines.iter().map(|l| l.ts_ms).collect();
@@ -1778,7 +1369,7 @@ mod tests {
     #[test]
     fn test_load_before_path_count_keeps_the_newest_and_still_sorts_oldest_first() {
         let db = TempDb::new("loadbefore_count");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let lines = load_before_path(db.path(), "Zmc", 5_000, 2);
         let ts: Vec<i64> = lines.iter().map(|l| l.ts_ms).collect();
@@ -1788,7 +1379,7 @@ mod tests {
     #[test]
     fn test_load_before_path_does_not_filter_gagged() {
         let db = TempDb::new("loadbefore_gagged");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let lines = load_before_path(db.path(), "Zmc", 5_000, 10);
         assert!(
@@ -1808,7 +1399,7 @@ mod tests {
     #[test]
     fn test_export_csv_shape_and_ordering() {
         let db = TempDb::new("csv");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
         let out = std::env::temp_dir().join(format!("clay_test_csv_{}.csv", std::process::id()));
         let _ = std::fs::remove_file(&out);
 
@@ -1818,10 +1409,10 @@ mod tests {
         let body = std::fs::read_to_string(&out).expect("read csv");
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(
-            lines[0], "id,world,datetime_local,ts_epoch_ms,gagged,text,raw",
-            "the header is a user-facing contract"
+            lines[0], "id,world,datetime_local,ts_epoch_ms,gagged,text,raw,wseq",
+            "the header is a user-facing contract: the six original columns, then wseq"
         );
-        // Sorted by world ASC then ts ASC: O'Brien, Other, then Zmc's four.
+        // Sorted by world ASC then wseq ASC: O'Brien, Other, then Zmc's four.
         assert!(lines[1].contains("O'Brien"));
         assert!(lines[2].contains("Other"));
         assert_eq!(lines.len(), 7);
@@ -1830,22 +1421,6 @@ mod tests {
         let coloured = lines.iter().find(|l| l.contains("flees west")).expect("coloured row");
         assert!(coloured.contains("the dragon flees west"));
         assert!(coloured.contains('\x1b'));
-
-        let _ = std::fs::remove_file(&out);
-    }
-
-    #[test]
-    fn test_export_csv_on_a_pre_gagged_database() {
-        let db = TempDb::new("csv_nogagged");
-        write_legacy_db(db.path(), false, &fixture());
-        let out = std::env::temp_dir()
-            .join(format!("clay_test_csv_ng_{}.csv", std::process::id()));
-        let _ = std::fs::remove_file(&out);
-
-        let n = export_csv(db.path(), &out).expect("export from pre-gagged db");
-        assert_eq!(n, 6, "the PRAGMA table_info fallback substitutes 0 for the missing column");
-        let body = std::fs::read_to_string(&out).expect("read csv");
-        assert!(body.lines().skip(1).all(|l| l.contains(",false,")));
 
         let _ = std::fs::remove_file(&out);
     }
@@ -1864,7 +1439,7 @@ mod tests {
     fn test_open_then_send_persists_rows() {
         let db = TempDb::new("writer");
         {
-            let sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+            let sdb = ScrollbackDb::open(db.path()).expect("open");
             let tx = sdb.sender();
             for i in 0..5 {
                 assert!(tx.send(ArchiveEntry::new("Zmc".to_string(), 1_000 + i, format!("line {i}"), false)));
@@ -1890,7 +1465,7 @@ mod tests {
         // The hot-reload path exits with senders still alive, so the writer never
         // sees a disconnect. flush_and_close is what makes that lossless.
         let db = TempDb::new("flush_close");
-        let mut sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+        let mut sdb = ScrollbackDb::open(db.path()).expect("open");
         assert_eq!(sdb.path(), db.path(), "the handle must report the file it writes");
         let tx = sdb.sender();
         // Deliberately far more than one batch (and more than the writer's 1000-row
@@ -1919,15 +1494,15 @@ mod tests {
         // which every read path here turns into an empty Vec — reported to the user
         // as "No matches", indistinguishable from an empty archive.
         let db = TempDb::new("busy");
-        write_legacy_db(db.path(), true, &fixture());
+        write_db(db.path(), &fixture());
 
         let writer = Connection::open(db.path()).expect("writer conn");
         tune_connection(&writer);
         writer.execute_batch("BEGIN IMMEDIATE;").expect("take the write lock");
         writer
             .execute(
-                "INSERT INTO output_log (ts_ms, world, line_raw, line_text, gagged) \
-                 VALUES (9000, 'Zmc', 'held', 'held', 0)",
+                "INSERT INTO output_log (wid, wseq, ts_ms, line_raw, gagged) \
+                 VALUES (1, 900000, 9000, 'held', 0)",
                 [],
             )
             .expect("write inside the held transaction");
@@ -1939,217 +1514,44 @@ mod tests {
         writer.execute_batch("COMMIT;").expect("release");
     }
 
-    // -- migration ---------------------------------------------------------
+    // -- refused files -----------------------------------------------------
 
-    fn wseqs_for(conn: &Connection, world: &str) -> Vec<i64> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT o.wseq FROM output_log o JOIN worlds w ON w.wid = o.wid
-                 WHERE w.name = ?1 ORDER BY o.id",
-            )
-            .expect("prepare");
-        stmt.query_map(params![world], |r| r.get::<_, i64>(0))
-            .expect("query")
-            .flatten()
-            .collect()
-    }
-
+    /// An archive in the layout before v1.5.41's (no `wid`) is refused like a newer one:
+    /// left exactly as it is, never written, and read as empty by every reader.
     #[test]
-    fn test_migration_preserves_every_row_and_rebuilds_wseq_in_id_order() {
-        let db = TempDb::new("mig_basic");
-        write_legacy_db(db.path(), true, &fixture());
-
-        let conn = Connection::open(db.path()).expect("open");
-        tune_connection(&conn);
-        let worlds = vec![WorldRef { world_uuid: "uuid-zmc".into(), name: "Zmc".into() }];
-        migrate_to_v2(&conn, &worlds).expect("migration");
-
-        assert_eq!(user_version(&conn), SCHEMA_VERSION);
-        assert_eq!(
-            meta_get(&conn, "migration_state").as_deref(), Some("done"),
-            "state must reach 'done' so readers can enable the fast path"
-        );
-
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM output_log", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, fixture().len() as i64, "no row may be lost");
-
-        // wseq is dense from 0 per world, in id (insertion) order — never ts order.
-        assert_eq!(wseqs_for(&conn, "Zmc"), vec![0, 1, 2, 3]);
-        assert_eq!(wseqs_for(&conn, "Other"), vec![0]);
-        assert_eq!(wseqs_for(&conn, "O'Brien"), vec![0]);
-
-        // The dropped column is really gone, and the legacy table with it.
-        assert!(!has_column(&conn, "output_log", "line_text"));
-        assert!(!has_column(&conn, "output_log", "world"));
-        assert!(!table_exists(&conn, "output_log_legacy"));
-
-        // The allocator is seeded past everything copied.
-        let next: i64 = conn
-            .query_row(
-                "SELECT next_wseq FROM worlds w WHERE w.name = 'Zmc'", [], |r| r.get(0))
-            .unwrap();
-        assert!(next >= 4, "next_wseq must clear the migrated rows, got {next}");
-    }
-
-    #[test]
-    fn test_migration_attributes_claimed_worlds_and_orphans_the_rest() {
-        let db = TempDb::new("mig_attr");
-        write_legacy_db(db.path(), true, &fixture());
-
-        let conn = Connection::open(db.path()).expect("open");
-        tune_connection(&conn);
-        // Only Zmc is claimed, and deliberately with different casing: memory
-        // matches names case-insensitively while SQL does not.
-        let worlds = vec![WorldRef { world_uuid: "uuid-zmc".into(), name: "zMC".into() }];
-        migrate_to_v2(&conn, &worlds).expect("migration");
-
-        let claimed: String = conn
-            .query_row("SELECT world_uuid FROM worlds WHERE name = 'Zmc'", [], |r| r.get(0))
-            .expect("Zmc row");
-        assert_eq!(claimed, "uuid-zmc", "case-insensitive match must claim the world");
-        let orphan_flag: i64 = conn
-            .query_row("SELECT orphan FROM worlds WHERE name = 'Zmc'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(orphan_flag, 0);
-
-        let orphans: i64 = conn
-            .query_row("SELECT COUNT(*) FROM worlds WHERE orphan = 1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(orphans, 2, "Other and O'Brien have no live world; they become orphans");
-
-        // Orphaned history is preserved, never dropped.
-        let kept: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM output_log o JOIN worlds w ON w.wid = o.wid
-                 WHERE w.orphan = 1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(kept, 2, "orphan rows must survive the migration");
-    }
-
-    #[test]
-    fn test_migration_resumes_from_a_partial_copy_without_duplicating() {
-        // Simulates a process killed mid-copy: output_log_v2 already holds some
-        // rows. The re-run must continue, not restart and not duplicate.
-        let db = TempDb::new("mig_resume");
-        write_legacy_db(db.path(), true, &fixture());
-
-        let conn = Connection::open(db.path()).expect("open");
-        tune_connection(&conn);
-        conn.execute_batch(SCHEMA_V2).unwrap();
-        conn.execute_batch(&output_log_v2_ddl("output_log_v2")).unwrap();
-        conn.execute(
-            "INSERT INTO worlds (world_uuid, name, next_wseq, orphan, created_ms)
-             VALUES ('uuid-zmc', 'Zmc', 0, 0, 0)", []).unwrap();
-        let wid: i64 = conn
-            .query_row("SELECT wid FROM worlds WHERE name='Zmc'", [], |r| r.get(0)).unwrap();
-        // First two Zmc rows already copied, ids 1 and 2.
-        conn.execute(
-            "INSERT INTO output_log_v2 (id, wid, wseq, ts_ms, line_raw, gagged)
-             SELECT id, ?1, id - 1, ts_ms, line_raw, gagged FROM output_log
-             WHERE world='Zmc' AND id <= 2", params![wid]).unwrap();
-        meta_set(&conn, "migration_state", "copying");
-
-        let worlds = vec![WorldRef { world_uuid: "uuid-zmc".into(), name: "Zmc".into() }];
-        migrate_to_v2(&conn, &worlds).expect("resumed migration");
-
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM output_log", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, fixture().len() as i64, "resume must not duplicate or drop rows");
-        assert_eq!(wseqs_for(&conn, "Zmc"), vec![0, 1, 2, 3], "sequence stays dense across a resume");
-    }
-
-    #[test]
-    fn test_migration_of_a_pre_gagged_database() {
-        let db = TempDb::new("mig_nogagged");
-        write_legacy_db(db.path(), false, &fixture());
-
-        let conn = Connection::open(db.path()).expect("open");
-        tune_connection(&conn);
-        migrate_to_v2(&conn, &[]).expect("migration from pre-gagged schema");
-
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM output_log", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, fixture().len() as i64);
-        let gagged: i64 = conn
-            .query_row("SELECT COUNT(*) FROM output_log WHERE gagged = 1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(gagged, 0, "a database with no gagged column defaults every row to 0");
-    }
-
-    #[test]
-    fn test_open_migrates_a_legacy_database_end_to_end() {
-        let db = TempDb::new("mig_open");
-        write_legacy_db(db.path(), true, &fixture());
+    fn test_an_archive_from_before_v2_is_refused_and_left_untouched() {
+        let db = TempDb::new("pre_v2");
+        {
+            let conn = Connection::open(db.path()).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE output_log (
+                     id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, world TEXT NOT NULL,
+                     line_raw TEXT NOT NULL, line_text TEXT NOT NULL,
+                     gagged INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO output_log (ts_ms, world, line_raw, line_text)
+                     VALUES (1000, 'Zmc', 'a dragon roars', 'a dragon roars');",
+            ).expect("old layout");
+        }
+        let before = std::fs::read(db.path()).expect("read");
 
         {
-            let worlds = vec![WorldRef { world_uuid: "uuid-zmc".into(), name: "Zmc".into() }];
-            let mut sdb = ScrollbackDb::open(db.path(), &worlds).expect("open");
-            let tx = sdb.sender();
-            // A line archived while (or just after) the migration runs must land.
-            assert!(tx.send(ArchiveEntry::new("Zmc".to_string(), 9_000, "post-migration line".to_string(), false)));
+            let mut sdb = ScrollbackDb::open(db.path()).expect("open");
+            assert!(sdb.sender().send(ArchiveEntry::new("Zmc".into(), 2_000, "new line".into(), false)));
             sdb.flush_and_close();
+            assert_eq!(sdb.stats().write_failed.load(Ordering::Relaxed), 1,
+                "a line for a refused archive is counted, so /info can say so");
         }
+        assert_eq!(std::fs::read(db.path()).expect("reread"), before, "the file must be left exactly as it was");
 
-        let conn = Connection::open(db.path()).expect("reopen");
-        assert_eq!(archive_state(&conn), ArchiveState::Ready);
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM output_log", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, fixture().len() as i64 + 1, "migrated rows plus the new one");
-
-        // And it is reachable through the normal read path.
-        let hits = ScrollbackDb::search(db.path(), Some("Zmc"), "*post-migration*", None, None, 10, false);
-        assert_eq!(hits.len(), 1);
-    }
-
-    #[test]
-    fn test_search_and_page_up_agree_before_and_after_migration() {
-        // The read paths must return the same thing either side of the swap;
-        // that is what makes the migration invisible to the user.
-        let db = TempDb::new("mig_reads");
-        write_legacy_db(db.path(), true, &fixture());
-
-        let before_search: Vec<String> =
-            ScrollbackDb::search(db.path(), Some("Zmc"), "*dragon*", None, None, 100, false)
-                .into_iter().map(|l| l.text).collect();
-        let before_page: Vec<String> =
-            load_before_path(db.path(), "Zmc", 5_000, 10).into_iter().map(|l| l.text).collect();
-        assert!(!before_search.is_empty() && !before_page.is_empty());
-
-        let conn = Connection::open(db.path()).expect("open");
-        tune_connection(&conn);
-        migrate_to_v2(&conn, &[WorldRef { world_uuid: "u".into(), name: "Zmc".into() }])
-            .expect("migration");
-        drop(conn);
-
-        let after_search: Vec<String> =
-            ScrollbackDb::search(db.path(), Some("Zmc"), "*dragon*", None, None, 100, false)
-                .into_iter().map(|l| l.text).collect();
-        let after_page: Vec<String> =
-            load_before_path(db.path(), "Zmc", 5_000, 10).into_iter().map(|l| l.text).collect();
-
-        assert_eq!(before_search, after_search, "search results must be unchanged by migration");
-        assert_eq!(before_page, after_page, "Page Up results must be unchanged by migration");
-    }
-
-    #[test]
-    fn test_export_csv_after_migration_keeps_the_legacy_columns() {
-        let db = TempDb::new("mig_csv");
-        write_legacy_db(db.path(), true, &fixture());
-        let conn = Connection::open(db.path()).expect("open");
-        tune_connection(&conn);
-        migrate_to_v2(&conn, &[]).expect("migration");
-        drop(conn);
-
-        let out = std::env::temp_dir().join(format!("clay_test_csv_v2_{}.csv", std::process::id()));
-        let _ = std::fs::remove_file(&out);
-        let n = export_csv(db.path(), &out).expect("export");
-        assert_eq!(n, 6);
-        let body = std::fs::read_to_string(&out).expect("read");
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(
-            lines[0], "id,world,datetime_local,ts_epoch_ms,gagged,text,raw,wseq",
-            "the six legacy columns keep their names and order; wseq is appended"
-        );
-        // `text` is still the stripped form even though the column no longer exists.
-        let coloured = lines.iter().find(|l| l.contains("flees west")).expect("coloured row");
-        assert!(coloured.contains("the dragon flees west"));
+        assert!(ScrollbackDb::search(db.path(), Some("Zmc"), "*", None, None, 10, false).is_empty());
+        assert!(query(db.path(), &ArchiveQuery {
+            world: Some("Zmc"), pattern: "*", kind: PatternKind::Glob,
+            before_wseq: None, since_ms: None, until_ms: None, limit: 10, newest_first: true,
+        }).is_empty());
+        assert!(load_before_path(db.path(), "Zmc", 9_999, 10).is_empty());
+        assert!(load_before_wseq(db.path(), "Zmc", 999, 10).is_empty());
+        let out = std::env::temp_dir().join(format!("clay_test_csv_pre_v2_{}.csv", std::process::id()));
+        assert!(export_csv(db.path(), &out).is_err(), "an export says why it has nothing");
         let _ = std::fs::remove_file(&out);
     }
 
@@ -2163,7 +1565,7 @@ mod tests {
         drop(conn);
 
         // open must not migrate or clobber it.
-        let sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+        let sdb = ScrollbackDb::open(db.path()).expect("open");
         drop(sdb);
         let conn = Connection::open(db.path()).expect("reopen");
         assert_eq!(user_version(&conn), 99, "a newer archive must be left untouched");
@@ -2179,7 +1581,7 @@ mod tests {
         // restart at 0 each time; wseq must not.
         let mut all: Vec<i64> = Vec::new();
         for _ in 0..3 {
-            let sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+            let sdb = ScrollbackDb::open(db.path()).expect("open");
             let tx = sdb.sender();
             for _ in 0..10 {
                 let (_wid, wseq) = tx.alloc_wseq("uuid-a", "Zmc").expect("alloc");
@@ -2199,8 +1601,8 @@ mod tests {
     fn test_wseq_blocks_are_disjoint_across_two_handles_on_one_file() {
         // Two Clay processes sharing one archive must not hand out the same number.
         let db = TempDb::new("wseq_two");
-        let a = ScrollbackDb::open(db.path(), &[]).expect("open a");
-        let b = ScrollbackDb::open(db.path(), &[]).expect("open b");
+        let a = ScrollbackDb::open(db.path()).expect("open a");
+        let b = ScrollbackDb::open(db.path()).expect("open b");
         let (sa, sb) = (a.sender(), b.sender());
 
         let mut seen = std::collections::HashSet::new();
@@ -2214,7 +1616,7 @@ mod tests {
     #[test]
     fn test_wseq_is_per_world_not_global() {
         let db = TempDb::new("wseq_perworld");
-        let sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+        let sdb = ScrollbackDb::open(db.path()).expect("open");
         let tx = sdb.sender();
         let (wid_a, seq_a) = tx.alloc_wseq("uuid-a", "Zmc").expect("a");
         let (wid_b, seq_b) = tx.alloc_wseq("uuid-b", "Other").expect("b");
@@ -2226,7 +1628,7 @@ mod tests {
     fn test_producer_assigned_wseq_reaches_the_database() {
         let db = TempDb::new("wseq_write");
         {
-            let mut sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+            let mut sdb = ScrollbackDb::open(db.path()).expect("open");
             let tx = sdb.sender();
             for i in 0..5 {
                 let (wid, wseq) = tx.alloc_wseq("uuid-a", "Zmc").expect("alloc");
@@ -2252,7 +1654,7 @@ mod tests {
         // line is not.
         let db = TempDb::new("wseq_fallback");
         {
-            let mut sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+            let mut sdb = ScrollbackDb::open(db.path()).expect("open");
             let tx = sdb.sender();
             assert!(tx.send(ArchiveEntry::new("Zmc".into(), 1, "no seq supplied".into(), false)));
             sdb.flush_and_close();
@@ -2265,7 +1667,7 @@ mod tests {
 
     /// Archive `n` lines for one world and return their wseqs.
     fn seed_v2(path: &Path, world: &str, n: i64) -> Vec<i64> {
-        let mut sdb = ScrollbackDb::open(path, &[]).expect("open");
+        let mut sdb = ScrollbackDb::open(path).expect("open");
         let tx = sdb.sender();
         let mut seqs = Vec::new();
         for i in 0..n {
@@ -2415,7 +1817,7 @@ mod tests {
             "big orc warrior",
         ];
         {
-            let mut sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+            let mut sdb = ScrollbackDb::open(db.path()).expect("open");
             let tx = sdb.sender();
             for (i, line) in corpus.iter().enumerate() {
                 let (wid, wseq) = tx.alloc_wseq("uuid-a", "Zmc").expect("alloc");
@@ -2486,7 +1888,7 @@ mod tests {
         // and must still return the SAME rows either way.
         let db = TempDb::new("fts_common");
         {
-            let mut sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+            let mut sdb = ScrollbackDb::open(db.path()).expect("open");
             let tx = sdb.sender();
             // Well past FTS_SELECTIVITY_CAP so the guard definitely trips.
             for i in 0..(FTS_SELECTIVITY_CAP + 500) {
@@ -2553,20 +1955,10 @@ mod tests {
     }
 
     #[test]
-    fn test_load_before_wseq_declines_on_a_pre_migration_archive() {
-        // Must return empty rather than error, so the caller falls back to the
-        // timestamp path instead of showing the user nothing.
-        let db = TempDb::new("pageup_legacy");
-        write_legacy_db(db.path(), true, &fixture());
-        assert!(load_before_wseq(db.path(), "Zmc", 999, 10).is_empty());
-        assert!(!load_before_path(db.path(), "Zmc", 9_999, 10).is_empty());
-    }
-
-    #[test]
     fn test_a_line_is_findable_through_fts_immediately_after_it_is_written() {
         let db = TempDb::new("fts_live");
         {
-            let mut sdb = ScrollbackDb::open(db.path(), &[]).expect("open");
+            let mut sdb = ScrollbackDb::open(db.path()).expect("open");
             let tx = sdb.sender();
             let (wid, wseq) = tx.alloc_wseq("uuid-a", "Zmc").expect("alloc");
             let mut e = ArchiveEntry::new("Zmc".into(), 1, "a wandering minstrel".into(), false);
@@ -2584,43 +1976,14 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_builds_the_fts_index_over_existing_rows() {
-        let db = TempDb::new("fts_migrate");
-        write_legacy_db(db.path(), true, &fixture());
-        let conn = Connection::open(db.path()).expect("open");
-        tune_connection(&conn);
-        migrate_to_v2(&conn, &[WorldRef { world_uuid: "u".into(), name: "Zmc".into() }])
-            .expect("migration");
-        let indexed: i64 = conn
-            .query_row("SELECT COUNT(*) FROM output_fts", [], |r| r.get(0))
-            .expect("count fts");
-        assert_eq!(indexed, fixture().len() as i64, "every migrated row must be indexed");
-        assert_eq!(meta_get(&conn, "migration_state").as_deref(), Some("done"));
-        drop(conn);
-
-        // And the index actually answers.
-        let hits = query(db.path(), &ArchiveQuery {
-            world: Some("Zmc"), pattern: "a goblin*", kind: PatternKind::Glob,
-            before_wseq: None, since_ms: None, until_ms: None,
-            limit: 10, newest_first: true,
-        });
-        assert_eq!(hits.len(), 1);
-    }
-
-    #[test]
     fn test_flush_batch_retains_the_batch_when_the_transaction_cannot_start() {
         // Regression guard for `Err(_) => { batch.clear(); return; }`, which threw
         // away up to a full batch of MUD output on a transient lock.
         let db = TempDb::new("retain");
         let conn = Connection::open(db.path()).expect("open");
         tune_connection(&conn);
-        conn.execute_batch(
-            "CREATE TABLE output_log (
-                 id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, world TEXT NOT NULL,
-                 line_raw TEXT NOT NULL, line_text TEXT NOT NULL,
-                 gagged INTEGER NOT NULL DEFAULT 0);",
-        )
-        .expect("schema");
+        conn.execute_batch(SCHEMA_V2).expect("schema");
+        conn.execute_batch(OUTPUT_LOG_V2).expect("output_log");
 
         let stats = Arc::new(ArchiveStats::default());
         let mut batch = vec![
@@ -2631,12 +1994,12 @@ mod tests {
         // An already-open transaction on the SAME connection makes
         // unchecked_transaction fail immediately.
         conn.execute_batch("BEGIN;").expect("occupy the connection");
-        flush_batch(&conn, &mut batch, &stats, false, &mut std::collections::HashMap::new());
+        flush_batch(&conn, &mut batch, &stats, true, &mut std::collections::HashMap::new());
         assert_eq!(batch.len(), 2, "the batch must survive a failed transaction start");
         assert_eq!(stats.write_failed.load(Ordering::Relaxed), 0, "retained is not failed");
 
         conn.execute_batch("COMMIT;").expect("release");
-        flush_batch(&conn, &mut batch, &stats, false, &mut std::collections::HashMap::new());
+        flush_batch(&conn, &mut batch, &stats, true, &mut std::collections::HashMap::new());
         assert!(batch.is_empty(), "the retry must then drain it");
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM output_log", [], |r| r.get(0))

@@ -16,13 +16,6 @@ use crate::{
     get_settings_path, get_reload_state_path, debug_log,
 };
 
-/// Legacy encryption key — only used for decrypting old .clay.dat files. Decrypt-only:
-/// `encrypt_password` never writes with this key, so no new data is ever protected by
-/// it (C5, security remediation) — it exists purely so pre-migration blobs still
-/// decrypt once, at which point they're re-encrypted under the per-machine
-/// `machine_key()` on the next save.
-const LEGACY_ENCRYPTION_KEY: &[u8; 32] = b"nonsupersecretpassword#\0\0\0\0\0\0\0\0\0";
-
 /// Per-machine encryption keys, loaded from `secure.key` (generated on first run), one
 /// per config directory: a clay_multi user's directory has its own, so the map is keyed
 /// by the file's path rather than being one process-wide value.
@@ -97,7 +90,8 @@ pub fn encrypt_password(password: &str) -> String {
     }
 }
 
-/// Decrypt a password. Tries machine key first, falls back to legacy key for migration.
+/// Decrypt a password stored by `encrypt_password`. A value without the `ENC:` prefix is
+/// a plain password (what `/import` and a hand-edited file give), returned as it is.
 pub fn decrypt_password(stored: &str) -> String {
     if stored.is_empty() {
         return String::new();
@@ -124,26 +118,13 @@ pub fn decrypt_password(stored: &str) -> String {
     let (nonce_bytes, ciphertext) = combined.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    // Try machine key first
     let key = machine_key();
     let cipher = Aes256Gcm::new((&key).into());
     if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
         return String::from_utf8_lossy(&plaintext).to_string();
     }
 
-    // Fall back to legacy key (old .clay.dat files). This key is fixed/public (it ships
-    // in the binary) and exists ONLY to let old blobs migrate — new data is always
-    // written with `encrypt_password`, which only ever uses the per-machine
-    // `machine_key()` (C5, security remediation). Log (always-on, no secret content)
-    // whenever this fires so stale legacy-key blobs are noticed; they get re-encrypted
-    // under the machine key the next time settings are saved.
-    let legacy_cipher = Aes256Gcm::new(LEGACY_ENCRYPTION_KEY.into());
-    if let Ok(plaintext) = legacy_cipher.decrypt(nonce, ciphertext) {
-        debug_log(true, "decrypt_password: decrypted a stale blob using LEGACY_ENCRYPTION_KEY — will be re-encrypted under the machine key on next save");
-        return String::from_utf8_lossy(&plaintext).to_string();
-    }
-
-    // Both failed — return as-is
+    // Another machine's key (a copied settings.dat): return as-is
     stored.to_string()
 }
 
@@ -490,7 +471,6 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "web_font_letter_spacing={}", app.settings.web_font_letter_spacing)?;
     writeln!(file, "web_font_word_spacing={}", app.settings.web_font_word_spacing)?;
     crate::font_profile::write_lines(&app.settings.font_profiles, &mut *file)?;
-    writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
     // Written unconditionally (even when empty): key-absent (old settings file) means
@@ -696,9 +676,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if !world.settings.slack_channels.is_empty() {
             writeln!(file, "slack_channels={}", world.settings.slack_channels)?;
         }
-        // Only a chat world has a chat-settings model to record (see migrate_chat_settings).
+        // For an older 1.7 Clay (see CHAT_SETTINGS_VERSION).
         if matches!(world.settings.world_type, WorldType::Slack | WorldType::Discord) {
-            writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
+            writeln!(file, "chat_settings_version={}", crate::CHAT_SETTINGS_VERSION)?;
         }
         // Notes (escape newlines and special chars)
         if !world.settings.notes.is_empty() {
@@ -878,18 +858,7 @@ fn append_settings_audit_log_to_path(
 
 pub fn load_settings(app: &mut App) -> io::Result<()> {
     let path = get_settings_path();
-    load_settings_from_path(app, &path)?;
-
-    // Seed the hidden url_shorteners= key into a settings.dat written before it existed,
-    // so the list /url uses is discoverable and editable in the file instead of being an
-    // invisible default. The rewrite is derived entirely from what was just loaded, so
-    // it's content-preserving; guarded on a parseable [global] section so a missing or
-    // corrupt file is never replaced with defaults.
-    let global = read_global_section(&path);
-    if !global.is_empty() && !global.contains_key("url_shorteners") {
-        let _ = save_settings(app);
-    }
-    Ok(())
+    load_settings_from_path(app, &path)
 }
 
 /// Load settings from a specific path (used by tests)
@@ -919,72 +888,7 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
 /// One asymmetry worth knowing: a key `content` omits entirely (e.g. `write_settings_dat`
 /// skips `websocket_password=` when it's empty) leaves `app`'s existing value alone rather
 /// than clearing it — an absent remote value can't "win" a conflict it never entered.
-/// mud-status-display.md Job 6: migrate a `gmcp_packages` value loaded from disk when it
-/// is *exactly* the pre-Job-6 default (`crate::LEGACY_DEFAULT_GMCP_PACKAGES`) to the
-/// current default (`crate::DEFAULT_GMCP_PACKAGES`, which additionally requests the
-/// `Char` package family) — so an *existing* world starts asking for character data too,
-/// not just a freshly created one (`WorldSettings::default()` already picks up the new
-/// default on its own).
 ///
-/// Any other stored value — including a user who customised the field to something else
-/// entirely, or one who happened to type the identical legacy string back in by hand — is
-/// left completely untouched. Those two cases are indistinguishable from the stored string
-/// alone; this migration deliberately accepts that rather than risk silently overwriting a
-/// real edit. Called from every load path that assigns `gmcp_packages` (the main
-/// settings.dat loader, `--multiuser`'s settings, and hot-reload state restore — the last
-/// of these matters too: without it, a `/reload` triggered mid-upgrade from a pre-Job-6
-/// build would restore the old process's still-unmigrated in-memory value over the freshly
-/// migrated one the new process just loaded from settings.dat).
-/// One-time upgrade of a world's Slack/Discord settings to the server-per-world model
-/// (`CHAT_SETTINGS_VERSION`). Before it, a Discord world showed *only* its one channel
-/// (or one DM user) and Slack a single channel; now a world shows the whole server
-/// unless "Show Only" narrows it. So an existing channel is copied into Show Only too -
-/// an upgraded world looks exactly as it did - and a legacy DM-only world becomes Send
-/// To `@user` with a Show Only that matches no channel (DMs always show). A Slack app
-/// token (`xapp-`) pasted into the single old token field moves to its own field.
-/// Idempotent: guarded by the version, which every writer then records.
-pub(crate) fn migrate_chat_settings(s: &mut crate::WorldSettings) {
-    if s.chat_settings_version >= crate::CHAT_SETTINGS_VERSION {
-        return;
-    }
-    // Only a Slack or Discord world has anything to upgrade. Any other kind is simply
-    // current: stamped in memory, so a world switched to a chat type later saves the
-    // version and is never taken for a legacy one, while its own file never carries the
-    // key (the writer leaves it out for every non-chat world).
-    if !matches!(s.world_type, crate::WorldType::Slack | crate::WorldType::Discord) {
-        s.chat_settings_version = crate::CHAT_SETTINGS_VERSION;
-        return;
-    }
-    let dm = s.discord_dm_user.trim().to_string();
-    if !dm.is_empty() {
-        if s.discord_channel.trim().is_empty() {
-            s.discord_channel = format!("@{}", dm);
-            if s.discord_channels.trim().is_empty() {
-                s.discord_channels = format!("@{}", dm);
-            }
-        }
-        s.discord_dm_user.clear();
-    }
-    if !s.discord_channel.trim().is_empty() && s.discord_channels.trim().is_empty() {
-        s.discord_channels = s.discord_channel.trim().to_string();
-    }
-    if !s.slack_channel.trim().is_empty() && s.slack_channels.trim().is_empty() {
-        s.slack_channels = s.slack_channel.trim().to_string();
-    }
-    if s.slack_token.trim().starts_with("xapp-") && s.slack_app_token.is_empty() {
-        s.slack_app_token = std::mem::take(&mut s.slack_token);
-    }
-    s.chat_settings_version = crate::CHAT_SETTINGS_VERSION;
-}
-
-fn migrate_gmcp_packages(value: &str) -> String {
-    if value == crate::LEGACY_DEFAULT_GMCP_PACKAGES {
-        crate::DEFAULT_GMCP_PACKAGES.to_string()
-    } else {
-        value.to_string()
-    }
-}
-
 /// `load_settings_from_str_reporting` with the unknown keys dropped.
 pub fn load_settings_from_str(app: &mut App, content: &str) {
     let _ = load_settings_from_str_reporting(app, content);
@@ -1000,15 +904,9 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
     let mut unknown: Vec<String> = Vec::new();
     let mut current_world: Option<String> = None;
     let mut current_action: Option<usize> = None;
-    let mut in_banned_hosts = false;
     let mut in_tf_globals = false;
     let mut in_world_default = false;
     let mut in_theme = false;
-    // [global] precedes [tf_globals], but a pre-scan keeps this independent of order.
-    let tf_globals_v2 = content.lines()
-        .filter_map(|l| l.trim().strip_prefix("tf_globals_version="))
-        .any(|v| v.parse::<u32>().unwrap_or(0) >= TF_GLOBALS_VERSION);
-    let mut dropped_tf_globals: Vec<String> = Vec::new();
     // Whether this file knows the per-interface input heights (see the end).
     let mut split_heights_seen = false;
     // Whether a `new_indicator=` line was read (then `new_line_indicator=` is ignored).
@@ -1025,7 +923,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
             in_theme = true;
             current_world = None;
             current_action = None;
-            in_banned_hosts = false;
             in_tf_globals = false;
             in_world_default = false;
             continue;
@@ -1041,16 +938,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
         if line.starts_with("[global]") {
             current_world = None;
             current_action = None;
-            in_banned_hosts = false;
-            in_tf_globals = false;
-            in_world_default = false;
-            continue;
-        }
-
-        if line.starts_with("[banned_hosts]") {
-            current_world = None;
-            current_action = None;
-            in_banned_hosts = true;
             in_tf_globals = false;
             in_world_default = false;
             continue;
@@ -1059,7 +946,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
         if line.starts_with("[world_default]") {
             current_world = None;
             current_action = None;
-            in_banned_hosts = false;
             in_tf_globals = false;
             in_world_default = true;
             continue;
@@ -1068,7 +954,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
         if line.starts_with("[tf_globals]") {
             current_world = None;
             current_action = None;
-            in_banned_hosts = false;
             in_tf_globals = true;
             in_world_default = false;
             continue;
@@ -1078,49 +963,33 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
             let name = &line[7..line.len() - 1];
             // Find or create world
             let idx = app.find_or_create_world(name);
-            // A section without the key is pre-overhaul (see migrate_chat_settings).
-            app.worlds[idx].settings.chat_settings_version = 0;
             current_world = Some(app.worlds[idx].name.clone());
             current_action = None;
-            in_banned_hosts = false;
             in_tf_globals = false;
             in_world_default = false;
             continue;
         }
 
         if line.starts_with("[action:") && line.ends_with(']') {
-            // Parse action section - supports both old format [action:NUMBER] and new format [action:NAME]
+            // `[action:<name>]`, the name escaped as `write_settings_dat` writes it
             current_world = None;
-            in_banned_hosts = false;
             in_tf_globals = false;
             in_world_default = false;
             let section_content = &line[8..line.len() - 1]; // Extract between "[action:" and "]"
 
-            // Unescape the section content (for new format names with special chars)
-            let unescaped = section_content
+            let action_name = section_content
                 .replace("\\]", "]")
                 .replace("\\[", "[")
                 .replace("\\e", "=")
                 .replace("\\\\", "\\");
-
-            // Check if it's old format (pure number) or new format (name)
-            let is_old_format = unescaped.chars().all(|c| c.is_ascii_digit());
-
-            if is_old_format {
-                // Old format: create new action, will get name from name= field
-                app.settings.actions.push(Action::new());
-                current_action = Some(app.settings.actions.len() - 1);
+            // An action already loaded under this name is updated (a re-load, `/import`).
+            if let Some(idx) = app.settings.actions.iter().position(|a| a.name == action_name) {
+                current_action = Some(idx);
             } else {
-                // New format: look for existing action with this name or create new
-                let action_name = unescaped;
-                if let Some(idx) = app.settings.actions.iter().position(|a| a.name == action_name) {
-                    current_action = Some(idx);
-                } else {
-                    let mut new_action = Action::new();
-                    new_action.name = action_name;
-                    app.settings.actions.push(new_action);
-                    current_action = Some(app.settings.actions.len() - 1);
-                }
+                let mut new_action = Action::new();
+                new_action.name = action_name;
+                app.settings.actions.push(new_action);
+                current_action = Some(app.settings.actions.len() - 1);
             }
             continue;
         }
@@ -1128,11 +997,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
         if let Some(eq_pos) = line.find('=') {
             let key = &line[..eq_pos];
             let value = &line[eq_pos + 1..];
-
-            // Bans are in-memory only — skip any [banned_hosts] entries in old files
-            if in_banned_hosts {
-                continue;
-            }
 
             // TF's DEFAULT world
             if in_world_default {
@@ -1154,23 +1018,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                 if app.tf_engine.env_imported.contains_key(key) {
                     continue;
                 }
-                // One-time cleanup of a file written before tf_globals_version=2, which
-                // saved every global: the whole imported environment (secrets included)
-                // and the engine's own seeds. Environment variable names are all
-                // capitals; a seed is recognised by its unchanged value.
-                // %wrap/%wrapsize go too: before version 2 Clay ignored them, but `/wrap <n>`
-                // (then Clay's wrap indent) set %wrapsize as a side effect - honoured now, a
-                // saved `wrapsize=5` would wrap every line at 5 columns.
-                if !tf_globals_v2 {
-                    let is_env_name = key.chars().any(|c| c.is_ascii_uppercase())
-                        && key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-                    let is_seed = app.tf_engine.seed_values.get(key).is_some_and(|s| *s == unescaped);
-                    let is_old_wrap = key == "wrap" || key == "wrapsize";
-                    if is_env_name || is_seed || is_old_wrap || crate::tf::TRANSIENT_GLOBALS.contains(&key) {
-                        dropped_tf_globals.push(key.to_string());
-                        continue;
-                    }
-                }
                 app.tf_engine.set_global(key, tf::TfValue::from(unescaped));
                 continue;
             }
@@ -1184,10 +1031,8 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                         s.replace("\\\\", "\x00").replace("\\n", "\n").replace("\\e", "=").replace("\x00", "\\")
                     }
                     match key {
-                        "name" => action.name = value.to_string(),
                         "world" => action.world = value.to_string(),
                         "match_type" => action.match_type = MatchType::parse(value),
-                        "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
                         "enabled" => action.enabled = value != "false",
                         "startup" => action.startup = value == "true",
@@ -1200,17 +1045,8 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                                     while action.patterns.len() <= idx {
                                         action.patterns.push(MatchPattern::default());
                                     }
-                                    match parts[2] {
-                                        // Back-compat: old files may have per-pattern type; fold into
-                                        // action-level match_type (any wildcard makes the whole action wildcard)
-                                        "type" => {
-                                            let mt = MatchType::parse(value);
-                                            if mt == MatchType::Wildcard {
-                                                action.match_type = MatchType::Wildcard;
-                                            }
-                                        }
-                                        "text" => action.patterns[idx].pattern = unescape_action_value(value),
-                                        _ => {}
+                                    if parts[2] == "text" {
+                                        action.patterns[idx].pattern = unescape_action_value(value);
                                     }
                                 }
                             }
@@ -1229,14 +1065,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                     }
                     "temp_convert" => {
                         app.settings.temp_convert_enabled = value == "true";
-                    }
-                    "pending_first" => {
-                        // Backward compatibility: pending_first=true -> UnseenFirst
-                        app.settings.world_switch_mode = if value == "true" {
-                            WorldSwitchMode::UnseenFirst
-                        } else {
-                            WorldSwitchMode::Alphabetical
-                        };
                     }
                     "world_switch_mode" => {
                         app.settings.world_switch_mode = WorldSwitchMode::from_name(value);
@@ -1279,15 +1107,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                     "font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
                             app.settings.font_size = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    // Backward compat: old single web_font_size sets all three
-                    "web_font_size" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            let clamped = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
-                            app.settings.web_font_size_phone = clamped;
-                            app.settings.web_font_size_tablet = clamped;
-                            app.settings.web_font_size_desktop = clamped;
                         }
                     }
                     "web_font_size_phone" => {
@@ -1363,16 +1182,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                         // the built-in order rather than disabling /url.
                         app.settings.url_shorteners = crate::encoding::UrlShortener::parse_list(value);
                     }
-                    "web_secure" => {
-                        app.settings.web_secure = value == "true";
-                    }
-                    // Legacy: ws_enabled/ws_port/websocket_enabled/websocket_port — silently ignored
-                    "ws_enabled" | "websocket_enabled" => {}
-                    "ws_port" | "websocket_port" => {}
-                    // Legacy: websocket_use_tls maps to web_secure
-                    "websocket_use_tls" => {
-                        app.settings.web_secure = value == "true";
-                    }
                     "websocket_password" => {
                         app.settings.websocket_password = decrypt_password(value);
                     }
@@ -1402,25 +1211,15 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                         }
                     }
                     "websocket_auth_key" => {
-                        // Load single device auth key (format: ENC:...|timestamp or legacy ENC:...)
-                        // If multiple lines found, ignore all (migration: startup will generate fresh)
+                        // The device auth key: ENC:<key>|<created, unix seconds>. Over a key
+                        // already loaded (an `/import` brings the other Clay's) neither is
+                        // kept: the next start makes a fresh one.
                         if app.settings.websocket_auth_key.is_some() {
-                            // Multiple keys found — clear and let startup generate a fresh one
                             app.settings.websocket_auth_key = None;
-                        } else {
-                            let (enc_part, timestamp) = if let Some(pipe_pos) = value.rfind('|') {
-                                let ts_str = &value[pipe_pos + 1..];
-                                if let Ok(ts) = ts_str.parse::<u64>() {
-                                    (&value[..pipe_pos], ts)
-                                } else {
-                                    (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
-                                }
-                            } else {
-                                (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
-                            };
+                        } else if let Some((enc_part, ts)) = value.rsplit_once('|') {
                             let key = decrypt_password(enc_part);
-                            if !key.is_empty() {
-                                app.settings.websocket_auth_key = Some(crate::AuthKey { key, created_at: timestamp });
+                            if let (false, Ok(created_at)) = (key.is_empty(), ts.parse::<u64>()) {
+                                app.settings.websocket_auth_key = Some(crate::AuthKey { key, created_at });
                             }
                         }
                     }
@@ -1438,27 +1237,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                         app.settings.web_path = sanitize_web_path(value);
                     }
                     "port_map_enabled" => app.settings.port_map_enabled = value == "true",
-                    // Legacy fields - map https to http when web_secure, ws_nonsecure to ws when !web_secure
-                    "https_enabled" => {
-                        // If https was enabled in old config, set http_enabled and web_secure
-                        if value == "true" {
-                            app.settings.http_enabled = true;
-                            app.settings.web_secure = true;
-                        }
-                    }
-                    "https_port" => {
-                        // Legacy: https_port was separate, now http_port is used for both
-                        if let Ok(p) = value.parse::<u16>() {
-                            // Only use https_port if web_secure is set
-                            if app.settings.web_secure {
-                                app.settings.http_port = p;
-                            }
-                        }
-                    }
-                    // Legacy: ws_nonsecure_enabled/ws_nonsecure_port — silently ignored
-                    "ws_nonsecure_enabled" | "ws_nonsecure_port" => {}
-                    // Legacy: ignore global encoding, it's now per-world
-                    "encoding" => {}
                     "tls_proxy_enabled" => {
                         app.settings.tls_proxy_enabled = value == "true";
                     }
@@ -1502,12 +1280,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                     }
                     "tts_voice" => {
                         app.settings.tts_voice = crate::kokoro::normalize_voice(value);
-                    }
-                    "tts_enabled" => {
-                        // Legacy: convert bool to TtsMode
-                        if value == "true" {
-                            app.settings.tts_mode = crate::tts::TtsMode::Local;
-                        }
                     }
                     // One interface's own text-to-speech: tts.<key>.<field>.
                     k if k.starts_with("tts.") => {
@@ -1568,10 +1340,8 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                     "picture_host" => {
                         app.settings.picture_host = crate::picture::PictureService::from_name(value);
                     }
-                    "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
-                        // Legacy: silently ignore (now handled by keybindings system)
-                    }
-                    // Read by the pre-scan above.
+                    // Written for an older 1.7 Clay, which drops a [tf_globals] entry it
+                    // takes for an environment variable from a file without it.
                     "tf_globals_version" => {}
                     _ => unknown.push(format!("[global] {key}")),
                 }
@@ -1587,11 +1357,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                         "password" => world.settings.password = decrypt_password(value),
                         "use_ssl" => world.settings.use_ssl = value == "true",
                         "log_enabled" => world.settings.log_enabled = value == "true",
-                        "log_file" => world.settings.log_enabled = true, // Backward compat: old log_file setting enables logging
-                        // "initiate_negotiation" was removed (Clay is now fully reactive and
-                        // never initiates telnet negotiation) - an old settings.dat carrying
-                        // this key falls through to the `_ => {}` wildcard below and is
-                        // silently ignored, per CLAUDE.md's backward-compat contract.
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
@@ -1630,7 +1395,7 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                             world.settings.first_command = unescape_string(value);
                         }
                         "gmcp_packages" => {
-                            world.settings.gmcp_packages = migrate_gmcp_packages(value);
+                            world.settings.gmcp_packages = value.to_string();
                         }
                         "auto_reconnect_secs" => {
                             let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
@@ -1649,7 +1414,8 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                         "discord_channels" => world.settings.discord_channels = value.to_string(),
                         "slack_app_token" => world.settings.slack_app_token = decrypt_password(value),
                         "slack_channels" => world.settings.slack_channels = value.to_string(),
-                        "chat_settings_version" => world.settings.chat_settings_version = value.parse().unwrap_or(0),
+                        // Written for an older 1.7 Clay, which converts a chat world without it.
+                        "chat_settings_version" => {}
                         // Notes
                         "notes" => world.settings.notes = unescape_string(value),
                         _ => unknown.push(format!("[world:{world_name}] {key}")),
@@ -1659,9 +1425,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
         }
     }
 
-    for world in &mut app.worlds {
-        migrate_chat_settings(&mut world.settings);
-    }
     // A settings.dat from before the input height was split by interface: every
     // interface starts at the console's, the height they all showed until now.
     if !split_heights_seen {
@@ -1675,12 +1438,6 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
     app.apply_tf_clock_format(None);
     app.apply_tf_textdiv();
     *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
-    if !dropped_tf_globals.is_empty() {
-        // Names only - the values may be secrets.
-        debug_log(true, &format!(
-            "settings: dropped {} environment/seed entries from an old [tf_globals] section: {}",
-            dropped_tf_globals.len(), dropped_tf_globals.join(", ")));
-    }
     unknown
 }
 
@@ -1911,7 +1668,6 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "web_font_letter_spacing={}", app.settings.web_font_letter_spacing)?;
     writeln!(file, "web_font_word_spacing={}", app.settings.web_font_word_spacing)?;
     crate::font_profile::write_lines(&app.settings.font_profiles, &mut *file)?;
-    writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
     // Written unconditionally (even when empty): key-absent (old settings file) means
@@ -2322,7 +2078,8 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         if !world.settings.slack_channels.is_empty() {
             writeln!(file, "slack_channels={}", world.settings.slack_channels.replace('=', "\\e"))?;
         }
-        writeln!(file, "chat_settings_version={}", world.settings.chat_settings_version)?;
+        // For an older 1.7 Clay reloaded into (see CHAT_SETTINGS_VERSION).
+        writeln!(file, "chat_settings_version={}", crate::CHAT_SETTINGS_VERSION)?;
         // A connected chat world's live session: its send target (a spec) and Discord
         // resume data, so the restored world resumes instead of starting over.
         if world.connected {
@@ -2620,88 +2377,29 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
     // i=is_input - a captured user-typed command, see OutputLine::is_input's doc comment -
     // the legacy 'n'=marked_new flag, if present in an older file, is simply ignored: the ▶
     // indicator is per-line now - see the 'v' flag written above)
-    // Older format: timestamp_secs|flags|text (flags: s=from_server, g=gagged) - seq=0
-    // Old format: timestamp_secs|text (for backward compatibility) - seq=0
     fn parse_timestamped_line(line: &str) -> OutputLine {
         let parts: Vec<&str> = line.splitn(4, '|').collect();
 
-        if parts.len() >= 2 {
-            if let Ok(ts_secs) = parts[0].parse::<u64>() {
-                let timestamp = UNIX_EPOCH + Duration::from_secs(ts_secs);
-
-                if parts.len() == 4 {
-                    // Newest format: timestamp|flags|seq|text
-                    let flags = parts[1];
-                    let seq = parts[2].parse::<u64>().unwrap_or(0);
-                    let text = unescape_string(parts[3]);
-                    let from_server = flags.contains('s');
-                    let gagged = flags.contains('g');
-                    let is_input = flags.contains('i');
-                    return OutputLine { archive_seq: archive_seq_flag(flags),
-                        text,
-                        timestamp,
-                        from_server,
-                        gagged,
-                        is_input,
-                        seq,
-                        highlight_color: None,
-                        from_archive: flags.contains('a'),
-                        archive_sourced: false,
-                        viewed: flags.contains('v'),
-                        display_id: None,
-                        hist: crate::LineHistory::from_flags(flags),
-                        tf_attrs: None,
-                    };
-                } else if parts.len() == 3 {
-                    // Older format: timestamp|flags|text (no seq) - predates is_input, but
-                    // parse it the same way in case a file written by a newer build (which
-                    // could in principle still hit this 3-part branch via some other path)
-                    // carries the flag; absence just means is_input stays false.
-                    let flags = parts[1];
-                    let text = unescape_string(parts[2]);
-                    let from_server = flags.contains('s');
-                    let gagged = flags.contains('g');
-                    let is_input = flags.contains('i');
-                    return OutputLine { archive_seq: None,
-                        text,
-                        timestamp,
-                        from_server,
-                        gagged,
-                        is_input,
-                        seq: 0,
-                        highlight_color: None,
-                        from_archive: false,
-                        archive_sourced: false,
-                        viewed: flags.contains('v'),
-                        display_id: None,
-                        hist: crate::LineHistory::from_flags(flags),
-                        tf_attrs: None,
-                    };
-                } else {
-                    // Old format: timestamp|text (assume from_server=true for compatibility)
-                    // No flags field at all, so no 'v' to read. Default to viewed: a line in
-                    // this format predates seq numbering entirely, and treating ancient
-                    // history as already-seen is right - the alternative would make every
-                    // such line claimable and paint a full screen of ▶ on first display.
-                    return OutputLine { archive_seq: None,
-                        text: unescape_string(parts[1]),
-                        timestamp,
-                        from_server: true,
-                        gagged: false,
-                        is_input: false,
-                        seq: 0,
-                        highlight_color: None,
-                        from_archive: false,
-                        archive_sourced: false,
-                        viewed: true,
-                        display_id: None,
-                        hist: crate::LineHistory::default(),
-                        tf_attrs: None,
-                    };
-                }
-            }
+        // timestamp_secs|flags|seq|text
+        if let (4, Ok(ts_secs)) = (parts.len(), parts[0].parse::<u64>()) {
+            let flags = parts[1];
+            return OutputLine { archive_seq: archive_seq_flag(flags),
+                text: unescape_string(parts[3]),
+                timestamp: UNIX_EPOCH + Duration::from_secs(ts_secs),
+                from_server: flags.contains('s'),
+                gagged: flags.contains('g'),
+                is_input: flags.contains('i'),
+                seq: parts[2].parse::<u64>().unwrap_or(0),
+                highlight_color: None,
+                from_archive: flags.contains('a'),
+                archive_sourced: false,
+                viewed: flags.contains('v'),
+                display_id: None,
+                hist: crate::LineHistory::from_flags(flags),
+                tf_attrs: None,
+            };
         }
-        // Fallback: no timestamp in old format, use current time
+        // Not a line this writer wrote (a hand edit): keep its text.
         OutputLine::new(unescape_string(line), 0)
     }
 
@@ -2753,8 +2451,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         negotiated_encoding: None,
                         prompt_timed: false,
                         prompt: String::new(),
-                        // A pre-overhaul state file has no chat_settings_version key.
-                        settings: WorldSettings { chat_settings_version: 0, ..WorldSettings::default() },
+                        settings: WorldSettings::default(),
                         chat_session_target: String::new(),
                         chat_resume: None,
                         next_seq: 0,
@@ -2793,34 +2490,20 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                 pending_world_idx = Some(idx);
                 output_world_idx = None;
             } else if let Some(suffix) = section.strip_prefix("action:") {
-                // Parse action section - supports both old format [action:NUMBER] and new format [action:NAME]
+                // `[action:<name>]`, the name escaped as `save_reload_state_to` writes it
                 current_section = "action".to_string();
-
-                // Unescape the section content (for new format names with special chars)
-                let unescaped = suffix
+                let action_name = suffix
                     .replace("\\]", "]")
                     .replace("\\[", "[")
                     .replace("\\e", "=")
                     .replace("\\\\", "\\");
-
-                // Check if it's old format (pure number) or new format (name)
-                let is_old_format = unescaped.chars().all(|c| c.is_ascii_digit());
-
-                if is_old_format {
-                    // Old format: create new action, will get name from name= field
-                    app.settings.actions.push(Action::new());
-                    current_action_idx = Some(app.settings.actions.len() - 1);
+                if let Some(idx) = app.settings.actions.iter().position(|a| a.name == action_name) {
+                    current_action_idx = Some(idx);
                 } else {
-                    // New format: look for existing action with this name or create new
-                    let action_name = unescaped;
-                    if let Some(idx) = app.settings.actions.iter().position(|a| a.name == action_name) {
-                        current_action_idx = Some(idx);
-                    } else {
-                        let mut new_action = Action::new();
-                        new_action.name = action_name;
-                        app.settings.actions.push(new_action);
-                        current_action_idx = Some(app.settings.actions.len() - 1);
-                    }
+                    let mut new_action = Action::new();
+                    new_action.name = action_name;
+                    app.settings.actions.push(new_action);
+                    current_action_idx = Some(app.settings.actions.len() - 1);
                 }
             }
             continue;
@@ -2877,14 +2560,6 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "temp_convert" => {
                         app.settings.temp_convert_enabled = value == "true";
                     }
-                    "pending_first" => {
-                        // Backward compatibility: pending_first=true -> UnseenFirst
-                        app.settings.world_switch_mode = if value == "true" {
-                            WorldSwitchMode::UnseenFirst
-                        } else {
-                            WorldSwitchMode::Alphabetical
-                        };
-                    }
                     "world_switch_mode" => {
                         app.settings.world_switch_mode = WorldSwitchMode::from_name(value);
                     }
@@ -2925,15 +2600,6 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
                             app.settings.font_size = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    // Backward compat: old single web_font_size sets all three
-                    "web_font_size" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            let clamped = s.clamp(crate::MIN_WEB_FONT_SIZE, 48.0);
-                            app.settings.web_font_size_phone = clamped;
-                            app.settings.web_font_size_tablet = clamped;
-                            app.settings.web_font_size_desktop = clamped;
                         }
                     }
                     "web_font_size_phone" => {
@@ -3025,24 +2691,11 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         // load_reload_state can spot a hand edit made while we ran.
                         set_settings_fingerprint(Some(value.to_string()));
                     }
-                    "web_secure" => {
-                        app.settings.web_secure = value == "true";
-                    }
-                    // Legacy: ws_enabled/ws_port/websocket_enabled/websocket_port — silently ignored
-                    "ws_enabled" | "websocket_enabled" => {}
-                    "ws_port" | "websocket_port" => {}
-                    // Legacy: websocket_use_tls maps to web_secure
-                    "websocket_use_tls" => {
-                        app.settings.web_secure = value == "true";
-                    }
                     "websocket_password" => {
                         app.settings.websocket_password = decrypt_password(value);
                     }
                     "websocket_allow_list" => {
                         app.settings.websocket_allow_list = value.to_string();
-                    }
-                    "websocket_whitelisted_host" => {
-                        // Legacy: ignored, whitelisted_host is now runtime-only state
                     }
                     "websocket_cert_file" => {
                         app.settings.websocket_cert_file = value.to_string();
@@ -3076,24 +2729,6 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         app.settings.web_path = sanitize_web_path(value);
                     }
                     "port_map_enabled" => app.settings.port_map_enabled = value == "true",
-                    // Legacy fields
-                    "https_enabled" => {
-                        if value == "true" {
-                            app.settings.http_enabled = true;
-                            app.settings.web_secure = true;
-                        }
-                    }
-                    "https_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            if app.settings.web_secure {
-                                app.settings.http_port = p;
-                            }
-                        }
-                    }
-                    // Legacy: ws_nonsecure_enabled/ws_nonsecure_port — silently ignored
-                    "ws_nonsecure_enabled" | "ws_nonsecure_port" => {}
-                    // Legacy: ignore global encoding, it's now per-world
-                    "encoding" => {}
                     "tls_proxy_enabled" => {
                         app.settings.tls_proxy_enabled = value == "true";
                     }
@@ -3135,12 +2770,6 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     }
                     "tts_voice" => {
                         app.settings.tts_voice = crate::kokoro::normalize_voice(value);
-                    }
-                    "tts_enabled" => {
-                        // Legacy: convert bool to TtsMode
-                        if value == "true" {
-                            app.settings.tts_mode = crate::tts::TtsMode::Local;
-                        }
                     }
                     // One interface's own text-to-speech: tts.<key>.<field>.
                     k if k.starts_with("tts.") => {
@@ -3200,9 +2829,6 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     }
                     "picture_host" => {
                         app.settings.picture_host = crate::picture::PictureService::from_name(value);
-                    }
-                    "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
-                        // Legacy: silently ignore (now handled by keybindings system)
                     }
                     "history_count" | "world_count" | "watchdog_override_count" => {
                         // These are informational, not needed for parsing
@@ -3312,10 +2938,6 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "password" => tw.settings.password = unescape_string(value),
                             "use_ssl" => tw.settings.use_ssl = value == "true",
                             "log_enabled" => tw.settings.log_enabled = value == "true",
-                            "log_file" => tw.settings.log_enabled = true, // Backward compat
-                            // "initiate_negotiation" was removed (Clay is now fully
-                            // reactive) - an old state file carrying this key falls
-                            // through to the `_ => {}` wildcard below and is ignored.
                             "msp_enabled" => tw.settings.msp_enabled = value == "true",
                             "mcp_enabled" => tw.settings.mcp_enabled = value == "true",
                             "mccp2_enabled" => tw.settings.mccp2_enabled = value == "true",
@@ -3350,7 +2972,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "login_command" => tw.settings.login_command = unescape_string(value),
                             "first_command" => tw.settings.first_command = unescape_string(value),
                             "gmcp_packages" => {
-                                tw.settings.gmcp_packages = migrate_gmcp_packages(&unescape_string(value));
+                                tw.settings.gmcp_packages = unescape_string(value);
                             }
                             "auto_reconnect_secs" => {
                                 let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
@@ -3416,7 +3038,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "discord_channels" => tw.settings.discord_channels = unescape_string(value),
                             "slack_app_token" => tw.settings.slack_app_token = unescape_string(value),
                             "slack_channels" => tw.settings.slack_channels = unescape_string(value),
-                            "chat_settings_version" => tw.settings.chat_settings_version = value.parse().unwrap_or(0),
+                            "chat_settings_version" => {}
                             "chat_session_target" => tw.chat_session_target = unescape_string(value),
                             "chat_resume_session" => tw.chat_resume.get_or_insert_with(Default::default).session_id = unescape_string(value),
                             "chat_resume_seq" => tw.chat_resume.get_or_insert_with(Default::default).seq = value.parse().unwrap_or(0),
@@ -3436,34 +3058,23 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             s.replace("\\\\", "\x00").replace("\\n", "\n").replace("\\e", "=").replace("\x00", "\\")
                         }
                         match key {
-                            "name" => action.name = value.to_string(),
                             "world" => action.world = value.to_string(),
-                            // Action-level match type (also handles legacy single-pattern files)
                             "match_type" => action.match_type = MatchType::parse(value),
-                            "pattern" => action.pattern = unescape_action_value(value),
                             "command" => action.command = unescape_action_value(value),
                             "enabled" => action.enabled = value != "false",
                             "startup" => action.startup = value == "true",
                             "gui_shortcut" => action.gui_shortcut = value == "true",
                         "suppress_blanks" => action.suppress_blanks = value == "true",
                             _ if key.starts_with("pattern.") => {
-                                // Multi-pattern keys: "pattern.N.text" (and legacy "pattern.N.type")
+                                // "pattern.N.text"
                                 let parts: Vec<&str> = key.splitn(3, '.').collect();
                                 if parts.len() == 3 {
                                     if let Ok(idx) = parts[1].parse::<usize>() {
                                         while action.patterns.len() <= idx {
                                             action.patterns.push(MatchPattern::default());
                                         }
-                                        match parts[2] {
-                                            // Back-compat: fold any per-pattern wildcard into action-level type
-                                            "type" => {
-                                                let mt = MatchType::parse(value);
-                                                if mt == MatchType::Wildcard {
-                                                    action.match_type = MatchType::Wildcard;
-                                                }
-                                            }
-                                            "text" => action.patterns[idx].pattern = unescape_action_value(value),
-                                            _ => {}
+                                        if parts[2] == "text" {
+                                            action.patterns[idx].pattern = unescape_action_value(value);
                                         }
                                     }
                                 }
@@ -3504,7 +3115,6 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.proxy_socket_path = tw.proxy_socket_path;
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
-        migrate_chat_settings(&mut world.settings);
         // A shell world carried across the exec (Linux): its PTY master fd + child pid, for
         // the restore path to adopt (see shell::adopt). Must be checked before the chat
         // branch below, since a shell world is also `!is_mud()`.
@@ -3524,8 +3134,8 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         if !tw.world_id.is_empty() {
             world.world_id = tw.world_id;
         }
-        // 0 means the state file predates this field; keep the epoch this World was
-        // constructed with rather than adopting a value that means "no epoch".
+        // 0 is the reserved "no epoch" (a state file missing the line): keep the epoch this
+        // World was constructed with rather than hand clients that.
         if tw.seq_epoch != 0 {
             world.seq_epoch = tw.seq_epoch;
         }
@@ -3661,30 +3271,14 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
     let settings_path = get_settings_path();
     if settings_path.exists() {
         if let Ok(settings_content) = std::fs::read_to_string(&settings_path) {
-            let mut found_count = 0u32;
-            for line in settings_content.lines() {
-                let trimmed = line.trim();
-                if let Some(value) = trimmed.strip_prefix("websocket_auth_key=") {
-                    found_count += 1;
-                    if found_count > 1 {
-                        // Multiple keys found — clear and let startup generate a fresh one
-                        app.settings.websocket_auth_key = None;
-                        break;
-                    }
-                    let (enc_part, timestamp) = if let Some(pipe_pos) = value.rfind('|') {
-                        let ts_str = &value[pipe_pos + 1..];
-                        if let Ok(ts) = ts_str.parse::<u64>() {
-                            (&value[..pipe_pos], ts)
-                        } else {
-                            (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
-                        }
-                    } else {
-                        (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
-                    };
-                    let key = decrypt_password(enc_part);
-                    if !key.is_empty() {
-                        app.settings.websocket_auth_key = Some(crate::AuthKey { key, created_at: timestamp });
-                    }
+            // ENC:<key>|<created, unix seconds> (persistence's one writer writes one line)
+            let saved = settings_content.lines()
+                .find_map(|line| line.trim().strip_prefix("websocket_auth_key="))
+                .and_then(|value| value.rsplit_once('|'));
+            if let Some((enc_part, ts)) = saved {
+                let key = decrypt_password(enc_part);
+                if let (false, Ok(created_at)) = (key.is_empty(), ts.parse::<u64>()) {
+                    app.settings.websocket_auth_key = Some(crate::AuthKey { key, created_at });
                 }
             }
         }
@@ -3775,7 +3369,6 @@ mod tests {
             input_height_tablet: 5,            // default: 3
             input_height_desktop: 6,           // default: 3
             web_font_weight: 200,              // default: 400
-            web_secure: true,                  // default: false
             http_enabled: true,                // default: false
             http_port: 8080,                   // default: 9000
             web_path: "stealth".to_string(),   // default: "clay"
@@ -3908,7 +3501,6 @@ mod tests {
             discord_channels: "#disc_a,#disc_b".to_string(),
             slack_app_token: "xapp-slack".to_string(),
             slack_channels: "#slack_a".to_string(),
-            chat_settings_version: crate::CHAT_SETTINGS_VERSION,
             notes: "test notes\nline two".to_string(),
             gmcp_packages: "Custom.Package 1".to_string(), // default: "Client.Media 1, Char 1"
             auto_reconnect_secs: 30,                       // default: 0
@@ -3949,7 +3541,6 @@ mod tests {
         assert_eq!(a.input_height_tablet, b.input_height_tablet, "{context}: input_height_tablet");
         assert_eq!(a.input_height_desktop, b.input_height_desktop, "{context}: input_height_desktop");
         assert_eq!(a.web_font_weight, b.web_font_weight, "{context}: web_font_weight");
-        assert_eq!(a.web_secure, b.web_secure, "{context}: web_secure");
         assert_eq!(a.http_enabled, b.http_enabled, "{context}: http_enabled");
         assert_eq!(a.http_port, b.http_port, "{context}: http_port");
         assert_eq!(a.web_path, b.web_path, "{context}: web_path");
@@ -4033,7 +3624,6 @@ mod tests {
         assert_eq!(a.discord_channels, b.discord_channels, "{context}: discord_channels");
         assert_eq!(a.slack_app_token, b.slack_app_token, "{context}: slack_app_token");
         assert_eq!(a.slack_channels, b.slack_channels, "{context}: slack_channels");
-        assert_eq!(a.chat_settings_version, b.chat_settings_version, "{context}: chat_settings_version");
         assert_eq!(a.notes, b.notes, "{context}: notes");
         assert_eq!(a.gmcp_packages, b.gmcp_packages, "{context}: gmcp_packages");
         assert_eq!(a.auto_reconnect_secs, b.auto_reconnect_secs, "{context}: auto_reconnect_secs");
@@ -4408,43 +3998,6 @@ mod tests {
         assert_eq!(events.len(), 1, "a message signed with the restored key must still dispatch");
     }
 
-    // ------------------------------------------------------------------
-    // gmcp_packages default migration (mud-status-display.md Job 6). See
-    // migrate_gmcp_packages's own doc comment for the exact rule: a stored value is
-    // upgraded only when it is byte-identical to the pre-Job-6 default: any other
-    // value, including one a user retyped by hand, is left completely alone.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn migrate_gmcp_packages_upgrades_the_untouched_legacy_default() {
-        assert_eq!(
-            migrate_gmcp_packages(crate::LEGACY_DEFAULT_GMCP_PACKAGES),
-            crate::DEFAULT_GMCP_PACKAGES,
-        );
-    }
-
-    #[test]
-    fn migrate_gmcp_packages_never_touches_a_customised_value() {
-        // The load-bearing case this migration must get right: anything other than
-        // the exact legacy default string survives completely unchanged, even a
-        // value that differs from it only by case, whitespace, or an appended
-        // package - none of those are "the same string" the migration is allowed to
-        // recognize.
-        for customized in [
-            "Client.Media 1, Room.Info 1",
-            "Char.Vitals 1",
-            "",
-            "client.media 1",
-            "Client.Media 1 ",
-            crate::DEFAULT_GMCP_PACKAGES,
-        ] {
-            assert_eq!(
-                migrate_gmcp_packages(customized), customized,
-                "a value that is not byte-identical to the legacy default must be left alone: {customized:?}"
-            );
-        }
-    }
-
     /// New Indicator is saved by name beside the bool an older build reads; the name wins
     /// whichever comes first, and a file with only the bool (an older Clay's, `/import`)
     /// loads as the character.
@@ -4472,30 +4025,40 @@ mod tests {
         assert!(bool_at < name_at, "the bool is written before the name: {written}");
     }
 
+    /// An action whose name is all digits is an action with that name. The loader once
+    /// took `[action:42]` for the numbered sections of a file from before 2026-01-15 and
+    /// loaded it nameless, adding another copy at every re-load (`/import`, a re-apply).
     #[test]
-    fn test_load_settings_from_str_migrates_an_untouched_legacy_gmcp_default() {
+    fn an_action_named_with_digits_keeps_its_name() {
         let mut app = App::new();
-        app.worlds.clear();
-        let content = "[world:Legacy]\nhostname=mud.example.com\nport=4000\ngmcp_packages=Client.Media 1\n";
-        load_settings_from_str(&mut app, content);
-        let w = app.worlds.iter().find(|w| w.name == "Legacy").expect("world loaded");
-        assert_eq!(
-            w.settings.gmcp_packages, crate::DEFAULT_GMCP_PACKAGES,
-            "an untouched legacy default must be upgraded on load, so an existing world starts asking for Char data too"
-        );
+        app.settings.actions.clear();
+        let mut action = Action::new();
+        action.name = "42".to_string();
+        action.command = "say the answer".to_string();
+        app.settings.actions.push(action);
+        let mut buf = Vec::new();
+        write_settings_dat(&app, &mut buf, false).unwrap();
+        let written = String::from_utf8(buf).unwrap();
+
+        let mut back = App::new();
+        back.settings.actions.clear();
+        load_settings_from_str(&mut back, &written);
+        load_settings_from_str(&mut back, &written);
+        let names: Vec<&str> = back.settings.actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["42"], "{written}");
+        assert_eq!(back.settings.actions[0].command, "say the answer");
     }
 
+    /// A world's GMCP packages are what was saved, `Client.Media 1` included: it was reset
+    /// to the default on every load, by a migration for a value no Clay ever wrote.
     #[test]
-    fn test_load_settings_from_str_leaves_a_customised_gmcp_value_alone() {
+    fn a_saved_gmcp_packages_value_is_kept() {
         let mut app = App::new();
         app.worlds.clear();
-        let content = "[world:Customized]\nhostname=mud.example.com\nport=4000\ngmcp_packages=Client.Media 1, Room.Info 1\n";
-        load_settings_from_str(&mut app, content);
-        let w = app.worlds.iter().find(|w| w.name == "Customized").expect("world loaded");
-        assert_eq!(
-            w.settings.gmcp_packages, "Client.Media 1, Room.Info 1",
-            "a customised gmcp_packages value must never be overwritten by the migration"
-        );
+        load_settings_from_str(&mut app,
+            "[world:Media]\nhostname=mud.example.com\nport=4000\ngmcp_packages=Client.Media 1\n");
+        let w = app.worlds.iter().find(|w| w.name == "Media").expect("world loaded");
+        assert_eq!(w.settings.gmcp_packages, "Client.Media 1");
     }
 
     #[test]
@@ -4621,90 +4184,14 @@ mod tests {
             "an absent key must default to DEFAULT_PROMPT_WAIT_MS");
     }
 
-    /// `world_type=mud_timed_prompt` must round-trip through settings.dat, and an
-    /// unrecognized value must fall back to `Mud` (`WorldType::from_name`'s documented
-    /// `_ => Mud` contract), in both settings.dat and the hot-reload state file - the
-    /// two independent parsers that each call `WorldType::from_name` directly.
-    #[test]
-    fn test_chat_settings_migration_keeps_old_behaviour_once() {
-        // A pre-overhaul Discord world showed only its one channel: after migration the
-        // channel is both Send To and Show Only.
-        let mut s = WorldSettings { chat_settings_version: 0, world_type: WorldType::Discord, ..WorldSettings::default() };
-        s.discord_channel = "123456789012345678".to_string();
-        migrate_chat_settings(&mut s);
-        assert_eq!(s.discord_channel, "123456789012345678");
-        assert_eq!(s.discord_channels, "123456789012345678");
-        assert_eq!(s.chat_settings_version, crate::CHAT_SETTINGS_VERSION);
-        // Idempotent: a user who later clears Show Only keeps it cleared.
-        s.discord_channels.clear();
-        migrate_chat_settings(&mut s);
-        assert!(s.discord_channels.is_empty());
-
-        // DM-only world: Send To @user, Show Only matches no channel (DMs always show).
-        let mut s = WorldSettings { chat_settings_version: 0, world_type: WorldType::Discord, ..WorldSettings::default() };
-        s.discord_dm_user = "223456789012345678".to_string();
-        migrate_chat_settings(&mut s);
-        assert_eq!(s.discord_channel, "@223456789012345678");
-        assert_eq!(s.discord_channels, "@223456789012345678");
-        assert!(s.discord_dm_user.is_empty());
-
-        // Slack: an app token pasted into the one old token field moves to its own field.
-        let mut s = WorldSettings { chat_settings_version: 0, world_type: WorldType::Slack, ..WorldSettings::default() };
-        s.slack_token = "xapp-1-abc".to_string();
-        s.slack_channel = "C0123ABCD".to_string();
-        migrate_chat_settings(&mut s);
-        assert!(s.slack_token.is_empty());
-        assert_eq!(s.slack_app_token, "xapp-1-abc");
-        assert_eq!(s.slack_channels, "C0123ABCD");
-
-        // A world already on the new model is never touched.
-        let mut s = WorldSettings {
-            discord_channel: "#general".to_string(),
-            ..Default::default()
-        };
-        migrate_chat_settings(&mut s);
-        assert!(s.discord_channels.is_empty());
-    }
-
-    #[test]
-    fn test_chat_settings_version_key_controls_migration_on_load() {
-        let mut app = App::new();
-        app.worlds.clear();
-        let content = "[world:Old]\nworld_type=discord\ndiscord_channel=general\n\
-                       [world:New]\nworld_type=discord\ndiscord_channel=general\nchat_settings_version=2\n";
-        load_settings_from_str(&mut app, content);
-        let old = app.worlds.iter().find(|w| w.name == "Old").unwrap();
-        assert_eq!(old.settings.discord_channels, "general", "pre-overhaul world keeps showing only its channel");
-        let new = app.worlds.iter().find(|w| w.name == "New").unwrap();
-        assert!(new.settings.discord_channels.is_empty(), "a new-model world shows everything");
-        // And the version is written back, so the next load doesn't migrate again.
-        let mut out = Vec::new();
-        {
-            let mut app2 = App::new();
-            app2.worlds.clear();
-            let mut w = World::new("W");
-            w.settings.world_type = WorldType::Discord;
-            w.settings.discord_channel = "#x".to_string();
-            app2.worlds.push(w);
-            // In-memory writer, not save_settings_to_path: that records the process-wide
-            // SETTINGS_FILE_FINGERPRINT, which test_settings_fingerprint_survives_reload_state_roundtrip
-            // needs to itself while tests run in parallel.
-            write_settings_dat(&app2, &mut out, false).unwrap();
-        }
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("chat_settings_version=2"), "{text}");
-    }
-
-    /// Only a chat world carries the version key: a MUD has nothing to upgrade, so its
-    /// section stays free of it, and - loaded without one - it is current in memory, so
-    /// switching it to Discord later saves the stamp rather than a legacy "0".
+    /// Only a chat world carries the version key (written for an older 1.7 Clay, which
+    /// converts a chat world without it): a MUD's section stays free of it, and a world
+    /// switched to Discord saves it.
     #[test]
     fn test_chat_settings_version_is_only_written_for_chat_worlds() {
         let mut app = App::new();
         app.worlds.clear();
         load_settings_from_str(&mut app, "[world:M]\nworld_type=mud\nhostname=h\nport=1\n\n[world:D]\nworld_type=discord\ndiscord_token=t\n");
-        let mud = app.worlds.iter().find(|w| w.name == "M").unwrap();
-        assert_eq!(mud.settings.chat_settings_version, crate::CHAT_SETTINGS_VERSION, "current in memory without the key");
         let section = |text: &str, name: &str| -> String {
             let i = text.find(&format!("[world:{name}]")).unwrap();
             let rest = &text[i + 1..];
@@ -4716,7 +4203,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(!section(&text, "M").contains("chat_settings_version"), "a MUD carries no key:\n{}", section(&text, "M"));
         assert!(section(&text, "D").contains("chat_settings_version=2"), "a Discord world does:\n{}", section(&text, "D"));
-        // Switched to Discord in the editor: the save stamps it, so no upgrade runs later.
+        // Switched to Discord in the editor: the save writes it.
         let idx = app.worlds.iter().position(|w| w.name == "M").unwrap();
         app.worlds[idx].settings.world_type = WorldType::Discord;
         let mut out = Vec::new();
@@ -4757,6 +4244,10 @@ mod tests {
         assert_eq!(s.discord_token, "tok", "an omitted (empty) token is left unchanged");
     }
 
+    /// `world_type=mud_timed_prompt` must round-trip through settings.dat, and an
+    /// unrecognized value must fall back to `Mud` (`WorldType::from_name`'s documented
+    /// `_ => Mud` contract), in both settings.dat and the hot-reload state file - the
+    /// two independent parsers that each call `WorldType::from_name` directly.
     #[test]
     fn test_world_type_mud_timed_prompt_and_unknown_name_round_trip_in_settings_dat() {
         let mut app = App::new();
@@ -4890,18 +4381,14 @@ mod tests {
         assert!(!text.contains("keep_alive_gag"), "{text}");
     }
 
+    /// A reload restores a world's GMCP packages as they were, `Client.Media 1` included.
     #[test]
-    fn test_load_reload_state_migrates_an_untouched_legacy_gmcp_default() {
-        // The hot-reload restore path (a separate load site from settings.dat) must
-        // apply the same migration - otherwise a `/reload` triggered mid-upgrade from
-        // a pre-Job-6 build would restore the old process's still-unmigrated
-        // in-memory value straight over whatever settings.dat's own loader already
-        // migrated moments earlier in the new process.
+    fn test_load_reload_state_keeps_a_saved_gmcp_value() {
         let mut app = App::new();
-        let content = "[world_state:0]\nname=Legacy\ngmcp_packages=Client.Media 1\n";
+        let content = "[world_state:0]\nname=Media\ngmcp_packages=Client.Media 1\n";
         load_reload_state_from_str(&mut app, content).expect("load_reload_state_from_str");
-        let w = app.worlds.iter().find(|w| w.name == "Legacy").expect("world restored");
-        assert_eq!(w.settings.gmcp_packages, crate::DEFAULT_GMCP_PACKAGES);
+        let w = app.worlds.iter().find(|w| w.name == "Media").expect("world restored");
+        assert_eq!(w.settings.gmcp_packages, "Client.Media 1");
     }
 
     #[test]
@@ -5490,7 +4977,6 @@ pattern=foo
         assert_ne!(non_default.input_height_tablet, default.input_height_tablet, "input_height_tablet should differ");
         assert_ne!(non_default.input_height_desktop, default.input_height_desktop, "input_height_desktop should differ");
         assert_ne!(non_default.web_font_weight, default.web_font_weight, "web_font_weight should differ");
-        assert_ne!(non_default.web_secure, default.web_secure, "web_secure should differ");
         assert_ne!(non_default.http_enabled, default.http_enabled, "http_enabled should differ");
         assert_ne!(non_default.http_port, default.http_port, "http_port should differ");
         assert_ne!(non_default.web_path, default.web_path, "web_path should differ");
@@ -5827,36 +5313,14 @@ MyHost.Example:9000=AABBCC
         assert!(!section.iter().any(|l| l.starts_with("PATH=") || l.starts_with("CARGO_")), "{section:?}");
     }
 
-    /// A settings.dat written before tf_globals_version=2 saved every global, including
-    /// the environment. Loading it drops environment-style and seed entries once; the
-    /// next save no longer contains them. A deliberate lower-case variable survives.
+    /// A `[tf_globals]` section loads as written: an all-capitals variable is the user's
+    /// own, and a %wrapsize means what TF means.
     #[test]
-    fn test_old_tf_globals_section_is_cleaned_once() {
-        let old = "[global]\nmore_mode=true\n\n[tf_globals]\nCLAY_TEST_LEAKED_TOKEN=abc\nmaxpri=2147483647\ntime_format=%H:%M\nmyvar=keep\n?=1\nwrap=1\nwrapsize=5\n";
+    fn test_tf_globals_section_loads_as_written() {
         let mut app = App::new();
-        load_settings_from_str(&mut app, old);
-        assert!(app.tf_engine.get_var("CLAY_TEST_LEAKED_TOKEN").is_none());
-        // An old `/wrap 5` (Clay's wrap indent then) must not wrap output at 5 columns now.
-        assert_eq!(app.settings.wrap_columns, 0, "pre-v2 %wrapsize is a stale /wrap side effect");
-        assert_eq!(app.tf_engine.get_var("myvar").map(|v| v.to_string_value()), Some("keep".to_string()));
-
-        let tmp = std::env::temp_dir().join(format!("clay_test_tf_globals_cleanup_{}.dat", std::process::id()));
-        save_settings_to_path(&app, &tmp).expect("save");
-        let content = std::fs::read_to_string(&tmp).expect("read");
-        let _ = std::fs::remove_file(&tmp);
-        let section = tf_globals_section(&content);
-        assert_eq!(section, vec!["myvar=keep".to_string()]);
-
-        // Once the file is version 2, an all-capitals variable is the user's own and stays.
-        let v2 = "[global]\ntf_globals_version=2\n\n[tf_globals]\nMYVAR=1\n";
-        let mut app2 = App::new();
-        load_settings_from_str(&mut app2, v2);
-        assert_eq!(app2.tf_engine.get_var("MYVAR").map(|v| v.to_string_value()), Some("1".to_string()));
-
-        // ...and so is a %wrapsize: set since version 2, it means what TF means.
-        let mut app3 = App::new();
-        load_settings_from_str(&mut app3, "[global]\ntf_globals_version=2\n\n[tf_globals]\nwrapsize=60\n");
-        assert_eq!(app3.settings.wrap_columns, 60);
+        load_settings_from_str(&mut app, "[global]\ntf_globals_version=2\n\n[tf_globals]\nMYVAR=1\nwrapsize=60\n");
+        assert_eq!(app.tf_engine.get_var("MYVAR").map(|v| v.to_string_value()), Some("1".to_string()));
+        assert_eq!(app.settings.wrap_columns, 60);
     }
 
     /// The live environment wins over a saved copy (a stale TFLIBDIR from another

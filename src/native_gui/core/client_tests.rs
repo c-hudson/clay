@@ -332,6 +332,29 @@ fn what_the_user_typed_is_hidden_under_f2_too() {
     assert_eq!(without, vec!["line 0"]);
 }
 
+/// A sent line takes the world's prompt only when it answers it (user report 2026-11-13:
+/// after `/url` the prompt was gone, Ctrl+L or not - the server sends no new prompt for a
+/// command that stays there). Text for the MUD still clears it, and a chat world's prompt,
+/// its send target, stays whatever is typed.
+#[test]
+fn a_command_keeps_the_prompt_and_text_for_the_world_answers_it() {
+    let mut h = H::password();
+    let mut chat = world_msg(1, "B", 0..1, 9);
+    chat.settings.world_type = "discord".into();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9), chat]);
+    h.msg(WsMessage::PromptUpdate { world_index: 0, prompt: "HP 100> ".into() });
+    h.msg(WsMessage::PromptUpdate { world_index: 1, prompt: "[#general] ".into() });
+    for line in ["/url https://example.com/a/long/path", "//echo hi", "/set x=1"] {
+        h.core.command_sent(line);
+        assert_eq!(h.core.worlds[0].prompt, "HP 100> ", "{line:?} kept the prompt");
+    }
+    h.core.command_sent("look");
+    assert_eq!(h.core.worlds[0].prompt, "", "text for the MUD answers it");
+    h.core.current = 1;
+    h.core.command_sent("hello");
+    assert_eq!(h.core.worlds[1].prompt, "[#general] ", "a chat world's send target stays");
+}
+
 #[test]
 fn a_partial_line_waits_for_the_rest() {
     let mut h = H::password();
@@ -772,13 +795,7 @@ fn saving_the_settings_back_unchanged_changes_nothing_but_what_was_edited() {
     let (tx, _rx) = tokio::sync::mpsc::channel(16);
     let _ = app.handle_ws_client_msg(1, settings_update(&before), &tx);
     let after = app.build_global_settings_msg();
-    // `web_secure` goes back true, as the web client sends it: it's kept only for wire
-    // compatibility and never read (the server is always TLS-capable).
-    let json = |s: &crate::websocket::GlobalSettingsMsg| {
-        let mut v = serde_json::to_value(s).unwrap();
-        v.as_object_mut().unwrap().remove("web_secure");
-        v
-    };
+    let json = |s: &crate::websocket::GlobalSettingsMsg| serde_json::to_value(s).unwrap();
     assert_eq!(json(&before), json(&after));
     // And the one field the slider moves does move.
     let mut edited = after.clone();
@@ -827,11 +844,6 @@ fn the_separator_style_is_saved_from_this_guis_settings() {
     let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
     assert_eq!(app.settings.separator_style, crate::SeparatorStyle::TinyFugue);
     assert!(app.needs_output_redraw, "the console's bar is redrawn");
-    // A server from before the style was on the wire sent none: nothing goes back.
-    s.separator_style = String::new();
-    assert!(matches!(settings_update(&s), WsMessage::UpdateGlobalSettings { separator_style: None, .. }));
-    let _ = app.handle_ws_client_msg(1, settings_update(&s), &tx);
-    assert_eq!(app.settings.separator_style, crate::SeparatorStyle::TinyFugue, "None = unchanged");
 }
 
 #[test]
@@ -1804,8 +1816,7 @@ fn archive_lines_survive_a_reconnect_and_stay_out_of_the_cache() {
     h.msg(WsMessage::HistoryLines { world_index: 0, request_id: id, before_seq, archive_before,
         lines: Vec::new(), archive: (0..3).map(archive_line).collect(), done: false });
     assert!(h.core.cache_snapshot().iter().all(|w| w.lines.iter().all(|l| !l.text.starts_with("old "))), "never cached");
-    // A reconnect to the same epoch keeps the buffer, archive lines and all (they are not
-    // the pre-1.5.23 archive lines that mark a corrupted buffer).
+    // A reconnect to the same epoch keeps the buffer, archive lines and all.
     h.input(Input::Closed("blip".into()));
     h.advance(Duration::from_secs(3));
     h.input(Input::Opened);

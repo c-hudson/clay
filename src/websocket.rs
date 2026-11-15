@@ -982,15 +982,14 @@ pub enum WsMessage {
         #[serde(default)]
         web_font_word_spacing: f32,
         ws_allow_list: String,
+        /// Read by nothing (the server is always TLS-capable, D8). Still sent, because a
+        /// 1.7.0 server requires the field.
+        #[serde(default)]
         web_secure: bool,
         http_enabled: bool,
         http_port: u16,
         #[serde(default = "default_web_path")]
         web_path: String,
-        #[serde(default)]
-        ws_enabled: bool,  // Legacy — ignored, kept for backward compat
-        #[serde(default)]
-        ws_port: u16,      // Legacy — ignored, kept for backward compat
         ws_cert_file: String,
         ws_key_file: String,
         #[serde(default)]
@@ -1733,7 +1732,7 @@ pub enum ScrollbackDoneReason {
 }
 
 /// Where a client's history reaches into the archive: its oldest archive line's durable
-/// sequence (`None` for a row read by timestamp from a pre-migration archive) and time.
+/// sequence (`None` for a row read by timestamp) and time.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArchiveCursor {
     #[serde(default)]
@@ -1770,9 +1769,9 @@ pub struct TimestampedLine {
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive
     /// Mirrors `OutputLine::archive_sourced` — a `/recall -D` result: archived *text*
     /// delivered as an ordinary live line. Display-only (draws 🛢️ instead of ✨).
-    /// Deliberately NOT folded into `from_archive` on the wire: app.js's
-    /// `bufferIsCorrupted()` treats any wire `from_archive` as proof of a pre-1.5.23
-    /// server and throws the client's whole buffer away.
+    /// Deliberately NOT folded into `from_archive` on the wire: a `from_archive` line is
+    /// one no client is ever sent (the pre-1.5.23 servers that sent them poisoned client
+    /// buffers).
     #[serde(default)]
     pub archive_sourced: bool,
     /// Mirrors `OutputLine::viewed` — see its doc comment in main.rs. Carried on the wire so a
@@ -2361,16 +2360,15 @@ pub struct GlobalSettingsMsg {
     #[serde(default)]
     pub font_profiles: Option<crate::font_profile::FontProfiles>,
     pub ws_allow_list: String,
+    /// Read by nothing (the server is always TLS-capable, D8). Still sent, because a
+    /// 1.7.0 client requires the field.
+    #[serde(default)]
     pub web_secure: bool,
     pub http_enabled: bool,
     pub http_port: u16,
     /// Stealth path prefix for the web UI (default "clay"; empty = legacy mode at "/")
     #[serde(default = "default_web_path")]
     pub web_path: String,
-    #[serde(default)]
-    pub ws_enabled: bool,  // Legacy — ignored, kept for backward compat
-    #[serde(default)]
-    pub ws_port: u16,      // Legacy — ignored, kept for backward compat
     pub ws_cert_file: String,  // Empty from server; populated when client sends updates
     pub ws_key_file: String,   // Empty from server; populated when client sends updates
     #[serde(default)]
@@ -2480,14 +2478,6 @@ pub struct GlobalSettingsMsg {
     /// Auth key value for display in web settings (only sent to authenticated clients)
     #[serde(default)]
     pub auth_key: String,
-    /// Legacy: once carried the plaintext WebSocket password for display in settings.
-    /// A server now always sends it empty (the password never leaves the server), and
-    /// reports only whether one is set via `ws_password_set`. Kept on the wire because
-    /// a client echoes it back in `UpdateGlobalSettings.ws_password`, where empty means
-    /// "unchanged" — an older server that still sends the real value gets it back
-    /// intact instead of having its password cleared.
-    #[serde(default)]
-    pub ws_password: String,
     /// Whether the server has a WebSocket password configured (the value itself is
     /// never sent). False from a server that predates it.
     #[serde(default)]

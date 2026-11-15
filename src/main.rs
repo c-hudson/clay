@@ -34,8 +34,10 @@ compile_error!("The 'web-front' and 'shell-worlds' features can't be built toget
 #[cfg(all(feature = "web-front", feature = "multiuser"))]
 compile_error!("The 'web-front' and 'multiuser' features are two different servers: build one or the other.");
 
-/// Current `WorldSettings::chat_settings_version` (2 = the server-per-world model with
-/// Send To / Show Only; see `persistence::migrate_chat_settings`).
+/// The chat-settings model a Slack/Discord world's section is written in (2 = the
+/// server-per-world model with Send To / Show Only), as `chat_settings_version=`. Nothing
+/// reads it any more; it is written because an older 1.7 Clay converts a chat world whose
+/// section lacks it.
 pub const CHAT_SETTINGS_VERSION: u32 = 2;
 pub mod daemon;
 pub mod instance;
@@ -2021,85 +2023,6 @@ pub fn clay_root_config_path(name: &str) -> PathBuf {
     clay_root_config_dir().join(name)
 }
 
-/// One-time migration: move legacy `~/.clay.*` dotfiles into `~/.clay/` config dir.
-/// Safe to call repeatedly — skips files that already exist at the new location.
-/// Must be called at startup before any config is loaded.
-pub fn migrate_legacy_config_files() {
-    // clay_web has no ~/.clay to migrate into.
-    if instance::is_web_only() {
-        return;
-    }
-    let home = get_home_dir();
-    let home_path = std::path::Path::new(&home);
-    let config_dir = clay_config_dir();
-
-    // (legacy name passed through clay_filename, new name inside config_dir)
-    let migrations: &[(&str, &str)] = &[
-        ("clay.key",           "secure.key"),
-        ("clay.dat",           "settings.dat"),
-        ("clay.multiuser.dat", "multiuser.dat"),
-        ("clay.key.dat",       "keybindings.dat"),
-        ("clay.theme.dat",     "theme.dat"),
-        ("clay.scrollback.db", "scrollback.db"),
-        ("clay.dmp.log",       "dump.log"),
-        ("clay.cert.pem",      "cert.pem"),
-        ("clay.key.pem",       "key.pem"),
-    ];
-
-    for (legacy_name, new_name) in migrations {
-        let legacy = home_path.join(clay_filename(legacy_name));
-        let new_path = config_dir.join(new_name);
-        if legacy.exists() && !new_path.exists() {
-            let _ = std::fs::rename(&legacy, &new_path);
-        }
-    }
-
-    // Scrollback SQLite sidecars (-wal, -shm)
-    for sidecar in &["-wal", "-shm"] {
-        let legacy = home_path.join(clay_filename(&format!("clay.scrollback.db{}", sidecar)));
-        let new_path = config_dir.join(format!("scrollback.db{}", sidecar));
-        if legacy.exists() && !new_path.exists() {
-            let _ = std::fs::rename(&legacy, &new_path);
-        }
-    }
-
-    // Reload state files (.clay.reload.<pid>) — enumerate and migrate any present
-    if let Ok(entries) = std::fs::read_dir(home_path) {
-        let prefix = clay_filename("clay.reload.");
-        for entry in entries.flatten() {
-            let fname = entry.file_name();
-            let fname_str = fname.to_string_lossy().into_owned();
-            if fname_str.starts_with(&prefix) {
-                let suffix = &fname_str[prefix.len()..];
-                let new_name = format!("reload.{}", suffix);
-                let new_path = config_dir.join(&new_name);
-                if !new_path.exists() {
-                    let _ = std::fs::rename(entry.path(), &new_path);
-                }
-            }
-        }
-    }
-
-    // Debug log: ~/clay.debug.log (no dot — never used clay_filename)
-    {
-        let legacy = home_path.join("clay.debug.log");
-        let new_path = config_dir.join("debug.log");
-        if legacy.exists() && !new_path.exists() {
-            let _ = std::fs::rename(&legacy, &new_path);
-        }
-    }
-
-    // Oldest theme file migration: ~/clay.theme.dat (no dot) → theme.dat
-    {
-        let legacy = home_path.join("clay.theme.dat");
-        let new_path = config_dir.join("theme.dat");
-        if legacy.exists() && !new_path.exists() {
-            let _ = std::fs::rename(&legacy, &new_path);
-        }
-    }
-    // Note: clay.output.debug and clay.remote.log were CWD-relative so no migration needed
-}
-
 /// Generate a WAV file from ANSI music notes (square wave, matching web client's oscillator)
 pub(crate) fn generate_wav_from_notes(notes: &[crate::ansi_music::MusicNote]) -> Vec<u8> {
     let sample_rate: u32 = 22050;
@@ -2272,9 +2195,7 @@ pub struct Settings {
     // The server is always TLS-capable now: localhost is served plain (no cert prompt,
     // see http::route_connection's loopback branch), remote clients always get TLS —
     // either a user-provided cert (websocket_cert_file/websocket_key_file) or the
-    // auto-generated one below. `web_secure` is kept only for settings.dat/import
-    // backward-compat and is no longer read to choose the server mode.
-    web_secure: bool,
+    // auto-generated one below.
     http_enabled: bool,            // Enable the web server
     http_port: u16,                // Port for the web interface
     web_path: String,              // Stealth path prefix for web UI (default "clay"; empty = legacy mode at "/")
@@ -2499,7 +2420,6 @@ impl Default for Settings {
             web_font_letter_spacing: 0.0,
             web_font_word_spacing: 0.0,
             font_profiles: Default::default(),
-            web_secure: false,         // Default to non-secure
             http_enabled: false,
             http_port: 9000,
             web_path: "clay".to_string(),
@@ -2598,13 +2518,6 @@ impl WorldType {
     }
 }
 
-/// `WorldSettings::gmcp_packages` default before mud-status-display.md Job 6. Kept as
-/// its own named constant (never re-typed inline) because `persistence.rs`'s load-time
-/// migration must compare against exactly this string to decide whether a stored value
-/// is untouched — see `DEFAULT_GMCP_PACKAGES` below for why the two must never drift
-/// apart from a hand-copied literal.
-pub(crate) const LEGACY_DEFAULT_GMCP_PACKAGES: &str = "Client.Media 1";
-
 /// Current default for `WorldSettings::gmcp_packages` (mud-status-display.md Job 6).
 /// Job 6's audit found that Clay only ever told a MUD server it supported
 /// `Client.Media` — a spec-following server has no reason to ever send `Char.*`
@@ -2613,14 +2526,8 @@ pub(crate) const LEGACY_DEFAULT_GMCP_PACKAGES: &str = "Client.Media 1";
 /// matching `stats::WorldStats::update_from_gmcp`'s own scope (any `Char.*` package,
 /// not one specific sub-package).
 ///
-/// A new world picks this up automatically via `WorldSettings::default()` below. An
-/// *existing* world's `settings.dat` entry does not — see `persistence.rs`'s
-/// `migrate_gmcp_packages`, called from every load path that assigns
-/// `gmcp_packages`, which upgrades a stored value only when it is *exactly*
-/// `LEGACY_DEFAULT_GMCP_PACKAGES` (i.e. the user never customised it). Any other
-/// stored value, including one a user deliberately edited back to look like the old
-/// default, is left alone — the plan (Job 6) accepts that these two cases are
-/// indistinguishable from the stored string alone.
+/// A new world picks this up via `WorldSettings::default()` below; a saved world keeps
+/// what it was saved with.
 /// `Room 1` (2026-11-01): the room the user is in, for the map (src/map).
 pub(crate) const DEFAULT_GMCP_PACKAGES: &str = "Client.Media 1, Char 1, Room 1";
 
@@ -2667,17 +2574,13 @@ pub struct WorldSettings {
     slack_workspace: String,
     // Discord settings. `discord_guild` is the Server spec, `discord_channel` the Send
     // To spec (a channel or @user), `discord_channels` the "Show Only" filter.
-    // `discord_dm_user` is legacy (pre-overhaul DM-only worlds); load-time migration
-    // folds it into discord_channel/discord_channels (persistence::migrate_chat_settings).
+    // `discord_dm_user` is the pre-overhaul DM-only world's user: nothing reads it, but
+    // the world editors still send it and settings.dat keeps it.
     discord_token: String,
     discord_guild: String,
     discord_channel: String,
     discord_channels: String,
     discord_dm_user: String,
-    /// Which chat-settings model these fields follow (`persistence::migrate_chat_settings`).
-    /// A world loaded from a file without the key is pre-overhaul (0) and is migrated
-    /// once; the key is always written, so the migration never repeats.
-    chat_settings_version: u32,
     // User notes (stored per-world, edited with /edit command)
     pub notes: String,
     // GMCP packages to request (comma-separated, e.g. "Client.Media 1, Char.Vitals 1").
@@ -2759,7 +2662,6 @@ impl Default for WorldSettings {
             discord_channel: String::new(),
             discord_channels: String::new(),
             discord_dm_user: String::new(),
-            chat_settings_version: CHAT_SETTINGS_VERSION,
             notes: String::new(),
             gmcp_packages: DEFAULT_GMCP_PACKAGES.to_string(),
             auto_reconnect_secs: 0,
@@ -6379,7 +6281,7 @@ pub struct App {
     pub shell_esc_armed_at: Option<std::time::Instant>,
     pub show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
     pub highlight_actions: bool, // F8 toggles - highlight lines matching action patterns
-    // WebSocket server (ws:// or wss:// depending on web_secure setting)
+    // WebSocket server (TLS for a remote client, plain on loopback: D8)
     pub ws_server: Option<WebSocketServer>,
     /// Plaintext auth key, shared with SecurityGate.auth_key for accept-time knock
     /// verification (Phase 3). Mirrors `settings.websocket_auth_key`; kept in sync by
@@ -6502,6 +6404,10 @@ pub struct App {
     /// Where a background `/sh <command>` reports back (`AppEvent::TfShellDone`); set by
     /// every event loop that handles that event.
     pub(crate) tf_event_tx: Option<mpsc::Sender<AppEvent>>,
+    /// Each background `/quote ... !<command>` whose command is still running, by process
+    /// id (`App::start_quote_source`). Dropping one stops its command. Not carried by a
+    /// reload: a quote that comes through drains the lines it had and ends.
+    pub(crate) quote_sources: std::collections::HashMap<u32, tfrun::QuoteSource>,
     /// Remote console only: the master reported (GlobalSettingsMsg::ws_password_set) that
     /// it has a WebSocket password. The value itself is never sent, so the /web popup
     /// starts with a blank password field that means "keep the current one".
@@ -6554,7 +6460,7 @@ pub struct App {
     pub(crate) client_notices: Vec<String>,
     /// Set to true after a web client authenticates, to trigger reconnects in the event loop.
     pub web_reconnect_needed: bool,
-    /// Set to true when http_port/http_enabled/web_secure changes, to restart the HTTP server.
+    /// Set to true when http_port/http_enabled/web_path changes, to restart the HTTP server.
     pub web_restart_needed: bool,
     /// True if this session started from a hot reload (suppress server startup messages)
     pub is_reload: bool,
@@ -6853,6 +6759,7 @@ impl App {
             tf_mail_files: std::collections::HashMap::new(),
             pending_terminal_ops: std::collections::VecDeque::new(),
             tf_event_tx: None,
+            quote_sources: std::collections::HashMap::new(),
             remote_ws_password_set: false,
             remote_multiuser: false,
             remote_reachability_json: String::new(),
@@ -6944,21 +6851,7 @@ impl App {
         if self.settings.scrollback_enabled {
             if self.scrollback.is_none() {
                 let path = clay_config_path("scrollback.db");
-                // Mint ids BEFORE opening: the migration attributes legacy rows
-                // (which recorded only a world name) to whichever live world
-                // currently answers to that name, so it needs the ids to exist.
-                for world in &mut self.worlds {
-                    world.ensure_world_id();
-                }
-                let refs: Vec<scrollback::WorldRef> = self
-                    .worlds
-                    .iter()
-                    .map(|w| scrollback::WorldRef {
-                        world_uuid: w.world_id.clone(),
-                        name: w.name.clone(),
-                    })
-                    .collect();
-                match scrollback::ScrollbackDb::open(&path, &refs) {
+                match scrollback::ScrollbackDb::open(&path) {
                     Ok(db) => self.scrollback = Some(db),
                     Err(e) => {
                         debug_log(true, &format!("scrollback: failed to open {:?}: {}", path, e));
@@ -7091,12 +6984,10 @@ impl App {
             web_font_word_spacing: self.settings.web_font_word_spacing,
             font_profiles: Some(self.settings.font_profiles.clone()),
             ws_allow_list: self.settings.websocket_allow_list.clone(),
-            web_secure: self.settings.web_secure,
+            web_secure: true,
             http_enabled: self.settings.http_enabled,
             http_port: self.settings.http_port,
             web_path: self.settings.web_path.clone(),
-            ws_enabled: false,  // Legacy
-            ws_port: 0,        // Legacy
             ws_cert_file: self.settings.websocket_cert_file.clone(),
             ws_key_file: self.settings.websocket_key_file.clone(),
             tls_configured: !self.settings.websocket_cert_file.is_empty() && !self.settings.websocket_key_file.is_empty(),
@@ -7131,8 +7022,6 @@ impl App {
             keybindings_json: self.keybindings.to_json(),
             tf_bound_keys_json: self.tf_bound_keys_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
-            // Never the password itself — see GlobalSettingsMsg::ws_password.
-            ws_password: String::new(),
             ws_password_set: !self.settings.websocket_password.is_empty(),
             reachability_json: self.reachability_json(),
         }
@@ -7193,7 +7082,6 @@ impl App {
             self.settings.font_profiles = profiles.clone();
         }
         self.settings.websocket_allow_list = settings.ws_allow_list.clone();
-        self.settings.web_secure = settings.web_secure;
         self.settings.http_enabled = settings.http_enabled;
         self.settings.http_port = settings.http_port;
         self.settings.web_path = sanitize_web_path(&settings.web_path);
@@ -7205,12 +7093,11 @@ impl App {
         if !settings.ws_key_file.is_empty() {
             self.settings.websocket_key_file = settings.ws_key_file.clone();
         }
-        // The auth key is sent by the master for display in /web; the WS password is
-        // not (a current master sends it empty, so the popup's password field starts
-        // blank and saving it blank leaves the master's password unchanged). An older
-        // master still sends the real value, which is mirrored so it round-trips.
-        self.settings.websocket_password = settings.ws_password.clone();
-        self.remote_ws_password_set = settings.ws_password_set || !settings.ws_password.is_empty();
+        // The auth key is sent by the master for display in /web; the WS password never
+        // is, so the popup's password field starts blank, and saving it blank leaves the
+        // master's password unchanged.
+        self.settings.websocket_password.clear();
+        self.remote_ws_password_set = settings.ws_password_set;
         self.settings.websocket_auth_key = if settings.auth_key.is_empty() {
             None
         } else {
@@ -8605,10 +8492,15 @@ impl App {
                 } else {
                     format!("({})", a.world)
                 };
-                let pattern_preview = if a.pattern.len() > 30 {
-                    format!("{}...", &a.pattern[..27])
+                let pattern = a.display_pattern();
+                let pattern_preview = if pattern.len() > 30 {
+                    let mut end = 27;
+                    while !pattern.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &pattern[..end])
                 } else {
-                    a.pattern.clone()
+                    pattern.to_string()
                 };
                 popup::ListItem {
                     id: idx.to_string(),  // Store original index as ID
@@ -11368,11 +11260,7 @@ impl App {
     /// deployment (standalone `-D` daemon, Android local-server mode, multiuser): the message
     /// fell into the catch-all with no reply, no save, no broadcast.
     pub(crate) fn handle_update_actions(&mut self, actions: Vec<Action>) {
-        // Update actions from remote client; normalize migrates any legacy single-pattern fields
         self.settings.actions = actions.clone();
-        for action in &mut self.settings.actions {
-            action.normalize();
-        }
         compile_all_action_regexes(&mut self.settings.actions);
         // Save settings to persist changes
         let _ = persistence::save_settings(self);
@@ -12326,12 +12214,12 @@ impl App {
         prompt_wait_ms: u64,
         tf_type: Option<String>,
         slack_token: String,
-        slack_channel: String,
-        slack_workspace: String,
+        _slack_channel: String,
+        _slack_workspace: String,
         discord_token: String,
-        discord_guild: String,
-        discord_channel: String,
-        discord_dm_user: String,
+        _discord_guild: String,
+        _discord_channel: String,
+        _discord_dm_user: String,
         chat: Option<crate::websocket::ChatSettingsUpdate>,
         keep_alive_gag_enabled: Option<bool>,
         keep_alive_gag: Option<String>,
@@ -12419,33 +12307,20 @@ impl App {
         if let Some(t) = tf_type {
             self.worlds[world_index].settings.tf_type = t.trim().to_string();
         }
-        // Slack/Discord fields follow the same "leave unchanged when empty" contract as
-        // world_type/password above - a save that never touched these (e.g. a MUD world's
-        // editor, or an older client) must not wipe a configured Slack/Discord world's
-        // credentials.
+        // The tokens follow the same "leave unchanged when empty" contract as
+        // world_type/password above - a save that never touched them (a MUD world's
+        // editor) must not wipe a configured Slack/Discord world's credentials. They
+        // travel only in these fields; the rest of each editor's chat settings come in
+        // `chat`, which every editor since 1.6.15 sends (the loose slack_channel,
+        // slack_workspace, discord_guild, discord_channel and discord_dm_user beside the
+        // tokens are an older editor's, read by nothing).
         if !slack_token.is_empty() {
             self.worlds[world_index].settings.slack_token = slack_token;
-        }
-        if !slack_channel.is_empty() {
-            self.worlds[world_index].settings.slack_channel = slack_channel;
-        }
-        if !slack_workspace.is_empty() {
-            self.worlds[world_index].settings.slack_workspace = slack_workspace;
         }
         if !discord_token.is_empty() {
             self.worlds[world_index].settings.discord_token = discord_token;
         }
-        if !discord_guild.is_empty() {
-            self.worlds[world_index].settings.discord_guild = discord_guild;
-        }
-        if !discord_channel.is_empty() {
-            self.worlds[world_index].settings.discord_channel = discord_channel;
-        }
-        if !discord_dm_user.is_empty() {
-            self.worlds[world_index].settings.discord_dm_user = discord_dm_user;
-        }
-        // A client that knows the overhauled chat model sends `chat`: authoritative for
-        // the non-secret fields, so an empty value clears (the legacy fields above can't).
+        // Authoritative for the non-secret fields, so an empty value clears.
         if let Some(c) = chat {
             let w = &mut self.worlds[world_index].settings;
             w.discord_guild = c.discord_guild.trim().to_string();
@@ -12570,7 +12445,7 @@ impl App {
         web_font_letter_spacing: f32,
         web_font_word_spacing: f32,
         ws_allow_list: String,
-        web_secure: bool,
+        _web_secure: bool,
         http_enabled: bool,
         http_port: u16,
         web_path: String,
@@ -12669,14 +12544,10 @@ impl App {
         }
         // Update web settings — flag a restart if server-affecting settings changed
         let sanitized_web_path = sanitize_web_path(&web_path);
-        // `web_secure` is kept for older peers only and chooses nothing since the server
-        // became always TLS-capable (D8): a difference in it is no reason to restart. The
-        // native GUI always sends `true`, so every Settings save from it restarted the web
-        // server (and dropped every attached browser) while the stored value was false.
+        // (`web_secure` is a 1.7.0 peer's field and chooses nothing, D8.)
         let web_changed = self.settings.http_enabled != http_enabled
             || self.settings.http_port != http_port
             || self.settings.web_path != sanitized_web_path;
-        self.settings.web_secure = web_secure;
         self.settings.http_enabled = http_enabled;
         if self.settings.http_port != http_port {
             self.web_port_override = None;
@@ -12684,7 +12555,6 @@ impl App {
         self.settings.http_port = http_port;
         self.settings.web_path = sanitized_web_path;
         if web_changed { self.web_restart_needed = true; }
-        // ws_enabled and ws_port are legacy — ignored
         // Only update cert/key if non-empty (remote clients send empty for security)
         if !ws_cert_file.is_empty() {
             self.settings.websocket_cert_file = ws_cert_file;
@@ -19132,6 +19002,22 @@ impl App {
             self.tf_engine.next_process_id += 1;
             id
         });
+        // A shell command's lines come as it prints them, so it can take as long as it
+        // likes without holding Clay up (with no loop to report back to, it runs now).
+        if let Some(shell) = q.shell {
+            if !self.policy.processes {
+                self.emit_tf_error(world_index, &format!("QUOTE: {}: Operation not permitted", shell.command), false);
+                return None;
+            }
+            match self.start_quote_source(id, *shell) {
+                Ok(Some(all)) => lines = all,
+                Ok(None) => {}
+                Err(e) => {
+                    self.emit_tf_error(world_index, &e, false);
+                    return None;
+                }
+            }
+        }
         self.register_repeat_process(tf::TfProcess {
             id,
             command: q.label,
@@ -19429,7 +19315,7 @@ impl App {
                     keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -20738,9 +20624,8 @@ impl App {
     /// The `count` archived lines of `world_name` just older than a boundary, oldest first:
     /// by the durable sequence when the boundary has one (an exact cut, so nothing is shown
     /// twice or skipped on a timestamp tie), else by time. The time is the fallback for a
-    /// boundary line that predates archiving, a pre-migration archive (whose rows have no
-    /// sequence; `load_before_wseq` declines on it) and a reload state that carried no
-    /// sequence. The console's Page Up and a client's `RequestHistory` both read through
+    /// boundary line that predates archiving or carries no sequence (the allocator was
+    /// unreachable when it arrived). The console's Page Up and a client's `RequestHistory` both read through
     /// this. Empty when there is no archive file.
     pub(crate) fn archive_page(world_name: &str, wseq: Option<i64>, ts_ms: i64, count: usize) -> Vec<scrollback::ScrollbackLine> {
         let db_path = clay_config_path("scrollback.db");
@@ -20766,7 +20651,7 @@ impl App {
         // Prefer the durable sequence over the timestamp: it cuts on an exact key,
         // so Page Up cannot re-show a line the buffer already holds (nor skip one
         // whose timestamp ties). Falls back to the timestamp when the buffer's
-        // oldest line predates archiving or the archive has not been migrated.
+        // oldest line predates archiving or carries no sequence.
         let (world_name, oldest_ts_ms, oldest_wseq) = {
             let world = &self.worlds[world_idx];
             let ts = world.output_lines.first().map(|l| {
@@ -21077,6 +20962,11 @@ pub enum AppEvent {
     /// A `/sh <command>` run in the background finished (`App::start_tf_shell`): the
     /// world it was for, its output (standard error included), its exit status.
     TfShellDone(usize, String, i32),
+    /// Lines a background `/quote ... !<command>`'s command printed, one read's worth
+    /// (`App::start_quote_source`): its process id, the lines as printed.
+    TfQuoteOutput(u32, Vec<String>),
+    /// That command ended (its process id); the quote ends once its lines are done.
+    TfQuoteEnded(u32),
     // Background connection events
     ConnectionSuccess(String, mpsc::Sender<WriteCommand>, Option<SocketFd>, bool),  // world_name, cmd_tx, socket_fd, is_tls
     /// A connect attempt failed: world_name, connection_id, every address tried.
@@ -23099,7 +22989,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 startup,
                                 gui_shortcut,
                                 suppress_blanks,
-                                ..Action::default()
                             };
 
                             app.popup_manager.close();
@@ -23280,7 +23169,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 startup,
                                 gui_shortcut,
                                 suppress_blanks,
-                                ..Action::default()
                             };
 
                             app.popup_manager.close();
@@ -24088,9 +23976,6 @@ async fn main() -> io::Result<()> {
         }
     }
 
-    // Migrate legacy ~/.clay.* dotfiles into ~/.clay/ before any config is loaded
-    migrate_legacy_config_files();
-
     // Always log startup (not gated by debug flag) for reload/crash diagnostics
     debug_log(is_debug_enabled(), &format!("STARTUP: {} (reload={}, crash={}, gui={:?}, web_gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg, web_gui_arg));
 
@@ -24234,10 +24119,9 @@ async fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         let pattern = grep_pattern.as_deref().unwrap_or("*");
-        // Through `query` rather than the legacy `search`: on a v2 archive this
-        // uses the FTS index where the pattern allows and the (wid, wseq) index
-        // otherwise, instead of scanning every row. `query` falls back to the
-        // legacy path by itself if the file has not been migrated yet.
+        // Through `query` rather than `search`: it uses the FTS index where the
+        // pattern allows and the (wid, wseq) index otherwise, instead of scanning
+        // every row. An archive from before v1.5.41 is refused (no matches).
         let results = scrollback::query(&db_path, &scrollback::ArchiveQuery {
             world: grep_world_filter.as_deref(),
             pattern,
@@ -25960,6 +25844,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::TfShellDone(world_idx, output, status) => {
                         app.finish_tf_shell(world_idx, &output, status, false);
                     }
+                    AppEvent::TfQuoteOutput(pid, lines) => app.quote_source_output(pid, lines),
+                    AppEvent::TfQuoteEnded(pid) => app.quote_source_ended(pid),
                     // ConnectWorldRequest: a remote/WebSocket client executed a world-switch or
                     // connect ClayCommand (e.g. via an action like /common); the master must
                     // connect the world itself since it owns the sockets. Mirrors the
@@ -26515,6 +26401,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::TfShellDone(world_idx, output, status) => {
                     app.finish_tf_shell(world_idx, &output, status, false);
                 }
+                AppEvent::TfQuoteOutput(pid, lines) => app.quote_source_output(pid, lines),
+                AppEvent::TfQuoteEnded(pid) => app.quote_source_ended(pid),
                 AppEvent::UpdateResult { result, reply_to } => {
                     // src/selfupdate.rs. No live reload on this loop: the binary is
                     // installed, and whoever asked is told to restart it.
@@ -26673,6 +26561,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         // the separator bar, and sent to the clients
         app.check_tf_mail();
         app.refresh_tf_status();
+
+        // A quote /kill'ed since stops its command (left running, it would print on to
+        // nobody).
+        app.drop_killed_quote_sources();
 
         // Arm the process timer for the next process due (processes may have been added
         // during this iteration)

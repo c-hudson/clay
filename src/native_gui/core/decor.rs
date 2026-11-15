@@ -109,11 +109,7 @@ impl ActionMatcher {
             .iter()
             .filter(|a| a.enabled)
             .map(|a| {
-                let patterns: Vec<String> = if a.patterns.is_empty() {
-                    vec![a.pattern.clone()]
-                } else {
-                    a.patterns.iter().map(|p| p.pattern.clone()).collect()
-                };
+                let patterns: Vec<String> = a.patterns.iter().map(|p| p.pattern.clone()).collect();
                 let regexes = patterns
                     .iter()
                     .filter(|p| !p.trim().is_empty())

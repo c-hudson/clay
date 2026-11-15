@@ -303,9 +303,51 @@ fn invalid_enum_value(cmd: &str, opt: char, value: &str, valid: &[&str]) -> TfCo
 /// is then its pid; after `-S` it is the shell's exit status, the TF command's value,
 /// or for a file 1 (0 when it can't be read). `-A` (Clay's) keeps escape sequences,
 /// which are otherwise removed from the generated text.
+/// `/quote`'s `<pre>`, `<suf>` and ANSI stripping, applied to one line of its source.
+pub(crate) fn decorate_quote_line(prefix: &str, line: &str, suffix: &str, strip_ansi: bool) -> String {
+    let line = format!("{}{}{}", prefix, line, suffix);
+    if strip_ansi { crate::util::strip_ansi_codes(&line) } else { line }
+}
+
+impl super::QuoteShell {
+    /// One line the command printed, as the quote has it.
+    pub fn decorate(&self, line: &str) -> String {
+        decorate_quote_line(&self.prefix, line, &self.suffix, self.strip_ansi)
+    }
+
+    /// The process to run: `sh -c`, standard error merged in order as in TF, no input,
+    /// in TF's current directory with its exported environment.
+    pub fn process(&self, engine: &super::TfEngine) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(format!("exec 2>&1\n{}", self.command))
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        if let Some(ref dir) = engine.current_dir {
+            cmd.current_dir(dir);
+        }
+        engine.apply_child_env(&mut cmd);
+        cmd
+    }
+
+    /// Run it to the end: its lines and exit status. For `-S`, and wherever nothing can
+    /// run in the background. The error is TF's message.
+    pub fn run_blocking(&self, engine: &super::TfEngine) -> Result<(Vec<String>, i64), String> {
+        match self.process(engine).output() {
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                Ok((text.lines().map(|line| self.decorate(line)).collect(), output.status.code().unwrap_or(-1) as i64))
+            }
+            Err(e) => Err(self.spawn_error(&e)),
+        }
+    }
+
+    /// TF's message when the command can't be started.
+    pub fn spawn_error(&self, e: &std::io::Error) -> String {
+        format!("QUOTE: {}: {}", self.command, os_error_text(e))
+    }
+}
+
 pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     use super::{QuoteDisposition, QuoteTiming, SubMode, TfValue};
-    use std::process::{Command, Stdio};
     const USAGE: &str = "-<time> -PS -w<string> -d<string> -s<string>";
 
     let mut rest = args.trim_start();
@@ -431,13 +473,11 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     };
     let label = format!("{}{}\"{}\"{}", prefix, source_char, source_text, suffix);
     let disposition = disposition.unwrap_or(if prefix.is_empty() { QuoteDisposition::Send } else { QuoteDisposition::Exec });
-    let decorate = |line: &str| {
-        let line = format!("{}{}{}", prefix, line, suffix);
-        if strip_ansi { crate::util::strip_ansi_codes(&line) } else { line }
-    };
+    let decorate = |line: &str| decorate_quote_line(&prefix, line, &suffix, strip_ansi);
 
     // What the source gives, and the value a synchronous quote returns.
     let mut recall_opts = None;
+    let mut shell = None;
     let (lines, sync_value): (Vec<String>, TfValue) = match source_char {
         '\'' => {
             // /restrict FILE (`/help restrict`: "'quote' with '").
@@ -469,21 +509,23 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
             if engine.restrict_level >= super::RestrictLevel::Shell {
                 return TfCommandResult::Error(format!("QUOTE: {}: Operation not permitted", source_text));
             }
-            // Standard error comes along, in order, as in TF.
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(format!("exec 2>&1\n{}", source_text))
-                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
-            if let Some(ref dir) = engine.current_dir {
-                cmd.current_dir(dir);
-            }
-            engine.apply_child_env(&mut cmd);
-            match cmd.output() {
-                Ok(output) => {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    let status = output.status.code().unwrap_or(-1) as i64;
-                    (text.lines().map(decorate).collect(), TfValue::Integer(status))
+            let source = super::QuoteShell {
+                command: source_text.clone(),
+                prefix: prefix.clone(),
+                suffix: suffix.clone(),
+                strip_ansi,
+            };
+            if sync {
+                // -S: the whole output now, and its exit status is %? - TF blocks here too.
+                match source.run_blocking(engine) {
+                    Ok((lines, status)) => (lines, TfValue::Integer(status)),
+                    Err(e) => return TfCommandResult::Error(e),
                 }
-                Err(e) => return TfCommandResult::Error(format!("QUOTE: {}: {}", source_text, os_error_text(&e))),
+            } else {
+                // In the background the App runs it and quotes each line as it is printed
+                // (App::start_quote): run here, a long command held all of Clay up.
+                shell = Some(Box::new(source));
+                (Vec::new(), TfValue::Integer(0))
             }
         }
         _ => {
@@ -553,7 +595,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
             }
         }
         return TfCommandResult::Quote {
-            lines, disposition, world, timing, recall_opts, strip_ansi, pid: None, label,
+            lines, disposition, world, timing, recall_opts, strip_ansi, pid: None, label, shell: None,
         };
     }
 
@@ -562,7 +604,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     engine.next_process_id += 1;
     engine.set_global("?", TfValue::Integer(pid as i64));
     let world = world.or_else(|| engine.context_world_name());
-    TfCommandResult::Quote { lines, disposition, world, timing, recall_opts, strip_ansi, pid: Some(pid), label }
+    TfCommandResult::Quote { lines, disposition, world, timing, recall_opts, strip_ansi, pid: Some(pid), label, shell }
 }
 
 /// /recall [-<count>] <pattern> - Search output history
@@ -3365,11 +3407,17 @@ pub fn cmd_xtitle(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 }
 
 /// /more [on|off|1|0] - stdlib.tf's `/set more %*`, which says how to page when turning
-/// it on (verified: "% \"More\" paging enabled.  Use TAB to scroll."; "off" is silent,
-/// and a bare /more is the flag's own validation error). %more is Clay's more-paging
-/// (`special_vars::BOUND`): the App applies it, in every interface.
+/// it on (verified: "% \"More\" paging enabled.  Use TAB to scroll."; "off" is silent).
+/// Anything else is the flag's own validation error. A bare /more reports the setting
+/// (user request 2026-11-14; real tf's bare /more is that error). %more is Clay's
+/// more-paging (`special_vars::BOUND`, mirrored from Settings before each command): the
+/// App applies it, in every interface.
 pub fn cmd_more(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let arg = args.trim();
+    if arg.is_empty() {
+        let on = engine.get_var("more").is_some_and(super::special_vars::flag_is_on);
+        return TfCommandResult::Success(Some(format!("% \"More\" paging is {}.", if on { "on" } else { "off" })));
+    }
     if let Err(e) = engine.assign_global("more", super::TfValue::from(arg)) {
         return TfCommandResult::Error(format!("more: {}.", e));
     }
@@ -3759,6 +3807,13 @@ mod tests {
         assert!(matches!(result, TfCommandResult::Error(_)));
     }
 
+    /// A background `!` quote's lines, as the App gets them: the engine hands the command
+    /// over unrun (`App::start_quote` runs it), so here it is run to the end.
+    fn shell_quote_lines(engine: &TfEngine, lines: &[String], shell: &Option<Box<super::super::QuoteShell>>) -> Vec<String> {
+        assert!(lines.is_empty(), "a background shell quote's lines come from its command");
+        shell.as_ref().expect("the command to run").run_blocking(engine).expect("it runs").0
+    }
+
     #[test]
     fn test_cmd_quote() {
         let mut engine = TfEngine::new();
@@ -3791,8 +3846,8 @@ mod tests {
         }
         engine.world_info_cache.push(WorldInfoCache { name: "myworld".to_string(), ..Default::default() });
         match cmd_quote(&mut engine, "-wmyworld -2:30 !echo hello") {
-            TfCommandResult::Quote { lines, disposition, world, timing, .. } => {
-                assert_eq!(lines, vec!["hello"]);
+            TfCommandResult::Quote { lines, disposition, world, timing, shell, .. } => {
+                assert_eq!(shell_quote_lines(&engine, &lines, &shell), vec!["hello"]);
                 assert_eq!(disposition, QuoteDisposition::Send);
                 assert_eq!(world, Some("myworld".to_string()));
                 // h:m, as in TF
@@ -3849,8 +3904,8 @@ mod tests {
         assert_eq!(echoed, ["ab\\c!d x", "hi suf", "q end"]);
 
         match cmd_quote(&mut engine, "say !echo hello world") {
-            TfCommandResult::Quote { lines, disposition, .. } => {
-                assert_eq!(lines, ["say hello world"]);
+            TfCommandResult::Quote { lines, disposition, shell, .. } => {
+                assert_eq!(shell_quote_lines(&engine, &lines, &shell), ["say hello world"]);
                 assert_eq!(disposition, QuoteDisposition::Exec, "a <pre> means exec (/help quote)");
             }
             other => panic!("got {:?}", other),
@@ -3911,9 +3966,9 @@ mod tests {
         // Default: ANSI stripped from shell source
         let result = cmd_quote(&mut engine, "!printf '\\033[31mred\\033[0m'");
         match result {
-            TfCommandResult::Quote { lines, strip_ansi, .. } => {
+            TfCommandResult::Quote { lines, strip_ansi, shell, .. } => {
                 assert!(strip_ansi, "strip_ansi should default to true");
-                assert_eq!(lines, vec!["red"], "ANSI should be stripped by default");
+                assert_eq!(shell_quote_lines(&engine, &lines, &shell), vec!["red"], "ANSI should be stripped by default");
             }
             _ => panic!("Expected Quote result"),
         }
@@ -3921,9 +3976,9 @@ mod tests {
         // -A: ANSI preserved from shell source
         let result = cmd_quote(&mut engine, "-A !printf '\\033[31mred\\033[0m'");
         match result {
-            TfCommandResult::Quote { lines, strip_ansi, .. } => {
+            TfCommandResult::Quote { lines, strip_ansi, shell, .. } => {
                 assert!(!strip_ansi, "strip_ansi should be false with -A");
-                assert!(lines[0].contains('\x1b'), "ANSI sequences should be preserved with -A");
+                assert!(shell_quote_lines(&engine, &lines, &shell)[0].contains('\x1b'), "ANSI sequences should be preserved with -A");
             }
             _ => panic!("Expected Quote result"),
         }
@@ -4046,9 +4101,8 @@ mod tests {
         // Test reading from shell command (using ! prefix)
         let result = cmd_quote(&mut engine, "!\"echo hello\"");
         match result {
-            TfCommandResult::Quote { lines, disposition, world, .. } => {
-                assert_eq!(lines.len(), 1);
-                assert_eq!(lines[0], "hello");
+            TfCommandResult::Quote { lines, disposition, world, shell, .. } => {
+                assert_eq!(shell_quote_lines(&engine, &lines, &shell), ["hello"]);
                 assert_eq!(disposition, QuoteDisposition::Send);
                 assert!(world.is_none());
             }
@@ -4058,9 +4112,8 @@ mod tests {
         // Test with prefix
         let result = cmd_quote(&mut engine, "say !\"echo world\"");
         match result {
-            TfCommandResult::Quote { lines, .. } => {
-                assert_eq!(lines.len(), 1);
-                assert_eq!(lines[0], "say world");
+            TfCommandResult::Quote { lines, shell, .. } => {
+                assert_eq!(shell_quote_lines(&engine, &lines, &shell), ["say world"]);
             }
             _ => panic!("Expected Quote result, got {:?}", result),
         }
@@ -5420,10 +5473,26 @@ mod tests {
             .filter(|e| matches!(e, crate::tf::effects::TfEffect::Setting(n, _) if n == "more")).collect();
         assert_eq!(settings.len(), 2);
 
+        // A bare /more reports the setting and changes nothing.
         match cmd_more(&mut engine, "") {
-            TfCommandResult::Error(e) => assert!(e.contains("Invalid more value")),
-            other => panic!("bare /more should error like real tf: {other:?}"),
+            TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "% \"More\" paging is off."),
+            other => panic!("{other:?}"),
         }
+        cmd_more(&mut engine, "1");
+        engine.take_effects();
+        match cmd_more(&mut engine, "  ") {
+            TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "% \"More\" paging is on."),
+            other => panic!("{other:?}"),
+        }
+        assert!(engine.take_effects().is_empty(), "reporting the setting must not set it");
+
+        // Anything but on/off/1/0 is the invalid-value message, and leaves it alone.
+        match cmd_more(&mut engine, "sideways") {
+            TfCommandResult::Error(e) => assert_eq!(e,
+                "more: Invalid more value \"sideways\".  Valid values are: off (0), on (1)."),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(engine.get_var("more").map(|v| v.to_string_value()).as_deref(), Some("on"));
     }
 
     /// `/wrap <n>` is TF's wrap width (%wrapsize) - not Clay's wrap indent (%wrapspace),

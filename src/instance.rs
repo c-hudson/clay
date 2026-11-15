@@ -72,7 +72,7 @@ static ANY_INSTANCE_STARTED: AtomicBool = AtomicBool::new(false);
 /// `clay_root_config_dir()` returns this directory instead (so `remote.log`, the
 /// certificate and an SSL world's `known_hosts.dat` land beside web.dat), `debug_log` and
 /// `output_debug_log` write nothing, the crash log goes to stderr, there is no `run/<pid>`
-/// marker, `migrate_legacy_config_files` does nothing, settings are never saved and no
+/// marker, settings are never saved and no
 /// `secure.key` is made (user request and rulings 2026-11-10; the inventory of every disk
 /// touch point is in .claude/rules/instances.md).
 static WEB_ONLY: OnceLock<PathBuf> = OnceLock::new();

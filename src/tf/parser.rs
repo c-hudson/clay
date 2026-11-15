@@ -2608,7 +2608,7 @@ See also: /help result, /help return, /help def, /help shift"#.to_string()
                 "/xtitle <text>\n\nPut <text> on the console's terminal tab or title bar, or, typed in the\nweb page or a GUI, on its browser tab or window. An SSH console leaves\nits terminal's title alone.".to_string()
             )),
             "more" => TfCommandResult::Success(Some(
-                "/more [on|off|1|0]\n\nToggle Clay's more-mode (pause when the screen fills). A bare or\ninvalid argument is an error (matches real tf's own validated %more\nflag).\n\nExample: /more on".to_string()
+                "/more [on|off|1|0]\n\nTurn Clay's more-mode (pause when the screen fills) on or off. With no\nargument, show whether it is on. Any other argument is an error.\n\nExample: /more on".to_string()
             )),
             "wrap" => TfCommandResult::Success(Some(
                 "/wrap [on|off|<n>]\n\nA numeric argument sets Clay's own output hang-indent width\n(Settings::wrapspace, same as the wrapspace setting) and turns on the\nTF-visible %wrap variable. on/off only update %wrap - Clay has no\noutput-wrapping on/off toggle to apply them to.\n\nExample: /wrap 4".to_string()

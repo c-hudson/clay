@@ -24,8 +24,7 @@ The hot reload process:
 
 6. **Startup actions**: they do not run again when the TinyFugue state came
    through the reload — what they defined is already there, and running them twice
-   would define every unnamed trigger twice. (A reload from an older Clay, whose
-   saved state doesn't include it, runs them as before.)
+   would define every unnamed trigger twice.
 
 7. **Cleanup**: Inconsistent states are fixed
    - Worlds without working command channels marked disconnected

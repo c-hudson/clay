@@ -1310,9 +1310,10 @@ Bounded by coalescing (normally exactly one range); `MAX_SEEN_SEQ_RANGES = 512` 
 that merges the oldest hole shut, which only ever moves the frontier forward.
 
 Carried across `InitialState` (both the in-memory reconnect and IndexedDB paths) and persisted
-in the cache as `seenRanges`. Legacy `{maxSeq, seqGaps}` entries convert exactly via
+in the cache as `seenRanges`. Legacy `{maxSeq, seqGaps}` entries converted exactly via
 `seenRangesFromLegacyGaps()` — no IndexedDB version bump, which would discard every user's
-cached scrollback (the `CLIENT_LINE_PREFIX` precedent).
+cached scrollback (the `CLIENT_LINE_PREFIX` precedent). Both conversions went 2026-11-14: a
+cache entry that old has no `seqEpoch` and is discarded before either could apply.
 
 Consequences at the three decision points that used to drop data:
 - `ServerData`: a batch is a duplicate only if *every* seq it spans is already seen; otherwise

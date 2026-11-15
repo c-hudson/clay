@@ -813,6 +813,8 @@ pub(crate) async fn run_app_loop(app: &mut App, mut event_rx: mpsc::Receiver<App
                     AppEvent::TfShellDone(world_idx, output, status) => {
                         app.finish_tf_shell(world_idx, &output, status, true);
                     }
+                    AppEvent::TfQuoteOutput(pid, lines) => app.quote_source_output(pid, lines),
+                    AppEvent::TfQuoteEnded(pid) => app.quote_source_ended(pid),
                     // SIGTERM/SIGHUP: TF's hook of that name, then Clay ends (after a
                     // moment for anything the hook sent to reach its world); SIGUSR2: the
                     // hook only.
@@ -1193,6 +1195,10 @@ pub(crate) async fn run_app_loop(app: &mut App, mut event_rx: mpsc::Receiver<App
         if let Some(due) = app.next_walk_deadline() {
             walk_sleep.as_mut().reset(tokio::time::Instant::from_std(due));
         }
+
+        // A quote /kill'ed since stops its command (left running, it would print on to
+        // nobody).
+        app.drop_killed_quote_sources();
 
         // Arm the process timer for the next process due (processes may have been added
         // during this iteration)

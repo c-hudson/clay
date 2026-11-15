@@ -153,8 +153,8 @@ prompt is the reference case — so `Prompt`/`MOO_prompt` auto-login could never
 | Prompt wait (ms) | Shown only for **MUD - Timed Prompt** worlds. A line the server leaves unfinished is shown as the prompt once nothing further has arrived for this long. If more text follows, the prompt clears and the line shows whole in the output; once you answer the prompt, it goes into the output as its own line. Raise it on a slow link if a line that was merely arriving slowly keeps flashing up as the prompt; lower it if prompts feel late | 1000 |
 
 Plain `MUD` worlds never infer a prompt from timing (unless a TinyFugue script turns `%lp`
-on), so a server that sends long lines in several pieces cannot produce a false prompt there. If a world used to rely on the
-unmarked-prompt detection introduced in v1.6.5, set its type to **MUD - Timed Prompt**.
+on), so a server that sends long lines in several pieces cannot produce a false prompt there. For a
+world whose prompts carry no marker, set its type to **MUD - Timed Prompt**.
 
 ### Keep-Alive Settings
 
@@ -226,9 +226,7 @@ There's a single server, not separate secure/non-secure WebSocket listeners — 
 serves the web UI and WebSocket connections on one port, and is TLS-capable for
 remote clients while always serving localhost plain (see `SECURITY-NOTES.md`). The
 live settings keys (`persistence.rs`) are `http_port` (default 9000) and `web_path`
-(the stealth URL prefix, default `clay`). Older config files may still contain a
-handful of separate-port/enabled keys from a previous WebSocket layout —
-`persistence.rs` loads and silently ignores all of them; they no longer do anything.
+(the stealth URL prefix, default `clay`).
 
 ### HTTP/HTTPS Web Interface
 

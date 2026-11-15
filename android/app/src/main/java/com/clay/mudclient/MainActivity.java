@@ -1229,16 +1229,6 @@ public class MainActivity extends AppCompatActivity {
             try { installFlag.createNewFile(); } catch (java.io.IOException ignored) {}
         }
 
-        // Migrate existing users from old host-presence heuristic to the explicit setup flag.
-        // Runs after the install-flag clear, so fresh installs skip this (prefs are empty).
-        SharedPreferences migratePrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        if (!migratePrefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
-            String existingHost = migratePrefs.getString(KEY_SERVER_HOST, "");
-            if (existingHost != null && !existingHost.isEmpty()) {
-                migratePrefs.edit().putBoolean(KEY_SETUP_COMPLETE, true).apply();
-            }
-        }
-
         // Create notification channels first
         createNotificationChannel();
         createServiceNotificationChannel();
@@ -1262,7 +1252,7 @@ public class MainActivity extends AppCompatActivity {
         // now from the current Configuration, so it's not left defaulting to "absent".
         hardwareKeyboardAttached = isHardwareKeyboardAttached(getResources().getConfiguration());
         // A screen reader moves the focus itself: never pull it back to the input for one.
-        keyboardForceActive = migratePrefs.getBoolean(KEY_KEYBOARD_ALWAYS_VISIBLE, true) && !hardwareKeyboardAttached && !isScreenReaderRunning();
+        keyboardForceActive = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_KEYBOARD_ALWAYS_VISIBLE, true) && !hardwareKeyboardAttached && !isScreenReaderRunning();
         applyKeyboardForce(keyboardForceActive);
         mouseAttached = isMouseAttached();
         inputManager = (android.hardware.input.InputManager) getSystemService(Context.INPUT_SERVICE);

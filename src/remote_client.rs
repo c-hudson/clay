@@ -957,10 +957,8 @@ fn apply_initial_state(app: &mut App, msg: WsMessage, ws_tx: &mpsc::UnboundedSen
             }
         }
     }
-    // Warn once per session if our version differs from the server's. An empty
-    // server_version means an old server that predates this field (#[serde(default)]) -
-    // stay silent, not a mismatch.
-    if !*version_mismatch_shown && !server_version.is_empty() && server_version != crate::VERSION {
+    // Warn once per session if our version differs from the server's.
+    if !*version_mismatch_shown && server_version != crate::VERSION {
         app.add_output(&format!(
             "Version mismatch: {} (local) ≠ {} (remote).",
             crate::VERSION, server_version
@@ -2369,12 +2367,10 @@ pub(crate) fn handle_remote_client_key(
                     web_font_letter_spacing: app.settings.web_font_letter_spacing,
                     web_font_word_spacing: app.settings.web_font_word_spacing,
                     ws_allow_list: app.settings.websocket_allow_list.clone(),
-                    web_secure: app.settings.web_secure,
+                    web_secure: true,
                     http_enabled: app.settings.http_enabled,
                     http_port: app.settings.http_port,
                     web_path: app.settings.web_path.clone(),
-                    ws_enabled: false,  // Legacy
-                    ws_port: 0,        // Legacy
                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     ws_password: String::new(),  // Empty = unchanged (see apply_remote_web_settings)
@@ -3680,12 +3676,10 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         web_font_letter_spacing: app.settings.web_font_letter_spacing,
         web_font_word_spacing: app.settings.web_font_word_spacing,
         ws_allow_list: app.settings.websocket_allow_list.clone(),
-        web_secure: app.settings.web_secure,
+        web_secure: true,
         http_enabled: app.settings.http_enabled,
         http_port: app.settings.http_port,
         web_path: app.settings.web_path.clone(),
-        ws_enabled: false,  // Legacy
-        ws_port: 0,         // Legacy
         ws_cert_file: app.settings.websocket_cert_file.clone(),
         ws_key_file: app.settings.websocket_key_file.clone(),
         // Empty = unchanged (the server never sends us its password, so the popup's

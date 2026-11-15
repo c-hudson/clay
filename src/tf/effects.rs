@@ -107,6 +107,8 @@ pub struct QuoteRequest {
     pub strip_ansi: bool,
     pub pid: Option<u32>,
     pub label: String,
+    /// A background quote of a shell command, for the App to run (`App::start_quote`).
+    pub shell: Option<Box<super::QuoteShell>>,
 }
 
 impl TfEffect {
@@ -159,8 +161,8 @@ pub fn push_result_effects(result: TfCommandResult, out: &mut Vec<TfEffect>) {
         TfCommandResult::ClayCommand(cmd) => out.push(TfEffect::clay(cmd)),
         TfCommandResult::Recall(opts) => out.push(TfEffect::Recall(opts)),
         TfCommandResult::RepeatProcess(p) => out.push(TfEffect::StartProcess(p)),
-        TfCommandResult::Quote { lines, disposition, world, timing, recall_opts, strip_ansi, pid, label } => {
-            out.push(TfEffect::Quote(QuoteRequest { lines, disposition, world, timing, recall_opts, strip_ansi, pid, label }));
+        TfCommandResult::Quote { lines, disposition, world, timing, recall_opts, strip_ansi, pid, label, shell } => {
+            out.push(TfEffect::Quote(QuoteRequest { lines, disposition, world, timing, recall_opts, strip_ansi, pid, label, shell }));
         }
         TfCommandResult::UnknownCommand(name) => out.push(TfEffect::Unknown(name)),
         TfCommandResult::Effects(effects) => out.extend(effects),
@@ -195,7 +197,7 @@ pub fn effects_to_result(effects: Vec<TfEffect>) -> TfCommandResult {
             TfEffect::StartProcess(p) => TfCommandResult::RepeatProcess(p),
             TfEffect::Quote(q) => TfCommandResult::Quote {
                 lines: q.lines, disposition: q.disposition, world: q.world, timing: q.timing,
-                recall_opts: q.recall_opts, strip_ansi: q.strip_ansi, pid: q.pid, label: q.label,
+                recall_opts: q.recall_opts, strip_ansi: q.strip_ansi, pid: q.pid, label: q.label, shell: q.shell,
             },
             TfEffect::Unknown(name) => TfCommandResult::UnknownCommand(name),
             other => TfCommandResult::Effects(vec![other]),

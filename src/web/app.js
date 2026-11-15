@@ -316,9 +316,8 @@
     // new ever appearing at the bottom because the frontier had been dragged up to the
     // archive's highest fabricated seq.
     //
-    // A fixed server never sends these, so their presence is proof the buffer predates the
-    // fix. Out-of-order real seqs are the same damage seen from the other side, and catch a
-    // buffer whose archive lines have since been trimmed out of the cache cap.
+    // What is checked is the damage itself, which any future slip of the same kind would
+    // leave too: real seqs out of order, or time running backwards mid-buffer.
     //
     // Discarding is the safe direction: the worst case is one extra download of history the
     // server still has, versus a world that stays permanently frozen.
@@ -337,14 +336,9 @@
             // Read from the archive on demand (HistoryLines): seq-less, older than
             // everything, never on the wire as from_archive. Says nothing either way.
             if (line._archive) continue;
-            // Direct evidence: the server marked this line as archived. Only a pre-1.5.23
-            // server ever put one on the wire.
-            if (line.from_archive) return true;
-            // Indirect evidence, and the only signal available when the lines arrived via the
-            // broadcast-ledger repair path - that resent them as ServerData, which carries no
-            // per-line from_archive flag at all. This is the reported shape: current text
-            // sitting ABOVE text from weeks earlier, because the archived lines were handed
-            // seqs above the live range and insertLinesBySeq ordered them last.
+            // The reported shape: current text sitting ABOVE text from weeks earlier,
+            // because the archived lines were handed seqs above the live range and
+            // insertLinesBySeq ordered them last.
             if (typeof line.ts === 'number' && line.ts > 0) {
                 if (prevTs !== null && line.ts < prevTs - CORRUPT_TS_REGRESSION_SECS) return true;
                 prevTs = Math.max(prevTs === null ? line.ts : prevTs, line.ts);
@@ -359,26 +353,6 @@
             prevSeq = line.seq;
         }
         return false;
-    }
-
-    // Convert a legacy cache entry ({maxSeq, seqGaps}) into ranges, so upgrading doesn't
-    // discard anyone's persisted scrollback (no IndexedDB version bump - same reasoning as
-    // the CLIENT_LINE_PREFIX migration in the InitialState handler). The old record was
-    // "everything from 0..maxSeq except these gaps", which maps exactly onto ranges.
-    function seenRangesFromLegacyGaps(maxSeq, seqGaps) {
-        if (!maxSeq || maxSeq <= 0) return [];
-        const gaps = (seqGaps || [])
-            .filter(g => g && typeof g.start === 'number' && typeof g.end === 'number')
-            .slice()
-            .sort((a, b) => a.start - b.start);
-        const ranges = [];
-        let cursor = 0;
-        for (const g of gaps) {
-            if (g.start > cursor) ranges.push({ start: cursor, end: Math.min(g.start - 1, maxSeq) });
-            cursor = Math.max(cursor, g.end + 1);
-        }
-        if (cursor <= maxSeq) ranges.push({ start: cursor, end: maxSeq });
-        return ranges.filter(r => r.end >= r.start);
     }
 
     // Builds the (world_index, last_contiguous_seq) list shared by AuthRequest.resume
@@ -1566,18 +1540,13 @@
     // Web settings popup state (global state from server)
     let settingsPopupOpen = false;
     let settingsActiveTab = 'general';
-    // web_secure is no longer user-facing (the server is always TLS-capable for
-    // remote clients; localhost is always plain — see http::route_connection).
-    // Still synced from/to the server for wire compat with GlobalSettingsMsg.
     let httpEnabled = false;
     let httpPort = 9000;
     let webPath = 'clay';
-    let wsEnabled = false;
-    let wsPort = 9001;
     let wsAllowList = '';
     let wsCertFile = '';
     let wsKeyFile = '';
-    let wsPassword = '';  // Legacy echo: only an older server sends its real password; a current one sends ''
+    let wsPassword = '';  // A password typed into Web settings; the server never sends its own
     let wsPasswordSet = false;  // Server has a password (GlobalSettingsMsg.ws_password_set); blank field = keep it
     let tlsConfigured = false;  // True if server has a custom (user-provided) TLS cert+key configured
     let serverAuthKey = '';  // Auth key from server (for display in web settings)
@@ -2666,9 +2635,9 @@
         // Build list of completions: internal commands + manual actions
         let completions = INTERNAL_COMMANDS.map(cmd => '/' + cmd);
 
-        // Add manual actions (empty pattern)
+        // Add manual actions (no patterns, as the console's completion has it)
         const manualActions = actions
-            .filter(a => !a.pattern || a.pattern.trim() === '')
+            .filter(a => !Array.isArray(a.patterns) || a.patterns.length === 0)
             .map(a => '/' + a.name);
         completions = completions.concat(manualActions);
 
@@ -4625,7 +4594,6 @@
                 // Initialize output cache for each world (empty - will be populated on render)
                 worldOutputCache = worlds.map(() => []);
                 // Ensure output_lines arrays exist, prefer timestamped versions
-                const currentTs = Math.floor(Date.now() / 1000);
                 // Wrapped in try/catch: a single malformed/unexpected world entry (e.g. a
                 // version mismatch between this client and an older/newer remote server)
                 // must not throw out of the whole InitialState handler and skip the
@@ -4728,8 +4696,8 @@
                         console.warn('Clay: discarding corrupted scrollback for world "' +
                             (world.name || ('#' + idx)) + '" (' +
                             (priorWorldCorrupt ? 'in-memory' : 'cached') +
-                            ') - archived lines or out-of-order seqs from the pre-1.5.23 ' +
-                            'archive bug; re-downloading from the server');
+                            ') - out-of-order seqs or times, as the pre-1.5.23 archive bug ' +
+                            'left; re-downloading from the server');
                         if (cachedWorldCorrupt && world.name) {
                             clearWorldCacheEntry(world.name);
                         }
@@ -4790,37 +4758,17 @@
                         // Cold start / full reload with a persistent cache hit: seed
                         // from the cache, then gap-fill (see startBackfill()) to pick
                         // up whatever arrived on the server while we were gone.
-                        //
-                        // One-time migration: caches written before the display-time
-                        // prefix change hold snapshot-baked "✨ " text (the server used
-                        // to bake it into build_initial_state's output). Post-change
-                        // snapshots never do, so this is a no-op from then on - strip
-                        // it here rather than bumping the cache DB version, which
-                        // would silently discard every user's cached scrollback.
-                        // dedupBySeq (Step 10, same rationale as above): this persistent
-                        // cache can already hold duplicates baked in before this fix shipped.
-                        world.output_lines = dedupBySeq(cachedWorld.lines.map(l =>
-                            (l && l.from_server === false && typeof l.text === 'string'
-                                && l.text.startsWith(CLIENT_LINE_PREFIX))
-                                ? Object.assign({}, l, { text: l.text.slice(CLIENT_LINE_PREFIX.length) })
-                                : l));
+                        // dedupBySeq (Step 10, same rationale as above): a safety net for
+                        // duplicates in a persisted buffer.
+                        world.output_lines = dedupBySeq(cachedWorld.lines);
                         // Restore the delivered-seq record persisted alongside this cache
                         // entry (scheduleWorldCacheSave) - same rationale as the priorWorld
-                        // branch above. Entries written before Phase C hold the legacy
-                        // {maxSeq, seqGaps} shape instead, which converts exactly; entries
-                        // older still have neither, which means "no known holes".
-                        carriedSeenRanges = cachedWorld.seenRanges
-                            || seenRangesFromLegacyGaps(cachedWorld.maxSeq, cachedWorld.seqGaps);
-                    } else if (world.output_lines_ts && world.output_lines_ts.length > 0) {
-                        // Use output_lines_ts if available (has timestamps)
-                        world.output_lines = world.output_lines_ts;
-                    } else if (world.output_lines) {
-                        // Convert plain strings to objects with current timestamp
-                        world.output_lines = world.output_lines.map(line =>
-                            typeof line === 'string' ? { text: line, ts: currentTs } : line
-                        );
+                        // branch above. None means "no known holes".
+                        carriedSeenRanges = cachedWorld.seenRanges || null;
                     } else {
-                        world.output_lines = [];
+                        // The server's slice, with timestamps (its plain `output_lines` is
+                        // always empty).
+                        world.output_lines = world.output_lines_ts || [];
                     }
                     // TF's %textdiv and Text Reveal's New Only: what this page holds now
                     // counts as already shown, and a reconnect keeps the marks it had (a
@@ -5025,12 +4973,6 @@
                             console.error('Error saving web path:', e);
                         }
                     }
-                    if (msg.settings.ws_enabled !== undefined) {
-                        wsEnabled = msg.settings.ws_enabled;
-                    }
-                    if (msg.settings.ws_port !== undefined) {
-                        wsPort = msg.settings.ws_port;
-                    }
                     if (msg.settings.ws_allow_list !== undefined) {
                         wsAllowList = msg.settings.ws_allow_list;
                     }
@@ -5046,10 +4988,9 @@
                     if (msg.settings.auth_key !== undefined) {
                         serverAuthKey = msg.settings.auth_key;
                     }
-                    if (msg.settings.ws_password !== undefined) {
-                        wsPassword = msg.settings.ws_password;
-                    }
-                    wsPasswordSet = !!(msg.settings.ws_password_set || msg.settings.ws_password);
+                    // Blank = keep the server's password (`UpdateGlobalSettings.ws_password`).
+                    wsPassword = '';
+                    wsPasswordSet = !!msg.settings.ws_password_set;
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
                     }
@@ -5151,9 +5092,8 @@
                 // msg.android_app_version is the last release that actually changed the
                 // Android app (bundled app.js/index.html, android/, or the bundled server -
                 // see ANDROID_APP_VERSION's doc comment in main.rs); Android nags only when
-                // its installed version is older than that. Non-Android clients, and Android
-                // talking to an older server that never sent the field, keep the original
-                // always-on server_version comparison.
+                // its installed version is older than that. Non-Android clients keep the
+                // server_version comparison.
                 //
                 // Shown ONCE PER VERSION, not once per app launch: the version it was shown
                 // for is remembered (localStorage, which persists in the Android WebView) and
@@ -5295,7 +5235,7 @@
                         }
                         const resent = sentLineFor(pendingReconnectCommand);
                         elements.input.value = '';
-                        elements.prompt.textContent = '';
+                        if (typedLineAnswersPrompt(pendingReconnectCommand, worlds[pendingReconnectTargetIdx])) elements.prompt.textContent = '';
                         keepSentLine(resent);
                     }
                     // Clear pending state
@@ -5676,17 +5616,8 @@
             case 'WorldAdded':
                 if (msg.world) {
                     const world = msg.world;
-                    const currentTs = Math.floor(Date.now() / 1000);
-                    // Convert output_lines to timestamped format (same as InitialState)
-                    if (world.output_lines_ts && world.output_lines_ts.length > 0) {
-                        world.output_lines = world.output_lines_ts;
-                    } else if (world.output_lines) {
-                        world.output_lines = world.output_lines.map(line =>
-                            typeof line === 'string' ? { text: line, ts: currentTs } : line
-                        );
-                    } else {
-                        world.output_lines = [];
-                    }
+                    // The timestamped lines (same as InitialState)
+                    world.output_lines = world.output_lines_ts || [];
                     // Seed the delivered-seq record from the lines this message carried
                     // (PROTOCOL-ROADMAP.md Phase C). Without this the world starts claiming
                     // nothing delivered, so the first switch-time/audit check would ask the
@@ -5957,12 +5888,6 @@
                             console.error('Error saving web path:', e);
                         }
                     }
-                    if (msg.settings.ws_enabled !== undefined) {
-                        wsEnabled = msg.settings.ws_enabled;
-                    }
-                    if (msg.settings.ws_port !== undefined) {
-                        wsPort = msg.settings.ws_port;
-                    }
                     if (msg.settings.ws_allow_list !== undefined) {
                         wsAllowList = msg.settings.ws_allow_list;
                     }
@@ -5978,10 +5903,9 @@
                     if (msg.settings.auth_key !== undefined) {
                         serverAuthKey = msg.settings.auth_key;
                     }
-                    if (msg.settings.ws_password !== undefined) {
-                        wsPassword = msg.settings.ws_password;
-                    }
-                    wsPasswordSet = !!(msg.settings.ws_password_set || msg.settings.ws_password);
+                    // Blank = keep the server's password (`UpdateGlobalSettings.ws_password`).
+                    wsPassword = '';
+                    wsPasswordSet = !!msg.settings.ws_password_set;
                     if (msg.settings.console_theme !== undefined) {
                         consoleTheme = msg.settings.console_theme;
                     }
@@ -7225,14 +7149,9 @@
     // server-authoritative total_visible_lines field (added alongside this fix) over
     // total_output_lines (raw, gagged included), which the client can't turn into a visible
     // count on its own since it has no knowledge of gagged status for lines it hasn't
-    // downloaded yet. Falls back to total_output_lines only against an older server that
-    // predates total_visible_lines (see websocket.rs's field doc comment) - an
-    // overcount there, but strictly better than treating "no data" as zero.
+    // downloaded yet.
     function totalVisibleLines(world) {
-        if (world.total_visible_lines !== undefined && world.total_visible_lines !== null) {
-            return world.total_visible_lines;
-        }
-        return world.total_output_lines || 0;
+        return world.total_visible_lines || 0;
     }
 
     // Start backfill after InitialState is processed.
@@ -7765,8 +7684,8 @@
             // report _max_seq as if the hole had never existed. `lines` is capped, so the
             // ranges routinely cover more seqs than the persisted slice does; that's the
             // point (rebuildSeenRanges unions the two rather than recomputing from lines).
-            // maxSeq is still written for the benefit of an older client reading this
-            // entry after a downgrade, and is what the pre-Phase-C shape keyed on.
+            // maxSeq is what the next hydration's restart check reads against a server
+            // that sends no epoch (a 1.7.0-1.7.34 --multiuser server).
             const seenRanges = w._seenRanges || [];
             // Stamped so the next hydration can tell whether these seqs still refer to
             // a live sequence space - see the epoch check in the InitialState handler.
@@ -8396,7 +8315,19 @@
         }
         historyIndex = -1;
         elements.input.value = '';
-        elements.prompt.textContent = '';
+        if (typedLineAnswersPrompt(cmd, worlds[currentWorldIndex])) elements.prompt.textContent = '';
+    }
+
+    // Whether a line typed in `world` answers its prompt (tfrun::typed_line_answers_prompt):
+    // text for a MUD world - not a /command, or '///x' (sent as '/x') while echo isn't
+    // masked. Only then does the server clear the prompt and the MUD send the next one; a
+    // command that stays on the server (/url, /dict, /set) keeps it, as does a chat world,
+    // whose prompt is its send target.
+    function typedLineAnswersPrompt(line, world) {
+        const worldType = (world && world.settings && world.settings.world_type) || 'mud';
+        if (worldType !== 'mud' && worldType !== 'mud_timed_prompt') return false;
+        const masked = !!(world && world.echo_masked);
+        return !line.startsWith('/') || (!masked && line.startsWith('///'));
     }
 
     // Navigate to previous command in history
@@ -11221,12 +11152,9 @@
             // segment trimmed and compared case-insensitively.
             if (action.world && !action.world.split(',').every(w => w.trim() === '') &&
                 !action.world.split(',').some(w => w.trim().toLowerCase() === worldName.toLowerCase())) continue;
-            // Action-level match type (legacy per-pattern type ignored)
+            // Action-level match type
             const matchType = action.match_type || 'Regexp';
-            // Build effective pattern list (new multi-pattern or legacy single)
-            const pats = Array.isArray(action.patterns) && action.patterns.length > 0
-                ? action.patterns
-                : (action.pattern ? [{ pattern: action.pattern }] : []);
+            const pats = Array.isArray(action.patterns) ? action.patterns : [];
             for (const mp of pats) {
                 const patText = typeof mp === 'string' ? mp : (mp.pattern || '');
                 if (!patText || patText.trim() === '') continue;
@@ -15453,7 +15381,7 @@
                 if (filterText) {
                     const nameMatch = action.name.toLowerCase().includes(filterText);
                     const worldMatch = action.world.toLowerCase().includes(filterText);
-                    const pats = Array.isArray(action.patterns) ? action.patterns : (action.pattern ? [{ pattern: action.pattern }] : []);
+                    const pats = Array.isArray(action.patterns) ? action.patterns : [];
                     const patternMatch = pats.some(p => (p.pattern || '').toLowerCase().includes(filterText));
                     if (!nameMatch && !worldMatch && !patternMatch) {
                         return false;
@@ -15539,8 +15467,8 @@
             patternSpan.className = 'action-pattern';
             // Show first pattern; if multiple, note count
             const pats = Array.isArray(action.patterns) ? action.patterns : [];
-            const firstPat = pats.length > 0 ? (pats[0].pattern || '') : (action.pattern || '');
-            const patCount = pats.length || (action.pattern ? 1 : 0);
+            const firstPat = pats.length > 0 ? (pats[0].pattern || '') : '';
+            const patCount = pats.length;
             patternSpan.textContent = patCount === 0 ? '(manual)'
                 : patCount === 1 ? firstPat
                 : firstPat + ' +' + (patCount - 1) + ' more';
@@ -16182,16 +16110,10 @@
             elements.actionWorld.value = action.world || '';
             // Set action-level match type
             elements.actionMatchType.value = action.match_type || 'Regexp';
-            // Build live patterns array (simple strings) from action.patterns or legacy single pattern
-            if (Array.isArray(action.patterns) && action.patterns.length > 0) {
-                editPatterns = action.patterns.map(function(p) {
-                    return typeof p === 'string' ? p : (p.pattern || '');
-                });
-            } else if (action.pattern) {
-                editPatterns = [action.pattern];
-            } else {
-                editPatterns = [];
-            }
+            // Build live patterns array (simple strings) from action.patterns
+            editPatterns = Array.isArray(action.patterns)
+                ? action.patterns.map(function(p) { return typeof p === 'string' ? p : (p.pattern || ''); })
+                : [];
             elements.actionCommand.value = action.command || '';
             elements.actionEnabled.value = (action.enabled !== false) ? 'yes' : 'no';
             elements.actionStartup.value = action.startup ? 'yes' : 'no';
@@ -16713,14 +16635,11 @@
             // This page's own fonts on this OS (null = unchanged).
             font_profile: ownFontUpdate(),
             ws_allow_list: wsAllowList,
-            // Always true now — the server is always TLS-capable for remote clients
-            // (auto cert or user-provided); kept only for GlobalSettingsMsg wire compat.
+            // Read by nothing (the server is always TLS-capable); a 1.7.0 server requires it.
             web_secure: true,
             http_enabled: httpEnabled,
             http_port: httpPort,
             web_path: webPath,
-            ws_enabled: wsEnabled,
-            ws_port: wsPort,
             ws_cert_file: wsCertFile,
             ws_key_file: wsKeyFile,
             ws_password: wsPassword,

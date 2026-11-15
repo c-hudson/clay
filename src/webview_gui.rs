@@ -124,18 +124,16 @@ fn parse_inherited_auth(v: &serde_json::Value) -> Option<InheritedAuth> {
     Some(InheritedAuth { password: password.to_string(), username })
 }
 
-/// Parse a `new-window:` payload: JSON `{world, auth}`, or the older bare
-/// world name (empty = not world-locked).
+/// Parse a `new-window:` payload: JSON `{world, auth}` (a null or empty world = not
+/// world-locked).
 fn parse_new_window_payload(rest: &str) -> (Option<String>, Option<InheritedAuth>) {
-    let rest = rest.trim();
-    if rest.starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
+    match serde_json::from_str::<serde_json::Value>(rest.trim()) {
+        Ok(v) => {
             let world = v["world"].as_str().filter(|w| !w.is_empty()).map(|w| w.to_string());
-            return (world, parse_inherited_auth(&v));
+            (world, parse_inherited_auth(&v))
         }
+        Err(_) => (None, None),
     }
-    let world = if rest.is_empty() { None } else { Some(rest.to_string()) };
-    (world, None)
 }
 
 /// JS statement that hands `auth` to a new window's app.js (seedInheritedAuth).
@@ -930,16 +928,6 @@ fn build_html(params: &WebViewParams) -> String {
         );
     }
 
-    // Inject world lock from env var (set by parent when spawning /window <world>)
-    if let Ok(world_name) = std::env::var("CLAY_WINDOW_WORLD") {
-        std::env::remove_var("CLAY_WINDOW_WORLD");
-        html = html.replace(
-            &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
-            &format!("window.WS_PROTOCOL = '{}';\n        window.LOCK_WORLD = '{}';",
-                params.ws_protocol, world_name.replace('\'', "\\'")),
-        );
-    }
-
     // Inject real server address for /window command (when using WS proxy)
     if let (Some(ref real_host), Some(real_port)) = (&params.server_host, params.server_port) {
         let proto = if params.server_secure { "https" } else { "http" };
@@ -1621,10 +1609,7 @@ fn create_webview_window(
         ctx.set_spell_checking_languages(&["en"]);
     }
 
-    // Read initial world lock from env var (set by CLAY_WINDOW_WORLD for backward compat)
-    let initial_world_lock: Option<String> = std::env::var("CLAY_WINDOW_WORLD").ok();
-
-    // Build the first webview (initial_world_lock is handled inside build_html via env var)
+    // Build the first webview
     let webview = build_webview(&window, params, &proxy, &reload_tx, None, None, None)?;
 
     #[cfg(unix)]
@@ -1639,10 +1624,6 @@ fn create_webview_window(
     let main_window_id = window_id;
     windows.insert(window_id, window);
     webviews.insert(window_id, webview);
-
-    // Suppress the unused variable warning — initial_world_lock was read from env
-    // and consumed by build_html() via CLAY_WINDOW_WORLD env var
-    let _ = initial_world_lock;
 
     // Clone params for use inside the event loop closure (needed for creating new windows)
     let params = params.clone();
@@ -2084,9 +2065,9 @@ mod inherited_auth_tests {
     }
 
     #[test]
-    fn new_window_payload_accepts_json_and_legacy_bare_name() {
+    fn new_window_payload_is_json() {
         assert_eq!(parse_new_window_payload(""), (None, None));
-        assert_eq!(parse_new_window_payload("MyWorld"), (Some("MyWorld".to_string()), None));
+        assert_eq!(parse_new_window_payload(r#"{"world":"","auth":null}"#), (None, None));
         let (world, auth) = parse_new_window_payload(
             r#"{"world":"MyWorld","auth":{"password":"pw","username":null}}"#);
         assert_eq!(world.as_deref(), Some("MyWorld"));

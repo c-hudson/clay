@@ -318,6 +318,9 @@ From the drop-in work (user rulings, or what Clay's design allows):
 - `/repeat` and `/quote` with no `-w` stay with the world they started in rather than
   following the foreground world.
 - `/histsize` reports that Clay keeps whole histories (it has no capacity to change).
+- A bare `/more` reports the setting (`% "More" paging is on.`, user request
+  2026-11-14); in TF it is `%more`'s invalid-value error. Any argument but
+  on/off/1/0 still is.
 - Clay's own status bar is shown until a script changes TF's status line; the web/GUI
   status strip keeps its menu, notes and font controls beside TF's fields.
 - A `/sh` from a web, GUI or remote-console client, or in a Clay with no console (`-D`,
@@ -399,7 +402,10 @@ From the drop-in work (2026-10):
   minutes (it was read as minutes:seconds).
 - **`/quote`** is TF's: it needs a source (`'`, `!`, `` ` ``, `#`), runs in the background
   unless `-S`, runs its lines as commands when there is a <pre>, and is a process `/ps`
-  lists and `/kill` stops. `/ps` prints TF's table.
+  lists and `/kill` stops. `/ps` prints TF's table. A background `!` command runs beside
+  Clay (`App::start_quote_source`), its lines quoted as printed, as TF reads the pipe from
+  its main loop (checked against tf 5.0: a `/repeat` ticks on through `/quote -0 !sleep 3`);
+  `-S` and `/sys` block, as TF's do.
 - **TF truthiness**: a non-numeric string is false; `&`/`|` return an operand.
 - **`/def`**'s default priority is 1.
 - **`/load`**: errors are reported in place, TF-style; a plain-text line aborts the load;

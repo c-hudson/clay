@@ -958,6 +958,22 @@
         assert!(!js.contains(r"replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0"), "app.js has its own escape-only test again");
     }
 
+    /// app.js clears the prompt for a sent line by tfrun::typed_line_answers_prompt's rule,
+    /// at both places a line is sent: a command (`/url`) keeps it.
+    #[test]
+    fn app_js_clears_the_prompt_by_the_servers_rule() {
+        let js = include_str!("web/app.js");
+        for part in [
+            "function typedLineAnswersPrompt(line, world) {",
+            "if (worldType !== 'mud' && worldType !== 'mud_timed_prompt') return false;",
+            "return !line.startsWith('/') || (!masked && line.startsWith('///'));",
+            "if (typedLineAnswersPrompt(cmd, worlds[currentWorldIndex])) elements.prompt.textContent = '';",
+            "if (typedLineAnswersPrompt(pendingReconnectCommand, worlds[pendingReconnectTargetIdx])) elements.prompt.textContent = '';",
+        ] {
+            assert!(js.contains(part), "app.js no longer has {part:?}: keep typedLineAnswersPrompt and tfrun::typed_line_answers_prompt in step");
+        }
+    }
+
     #[test]
     fn test_wrap_urls_with_osc8() {
         use super::wrap_urls_with_osc8;
@@ -3318,7 +3334,7 @@
         let settings = app.settings.clone();
 
         {
-            let sdb = crate::scrollback::ScrollbackDb::open(&db_path, &[]).expect("open archive");
+            let sdb = crate::scrollback::ScrollbackDb::open(&db_path).expect("open archive");
             app.worlds[0].scrollback_tx = Some(sdb.sender());
             app.worlds[0].ensure_world_id();
 
@@ -3415,7 +3431,7 @@
         app.tf_engine.execute("/def -agG -t\"hidden*\" hide_hidden");
         app.tf_engine.execute("/def -t\"swap*\" swap = /substitute -aG swapped");
         {
-            let sdb = crate::scrollback::ScrollbackDb::open(&db_path, &[]).expect("open archive");
+            let sdb = crate::scrollback::ScrollbackDb::open(&db_path).expect("open archive");
             app.worlds[0].scrollback_tx = Some(sdb.sender());
             app.worlds[0].ensure_world_id();
             app.process_server_data(0, b"secret one\nnormal two\nhidden three\nswap four\n", 24, 80, false);
@@ -10644,6 +10660,7 @@ third
             strip_ansi: false,
             pid: None,
             label: "!\"cmd\"".to_string(),
+            shell: None,
         }
     }
 
@@ -11044,10 +11061,9 @@ third
         );
     }
 
-    /// A settings save that differs from the stored settings only in `web_secure` (which
-    /// chooses nothing since D8; the native GUI always sends `true`) doesn't restart the web
-    /// server - every native Settings save did, dropping each attached browser - while a new
-    /// port still does.
+    /// A settings save that changes nothing about the web server doesn't restart it, whatever
+    /// `web_secure` it carries (a 1.7.0 peer's field, read by nothing since D8; every native
+    /// Settings save once restarted it, dropping each attached browser), while a new port does.
     #[test]
     fn a_web_secure_difference_alone_does_not_restart_the_web_server() {
         let save = |app: &mut App, web_secure: bool, port: u16| {
@@ -11066,9 +11082,9 @@ third
             );
         };
         let mut app = App::new();
-        app.settings.web_secure = false;
         let port = app.settings.http_port;
         save(&mut app, true, port);
+        save(&mut app, false, port);
         assert!(!app.web_restart_needed, "web_secure alone is no reason to restart");
         save(&mut app, true, port.wrapping_add(1));
         assert!(app.web_restart_needed, "a new port is");
@@ -11586,7 +11602,6 @@ third
         let mut app = App::new();
         app.settings.websocket_password = "s3cret-pw".to_string();
         let msg = app.build_global_settings_msg();
-        assert_eq!(msg.ws_password, "");
         assert!(msg.ws_password_set);
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("s3cret-pw"), "password leaked into GlobalSettingsMsg: {json}");
@@ -17118,7 +17133,7 @@ third
     /// test archives under a world name of its own.
     fn seed_history_archive(world: &str, n: i64, gagged: impl Fn(i64) -> bool) -> Vec<i64> {
         let path = clay_config_path("scrollback.db");
-        let mut sdb = crate::scrollback::ScrollbackDb::open(&path, &[]).expect("open archive");
+        let mut sdb = crate::scrollback::ScrollbackDb::open(&path).expect("open archive");
         let tx = sdb.sender();
         let mut seqs = Vec::new();
         for i in 0..n {
@@ -17474,9 +17489,9 @@ third
 
     #[test]
     fn test_reload_without_a_seq_epoch_keeps_the_live_one() {
-        // A state file written by a build predating this field reports 0, which means "no
-        // epoch" - it must not clobber the epoch the World was constructed with, or every
-        // reload from an old state file would hand clients the reserved value.
+        // A state file missing the field reads 0, which means "no epoch" - it must not
+        // clobber the epoch the World was constructed with, or the reload would hand
+        // clients the reserved value.
         let state = "[world_state:0]\nname=alpha\nnext_seq=500\n";
         let mut app = App::new();
         crate::persistence::load_reload_state_from_str(&mut app, state).expect("parses");
@@ -20277,7 +20292,7 @@ third
         app.worlds.clear();
         app.current_world_index = 0;
         app.worlds.push(send_test_world("Placeholder", false));
-        app.scrollback = Some(crate::scrollback::ScrollbackDb::open(&db_path, &[]).expect("open archive"));
+        app.scrollback = Some(crate::scrollback::ScrollbackDb::open(&db_path).expect("open archive"));
 
         crate::commands::apply_world_definition(&mut app, crate::tf::PendingWorldOp {
             name: "Cave".into(), host: Some("cave.tcp.com".into()), port: Some("2283".into()), ..Default::default()
@@ -20650,8 +20665,15 @@ third
         run(&mut app, "/set more=off");
         assert!(!app.settings.more_mode_enabled, "%more is Clay's more-paging");
 
-        assert!(matches!(app.tf_engine.execute("/more"), tf::TfCommandResult::Error(_)),
-            "bare /more is an error, matching real tf's own validated %more flag");
+        // A bare /more reports Clay's setting, as it stands when the command runs.
+        app.settings.more_mode_enabled = true;
+        let effects = app.run_tf_in_world(0, "/more");
+        let shown: Vec<String> = effects.iter().filter_map(|e| match e {
+            tf::effects::TfEffect::Output { text, .. } => Some(text.clone()),
+            _ => None,
+        }).collect();
+        assert!(shown.iter().any(|t| t.contains("\"More\" paging is on.")), "{effects:?}");
+        assert!(app.settings.more_mode_enabled);
         assert!(matches!(app.tf_engine.execute("/more sideways"), tf::TfCommandResult::Error(_)));
     }
 

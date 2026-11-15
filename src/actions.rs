@@ -63,12 +63,6 @@ pub struct Action {
     #[serde(default)]
     pub match_type: MatchType,
 
-    /// Legacy single-pattern field — accepted on deserialise for backward-compat with
-    /// old `settings.dat` and old WebSocket clients, but **never emitted** when
-    /// serialising.  `Action::normalize()` migrates it into `patterns`.
-    #[serde(default, skip_serializing)]
-    pub pattern: String,
-
     pub command: String,        // Command(s) to execute, semicolon-separated
     #[serde(default = "default_enabled")]
     pub enabled: bool,          // If false, action will not fire
@@ -96,7 +90,6 @@ impl Default for Action {
             world: String::new(),
             patterns: Vec::new(),
             match_type: MatchType::Regexp,
-            pattern: String::new(),
             command: String::new(),
             enabled: true,
             startup: false,
@@ -111,21 +104,6 @@ impl Action {
         Self::default()
     }
 
-    /// Migrate the legacy single-pattern field (`pattern`) into `patterns`.
-    ///
-    /// Idempotent: does nothing if `patterns` is already non-empty, or if the legacy
-    /// `pattern` field is empty (i.e. the action is manual-only).  Call this after any
-    /// deserialisation and before `compile_regex()`.  Does **not** touch `match_type`,
-    /// which is now the authoritative action-level type.
-    pub fn normalize(&mut self) {
-        if self.patterns.is_empty() && !self.pattern.is_empty() {
-            self.patterns.push(MatchPattern {
-                pattern: std::mem::take(&mut self.pattern),
-                compiled_regex: None,
-            });
-        }
-    }
-
     /// Return a display-friendly preview of the first pattern (empty string if none).
     pub fn display_pattern(&self) -> &str {
         self.patterns.first().map(|mp| mp.pattern.as_str()).unwrap_or("")
@@ -133,13 +111,10 @@ impl Action {
 
     /// Pre-compile the regex for **every** pattern in this action.
     ///
-    /// Automatically calls `normalize()` first so legacy single-pattern fields are
-    /// migrated into `patterns` before compilation.  Safe to call multiple times.
-    /// The action-level `match_type` is applied uniformly to all patterns.
+    /// Safe to call multiple times. The action-level `match_type` is applied uniformly to all patterns.
     /// - An empty pattern or a disabled action → `None` (never matches).
     /// - A bad regex → `None` (silently skipped; never panics).
     pub fn compile_regex(&mut self) {
-        self.normalize();
         let match_type = self.match_type;
         for mp in &mut self.patterns {
             if mp.pattern.is_empty() || !self.enabled {
@@ -243,10 +218,8 @@ pub fn rewrite_slashless_action(command: &str, actions: &[Action], world_name: &
 
 /// Pre-compile regexes for all actions.
 /// Call after loading settings, restoring reload state, or bulk action updates.
-/// Also calls `normalize()` so legacy single-pattern actions are migrated.
 pub fn compile_all_action_regexes(actions: &mut [Action]) {
     for action in actions.iter_mut() {
-        action.normalize();
         action.compile_regex();
     }
 }
@@ -1028,57 +1001,16 @@ mod tests {
         assert!(re.is_match("say \u{201C}hello\u{201D}")); // curly double quotes
     }
 
-    // --- Action normalize() ---
-
-    #[test]
-    fn test_normalize_migrates_legacy_pattern() {
-        let mut action = Action {
-            pattern: "^You say".to_string(),
-            match_type: MatchType::Wildcard,
-            ..Action::default()
-        };
-        assert!(action.patterns.is_empty());
-        action.normalize();
-        assert_eq!(action.patterns.len(), 1);
-        assert_eq!(action.patterns[0].pattern, "^You say");
-        assert_eq!(action.match_type, MatchType::Wildcard); // action-level type preserved
-        assert!(action.pattern.is_empty()); // legacy field cleared
-    }
-
-    #[test]
-    fn test_normalize_empty_legacy_pattern_no_op() {
-        let mut action = Action {
-            pattern: String::new(),
-            ..Action::default()
-        };
-        action.normalize();
-        assert!(action.patterns.is_empty()); // manual-only action stays empty
-    }
-
-    #[test]
-    fn test_normalize_idempotent_when_patterns_nonempty() {
-        let mut action = Action {
-            pattern: "legacy".to_string(), // would be migrated if patterns were empty
-            ..Action::default()
-        };
-        action.patterns.push(MatchPattern { pattern: "existing".to_string(), compiled_regex: None });
-        action.normalize();
-        // patterns already non-empty, legacy field NOT migrated
-        assert_eq!(action.patterns.len(), 1);
-        assert_eq!(action.patterns[0].pattern, "existing");
-    }
-
     // --- Action compile_regex() ---
 
     #[test]
     fn test_action_compile_regexp() {
         let mut action = Action {
-            pattern: "^You say".to_string(),
+            patterns: vec![MatchPattern { pattern: "^You say".to_string(), compiled_regex: None }],
             match_type: MatchType::Regexp,
             enabled: true,
             ..Action::default()
         };
-        action.normalize();
         action.compile_regex();
         assert_eq!(action.patterns.len(), 1);
         assert!(action.patterns[0].compiled_regex.is_some());
@@ -1088,12 +1020,11 @@ mod tests {
     #[test]
     fn test_action_compile_wildcard() {
         let mut action = Action {
-            pattern: "*tells you*".to_string(),
+            patterns: vec![MatchPattern { pattern: "*tells you*".to_string(), compiled_regex: None }],
             match_type: MatchType::Wildcard,
             enabled: true,
             ..Action::default()
         };
-        action.normalize();
         action.compile_regex();
         assert_eq!(action.patterns.len(), 1);
         assert!(action.patterns[0].compiled_regex.is_some());
@@ -1103,11 +1034,10 @@ mod tests {
     #[test]
     fn test_action_compile_disabled() {
         let mut action = Action {
-            pattern: "test".to_string(),
+            patterns: vec![MatchPattern { pattern: "test".to_string(), compiled_regex: None }],
             enabled: false,
             ..Action::default()
         };
-        action.normalize();
         action.compile_regex();
         // Disabled: pattern exists in list but compiled_regex is None
         assert_eq!(action.patterns.len(), 1);
@@ -1117,14 +1047,14 @@ mod tests {
     #[test]
     fn test_action_compile_empty_pattern() {
         let mut action = Action {
-            pattern: String::new(),
+            patterns: vec![MatchPattern { pattern: String::new(), compiled_regex: None }],
             enabled: true,
             ..Action::default()
         };
-        action.normalize();
         action.compile_regex();
-        // Empty pattern: patterns vec stays empty (manual-only action)
-        assert!(action.patterns.is_empty());
+        // An empty pattern never matches.
+        assert_eq!(action.patterns.len(), 1);
+        assert!(action.patterns[0].compiled_regex.is_none());
     }
 
     #[test]
@@ -1199,9 +1129,9 @@ mod tests {
     #[test]
     fn test_compile_all_action_regexes() {
         let mut actions = vec![
-            Action { pattern: "test1".to_string(), enabled: true, ..Action::default() },
-            Action { pattern: "test2".to_string(), enabled: false, ..Action::default() },
-            Action { pattern: "test3".to_string(), enabled: true, ..Action::default() },
+            Action { patterns: vec![MatchPattern { pattern: "test1".to_string(), compiled_regex: None }], enabled: true, ..Action::default() },
+            Action { patterns: vec![MatchPattern { pattern: "test2".to_string(), compiled_regex: None }], enabled: false, ..Action::default() },
+            Action { patterns: vec![MatchPattern { pattern: "test3".to_string(), compiled_regex: None }], enabled: true, ..Action::default() },
         ];
         compile_all_action_regexes(&mut actions);
         assert!(actions[0].patterns[0].compiled_regex.is_some());
@@ -1214,13 +1144,12 @@ mod tests {
     fn make_action(name: &str, pattern: &str, command: &str, match_type: MatchType) -> Action {
         let mut a = Action {
             name: name.to_string(),
-            pattern: pattern.to_string(),
+            patterns: vec![MatchPattern { pattern: pattern.to_string(), compiled_regex: None }],
             command: command.to_string(),
             match_type,
             enabled: true,
             ..Action::default()
         };
-        a.normalize();
         a.compile_regex();
         a
     }

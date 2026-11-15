@@ -39,7 +39,6 @@ pub fn shown(actions: &[Action], world: &str, filter: &str) -> Vec<usize> {
                 || a.name.to_lowercase().contains(&filter)
                 || a.world.to_lowercase().contains(&filter)
                 || a.patterns.iter().any(|p| p.pattern.to_lowercase().contains(&filter))
-                || a.pattern.to_lowercase().contains(&filter)
         })
         .collect();
     out.sort_by_key(|&i| actions[i].name.to_lowercase());
@@ -48,7 +47,7 @@ pub fn shown(actions: &[Action], world: &str, filter: &str) -> Vec<usize> {
 
 /// The list's Pattern column: the first pattern, "+N more", or "(manual)".
 pub fn pattern_column(a: &Action) -> String {
-    let pats: Vec<&str> = if a.patterns.is_empty() && !a.pattern.is_empty() { vec![a.pattern.as_str()] } else { a.patterns.iter().map(|p| p.pattern.as_str()).collect() };
+    let pats: Vec<&str> = a.patterns.iter().map(|p| p.pattern.as_str()).collect();
     match pats.as_slice() {
         [] => "(manual)".into(),
         [one] => one.to_string(),
@@ -175,9 +174,6 @@ impl ActionsView {
         let new = a.is_none();
         let a = a.unwrap_or_default();
         let mut pats: Vec<String> = a.patterns.iter().map(|p| p.pattern.clone()).collect();
-        if pats.is_empty() && !a.pattern.is_empty() {
-            pats.push(a.pattern.clone());
-        }
         if new {
             pats = vec![String::new()];
         }
@@ -230,7 +226,6 @@ impl ActionsView {
             .filter(|p| !p.trim().is_empty())
             .map(|pattern| MatchPattern { pattern, compiled_regex: None })
             .collect();
-        a.pattern.clear();
         a.command = ed.command.read(cx).value().to_string();
         a.enabled = chosen(&ed.enabled, cx) == "Yes";
         a.startup = chosen(&ed.startup, cx) == "Yes";
