@@ -14515,8 +14515,10 @@
             elements.activityIndicator.title = '';
         }
 
-        // Note icon: only shown when the current world actually has notes.
-        elements.statusNoteBtn.style.display = (world && world.settings && world.settings.has_notes) ? '' : 'none';
+        // Note icon: only shown when the current world actually has notes, and only once it
+        // has connected, as its name is (a 📝 with no name beside it named no world).
+        elements.statusNoteBtn.style.display = (world && (world.was_connected || world.is_activity) &&
+            world.settings && world.settings.has_notes) ? '' : 'none';
 
         // Status/vitals panel (mud-status-display.md Job 3): re-render for whichever
         // world is now current. Also called directly (and more cheaply) from the

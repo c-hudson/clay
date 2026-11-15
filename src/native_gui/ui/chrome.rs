@@ -554,8 +554,9 @@ impl ClayView {
             row = row.child(div().flex_1());
         }
 
-        // The notes icon, when this world has notes.
-        if world.and_then(|w| w.settings.as_ref()).is_some_and(|s| s.has_notes) {
+        // The notes icon, when this world has notes - only once it has connected, as its
+        // name is (a 📝 with no name beside it named no world).
+        if world.filter(|w| w.was_connected || w.is_activity).and_then(|w| w.settings.as_ref()).is_some_and(|s| s.has_notes) {
             row = row.child(self.emoji_button("status-note", "📝", "Notes").on_click(cx.listener(|this, _, w, cx| this.open_surface("notes", w, cx))));
         }
 

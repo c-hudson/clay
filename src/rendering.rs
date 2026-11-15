@@ -2808,12 +2808,18 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // Time on the right (no space before it, underscores fill to it)
     let time_display = time_str.clone();
 
+    // Only show connection ball, world name, and tag indicator if world has ever connected
+    // Use world.was_connected flag (set to true on first connection)
+    let was_connected = world.was_connected || world.is_activity;
+
     // The current world has notes (`/note`): "📝 " just before the time, the same symbol
-    // the web/GUI status bar shows. 📝 is East Asian Wide, two columns in every width
-    // table, so ratatui, the terminal and any multiplexer between them agree. Never a VS16
-    // sequence such as 🗒️: ratatui reserves two cells for it, VTE (xfce4-terminal), tmux
-    // and screen draw one, and the cells after it - the clock - came out garbled.
-    let note_indicator = if world.has_notes(app.is_master) { "📝 " } else { "" };
+    // the web/GUI status bar shows - and, like the world's name, only once the world has
+    // connected (a 📝 with no name beside it named no world). 📝 is East Asian Wide, two
+    // columns in every width table, so ratatui, the terminal and any multiplexer between
+    // them agree. Never a VS16 sequence such as 🗒️: ratatui reserves two cells for it,
+    // VTE (xfce4-terminal), tmux and screen draw one, and the cells after it - the clock -
+    // came out garbled.
+    let note_indicator = if was_connected && world.has_notes(app.is_master) { "📝 " } else { "" };
     let note_width = if note_indicator.is_empty() { 0 } else { 3 };
 
     // Create styled spans
@@ -2821,10 +2827,6 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Status indicator on the left (black on red if active, dim underscores if not)
     spans.push(Span::styled(status_str.clone(), status_indicator_style(theme, status_active)));
-
-    // Only show connection ball, world name, and tag indicator if world has ever connected
-    // Use world.was_connected flag (set to true on first connection)
-    let was_connected = world.was_connected || world.is_activity;
 
     let current_pos = if was_connected {
         // Connection status ball (`connection_ball`). Reused for the SSH remote console for

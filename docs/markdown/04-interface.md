@@ -41,7 +41,7 @@ colour, or underscores with Settings > Separator Style set to TinyFugue (see **S
 | Left (10 chars) | Status | `More: XXXX` when paused, `Hist: XXXX` when scrolled, underscores otherwise |
 | After status | Connection | Green ball (🟢) + world name when connected |
 | Center | Activity | `(Activity: X)` count of worlds with unseen output |
-| Right, before the time | Notes | 📝 when the current world has notes (`/note`) |
+| Right, before the time | Notes | 📝 when the current world has notes (`/note`), once it has connected (like its name) |
 | Right | Time | Current time in HH:MM format (cyan) |
 
 **Status indicator formatting:**

@@ -10611,8 +10611,10 @@ third
     /// The separator bar shows "📝 " just before the clock while the current world has
     /// notes - the master's own, or on the SSH remote console what the server said, even
     /// when that mirror still holds text `/note` fetched before another interface cleared
-    /// them. The fill gives up the emoji's two cells and the space, so the clock stays
-    /// whole at the right edge.
+    /// them - once that world has connected, as its name is: before then the bar names no
+    /// world, and a 📝 alone (a fresh start on a world with notes) named none either. The
+    /// fill gives up the emoji's two cells and the space, so the clock stays whole at the
+    /// right edge.
     #[test]
     fn test_separator_bar_shows_note_emoji_before_the_time() {
         use ratatui::{backend::TestBackend, layout::Rect, Terminal};
@@ -10637,6 +10639,9 @@ third
         assert_eq!(tail(&app), without, "no notes, no emoji");
 
         app.worlds[0].settings.notes = "remember the key".to_string();
+        assert_eq!(tail(&app), without, "a world that has never connected shows no name, and no 📝");
+
+        app.worlds[0].was_connected = true;
         assert_eq!(tail(&app), with, "the emoji (two cells), a space, then the time");
 
         // The SSH remote console's mirror: the server's word, not stale fetched text.
@@ -10644,6 +10649,19 @@ third
         assert_eq!(tail(&app), without, "a mirror goes by has_notes, not settings.notes");
         app.worlds[0].mirrored_has_notes = true;
         assert_eq!(tail(&app), with);
+    }
+
+    /// The web page (and so the WebView GUI and the Android app) and the native GUI show
+    /// the 📝 button by the console's rule: the current world has notes AND has connected,
+    /// the same test that shows its name. Each showed it for a world never connected.
+    #[test]
+    fn the_notes_button_waits_for_the_world_to_connect_in_every_interface() {
+        let js = include_str!("web/app.js");
+        assert!(js.contains("elements.statusNoteBtn.style.display = (world && (world.was_connected || world.is_activity) &&"),
+            "app.js shows 📝 for a world that has never connected again");
+        let chrome = include_str!("native_gui/ui/chrome.rs");
+        assert!(chrome.contains("if world.filter(|w| w.was_connected || w.is_activity).and_then(|w| w.settings.as_ref()).is_some_and(|s| s.has_notes) {"),
+            "the native GUI shows 📝 for a world that has never connected again");
     }
 
     // --- App::start_quote ---
