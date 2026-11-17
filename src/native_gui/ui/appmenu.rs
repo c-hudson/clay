@@ -15,8 +15,14 @@
 //! through its `gmenu-dbusmenu-proxy`, which takes only a window typed as an ordinary one
 //! (`_NET_WM_WINDOW_TYPE_NORMAL`, which GPUI leaves unset, so Clay sets it). Each Clay
 //! window (the main one and its `/window`s) has its own actions, so a choice acts on the
-//! window it was made for. On Wayland there is no window property to set, and nothing is
-//! offered.
+//! window it was made for.
+//!
+//! On Wayland there is no window property to set. KDE has a protocol of its own for it
+//! (user request 2026-11-16): the window tells KWin the bus name and path of a
+//! `com.canonical.dbusmenu` object (`org_kde_kwin_appmenu`, wl.rs), which Plasma's Global
+//! Menu and KWin's title-bar menu button read. So there each window has such an object,
+//! with the same list under one **Clay** menu (as on macOS and under xfce's applet) and
+//! the same way back to its window. Another Wayland compositor is offered nothing.
 //!
 //! The same list is the macOS Dock icon's menu (less Quit, which the Dock has), and on
 //! Windows it heads each Clay window's own menu (a right-click on the title bar, or
@@ -69,7 +75,7 @@ impl Shown {
 pub struct AppMenu {
     last: Option<Shown>,
     /// Linux: the window's id once its menu is offered; None until then, and for good
-    /// where there is no X11 window (`tried`).
+    /// where nothing reads one (`tried`: Wayland without KDE's protocol).
     #[cfg(target_os = "linux")]
     offered: Option<u64>,
     /// Windows: the window, and how many entries of ours head its menu.
@@ -378,7 +384,7 @@ mod linux {
     use x11rb::rust_connection::RustConnection;
     use x11rb::wrapper::ConnectionExt as _;
     use zbus::object_server::SignalEmitter;
-    use zbus::zvariant::{OwnedValue, Signature, Str, Structure};
+    use zbus::zvariant::{OwnedValue, Signature, Str, Structure, Value};
 
     use super::super::ClayView;
     use super::super::chrome::{MenuEntry, every_menu_section, menu_always_shows, menu_shows};
@@ -404,9 +410,17 @@ mod linux {
         format!("/org/clay/Clay/window/{id}")
     }
 
+    fn menu_path(id: u64) -> String {
+        format!("/org/clay/Clay/dbusmenu/{id}")
+    }
+
     /// What the windows ask of the D-Bus side, in order, on one thread.
     enum Job {
+        /// An X11 window: GTK's model and actions, named by properties on the window.
         Offer { id: u64, xid: u32, choices: mpsc::UnboundedSender<String> },
+        /// A Wayland window under KWin: a dbusmenu object; `ready` gets the bus name and
+        /// the path for the window to give the compositor.
+        OfferMenu { id: u64, choices: mpsc::UnboundedSender<String>, ready: futures::channel::oneshot::Sender<(String, String)> },
         Withdraw(u64),
         Show(u64, Shown),
     }
@@ -424,17 +438,31 @@ mod linux {
         let _ = tx.send(job);
     }
 
-    /// Offer this window's menu: its actions on the bus, and on the window where to find
-    /// them. A choice comes back to the window's `menu_action`. None where the window isn't
-    /// an X11 one.
+    /// Offer this window's menu: on the bus, and to the desktop where to find it (X11:
+    /// properties on the window; Wayland: KDE's protocol, where the compositor has it). A
+    /// choice comes back to the window's `menu_action`. None where nothing would read it.
     pub(super) fn offer(window: &Window, cx: &mut Context<ClayView>) -> Option<u64> {
         let xid = match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Xcb(h)) => h.window.get(),
-            Ok(RawWindowHandle::Xlib(h)) => h.window as u32,
+            Ok(RawWindowHandle::Xcb(h)) => Some(h.window.get()),
+            Ok(RawWindowHandle::Xlib(h)) => Some(h.window as u32),
+            _ if super::super::wl::has_appmenu(window) => None,
             _ => return None,
         };
         let id = window.window_handle().window_id().as_u64();
         let choices = super::deliver(window, cx);
+        let Some(xid) = xid else {
+            let (ready, named) = futures::channel::oneshot::channel();
+            send(Job::OfferMenu { id, choices, ready });
+            // By the window's handle, as `deliver` goes back to it.
+            let handle = window.window_handle();
+            cx.spawn(async move |_, cx| {
+                if let Ok((service, path)) = named.await {
+                    let _ = handle.update(cx, |_, window, _| super::super::wl::set_appmenu(window, &service, &path));
+                }
+            })
+            .detach();
+            return Some(id);
+        };
         send(Job::Offer { id, xid, choices });
         Some(id)
     }
@@ -467,8 +495,17 @@ mod linux {
                         props.set(xid, &bus_name, &path);
                     }
                 }
+                Job::OfferMenu { id, choices, ready } => {
+                    let path = menu_path(id);
+                    let offered = zbus::block_on(conn.object_server().at(path.as_str(), DbusMenu { choices, shown: Shown::default(), revision: 1 }));
+                    if matches!(offered, Ok(true)) {
+                        let _ = ready.send((bus_name.clone(), path));
+                    }
+                }
+                // A window has one kind or the other: the one it hasn't is not there to remove.
                 Job::Withdraw(id) => {
                     let _ = zbus::block_on(conn.object_server().remove::<WindowActions, _>(window_path(id).as_str()));
+                    let _ = zbus::block_on(conn.object_server().remove::<DbusMenu, _>(menu_path(id).as_str()));
                 }
                 Job::Show(id, shown) => {
                     let path = window_path(id);
@@ -477,6 +514,15 @@ mod linux {
                         let changes = iface.get_mut().await.show(shown);
                         if !changes.is_empty() {
                             WindowActions::changed(iface.signal_emitter(), Vec::new(), changes, HashMap::new(), HashMap::new()).await?;
+                        }
+                        zbus::Result::Ok(())
+                    });
+                    let path = menu_path(id);
+                    let _ = zbus::block_on(async {
+                        let iface = conn.object_server().interface::<_, DbusMenu>(path.as_str()).await?;
+                        let revision = iface.get_mut().await.show(shown);
+                        if let Some(revision) = revision {
+                            DbusMenu::layout_updated(iface.signal_emitter(), revision, ROOT).await?;
                         }
                         zbus::Result::Ok(())
                     });
@@ -594,6 +640,195 @@ mod linux {
         ) -> zbus::Result<()>;
     }
 
+    // KDE's Global Menu on Wayland: `com.canonical.dbusmenu`, one object per window.
+
+    /// The ids: the root, the one **Clay** menu under it, an item by its place among every
+    /// item there can be (so a click means the same item whatever the server shows), and
+    /// the separators.
+    pub(super) const ROOT: i32 = 0;
+    pub(super) const CLAY: i32 = 1;
+    const ITEM0: i32 = 10;
+    const SEPARATOR0: i32 = 1000;
+
+    pub(super) fn item_id(action: &str) -> Option<i32> {
+        names().position(|n| n == action).map(|i| ITEM0 + i as i32)
+    }
+
+    pub(super) fn action_of(id: i32) -> Option<&'static str> {
+        usize::try_from(id.checked_sub(ITEM0)?).ok().and_then(|i| names().nth(i))
+    }
+
+    /// dbusmenu marks an access key with an underscore: a literal one is doubled.
+    pub(super) fn menu_label(label: &str) -> String {
+        label.replace('_', "__")
+    }
+
+    /// The Clay menu's rows as `shown` has them: the hamburger's sections and Quit, a
+    /// separator between two. An id and its properties.
+    pub(super) fn menu_rows(shown: Shown) -> Vec<(i32, Item)> {
+        let mut rows = Vec::new();
+        for (n, section) in items::sections(shown).into_iter().enumerate() {
+            if n > 0 {
+                rows.push((SEPARATOR0 + n as i32, Item::from([("type".to_string(), text("separator"))])));
+            }
+            for (action, label, shortcut) in section {
+                let Some(id) = item_id(action) else { continue };
+                let mut props = Item::from([("label".to_string(), text(&menu_label(label)))]);
+                // The hamburger's keys (F1, ...) beside the item; a command (/worlds) is no key.
+                if !shortcut.is_empty() && !shortcut.starts_with('/') {
+                    if let Ok(keys) = OwnedValue::try_from(Value::from(vec![vec![shortcut.to_string()]])) {
+                        props.insert("shortcut".to_string(), keys);
+                    }
+                }
+                rows.push((id, props));
+            }
+        }
+        rows
+    }
+
+    /// The root and the Clay menu, then its rows.
+    fn menu_items(shown: Shown) -> Vec<(i32, Item)> {
+        let submenu = ("children-display".to_string(), text("submenu"));
+        let mut all = vec![(ROOT, Item::from([submenu.clone()])), (CLAY, Item::from([("label".to_string(), text("Clay")), submenu]))];
+        all.extend(menu_rows(shown));
+        all
+    }
+
+    /// The properties asked for: all of them when none is named.
+    fn only(mut props: Item, names: &[String]) -> Item {
+        if !names.is_empty() {
+            props.retain(|k, _| names.iter().any(|n| n == k));
+        }
+        props
+    }
+
+    /// A menu item with what is under it: `(ia{sv}av)`, each child a variant of the same.
+    pub(super) type Node = (i32, Item, Vec<OwnedValue>);
+
+    fn child((id, props, children): Node) -> Option<OwnedValue> {
+        OwnedValue::try_from(Value::from(Structure::from((id, props, children)))).ok()
+    }
+
+    /// `parent` with its children `depth` levels down (negative: all the way).
+    pub(super) fn menu_layout(shown: Shown, parent: i32, depth: i32, names: &[String]) -> Option<Node> {
+        let mut items = menu_items(shown).into_iter().map(|(id, props)| (id, only(props, names)));
+        let rows = |depth: i32, items: &mut dyn Iterator<Item = (i32, Item)>| -> Vec<OwnedValue> {
+            if depth == 0 { Vec::new() } else { items.filter_map(|(id, props)| child((id, props, Vec::new()))).collect() }
+        };
+        match parent {
+            ROOT => {
+                let (_, root) = items.next()?;
+                let (_, clay) = items.next()?;
+                let under = if depth == 0 { Vec::new() } else { child((CLAY, clay, rows(depth - 1, &mut items))).into_iter().collect() };
+                Some((ROOT, root, under))
+            }
+            CLAY => {
+                let (_, clay) = items.nth(1)?;
+                Some((CLAY, clay, rows(depth, &mut items)))
+            }
+            id => items.find(|(i, _)| *i == id).map(|(i, props)| (i, props, Vec::new())),
+        }
+    }
+
+    /// One window's menu, as KDE reads it on Wayland.
+    pub(super) struct DbusMenu {
+        pub(super) choices: mpsc::UnboundedSender<String>,
+        pub(super) shown: Shown,
+        /// Goes up when the layout changes; a reader keeps the one it last fetched.
+        pub(super) revision: u32,
+    }
+
+    impl DbusMenu {
+        /// The server's changed: the new revision, when the menu is another one.
+        fn show(&mut self, shown: Shown) -> Option<u32> {
+            if self.shown == shown {
+                return None;
+            }
+            self.shown = shown;
+            self.revision += 1;
+            Some(self.revision)
+        }
+
+        /// A click on an item this server's menu has; anything else does nothing.
+        pub(super) fn clicked(&self, id: i32, event: &str) {
+            if event != "clicked" {
+                return;
+            }
+            if let Some(action) = action_of(id).filter(|a| self.shown.shows(a)) {
+                let _ = self.choices.unbounded_send(action.to_string());
+            }
+        }
+    }
+
+    #[zbus::interface(name = "com.canonical.dbusmenu")]
+    impl DbusMenu {
+        #[zbus(property)]
+        fn version(&self) -> u32 {
+            3
+        }
+
+        #[zbus(property)]
+        fn text_direction(&self) -> String {
+            "ltr".to_string()
+        }
+
+        #[zbus(property)]
+        fn status(&self) -> String {
+            "normal".to_string()
+        }
+
+        #[zbus(property)]
+        fn icon_theme_path(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn get_layout(&self, parent_id: i32, recursion_depth: i32, property_names: Vec<String>) -> zbus::fdo::Result<(u32, Node)> {
+            match menu_layout(self.shown, parent_id, recursion_depth, &property_names) {
+                Some(node) => Ok((self.revision, node)),
+                None => Err(zbus::fdo::Error::InvalidArgs(format!("no menu item {parent_id}"))),
+            }
+        }
+
+        fn get_group_properties(&self, ids: Vec<i32>, property_names: Vec<String>) -> Vec<(i32, Item)> {
+            menu_items(self.shown).into_iter().filter(|(id, _)| ids.is_empty() || ids.contains(id)).map(|(id, props)| (id, only(props, &property_names))).collect()
+        }
+
+        fn get_property(&self, id: i32, name: &str) -> zbus::fdo::Result<OwnedValue> {
+            let found = menu_items(self.shown).into_iter().find(|(i, _)| *i == id).and_then(|(_, mut props)| props.remove(name));
+            found.ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no property {name} on menu item {id}")))
+        }
+
+        fn event(&self, id: i32, event_id: &str, _data: OwnedValue, _timestamp: u32) {
+            self.clicked(id, event_id);
+        }
+
+        /// The ids that weren't found: none is reported, a stale id's click is dropped.
+        fn event_group(&self, events: Vec<(i32, String, OwnedValue, u32)>) -> Vec<i32> {
+            for (id, event_id, _, _) in &events {
+                self.clicked(*id, event_id);
+            }
+            Vec::new()
+        }
+
+        /// Nothing is built on demand: the layout a reader has is the one there is.
+        fn about_to_show(&self, _id: i32) -> bool {
+            false
+        }
+
+        fn about_to_show_group(&self, _ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
+            (Vec::new(), Vec::new())
+        }
+
+        #[zbus(signal)]
+        async fn items_properties_updated(emitter: &SignalEmitter<'_>, updated: Vec<(i32, Item)>, removed: Vec<(i32, Vec<String>)>) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        async fn layout_updated(emitter: &SignalEmitter<'_>, revision: u32, parent: i32) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        async fn item_activation_requested(emitter: &SignalEmitter<'_>, id: i32, timestamp: u32) -> zbus::Result<()>;
+    }
+
     /// The window properties that say where its menu is, on one X connection.
     #[derive(Default)]
     struct Props(Option<(RustConnection, [Atom; 3], Atom, [Atom; 2])>);
@@ -676,6 +911,101 @@ mod linux {
             assert!(actions.show(Shown { multiuser: true, picture_upload: false, change_password: true }).is_empty(), "no change, nothing to say");
             let changes = actions.show(Shown { multiuser: true, picture_upload: false, change_password: false });
             assert_eq!(changes.get("change-password"), Some(&false), "clay_multi: password.dat is the operator's");
+        }
+
+        use super::{CLAY, DbusMenu, ROOT, action_of, item_id, menu_label, menu_layout, menu_rows};
+
+        /// A node's id, and its children's nodes.
+        fn node_id(v: &OwnedValue) -> i32 {
+            let s = Structure::try_from(v.clone()).expect("a child is a structure");
+            i32::try_from(&s.fields()[0]).expect("which starts with its id")
+        }
+
+        /// KDE's menu is the hamburger's list for every kind of server: its sections in
+        /// order with a separator between two, then Quit, each item under an id that means
+        /// that item whatever the server shows.
+        #[test]
+        fn the_kde_menu_is_the_hamburgers_for_every_server() {
+            for shown in Shown::every() {
+                let rows = menu_rows(shown);
+                let mut want = Vec::new();
+                for (n, section) in super::items::sections(shown).into_iter().enumerate() {
+                    if n > 0 {
+                        want.push("-".to_string());
+                    }
+                    want.extend(section.iter().map(|(_, label, _)| label.to_string()));
+                }
+                let got: Vec<String> = rows.iter().map(|(_, p)| if p.get("type").map(text).as_deref() == Some("separator") { "-".to_string() } else { p.get("label").map(text).unwrap_or_default() }).collect();
+                assert_eq!(got, want, "{shown:?}");
+                assert_eq!(want.last().map(String::as_str), Some("Quit"));
+                let ids: std::collections::HashSet<i32> = rows.iter().map(|(id, _)| *id).collect();
+                assert_eq!(ids.len(), rows.len(), "distinct ids: {shown:?}");
+                assert!(!ids.contains(&ROOT) && !ids.contains(&CLAY));
+                for (action, _, _) in super::items::sections(shown).into_iter().flatten() {
+                    let id = item_id(action).expect("every item has an id");
+                    assert_eq!(action_of(id), Some(action));
+                    assert!(ids.contains(&id), "{action} is in the menu under its id");
+                }
+            }
+            let single = item_id("help");
+            assert!(Shown::every().into_iter().all(|_| item_id("help") == single), "an id never depends on the server");
+            assert_eq!(action_of(ROOT), None);
+            assert_eq!(action_of(CLAY), None);
+            assert_eq!(action_of(1001), None, "a separator is no action");
+            let help = menu_rows(Shown::default()).into_iter().find(|(id, _)| Some(*id) == single).expect("Help is there").1;
+            assert!(help.contains_key("shortcut"), "F1 beside Help");
+            assert_eq!(menu_label("a_b"), "a__b", "an underscore would be an access key");
+        }
+
+        /// What a reader asks for: the root holds the one Clay menu, which holds the rows;
+        /// a depth stops there, and named properties are the only ones sent.
+        #[test]
+        fn the_kde_menu_layout_is_one_clay_menu_and_honours_depth() {
+            let shown = Shown::default();
+            let rows: Vec<i32> = menu_rows(shown).into_iter().map(|(id, _)| id).collect();
+            let (id, props, children) = menu_layout(shown, ROOT, -1, &[]).expect("the root");
+            assert_eq!(id, ROOT);
+            assert_eq!(props.get("children-display").map(text).as_deref(), Some("submenu"));
+            assert_eq!(children.iter().map(node_id).collect::<Vec<_>>(), vec![CLAY]);
+            let clay = Structure::try_from(children[0].clone()).unwrap();
+            let under = zbus::zvariant::Array::try_from(clay.fields()[2].clone()).expect("children");
+            assert_eq!(under.len(), rows.len(), "everything under Clay");
+
+            assert!(menu_layout(shown, ROOT, 0, &[]).unwrap().2.is_empty(), "depth 0: the item alone");
+            let (_, _, one) = menu_layout(shown, ROOT, 1, &[]).unwrap();
+            let clay = Structure::try_from(one[0].clone()).unwrap();
+            assert_eq!(zbus::zvariant::Array::try_from(clay.fields()[2].clone()).unwrap().len(), 0, "depth 1: Clay without its rows");
+
+            let (id, props, children) = menu_layout(shown, CLAY, -1, &["label".to_string()]).expect("the Clay menu");
+            assert_eq!((id, props.get("label").map(text).as_deref()), (CLAY, Some("Clay")));
+            assert!(!props.contains_key("children-display"), "only the property asked for");
+            assert_eq!(children.iter().map(node_id).collect::<Vec<_>>(), rows);
+            let help = item_id("help").unwrap();
+            assert_eq!(menu_layout(shown, help, -1, &[]).map(|(id, _, c)| (id, c.len())), Some((help, 0)));
+            assert!(menu_layout(shown, 9999, -1, &[]).is_none());
+        }
+
+        /// A click runs the item in its window; an item this server's menu lacks, another
+        /// event or an unknown id does nothing. A new server means a new revision.
+        #[test]
+        fn a_kde_menu_click_runs_only_what_the_menu_shows() {
+            let (choices, mut chosen) = futures::channel::mpsc::unbounded();
+            let mut menu = DbusMenu { choices, shown: Shown::default(), revision: 1 };
+            menu.clicked(item_id("help").unwrap(), "clicked");
+            menu.clicked(item_id("help").unwrap(), "hovered");
+            menu.clicked(item_id("logout").unwrap(), "clicked");
+            menu.clicked(CLAY, "clicked");
+            menu.clicked(1001, "clicked");
+            menu.clicked(item_id("quit").unwrap(), "clicked");
+            let mut got = Vec::new();
+            while let Ok(a) = chosen.try_recv() {
+                got.push(a);
+            }
+            assert_eq!(got, vec!["help".to_string(), "quit".to_string()]);
+            assert_eq!(menu.show(Shown::default()), None, "the same server: the same menu");
+            assert_eq!(menu.show(Shown { multiuser: true, picture_upload: false, change_password: true }), Some(2));
+            menu.clicked(item_id("logout").unwrap(), "clicked");
+            assert_eq!(chosen.try_recv().ok().as_deref(), Some("logout"));
         }
     }
 }

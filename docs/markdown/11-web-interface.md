@@ -59,6 +59,10 @@ The web interface provides a complete MUD experience:
 - **More-mode pausing**: Tab to release, same as console. Every world pauses on its own, so a world you switch to with a backlog shows one screenful and holds the rest under MORE, as the console does
 - **Command history**: Ctrl+P/N navigation
 - **Multiple worlds**: Full world switching support
+- **Size while resizing**: resize the browser window and a small box in its middle shows
+  the output's size in characters (`80x24`) until a second after you stop; on a phone or
+  tablet it shows when you turn the device, not when the on-screen keyboard opens (see
+  **Output Area** in the Interface chapter)
 
 ### Separator Bar and Button Row
 

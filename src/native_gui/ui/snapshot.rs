@@ -456,6 +456,46 @@ pub fn run(mut session: Session, mut events: mpsc::UnboundedReceiver<Input>, out
                     });
                     Vec::new()
                 }
+                // The target window resized to W,H as the platform would report it
+                // (ui/sizepopup.rs): the headless window only stores a size, so the bounds
+                // report is made here - what the platform's resize callback calls - then
+                // the frame the new layout asks for. With no size the bounds are reported
+                // as they stand: a move, or what follows the zoom's own resize.
+                "resize" => {
+                    let _ = cx.update_window(target, |_, w, app| {
+                        if let (Some(width), Some(height)) = (nums.first(), nums.get(1)) {
+                            w.resize(gpui::size(px(*width), px(*height)));
+                        }
+                        w.bounds_changed(app);
+                    });
+                    cx.run_until_parked();
+                    let _ = cx.update_window(target, |_, w, app| {
+                        let _ = w.draw(app);
+                        w.simulate_next_frame(app);
+                    });
+                    cx.run_until_parked();
+                    let _ = cx.update_window(target, |_, w, app| {
+                        let _ = w.draw(app);
+                    });
+                    Vec::new()
+                }
+                // The main view's size popup (its label, or none), the cells its output
+                // was last laid out to (the focused pane's, where the popup's are the
+                // whole output's) and the target window's content size, without drawing.
+                "size" => {
+                    cx.run_until_parked();
+                    let _ = cx.update_window(target, |_, w, app| {
+                        let v = view.read(app);
+                        let vs = w.viewport_size();
+                        let cells = {
+                            let s = v.scroll.borrow();
+                            crate::sizepopup::label(s.view_cols, s.view_rows)
+                        };
+                        let popup = v.size_popup_label().unwrap_or_else(|| "none".to_string());
+                        println!("snapshot-size: {arg} popup={popup} cells={cells} viewport={}x{}", f32::from(vs.width), f32::from(vs.height));
+                    });
+                    Vec::new()
+                }
                 // The connection and its dialog as they stand, without drawing (`state:`
                 // draws first, which runs what the view queued for its next frame).
                 "peek" => {

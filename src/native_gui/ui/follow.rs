@@ -277,8 +277,11 @@ impl ClayView {
                 own?.update(cx, |_, window, _| window.bounds().origin).ok().map(|o| gpui::point(o.x + step, o.y + step))
             });
             let how = super::ViewWindow { title: title.into(), size, is_main: false, leader: Some(me.clone()), origin };
-            if let Some(opened) = super::open_view_window(cx, fonts, session, None, mode, how) {
-                let _ = me.update(cx, |v, _| v.link.followers.push(opened));
+            match super::open_view_window(cx, fonts, session, None, mode, how) {
+                Ok(opened) => {
+                    let _ = me.update(cx, |v, _| v.link.followers.push(opened));
+                }
+                Err(e) => crate::debug_log(true, &format!("native-gui: a window could not be opened ({e})")),
             }
         });
     }

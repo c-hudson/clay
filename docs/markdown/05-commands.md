@@ -80,6 +80,12 @@ phone and SSH console attached to this Clay. It is `/remote --pause` on each of 
 /pause
 ```
 
+Clay answers with the ones it paused, each client by the number `/remote` lists it under:
+
+```
+Paused on: the console, client 3 (Web, 192.168.1.20), and client 4 (RemoteGUI, 127.0.0.1).
+```
+
 A paused interface stops counting as watching its world, so text arriving there shows as
 new activity, and as new text (▶), where you are. Each one resumes as soon as it is used:
 a key at the console; in a GUI, a browser or the phone app, any key, click, touch or turn

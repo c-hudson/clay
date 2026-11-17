@@ -1582,6 +1582,34 @@ body.desktop-input #menu-dropdown .menu-item[data-action="emoji_picker"] { displ
 .cs-lan-note { padding: 2px 0 4px; font-size: 0.78em; opacity: 0.85; text-align: left; }
 .cs-lan-error { padding: 2px 0 4px; font-size: 0.78em; color: var(--error-color); text-align: left; }
 
+/* ─── Size popup ───
+   The output's size in characters (80x24), in the middle of the window while it is
+   resized, as xfwm4 shows for a terminal (app.js noteWindowResize, src/sizepopup.rs;
+   the native GUI's is ui/sizepopup.rs, the same box). No fade, and nothing of the mouse:
+   a press goes to whatever is under it. Above every dialog and menu. */
+#size-popup {
+    display: none;
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 20000;
+    pointer-events: none;
+    padding: 3px 8px;
+    background-color: var(--theme-bg-elevated, #111);
+    color: var(--text-color);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+#size-popup.visible {
+    display: block;
+}
+
 /* ─── Filter Popup (F4) ─── */
 .filter-popup {
     position: fixed;

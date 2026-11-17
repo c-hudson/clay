@@ -1,8 +1,10 @@
 //! The settings' Transparency, as the WebView GUI applies it (webview_gui.rs `SetOpacity`:
 //! GTK's `set_opacity` on every window): the whole window, text and all, at that
 //! opacity. On X11 that is the `_NET_WM_WINDOW_OPACITY` property a compositing window
-//! manager reads. Elsewhere (Wayland, Windows, macOS) it's kept but not applied, as in
-//! the WebView GUI.
+//! manager reads; on Wayland the compositor's `wp_alpha_modifier_v1` (wl.rs; KWin has
+//! it), which covers what Clay draws and leaves the compositor's own title bar opaque.
+//! Elsewhere (Windows, macOS, a Wayland compositor without the protocol) it's kept but
+//! not applied, as in the WebView GUI.
 
 use gpui::Window;
 
@@ -32,7 +34,17 @@ impl Opacity {
         self.last = Some(v);
         let Some(v) = send else { return };
         #[cfg(target_os = "linux")]
-        x11::set(window, v);
+        if super::wl::set_opacity(window, v) {
+            // GPUI declares an opaque window's whole surface opaque, and KWin goes by that
+            // whatever the multiplier: it stops drawing what is behind, so the window
+            // blends with its own last frame and looks as solid as before. A transparent
+            // background is how GPUI is told to drop the declaration; Clay still paints
+            // every pixel. It also asks for the frame that commits the two changes.
+            let opaque = v == u32::MAX;
+            window.set_background_appearance(if opaque { gpui::WindowBackgroundAppearance::Opaque } else { gpui::WindowBackgroundAppearance::Transparent });
+        } else {
+            x11::set(window, v);
+        }
         #[cfg(not(target_os = "linux"))]
         let _ = (window, v);
     }

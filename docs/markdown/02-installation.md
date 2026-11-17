@@ -28,11 +28,11 @@ source ~/.cargo/env
 ### The build script
 
 `./build.sh` builds a release binary with whatever this machine supports. It adds the
-native GUI (`native-gui`) where GPUI's libraries and a Rust 1.98 toolchain are found, and
-the WebView GUI (`webview-gui`) only where the native one can't be built - Termux, a
-machine without those libraries, or a native build that fails - so a desktop build
-carries one GUI, not two. Audio and the SSH transport come along where they can, and a
-Linux machine with none of the GUI or audio libraries gets the static musl build below.
+native GUI (`native-gui`) where GPUI's libraries and a Rust 1.98 toolchain are found. The
+WebView GUI (`webview-gui`) is built on Termux only, where the native one can't be: a
+desktop that can't build the native GUI gets a build without a GUI, and the script says
+what is missing. Audio and the SSH transport come along where they can, and a Linux
+machine with none of the GUI or audio libraries gets the static musl build below.
 
 ### Linux (Recommended: musl build)
 
@@ -61,18 +61,22 @@ on every platform, and Clay pins certificates itself (trust on first use) rather
 asking the operating system's trust store. `rustls-backend` is still accepted as a
 feature name, doing nothing, so older build commands keep working.
 
-### Linux with WebView GUI
+### The WebView GUI (Termux; anywhere else only if you ask for it)
 
-To build with the native WebView GUI client feature (`webview-gui` — wry/tao;
-`native-audio` for ANSI music/MSP sound is on by default alongside it):
+The WebView GUI is the Termux build's GUI. No desktop download has it and `./build.sh`
+builds it nowhere else, but it stays a feature you can ask cargo for (`webview-gui` —
+wry/tao; `native-audio` for ANSI music/MSP sound is on by default alongside it). On Linux:
 
 ```bash
 # Install dependencies (Debian/Ubuntu)
 sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev
 
-# Build with GUI (audio included by default)
+# Build with the WebView GUI (audio included by default)
 cargo build --features webview-gui
 ```
+
+A Linux binary built this way needs WebKitGTK on every machine it runs on, not only the
+one that built it; without it the program does not start at all.
 
 ### macOS
 
@@ -82,8 +86,8 @@ macOS builds use the native toolchain (no musl needed):
 # Terminal client only
 cargo build --no-default-features --features ssh-transport,shell-worlds
 
-# With WebView GUI (audio included by default, no extra deps)
-cargo build --features webview-gui
+# With the GUI (the native one; needs Rust 1.98 or newer; audio included by default)
+cargo build --features native-gui
 
 # Binary location
 ./target/debug/clay
@@ -123,10 +127,10 @@ Native build (MSVC) — no WSL required:
 # Install Rust from https://rustup.rs
 # Install Visual Studio Build Tools (MSVC)
 
-# Build with WebView GUI (uses WebView2). Static CRT linking eliminates a
-# vcruntime140.dll runtime dependency.
+# Build with the GUI (the native one; needs Rust 1.98 or newer). Static CRT linking
+# eliminates a vcruntime140.dll runtime dependency.
 set RUSTFLAGS=-C target-feature=+crt-static
-cargo build --release --features webview-gui
+cargo build --release --features native-gui
 ```
 
 ## Feature Flags
@@ -135,7 +139,7 @@ cargo build --release --features webview-gui
 |---------|-------------|
 | `rustls-backend` | Accepted and ignored: TLS is always rustls now |
 | `native-gui` | Build the native GUI (GPUI; needs Rust 1.98 or newer and a display; `--gui`) |
-| `webview-gui` | Build the WebView GUI client (requires display; `--web-gui`, and `--gui` in a build without `native-gui`) |
+| `webview-gui` | Build the WebView GUI client: the Termux build's GUI, in no desktop download and no `build.sh` build elsewhere (requires display; `--web-gui`, and `--gui` in a build without `native-gui`) |
 | `native-audio` | ANSI music / MSP sound playback via rodio (on by default) |
 | `ssh-transport` | SSH-tunneled `--console`/`--gui`/`--web-gui` and Android's SSH proxy (on by default) |
 | `shell-worlds` | Shell worlds, a world that is a local terminal (on by default; in every release build except the Android app) |
@@ -184,8 +188,8 @@ GUI chapter.
 | `-v`, `--version` | Show version and exit |
 | `--conf=<path>` | Use alternate config file instead of `~/.clay/settings.dat` |
 | `--console[=host[:port]]` | Console (TUI) mode; with an address, connects to a running Clay instance instead of starting a local one (default port: 9000) |
-| `--gui[=host[:port]]` | GUI mode: the native GUI (`native-gui` feature; a build without it opens the WebView GUI instead); same local-vs-remote distinction as `--console` |
-| `--web-gui[=host[:port]]` | WebView GUI mode (requires the `webview-gui` feature); same local-vs-remote distinction as `--console` |
+| `--gui[=host[:port]]` | GUI mode: the native GUI (`native-gui` feature; a build with only the WebView GUI, as on Termux, opens that instead); same local-vs-remote distinction as `--console` |
+| `--web-gui[=host[:port]]` | WebView GUI mode, where it is built in (the Termux GUI binary, or a build of your own with the `webview-gui` feature). A build with only the native GUI opens that instead, as `--gui` does; same local-vs-remote distinction as `--console` |
 | `--ssh` | Tunnel `--console=`/`--gui=`/`--web-gui=` through SSH instead of connecting directly (requires the `ssh-transport` feature) |
 | `-D` | Run as a headless daemon server |
 | `--multiuser` | Run the multiuser server (the `clay_multi` build runs it with no options too; see the Multiuser Server chapter) |

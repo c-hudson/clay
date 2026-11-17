@@ -169,6 +169,8 @@ impl ClayView {
     /// server hears of it on the next report (`report_other_views`).
     pub(super) fn split_changed(&mut self) {
         self.session.core.split_skip = self.split_other();
+        // The size popup's measure of the two panes as one is the last split's.
+        self.size_popup.whole.set(None);
     }
 
     /// Shift+Tab (`split_focus`), or a plain click in the other pane: the focus moves there.

@@ -2,9 +2,10 @@
 //!
 //! - Taskbar Alert (Settings, off by default): the MUD sent text and no Clay window has
 //!   focus - flash the main window's taskbar button (X11's urgency hint, Windows'
-//!   `FlashWindowEx`), bounce the Dock icon (macOS). Once per stretch without focus;
-//!   GPUI does nothing on Wayland. The window with the connection decides (follow.rs
-//!   `handle`), since every `/window` sees the same text.
+//!   `FlashWindowEx`), bounce the Dock icon (macOS). Once per stretch without focus.
+//!   GPUI does nothing on Wayland, so there Clay asks the compositor itself (wl.rs: an
+//!   activation it must refuse, which flags the window). The window with the connection
+//!   decides (follow.rs `handle`), since every `/window` sees the same text.
 //! - The activity count (the ACT badge's) on the taskbar button or Dock icon, kept by the
 //!   window with the connection.
 
@@ -19,8 +20,11 @@ pub(super) fn alert(handle: AnyWindowHandle, cx: &mut App) {
     cx.defer(move |cx| {
         let _ = handle.update(cx, |_, window, _| {
             window.request_attention();
+            // GPUI's is empty on Wayland; the compositor is asked directly (wl.rs).
             #[cfg(target_os = "linux")]
-            x11::flagged(window);
+            if !super::wl::request_attention(window) {
+                x11::flagged(window);
+            }
         });
     });
 }

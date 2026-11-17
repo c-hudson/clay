@@ -30,6 +30,17 @@ The output area displays text from the MUD server:
 - **Unlimited scrollback**: Output is stored in memory (grows with available RAM)
 - **Word wrapping**: Long lines wrap intelligently, preserving ANSI codes
 - **MUD tags**: Optional display of channel tags and timestamps (toggle with F2)
+- **Size while resizing**: in the GUI, the web page and the Android app, a small box in
+  the middle of the window shows the output's size in characters while you resize the
+  window - `80x24` is 80 columns by 24 rows - and goes away a second after you stop. It
+  is the output area alone (not the input area, the bars, the tabs or the icon bar): the
+  size Clay wraps and pages the output by, and the size a shell world's terminal gets.
+  While the output is split it is still the whole output area's, as if it weren't split,
+  not one pane's. Moving the window doesn't show it, nor
+  does the native GUI's own zoom (`Ctrl+plus`/`Ctrl+minus`) or a browser's page zoom, and
+  on a phone or tablet the on-screen keyboard opening doesn't either (turning the device
+  does). The console has none: a terminal's size is its window manager's to show, as
+  xfce4 does for xfce4-terminal
 
 ### Separator Bar
 

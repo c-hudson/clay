@@ -461,13 +461,42 @@ pub(crate) fn note_restart_fallback(chosen: UiKind) {
     });
 }
 
-/// What `note_restart_fallback` recorded, if anything.
+/// A restart named the WebView GUI and this build has only the native one
+/// (`web_gui_to_native`): said after "Reload successful", like the note above.
+pub(crate) fn note_restart_without_web_gui() {
+    let _ = RESTART_NOTE.set("This build has no WebView GUI (it is built on Termux only), so Clay came back in the native GUI.");
+}
+
+/// What `note_restart_fallback` or `note_restart_without_web_gui` recorded, if anything.
 pub(crate) fn restart_fallback_note() -> Option<&'static str> {
     RESTART_NOTE.get().copied()
 }
 
 /// Whether this build has a GUI at all.
 pub(crate) const GUI_BUILT: bool = cfg!(any(feature = "native-gui", feature = "webview-gui"));
+
+/// What a build with the native GUI and without the WebView one says when started with
+/// `--web-gui`, before it opens the native GUI in its place (main.rs).
+pub(crate) const WEB_GUI_NOT_BUILT: &str =
+    "--web-gui: the WebView GUI is not in this build (it is built on Termux only); opening the GUI (--gui) in its place.";
+
+/// `--web-gui[=host]` becomes `--gui[=host]`: what main.rs does with the two arguments in a
+/// build that has the native GUI and not the WebView one (every desktop build, user ruling
+/// 2026-11-16), so a launcher from before that, and the restart of a Clay that was in the
+/// WebView GUI when it updated, still get a window. Whether it did. Both named together is
+/// left as it is, for the caller to refuse.
+pub(crate) fn web_gui_to_native(gui: &mut Option<Option<String>>, web_gui: &mut Option<Option<String>>) -> bool {
+    if gui.is_some() {
+        return false;
+    }
+    match web_gui.take() {
+        Some(target) => {
+            *gui = Some(target);
+            true
+        }
+        None => false,
+    }
+}
 
 /// A window can be shown here: on Linux and Termux the display server answers - a display
 /// forwarded over SSH counts, as `--gui` would use it - and on Windows and macOS this isn't a
@@ -2799,6 +2828,23 @@ mod tests {
         assert_eq!(restart_ui(Console, true, false), Gui, "no terminal: the GUI");
         assert_eq!(restart_ui(Gui, false, false), Gui, "neither: as it was");
         assert_eq!(restart_ui(Console, false, false), Console);
+    }
+
+    /// User ruling 2026-11-16: the WebView GUI is Termux's, so a desktop build has only the
+    /// native one, and `--web-gui` there opens it - with the address it was given.
+    #[test]
+    fn web_gui_becomes_the_native_gui_where_only_that_is_built() {
+        let run = |gui: Option<Option<&str>>, web: Option<Option<&str>>| {
+            let own = |a: Option<Option<&str>>| a.map(|t| t.map(str::to_string));
+            let (mut gui, mut web) = (own(gui), own(web));
+            let did = super::web_gui_to_native(&mut gui, &mut web);
+            (did, gui, web)
+        };
+        assert_eq!(run(None, Some(None)), (true, Some(None), None), "--web-gui");
+        assert_eq!(run(None, Some(Some("mini:9000"))), (true, Some(Some("mini:9000".to_string())), None), "--web-gui=host");
+        assert_eq!(run(None, None), (false, None, None), "neither named");
+        assert_eq!(run(Some(None), None), (false, Some(None), None), "--gui alone");
+        assert_eq!(run(Some(None), Some(None)), (false, Some(None), Some(None)), "both: left for main to refuse");
     }
 
     #[test]

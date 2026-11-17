@@ -17,6 +17,12 @@
 //! - a window the user has dragged to a new size while zoomed re-bases: later steps
 //!   scale the user's size (a pure move re-anchors the origin);
 //! - a maximized or fullscreen window changes only its text, and its size is never a base;
+//! - where the platform won't place a window or say where it is (Wayland: user request
+//!   2026-11-16, for KDE), "becomes the screen" is a **maximize** (`step_unplaced`): the
+//!   step that would outgrow the screen's size maximizes, zooming in again does nothing,
+//!   zooming out restores the window at the previous level's size and 1:1 at the base's;
+//!   a maximize the zoom made is the zoom's own, and the user restoring it re-bases as
+//!   any window restored while zoomed does;
 //! - everything is in memory, per window: nothing here touches settings, the server or
 //!   another window.
 //!
@@ -120,10 +126,24 @@ impl Step {
 
 /// What a step changed: the text scale, and the window's new bounds when the window
 /// moves with it (`None` for a maximized or fullscreen window, which keeps its size).
+/// `maximize` is `step_unplaced`'s alone: `Some(true)` maximize the window now,
+/// `Some(false)` restore it now - `bounds` is then what it takes once it is restored.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Change {
     pub scale: f32,
     pub bounds: Option<Rect>,
+    pub maximize: Option<bool>,
+}
+
+/// A maximize `step_unplaced` asked for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Maxed {
+    #[default]
+    No,
+    /// Asked of the platform, not reported back yet.
+    Asked,
+    /// The window has been seen maximized since.
+    Seen,
 }
 
 /// Whose change a bounds report was.
@@ -147,6 +167,8 @@ pub struct ZoomState {
     /// same size and place is an echo (X11 reports a resize and a move apart), the same
     /// size elsewhere is the user's move, another size the user's resize.
     applied: Option<Rect>,
+    /// The window is maximized because a step would have outgrown the screen.
+    maxed: Maxed,
 }
 
 impl ZoomState {
@@ -178,7 +200,7 @@ impl ZoomState {
                 if let Some(b) = bounds {
                     self.expected = Some((b, now));
                 }
-                return Some(Change { scale: 1.0, bounds });
+                return Some(Change { scale: 1.0, bounds, maximize: None });
             }
             Step::In => self.level.checked_add(1).filter(|l| *l <= MAX_LEVEL)?,
             Step::Out => self.level.checked_sub(1).filter(|l| *l >= MIN_LEVEL)?,
@@ -188,7 +210,7 @@ impl ZoomState {
             // Only the text: a maximized window keeps the size the window manager gave it,
             // and that size is never a base.
             self.level = new;
-            return Some(Change { scale: scale_at(new), bounds: None });
+            return Some(Change { scale: scale_at(new), bounds: None, maximize: None });
         }
 
         let base = *self.base.get_or_insert(current);
@@ -222,13 +244,79 @@ impl ZoomState {
             self.base = None;
         }
         self.expected = Some((want, now));
-        Some(Change { scale: s, bounds: Some(want) })
+        Some(Change { scale: s, bounds: Some(want), maximize: None })
+    }
+
+    /// `step` where the platform won't place a window or say where it is (Wayland): only
+    /// the screen's **size** is known (`screen`: width, height - the whole output, since a
+    /// panel can't be seen either), so a window can't be made the screen by resizing and
+    /// moving it. The step that would outgrow that size maximizes instead; from there
+    /// zooming in does nothing, zooming out restores the window at the previous level's
+    /// size and 1:1 at the base's. `maximized` is the window's state now, `resizable`
+    /// false when it is maximized or fullscreen.
+    pub fn step_unplaced(&mut self, step: Step, current: Rect, screen: Option<(f32, f32)>, maximized: bool, resizable: bool, now: Instant) -> Option<Change> {
+        if self.maxed == Maxed::Seen && !maximized {
+            // The user restored it between two reports: an ordinary window again.
+            self.forget_maximize();
+        }
+        if self.maxed != Maxed::No {
+            let new = match step {
+                // As large as the screen already: this step does nothing at all.
+                Step::In => return None,
+                Step::Out => self.level - 1,
+                Step::Reset => 0,
+            };
+            self.maxed = Maxed::No;
+            self.level = new;
+            let s = scale_at(new);
+            let bounds = if new == 0 { self.base.take() } else { self.base.map(|b| Rect::new(b.x, b.y, b.w * s, b.h * s)) };
+            self.expected = bounds.map(|b| (b, now));
+            return Some(Change { scale: s, bounds, maximize: Some(false) });
+        }
+        if resizable && step == Step::In && self.level < MAX_LEVEL {
+            if let Some((sw, sh)) = screen {
+                let base = self.base.unwrap_or(current);
+                let s = scale_at(self.level + 1);
+                if !Rect::new(0.0, 0.0, base.w * s, base.h * s).fits(&Rect::new(0.0, 0.0, sw, sh)) {
+                    // The window stays the size it is under the maximize, which is the
+                    // size it comes back to.
+                    self.base = Some(base);
+                    self.level += 1;
+                    self.maxed = Maxed::Asked;
+                    self.expected = None;
+                    return Some(Change { scale: s, bounds: None, maximize: Some(true) });
+                }
+            }
+        }
+        // Everything else is the placed rules without a screen to stay on.
+        self.step(step, current, None, resizable, now)
+    }
+
+    /// The maximize is no longer the zoom's: the window is what the user left, to be
+    /// re-based by the next bounds report as any window restored while zoomed is.
+    fn forget_maximize(&mut self) {
+        self.maxed = Maxed::No;
+        self.applied = None;
+        self.expected = None;
     }
 
     /// The platform reported the window's bounds (a resize or a move). Ours are consumed;
     /// the user's move the base along, or re-base the zoom so later steps scale the window
     /// they made.
     pub fn observed(&mut self, bounds: Rect, resizable: bool, now: Instant) -> Observed {
+        if self.maxed != Maxed::No {
+            if !resizable {
+                // The maximize a step asked for.
+                self.maxed = Maxed::Seen;
+                return Observed::Ours;
+            }
+            if self.maxed == Maxed::Asked {
+                // A report from before the maximize took effect.
+                return Observed::Ours;
+            }
+            // The user restored it.
+            self.forget_maximize();
+        }
         if let Some((want, at)) = self.expected {
             let fresh = now.duration_since(at) < EXPECT_WINDOW;
             if want.same_size(&bounds) {
@@ -440,7 +528,7 @@ mod tests {
         z.step(Step::In, BASE, None, true, now).unwrap();
         z.step(Step::In, Rect::new(100.0, 50.0, 960.0, 720.0), None, true, now).unwrap();
         let c = z.step(Step::Reset, Rect::new(100.0, 50.0, 1152.0, 864.0), None, true, now).unwrap();
-        assert_eq!(c, Change { scale: 1.0, bounds: Some(BASE) });
+        assert_eq!(c, Change { scale: 1.0, bounds: Some(BASE), maximize: None });
         assert_eq!(z.level(), 0);
     }
 
@@ -462,7 +550,7 @@ mod tests {
         let now = Instant::now();
         let maxed = Rect::new(0.0, 0.0, 1920.0, 1080.0);
         let c = z.step(Step::In, maxed, Some(maxed), false, now).unwrap();
-        assert_eq!(c, Change { scale: 1.2, bounds: None });
+        assert_eq!(c, Change { scale: 1.2, bounds: None, maximize: None });
         assert_eq!(z.level(), 1);
         // Un-maximized: the window manager restores 800×600; at level 1 that means a base
         // of 800/1.2 × 600/1.2, so the next step scales from the restored size.
@@ -589,6 +677,111 @@ mod tests {
         for _ in 0..MAX_LEVEL {
             r = z.step(Step::In, r, None, true, now).unwrap().bounds.unwrap();
             assert!(near(r.x, 500.0) && near(r.y, 500.0));
+        }
+        assert!(near(r.w, 800.0 * scale_at(MAX_LEVEL)), "{}", r.w);
+    }
+
+    /// A 1280x800 output, as `step_unplaced` is given it: a size and nothing else.
+    const OUTPUT: Option<(f32, f32)> = Some((1280.0, 800.0));
+
+    /// Two steps in on an 800x600 window: 960x720 fits the output, 1152x864 does not.
+    fn maximized_by_zoom(now: Instant) -> ZoomState {
+        let mut z = ZoomState::default();
+        let c = z.step_unplaced(Step::In, BASE, OUTPUT, false, true, now).unwrap();
+        assert!(rect_near(c.bounds.unwrap(), Rect::new(100.0, 50.0, 960.0, 720.0)), "{:?}", c.bounds);
+        assert_eq!(c.maximize, None);
+        assert_eq!(z.observed(c.bounds.unwrap(), true, now), Observed::Ours);
+        let c = z.step_unplaced(Step::In, c.bounds.unwrap(), OUTPUT, false, true, now).unwrap();
+        assert_eq!((c.bounds, c.maximize), (None, Some(true)), "the window is not resized under a maximize");
+        assert!(near(c.scale, 1.44), "the text still grows: {}", c.scale);
+        assert_eq!(z.level(), 2);
+        z
+    }
+
+    #[test]
+    fn unplaced_a_step_that_would_outgrow_the_screen_maximizes_and_the_next_does_nothing() {
+        let now = Instant::now();
+        let mut z = maximized_by_zoom(now);
+        let full = Rect::new(0.0, 0.0, 1280.0, 756.0);
+        assert_eq!(z.observed(full, false, now), Observed::Ours, "the zoom's own maximize shows no size popup");
+        assert_eq!(z.step_unplaced(Step::In, full, OUTPUT, true, false, now), None);
+        assert_eq!(z.level(), 2, "nor does the text grow");
+    }
+
+    #[test]
+    fn unplaced_zooming_out_of_the_maximize_restores_the_previous_levels_size() {
+        let now = Instant::now();
+        let mut z = maximized_by_zoom(now);
+        let full = Rect::new(0.0, 0.0, 1280.0, 756.0);
+        z.observed(full, false, now);
+        let c = z.step_unplaced(Step::Out, full, OUTPUT, true, false, now).unwrap();
+        assert_eq!(c.maximize, Some(false));
+        assert!(near(c.scale, 1.2));
+        assert!(rect_near(c.bounds.unwrap(), Rect::new(100.0, 50.0, 960.0, 720.0)), "{:?}", c.bounds);
+        assert_eq!(z.observed(Rect::new(0.0, 0.0, 960.0, 720.0), true, now), Observed::Ours, "the restore is the zoom's too");
+        // And on down to 1:1, an ordinary window again.
+        let c = z.step_unplaced(Step::Out, Rect::new(0.0, 0.0, 960.0, 720.0), OUTPUT, false, true, now).unwrap();
+        assert_eq!(c.maximize, None);
+        assert!(rect_near(c.bounds.unwrap(), BASE), "{:?}", c.bounds);
+    }
+
+    #[test]
+    fn unplaced_reset_from_the_maximize_restores_the_base() {
+        let now = Instant::now();
+        let mut z = maximized_by_zoom(now);
+        z.observed(Rect::new(0.0, 0.0, 1280.0, 756.0), false, now);
+        let c = z.step_unplaced(Step::Reset, Rect::new(0.0, 0.0, 1280.0, 756.0), OUTPUT, true, false, now).unwrap();
+        assert_eq!(c, Change { scale: 1.0, bounds: Some(BASE), maximize: Some(false) });
+        assert!(!z.active());
+        // The platform restores the size from before the maximize first: still ours.
+        assert_eq!(z.observed(Rect::new(0.0, 0.0, 960.0, 720.0), true, now), Observed::Ours);
+        assert_eq!(z.observed(Rect::new(0.0, 0.0, 800.0, 600.0), true, now), Observed::Ours);
+    }
+
+    #[test]
+    fn unplaced_the_users_restore_of_the_zooms_maximize_rebases() {
+        let now = Instant::now();
+        let mut z = maximized_by_zoom(now);
+        z.observed(Rect::new(0.0, 0.0, 1280.0, 756.0), false, now);
+        // The user un-maximizes: the window is back at 960x720, showing level 2's text.
+        let restored = Rect::new(0.0, 0.0, 960.0, 720.0);
+        assert_eq!(z.observed(restored, true, now + Duration::from_secs(5)), Observed::Theirs);
+        assert_eq!(z.level(), 2);
+        // So that size is level 2's, and a step out is a step smaller than it.
+        let c = z.step_unplaced(Step::Out, restored, OUTPUT, false, true, now + Duration::from_secs(6)).unwrap();
+        assert_eq!(c.maximize, None);
+        let b = c.bounds.unwrap();
+        assert!(near(b.w, 800.0) && near(b.h, 600.0), "{b:?}");
+    }
+
+    #[test]
+    fn unplaced_a_report_from_before_the_maximize_took_effect_is_not_the_users_restore() {
+        let now = Instant::now();
+        let mut z = maximized_by_zoom(now);
+        assert_eq!(z.observed(Rect::new(0.0, 0.0, 960.0, 720.0), true, now), Observed::Ours);
+        assert_eq!(z.step_unplaced(Step::In, Rect::new(0.0, 0.0, 960.0, 720.0), OUTPUT, false, true, now), None, "still the zoom's maximize");
+    }
+
+    #[test]
+    fn unplaced_the_users_own_maximize_changes_only_the_text() {
+        let now = Instant::now();
+        let mut z = ZoomState::default();
+        let full = Rect::new(0.0, 0.0, 1280.0, 756.0);
+        let c = z.step_unplaced(Step::In, full, OUTPUT, true, false, now).unwrap();
+        assert_eq!(c, Change { scale: 1.2, bounds: None, maximize: None });
+        let c = z.step_unplaced(Step::In, full, OUTPUT, true, false, now).unwrap();
+        assert!(near(c.scale, 1.44), "and keeps growing: it is not the zoom's maximize");
+    }
+
+    #[test]
+    fn unplaced_without_a_screen_size_nothing_maximizes() {
+        let now = Instant::now();
+        let mut z = ZoomState::default();
+        let mut r = BASE;
+        for _ in 0..MAX_LEVEL {
+            let c = z.step_unplaced(Step::In, r, None, false, true, now).unwrap();
+            assert_eq!(c.maximize, None);
+            r = c.bounds.unwrap();
         }
         assert!(near(r.w, 800.0 * scale_at(MAX_LEVEL)), "{}", r.w);
     }

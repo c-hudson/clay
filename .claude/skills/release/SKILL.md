@@ -34,7 +34,7 @@ Platform → assets built and uploaded:
 |------|--------|-----------------------|
 | `--android` | Android APK | `clay-android.apk` |
 | `--mac` | macOS universal (x86_64 + aarch64 via lipo) | `clay-macos-universal` |
-| `--linux` | Linux musl + Linux GUI (native + WebView + audio) | `clay-linux-x86_64-musl`, `clay-linux-x86_64-gui` |
+| `--linux` | Linux musl + Linux GUI (native GUI + audio) | `clay-linux-x86_64-musl`, `clay-linux-x86_64-gui` |
 | `--windows` | Windows x86_64 via Windows VM (192.168.2.14) | `clay-windows-x86_64.exe` |
 
 Examples:
@@ -141,9 +141,10 @@ APK (whose `buildNativeServer` task shells out to cargo).
 Build in this order, each to completion before starting the next:
 
 1. **Linux musl** — see machines.md for exact command
-2. **Linux GUI (native GUI + WebView GUI + audio)** — see machines.md: it goes through
+2. **Linux GUI (native GUI + audio)** — see machines.md: it goes through
    `tests/native_gui/cargo-native.sh` (toolchain 1.98.1, target dir `target/native-gui/`),
-   with `NATIVE_GUI_FEATURES=webview-gui,native-audio,native-gui`. The artifact is
+   with `NATIVE_GUI_FEATURES=native-audio,native-gui`. **No desktop asset has the WebView
+   GUI** (user ruling 2026-11-16: `webview-gui` is built for Termux only). The artifact is
    `target/native-gui/release/clay`, not `target/release/clay`.
 3. **Termux armv7 / aarch64 / aarch64-GUI cross-builds** — see below
 4. **Android APK** — see machines.md for build, align, and sign commands
@@ -283,7 +284,7 @@ VirtualBox VM: finish 6a (including the stop) before starting 6b.
    and assert `git rev-parse HEAD` equals `EXPECTED_SHA`.
 3. Run the Mac VM build command from machines.md (it exports `MACOSX_DEPLOYMENT_TARGET=11.0`,
    builds both `x86_64-apple-darwin` and `aarch64-apple-darwin` with `cargo +1.98.1` and the
-   `webview-gui,native-audio,native-gui` features, and `lipo`s them). Run it detached (see
+   `native-audio,native-gui` features, and `lipo`s them). Run it detached (see
    "Long remote builds" below); it is a long build.
 4. Copy it back:
    `scp -P 2222 -o UserKnownHostsFile=$HOME/VMs/macos/known_hosts adrick@127.0.0.1:clay/clay-macos-universal /tmp/clay-macos-universal`,
@@ -325,7 +326,7 @@ ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no adrick@192.
 **Build (cmd.exe — this VM is NOT bash; see the cmd.exe note in "Syncing a remote"):**
 1. Sync + build in one cmd.exe invocation, then read the printed SHA and confirm it equals `EXPECTED_SHA` before trusting the binary:
    ```cmd
-   cd clay && git checkout -- Cargo.lock && git pull && git rev-parse HEAD && set RUSTFLAGS=-C target-feature=+crt-static && cargo +1.98.1 build --release --features webview-gui,native-audio,native-gui
+   cd clay && git checkout -- Cargo.lock && git pull && git rev-parse HEAD && set RUSTFLAGS=-C target-feature=+crt-static && cargo +1.98.1 build --release --features native-audio,native-gui
    ```
    (`set VAR=val && cargo ...` in the same line is how cmd passes an env var to the build; that part was already correct in machines.md — the sync prefix is the new part.) `+1.98.1` is the
    native GUI's toolchain (installed on the VM). A cold build takes ~21 minutes: run it
@@ -397,6 +398,19 @@ done
 For the binaries that don't run here, `strings <asset> | grep -c alacritty_terminal` must be
 above 0 (shell worlds are in) - except the APK's `libclay.so`, where it must be 0.
 
+**Only the Termux GUI asset has the WebView GUI** (user ruling 2026-11-16). The Linux GUI
+asset must say so itself and need no WebKitGTK; for the rest, a text only a `webview-gui`
+build holds must be absent from the desktop assets and present in Termux's:
+```bash
+f=/tmp/clay-linux-x86_64-gui
+! "$f" --version | grep -q webview-gui && [ "$(ldd "$f" | grep -ci 'webkit\|libgtk')" = 0 ] \
+  && echo "  $(basename "$f"): no WebView GUI, OK" || echo "  $(basename "$f"): HAS THE WEBVIEW GUI"
+for f in /tmp/clay-linux-x86_64-gui /tmp/clay-windows-x86_64.exe /tmp/clay-macos-universal /tmp/clay-termux-aarch64; do
+  [ -e "$f" ] && printf '  %-28s %s\n' "$(basename "$f")" "$(strings "$f" | grep -c 'web-gui attached to')"
+done
+```
+The three desktop counts must be 0 and `clay-termux-aarch64`'s above 0.
+
 **Also verify the Android APK bundles the standalone-mode native server** — `android.sh` already
 asserts this before signing, but if the APK was produced some other way, check it here too:
 ```bash
@@ -410,7 +424,7 @@ For a full release:
 | Source | Local Path | Asset Name |
 |--------|-----------|------------|
 | Linux musl | `target/x86_64-unknown-linux-musl/release/clay` | `clay-linux-x86_64-musl` |
-| Linux GUI (native + WebView) | `/tmp/clay-linux-x86_64-gui` | `clay-linux-x86_64-gui` |
+| Linux GUI (native) | `/tmp/clay-linux-x86_64-gui` | `clay-linux-x86_64-gui` |
 | Windows (if reachable) | `/tmp/clay-windows-x86_64.exe` | `clay-windows-x86_64.exe` |
 | Android | `android/clay-android.apk` | `clay-android.apk` |
 | Mac (Mac VM) | `/tmp/clay-macos-universal` | `clay-macos-universal` |

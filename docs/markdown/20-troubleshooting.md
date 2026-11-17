@@ -278,6 +278,23 @@ Or start fresh - Clay creates defaults on startup.
 2. Start Clay (creates fresh settings)
 3. Manually migrate important settings
 
+### The GUI Window Does Not Open (Linux)
+
+**Symptoms:** `clay` or `clay --gui` ends at once, with one of these on the terminal:
+
+- `error while loading shared libraries: libwebkit2gtk-4.1.so.0`: the `-gui` downloads
+  up to v1.7.36 held both GUIs, and the WebView one needs WebKitGTK, which a KDE desktop
+  does not install by default. Later downloads hold the native GUI only and need no
+  WebKitGTK, so download the current one. To keep the old file, install the library
+  (`sudo apt install libwebkit2gtk-4.1-0` on Kubuntu and KDE neon). A build of your own
+  with the `webview-gui` feature needs it the same way.
+- `Clay could not open its window (...)`: the graphics driver refused the window. Clay
+  already switches to software drawing by itself when the machine's own OpenGL can't be
+  used (a virtual machine's graphics card, an old one); `debug.log` has a line saying so
+  and why. To force software drawing, start it as `LIBGL_ALWAYS_SOFTWARE=1 clay`.
+
+`clay --console` runs Clay in the terminal whatever the graphics.
+
 ### Clay Closed Unexpectedly
 
 Every Clay - the console, a GUI, `-D`, `clay_multi` - writes how it ended to

@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Build script for Clay MUD Client
-# Automatically detects available features and falls back gracefully
+# Automatically detects available features and falls back gracefully.
+# The GUI it builds is the native one; the WebView GUI is built on Termux only.
 #
 # Usage: ./build.sh [--only clay|multi|web] [--no-shell-worlds]
 #
@@ -232,9 +233,12 @@ else
 fi
 
 # --- WebView GUI ---
-# The native GUI is Clay's GUI. The WebView GUI is built only where the native one
-# can't be - Termux/Android, a machine without GPUI's libraries or a new enough
-# Rust, or a native build that fails below - so a desktop build carries one GUI.
+# The native GUI is Clay's GUI. The WebView GUI is Termux's, where the native one can't
+# be built, and this script builds it nowhere else (user ruling 2026-11-16): a desktop
+# that can't build the native GUI gets a build without a GUI, never the WebView one in
+# its place. It stays a compile-time option of Clay's for whoever asks cargo for it
+# (`cargo build --release --features webview-gui`); check_webview's desktop arms say what
+# that needs, and only its Termux arm is reached from here.
 check_webview() {
     case "$OS" in
         linux)
@@ -314,10 +318,13 @@ add_webview_if_available() {
     fi
 }
 
-if $HAS_NATIVE_GUI; then
-    echo "  [-] webview-gui (not built: the native GUI is)"
-else
+if $IS_TERMUX; then
     add_webview_if_available
+else
+    echo "  [-] webview-gui (built only on Termux)"
+    if ! $HAS_NATIVE_GUI && ! $IS_ANDROID; then
+        echo "      This build will have no GUI: fix what the native GUI is missing, above."
+    fi
 fi
 
 # --- Native audio ---
@@ -482,13 +489,13 @@ if build_with_fallback "$FEATURES" "$BUILD_TARGET" "$EXTRA_RUSTFLAGS" "full feat
     BUILD_OK=true
 fi
 
-# Fallback: try without the native GUI; the WebView GUI stands in for it where it can
+# Fallback: try without the native GUI. What comes out has no GUI: the WebView GUI is not
+# built in its place (it is Termux's, see above).
 if ! $BUILD_OK && $HAS_NATIVE_GUI; then
     echo ""
-    echo "Full build failed. Retrying without native-gui..."
+    echo "Full build failed. Retrying without native-gui (the result has no GUI)..."
     FEATURES=$(echo "$FEATURES" | sed 's/,native-gui//')
     HAS_NATIVE_GUI=false
-    add_webview_if_available
     if build_with_fallback "$FEATURES" "$BUILD_TARGET" "$EXTRA_RUSTFLAGS" "without native-gui ($FEATURES)"; then
         BUILD_OK=true
     fi

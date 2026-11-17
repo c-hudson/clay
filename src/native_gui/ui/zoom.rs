@@ -9,8 +9,10 @@
 //! GPUI resizes a window (`Window::resize`, the content size) but has no call to move one,
 //! so a window grown to its screen's size is put at the screen's origin by asking the
 //! platform directly, as `opacity.rs` and `appmenu.rs` do: X11 `ConfigureWindow`, Win32
-//! `SetWindowPos`, AppKit `setFrameTopLeftPoint:`; Wayland has no client-side move, so a
-//! clamped window may overhang there until the user moves it.
+//! `SetWindowPos`, AppKit `setFrameTopLeftPoint:`. Wayland has no client-side move, and
+//! tells a program neither where its window is nor how big the frame or a panel is, so
+//! there a window that would outgrow the output is maximized instead
+//! (`ZoomState::step_unplaced`; user request 2026-11-16, for KDE).
 //!
 //! Everything is in **content** coordinates: a window is where GPUI reports its content
 //! (X11 and Windows report the content's place; AppKit the frame's, so `window_rect`
@@ -31,7 +33,7 @@ use std::time::Instant;
 use gpui::{px, size, Context, Window};
 
 use super::ClayView;
-use crate::zoom::{Frame, Rect, Step};
+use crate::zoom::{Frame, Observed, Rect, Step};
 
 impl ClayView {
     /// The size this window's text is drawn at: the saved font size times the zoom.
@@ -48,13 +50,34 @@ impl ClayView {
         let resizable = resizable(window);
         let frame = frame_of(window);
         let screen = work_area(window, cx).map(|area| frame.inset(area));
-        let change = self.zoom.step(step, current, screen, resizable, Instant::now());
+        let change = if unplaced(window) {
+            self.zoom.step_unplaced(step, current, screen.map(|s| (s.w, s.h)), window.is_maximized(), resizable, Instant::now())
+        } else {
+            self.zoom.step(step, current, screen, resizable, Instant::now())
+        };
         crate::debug_log(true, &format!("ZOOM {action}: window {current:?} frame {frame:?} screen {screen:?} resizable={resizable} -> level {} {change:?}", self.zoom.level()));
         let Some(change) = change else { return };
-        if let Some(b) = change.bounds {
-            window.resize(size(px(b.w), px(b.h)));
-            let (x, y) = frame.outer(b.x, b.y);
-            move_window(window, x, y);
+        self.zoom_restore_to = None;
+        match change.maximize {
+            // GPUI's `zoom_window` toggles, so each way only from the other state.
+            Some(true) => {
+                if !window.is_maximized() {
+                    window.zoom_window();
+                }
+            }
+            Some(false) if window.is_maximized() => {
+                // The size is taken once the window is seen restored (below): the
+                // platform first gives it the size it had before the maximize.
+                self.zoom_restore_to = change.bounds;
+                window.zoom_window();
+            }
+            _ => {
+                if let Some(b) = change.bounds {
+                    window.resize(size(px(b.w), px(b.h)));
+                    let (x, y) = frame.outer(b.x, b.y);
+                    move_window(window, x, y);
+                }
+            }
         }
         // The text changes size under the view: stay at the bottom if that is where it
         // was, as the font slider does (chrome.rs `set_font_size`).
@@ -66,11 +89,39 @@ impl ClayView {
     }
 
     /// The platform reported this window's bounds (a resize or a move, ours or the
-    /// user's): the zoom learns which, so a dragged size is what later steps scale.
-    pub(super) fn zoom_observe_bounds(&mut self, window: &Window) {
+    /// user's): the zoom learns which, so a dragged size is what later steps scale. The
+    /// answer is for the size popup (sizepopup.rs), which shows nothing for our own.
+    pub(super) fn zoom_observe_bounds(&mut self, window: &mut Window) -> Observed {
         let rect = window_rect(window);
+        // Restored from the zoom's own maximize: now the size the step wanted. GPUI comes
+        // back to the size the compositor last gave it, which a zoom's own resize never
+        // was, so that is usually the 1:1 size. Asked after this frame: this observer
+        // runs in the middle of GPUI's handling of the restore, which then sets the
+        // window's geometry itself - a resize from in here left the frame at the old
+        // size around the new content.
+        if !window.is_maximized() {
+            if let Some(b) = self.zoom_restore_to.take() {
+                if (b.w - rect.w).abs() > crate::zoom::SIZE_TOLERANCE || (b.h - rect.h).abs() > crate::zoom::SIZE_TOLERANCE {
+                    window.on_next_frame(move |window, _| window.resize(size(px(b.w), px(b.h))));
+                }
+            }
+        }
         let whose = self.zoom.observed(rect, resizable(window), Instant::now());
         crate::debug_log(crate::is_debug_enabled(), &format!("ZOOM-BOUNDS {rect:?} -> {whose:?} at level {}", self.zoom.level()));
+        whose
+    }
+}
+
+/// A window the platform won't place or locate: a Wayland one.
+fn unplaced(window: &Window) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        super::wl::is_wayland(window)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        false
     }
 }
 

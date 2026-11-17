@@ -14193,8 +14193,8 @@ third
                     "Every other interface is already paused.".to_string()
                 } else {
                     assert!(ph_told, "B={handler_b}: the phone shows its PAUSED badge");
-                    let console = if handler_b { "" } else { "the console, " };
-                    format!("Paused {console}client 9 (Web, 192.168.1.20) — activity now visible")
+                    let console = if handler_b { "" } else { "the console and " };
+                    format!("Paused on: {console}client 9 (Web, 192.168.1.20).")
                 };
                 assert!(said.iter().any(|l| l.starts_with(&reply)), "B={handler_b} round {round}: {said:?}");
             }
@@ -14216,9 +14216,25 @@ third
         let _a = tts_test_client(&server, 3);
         let _b = tts_test_client(&server, 4);
         app.ws_server = Some(server);
-        let msg = app.pause_other_interfaces(None);
-        assert!(msg.starts_with("Paused client 3 (Web, 192.168.1.20), client 4 (Web, 192.168.1.20) —"), "{msg}");
+        assert_eq!(app.pause_other_interfaces(None), "Paused on: client 3 (Web, 192.168.1.20) and client 4 (Web, 192.168.1.20).");
         assert!(!app.console_paused, "the console typed it");
+
+        // Three or more are a list with "and" before the last (the user's wording
+        // 2026-11-16: "Paused on: x, x, and x."); a client asked, so the console is one.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+        app.console_tui = true;
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let _clients: Vec<_> = [3, 4, 5].into_iter().map(|id| tts_test_client(&server, id)).collect();
+        app.ws_server = Some(server);
+        for (id, owner) in [(3, "asker"), (4, "phone"), (5, "browser")] {
+            app.set_display_owner_id(id, owner);
+        }
+        assert_eq!(
+            app.pause_other_interfaces(Some(3)),
+            "Paused on: the console, client 4 (Web, 192.168.1.20), and client 5 (Web, 192.168.1.20)."
+        );
     }
 
     /// `ResumeSession` (user report 2026-11-04: a GUI kept its PAUSED badge though it was
@@ -24141,6 +24157,62 @@ fn the_web_page_announces_shown_lines_once_in_screen_reader_mode() {
     assert!(!js[js.find("function renderOutput(").unwrap()..].split("\n    function ").next().unwrap().contains("announceLine"), "never from a redraw");
     assert!(js.contains("screen_reader_profile: (screenReaderProfiles && fontProfileKey in screenReaderProfiles)"));
     assert!(js.contains("if (screenReader) return 0;"), "no Text Reveal in Screen Reader mode");
+}
+
+/// The size popup (src/sizepopup.rs): the web page shows the output's size in characters
+/// while its window is resized, by the rules the native GUI's follows - the same label,
+/// the same second past the last change, the same quiet first second - asked from the
+/// window's resize event alone (the layout observer fires for every appended line), never
+/// read out and never in the mouse's way.
+#[test]
+fn the_web_page_shows_its_size_while_the_window_is_resized() {
+    let html = include_str!("web/index.html");
+    assert!(html.contains(r#"<div id="size-popup" aria-hidden="true"></div>"#));
+    let css = include_str!("web/style.css");
+    let rule = css[css.find("\n#size-popup {").expect("the popup's rule")..].split('}').next().unwrap();
+    assert!(rule.contains("display: none;"), "hidden until a resize");
+    assert!(rule.contains("pointer-events: none;"), "a press goes to what is under it");
+
+    let js = include_str!("web/app.js");
+    assert!(js.contains(&format!("const SIZE_POPUP_LINGER_MS = {};", crate::sizepopup::LINGER.as_millis())));
+    // The native view counts its quiet period in ticks of its 250 ms clock.
+    let quiet_ms = u32::from(crate::sizepopup::START_QUIET_TICKS) * 250;
+    assert!(js.contains(&format!("const SIZE_POPUP_QUIET_MS = {quiet_ms};")));
+    assert_eq!(crate::sizepopup::label(80, 24), "80x24");
+    let label = js[js.find("function sizePopupLabel(cols, rows) {").unwrap()..].split("\n    }").next().unwrap();
+    assert!(label.contains("return cols + 'x' + rows;"));
+
+    // Split, the rows are the whole output's, as if it were one pane (user request
+    // 2026-11-15): from the top pane's top to the bottom pane's bottom, never the
+    // focused pane's own.
+    assert!(js.contains("el.textContent = sizePopupLabel(getVisibleColumnCount(), sizePopupRows());"));
+    let rows = js[js.find("function sizePopupRows() {").unwrap()..].split("\n    }").next().unwrap();
+    assert!(rows.contains("if (!splitPane) return viewMetricsFor(main).lines;"));
+    assert!(rows.contains("bottom.offsetTop + bottom.offsetHeight - top.offsetTop"));
+
+    // One caller, the window's own resize: the layout observer only refreshes a popup
+    // that is already up.
+    assert_eq!(js.matches("noteWindowResize();").count(), 1);
+    let on_resize = js[js.find("window.addEventListener('resize', function() {\n            // A move to a screen").unwrap()..].split("\n        });").next().unwrap();
+    assert!(on_resize.contains("noteWindowResize();"));
+    assert!(js.contains("if (sizePopupShown) refreshSizePopup();"));
+
+    // `ResizeWatch::observe`, in its order: the size is recorded whatever it was; a
+    // change of scale, an unchanged size and the first second show nothing; then the
+    // page's own two - a window with no output, and a touch device's keyboard.
+    let note = js[js.find("function noteWindowResize(").unwrap()..].split("\n    function ").next().unwrap();
+    let mut from = 0;
+    for step in [
+        "sizePopupSeen = now;",
+        "if (!was || was.scale !== now.scale) return;",
+        "if (was.w === now.w && was.h === now.h) return;",
+        "if (performance.now() - sizePopupBorn < SIZE_POPUP_QUIET_MS) return;",
+        "if (document.hidden || popupWindowMode || noteMode) return;",
+        "if (was.w === now.w && softKeyboardLikely()) return;",
+        "showSizePopup();",
+    ] {
+        from += note[from..].find(step).unwrap_or_else(|| panic!("noteWindowResize is missing, or has out of order: {step}"));
+    }
 }
 
 /// The web page draws TF's status line in the Separator Style's look as the console does:

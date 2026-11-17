@@ -3248,6 +3248,7 @@
         a11yUpgrade(document);
         setupMapPane();
         watchDialogs();
+        sizePopupBaseline();
         document.addEventListener('keydown', a11yKeys, true);
         // A paused session resumes when the page is used (capture phase: before anything
         // can stop the event).
@@ -3438,6 +3439,94 @@
                 lastSentViewState = newState;
             }
         }
+    }
+
+    // The size popup (src/sizepopup.rs holds the rules and their tests; the native GUI's
+    // is ui/sizepopup.rs): while the window is resized, a small box in its middle says
+    // how many characters the output holds - the pair sendViewStateIfChanged reports,
+    // and with /split the output as if it weren't split (sizePopupRows). Nothing says
+    // when a drag ends, so it stays SIZE_POPUP_LINGER_MS past the last change. Both
+    // numbers are pinned to the Rust constants by a test.
+    const SIZE_POPUP_LINGER_MS = 1000;
+    // A page's first second: a WebView window is sized more than once as it opens.
+    const SIZE_POPUP_QUIET_MS = 1000;
+    let sizePopupSeen = null;      // the window as last recorded: { w, h, scale }
+    let sizePopupBorn = 0;
+    let sizePopupTimer = null;
+    let sizePopupShown = false;
+    function sizePopupLabel(cols, rows) {
+        return cols + 'x' + rows;
+    }
+    function sizePopupWindow() {
+        return { w: window.innerWidth, h: window.innerHeight, scale: window.devicePixelRatio || 1 };
+    }
+    // The window as the page opened: what its later sizes are compared with (init).
+    function sizePopupBaseline() {
+        sizePopupSeen = sizePopupWindow();
+        sizePopupBorn = performance.now();
+    }
+    // A touch-first device's on-screen keyboard shrinks the page exactly as a resize
+    // does, so there a change of height alone is taken for the keyboard (a rotation or
+    // a split screen changes the width). With a keyboard and a mouse attached the
+    // Android app is a desktop window.
+    function softKeyboardLikely() {
+        if (desktopInputAttached()) return false;
+        return !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+    }
+    // The rows the popup shows: the output's as one pane. Split (/split), that is what
+    // #output-container would hold with the other pane and the bar between them gone
+    // (user request 2026-11-15; native output::whole_probe) - from the top pane's top to
+    // the bottom pane's bottom, less this container's own border and padding, in
+    // getVisibleLineCount's rows - never the focused pane's own. Kept with the view's
+    // other measures, so a resize measures it afresh.
+    function sizePopupRows() {
+        const main = elements.outputContainer;
+        if (!splitPane) return viewMetricsFor(main).lines;
+        const now = performance.now();
+        let m = viewMetrics.get('whole');
+        if (!m || now - m.at > 500) {
+            const top = splitPane.onTop ? splitPane.container : main;
+            const bottom = splitPane.onTop ? main : splitPane.container;
+            const cs = getComputedStyle(main);
+            const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+            const span = bottom.offsetTop + bottom.offsetHeight - top.offsetTop - (main.offsetHeight - main.clientHeight);
+            m = { at: now, lines: Math.max(1, Math.floor((span - pad) / lineHeightPx())) };
+            viewMetrics.set('whole', m);
+        }
+        return m.lines;
+    }
+    function refreshSizePopup() {
+        const el = document.getElementById('size-popup');
+        if (el) el.textContent = sizePopupLabel(getVisibleColumnCount(), sizePopupRows());
+    }
+    function showSizePopup() {
+        const el = document.getElementById('size-popup');
+        if (!el) return;
+        // Measured now: the cached rows and columns are the old window's.
+        invalidateViewMetrics();
+        refreshSizePopup();
+        el.classList.add('visible');
+        sizePopupShown = true;
+        clearTimeout(sizePopupTimer);
+        sizePopupTimer = setTimeout(function() {
+            sizePopupShown = false;
+            el.classList.remove('visible');
+        }, SIZE_POPUP_LINGER_MS);
+    }
+    // The window's resize event (ResizeWatch::observe in src/sizepopup.rs): the popup
+    // shows for a change of size - not of scale (the browser's own zoom, another
+    // monitor), not while the page is starting, not in a window with no output, and
+    // not for the on-screen keyboard. Whatever it was, it is the size on record now.
+    function noteWindowResize() {
+        const was = sizePopupSeen;
+        const now = sizePopupWindow();
+        sizePopupSeen = now;
+        if (!was || was.scale !== now.scale) return;
+        if (was.w === now.w && was.h === now.h) return;
+        if (performance.now() - sizePopupBorn < SIZE_POPUP_QUIET_MS) return;
+        if (document.hidden || popupWindowMode || noteMode) return;
+        if (was.w === now.w && softKeyboardLikely()) return;
+        showSizePopup();
     }
 
     // Check if scrolled to bottom
@@ -20617,6 +20706,9 @@
         if (window.ResizeObserver) {
             const repinObserver = new ResizeObserver(function() {
                 invalidateViewMetrics();
+                // The size popup follows the layout while it is up (only then: this
+                // fires for every line appended).
+                if (sizePopupShown) refreshSizePopup();
                 // TF's %textdiv "clear" blank stays as tall as the output area. Set only on
                 // a change, so this can't feed back into itself. (Only in that mode: this
                 // fires on every frame the output grows, and the query walked every line.)
@@ -20752,6 +20844,8 @@
             updateStatusBar();
             // Update view state for synchronized more-mode (visible lines may have changed)
             sendViewStateIfChanged();
+            // Last, once the layout above has settled: the size, in characters.
+            noteWindowResize();
         });
 
         // Handle mobile keyboard visibility

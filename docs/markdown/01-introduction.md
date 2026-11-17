@@ -35,7 +35,7 @@ Clay is a modern terminal-based MUD (Multi-User Dungeon) client that combines th
 ### Remote Access
 - WebSocket server for remote clients
 - Browser-based web interface
-- Native WebView GUI client (wry/tao, same interface as the web client)
+- Native GUI client (`--gui`), and on Termux a WebView GUI (the web interface in a window)
 - Remote console client
 - SSH-tunneled console/GUI (`--ssh`)
 - Headless daemon (`-D`) and multiuser server (`--multiuser`) modes

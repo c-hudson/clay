@@ -76,6 +76,7 @@ pub mod webview_gui;
 #[cfg(any(feature = "webview-gui", feature = "native-gui"))]
 pub mod desktop;
 pub mod zoom;
+pub mod sizepopup;
 pub mod selfupdate;
 #[cfg(feature = "native-gui")]
 pub mod native_gui;
@@ -14201,7 +14202,9 @@ impl App {
     /// `/pause`: `/remote --pause` on every interface but the one that typed it (`asker`,
     /// `None` = the console). The asker's other connections - a browser's other tabs, a
     /// GUI's other windows (`same_interface`) - are the same interface and are left alone.
-    /// Each paused one resumes as soon as it is used. The reply, for whoever asked.
+    /// Each paused one resumes as soon as it is used. The reply, for whoever asked, names
+    /// them (`Paused on: the console, client 3 (Web, 10.0.0.2), and client 4 (...).`, the
+    /// user's wording 2026-11-16; a client's number is what `/remote --pause <id>` takes).
     pub(crate) fn pause_other_interfaces(&mut self, asker: Option<u64>) -> String {
         let mut paused = Vec::new();
         let mut already = 0;
@@ -14238,7 +14241,7 @@ impl App {
                 .to_string();
         }
         self.broadcast_activity();
-        format!("Paused {} — activity now visible on other sessions. Each resumes when it is used.", paused.join(", "))
+        format!("Paused on: {}.", crate::util::and_list(&paused))
     }
 
     /// Toggle the paused state for a WebSocket client.
@@ -23782,8 +23785,12 @@ async fn main() -> io::Result<()> {
         println!("    --console=host[:port][/path] Connect to a Clay server via console (default port: 9000, web path clay)");
         println!("    --gui                Run Clay with the GUI (the native one; a build without it opens the WebView one)");
         println!("    --gui=host[:port]    Attach the GUI to a Clay server (default port: 9000)");
-        println!("    --web-gui            Run Clay with the WebView GUI (the web interface in a window)");
-        println!("    --web-gui=host[:port][/path] Connect to a Clay server via the WebView GUI (web path clay)");
+        if cfg!(feature = "webview-gui") {
+            println!("    --web-gui            Run Clay with the WebView GUI (the web interface in a window)");
+            println!("    --web-gui=host[:port][/path] Connect to a Clay server via the WebView GUI (web path clay)");
+        } else {
+            println!("    --web-gui[=host]     The same as --gui here: the WebView GUI is built on Termux only");
+        }
         println!("    --ssh                Tunnel --console=/--gui=/--web-gui= through SSH instead of connecting");
         println!("                         directly. Target grammar becomes:");
         println!("                           [user@]host[:clayport[:sshport]]");
@@ -23907,13 +23914,31 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    // The WebView GUI is Termux's (user ruling 2026-11-16): no desktop build carries it
+    // unless it was asked of cargo. A build with the native GUI and without it opens the
+    // native one for `--web-gui` too, so a command line from before that still gets its
+    // window - a launcher's, and above all the restart of a Clay that was in the WebView
+    // GUI when it updated, which would otherwise end with every connection it holds. The
+    // mirror of `--gui` in a build without the native GUI, below.
+    if cfg!(all(feature = "native-gui", not(feature = "webview-gui")))
+        && platform::web_gui_to_native(&mut gui_arg, &mut web_gui_arg)
+    {
+        // Never `eprintln!`: a GUI's successor may have no stderr at all.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "clay: {}", platform::WEB_GUI_NOT_BUILT);
+        debug_log(true, &format!("STARTUP: {}", platform::WEB_GUI_NOT_BUILT));
+        if is_reload_arg || is_crash_arg {
+            platform::note_restart_without_web_gui();
+        }
+    }
+
     // `--gui` is the native GUI (src/native_gui) when it is built in: alone it runs Clay
     // in this process, with a host it attaches to that Clay. It is also what a start that
     // names no interface opens wherever a window can be shown (platform::gui_can_open:
     // not over SSH, and on Linux a display server listening), the console otherwise. A
     // build without the native GUI opens the WebView one for `--gui` instead (Termux, a
-    // plain `--features webview-gui` build), so the default and old command lines keep
-    // working; `--web-gui` always means the WebView one.
+    // `--features webview-gui` build), so the default and old command lines keep working;
+    // `--web-gui` means the WebView one wherever it is built in.
     if gui_arg.is_some() && (console_arg.is_some() || web_gui_arg.is_some()) {
         eprintln!("Error: --gui cannot be combined with --console or --web-gui.");
         std::process::exit(1);
@@ -24268,8 +24293,8 @@ async fn main() -> io::Result<()> {
     if has_gui_flag && !use_gui {
         #[cfg(not(feature = "webview-gui"))]
         {
-            eprintln!("clay: this build has no GUI: --gui needs the 'native-gui' feature, --web-gui the 'webview-gui' feature.");
-            eprintln!("clay: rebuild with: cargo build --features native-gui  (or webview-gui)");
+            eprintln!("clay: this build has no GUI: it needs the 'native-gui' feature (on Termux, 'webview-gui').");
+            eprintln!("clay: ./build.sh builds Clay with the GUI this machine can have.");
             std::process::exit(1);
         }
     }

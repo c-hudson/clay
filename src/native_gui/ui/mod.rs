@@ -23,6 +23,7 @@ mod more;
 pub mod output;
 mod picture;
 mod select;
+mod sizepopup;
 mod split;
 mod surfaces;
 mod textdiv;
@@ -31,6 +32,8 @@ mod titlebar;
 mod taskbar;
 mod viewmode;
 mod windows;
+#[cfg(target_os = "linux")]
+mod wl;
 mod zoom;
 #[cfg(feature = "native-gui-snapshot")]
 pub mod snapshot;
@@ -138,6 +141,11 @@ pub struct ClayView {
     /// This window's zoom (Ctrl+plus/minus/0, ui/zoom.rs): the text is drawn at
     /// `font_size` times its scale (`text_size()`); in memory, this window's alone.
     zoom: crate::zoom::ZoomState,
+    /// The size a zoom step wants once the window is back from the maximize the zoom made
+    /// (Wayland, `ZoomState::step_unplaced`): taken when the window is seen restored.
+    zoom_restore_to: Option<crate::zoom::Rect>,
+    /// The size shown in the middle of this window while it is resized (sizepopup.rs).
+    size_popup: sizepopup::SizePopup,
     wrapspace: usize,
     wrap_columns: usize,
     letter_spacing: f32,
@@ -268,8 +276,9 @@ impl ClayView {
         })
         .detach();
         // The window's bounds changed (ours, or the user's resize or move): the zoom
-        // (ui/zoom.rs) learns which, so a dragged size is what later steps scale.
-        cx.observe_window_bounds(window, |this, window, _cx| this.zoom_observe_bounds(window)).detach();
+        // (ui/zoom.rs) learns which, so a dragged size is what later steps scale, and a
+        // resize that isn't the zoom's shows the size in characters (ui/sizepopup.rs).
+        cx.observe_window_bounds(window, |this, window, cx| this.bounds_observed(window, cx)).detach();
         // The system's light/dark changed: GPUI has just put the title bar back to the
         // system's choice, so draw again to put the theme's back (titlebar.rs).
         cx.observe_window_appearance(window, |_, _window, cx| cx.notify()).detach();
@@ -290,6 +299,8 @@ impl ClayView {
             show_tags: false,
             font_size: DEFAULT_FONT_SIZE,
             zoom: crate::zoom::ZoomState::default(),
+            zoom_restore_to: None,
+            size_popup: sizepopup::SizePopup::new(window),
             wrapspace: 0,
             wrap_columns: 0,
             letter_spacing: 0.0,
@@ -884,6 +895,7 @@ impl ClayView {
         }
         self.drag_scroll(cx);
         self.blink(cx);
+        self.size_popup.tick();
         self.save_cache();
         let clock = chrome::clock_text(self.session.core.settings.as_ref().map_or("", |s| s.clock_format.as_str()));
         if clock != self.chrome.clock {
@@ -1186,9 +1198,12 @@ impl ClayView {
             None => pane(top, self.split_size.top_h.clone()).flex_grow(1.0).flex_basis(px(0.0)),
         };
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
+            // The two panes and the bar as the one pane they would be, for the size popup.
+            .child(output::whole_probe(self.size_popup.whole.clone(), self.text_size(), self.fonts.clone()))
             .child(top)
             .child(bar)
             .child(pane(bottom, self.split_size.bottom_h.clone()).flex_grow(1.0).flex_basis(px(0.0)))
@@ -1199,7 +1214,8 @@ impl ClayView {
     /// `other`: the pane without the focus, whose mouse is its own (split.rs).
     fn pane_body(&mut self, other: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.session.core.current_world().is_some_and(|w| w.showing_splash) {
-            return self.splash().into_any_element();
+            // Nothing lays the output out here, so the pane is measured for it.
+            return self.splash().child(output::view_probe(self.scroll.clone(), self.text_size(), self.fonts.clone())).into_any_element();
         }
         // A shell world draws its grid with no wrapping and the real cursor; an
         // ordinary world draws its (wrapped, selectable) lines.
@@ -1630,6 +1646,7 @@ impl Render for ClayView {
             .children(input_menu)
             .children(debug_dialog)
             .children(self.surf.stack.render())
+            .children(self.size_popup_layer())
     }
 }
 
@@ -1680,8 +1697,16 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         // The launcher entry docks attach the activity badge to (Linux).
         crate::desktop::ensure_desktop_file();
         let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true, leader: None, origin: None };
-        let Some((main, main_window)) = open_view_window(cx, fonts, session, Some(events), viewmode::ViewMode::default(), how) else {
-            panic!("open the main window");
+        let (main, main_window) = match open_view_window(cx, fonts, session, Some(events), viewmode::ViewMode::default(), how) {
+            Ok(opened) => opened,
+            // Said, not a panic: nothing in Clay is broken, this machine's graphics
+            // refused the window (what `native_gui::gpu_plan` could not work around).
+            Err(e) => {
+                if crate::native_gui::runs_clay() {
+                    crate::quit_in_process_clay();
+                }
+                crate::native_gui::fail(format!("Clay could not open its window ({e}). `clay --console` runs Clay in the terminal instead."));
+            }
         };
         // Running Clay itself: what /quit does before the process ends (the archive
         // flushed, the TLS proxies ended, the router's port back), as the WebView GUI does.
@@ -1741,7 +1766,7 @@ pub(super) fn open_view_window(
     events: Option<mpsc::UnboundedReceiver<NetInput>>,
     mode: viewmode::ViewMode,
     how: ViewWindow,
-) -> Option<(gpui::WeakEntity<ClayView>, gpui::AnyWindowHandle)> {
+) -> Result<(gpui::WeakEntity<ClayView>, gpui::AnyWindowHandle), String> {
     let ViewWindow { title, size: (w, h), is_main, leader, origin } = how;
     // A follower's connection is already up (its leader's): only a window with its own starts one.
     let starts = events.is_some();
@@ -1783,8 +1808,8 @@ pub(super) fn open_view_window(
                 cx.new(|cx| gpui_component::Root::new(v, window, cx))
             },
         )
-        .ok()?;
-    let main = view?;
+        .map_err(|e| format!("{e:#}"))?;
+    let main = view.ok_or("its view was never built")?;
     main.update(cx, |v, _| v.link.own_window = Some(window.into()));
     let weak = main.downgrade();
     // The connection's reports (a follower's come from its leader).
@@ -1831,5 +1856,5 @@ pub(super) fn open_view_window(
             v.after(fx, cx);
         });
     }
-    Some((weak, window.into()))
+    Ok((weak, window.into()))
 }

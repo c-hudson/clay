@@ -2388,6 +2388,14 @@ feature = "New Indicator's background styles: a glow behind the first 4 cells of
 note = "decor flags StyledLine::new_glow, ui/output.rs paints four cells per row"
 
 [[item]]
+id = "ui:output.resize-popup"
+section = "output"
+phase = 2
+status = "done"
+feature = "While the window is resized, a small box in its middle shows the output's size in characters (80x24: the output's columns x rows, the pair UpdateViewState reports; split, the output as if it weren't) until a second after the last change; nothing for a move, the start-up, a change of scale or the program's own resize (src/sizepopup.rs; app.js noteWindowResize / #size-popup)"
+note = "ui/sizepopup.rs: ClayView::bounds_observed feeds sizepopup::ResizeWatch from the bounds observer the zoom shares (its own resize is Observed::Ours); a deferred layer with no hitbox; output::view_probe measures a pane showing the splash, output::whole_probe a split's two panes as one"
+
+[[item]]
 id = "ui:output.prefix-archive"
 section = "output"
 phase = 2
@@ -3040,7 +3048,7 @@ id = "ui:settings.transparency"
 section = "dialogs"
 phase = 5
 status = "done"
-feature = "the Transparency slider: every window (text and all) at that opacity on X11 (_NET_WM_WINDOW_OPACITY, what GTK set_opacity sets there), its preview live; kept but not applied on Wayland, Windows and macOS, as in the WebView GUI"
+feature = "the Transparency slider: every window (text and all) at that opacity on X11 (_NET_WM_WINDOW_OPACITY, what GTK set_opacity sets there) and on Wayland where the compositor has wp_alpha_modifier_v1 (KWin; ui/wl.rs), its preview live; kept but not applied on Windows, macOS and any other Wayland compositor, as in the WebView GUI"
 note = "app.js applyTransparency"
 
 [[item]]
@@ -3057,7 +3065,7 @@ section = "status"
 phase = 5
 status = "done"
 feature = "the hamburger's items outside the window: a Linux panel's app menu, the macOS menu bar and Dock menu, the Windows window menu (title-bar right-click)"
-note = "ui/appmenu.rs; the WebView GUI has none (user ruling 2026-10-31)"
+note = "ui/appmenu.rs; the WebView GUI has none (user ruling 2026-10-31). Linux: GTK's menu model named by X11 window properties, and under KWin on Wayland a com.canonical.dbusmenu object named through org_kde_kwin_appmenu (ui/wl.rs, 2026-11-16)"
 
 [[item]]
 id = "ui:desktop.taskbar_alert"
@@ -3065,7 +3073,7 @@ section = "status"
 phase = 5
 status = "done"
 feature = "Taskbar Alert: text from the MUD with no Clay window focused flashes the taskbar button / bounces the Dock icon, once until focus returns"
-note = "ui/taskbar.rs, desktop.rs alert_once; app.js noteTaskbarAlert through the WebView GUI's host"
+note = "ui/taskbar.rs, desktop.rs alert_once; app.js noteTaskbarAlert through the WebView GUI's host. On Wayland the native GUI asks the compositor itself (ui/wl.rs: an xdg_activation_v1 token without a serial, which flags the window and never focuses it)"
 
 [[item]]
 id = "ui:desktop.badge"
@@ -3489,7 +3497,7 @@ section = "windows"
 phase = 0
 status = "done"
 feature = "action zoom_in"
-note = "ui/zoom.rs: Ctrl+plus zooms this window's text and size together (src/zoom.rs), per window, in memory. app.js returns false by ruling 2026-11-10: a browser keeps its own zoom, the WebView GUI none"
+note = "ui/zoom.rs: Ctrl+plus zooms this window's text and size together (src/zoom.rs), per window, in memory; on Wayland a step that would outgrow the output maximizes instead (ZoomState::step_unplaced). app.js returns false by ruling 2026-11-10: a browser keeps its own zoom, the WebView GUI none"
 
 [[item]]
 id = "action:zoom_out"

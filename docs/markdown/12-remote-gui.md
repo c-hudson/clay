@@ -6,6 +6,10 @@ the exact same HTML/CSS/JS interface the browser-based **Web Interface** chapter
 Building the `webview-gui` feature gives you a `--web-gui` flag that opens this window instead
 of (or alongside) the terminal UI.
 
+It is the GUI of the Termux build, where the native GUI can't be built. The Linux, Windows
+and macOS downloads carry the native GUI only, so what this chapter says about the WebView
+window applies there only to a build of your own (see **Building**).
+
 ## Two GUIs
 
 Clay has two graphical clients, and the flags tell them apart:
@@ -17,7 +21,10 @@ Clay has two graphical clients, and the flags tell them apart:
   Clay starts with no flag at all, wherever a window can be shown (see below). A build without it (the Termux GUI binary, or a
   `--features webview-gui` build of your own) opens the WebView GUI for `--gui` instead.
 - **`--web-gui`** is the WebView GUI this chapter describes: the web interface in a window. It
-  stays available as the fallback, and for anything the native GUI does not do yet.
+  is in the Termux GUI binary (`clay-termux-aarch64`) and in a build you make with the
+  `webview-gui` feature. A build with only the native GUI opens that for `--web-gui`
+  too, saying so on the terminal, so an older launcher keeps working, and a Clay that was
+  in the WebView GUI when it updated comes back in the native one with its connections.
 
 ### With no flag
 
@@ -55,6 +62,10 @@ Requires the `webview-gui` feature (`wry`, `tao`, and on Linux `webkit2gtk`/`gdk
 `gio`/`glib`/`x11rb` — see `Cargo.toml`'s `[features]`). This is a display-dependent
 feature and cannot be built or run in a headless environment (the standard musl build
 in the **Installation** chapter deliberately omits it for that reason).
+
+Only the Termux GUI binary is released with it, and `./build.sh` adds it on Termux only.
+On a desktop it is yours to ask for, with the commands below; a Linux binary built with it
+needs WebKitGTK installed wherever it runs.
 
 ```bash
 # Linux (requires GTK/WebKit dev libraries)
@@ -126,9 +137,10 @@ window itself.
 - **The hamburger's items, outside the window** (the native GUI only; the WebView GUI
   doesn't do this). Each choice acts on the window it was made for.
   - **Linux:** an app-menu applet on the panel (xfce4's AppMenu plugin, MATE's and
-    Budgie's) shows a Clay menu with the hamburger's items, then Quit. KDE Plasma's Global
-    Menu reads the same window properties. It needs an X11 session: Wayland has no way to
-    say where a window's menu is. Without such an applet nothing changes.
+    Budgie's) shows a Clay menu with the hamburger's items, then Quit. On KDE Plasma it
+    is the Global Menu widget (add it to a panel), in the Wayland session and the X11 one
+    alike. No other Wayland desktop has a way for a window to say where its menu is.
+    Without such an applet nothing changes.
   - **macOS:** the menu bar's Clay menu, and the Dock icon's right-click menu (without
     Quit, which the Dock has).
   - **Windows:** the top of the window's own menu: right-click the title bar, or
@@ -136,8 +148,13 @@ window itself.
     that key (`collapse_spaces`). There is no Quit, since that menu has Close.
 - **Taskbar Alert** (Settings > General, off by default): when the MUD sends text while
   no Clay window has focus, the taskbar button flashes (X11, Windows) or the Dock icon
-  bounces (macOS). It happens once until a Clay window has the focus again. GPUI can't do
-  it on Wayland.
+  bounces (macOS). On Wayland the native GUI's window is marked as wanting attention,
+  which KDE Plasma's task manager shows; it is never given the focus. It happens once
+  until a Clay window has the focus again.
+- **Transparency** (Settings > General): the whole window at that opacity, text and all.
+  It acts on Linux: on X11 with a compositing window manager (both GUIs), and in the
+  native GUI on a Wayland desktop that supports it. KDE Plasma does; there the title bar,
+  which KDE draws, stays solid. Elsewhere the setting is kept and has no effect.
 - **The activity count** (the status bar's ACT number) shows on the taskbar button or the
   Dock icon:
   - Windows: a red badge on the button;
@@ -177,8 +194,12 @@ window's original size and place. The zoom is this window's alone and lives in m
 saved, a `/window` zooms by itself, and another Clay is not affected. The chrome (status
 bar, menus, tabs) keeps its size; the font slider still shows the saved text size, and the
 text is drawn at that size times the zoom. If you drag the window to a new size while
-zoomed, later steps scale that size. On Wayland a program cannot move its window, so a
-window grown to the screen's size may need a nudge back on screen. The WebView GUI and a
+zoomed, later steps scale that size. A zoom step doesn't show the size box a resize by
+hand does (see **Output Area** in the Interface chapter): both GUIs show the output's
+size in characters, `80x24`, in the middle of a window while you resize it. On Wayland a program can neither move its window
+nor learn how much of the screen is free, so there a step that would outgrow the screen
+maximizes the window instead: zooming in again does nothing, and zooming out or Ctrl+0
+brings it back. The WebView GUI and a
 browser tab have no window zoom (a browser's Ctrl+plus/minus stay its own page zoom).
 
 There are no other GUI-only shortcuts beyond what's listed in the Web Interface chapter's

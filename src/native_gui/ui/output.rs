@@ -298,6 +298,17 @@ impl Scroll {
         self.pending += rows;
     }
 
+    /// The rows and cells a layout found the view to hold. The server sizes more-mode and
+    /// a shell world's PTY by this, reported as the view renders (`report_view`); a new
+    /// size needs a render after this layout to go out.
+    fn set_view(&mut self, rows: usize, cols: usize, window: &Window) {
+        if (self.view_rows, self.view_cols) != (rows, cols) {
+            window.request_animation_frame();
+        }
+        self.view_rows = rows;
+        self.view_cols = cols;
+    }
+
     /// Jump to the bottom and follow it.
     pub fn follow_bottom(&mut self) {
         self.follow = true;
@@ -730,28 +741,77 @@ fn prepare(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window
     p
 }
 
-fn prepare_lines(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) -> Prepared {
-    let font_size = px(snapshot.font_size);
+/// The output font's measures at `font_size`: a row is one text size tall, a cell the
+/// font's `0`.
+fn metrics_for(font_size: f32, fonts: &Fonts, window: &Window) -> Metrics {
+    let size = px(font_size);
     let ts = window.text_system();
-    let primary = ts.resolve_font(&snapshot.fonts.font(snapshot.fonts.base(), false, false));
-    let metrics = Metrics {
-        font_size,
-        row: snapshot.font_size,
-        ascent: f32::from(ts.ascent(primary, font_size)),
+    let primary = ts.resolve_font(&fonts.font(fonts.base(), false, false));
+    Metrics {
+        font_size: size,
+        row: font_size,
+        ascent: f32::from(ts.ascent(primary, size)),
         // GPUI reports the descent as a (negative) offset below the baseline.
-        descent: f32::from(ts.descent(primary, font_size)).abs(),
-        ch: ts.ch_advance(primary, font_size).map(f32::from).unwrap_or(snapshot.font_size * 0.6),
-    };
+        descent: f32::from(ts.descent(primary, size)).abs(),
+        ch: ts.ch_advance(primary, size).map(f32::from).unwrap_or(font_size * 0.6),
+    }
+}
 
+/// What a pane of `bounds` holds: the area its text is drawn in (less the padding and the
+/// scroll bar's strip), that area's width, and the whole rows and cells in it.
+fn view_cells(bounds: Bounds<Pixels>, m: &Metrics) -> (Bounds<Pixels>, f32, usize, usize) {
     let bar_w = BAR_W + BAR_GAP;
     let content = Bounds::new(
         point(bounds.origin.x + px(PAD_X), bounds.origin.y + px(PAD_Y)),
         size(bounds.size.width - px(2.0 * PAD_X + bar_w), bounds.size.height - px(2.0 * PAD_Y)),
     );
-    let width = f32::from(content.size.width).max(metrics.ch);
+    let width = f32::from(content.size.width).max(m.ch);
     let height = f32::from(content.size.height);
-    let view_rows = ((height / metrics.row).floor() as usize).max(1);
-    let view_cols = ((width / metrics.ch).floor() as usize).max(1);
+    let view_rows = ((height / m.row).floor() as usize).max(1);
+    let view_cols = ((width / m.ch).floor() as usize).max(1);
+    (content, width, view_rows, view_cols)
+}
+
+/// A pane with no output in it (the splash) measured as the output would be, so the size
+/// reported to the server (`report_view`) and shown while the window is resized
+/// (sizepopup.rs) is the pane's and not the last layout's - or, in a window that has
+/// only ever shown the splash, `Scroll`'s 80x24. It draws nothing.
+pub fn view_probe(scroll: ScrollHandle, font_size: f32, fonts: Fonts) -> impl IntoElement {
+    canvas(
+        move |bounds, window, _cx| {
+            let (_, _, rows, cols) = view_cells(bounds, &metrics_for(font_size, &fonts, window));
+            scroll.borrow_mut().set_view(rows, cols, window);
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// The output as the one pane it would be, in columns and rows; None until measured.
+pub type WholeView = Rc<std::cell::Cell<Option<(usize, usize)>>>;
+
+/// The whole output area measured as one pane while it is split (`/split`): laid over the
+/// two panes and the bar between them, it finds what a single pane of that area would
+/// hold, which is what the size popup shows (user request 2026-11-15; sizepopup.rs). A
+/// new size needs a render after this layout to be shown. It draws nothing.
+pub fn whole_probe(whole: WholeView, font_size: f32, fonts: Fonts) -> impl IntoElement {
+    canvas(
+        move |bounds, window, _cx| {
+            let (_, _, rows, cols) = view_cells(bounds, &metrics_for(font_size, &fonts, window));
+            if whole.replace(Some((cols, rows))) != Some((cols, rows)) {
+                window.request_animation_frame();
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .inset_0()
+}
+
+fn prepare_lines(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) -> Prepared {
+    let metrics = metrics_for(snapshot.font_size, &snapshot.fonts, window);
+    let (content, width, view_rows, view_cols) = view_cells(bounds, &metrics);
     let n = snapshot.lines.len();
     let scroll = snapshot.scroll.clone();
     let mut st = scroll.borrow_mut();
@@ -830,13 +890,7 @@ fn prepare_lines(snapshot: OutputSnapshot, bounds: Bounds<Pixels>, window: &mut 
         }
     }
     st.rows_below = below;
-    // The server sizes more-mode and a shell world's PTY by this, reported as the view
-    // renders (`report_view`); a new size needs a render after this layout to go out.
-    if (st.view_rows, st.view_cols) != (view_rows, view_cols) {
-        window.request_animation_frame();
-    }
-    st.view_rows = view_rows;
-    st.view_cols = view_cols;
+    st.set_view(view_rows, view_cols, window);
     crate::crashlog::set_context("view", format!("{view_cols}x{view_rows} follow={} shown={n}", st.follow));
     // Rows in all, for the scroll bar: a line laid out by its rows, one that isn't by
     // its count in columns at the wrap the layout uses.
