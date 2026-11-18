@@ -14,6 +14,7 @@ mod follow;
 pub mod fonts;
 pub mod ink;
 mod input_view;
+mod keep;
 mod keymap;
 mod kit;
 mod map;
@@ -144,6 +145,8 @@ pub struct ClayView {
     /// The size a zoom step wants once the window is back from the maximize the zoom made
     /// (Wayland, `ZoomState::step_unplaced`): taken when the window is seen restored.
     zoom_restore_to: Option<crate::zoom::Rect>,
+    /// The main window's record for a restart (keep.rs); `None` in every other window.
+    keep: Option<keep::Keep>,
     /// The size shown in the middle of this window while it is resized (sizepopup.rs).
     size_popup: sizepopup::SizePopup,
     wrapspace: usize,
@@ -300,6 +303,7 @@ impl ClayView {
             font_size: DEFAULT_FONT_SIZE,
             zoom: crate::zoom::ZoomState::default(),
             zoom_restore_to: None,
+            keep: None,
             size_popup: sizepopup::SizePopup::new(window),
             wrapspace: 0,
             wrap_columns: 0,
@@ -896,6 +900,7 @@ impl ClayView {
         self.drag_scroll(cx);
         self.blink(cx);
         self.size_popup.tick();
+        self.keep_tick(window, cx);
         self.save_cache();
         let clock = chrome::clock_text(self.session.core.settings.as_ref().map_or("", |s| s.clock_format.as_str()));
         if clock != self.chrome.clock {
@@ -1696,7 +1701,9 @@ pub fn run(session: Session, events: mpsc::UnboundedReceiver<NetInput>) {
         let fonts = fonts::load(cx);
         // The launcher entry docks attach the activity badge to (Linux).
         crate::desktop::ensure_desktop_file();
-        let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true, leader: None, origin: None };
+        // A restart's window opens where the last one was (keep.rs).
+        let kept = crate::keptwindow::take(crate::keptwindow::NATIVE);
+        let how = ViewWindow { title: "Clay".into(), size: (800.0, 600.0), is_main: true, leader: None, origin: None, kept };
         let (main, main_window) = match open_view_window(cx, fonts, session, Some(events), viewmode::ViewMode::default(), how) {
             Ok(opened) => opened,
             // Said, not a panic: nothing in Clay is broken, this machine's graphics
@@ -1754,6 +1761,9 @@ pub(super) struct ViewWindow {
     pub leader: Option<gpui::WeakEntity<ClayView>>,
     /// Where its top left goes (`None`: centred on the screen).
     pub origin: Option<gpui::Point<gpui::Pixels>>,
+    /// The main window a restart handed over (keep.rs): its bounds, state and zoom
+    /// instead of `size` and `origin`.
+    pub kept: Option<crate::keptwindow::KeptWindow>,
 }
 
 /// A window of output: the main window, with its connection's reports on `events`, or a
@@ -1767,18 +1777,25 @@ pub(super) fn open_view_window(
     mode: viewmode::ViewMode,
     how: ViewWindow,
 ) -> Result<(gpui::WeakEntity<ClayView>, gpui::AnyWindowHandle), String> {
-    let ViewWindow { title, size: (w, h), is_main, leader, origin } = how;
+    let ViewWindow { title, size: (w, h), is_main, leader, origin, kept } = how;
     // A follower's connection is already up (its leader's): only a window with its own starts one.
     let starts = events.is_some();
-    let bounds = match origin {
-        Some(origin) => Bounds::new(origin, size(px(w), px(h))),
-        None => Bounds::centered(None, size(px(w), px(h)), cx),
+    let (window_bounds, display_id) = match &kept {
+        Some(kept) => keep::opening(kept, cx),
+        None => (
+            WindowBounds::Windowed(match origin {
+                Some(origin) => Bounds::new(origin, size(px(w), px(h))),
+                None => Bounds::centered(None, size(px(w), px(h)), cx),
+            }),
+            None,
+        ),
     };
     let mut view = None;
     let window = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(window_bounds),
+                display_id,
                 titlebar: Some(TitlebarOptions { title: Some(title), ..Default::default() }),
                 // Wayland's app id; X11 takes `set_app_id` (below). Docks match the window
                 // to clay.desktop by it (src/desktop.rs).
@@ -1789,9 +1806,13 @@ pub(super) fn open_view_window(
                 window.set_app_id("clay");
                 let v = cx.new(|cx| {
                     let mut v = ClayView::new(fonts, session, window, cx);
-                    // Only the main window keeps the disk cache.
+                    // Only the main window keeps the disk cache, and is kept for a restart.
                     if is_main {
                         v.cache = Some(CacheSaver::default());
+                        v.keep = Some(keep::Keep::opened(kept.as_ref(), window));
+                        if let Some(zoom) = kept.as_ref().and_then(keep::resumed_zoom) {
+                            v.zoom = zoom;
+                        }
                     }
                     v.mode = mode;
                     v.link.leader = leader;

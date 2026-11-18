@@ -75,6 +75,12 @@ On a phone or tablet, a row of buttons sits under the separator bar:
 - **▲** next world, **▼** previous world (as Ctrl+Up and Ctrl+Down)
 - On a phone, the hamburger menu (☰) and the font slider move into this row too
 
+On a phone or tablet, and in the Android app, slide the separator bar up or down with a
+finger to make the input taller or shorter. It moves a row at a time and always leaves
+the output at least a line. The new height is saved as that device's Input height, so it
+comes back on the next start. A tap on the bar's world name, More or ACT still works as a
+tap.
+
 **The Android app with a keyboard and a mouse** looks like the desktop GUI: the button
 row goes, the separator bar carries the menu and the font slider, the icon bar (until
 the app has an Icon Bar place of its own) and the output's scroll bar appear, and the menu offers the
@@ -114,7 +120,7 @@ Click the hamburger icon for:
 | Actions | Open the actions editor (`/actions`) |
 | Settings | Open Settings (`/setup`) |
 | Emoji Picker | Insert an emoji (not on a phone or tablet, whose keyboard has its own, unless the Android app has a keyboard and mouse; `Esc-e` still opens it) |
-| Import Picture | Upload a picture and put its link in the input line (on Android, choose a picture app) |
+| Share Picture | Upload a picture and put its link in the input line (on Android, choose a picture app) |
 | Toggle Tags | Show/hide MUD tags (F2) |
 | Find | Show only matching lines (F4) |
 | Search History | Find text in the output (F5) |
@@ -129,7 +135,7 @@ connected, as its name is (the console shows the same 📝 on its separator bar)
 Worlds is the `recent_worlds` key action, which has no default key (bind one in the
 keybind editor). Import Settings is the **Import** button on Settings' General tab (before
 the `?`), and `/import` opens it too. Reload is `Ctrl+R` or `/reload`. A picture dragged
-onto the page is uploaded as Import Picture's are (see **Importing a Picture** in the
+onto the page is uploaded as Share Picture's are (see **Sharing a Picture** in the
 Interface chapter).
 
 ### World Selector

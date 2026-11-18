@@ -59,7 +59,12 @@ impl ClayView {
     /// The platform reported this window's bounds (a resize or a move, ours or the
     /// user's): the zoom learns which, and a resize that isn't the zoom's shows the size.
     pub(super) fn bounds_observed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let own = self.zoom_observe_bounds(window) == Observed::Ours;
+        // While a restart's window is still being put back (keep.rs, X11) the reports are
+        // the window manager's and ours, not the user's.
+        let own = self.keep_placing() || self.zoom_observe_bounds(window) == Observed::Ours;
+        // What a restart keeps (keep.rs): the kept place taken first, then noted.
+        self.keep_place(window);
+        self.keep_note(window, cx);
         // The content size, already the new one when GPUI calls its bounds observers.
         let size = window.viewport_size();
         if !self.size_popup.watch.observe(f32::from(size.width), f32::from(size.height), window.scale_factor(), own) {

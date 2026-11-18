@@ -176,7 +176,7 @@ pub(super) const MAIN_MENU: &[Option<MenuEntry>] = &[
     Some(("setup", "Settings", "/setup")),
     Some(("map", "Map", "/map")),
     Some(("emoji_picker", "Emoji Picker", "")),
-    Some(("import-picture", "Import Picture", "")),
+    Some(("import-picture", "Share Picture", "")),
     None,
     Some(("toggle-tags", "Toggle Tags", "F2")),
     Some(("filter", "Find", "F4")),
@@ -191,7 +191,7 @@ pub(super) const MAIN_MENU: &[Option<MenuEntry>] = &[
 
 /// Whether the hamburger shows `action`: Logout only on a multiuser server, Change
 /// Password only where the server answers it (not clay_multi, whose password.dat is the
-/// operator's), Import Picture only where the server uploads pictures (as app.js hides
+/// operator's), Share Picture only where the server uploads pictures (as app.js hides
 /// them). A clay_multi user's worlds and map are their own, so Edit World and Map stay.
 pub(super) fn menu_shows(action: &str, shown: super::appmenu::Shown) -> bool {
     match action {
@@ -944,7 +944,7 @@ mod tests {
                 vec!["toggle-tags", "filter", "search"],
                 vec!["new-window", "resync"],
             ],
-            "single-user without uploads: no Change Password, Import Picture or Logout, and no empty section after Resync"
+            "single-user without uploads: no Change Password, Share Picture or Logout, and no empty section after Resync"
         );
         assert_eq!(
             ids(Shown { multiuser: true, picture_upload: true, change_password: false }),

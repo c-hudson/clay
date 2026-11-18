@@ -64,7 +64,7 @@ impl ClayView {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Import Picture".into()),
+            prompt: Some("Share Picture".into()),
         });
         cx.spawn(async move |this, cx| {
             match chosen.await {

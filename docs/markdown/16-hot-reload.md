@@ -48,6 +48,16 @@ and says so after "Reload successful". A reload from a Clay older than v1.7.28, 
 said, comes back as that version's default: the GUI on macOS and Windows, the console
 elsewhere.
 
+In a GUI the window comes back as it was: the same place and size, maximized or full
+screen if it was (and restoring it then gives back the size it had before), with the
+native GUI's zoom level (`Ctrl+plus`/`Ctrl+minus`). This holds for `/reload` and `Ctrl+R`
+in a GUI that runs Clay itself and in one attached to another Clay, for a reload started
+from elsewhere (another device's `/reload`, `/update`), and for `/server`. On Wayland
+only the size and the maximized or full-screen state come back: a Wayland program is never
+told where its window is, so the compositor places it. Other windows (`/window`, Settings)
+aren't reopened by a reload. A start that isn't a reload opens the window at its usual
+size, as before.
+
 `--console` and `--gui` switch the interface at the reload. The GUI needs a build that has
 one and a display: on Linux one that answers (a display forwarded over SSH counts), on
 Windows and macOS a desktop session, never one reached over SSH; the console needs a terminal Clay is in the foreground of (a GUI started

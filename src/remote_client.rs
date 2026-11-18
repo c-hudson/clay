@@ -37,8 +37,30 @@ use crate::input_handler::*;
 use crate::rendering::*;
 use crate::platform::*;
 
+/// `--grep`'s pattern as a regex: a glob (`*`, `?`, TF's `{a|b}`), found anywhere in the
+/// line, or with `--regexp` a regex as typed. Matched case-insensitively against the line
+/// without its escape codes, by the live search, the host's archive (`GrepArchive`) and
+/// this machine's (`--grep -D`) alike.
+pub(crate) fn grep_regex(pattern: &str, use_regex: bool) -> String {
+    if use_regex {
+        pattern.to_string()
+    } else {
+        tf::macros::glob_to_regex(pattern)
+    }
+}
+
+/// One line of `--grep`'s output: `HH:MM:SS:world  text`, with `-D` (`dated`, the archive
+/// spans days) `MM/DD HH:MM:SS:world  text`.
+pub(crate) fn grep_line(ts_secs: i64, dated: bool, world: &str, text: &str, strip_ansi: bool) -> String {
+    let lt = local_time_from_epoch(ts_secs);
+    let text = if strip_ansi { strip_ansi_codes(text) } else { text.to_string() };
+    let date = if dated { format!("{:02}/{:02} ", lt.month, lt.day) } else { String::new() };
+    format!("{date}{:02}:{:02}:{:02}:{world}  {text}", lt.hour, lt.minute, lt.second)
+}
+
 /// Run as grep client connecting to remote daemon (--grep=host:port)
-/// Searches world output for matching lines and prints to stdout
+/// Searches world output for matching lines and prints to stdout; with `archive` (`-D`)
+/// the host's archive too (`GrepArchive`).
 pub(crate) async fn run_grep_client(
     addr: &str,
     pattern: &str,
@@ -46,6 +68,7 @@ pub(crate) async fn run_grep_client(
     use_regex: bool,
     strip_ansi: bool,
     follow_mode: bool,
+    archive: bool,
 ) -> io::Result<()> {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use futures::SinkExt;
@@ -62,11 +85,7 @@ pub(crate) async fn run_grep_client(
     };
 
     // Compile pattern
-    let regex_pattern = if use_regex {
-        pattern.to_string()
-    } else {
-        tf::macros::glob_to_regex(pattern)
-    };
+    let regex_pattern = grep_regex(pattern, use_regex);
     let re = match RegexBuilder::new(&regex_pattern).case_insensitive(true).build() {
         Ok(r) => r,
         Err(e) => {
@@ -210,11 +229,11 @@ pub(crate) async fn run_grep_client(
     }
 
     // Wait for InitialState
-    let worlds: Vec<WorldStateMsg> = loop {
+    let (worlds, server_greps_archive): (Vec<WorldStateMsg>, bool) = loop {
         match ws_read.next().await {
             Some(Ok(Message::Text(text))) => {
-                if let Ok(WsMessage::InitialState { worlds, .. }) = serde_json::from_str::<WsMessage>(&text) {
-                    break worlds;
+                if let Ok(WsMessage::InitialState { worlds, grep_archive, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                    break (worlds, grep_archive);
                 }
             }
             Some(Ok(Message::Close(_))) | None => {
@@ -224,6 +243,11 @@ pub(crate) async fn run_grep_client(
             _ => {}
         }
     };
+
+    // The Activity world is a copy of other worlds' lines, and the server answers no
+    // RequestScrollback for it: asking left `--grep=host` waiting forever (since the
+    // Activity world came, 2026-11-05). Its lines are searched in their own worlds.
+    let worlds: Vec<WorldStateMsg> = worlds.into_iter().filter(|w| !w.is_activity).collect();
 
     // Build world index→name map and validate world filter
     let mut world_names: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
@@ -237,7 +261,8 @@ pub(crate) async fn run_grep_client(
             .filter(|w| w.name.to_lowercase() == filter_lower)
             .map(|w| w.index)
             .collect();
-        if matching.is_empty() {
+        // Under -D a world the host no longer has may still be in its archive.
+        if matching.is_empty() && !(archive && server_greps_archive) {
             eprintln!("Error: World '{}' not found. Available worlds:", filter);
             for w in &worlds {
                 eprintln!("  {}", w.name);
@@ -257,24 +282,34 @@ pub(crate) async fn run_grep_client(
     };
 
     let format_line = |ts: u64, world_name: &str, text: &str| -> String {
-        let lt = local_time_from_epoch(ts as i64);
-        let display_text = if strip_ansi { strip_ansi_codes(text) } else { text.to_string() };
-        format!("{:02}:{:02}:{:02}:{}  {}",
-            lt.hour, lt.minute, lt.second, world_name, display_text)
+        grep_line(ts as i64, archive, world_name, text, strip_ansi)
     };
 
     if follow_mode {
-        // Follow mode: match new output as it arrives
-        // Enable raw mode to capture Ctrl+L for screen clearing
-        let raw_mode_enabled = enable_raw_mode().is_ok();
-        let mut key_reader = EventStream::new();
+        // Follow mode: match new output as it arrives. At a terminal, raw mode lets Ctrl+L
+        // clear the screen. Without one (cron, `setsid`, `ssh host clay ...` with no -t)
+        // there are no keys to read, and crossterm's `EventStream::new()` panics ("reader
+        // source not set"), so the keys are left alone and Ctrl+C (SIGINT) ends it.
+        // `poll` answers Err, never a panic, when it has nothing to read from.
+        use std::io::IsTerminal;
+        let keys_readable = crossterm::event::poll(std::time::Duration::ZERO).is_ok();
+        // Raw mode only with a key reader: it turns Ctrl+C into a key, which then must be read.
+        let raw_mode_enabled = keys_readable && enable_raw_mode().is_ok();
+        let mut key_reader = keys_readable.then(EventStream::new);
+        // Raw mode turns off the terminal's own \n -> \r\n; a pipe or a file wants \n alone.
+        let eol = if raw_mode_enabled && std::io::stdout().is_terminal() { "\r\n" } else { "\n" };
 
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     break;
                 }
-                key_event = key_reader.next() => {
+                key_event = async {
+                    match key_reader.as_mut() {
+                        Some(keys) => keys.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     match key_event {
                         Some(Ok(Event::Key(KeyEvent { code: KeyCode::Char('l'), modifiers, kind: KeyEventKind::Press, .. }))) if modifiers.contains(KeyModifiers::CONTROL) => {
                             // Clear screen and move cursor to top
@@ -299,7 +334,7 @@ pub(crate) async fn run_grep_client(
                                     for line in data.lines() {
                                         let clean = strip_ansi_codes(line);
                                         if re.is_match(&clean) {
-                                            print!("{}\r\n", format_line(ts, world_name, line));
+                                            print!("{}{eol}", format_line(ts, world_name, line));
                                         }
                                     }
                                 }
@@ -434,6 +469,45 @@ pub(crate) async fn run_grep_client(
         // seq-ascending as sent by the server and prepended in oldest-first request order -
         // so the accumulated Vec is already fully sorted with no duplicates.
 
+        // -D: the host's archive. Each world it holds is cut at its oldest live line, which
+        // the backfill above already has, so the two halves never list a line twice.
+        let mut archive_hits: Vec<websocket::GrepArchiveHit> = Vec::new();
+        if archive && !server_greps_archive {
+            eprintln!("{addr} can't search its archive (an older Clay); searching its live output only.");
+        } else if archive {
+            let _ = ws_tx.send(WsMessage::GrepArchive {
+                request_id: 1,
+                world: world_filter.map(str::to_string),
+                regex: regex_pattern.clone(),
+            });
+            loop {
+                match ws_read.next().await {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsMessage>(&text) {
+                        Ok(WsMessage::GrepArchiveLines { lines, done, error, .. }) => {
+                            if let Some(error) = error {
+                                eprintln!("{addr}: {error}; searching its live output only.");
+                            }
+                            archive_hits.extend(lines);
+                            if done {
+                                break;
+                            }
+                        }
+                        Ok(WsMessage::Ping) => {
+                            let _ = ws_tx.send(WsMessage::Pong);
+                        }
+                        Ok(WsMessage::PingCheck { nonce }) => {
+                            // As in the backfill loop above: nothing held to resume.
+                            let _ = ws_tx.send(WsMessage::PongCheck { nonce, acked: Vec::new() });
+                        }
+                        _ => {}
+                    },
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            archive_hits.sort_by_key(|h| h.ts_ms);
+        }
+
         // Collect all lines across worlds, sort by timestamp then seq
         let mut all_lines: Vec<(usize, &TimestampedLine)> = Vec::new();
         for (world_idx, lines) in &world_lines {
@@ -443,15 +517,26 @@ pub(crate) async fn run_grep_client(
         }
         all_lines.sort_by(|a, b| a.1.ts.cmp(&b.1.ts).then(a.1.seq.cmp(&b.1.seq)));
 
-        // Match and print
+        // Match, then print in time order: the archive's first where a second ties, as
+        // they are older (a stable sort keeps each half's own order).
+        let mut found: Vec<(u64, String)> = archive_hits.iter()
+            .map(|h| {
+                let ts = (h.ts_ms / 1000).max(0) as u64;
+                (ts, format_line(ts, &h.world, &h.text))
+            })
+            .collect();
         for (world_idx, line) in &all_lines {
             if !line.from_server { continue; }
             let clean = strip_ansi_codes(&line.text);
             if re.is_match(&clean) {
                 let world_name = world_names.get(world_idx).map(|s| s.as_str()).unwrap_or("?");
-                println!("{}", format_line(line.ts, world_name, &line.text));
-                had_match = true;
+                found.push((line.ts, format_line(line.ts, world_name, &line.text)));
             }
+        }
+        found.sort_by_key(|(ts, _)| *ts);
+        for (_, line) in &found {
+            println!("{line}");
+            had_match = true;
         }
 
         // Exit code: 0 if matches found, 1 if none (grep convention)

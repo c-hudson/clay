@@ -7,7 +7,15 @@ would be. It is a full terminal, not a command box.
 
 ## Creating one
 
-In the world editor, choose **Type: Shell**. The only other field is **Command**:
+The quickest way is **`/shell`** (or a bare **`/sh`**): it goes to the world named
+`shell`, and makes it first if there isn't one - a Shell world running your login shell.
+If its shell isn't running, `/shell` starts it; if it is, `/shell` just switches to it.
+It works the same from the console, the GUI, the web page and the Android app attached
+to a Clay that has shell worlds. A world you already have named `shell` that isn't a Shell
+world is left alone. (`/sh <command>` is still TinyFugue's: it runs that command.)
+
+To make one of your own, in the world editor choose **Type: Shell**. The only other field
+is **Command**:
 
 - Leave it blank to run your login shell (`$SHELL -l`; on Windows, the command
   interpreter in `%COMSPEC%`, usually `cmd.exe`).

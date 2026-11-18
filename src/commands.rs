@@ -1670,6 +1670,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 Err(e) => app.add_output(&e),
             }
         }
+        Command::Shell { args } => match prepare_shell_world(app, &args) {
+            Ok(followup) => return Box::pin(handle_command(&followup, app, event_tx)).await,
+            Err(e) => app.add_output(&e),
+        },
         Command::EditList | Command::Edit { .. } => {
             // The split-screen editor (App::run_note_command, shared with the remote console).
             app.run_note_command(&parsed);
@@ -2810,6 +2814,46 @@ pub(crate) fn prepare_world_connect_host_port(
     })
 }
 
+/// The world `/shell` (and a bare `/sh`) goes to.
+pub(crate) const SHELL_WORLD_NAME: &str = "shell";
+
+/// `/shell`, and a bare TF `/sh` (user request 2026-11-17): make the world named "shell"
+/// when there is none - a Shell world with no Command, so it runs the login shell - and
+/// return the `/worlds <name>` command each dispatch site re-runs through its own
+/// pipeline, as `prepare_world_connect_host_port` does: that switches to the world and
+/// starts its shell unless it is running, the same in every interface and both handlers.
+/// A world named "shell" that isn't a Shell world is left alone, and a build without
+/// shell worlds makes none.
+pub(crate) fn prepare_shell_world(app: &mut App, args: &str) -> Result<String, String> {
+    if !args.trim().is_empty() {
+        return Err("Usage: /shell  (go to the shell world; /sh <command> runs a command)".to_string());
+    }
+    if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(SHELL_WORLD_NAME)) {
+        let world = &app.worlds[idx];
+        if world.settings.world_type != WorldType::Shell {
+            return Err(format!("World '{}' isn't a shell world, so /shell leaves it alone.", world.name));
+        }
+        return Ok(format!("/worlds {}", world.name));
+    }
+    #[cfg(not(feature = "shell-worlds"))]
+    {
+        Err(crate::shell::NOT_IN_THIS_BUILD.to_string())
+    }
+    #[cfg(feature = "shell-worlds")]
+    {
+        let mut world = World::new(SHELL_WORLD_NAME);
+        world.scrollback_tx = app.scrollback.as_ref().map(|db| db.sender());
+        world.settings.world_type = WorldType::Shell;
+        app.worlds.push(world);
+        let idx = app.worlds.len() - 1;
+        let _ = persistence::save_settings(app);
+        // Triggers and hooks match -T against the engine's copy of the worlds.
+        app.sync_tf_world_info();
+        app.broadcast_world_added(idx);
+        Ok(format!("/worlds {}", SHELL_WORLD_NAME))
+    }
+}
+
 /// Expand a leading `~` (home directory) in a user-supplied path, same convention `/lcd`
 /// already applies inline - factored out here so `/log <file>` gets it too.
 fn expand_tilde_path(path: &str) -> String {
@@ -2827,6 +2871,47 @@ fn expand_tilde_path(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::encoding::UrlShortener;
+
+    /// `/shell` makes the "shell" world once - a Shell world with no Command, so the login
+    /// shell - and after that only goes to it; a world of that name of another type is
+    /// left alone, and the usage line answers anything typed after it.
+    #[test]
+    fn shell_makes_its_world_once_and_then_goes_to_it() {
+        assert_eq!(crate::parse_command("/shell"), Command::Shell { args: String::new() });
+        assert_eq!(crate::parse_command("/SHELL top"), Command::Shell { args: "top".to_string() });
+
+        let mut app = App::new();
+        app.worlds = vec![World::new("mud")];
+        assert!(prepare_shell_world(&mut app, "top").unwrap_err().starts_with("Usage: /shell"));
+        assert_eq!(app.worlds.len(), 1, "a usage error makes nothing");
+
+        let first = prepare_shell_world(&mut app, "");
+        if cfg!(feature = "shell-worlds") {
+            assert_eq!(first.as_deref(), Ok("/worlds shell"));
+            assert_eq!(app.worlds.len(), 2);
+            let shell = &app.worlds[1];
+            assert_eq!((shell.name.as_str(), &shell.settings.world_type), ("shell", &WorldType::Shell));
+            assert!(shell.settings.hostname.is_empty(), "no Command: the login shell");
+            assert!(shell.settings.has_connection_settings(), "so /worlds starts it");
+            assert_eq!(prepare_shell_world(&mut app, "").as_deref(), Ok("/worlds shell"));
+            assert_eq!(app.worlds.len(), 2, "made once");
+        } else {
+            assert!(first.is_err());
+            assert_eq!(app.worlds.len(), 1, "a build without shell worlds makes none");
+        }
+
+        // Someone's MUD world named Shell is not taken over.
+        let mut app = App::new();
+        app.worlds = vec![World::new("Shell")];
+        let refused = prepare_shell_world(&mut app, "").unwrap_err();
+        assert!(refused.contains("'Shell' isn't a shell world"), "{refused}");
+        assert_eq!(app.worlds.len(), 1);
+
+        // A Shell world named SHELL is the one, by its own name.
+        app.worlds[0].name = "SHELL".to_string();
+        app.worlds[0].settings.world_type = WorldType::Shell;
+        assert_eq!(prepare_shell_world(&mut app, "").as_deref(), Ok("/worlds SHELL"));
+    }
 
     /// Every entry starts under its column's heading, whatever the widths before it.
     #[test]

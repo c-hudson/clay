@@ -2407,7 +2407,7 @@ Usage: $[function(args)] or in /expr//test"#.to_string()
                 r#"Commands (/help <command> for details)
 Clay:
   /setup  /web  /reach  /actions  /menu  /connections
-  /world  /server  /disconnect  /dc  /addworld  /unworld
+  /world  /shell  /server  /disconnect  /dc  /addworld  /unworld
   /reload  /version  /quit  /remote  /pause  /ban  /unban
   /flush  /dump  /note  /tag  /notify  /import  /window
   /font  /update  /dict  /urban  /translate  /url  /testmusic
@@ -3002,7 +3002,7 @@ Examples:
                 "/log [-w[<world>]] [-i] [-l] [-g] [OFF|ON|<file>]\n\nStart, stop, or list per-world output logging.\n\nOptions:\n  -w<world>   Act on <world> (attached, no space; bare -w = current world)\n  -i          Also toggle the global \"log input\" setting\n  -l          Accepted; Clay's log already includes local (client) output\n  -g          Accepted; Clay logs per-world, not one combined stream\n\nArguments:\n  ON          Resume the target's normal log file\n  <file>      Log the target to this exact file instead\n  OFF         Stop logging the target\n  (none)      With a -wilg option: same as ON. Otherwise: list every\n              world that is currently logging.\n\nExamples:\n  /log                - List every world currently logging\n  /log ON             - Start logging the current world\n  /log ~/mud.log      - Log the current world to this file\n  /log -wOtherMUD OFF - Stop logging a different world\n  /log -i             - Start logging the current world, plus typed input".to_string()
             )),
             "sh" => TfCommandResult::Success(Some(
-                "/sh [-q] [<command>]\n\nRun <command> with /bin/sh - or, with no <command>, an interactive\n%{SHELL} - on the terminal, as TF does: Clay's screen is put away, the\nshell runs, and the screen comes back (after a keypress, when %{shpause}\nis on). %? is the exit status, or -1 if it didn't exit normally.\nVariables from the environment or /setenv are passed to it. ^C and ^\\\nreach only the shell.\n\nOnly Clay's own console has a terminal to lend. From a web, GUI or\nremote-console client, or a Clay without a console (-D, the GUI), a\n<command> runs in the background instead and its output is shown when\nit finishes; an interactive shell isn't available there.\n\n-q leaves out the SHELL hook and TF's \"% Executing command: <command>\"\nline. For TF's /psh, /require psh.tf.\n\nExample: /sh ls -la".to_string()
+                "/sh [-q] [<command>]\n\nRun <command> with /bin/sh on the terminal, as TF does: Clay's screen is\nput away, the command runs, and the screen comes back (after a keypress,\nwhen %{shpause} is on). %? is the exit status, or -1 if it didn't exit\nnormally. Variables from the environment or /setenv are passed to it.\n^C and ^\\ reach only the command.\n\nOnly Clay's own console has a terminal to lend. From a web, GUI or\nremote-console client, or a Clay without a console (-D, the GUI), the\ncommand runs in the background instead and its output is shown when it\nfinishes.\n\nWith no <command>, /sh is /shell: the world named \"shell\", a terminal in\nevery interface (/help shell). Only a Clay built without shell worlds\nruns TF's interactive %{SHELL} on the console instead.\n\n-q leaves out the SHELL hook and TF's \"% Executing command: <command>\"\nline. For TF's /psh, /require psh.tf.\n\nExample: /sh ls -la".to_string()
             )),
             "time" => TfCommandResult::Success(Some(
                 "/time [<format>]\n/time /command\n\nWithout a /command argument, print the current time formatted by\n<format> (ftime()-style conversions: %Y %m %d %H %M %S %a %A %b %B ...);\nwithout <format>, uses %{time_format} (default \"%H:%M\"). Sets %? to the\nformatted string.\n\nWith a \"/command\" argument (Clay's own kept extension - see /runtime for\nTF's own real=/cpu= timing report), run <command> and report how long it\ntook.\n\nExamples:\n  /time\n  /time %Y-%m-%d\n  /time /load big_script.tf".to_string()
@@ -4585,7 +4585,7 @@ mod tests {
         // (reachable via `main.rs::parse_command`), plus the `/tf<name>` prefix escape.
         const CLAY_NATIVE_ONLY: &[&str] = &[
             "actions", "chat", "dict", "dump", "flush", "font", "import", "info",
-            "menu", "msdp", "mssp", "note", "notify", "pause", "reload", "remote", "server", "setup", "stats", "tag",
+            "menu", "msdp", "mssp", "note", "notify", "pause", "reload", "remote", "server", "setup", "shell", "stats", "tag",
             "map", "reach", "split", "testmusic", "tfgag", "tfhelp", "translate", "tts", "unban", "unsplit", "update",
             "urban", "url", "web", "window",
         ];

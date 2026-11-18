@@ -644,6 +644,12 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                         Err(e) => app.emit_client_text(world_index, &e, true),
                     }
                 }
+                Command::Shell { ref args } => match crate::commands::prepare_shell_world(app, args) {
+                    Ok(followup) => return Box::pin(handle_daemon_ws_message(
+                        app, client_id, WsMessage::SendCommand { world_index, command: followup }, event_tx,
+                    )).await,
+                    Err(e) => app.emit_client_text(world_index, &e, true),
+                },
                 // Connect command - use daemon connection logic
                 Command::Connect { .. } => {
                     if world_index < app.worlds.len() && !app.worlds[world_index].connected {
@@ -1235,6 +1241,9 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         }
         WsMessage::RequestHistory { world_index, count, request_id, before_seq, before_ts, archive_before } => {
             app.handle_request_history(client_id, world_index, count, request_id, before_seq, before_ts, archive_before);
+        }
+        WsMessage::GrepArchive { request_id, world, regex } => {
+            app.handle_grep_archive(client_id, request_id, world, regex);
         }
         WsMessage::RequestWorldState { world_index } => {
             app.handle_request_world_state(client_id, world_index);

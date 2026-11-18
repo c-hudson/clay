@@ -118,6 +118,22 @@ Open the World Selector popup or manage worlds.
 - `Tab` - Cycle through buttons
 - Type to filter worlds
 
+### /shell (or /sh)
+Go to the world named `shell`, a terminal on the machine Clay runs on.
+
+```
+/shell
+/sh
+```
+
+When there is no world named `shell`, one is made: a Shell world that runs your login
+shell (give it a Command with `/worlds -e shell`). When its shell isn't running it is
+started; when it is, `/shell` only switches to it. A world named `shell` that isn't a
+Shell world is left alone. `/sh <command>` is still TinyFugue's: it runs `<command>`.
+A Clay built without shell worlds (the Android app's own server) has no `/shell`; there
+a bare `/sh` is TinyFugue's interactive shell on the console. See
+[Shell Worlds](23-shell-worlds.md).
+
 ### /connections (or /l)
 List all connected worlds in a table format.
 

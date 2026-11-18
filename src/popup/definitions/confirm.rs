@@ -151,7 +151,7 @@ pub const PICTURE_UPLOAD: &str = "picture_upload";
 /// "Upload cat.png (2.1 MB) to catbox.moe?" - a terminal drop is asked about before it's
 /// uploaded (src/picture.rs).
 pub fn create_picture_upload_dialog(message: &str) -> PopupDefinition {
-    let mut def = create_confirm_dialog("picture_upload", "Import Picture", message);
+    let mut def = create_confirm_dialog("picture_upload", "Share Picture", message);
     def.custom_data.insert(PICTURE_UPLOAD.to_string(), "1".to_string());
     def
 }

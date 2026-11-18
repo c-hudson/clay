@@ -2372,7 +2372,7 @@ public class MainActivity extends AppCompatActivity {
                 pick.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,
                     params != null && params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
                 try {
-                    pictureChooser.launch(Intent.createChooser(pick, "Import Picture"));
+                    pictureChooser.launch(Intent.createChooser(pick, "Share Picture"));
                 } catch (android.content.ActivityNotFoundException e) {
                     pictureChooserCallback = null;
                     callback.onReceiveValue(null);

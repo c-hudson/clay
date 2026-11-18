@@ -252,7 +252,7 @@ release); `-f` prevents the staleness from being introduced in the first place.
 ### Windows x86_64 binary (MSVC, native GUI + audio; no WebView GUI, as on Linux)
 
 Toolchain **1.98.1** (installed on the VM; `rustup toolchain list` shows it) for the native
-GUI, hence `cargo +1.98.1`. About 60 MB, static CRT. A cold build takes ~21 minutes (a warm
+GUI, hence `cargo +1.98.1`. About 70 MB (v1.7.37; 73 MB with both GUIs in v1.7.36), static CRT. A cold build takes ~21 minutes (a warm
 one a few), so run it detached from the SSH session (see SKILL.md "Long remote builds").
 
 This VM runs **cmd.exe**, not bash — use `&&` (not `;`), no `2>/dev/null`, no `test "$()"`.
@@ -331,7 +331,7 @@ at `~/VMs/OSX-KVM`), running on this AMD host. It is the only macOS builder for 
   lipo -create target/x86_64-apple-darwin/release/clay target/aarch64-apple-darwin/release/clay -output clay-macos-universal'
 scp -P 2222 -o UserKnownHostsFile=$HOME/VMs/macos/known_hosts adrick@127.0.0.1:clay/clay-macos-universal /tmp/clay-macos-universal
 ```
-About 121 MB with both GUIs (v1.7.36); not measured since the WebView GUI was left out.
+About 138 MB (v1.7.37; 144 MB with both GUIs in v1.7.36).
 `MACOSX_DEPLOYMENT_TARGET=11.0` is required: the VM's SDK is macOS 26. Rust code already
 defaults to an old minimum, but C dependencies built by `cc`/clang (SQLite, ring, ...) default
 to the SDK's own version, which would stop the binary loading on older macOS. 11.0 matches

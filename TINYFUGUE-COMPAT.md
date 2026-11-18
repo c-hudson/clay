@@ -324,8 +324,11 @@ From the drop-in work (user rulings, or what Clay's design allows):
 - Clay's own status bar is shown until a script changes TF's status line; the web/GUI
   status strip keeps its menu, notes and font controls beside TF's fields.
 - A `/sh` from a web, GUI or remote-console client, or in a Clay with no console (`-D`,
-  the GUI), runs in the background with its output shown when done; an interactive
-  shell is only available on Clay's own console.
+  the GUI), runs in the background with its output shown when done.
+- A bare `/sh` is Clay's `/shell` (user request 2026-11-17): it goes to the world named
+  `shell`, a Shell world made when there is none, in every interface - no SHELL hook, no
+  `% Executing shell:` line. Only a Clay built without shell worlds runs TF's interactive
+  `%SHELL` on its own console.
 - `moresize()` counts the lines held at Clay's more prompt; its "n"/"l"/"a" flags change
   nothing (Clay has no scrolled-back-but-seen lines below the window).
 - `%wrapsize`, `%clock_format` and mail checking are off until a script sets or asks for

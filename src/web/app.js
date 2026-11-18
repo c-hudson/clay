@@ -2604,7 +2604,7 @@
 
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'reach', 'actions',
-        'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'server', 'import',
+        'worlds', 'world', 'shell', 'connections', 'l', 'disconnect', 'dc', 'connect', 'server', 'import',
         'flush', 'menu', 'split', 'unsplit', 'send', 'remote', 'pause', 'ban', 'unban',
         'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'info', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say', 'tts',
@@ -3231,6 +3231,9 @@
             document.body.classList.add('is-mobile');
         }
         document.body.classList.toggle('desktop-input', desktopInputAttached());
+        // The separator bar is the input's drag handle here (attachBarDrag); style.css lets
+        // a finger on it drag rather than pan.
+        document.body.classList.toggle('separator-drag', separatorDragOn());
         // A phone keeps the input that clears on Enter.
         if (mode === 'phone') clearSentLines();
         applyKeyboardForceState();
@@ -9541,7 +9544,6 @@
     // The top pane's lines (null: half each), this page's own, kept for its next /split and
     // across a relaunch (saveSplitState); each pane keeps one line.
     let splitTopLines = null;
-    let splitResizeDrag = null; // { y, h, moved }
     let lastOtherViewsSent = null;
 
     function splitWorldIndex() {
@@ -9760,17 +9762,32 @@
     }
 
     // A press on the pane bar moves the focus to a grey bar's pane, as before, and a drag
-    // from it moves the bar a line at a time, leaving each pane a line at least. Its
-    // More/History badge is a button of its own.
-    function startSplitResize(e) {
-        if (!splitPane || (e.button !== undefined && e.button !== 0)) return;
-        if (e.target.closest && e.target.closest('.status-more')) return;
-        if (splitPane.onTop) splitFocusSwap();
-        const top = splitPane.onTop ? splitPane.container : elements.outputContainer;
-        splitResizeDrag = { y: e.clientY, h: top.offsetHeight, moved: false };
-        try { splitPane.bar.setPointerCapture(e.pointerId); } catch (err) { /* a mouse event without capture */ }
-        e.preventDefault();
-    }
+    // from it (attachBarDrag) moves the bar a line at a time, leaving each pane a line at
+    // least. Its More/History badge is a button of its own.
+    const splitResizeDrag = {
+        canStart: (e) => !!splitPane && !(e.target.closest && e.target.closest('.status-more')),
+        claimPress: true,
+        begin: () => {
+            if (splitPane.onTop) splitFocusSwap();
+            const top = splitPane.onTop ? splitPane.container : elements.outputContainer;
+            return { h: top.offsetHeight };
+        },
+        move: (d, dy) => {
+            if (!splitPane) return;
+            const top = splitPane.onTop ? splitPane.container : elements.outputContainer;
+            const pad = splitPaneHeight(top, 0);
+            const most = splitLinesShown().most;
+            const lines = Math.min(most, Math.max(1, Math.round((d.h + dy - pad) / lineHeightPx())));
+            if (lines !== splitTopLines) {
+                splitTopLines = lines;
+                applySplitSize();
+            }
+        },
+        // Let go: the size is kept for this page's next split (and a relaunch).
+        end: (d, moved) => {
+            if (moved) saveSplitState();
+        },
+    };
     // The whole lines the top pane shows, and the most it can have in this window (the
     // bottom pane keeps one): what a drag and `/split +<lines>`/`-<lines>` move from.
     function splitLinesShown() {
@@ -9783,30 +9800,6 @@
         const shown = Math.min(most, Math.max(1, Math.floor((top.offsetHeight - pad) / row + 0.01)));
         return { shown: shown, most: most };
     }
-    function moveSplitResize(e) {
-        const d = splitResizeDrag;
-        if (!d || !splitPane) return;
-        const dy = e.clientY - d.y;
-        if (!d.moved && Math.abs(dy) < 3) return;
-        d.moved = true;
-        const top = splitPane.onTop ? splitPane.container : elements.outputContainer;
-        const row = lineHeightPx();
-        const pad = splitPaneHeight(top, 0);
-        const most = splitLinesShown().most;
-        const lines = Math.min(most, Math.max(1, Math.round((d.h + dy - pad) / row)));
-        if (lines !== splitTopLines) {
-            splitTopLines = lines;
-            applySplitSize();
-        }
-        e.preventDefault();
-    }
-    // Let go: the size is kept for this page's next split (and a relaunch).
-    function endSplitResize() {
-        const d = splitResizeDrag;
-        splitResizeDrag = null;
-        if (d && d.moved) saveSplitState();
-    }
-
     // What /split was given: `-n <lines>` (`-n10` too) as `lines`, or `+<lines>`/`-<lines>`
     // as `by`, then a world name. A port of util.rs parse_split_args; `error` is the line to
     // say. A `+` word that isn't a number is a world's name.
@@ -9880,10 +9873,7 @@
             if (e.target.closest && e.target.closest('a')) return;
             splitFocusSwap();
         });
-        bar.addEventListener('pointerdown', startSplitResize);
-        bar.addEventListener('pointermove', moveSplitResize);
-        bar.addEventListener('pointerup', endSplitResize);
-        bar.addEventListener('pointercancel', endSplitResize);
+        attachBarDrag(bar, splitResizeDrag);
         // Its More/History badge releases a screenful of its pane, as the status bar's does
         // (the focus comes to the pane first).
         bar.querySelector('.status-more').addEventListener('click', guard('paneMore', (e) => {
@@ -10316,6 +10306,7 @@
             { l: '/worlds -e [name]', r: 'Edit a world (a new name makes one)' },
             { l: '/worlds -l &lt;name&gt;', r: 'Connect without auto-login' },
             { l: '/worlds -b &lt;name&gt;', r: 'Connect in background (no switch)' },
+            { l: '/shell (or /sh)', r: 'Go to the shell world, a terminal (made and started when need be)' },
             { l: '/addworld [-x] name host port', r: 'Create a new world' },
             { l: '/disconnect [world|-ALL] (or /dc)', r: 'Disconnect a world (the current one if none)' },
             { l: '/connections (or /l)', r: 'List connected worlds' },
@@ -10870,9 +10861,9 @@
             '  terminals that support combined emoji (ZWJ). If',
             '  unsupported, shows two separate emoji instead of',
             '  one combined one.', '',
-            'Picture Host: Where Import Picture uploads a picture',
+            'Picture Host: Where Share Picture uploads a picture',
             '  (dragged onto the window or terminal, or chosen with',
-            '  Import Picture in the menu); its link goes into the',
+            '  Share Picture in the menu); its link goes into the',
             '  input line. "+ URL Short" runs the link through',
             '  /url\'s shortening. "(2d)": tmpfiles.org deletes it',
             '  after 2 days. Uploads are public. "Off" turns',
@@ -15012,29 +15003,105 @@
         if (inputHeight !== before) sendGlobalSettings();
     }
 
-    // Dragging the input's top edge (#input-resize-handle) up or down: the height follows
-    // in whole rows while the pointer moves, and is saved when it is let go. Pointer
-    // capture keeps the move and release coming to the handle once the pointer has left
-    // it, mouse and touch alike.
-    let inputResizeDrag = null; // { y: where the drag started, rows: the height then }
-    function startInputResize(e) {
-        if (e.button !== undefined && e.button !== 0) return;
-        inputResizeDrag = { y: e.clientY, rows: inputHeight };
-        try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* a mouse event without capture */ }
-        e.preventDefault();
+    // ============================================================================
+    // Dragging a bar up or down
+    // ============================================================================
+    // Three bars drag: the input's top edge (#input-resize-handle) and, in a touch layout,
+    // the separator bar (#status-bar) both resize the input; a split's pane bar moves the
+    // line between the panes. A press becomes a drag only once it has moved BAR_DRAG_SLOP
+    // (a finger wobbles more than a mouse), so a tap on the bar's world name, More, ACT or
+    // notes icon stays a tap; the click a drag ends with is swallowed. Pointer capture
+    // keeps the moves and the release coming once the pointer has left the bar.
+    //   opts.canStart(e)    - may this press start one (default: yes)
+    //   opts.begin(e)       - the drag's state, or null for no drag
+    //   opts.move(state, dy) - dy: px from where the press started, down positive
+    //   opts.end(state, moved)
+    //   opts.claimPress     - the bar is only a handle: capture and keep the press at once
+    function barDragSlop(e) {
+        return e.pointerType === 'mouse' ? 3 : 8;
     }
-    function moveInputResize(e) {
-        if (!inputResizeDrag) return;
-        const rowH = (webFontLineHeight || 1.2) * (currentFontSize || 14);
-        const rows = Math.max(1, Math.min(15, Math.round(inputResizeDrag.rows + (inputResizeDrag.y - e.clientY) / rowH)));
-        if (rows !== inputHeight) setInputHeight(rows);
-        e.preventDefault();
+    function attachBarDrag(el, opts) {
+        let drag = null;            // { id, y, slop, moved, state }
+        let swallowClickUntil = 0;  // a drag's own click, if one follows it
+        const capture = (e) => {
+            try { el.setPointerCapture(e.pointerId); } catch (err) { /* a mouse event without capture */ }
+        };
+        el.addEventListener('pointerdown', (e) => {
+            swallowClickUntil = 0;
+            if (drag || (e.button !== undefined && e.button !== 0)) return;
+            if (opts.canStart && !opts.canStart(e)) return;
+            const state = opts.begin(e);
+            if (state === null || state === undefined) return;
+            drag = { id: e.pointerId, y: e.clientY, slop: barDragSlop(e), moved: false, state: state };
+            // A tap must still reach the button under it, so a bar with buttons captures
+            // only once the press has become a drag.
+            if (opts.claimPress) {
+                capture(e);
+                e.preventDefault();
+            }
+        });
+        el.addEventListener('pointermove', (e) => {
+            const d = drag;
+            if (!d || e.pointerId !== d.id) return;
+            const dy = e.clientY - d.y;
+            if (!d.moved) {
+                if (Math.abs(dy) < d.slop) return;
+                d.moved = true;
+                if (!opts.claimPress) capture(e);
+            }
+            opts.move(d.state, dy);
+            e.preventDefault();
+        });
+        const finish = (e) => {
+            const d = drag;
+            if (!d || e.pointerId !== d.id) return;
+            drag = null;
+            if (d.moved) swallowClickUntil = Date.now() + 500;
+            opts.end(d.state, d.moved);
+        };
+        el.addEventListener('pointerup', finish);
+        el.addEventListener('pointercancel', finish);
+        el.addEventListener('click', (e) => {
+            if (Date.now() >= swallowClickUntil) return;
+            swallowClickUntil = 0;
+            e.stopPropagation();
+            e.preventDefault();
+        }, true);
     }
-    function endInputResize(e) {
-        if (!inputResizeDrag) return;
-        const from = inputResizeDrag.rows;
-        inputResizeDrag = null;
-        if (inputHeight !== from) sendGlobalSettings();
+
+    // Resizing the input by a drag: in whole rows while the pointer moves, saved as this
+    // device's input height when it is let go. 1 to 15 rows, and never so many that the
+    // output has no line left (each pane one while split).
+    function inputRowsToSpare() {
+        const panes = [elements.outputContainer];
+        if (splitPane) panes.push(splitPane.container);
+        let spare = 0;
+        for (const p of panes) {
+            if (p && p.offsetParent !== null) spare += Math.max(0, p.offsetHeight - splitPaneHeight(p, 1));
+        }
+        return Math.floor(spare / inputRowPx());
+    }
+    const inputResizeDrag = {
+        begin: () => ({ rows: inputHeight, most: Math.max(inputHeight, Math.min(15, inputHeight + inputRowsToSpare())) }),
+        move: (d, dy) => {
+            const rows = Math.max(1, Math.min(d.most, Math.round(d.rows - dy / inputRowPx())));
+            if (rows !== inputHeight) setInputHeight(rows);
+        },
+        end: (d) => {
+            if (inputHeight !== d.rows) sendGlobalSettings();
+        },
+    };
+
+    // The separator bar is a drag handle for the input in a touch layout: the phone and
+    // tablet layouts and the Android app, its keyboard-and-mouse look included (user
+    // ruling 2026-11-17). A desktop's GUIs keep the input's top edge. The menu button and
+    // the font slider keep their own gestures.
+    function separatorDragOn() {
+        return deviceMode !== 'desktop' || !!window.Android;
+    }
+    function separatorDragCanStart(e) {
+        if (!separatorDragOn()) return false;
+        return !(e.target.closest && e.target.closest('.status-menu-btn, .font-slider-group, input, button, select, textarea, a'));
     }
 
     // Force browser to repaint (fixes delayed rendering when tab isn't focused)
@@ -21923,14 +21990,13 @@
         // renderEmojiTabs() itself, since the buttons are built there from
         // emojiCategories rather than existing statically in the DOM.
         if (elements.emojiCloseBtn) elements.emojiCloseBtn.onclick = closeEmojiPopup;
-        // The input's top edge resizes it (see startInputResize).
+        // The input's top edge resizes it, and in a touch layout so does the separator bar
+        // (see attachBarDrag).
         const inputResizeHandle = document.getElementById('input-resize-handle');
         if (inputResizeHandle) {
-            inputResizeHandle.addEventListener('pointerdown', startInputResize);
-            inputResizeHandle.addEventListener('pointermove', moveInputResize);
-            inputResizeHandle.addEventListener('pointerup', endInputResize);
-            inputResizeHandle.addEventListener('pointercancel', endInputResize);
+            attachBarDrag(inputResizeHandle, Object.assign({ claimPress: true }, inputResizeDrag));
         }
+        attachBarDrag(elements.statusBar, Object.assign({ canStart: separatorDragCanStart }, inputResizeDrag));
         if (elements.emojiSearch) elements.emojiSearch.oninput = updateEmojiFilter;
 
         // Actions Editor popup

@@ -114,11 +114,11 @@ cargo build --release --no-default-features --features rustls-backend,ssh-transp
 | `--local-server` | Headless, loopback-only, for an embedding client (needs `CLAY_WS_PASSWORD`); `--port=<N>` overrides the port |
 | `--ssh-proxy` | Headless SSH-forward proxy for an embedding client (`--target=`, `--listen-port=`) |
 | `--conf=<path>` | Custom config file (default `~/.clay/settings.dat`) |
-| `--grep=host[:port] <pattern>` | Search world output; `-w` world, `--regexp`, `--noesc`, `-f` follow |
-| `--grep-archive <pattern>` | Search long-term archive; `-w` world, `--regexp`, `--noesc` |
+| `--grep=host[:port] <pattern>` | Search world output; `-w` world, `--regexp`, `--noesc`, `-f` follow, `-D` its archive too |
+| `--grep -D <pattern>` | Search this machine's archive; `-w` world, `--regexp`, `--noesc` |
 | `--dump[=<dir>]` | Export scrollback archive to CSV |
 | `-v`, `--version` | Show version/build info |
-| `-h`, `--help` | Show help |
+| `-h`, `--help` | The common options (`/help clay` inside Clay has every one) |
 
 Most-needed:
 ```bash

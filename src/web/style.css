@@ -545,6 +545,14 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
     z-index: 2;
 }
 
+/* In a touch layout (the phone and tablet layouts, the Android app) the separator bar is
+   the input's drag handle (app.js separatorDragOn, user ruling 2026-11-17): a finger on it
+   drags rather than pans, and a tap on its buttons is still a tap. */
+body.separator-drag #status-bar {
+    touch-action: none;
+    cursor: ns-resize;
+}
+
 /* TF's status area (/help status area), once a script has made it its own: its rows
    take the place of the bar's own indicators; the controls stay. */
 #status-bar.tf-status-on { height: auto; min-height: var(--status-height); }
@@ -607,7 +615,7 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
    its dot and name only - on the status bar's colour. It and the full #status-bar below
    turn grey (--pane-unfocused-bg: the bar's colour as a grey of the same lightness, set by
    app.js applyPaneGrey) while their pane hasn't the focus; a press on a grey bar moves the
-   focus to its pane, and dragging the bar resizes the panes (app.js startSplitResize). The
+   focus to its pane, and dragging the bar resizes the panes (app.js splitResizeDrag). The
    spacer is the menu button's twin, so the dot sits under the full bar's. */
 .pane-bar {
     display: flex;
@@ -1342,8 +1350,8 @@ html.note-window #app > :not(#note-editor-view):not(.modal) {
 }
 
 /* The input's top edge, a few pixels either side of it: drag to resize the input
-   (app.js startInputResize). Above the prompt and the textarea, and outside the
-   container's own box by 3px so the grab lands on the line itself. */
+   (app.js attachBarDrag, inputResizeDrag). Above the prompt and the textarea, and outside
+   the container's own box by 3px so the grab lands on the line itself. */
 #input-resize-handle {
     position: absolute;
     left: 0;

@@ -1704,7 +1704,7 @@ pub(crate) fn perform_completion(app: &mut App) -> bool {
             // Unified / commands: Clay commands + TF commands + manual actions + macros
             let internal_commands = vec![
                 // Clay-specific commands
-                "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections", "/server",
+                "/help", "/disconnect", "/dc", "/worlds", "/world", "/shell", "/connections", "/server",
                 "/setup", "/web", "/actions", "/reload", "/update", "/quit", "/gag",
                 "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify", "/split", "/unsplit", "/map", "/pause",
                 // TF commands (now available with / prefix)

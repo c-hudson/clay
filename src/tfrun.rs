@@ -1797,8 +1797,9 @@ mod tests {
     }
 
     /// /sh on the console gets the terminal (queued for the console loop); from a client
-    /// it runs in the background, its output and status coming back as TfShellDone, and
-    /// a bare /sh - an interactive shell - can't be had there.
+    /// it runs in the background, its output and status coming back as TfShellDone. A
+    /// bare /sh is the shell world (/shell) - or, in a build without shell worlds, an
+    /// interactive shell, which a client can't have.
     #[tokio::test]
     async fn test_sh_console_gets_terminal_client_runs_captured() {
         let mut app = app_with_world();
@@ -1824,8 +1825,16 @@ mod tests {
         assert!(texts(&app).iter().any(|t| t == "from client"), "{:?}", texts(&app));
         assert_eq!(app.tf_engine.get_var("?").map(|v| v.to_string_value()).as_deref(), Some("4"));
 
-        let _ = app.handle_ws_send_command_impl(1, 0, "/sh", &event_tx);
-        assert!(texts(&app).iter().any(|t| t.contains("interactive shell needs Clay's own console")), "{:?}", texts(&app));
+        let action = app.handle_ws_send_command_impl(1, 0, "/sh", &event_tx);
+        if cfg!(feature = "shell-worlds") {
+            // Made, switched to and handed back to be connected.
+            let idx = app.worlds.iter().position(|w| w.name == "shell").expect("the shell world");
+            assert_eq!(app.worlds[idx].settings.world_type, crate::WorldType::Shell);
+            assert!(matches!(action, WsAsyncAction::Connect { world_index, .. } if world_index == idx));
+        } else {
+            assert!(texts(&app).iter().any(|t| t.contains("interactive shell needs Clay's own console")), "{:?}", texts(&app));
+        }
+        assert!(app.pending_terminal_ops.is_empty());
         let _ = app.handle_ws_send_command_impl(1, 0, "/suspend", &event_tx);
         assert!(app.pending_terminal_ops.is_empty());
     }

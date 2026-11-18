@@ -602,7 +602,7 @@ fn setup_help_text() -> Vec<String> {
         "  continuation lines of long MUD output (0 = off).",
         "  Like TinyFugue's wrapspace, but defaults to 0.",
         "",
-        "Picture Host: Where Import Picture uploads a picture",
+        "Picture Host: Where Share Picture uploads a picture",
         "  (dragged onto the terminal or window, or chosen from",
         "  the menu in the web/GUI/Android UI); its link goes",
         "  into the input line. '+ URL Short' runs the link",

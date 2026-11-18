@@ -2388,12 +2388,28 @@ feature = "New Indicator's background styles: a glow behind the first 4 cells of
 note = "decor flags StyledLine::new_glow, ui/output.rs paints four cells per row"
 
 [[item]]
+id = "ui:input.separator-drag"
+section = "input"
+phase = 0
+status = "waived"
+feature = "In a touch layout (phone, tablet, the Android app) a finger sliding the separator bar resizes the input and saves this device's input height; taps on the bar stay taps (app.js attachBarDrag, separatorDragOn)"
+note = "touch layouts only by user ruling 2026-11-17; the native GUI resizes the input from the strip at its top edge (ui/input_view.rs #input-resize)"
+
+[[item]]
 id = "ui:output.resize-popup"
 section = "output"
 phase = 2
 status = "done"
 feature = "While the window is resized, a small box in its middle shows the output's size in characters (80x24: the output's columns x rows, the pair UpdateViewState reports; split, the output as if it weren't) until a second after the last change; nothing for a move, the start-up, a change of scale or the program's own resize (src/sizepopup.rs; app.js noteWindowResize / #size-popup)"
 note = "ui/sizepopup.rs: ClayView::bounds_observed feeds sizepopup::ResizeWatch from the bounds observer the zoom shares (its own resize is Observed::Ours); a deferred layer with no hitbox; output::view_probe measures a pane showing the splash, output::whole_probe a split's two panes as one"
+
+[[item]]
+id = "ui:window.kept-across-reload"
+section = "output"
+phase = 0
+status = "done"
+feature = "A /reload (or /server, or the restart after /update) reopens the GUI's main window where it was, at its size, maximized or fullscreen if it was, with the zoom it had (src/keptwindow.rs; user request 2026-11-17). The WebView GUI keeps its window the same way; a browser page or the Android app has no window of its own to keep"
+note = "ui/keep.rs: ClayView::keep_note records the window from every bounds report, zoom step and tick; platform's exec paths hand it over in CLAY_KEPT_WINDOW; keep::opening opens from it, and on X11 keep_place moves the window there once the window manager has framed it, then maximizes"
 
 [[item]]
 id = "ui:output.prefix-archive"
@@ -2577,7 +2593,7 @@ section = "status"
 phase = 2
 status = "done"
 feature = "hamburger menu (dropdown upward); items open their features as those land"
-note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings, Map (not on a multiuser server), Emoji Picker (not on a phone or tablet), Import Picture (when the server uploads pictures) | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab; Notes, Notes List and Recent Worlds left it 2026-10-17: /note, the status bar's note icon, /note -l, and the recent_worlds key action)"
+note = "index.html #menu-dropdown: Help, World Selector, Actions, Settings, Map (not on a multiuser server), Emoji Picker (not on a phone or tablet), Share Picture (when the server uploads pictures) | Toggle Tags, Find, Search History | Change Password, New Window, Resync | Logout (Reload and Import Settings left it 2026-10-15: Ctrl+R, and a button on Settings' General tab; Notes, Notes List and Recent Worlds left it 2026-10-17: /note, the status bar's note icon, /note -l, and the recent_worlds key action)"
 
 [[item]]
 id = "ui:status.world"
@@ -3362,6 +3378,22 @@ phase = 4
 status = "see"
 feature = "wire HistoryLines"
 note = "handled: see msg:HistoryLines"
+
+[[item]]
+id = "wire:GrepArchive"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire GrepArchive"
+note = "sent only by the command line's clay --grep=host -D (remote_client::run_grep_client); no GUI sends it"
+
+[[item]]
+id = "wire:GrepArchiveLines"
+section = "wire"
+phase = 0
+status = "waived"
+feature = "wire GrepArchiveLines"
+note = "the answer to the command line's GrepArchive; no GUI asks for it"
 
 [[item]]
 id = "wire:PictureUpload"

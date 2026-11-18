@@ -2412,6 +2412,8 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
 
     sync_crash_count_env();
     pass_start_to_successor();
+    // The GUI's window, to open where it was (src/keptwindow.rs).
+    crate::keptwindow::pass_to_successor();
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
     // Without TinyFugue's startup options: a reload must not load the rc or connect again.
@@ -2426,6 +2428,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         .exec();
 
     // If we get here, exec failed
+    crate::keptwindow::forget_passed();
     Err(io::Error::other(format!("exec failed: {} (path: {})", err, exe.display())))
 }
 
@@ -2563,6 +2566,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     debug_log(is_debug_enabled(), &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
     sync_crash_count_env();
     pass_start_to_successor();
+    crate::keptwindow::pass_to_successor();
 
     // On Windows, disable raw mode and leave alternate screen BEFORE spawning
     let _ = crossterm::terminal::disable_raw_mode();
@@ -2601,6 +2605,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             }
             Err(e) => {
                 debug_log(true, &format!("RELOAD: could not start {}: {}", exe.display(), e));
+                crate::keptwindow::forget_passed();
                 return Err(io::Error::other(format!("Failed to spawn reload process: {}", e)));
             }
         }
@@ -2628,6 +2633,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
                 std::env::remove_var("CLAY_RELOAD_SYNC_EVENT");
                 unsafe { CloseHandle(sync_event); }
             }
+            crate::keptwindow::forget_passed();
             Err(io::Error::other(format!("Failed to spawn reload process: {} (path: {})", e, exe.display())))
         }
     }
@@ -2699,8 +2705,11 @@ fn exec_relaunch_with_args(args: Vec<String>, use_gui: bool) -> io::Result<()> {
     }
 
     debug_log(is_debug_enabled(), &format!("RELAUNCH: About to exec {} with args={:?}", exe.display(), args));
+    // The GUI's window, to open where it was (src/keptwindow.rs).
+    crate::keptwindow::pass_to_successor();
     give_back_stderr();
     let err = std::process::Command::new(&exe).args(&args).exec();
+    crate::keptwindow::forget_passed();
 
     // If we get here, exec failed — restore the terminal so the caller isn't left broken.
     if !use_gui {
@@ -2721,9 +2730,13 @@ fn exec_relaunch_with_args(args: Vec<String>, _use_gui: bool) -> io::Result<()> 
     if !exe.exists() {
         return Err(io::Error::other(format!("Executable not found. Debug: {}", debug_info)));
     }
+    crate::keptwindow::pass_to_successor();
     match std::process::Command::new(&exe).args(&args).spawn() {
         Ok(_) => std::process::exit(0),
-        Err(e) => Err(io::Error::other(format!("Failed to spawn process: {} (path: {})", e, exe.display()))),
+        Err(e) => {
+            crate::keptwindow::forget_passed();
+            Err(io::Error::other(format!("Failed to spawn process: {} (path: {})", e, exe.display())))
+        }
     }
 }
 

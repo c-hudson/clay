@@ -114,12 +114,15 @@ only repeats/quotes), `/kill <pid>` stops one.
 
 ## Shell
 
-`/sh <command>` runs a command with /bin/sh, and plain `/sh` an interactive
-`%SHELL`, on the terminal: Clay's screen is put away while it runs and comes
-back after a keypress (`%shpause`). `%?` is its exit status. `^C` reaches
-only the shell. From the web/GUI client, or a Clay with no console, a command
-runs in the background and its output is shown when it finishes. `/suspend`
-stops Clay as `^Z` does. TF's `/psh` comes with `/require psh.tf`.
+`/sh <command>` runs a command with /bin/sh on the terminal: Clay's screen is
+put away while it runs and comes back after a keypress (`%shpause`). `%?` is
+its exit status. `^C` reaches only the command. From the web/GUI client, or a
+Clay with no console, a command runs in the background and its output is
+shown when it finishes. Plain `/sh` is Clay's `/shell`: it goes to the world
+named `shell`, a terminal in every interface, making it first if need be (see
+[Shell Worlds](23-shell-worlds.md)); only a Clay built without shell worlds
+runs TF's interactive `%SHELL` on the console instead. `/suspend` stops Clay as
+`^Z` does. TF's `/psh` comes with `/require psh.tf`.
 
 ## Prompts
 
@@ -613,7 +616,8 @@ per-key/per-command ruling tables this was decided from.
   TF's own `% Redefined macro X` message unless a REDEF hook gags it.
   `/list`/`/purge`'s own filter semantics are otherwise unchanged from
   Clay's pre-parity behavior.
-- **Console-only**: an interactive `/sh`,
+- **Console-only**: an interactive `/sh` (only in a Clay built without
+  shell worlds; elsewhere a bare `/sh` is `/shell`),
   `/suspend`, `/limit`/`/unlimit`/`/relimit` (drive the console's own
   F4 filter popup — a remote client's `/limit` reaches the shared engine
   but nothing drains it until the console next processes a typed command),

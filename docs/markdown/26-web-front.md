@@ -41,7 +41,7 @@ and `#` comments, nothing else, and these are all its keys:
 Anything else - a key the sample doesn't have, a `[section]`, a value that isn't what the
 key takes - stops clay_web at start, naming the line. Everything a visitor's Clay could
 otherwise be set up with is fixed: Clay's defaults (more-mode on, spell check on, no text
-reveal, three input rows), the status panel off, Import Picture off, GMCP off, no triggers,
+reveal, three input rows), the status panel off, Share Picture off, GMCP off, no triggers,
 and the **Dark - New** theme, which each visitor may switch to **Light - New** from the
 page's menu. Everyone may connect; an address that probes other paths or floods
 connections is banned (see below).

@@ -85,6 +85,8 @@ impl ClayView {
         if follow {
             self.scroll.borrow_mut().follow_bottom();
         }
+        // A maximized window's step changes no bounds: the restart's record gets the level.
+        self.keep_note(window, cx);
         cx.notify();
     }
 
@@ -113,7 +115,7 @@ impl ClayView {
 }
 
 /// A window the platform won't place or locate: a Wayland one.
-fn unplaced(window: &Window) -> bool {
+pub(super) fn unplaced(window: &Window) -> bool {
     #[cfg(target_os = "linux")]
     {
         super::wl::is_wayland(window)
@@ -133,7 +135,7 @@ fn resizable(window: &Window) -> bool {
 /// The window now: where its content is, in global logical pixels, and its content size.
 /// GPUI's bounds are the content's place on X11 and Windows; AppKit's are the frame's, so
 /// the content sits a title bar lower there.
-fn window_rect(window: &Window) -> Rect {
+pub(super) fn window_rect(window: &Window) -> Rect {
     let b = window.bounds();
     let s = window.viewport_size();
     let x = f32::from(b.origin.x);
@@ -172,6 +174,19 @@ fn frame_of(window: &Window) -> Frame {
     }
 }
 
+/// The frame once the platform tells it: `None` on X11 before the window manager has
+/// framed the window (or with none); elsewhere `frame_of`'s at once.
+pub(super) fn frame_known(window: &Window) -> Option<Frame> {
+    #[cfg(target_os = "linux")]
+    {
+        x11::frame_extents(window)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(frame_of(window))
+    }
+}
+
 /// The usable area of the monitor the window is on (panels and docks excluded), in
 /// global logical pixels, when known.
 fn work_area(window: &Window, cx: &gpui::App) -> Option<Rect> {
@@ -186,7 +201,7 @@ fn work_area(window: &Window, cx: &gpui::App) -> Option<Rect> {
 
 /// Put the window's frame's top-left at (`x`, `y`) in global logical pixels, where the
 /// platform lets a program do that (see the module doc).
-fn move_window(window: &Window, x: f32, y: f32) {
+pub(super) fn move_window(window: &Window, x: f32, y: f32) {
     #[cfg(target_os = "linux")]
     x11::move_to(window, x, y);
     #[cfg(target_os = "windows")]

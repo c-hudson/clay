@@ -721,8 +721,7 @@ fn fts_match_expr(pattern: &str, kind: PatternKind) -> Option<String> {
     Some(expr)
 }
 
-/// Run an `ArchiveQuery`. This is the v2 read path; `search` remains as the
-/// name-and-timestamp wrapper `--grep-archive` uses.
+/// Run an `ArchiveQuery`. This is the v2 read path (`/recall -D`, `clay --grep -D`).
 ///
 /// The bounded work is what matters here: `wid = ? AND wseq < ?` is a leading
 /// equality plus a range on `idx_log_wid_wseq`, so SQLite walks an index range
@@ -881,6 +880,21 @@ pub fn query(path: &Path, q: &ArchiveQuery) -> Vec<ScrollbackLine> {
         out.reverse();
     }
     out
+}
+
+/// Every world name the archive holds, each once (case aside): the worlds a search of
+/// "every world" asks `query` about one at a time, those Clay no longer has included.
+pub fn world_names(path: &Path) -> Vec<String> {
+    let Some(conn) = open_reader(path) else { return Vec::new() };
+    if archive_state(&conn) != ArchiveState::Ready {
+        return Vec::new();
+    }
+    let Ok(mut stmt) = conn.prepare("SELECT name FROM worlds GROUP BY name COLLATE NOCASE ORDER BY MIN(wid)") else {
+        return Vec::new();
+    };
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default()
 }
 
 /// Load up to `count` archived lines immediately preceding `before_wseq` for a

@@ -186,6 +186,28 @@ impl ZoomState {
         self.level != 0
     }
 
+    /// What a restart keeps (src/keptwindow.rs): the level, the base, and whether the
+    /// window is maximized by a step of ours. `None` at 1:1, where the window is all there
+    /// is to keep.
+    pub fn kept(&self) -> Option<(i8, Option<Rect>, bool)> {
+        self.active().then_some((self.level, self.base, self.maxed != Maxed::No))
+    }
+
+    /// The zoom a restart kept, on the window it sized, now at `at` (the kept window). The
+    /// window counts as ours there - its report is an echo, a move from it the user's (or
+    /// the window manager's), which takes the base along - so 1:1 still comes back to
+    /// the base exactly, and a level that was clamped to the screen stays clamped.
+    pub fn resumed(level: i8, base: Option<Rect>, at: Rect, maxed: bool) -> ZoomState {
+        let level = level.clamp(MIN_LEVEL, MAX_LEVEL);
+        ZoomState {
+            level,
+            base: base.filter(|_| level != 0),
+            expected: None,
+            applied: base.map(|_| at),
+            maxed: if maxed && level != 0 { Maxed::Seen } else { Maxed::No },
+        }
+    }
+
     /// Take a step. `current` is the window now, `screen` its monitor's usable area when
     /// known, `resizable` false for a maximized or fullscreen window. `None` means
     /// nothing changes - not the level, not the text, not the window.
@@ -469,6 +491,45 @@ mod tests {
         // original hung off the screen's bottom, as this one did.
         let c = z.step(Step::Out, c.bounds.unwrap(), Some(screen), true, now).unwrap();
         assert_eq!(c.bounds, Some(start));
+    }
+
+    /// A restart keeps the zoom with the window (src/keptwindow.rs): the restored state
+    /// is the one left, so a clamped level stays clamped, 1:1 comes back to the base
+    /// exactly, and a window manager placing the new window elsewhere first and Clay
+    /// moving it back takes the base there and back with it.
+    #[test]
+    fn a_kept_zoom_resumes_where_it_was() {
+        let screen = Rect::new(0.0, 0.0, 1280.0, 720.0);
+        let start = Rect::new(300.0, 200.0, 800.0, 600.0);
+        let mut z = ZoomState::default();
+        let now = Instant::now();
+        assert_eq!(z.kept(), None, "1:1 keeps nothing");
+        let c = z.step(Step::In, start, Some(screen), true, now).unwrap();
+        z.observed(c.bounds.unwrap(), true, now);
+        let c = z.step(Step::In, c.bounds.unwrap(), Some(screen), true, now).unwrap();
+        let clamped = c.bounds.unwrap();
+        z.observed(clamped, true, now);
+        let (level, base, maxed) = z.kept().expect("zoomed");
+        assert_eq!((level, base, maxed), (2, Some(start), false));
+
+        // The successor: its window opens at the clamped bounds, the window manager puts
+        // it elsewhere, Clay moves it back.
+        let mut z = ZoomState::resumed(level, base, clamped, maxed);
+        assert!(near(z.scale(), 1.44));
+        assert_eq!(z.observed(clamped, true, now), Observed::Ours, "the window it sized is an echo");
+        let elsewhere = Rect::new(40.0, 30.0, clamped.w, clamped.h);
+        assert_eq!(z.observed(elsewhere, true, now), Observed::Theirs);
+        z.observed(clamped, true, now);
+        assert_eq!(z.step(Step::In, clamped, Some(screen), true, now), None, "still clamped");
+        let c = z.step(Step::Reset, clamped, Some(screen), true, now).unwrap();
+        assert_eq!(c.bounds, Some(start), "1:1 is the base, place included");
+
+        // Zoomed while maximized: only the text was, so only the level comes back.
+        let z = ZoomState::resumed(3, None, screen, false);
+        assert_eq!(z.kept(), Some((3, None, false)));
+        // Out of range or at 1:1, nothing odd survives.
+        assert_eq!(ZoomState::resumed(40, None, screen, true).level(), MAX_LEVEL);
+        assert_eq!(ZoomState::resumed(0, Some(start), screen, true).kept(), None);
     }
 
     #[test]

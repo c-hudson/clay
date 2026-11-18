@@ -12096,6 +12096,7 @@ third
             picture_upload: false,
             map: false,
             history_on_demand: false,
+            grep_archive: false,
             resume_session: false,
             info_report: false,
             shell_worlds: true,
@@ -17235,6 +17236,61 @@ third
         assert_eq!(archive.first().map(|a| a.text.as_str()), Some("archived 0"));
         assert_eq!(archive.last().map(|a| a.text.as_str()), Some("archived 19"));
         assert!(done, "fewer rows than asked for: nothing older");
+    }
+
+    fn grep_archive_reply(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) -> (Vec<crate::websocket::GrepArchiveHit>, Option<String>) {
+        let mut hits = Vec::new();
+        while let Ok(out) = rx.try_recv() {
+            if let crate::websocket::Outbound::Message(msg) = out {
+                if let WsMessage::GrepArchiveLines { lines, done, error, .. } = *msg {
+                    hits.extend(lines);
+                    if done {
+                        return (hits, error);
+                    }
+                }
+            }
+        }
+        panic!("no last GrepArchiveLines");
+    }
+
+    /// `clay --grep=host -D`: the archive below each world's oldest live line (the client
+    /// has those from its backfill), a world Clay no longer has searched whole, matched as
+    /// `--grep` matches (a glob found anywhere in the line, any case); none while the
+    /// archive is off.
+    #[test]
+    fn test_grep_archive_is_cut_at_memory_and_finds_a_world_gone() {
+        let name = "GrepArchiveCut";
+        let gone = "GrepArchiveGone";
+        let wseqs = seed_history_archive(name, 30, |_| false);
+        seed_history_archive(gone, 5, |_| false);
+        let mut app = App::new();
+        app.settings.scrollback_enabled = true;
+        app.worlds = vec![World::new(name)];
+        for (seq, w) in wseqs[20..].iter().enumerate() {
+            let mut l = OutputLine::new(format!("archived {}", 20 + seq), seq as u64);
+            l.archive_seq = Some(*w);
+            app.worlds[0].output_lines.push(l);
+        }
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        while rx.try_recv().is_ok() {}
+
+        let regex = crate::remote_client::grep_regex("ARCHIVED 2", false);
+        app.handle_grep_archive(client_id, 1, None, regex.clone());
+        let (hits, error) = grep_archive_reply(&mut rx);
+        assert_eq!(error, None);
+        let of = |w: &str| hits.iter().filter(|h| h.world == w).map(|h| h.text.clone()).collect::<Vec<_>>();
+        assert_eq!(of(name), vec!["archived 2"], "20-29 are live: the client searches those itself");
+        assert_eq!(of(gone), vec!["archived 2"], "a world only the archive has is searched whole");
+
+        app.handle_grep_archive(client_id, 2, Some(gone.to_lowercase()), crate::remote_client::grep_regex("*", false));
+        let (hits, _) = grep_archive_reply(&mut rx);
+        assert_eq!(hits.iter().map(|h| h.text.clone()).collect::<Vec<_>>(), (0..5).map(|i| format!("archived {i}")).collect::<Vec<_>>(),
+            "one world, by name in any case, oldest first");
+
+        app.settings.scrollback_enabled = false;
+        app.handle_grep_archive(client_id, 3, None, regex);
+        let (hits, error) = grep_archive_reply(&mut rx);
+        assert!(hits.is_empty() && error.is_some_and(|e| e.contains("Archive Input/Output")));
     }
 
     #[test]

@@ -472,6 +472,11 @@ pub enum WsMessage {
         /// is; a multiuser server, which has no archive, says false. `serde(default)` = false.
         #[serde(default)]
         history_on_demand: bool,
+        /// `true` = this server takes `GrepArchive` (`clay --grep=host -D`: search its
+        /// archive). False where `history_on_demand` is: an instance with no files of its
+        /// own. `serde(default)` = false (an older server).
+        #[serde(default)]
+        grep_archive: bool,
         /// `true` = this server has the map (src/map) and takes `MapWatch`, `MapRoute`,
         /// `MapStop` and `MapSearch`. Gated as `other_views` is; a multiuser server says
         /// false. `serde(default)` = false.
@@ -1407,6 +1412,25 @@ pub enum WsMessage {
         #[serde(default)] archive: Vec<ArchiveLine>,
         #[serde(default)] done: bool,
     },
+    // (client -> server) `clay --grep=host -D`: the archive's lines matching `regex`
+    // (case-insensitive, matched against the line without its escape codes), of `world` or
+    // of every world, each world Clay holds cut at its oldest live line as /recall -D cuts
+    // it, so nothing the client also gets from RequestScrollback comes twice. Answered with
+    // GrepArchiveLines. Sent only to a server whose InitialState.grep_archive says it takes it.
+    GrepArchive {
+        request_id: u64,
+        #[serde(default)] world: Option<String>,
+        regex: String,
+    },
+    // (server -> client) A part of the answer to GrepArchive, oldest first within a world;
+    // the last has `done`. `error`: no archive to search (the client still searches the live
+    // lines).
+    GrepArchiveLines {
+        request_id: u64,
+        #[serde(default)] lines: Vec<GrepArchiveHit>,
+        #[serde(default)] done: bool,
+        #[serde(default)] error: Option<String>,
+    },
     // (server -> client) This many bytes of upload `id` have arrived (one per chunk; the
     // client keeps picture::ACK_WINDOW chunks unacknowledged).
     PictureUploadAck { id: u64, received: u64 },
@@ -1750,6 +1774,14 @@ pub struct ArchiveLine {
     pub wseq: Option<i64>,
     #[serde(default)]
     pub gagged: bool,
+}
+
+/// One archive line that matched a `GrepArchive` (`GrepArchiveLines.lines`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct GrepArchiveHit {
+    pub world: String,
+    pub ts_ms: i64,
+    pub text: String,
 }
 
 /// A line of output with timestamp

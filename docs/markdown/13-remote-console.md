@@ -70,7 +70,7 @@ The remote console provides the identical interface to the main console:
 - Command history
 - Spell checking (if enabled on master)
 - Importing a picture by dragging it onto the terminal: the file is read on this console's
-  machine and sent to the server, which uploads it (see **Importing a Picture** in the
+  machine and sent to the server, which uploads it (see **Sharing a Picture** in the
   Interface chapter)
 
 ## Key Differences from Main Console

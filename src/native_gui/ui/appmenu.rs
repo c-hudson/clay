@@ -883,7 +883,7 @@ mod linux {
             let first = Structure::try_from(root[0][":section"].clone()).expect("a section link");
             assert_eq!(first.fields().len(), 2);
             let labels: Vec<Vec<String>> = group[1..].iter().map(|(_, _, items)| items.iter().map(|i| text(&i["label"])).collect()).collect();
-            assert_eq!(labels[0], ["Help", "World Selector", "Edit World", "Actions", "Settings", "Map", "Emoji Picker", "Import Picture"]);
+            assert_eq!(labels[0], ["Help", "World Selector", "Edit World", "Actions", "Settings", "Map", "Emoji Picker", "Share Picture"]);
             assert_eq!(labels[4], ["Quit"]);
             let help = &group[1].2[0];
             assert_eq!(text(&help["action"]), "win.help");

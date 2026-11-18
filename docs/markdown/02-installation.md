@@ -197,6 +197,12 @@ GUI chapter.
 | `--local-server` | Run headless, loopback-only, for an embedding client (e.g. the Android app); with `CLAY_LOCAL_SERVER_LAN=1` in the environment it listens on every interface (the app's Allow Other Devices) |
 | `--port=<N>` | Override the listen port (used with `--local-server`) |
 | `--upgrade` | Download the newest release from GitHub, install it over this binary and exit, without starting the console or a GUI (`/update`'s install, from the command line). A Clay already running from the same file keeps its version until it restarts or `/reload`s. Not on Termux |
+| `--grep=host[:port] <pattern>` | Search a running Clay's output and print the matching lines (`CLAY_PASSWORD` holds its password): `-w <world>` one world, `--regexp` a regular expression instead of a glob, `--noesc` without colour codes, `-f` follow new output like `tail -f`, `-D` its archive too, each line dated |
+| `--grep -D <pattern>` | Search this machine's archive (`~/.clay/scrollback.db`) directly, with no Clay running; `-w`, `--regexp` and `--noesc` as above |
+| `--dump[=<dir>]` | Export the archive to `scrollback_dump.csv` (default: the current directory) |
+
+`clay -h` lists the common options. Inside Clay, `/help clay` lists them all, the
+TinyFugue ones (`-f<file>`, `-c<cmd>`, ...) included.
 
 Remote connections always use `--console=host:port`, `--gui=host:port` or `--web-gui=host:port` — there is
 no separate flag for it.

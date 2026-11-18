@@ -44,6 +44,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /help <command>      - Help on a specific command (e.g. /help def)",
     "  /help keys           - Keyboard bindings (short list)",
     "  /help web            - Remote access, and the browser editors",
+    "  /help clay           - Command-line options",
 ];
 
 /// Topic-specific help content for Clay commands.
@@ -74,6 +75,22 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "  Tab - Cycle buttons   Esc - Close",
             "  Type to filter        F - Focus filter",
             "  A Add  E Edit  D Delete  O Connect  C Cancel",
+        ],
+        "shell" => vec![
+            "/shell                     Go to the shell world",
+            "/sh                        The same (/sh <command> runs",
+            "                           a command: /help sh)",
+            "",
+            "Switches to the world named \"shell\", a terminal on the",
+            "machine Clay runs on. When there is no such world it is",
+            "made: a Shell world running your login shell (change its",
+            "Command with /worlds -e shell). When its shell isn't",
+            "running, it is started; when it is, /shell only switches.",
+            "",
+            "Keys go to the terminal there; the switch-world keys still",
+            "switch. A world named shell that isn't a Shell world is",
+            "left alone. Not in a Clay built without shell worlds, such",
+            "as the Android app's own server.",
         ],
         "disconnect" | "dc" => vec![
             "/disconnect (or /dc) [<world>|-ALL]   Disconnect a world",
@@ -256,6 +273,92 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "A topic Clay doesn't cover comes from TinyFugue's help",
             "file when tf is installed (/help intro, /help kecho).",
             "Those topics are case-sensitive, as in TF.",
+        ],
+        // Every option a user types (user request 2026-11-17: `clay -h`, main.rs
+        // CLI_USAGE, keeps the common ones). The internal ones (--reload, --crash,
+        // --tls-proxy=, --gui-snapshot=, --gui-verify) stay out; a test pins the rest.
+        "clay" => vec![
+            "clay [options] [<world> | <host> <port>]",
+            "",
+            "Every command-line option (clay -h lists the common ones).",
+            "",
+            "Interfaces:",
+            "  --console               The console (TUI)",
+            "  --console=host[:port][/path]",
+            "                          Attach the console to a Clay server",
+            "                          (port 9000, web path clay)",
+            "  --gui                   The GUI (the native one; a build",
+            "                          without it opens the WebView one)",
+            "  --gui=host[:port]       Attach the GUI to a Clay server",
+            "  --web-gui[=host[:port]] The WebView GUI, where it is built",
+            "                          (Termux); elsewhere the same as --gui",
+            "  --ssh                   Reach the --console=, --gui= or",
+            "                          --web-gui= host through SSH, written",
+            "                          [user@]host[:clayport[:sshport]]",
+            "                          (9000, 22 and your login name by",
+            "                          default). Keys from ssh-agent, then",
+            "                          ~/.ssh/id_*; the console asks for a",
+            "                          key's passphrase, a GUI doesn't.",
+            "  With none of these: the GUI where a window can open (a",
+            "  desktop session, not a terminal over SSH), else the console.",
+            "",
+            "Servers:",
+            "  -D                      A headless daemon server",
+            "  --multiuser             The multiuser server (clay_multi)",
+            "  --web-front             The web gateway (clay_web)",
+            "  --local-server          Headless and loopback-only, for an",
+            "                          embedding client (the Android app);",
+            "                          needs CLAY_WS_PASSWORD",
+            "  --port=<N>              Its listen port (--local-server)",
+            "  --ssh-proxy             Headless: forward 127.0.0.1:<listen",
+            "                          port> to a Clay over SSH (the app)",
+            "  --target=[user@]host:clayport:sshport",
+            "                          Where to (with --ssh-proxy)",
+            "  --listen-port=<N>       The local port (with --ssh-proxy);",
+            "                          credentials in CLAY_SSH_KEY,",
+            "                          CLAY_SSH_KEY_PASSPHRASE or",
+            "                          CLAY_SSH_PASSWORD (one at least)",
+            "",
+            "Searching output:",
+            "  --grep=host[:port] <pattern>",
+            "                          Search a Clay's output (port 9000);",
+            "                          its password in CLAY_PASSWORD",
+            "    -w <world>            Only that world",
+            "    --regexp              A regexp (else a glob: * and ?),",
+            "                          found anywhere in a line, any case",
+            "    --noesc               Leave out the ANSI color codes",
+            "    -f                    Follow new output until Ctrl+C",
+            "    -D                    Its archive too, each line dated (a",
+            "                          Clay older than this one can't)",
+            "  --grep -D <pattern>     This machine's archive, read",
+            "                          directly: no Clay need be running",
+            "  --dump[=<dir>]          The archive to scrollback_dump.csv",
+            "                          (default: the current directory)",
+            "",
+            "Other:",
+            "  --conf=<path>           This settings file instead of",
+            "                          ~/.clay/settings.dat (clay_web: the",
+            "                          web.dat to read, default ./web.dat)",
+            "  --upgrade               Install the newest release from",
+            "                          GitHub over this binary, and exit",
+            "  --tts-install           Download the Kokoro voice, and exit",
+            "  -v, --version           Version and build information",
+            "  -h, --help              The common options",
+            "",
+            "TinyFugue's (a local console or GUI, or -D):",
+            "  <world>                 Connect to <world> once started",
+            "  <host> <port>           Connect to a temporary world there",
+            "  -f<file>                Load <file> as the startup rc, not",
+            "                          the first of ~/.tfrc, ~/tfrc,",
+            "                          ./.tfrc and ./tfrc",
+            "  -f                      Load no rc",
+            "  -c<cmd>                 Run <cmd> after the rc, as if typed",
+            "  -L<dir>                 TinyFugue's library directory",
+            "  -l                      No automatic login for <world>",
+            "  -q                      Quiet login for <world>",
+            "  -n                      Accepted; Clay never connects at",
+            "                          startup by itself",
+            "  TinyFugue's -v is Clay's version option.",
         ],
         "version" => vec![
             "/version                   Show version info",
@@ -596,6 +699,44 @@ mod tests {
     #[test]
     fn a_bare_help_is_this_page_everywhere() {
         assert_eq!(crate::tf::parser::help_text(&crate::tf::TfEngine::new(), ""), HELP_LINES.join("\n"));
+    }
+
+    /// `/help clay` has every option a user types: each `--name` the command-line parser
+    /// in main.rs takes, and everything `clay -h` (`CLI_USAGE`) shows. A new option the
+    /// topic doesn't name fails here.
+    #[test]
+    fn help_clay_names_every_command_line_option() {
+        let topic = get_topic_help("clay").unwrap().join("\n");
+        let names = |text: &str| -> Vec<String> {
+            regex::Regex::new(r"--[a-z][a-z-]*").unwrap()
+                .find_iter(text).map(|m| m.as_str().to_string()).collect()
+        };
+        let src = include_str!("../../main.rs");
+        let parser = &src[src.find("let mut grep_mode = false;").expect("the parser's start")..];
+        let parser = &parser[..parser.find("// TinyFugue's startup options belong").expect("the parser's end")];
+        // Internal: what Clay starts itself with, never typed.
+        const INTERNAL: &[&str] = &["--reload", "--crash", "--tls-proxy", "--gui-snapshot", "--gui-verify"];
+        let mut checked = 0;
+        for name in names(parser).into_iter().chain(names(crate::CLI_USAGE)) {
+            if INTERNAL.contains(&name.as_str()) || name == "--grep-archive" {
+                continue;
+            }
+            assert!(topic.contains(&name), "/help clay doesn't name {name}");
+            checked += 1;
+        }
+        assert!(checked > 20, "the parser wasn't found: {checked}");
+        for short in ["-D", "-v", "-h", "-w", "-f", "-c<cmd>", "-L<dir>", "-l", "-q", "-n"] {
+            assert!(topic.contains(&format!("  {short}")) || topic.contains(&format!(" {short} ")), "/help clay doesn't name {short}");
+        }
+    }
+
+    /// `clay -h` is the user's text (2026-11-17), its last line naming the topic.
+    #[test]
+    fn clay_h_points_at_the_topic() {
+        assert!(crate::CLI_USAGE.starts_with("Usage: clay [OPTIONS] [<world> | <host> <port>]\n"));
+        assert!(crate::CLI_USAGE.trim_end().ends_with("See clay help for additional command line options."));
+        assert!(get_topic_help("clay").is_some());
+        assert!(HELP_LINES.iter().any(|l| l.contains("/help clay")));
     }
 
     /// A topic lives in one file. The console asks this file first, every other

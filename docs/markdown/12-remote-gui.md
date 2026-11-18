@@ -124,8 +124,8 @@ different about running it as a native window instead of a browser tab:
   - **Paste**: the clipboard into the input line, exactly as the input's own Paste does.
     On macOS the WebView may ask you to confirm it.
   - **Debug Selection** (see below).
-- Menu > Import Picture opens a file dialog, and a picture dragged onto the window is
-  uploaded too (see **Importing a Picture** in the Interface chapter). The native GUI does
+- Menu > Share Picture opens a file dialog, and a picture dragged onto the window is
+  uploaded too (see **Sharing a Picture** in the Interface chapter). The native GUI does
   the same; on Linux its file dialog needs xdg-desktop-portal, and without it a drag
   still works.
 
@@ -191,7 +191,8 @@ window that would outgrow its monitor becomes the size of the screen instead - t
 usable area, title bar and borders included, whichever edge it reached first - and
 further steps do nothing until you zoom out again; zooming back to 1:1 restores the
 window's original size and place. The zoom is this window's alone and lives in memory: it is never
-saved, a `/window` zooms by itself, and another Clay is not affected. The chrome (status
+saved, a `/window` zooms by itself, and another Clay is not affected; a `/reload` keeps it
+along with the window's size and place (see the Hot Reload chapter). The chrome (status
 bar, menus, tabs) keeps its size; the font slider still shows the saved text size, and the
 text is drawn at that size times the zoom. If you drag the window to a new size while
 zoomed, later steps scale that size. A zoom step doesn't show the size box a resize by

@@ -1574,10 +1574,27 @@ fn create_webview_window(
     } else {
         Some(tao::window::Theme::Dark)
     };
-    let window = WindowBuilder::new()
+    // A restart's window opens where the last one was, at its size and state
+    // (src/keptwindow.rs: tao's outer position and inner size, logical).
+    let kept = crate::keptwindow::take(crate::keptwindow::WEBVIEW);
+    let mut kept_windowed = crate::keptwindow::Windowed::from(kept.as_ref().map(|k| (k.x, k.y, k.w, k.h)));
+    let (width, height) = kept.as_ref().map_or((800.0, 600.0), |k| (f64::from(k.w), f64::from(k.h)));
+    let mut builder = WindowBuilder::new()
         .with_title(title)
         .with_theme(window_theme)
-        .with_inner_size(tao::dpi::LogicalSize::new(800.0, 600.0))
+        .with_inner_size(tao::dpi::LogicalSize::new(width, height));
+    if let Some(k) = &kept {
+        if k.placed {
+            builder = builder.with_position(tao::dpi::LogicalPosition::new(f64::from(k.x), f64::from(k.y)));
+        }
+        builder = match k.state {
+            crate::keptwindow::WindowState::Windowed => builder,
+            crate::keptwindow::WindowState::Maximized => builder.with_maximized(true),
+            crate::keptwindow::WindowState::Fullscreen => builder.with_fullscreen(Some(tao::window::Fullscreen::Borderless(None))),
+        };
+        crate::debug_log(true, &format!("KEPT WINDOW: opened from {k:?}"));
+    }
+    let window = builder
         .build(&event_loop)
         .map_err(|e| io::Error::other(format!("Failed to create window: {}", e)))?;
 
@@ -1949,6 +1966,12 @@ fn create_webview_window(
                     }
                 }
             }
+            // What a restart keeps (src/keptwindow.rs): the main window as it is now.
+            Event::WindowEvent { event: WindowEvent::Resized(_) | WindowEvent::Moved(_), window_id, .. } if window_id == main_window_id => {
+                if let Some(w) = windows.get(&main_window_id) {
+                    note_kept_window(w, &mut kept_windowed);
+                }
+            }
             Event::WindowEvent { event: WindowEvent::Focused(true), .. } => {
                 crate::desktop::alert_reset();
                 // GTK's urgency hint stays until it is taken back.
@@ -1966,6 +1989,37 @@ fn create_webview_window(
             }
             _ => {}
         }
+    });
+}
+
+/// The main window moved, was resized or maximized (tao reports a maximize as a move):
+/// that is what a restart keeps. `windowed` is the window when last neither maximized
+/// nor fullscreen, the size it comes back to.
+fn note_kept_window(w: &tao::window::Window, windowed: &mut crate::keptwindow::Windowed) {
+    use crate::keptwindow::{KeptWindow, WindowState};
+    let sf = w.scale_factor();
+    let state = if w.fullscreen().is_some() {
+        WindowState::Fullscreen
+    } else if w.is_maximized() {
+        WindowState::Maximized
+    } else {
+        WindowState::Windowed
+    };
+    let size = w.inner_size().to_logical::<f64>(sf);
+    let pos = w.outer_position().ok().map(|p| p.to_logical::<f64>(sf));
+    let here = pos.map_or((0.0, 0.0), |p| (p.x as f32, p.y as f32));
+    let here = (here.0, here.1, size.width as f32, size.height as f32);
+    let (x, y, width, height) = windowed.see(state, here, std::time::Instant::now());
+    crate::keptwindow::note(KeptWindow {
+        gui: crate::keptwindow::WEBVIEW.into(),
+        x,
+        y,
+        w: width,
+        h: height,
+        placed: pos.is_some(),
+        state,
+        display: None,
+        zoom: None,
     });
 }
 

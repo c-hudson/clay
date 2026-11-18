@@ -77,12 +77,34 @@ pub mod webview_gui;
 pub mod desktop;
 pub mod zoom;
 pub mod sizepopup;
+pub mod keptwindow;
 pub mod selfupdate;
 #[cfg(feature = "native-gui")]
 pub mod native_gui;
 pub mod testserver;
 #[cfg(test)]
 pub mod testharness;
+
+/// `clay -h`: the common options only (user request 2026-11-17, the user's own wording);
+/// every option is `/help clay`'s (popup/definitions/help.rs, pinned by a test there).
+pub(crate) const CLI_USAGE: &str = "\
+Usage: clay [OPTIONS] [<world> | <host> <port>]
+
+Options:
+  --console[=host]   Console mode
+  --gui[=host]       GUI mode
+  -D                 Run as headless daemon server
+  --port=<N>         Override the listen port (used with --local-server)
+  --upgrade          Update client to newest release on GitHub
+  --grep=host <pat>  Search world output
+     -w <world>      Limit to a specific world
+     --regexp        Search using regexps
+     -f              follow mode (i.e. like tail -f)
+     --noesc         Remove ANSI escape codes from output
+     -D              include searching offline archive
+
+  See clay help for additional command line options.
+";
 
 // Version information
 pub(crate) const VERSION: &str = "1.7.37";
@@ -2990,6 +3012,11 @@ pub enum Command {
     /// `use_ssl` (from `-x`) is honored here (there's no pre-existing world
     /// setting to fall back to, unlike the named-world form).
     WorldConnectHostPort { host: String, port: String, use_ssl: bool, no_login: bool, background: bool },
+    /// /shell (and a bare TF `/sh`) - go to the world named "shell", making it (a Shell
+    /// world running the login shell) when there is none and starting its shell when it
+    /// isn't running (user request 2026-11-17; `commands::prepare_shell_world`). `args`:
+    /// anything typed after it, which only gets the usage line.
+    Shell { args: String },
     /// /__connect [host port [ssl]] - connect to server (internal use by buttons/TF)
     Connect { host: Option<String>, port: Option<String>, ssl: bool },
     /// /server host:port | host port | --close | --cancel - attach to/detach from a remote
@@ -3230,6 +3257,7 @@ pub fn parse_command(input: &str) -> Command {
         }
         "/connections" | "/l" => Command::WorldsList,
         "/worlds" | "/world" => parse_world_command(args),
+        "/shell" => Command::Shell { args: args.join(" ") },
         "/__connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
         // Clay's remote attach. ("/connect" is TinyFugue's: connect a world.)
         "/server" => parse_remote_attach_command(args),
@@ -10009,6 +10037,31 @@ impl App {
         })
     }
 
+    /// Where a search of a world's archive stops so that what its live buffer `live`
+    /// holds isn't listed twice (every live line was archived as it arrived): rows with a
+    /// `wseq` below the first, or - with no archived line live - up to the second, a time.
+    /// `/recall -D` and `clay --grep=host -D` (`handle_grep_archive`) cut by this one rule.
+    ///
+    /// The cut is on the DURABLE archive sequence, not on a timestamp: timestamps collide,
+    /// so equal ts_ms values straddled the old boundary in both directions — dropping some
+    /// rows and duplicating others. With wseq the two halves are disjoint by construction,
+    /// which is why nothing after needs to de-duplicate. The timestamp fallback is for the
+    /// first run after an upgrade, a world whose buffer predates archiving, or a degraded
+    /// allocator; it reproduces the old semantics exactly rather than returning nothing.
+    pub(crate) fn archive_cut(live: &[OutputLine]) -> (Option<i64>, Option<i64>) {
+        let before_wseq: Option<i64> = live.iter().filter_map(|l| l.archive_seq).min();
+        let until_ms = if before_wseq.is_some() {
+            None
+        } else {
+            live.iter()
+                .filter_map(|l| l.timestamp.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .min()
+                .map(|oldest| oldest - 1)
+        };
+        (before_wseq, until_ms)
+    }
+
     /// Resolve the output buffer a /recall should read from, from `opts.world` -
     /// independent of `opts.source` (see `RecallWorld`'s doc comment), so `-i -wmud`
     /// and `-wmud` (no `-i`) both read the same world's buffer and only differ in which
@@ -10046,27 +10099,7 @@ impl App {
                 // The live half still works; only the archive half is missing.
                 return Ok(in_history(live));
             }
-            // Cut the archive at the oldest line the live buffer already holds, so the
-            // overlap (every live line was archived as it arrived) isn't listed twice.
-            //
-            // The cut is on the DURABLE archive sequence, not on a timestamp:
-            // timestamps collide, so equal ts_ms values straddled the old boundary in
-            // both directions — dropping some rows and duplicating others. With wseq
-            // the two halves are disjoint by construction, which is why nothing below
-            // needs to de-duplicate.
-            let before_wseq: Option<i64> = live.iter().filter_map(|l| l.archive_seq).min();
-            // Timestamp fallback for the first run after an upgrade, a world whose
-            // buffer predates archiving, or a degraded allocator. Reproduces the old
-            // semantics exactly rather than returning nothing.
-            let until_ms = if before_wseq.is_some() {
-                None
-            } else {
-                live.iter()
-                    .filter_map(|l| l.timestamp.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .min()
-                    .map(|oldest| oldest - 1)
-            };
+            let (before_wseq, until_ms) = Self::archive_cut(&live);
             let pattern = opts.pattern.as_deref().unwrap_or("*");
             // Carry the REAL match style through. Passing a bare `use_regex` bool
             // collapsed Simple into Glob, so `-D -msimple rc` asked the archive for
@@ -11058,6 +11091,70 @@ impl App {
             archive,
             done,
         });
+    }
+
+    /// `WsMessage::GrepArchive` handling, shared by both server handlers: `clay --grep=host
+    /// -D` searching this Clay's archive. Each world Clay holds is cut at its oldest live line
+    /// (`archive_cut`, as `/recall -D`), since the client searches the live lines itself; a
+    /// world only the archive still has is searched whole. The newest `PER_WORLD` matches of
+    /// each, oldest first, sent `CHUNK` at a time.
+    pub(crate) fn handle_grep_archive(&mut self, client_id: u64, request_id: u64, world: Option<String>, regex: String) {
+        const PER_WORLD: usize = 10_000;
+        const CHUNK: usize = 1000;
+        let refuse = |app: &mut Self, error: String| {
+            app.ws_send_to_client(client_id, WsMessage::GrepArchiveLines { request_id, lines: Vec::new(), done: true, error: Some(error) });
+        };
+        let db_path = clay_config_path("scrollback.db");
+        if !self.policy.user_paths || !self.settings.scrollback_enabled || !db_path.exists() {
+            refuse(self, "this Clay keeps no archive (\"Archive Input/Output\" is off in its Setup)".to_string());
+            return;
+        }
+        if regex::Regex::new(&regex).is_err() {
+            refuse(self, format!("invalid pattern '{regex}'"));
+            return;
+        }
+        let wanted = |name: &str| world.as_deref().is_none_or(|w| w.eq_ignore_ascii_case(name));
+        // The worlds Clay holds, each with its cut; then every other name the archive has.
+        let mut searches: Vec<(String, Option<i64>, Option<i64>)> = self.worlds.iter()
+            .filter(|w| !w.is_activity && wanted(&w.name))
+            .map(|w| {
+                let (wseq, ms) = Self::archive_cut(&w.output_lines);
+                (w.name.clone(), wseq, ms)
+            })
+            .collect();
+        for name in scrollback::world_names(&db_path) {
+            if wanted(&name) && !searches.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(&name)) {
+                searches.push((name, None, None));
+            }
+        }
+        let mut hits: Vec<websocket::GrepArchiveHit> = Vec::new();
+        for (name, before_wseq, until_ms) in &searches {
+            // The newest PER_WORLD, given back oldest first.
+            let rows = scrollback::query(&db_path, &scrollback::ArchiveQuery {
+                world: Some(name),
+                pattern: &regex,
+                kind: scrollback::PatternKind::Regex,
+                before_wseq: *before_wseq,
+                since_ms: None,
+                until_ms: *until_ms,
+                limit: PER_WORLD,
+                newest_first: true,
+            });
+            hits.extend(rows.into_iter().map(|r| websocket::GrepArchiveHit {
+                world: name.clone(),
+                ts_ms: r.ts_ms,
+                text: r.text.replace('\r', ""),
+            }));
+        }
+        let mut chunks = hits.chunks(CHUNK).peekable();
+        if chunks.peek().is_none() {
+            self.ws_send_to_client(client_id, WsMessage::GrepArchiveLines { request_id, lines: Vec::new(), done: true, error: None });
+            return;
+        }
+        while let Some(chunk) = chunks.next() {
+            let done = chunks.peek().is_none();
+            self.ws_send_to_client(client_id, WsMessage::GrepArchiveLines { request_id, lines: chunk.to_vec(), done, error: None });
+        }
     }
 
     /// `WsMessage::RequestState` handling — shared by master-WS and daemon (T40). Confirmed
@@ -18840,6 +18937,10 @@ impl App {
                     Err(e) => self.emit_client_text(world_index, &e, false),
                 }
             }
+            Command::Shell { ref args } => match commands::prepare_shell_world(self, args) {
+                Ok(followup) => return self.handle_ws_send_command(client_id, world_index, &followup, event_tx),
+                Err(e) => self.emit_client_text(world_index, &e, false),
+            },
             // Connect command - needs async follow-up
             Command::Connect { .. } => {
                 if world_index < self.worlds.len() && !self.worlds[world_index].connected {
@@ -19640,6 +19741,9 @@ impl App {
             WsMessage::RequestHistory { world_index, count, request_id, before_seq, before_ts, archive_before } => {
                 self.handle_request_history(client_id, world_index, count, request_id, before_seq, before_ts, archive_before);
             }
+            WsMessage::GrepArchive { request_id, world, regex } => {
+                self.handle_grep_archive(client_id, request_id, world, regex);
+            }
             WsMessage::ToggleWorldGmcp { world_index } => self.toggle_world_gmcp(world_index),
             // The map (src/map): one shared method each, as handler B does.
             WsMessage::MapWatch { views } => self.map_watch(client_id, views),
@@ -20118,6 +20222,7 @@ impl App {
             picture_upload: self.policy.pictures,
             // The archive and the map are a Clay's own files: none for a visitor.
             history_on_demand: self.policy.user_paths,
+            grep_archive: self.policy.user_paths,
             map: self.policy.user_paths,
             resume_session: true,
             info_report: true,
@@ -23600,6 +23705,9 @@ async fn main() -> io::Result<()> {
     // What any ending leaves in debug.log, in every mode (src/crashlog.rs): the panic hook,
     // the fatal-signal / unhandled-exception handler, the start time for the banner.
     crashlog::install();
+    // A GUI's window handed over by the process this one replaces (src/keptwindow.rs),
+    // out of the environment before anything is started that would inherit it.
+    keptwindow::take_from_env();
 
     // On Windows, ensure Winsock is initialized before any socket operations.
     // This is needed because inherited socket handles from a parent process
@@ -23657,9 +23765,11 @@ async fn main() -> io::Result<()> {
     let mut ssh_proxy_target: Option<String> = None;
     #[allow(unused_variables)]
     let mut ssh_proxy_listen_port: Option<u16> = None;
+    // `--grep[=host]`: `grep_mode` for either form, `grep_arg` the host when one is named.
+    // With no host only `-D` (this machine's archive) can be searched.
+    let mut grep_mode = false;
     let mut grep_arg: Option<String> = None;
     let mut grep_extra_args: Vec<String> = Vec::new();
-    let mut grep_archive_mode = false;
     let mut dump_mode = false;
     let mut dump_out_dir: Option<String> = None;
 
@@ -23669,17 +23779,20 @@ async fn main() -> io::Result<()> {
         while i < args.len() {
             let arg = &args[i];
             if arg == "--grep-archive" {
-                grep_archive_mode = true;
-                grep_extra_args = args[i + 1..].to_vec();
-                break;
+                eprintln!("Error: --grep-archive is now --grep -D. Use -h for help.");
+                std::process::exit(1);
             }
-            if let Some(stripped) = arg.strip_prefix("--grep=") {
-                let mut addr = stripped.to_string();
-                // Default to port 9000 if no port specified
-                if !addr.contains(':') {
-                    addr.push_str(":9000");
+            if arg == "--grep" || arg.starts_with("--grep=") {
+                grep_mode = true;
+                let host = arg.strip_prefix("--grep=").unwrap_or("");
+                if !host.is_empty() {
+                    let mut addr = host.to_string();
+                    // Default to port 9000 if no port specified
+                    if !addr.contains(':') {
+                        addr.push_str(":9000");
+                    }
+                    grep_arg = Some(addr);
                 }
-                grep_arg = Some(addr);
                 // Collect all remaining args for grep
                 grep_extra_args = args[i + 1..].to_vec();
                 break;
@@ -23750,7 +23863,7 @@ async fn main() -> io::Result<()> {
             else if matches!(gui_arg, Some(Some(_))) { Some("--gui=") }
             else if matches!(web_gui_arg, Some(Some(_))) { Some("--web-gui=") }
             else if multiuser_mode { Some("--multiuser") }
-            else if grep_arg.is_some() || grep_archive_mode { Some("--grep") }
+            else if grep_mode { Some("--grep") }
             else if dump_mode { Some("--dump") }
             else if local_server_mode { Some("--local-server") }
             else if ssh_proxy_mode { Some("--ssh-proxy") }
@@ -23776,75 +23889,9 @@ async fn main() -> io::Result<()> {
     }
 
     if show_help {
-        println!("Clay MUD Client v{}", VERSION);
-        println!();
-        println!("Usage: clay [OPTIONS] [<world> | <host> <port>]");
-        println!();
-        println!("Options:");
-        println!("    --console            Run in console (TUI) mode");
-        println!("    --console=host[:port][/path] Connect to a Clay server via console (default port: 9000, web path clay)");
-        println!("    --gui                Run Clay with the GUI (the native one; a build without it opens the WebView one)");
-        println!("    --gui=host[:port]    Attach the GUI to a Clay server (default port: 9000)");
-        if cfg!(feature = "webview-gui") {
-            println!("    --web-gui            Run Clay with the WebView GUI (the web interface in a window)");
-            println!("    --web-gui=host[:port][/path] Connect to a Clay server via the WebView GUI (web path clay)");
-        } else {
-            println!("    --web-gui[=host]     The same as --gui here: the WebView GUI is built on Termux only");
-        }
-        println!("    --ssh                Tunnel --console=/--gui=/--web-gui= through SSH instead of connecting");
-        println!("                         directly. Target grammar becomes:");
-        println!("                           [user@]host[:clayport[:sshport]]");
-        println!("                         clayport defaults to 9000, sshport to 22, user to");
-        println!("                         the local OS username. Tries ssh-agent, then the");
-        println!("                         default ~/.ssh/id_* key files (console mode may");
-        println!("                         prompt for a passphrase; GUI mode fails closed).");
-        println!("    -D                   Run as headless daemon server");
-        println!("    --multiuser          Run as multiuser server");
-        println!("    --local-server       Run headless, loopback-only, for an embedding client");
-        println!("                         (e.g. the Android app's bundled instance).");
-        println!("                         Requires CLAY_WS_PASSWORD to be set.");
-        println!("    --port=<N>           Override the listen port (used with --local-server)");
-        println!("    --ssh-proxy          Run headless: forward 127.0.0.1:<listen-port> to a");
-        println!("                         remote Clay daemon over SSH, for an embedding client");
-        println!("                         (e.g. the Android app's SshProxyManager).");
-        println!("    --target=[user@]host:clayport:sshport  Remote to reach (with --ssh-proxy)");
-        println!("    --listen-port=<N>    Local port to accept on (with --ssh-proxy)");
-        println!("                         Credentials via CLAY_SSH_KEY/CLAY_SSH_KEY_PASSPHRASE/");
-        println!("                         CLAY_SSH_PASSWORD env vars (at least one required).");
-        println!("    --conf=<path>        Use custom config file (default: ~/.clay/settings.dat;");
-        println!("                         for clay_web the web.dat to read, default ./web.dat)");
-        println!("    --grep=host[:port] <pattern>  Search world output (default port: 9000)");
-        println!("      -w <world>              Limit to specific world");
-        println!("      --regexp                Use regex (default: glob with * and ? wildcards)");
-        println!("      --noesc                 Strip ANSI color codes from output");
-        println!("      -f                      Follow mode (match new output, runs until Ctrl+C)");
-        println!("      Password via CLAY_PASSWORD environment variable");
-        println!("    --grep-archive <pattern>  Search long-term archive (~/.clay/scrollback.db)");
-        println!("      -w <world>              Limit to specific world");
-        println!("      --regexp                Use regex (default: glob with * and ? wildcards)");
-        println!("      --noesc                 Strip ANSI color codes from output");
-        println!("    --dump[=<dir>]       Export the offline scrollback archive to scrollback_dump.csv");
-        println!("                         Default output directory: current working directory");
-        println!("    --upgrade            Update this binary to the newest release on GitHub and exit");
-        println!("    -v, --version        Show version and build information");
-        println!("    -h, --help           Show this help message");
-        println!();
-        println!("TinyFugue compatibility (a local console/GUI session, or -D):");
-        println!("    <world>              Connect to <world> once started");
-        println!("    <host> <port>        Connect to a temporary world at that address");
-        println!("    -f<file>             Load <file> as the startup rc instead of the first of");
-        println!("                         ~/.tfrc, ~/tfrc, ./.tfrc, ./tfrc that exists");
-        println!("    -f                   Load no rc");
-        println!("    -c<cmd>              Run <cmd> after the rc, as if typed");
-        println!("    -L<dir>              TinyFugue library directory for this session");
-        println!("    -l                   No automatic login for <world>");
-        println!("    -q                   Quiet login for <world>");
-        println!("    -n                   Accepted; Clay never connects at startup by itself");
-        println!("    (TinyFugue's -v is Clay's version option; Clay's console is always visual)");
-        println!();
-        println!("Without --gui, --web-gui or --console:");
-        println!("    The GUI, when this build has one and a window can open here (a desktop");
-        println!("    session, not a terminal reached over SSH); the console otherwise.");
+        // The common options; `/help clay` inside Clay has them all (user request
+        // 2026-11-17). Before any TUI, so printing is fine.
+        print!("{CLI_USAGE}");
         return Ok(());
     }
 
@@ -23950,7 +23997,7 @@ async fn main() -> io::Result<()> {
     #[cfg(feature = "native-gui")]
     {
         let other_mode = console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode
-            || local_server_mode || ssh_proxy_mode || dump_mode || grep_arg.is_some() || grep_archive_mode
+            || local_server_mode || ssh_proxy_mode || dump_mode || grep_mode
             || tls_proxy_config.is_some();
         let target = gui_arg.clone()
             .or_else(|| native_gui_verify.map(|_| None))
@@ -23990,7 +24037,7 @@ async fn main() -> io::Result<()> {
     #[cfg(any(feature = "multiuser", feature = "web-front"))]
     let runs_server = {
         let attaches = matches!(console_arg, Some(Some(_))) || matches!(web_gui_arg, Some(Some(_))) || matches!(gui_arg, Some(Some(_)));
-        let one_shot = tls_proxy_config.is_some() || grep_arg.is_some() || grep_archive_mode || dump_mode || ssh_proxy_mode;
+        let one_shot = tls_proxy_config.is_some() || grep_mode || dump_mode || ssh_proxy_mode;
         !(attaches || one_shot || daemon_mode || console_arg.is_some() || web_gui_arg.is_some() || gui_arg.is_some())
     };
     #[cfg(feature = "web-front")]
@@ -24004,13 +24051,15 @@ async fn main() -> io::Result<()> {
     // Always log startup (not gated by debug flag) for reload/crash diagnostics
     debug_log(is_debug_enabled(), &format!("STARTUP: {} (reload={}, crash={}, gui={:?}, web_gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg, web_gui_arg));
 
-    // Parse --grep / --grep-archive extra args
+    // Parse --grep's own options
     let mut grep_world_filter: Option<String> = None;
     let mut grep_use_regex = false;
     let mut grep_strip_ansi = false;
     let mut grep_follow_mode = false;
+    // -D: the archive too - the host's with a host, else this machine's scrollback.db.
+    let mut grep_archive = false;
     let mut grep_pattern: Option<String> = None;
-    if grep_arg.is_some() || grep_archive_mode {
+    if grep_mode {
         let mut gi = 0;
         while gi < grep_extra_args.len() {
             match grep_extra_args[gi].as_str() {
@@ -24025,6 +24074,7 @@ async fn main() -> io::Result<()> {
                 "--regexp" => grep_use_regex = true,
                 "--noesc" => grep_strip_ansi = true,
                 "-f" => grep_follow_mode = true,
+                "-D" => grep_archive = true,
                 other if other.starts_with('-') => {
                     eprintln!("Error: Unknown grep option '{}'. Use -h for help.", other);
                     std::process::exit(1);
@@ -24040,12 +24090,16 @@ async fn main() -> io::Result<()> {
             }
             gi += 1;
         }
+        if grep_arg.is_none() && !grep_archive {
+            eprintln!("Error: --grep needs a host to search live output (--grep=host); --grep -D searches this machine's archive. Use -h for help.");
+            std::process::exit(1);
+        }
+        if grep_follow_mode && grep_archive {
+            eprintln!("Error: -f follows new output from a running Clay; -D searches what is stored. Use one of them.");
+            std::process::exit(1);
+        }
         if grep_pattern.is_none() {
-            if grep_archive_mode {
-                eprintln!("Error: Missing search pattern. Usage: clay --grep-archive [OPTIONS] <pattern>");
-            } else {
-                eprintln!("Error: Missing search pattern. Usage: clay --grep=host:port [OPTIONS] <pattern>");
-            }
+            eprintln!("Error: Missing search pattern. Usage: clay --grep[=host[:port]] [OPTIONS] <pattern>");
             std::process::exit(1);
         }
     }
@@ -24099,20 +24153,16 @@ async fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     if ssh_proxy_mode && (console_arg.is_some() || web_gui_arg.is_some() || ssh_mode || daemon_mode
-        || multiuser_mode || local_server_mode || grep_arg.is_some() || grep_archive_mode || dump_mode)
+        || multiuser_mode || local_server_mode || grep_mode || dump_mode)
     {
         eprintln!("Error: --ssh-proxy cannot be combined with other modes.");
         std::process::exit(1);
     }
-    if grep_arg.is_some() && (console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode) {
+    if grep_mode && (console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode) {
         eprintln!("Error: --grep cannot be combined with --console/--gui/--web-gui/-D/--multiuser.");
         std::process::exit(1);
     }
-    if grep_archive_mode && (grep_arg.is_some() || console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode) {
-        eprintln!("Error: --grep-archive cannot be combined with other modes.");
-        std::process::exit(1);
-    }
-    if dump_mode && (grep_arg.is_some() || grep_archive_mode || console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode) {
+    if dump_mode && (grep_mode || console_arg.is_some() || web_gui_arg.is_some() || daemon_mode || multiuser_mode) {
         eprintln!("Error: --dump cannot be combined with other modes.");
         std::process::exit(1);
     }
@@ -24136,45 +24186,34 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // Handle --grep-archive (offline archive search, no server needed)
-    if grep_archive_mode {
+    // `--grep -D` with no host: this machine's archive, read directly, no Clay running
+    // needed (what `--grep-archive` was). The pattern is matched as `--grep` matches it.
+    if grep_mode && grep_arg.is_none() {
         let db_path = clay_config_path("scrollback.db");
         if !db_path.exists() {
             eprintln!("Error: Archive database not found at {}. Enable \"Archive Input/Output\" in Clay Setup first.", db_path.display());
             std::process::exit(1);
         }
-        let pattern = grep_pattern.as_deref().unwrap_or("*");
-        // Through `query` rather than `search`: it uses the FTS index where the
-        // pattern allows and the (wid, wseq) index otherwise, instead of scanning
-        // every row. An archive from before v1.5.41 is refused (no matches).
-        let results = scrollback::query(&db_path, &scrollback::ArchiveQuery {
+        let regex = remote_client::grep_regex(grep_pattern.as_deref().unwrap_or("*"), grep_use_regex);
+        let mut results = scrollback::query(&db_path, &scrollback::ArchiveQuery {
             world: grep_world_filter.as_deref(),
-            pattern,
-            kind: if grep_use_regex {
-                scrollback::PatternKind::Regex
-            } else {
-                scrollback::PatternKind::Glob
-            },
+            pattern: &regex,
+            kind: scrollback::PatternKind::Regex,
             before_wseq: None,
             since_ms: None,
             until_ms: None,
             limit: 100_000,
-            // Oldest-first, matching what --grep-archive has always printed.
-            newest_first: false,
+            // The newest matches, so a large archive doesn't hide the recent ones.
+            newest_first: true,
         });
-        if results.is_empty() {
-            eprintln!("No matches found.");
-        }
+        // Every world's wseq counts on its own: time is the one order across worlds.
+        results.sort_by_key(|l| l.ts_ms);
         for line in &results {
-            let ts_secs = line.ts_ms / 1000;
-            let lt = local_time_from_epoch(ts_secs);
-            let ts_str = format!("{:02}/{:02} {:02}:{:02}", lt.month, lt.day, lt.hour, lt.minute);
-            let text = if grep_strip_ansi {
-                util::strip_ansi_codes(&line.text)
-            } else {
-                line.text.clone()
-            };
-            println!("{} [{}] {}", ts_str, line.world, text);
+            println!("{}", remote_client::grep_line(line.ts_ms / 1000, true, &line.world, &line.text, grep_strip_ansi));
+        }
+        // grep's convention: 1 when nothing matched.
+        if results.is_empty() {
+            std::process::exit(1);
         }
         return Ok(());
     }
@@ -24213,6 +24252,7 @@ async fn main() -> io::Result<()> {
             grep_use_regex,
             grep_strip_ansi,
             grep_follow_mode,
+            grep_archive,
         ).await;
     }
 

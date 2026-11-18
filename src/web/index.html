@@ -257,7 +257,8 @@
         <!-- Input area -->
         <div id="input-container">
             <!-- The input's top edge: drag it up or down to resize the input (app.js
-                 startInputResize); the row count is saved as the Input height setting. -->
+                 attachBarDrag, inputResizeDrag; in a touch layout the separator bar does the
+                 same); the row count is saved as the Input height setting. -->
             <div id="input-resize-handle" title="Drag to resize the input"></div>
             <!-- The lines already sent, still on screen above the one being typed (TF's
                  %cleardone off; app.js keepSentLine/layoutInputArea). Never on a phone. -->
@@ -276,7 +277,7 @@
             <div class="menu-item" data-action="setup">Settings<span class="shortcut">/setup</span></div>
             <div class="menu-item menu-map" data-action="map">Map<span class="shortcut">/map</span></div>
             <div class="menu-item" data-action="emoji_picker">Emoji Picker</div>
-            <div class="menu-item" data-action="import-picture" style="display: none;">Import Picture</div>
+            <div class="menu-item" data-action="import-picture" style="display: none;">Share Picture</div>
             <!-- clay_web only (style.css body.web-front): the visitor's Dark - New / Light - New
                  switch, remembered in this browser (app.js applyWebFrontTheme). -->
             <div class="menu-item menu-web-theme" data-action="web-theme">Light Theme</div>
@@ -1160,7 +1161,7 @@
                                                 </select>
                                             </div>
                                         </div>
-                                        <div class="setting-row" title="Where Import Picture uploads a picture; its link goes into the input line. '+ URL Short' runs the link through /url's shortening; '(2d)': tmpfiles.org deletes it after 2 days. Uploads are public.">
+                                        <div class="setting-row" title="Where Share Picture uploads a picture; its link goes into the input line. '+ URL Short' runs the link through /url's shortening; '(2d)': tmpfiles.org deletes it after 2 days. Uploads are public.">
                                             <span class="setting-label">Picture Host</span>
                                             <div class="setting-value">
                                                 <select id="setup-picture-host-select" class="form-select">
@@ -1593,7 +1594,7 @@
         </div>
 
         <!-- Notes List (/note -l, as the console's): the worlds with notes -->
-        <!-- Import Picture's picker (Menu > Import Picture; Android opens a picture app). -->
+        <!-- Import Picture's picker (Menu > Share Picture; Android opens a picture app). -->
         <input type="file" id="picture-file-input" accept="image/*" multiple style="display: none;">
 
         <div id="notes-list-modal" class="modal">

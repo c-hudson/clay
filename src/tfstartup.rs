@@ -77,8 +77,8 @@ pub(crate) fn split_tf_cli(args: &[String]) -> Result<(TfStartupOpts, Vec<String
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        // --grep and --grep-archive take every argument after them as their own.
-        if arg == "--grep-archive" || arg.starts_with("--grep=") {
+        // --grep[=host] takes every argument after it as its own (its -D and -f too).
+        if arg == "--grep" || arg.starts_with("--grep=") {
             rest.extend(args[i..].iter().cloned());
             break;
         }
@@ -381,6 +381,10 @@ mod tests {
         let (opts, rest) = split_tf_cli(&strings(&["-v", "-D", "--grep=h:9000", "-f", "pat"])).unwrap();
         assert!(!opts.given);
         assert_eq!(rest, strings(&["-v", "-D", "--grep=h:9000", "-f", "pat"]));
+        // --grep with no host keeps its words too: its -D is the archive, `pat` no world.
+        let (opts, rest) = split_tf_cli(&strings(&["--grep", "-D", "-w", "mud", "pat"])).unwrap();
+        assert!(!opts.given);
+        assert_eq!(rest, strings(&["--grep", "-D", "-w", "mud", "pat"]));
         // -v in a TF bundle is refused with the way to get TF's meaning.
         assert!(split_tf_cli(&strings(&["-nv"])).unwrap_err().contains("always visual"));
         // An unknown dash option is Clay's parser's to reject.

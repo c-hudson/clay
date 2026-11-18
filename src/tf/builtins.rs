@@ -244,6 +244,13 @@ pub fn cmd_sh(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         }
     }
     let command = (!args.trim().is_empty()).then(|| args.to_string());
+    // Clay's: with no <command>, the shell is a world of its own, in every interface
+    // (user request 2026-11-17, `commands::prepare_shell_world`) - TF's interactive shell
+    // on the terminal only where the build has no shell worlds. No SHELL hook or
+    // "% Executing" line: nothing is executed here.
+    if command.is_none() && cfg!(feature = "shell-worlds") {
+        return TfCommandResult::ClayCommand("/shell".to_string());
+    }
 
     if !quiet {
         let (kind, what) = match &command {
@@ -4017,11 +4024,22 @@ mod tests {
             TfEffect::Shell { command: Some(cmd) },
         ] if text == "% Executing command: echo hi" && cmd == "echo hi"), "{:?}", frame);
 
-        let frame = run(&mut engine, "");
-        assert!(matches!(&frame[..], [
-            TfEffect::Output { text, .. },
-            TfEffect::Shell { command: None },
-        ] if text == "% Executing shell: /bin/zsh"), "{:?}", frame);
+        // A bare /sh is the shell world (`/shell`) where the build has them, else TF's
+        // interactive %SHELL.
+        if cfg!(feature = "shell-worlds") {
+            for args in ["", "-q", "  "] {
+                engine.begin_frame();
+                let result = cmd_sh(&mut engine, args);
+                assert!(matches!(&result, TfCommandResult::ClayCommand(c) if c == "/shell"), "{:?}: {:?}", args, result);
+                assert!(engine.end_frame().is_empty(), "no hook, no message");
+            }
+        } else {
+            let frame = run(&mut engine, "");
+            assert!(matches!(&frame[..], [
+                TfEffect::Output { text, .. },
+                TfEffect::Shell { command: None },
+            ] if text == "% Executing shell: /bin/zsh"), "{:?}", frame);
+        }
 
         let frame = run(&mut engine, "-q echo hi");
         assert!(matches!(&frame[..], [TfEffect::Shell { command: Some(_) }]), "{:?}", frame);

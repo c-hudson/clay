@@ -276,7 +276,7 @@ impl ClayView {
                 let step = gpui::px(32.0 * ((open % 8) + 1) as f32);
                 own?.update(cx, |_, window, _| window.bounds().origin).ok().map(|o| gpui::point(o.x + step, o.y + step))
             });
-            let how = super::ViewWindow { title: title.into(), size, is_main: false, leader: Some(me.clone()), origin };
+            let how = super::ViewWindow { title: title.into(), size, is_main: false, leader: Some(me.clone()), origin, kept: None };
             match super::open_view_window(cx, fonts, session, None, mode, how) {
                 Ok(opened) => {
                     let _ = me.update(cx, |v, _| v.link.followers.push(opened));
