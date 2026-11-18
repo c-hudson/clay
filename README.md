@@ -67,8 +67,12 @@ Get the latest version from the [releases page](https://github.com/c-hudson/clay
 - **Windows:** [clay-windows-x86_64.exe](https://github.com/c-hudson/clay/releases/latest/download/clay-windows-x86_64.exe)
 - **macOS** (Intel and Apple Silicon): [clay-macos-universal](https://github.com/c-hudson/clay/releases/latest/download/clay-macos-universal)
 - **Linux:** [clay-linux-x86_64-gui](https://github.com/c-hudson/clay/releases/latest/download/clay-linux-x86_64-gui)
-  with the desktop app, or [clay-linux-x86_64-musl](https://github.com/c-hudson/clay/releases/latest/download/clay-linux-x86_64-musl)
+  with the desktop app (Ubuntu 20.04, Debian 11, Fedora 32, RHEL 9 or newer), or
+  [clay-linux-x86_64-musl](https://github.com/c-hudson/clay/releases/latest/download/clay-linux-x86_64-musl)
   for the terminal only (any distro)
+- **Linux on ARM64** (Raspberry Pi 4/5 with 64-bit Pi OS, ARM servers):
+  [clay-linux-aarch64-musl](https://github.com/c-hudson/clay/releases/latest/download/clay-linux-aarch64-musl),
+  terminal only (any distro)
 - **Android:** [clay-android.apk](https://github.com/c-hudson/clay/releases/latest/download/clay-android.apk)
 - **Termux:** [clay-termux-aarch64-nogui](https://github.com/c-hudson/clay/releases/latest/download/clay-termux-aarch64-nogui),
   [clay-termux-aarch64](https://github.com/c-hudson/clay/releases/latest/download/clay-termux-aarch64)

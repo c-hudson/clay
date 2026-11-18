@@ -39,26 +39,60 @@ cargo build --release --target x86_64-unknown-linux-musl --no-default-features -
 
 ### Linux GUI (native GUI + audio, x86_64, non-static)
 ```bash
-NATIVE_GUI_FEATURES=native-audio,native-gui tests/native_gui/cargo-native.sh build --release
-cp target/native-gui/release/clay /tmp/clay-linux-x86_64-gui
+./build-linux-gui.sh
 ```
-- Binary: `target/native-gui/release/clay` → copy to `/tmp/clay-linux-x86_64-gui` (avoids filename collision with musl build during upload)
+- Binary: `target/native-gui/x86_64-unknown-linux-gnu/release/clay`, copied by the script to
+  `/tmp/clay-linux-x86_64-gui` (avoids filename collision with musl build during upload)
 - Release asset name: `clay-linux-x86_64-gui`
+- **Linked against glibc 2.31, not this machine's** (user request 2026-11-18). Built plainly
+  here it needed glibc 2.43 (v1.7.38), which only the newest distributions have - Ubuntu
+  24.04, Mint 22, Debian 13, Fedora 43 and RHEL 9/10 could not start it, not even
+  `--console`. The script links against Ubuntu 20.04's glibc and X11/ALSA/fontconfig
+  libraries from `tools/glibc-sysroot.py` (`~/.cache/clay-glibc-sysroot/focal-<hash>`,
+  about 60 MB: the focal release pocket, InRelease checked with gpgv against this machine's
+  `ubuntu-archive-keyring.gpg`, every file by SHA256; a new directory whenever its package
+  list changes, so every `-sys` build script reruns), with this machine's gcc and Rust
+  1.98.1: `--sysroot` for the C code and the link, the sysroot's `lib/` searched before
+  gcc's own directory (which is this machine's, and its `libgcc_s` needs glibc 2.34),
+  pkg-config pointed at the sysroot, an explicit `--target` so build scripts and
+  proc-macros still link against this machine's glibc. It fails unless the binary needs no glibc symbol version above 2.31 and
+  `--version` runs under the sysroot's own 2.31 loader and libraries with `LD_BIND_NOW=1`.
+  The asset then runs on Ubuntu 20.04+, Debian 11+, Mint 20+, Fedora 32+ and RHEL 9+.
+  A new `-sys` crate whose build script asks pkg-config for a library stops the build with
+  "`foo.pc` ... not found": add its focal `-dev` package to the tool's `ROOTS`.
 - Non-static (links glibc dynamically). The native (GPUI) GUI and audio, **never the
   WebView GUI** (user ruling 2026-11-16: `webview-gui` is in the Termux GUI asset and no
   other; `--web-gui` opens the native GUI in a build without it). So it links no WebKitGTK
   or GTK and starts on a desktop without them (a stock Kubuntu has no WebKitGTK; the
   two-GUI asset up to v1.7.36 could not start there). About 107 MB unstripped.
 - **The native GUI needs Rust 1.98.1** (GPUI; the host default toolchain is too old), so the
-  build goes through `tests/native_gui/cargo-native.sh`: it runs `cargo +1.98.1` with the
-  features in `NATIVE_GUI_FEATURES`, in its own target dir `target/native-gui/` (a separate
-  cargo lock - still run it one at a time with the other local builds), and on Linux adds a
-  `-L native=target/native-gui-link` for the libxkbcommon-x11 symlink when only the runtime
-  library is installed. One-time setup: `rustup toolchain install 1.98.1`, plus the
-  pkg-config dev packages GPUI links (xkbcommon, wayland, fontconfig, freetype; see
-  `build.sh`'s `check_native_gui`). There is no fallback build for this asset: if the
-  native GUI can't be built, skip the asset and say so - never a `webview-gui` build in its
-  place.
+  script runs `cargo +1.98.1`, in `tests/native_gui/cargo-native.sh`'s target dir
+  `target/native-gui/` (a separate cargo lock - still run it one at a time with the other
+  local builds; its `--target` build lands in `x86_64-unknown-linux-gnu/` there, apart from
+  the dev builds). One-time setup: `rustup toolchain install 1.98.1`; the libraries it links
+  come from the sysroot, not this machine's -dev packages. There is no fallback build for
+  this asset: if the native GUI can't be built, skip the asset and say so - never a
+  `webview-gui` build in its place, and never a plain build linked against this machine's
+  glibc.
+
+### Linux ARM64 (static musl, cross-compiled, no GUI)
+```bash
+./build-linux-aarch64.sh
+```
+- Binary: `target/aarch64-unknown-linux-musl/release/clay`, copied by the script to
+  `/tmp/clay-linux-aarch64-musl`
+- Release asset name: `clay-linux-aarch64-musl` (user request 2026-11-18): the x86_64 musl
+  build's features (`ssh-transport,shell-worlds`) for Raspberry Pi 4/5 on 64-bit Pi OS, ARM
+  servers and Asahi Linux. `/update` on ARM64 Linux takes it (`platform::release_asset_for`),
+  except from a build with a GUI, which it would lose.
+- The C code is compiled by Zig 0.17.1, which the script fetches on first use into
+  `~/.cache/clay-zig` (SHA256 pinned in the script; about 350 MB unpacked) and wraps in
+  `target/zig-aarch64/` - the same approach as `build-drobo5n.sh`, including
+  `-C link-self-contained=no`. Its Rust target `aarch64-unknown-linux-musl` is on the default
+  toolchain (the script adds it when missing).
+- Nothing here runs it. To try it: `apt-get download qemu-user` (no root), unpack it with
+  `dpkg-deb -x` into `~/.cache/claude-scratch/clay/`, and run
+  `.../usr/bin/qemu-aarch64 /tmp/clay-linux-aarch64-musl --version`.
 
 ### Windows (pre-built by user)
 

@@ -45,7 +45,8 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 | Platform | Binary | Notes |
 |----------|--------|-------|
 | Linux x86_64 (static) | `clay-linux-x86_64-musl` | Console, Web |
-| Linux x86_64 | `clay-linux-x86_64-gui` | Console, GUI, Web, Audio |
+| Linux x86_64 | `clay-linux-x86_64-gui` | Console, GUI, Web, Audio (glibc 2.31 or newer) |
+| Linux ARM64 (static) | `clay-linux-aarch64-musl` | Console, Web |
 | Android | `clay-android.apk` | Console (remote or standalone server) |
 | Termux ARM64 (GUI) | `clay-termux-aarch64` | Console, GUI, Web |
 | Termux ARM64 | `clay-termux-aarch64-nogui` | Console, Web |

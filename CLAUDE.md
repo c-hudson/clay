@@ -34,6 +34,7 @@ cargo clippy                         # Lint
 ### Cross-Platform Builds
 
 - **Termux:** cross-compiled with the Android NDK, no phone needed: `./build-termux-aarch64.sh` / `./build-termux-armv7.sh` (no GUI) and `./build-termux-aarch64-gui.sh` (webview GUI - links against Termux's own packages unpacked by `tools/termux-sysroot.py`, applies the tao/wry X11 patches in a throwaway worktree). No hot reload, TLS proxy, or Ctrl+Z on Android.
+- **Linux release assets:** `./build-linux-gui.sh` (the GUI asset, linked against glibc 2.31 from `tools/glibc-sysroot.py`'s Ubuntu 20.04 sysroot, never this machine's) and `./build-linux-aarch64.sh` (static ARM64 musl, Zig as its C compiler). → `.claude/rules/build-features.md`
 - **macOS:** `cargo build --no-default-features --features ssh-transport,shell-worlds` (no musl). Universal binary via `lipo` combining x86_64-apple-darwin and aarch64-apple-darwin targets.
 - **Windows:** `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo +1.98.1 build --release --features native-audio,native-gui` (MSVC, not cross-compiled)
 

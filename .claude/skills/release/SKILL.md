@@ -1,6 +1,6 @@
 ---
 name: release
-description: Automated multi-platform build and GitHub release for Clay. Builds locally (Linux musl, Termux cross-builds, Android, and macOS in a local QEMU VM) and on the Windows VM, uploads to GitHub.
+description: Automated multi-platform build and GitHub release for Clay. Builds locally (Linux musl and GUI, Linux ARM64, Termux cross-builds, Android, and macOS in a local QEMU VM) and on the Windows VM, uploads to GitHub.
 ---
 
 # /release — Automated Multi-Platform Build & GitHub Release
@@ -34,7 +34,7 @@ Platform → assets built and uploaded:
 |------|--------|-----------------------|
 | `--android` | Android APK | `clay-android.apk` |
 | `--mac` | macOS universal (x86_64 + aarch64 via lipo) | `clay-macos-universal` |
-| `--linux` | Linux musl + Linux GUI (native GUI + audio) | `clay-linux-x86_64-musl`, `clay-linux-x86_64-gui` |
+| `--linux` | Linux musl + Linux GUI (native GUI + audio) + Linux ARM64 musl | `clay-linux-x86_64-musl`, `clay-linux-x86_64-gui`, `clay-linux-aarch64-musl` |
 | `--windows` | Windows x86_64 via Windows VM (192.168.2.14) | `clay-windows-x86_64.exe` |
 
 Examples:
@@ -141,13 +141,16 @@ APK (whose `buildNativeServer` task shells out to cargo).
 Build in this order, each to completion before starting the next:
 
 1. **Linux musl** — see machines.md for exact command
-2. **Linux GUI (native GUI + audio)** — see machines.md: it goes through
-   `tests/native_gui/cargo-native.sh` (toolchain 1.98.1, target dir `target/native-gui/`),
-   with `NATIVE_GUI_FEATURES=native-audio,native-gui`. **No desktop asset has the WebView
-   GUI** (user ruling 2026-11-16: `webview-gui` is built for Termux only). The artifact is
-   `target/native-gui/release/clay`, not `target/release/clay`.
-3. **Termux armv7 / aarch64 / aarch64-GUI cross-builds** — see below
-4. **Android APK** — see machines.md for build, align, and sign commands
+2. **Linux GUI (native GUI + audio)** — `./build-linux-gui.sh` (see machines.md): it links
+   against Ubuntu 20.04's glibc 2.31 so the asset runs on older distributions, and it fails
+   unless the binary needs no glibc above 2.31 and starts under that glibc's loader. Toolchain
+   1.98.1, target dir `target/native-gui/`. **No desktop asset has the WebView GUI** (user
+   ruling 2026-11-16: `webview-gui` is built for Termux only). The artifact lands at
+   `/tmp/clay-linux-x86_64-gui`.
+3. **Linux ARM64 musl** — `./build-linux-aarch64.sh` (see machines.md); output
+   `/tmp/clay-linux-aarch64-musl`.
+4. **Termux armv7 / aarch64 / aarch64-GUI cross-builds** — see below
+5. **Android APK** — see machines.md for build, align, and sign commands
 
 **A chain of local builds must fail loudly.** Do not string them together with newlines in
 one backgrounded shell and read only the tail: a step that dies mid-chain looks identical to
@@ -196,6 +199,12 @@ the Step 7 freshness check to catch it after the fact.
 **Windows**: Built remotely on the Windows VM (see Step 6b). Do NOT cross-compile.
 - Windows is never built as part of `--linux`, `--android`, or `--mac` partial releases.
 - Fallback: if the VM is unreachable *and* `clay.exe` exists in the project root, use it as a hand-built fallback (copy to `/tmp/clay-windows-x86_64.exe`). If it doesn't exist either, warn and skip Windows.
+
+**Linux ARM64 (cross-compiled, static musl, no GUI)**: Built locally with Zig as the C
+compiler — see machines.md.
+- Run `./build-linux-aarch64.sh`; output lands at `/tmp/clay-linux-aarch64-musl`. It shares
+  `target/` with the musl build, so it runs after it, never alongside.
+- Part of a full release and of `--linux`; skip it for `--android`, `--mac` and `--windows`.
 
 **Termux armv7 (cross-compiled, no GUI)**: Built locally via the Android NDK — see machines.md.
 - Run `./build-termux-armv7.sh`; output lands at `/tmp/clay-termux-armv7-32bit-nogui`.
@@ -374,8 +383,8 @@ including one whose shell reported success (see Step 5):
 
 ```bash
 BUMP_TS=$(git log -1 --format=%ct "$EXPECTED_SHA")
-for f in /tmp/clay-linux-x86_64-musl /tmp/clay-linux-x86_64-gui /tmp/clay-windows-x86_64.exe \
-         android/clay-android.apk /tmp/clay-macos-universal \
+for f in /tmp/clay-linux-x86_64-musl /tmp/clay-linux-x86_64-gui /tmp/clay-linux-aarch64-musl \
+         /tmp/clay-windows-x86_64.exe android/clay-android.apk /tmp/clay-macos-universal \
          /tmp/clay-termux-aarch64 /tmp/clay-termux-aarch64-nogui /tmp/clay-termux-armv7-32bit-nogui; do
   if [ -e "$f" ] && [ "$(stat -c %Y "$f")" -ge "$BUMP_TS" ]; then st=OK; else st=STALE; fi
   printf '  %-42s %s\n' "$(basename "$f")" "$st"
@@ -397,6 +406,13 @@ done
 ```
 For the binaries that don't run here, `strings <asset> | grep -c alacritty_terminal` must be
 above 0 (shell worlds are in) - except the APK's `libclay.so`, where it must be 0.
+
+**The Linux GUI asset must run on glibc 2.31** (`build-linux-gui.sh` checks this before
+copying it; check the staged copy again, since a stale one from an older build would not):
+```bash
+objdump -T /tmp/clay-linux-x86_64-gui | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1   # GLIBC_2.31 or lower
+file /tmp/clay-linux-aarch64-musl | grep -q 'ARM aarch64.*statically linked' && echo "  aarch64: static ARM64 OK"
+```
 
 **Only the Termux GUI asset has the WebView GUI** (user ruling 2026-11-16). The Linux GUI
 asset must say so itself and need no WebKitGTK; for the rest, a text only a `webview-gui`
@@ -425,6 +441,7 @@ For a full release:
 |--------|-----------|------------|
 | Linux musl | `target/x86_64-unknown-linux-musl/release/clay` | `clay-linux-x86_64-musl` |
 | Linux GUI (native) | `/tmp/clay-linux-x86_64-gui` | `clay-linux-x86_64-gui` |
+| Linux ARM64 musl (cross-compiled locally) | `/tmp/clay-linux-aarch64-musl` | `clay-linux-aarch64-musl` |
 | Windows (if reachable) | `/tmp/clay-windows-x86_64.exe` | `clay-windows-x86_64.exe` |
 | Android | `android/clay-android.apk` | `clay-android.apk` |
 | Mac (Mac VM) | `/tmp/clay-macos-universal` | `clay-macos-universal` |
@@ -438,7 +455,7 @@ For platform-limited releases, only collect the asset(s) listed in the platform 
 ```bash
 cp target/x86_64-unknown-linux-musl/release/clay /tmp/clay-linux-x86_64-musl
 # Windows is already at /tmp/clay-windows-x86_64.exe (scp'd from VM, or copied from fallback clay.exe)
-# Linux GUI and Mac are already copied to /tmp with the correct name
+# Linux GUI, Linux ARM64 and Mac are already copied to /tmp with the correct name
 ```
 
 ### Step 8: Create or Update GitHub Release
@@ -464,6 +481,7 @@ Do **not** delete assets for platforms not being released in this run.
 gh release create vX.Y.Z \
     /tmp/clay-linux-x86_64-musl#clay-linux-x86_64-musl \
     /tmp/clay-linux-x86_64-gui#clay-linux-x86_64-gui \
+    /tmp/clay-linux-aarch64-musl#clay-linux-aarch64-musl \
     [/tmp/clay-windows-x86_64.exe#clay-windows-x86_64.exe if Windows was reachable] \
     android/clay-android.apk#clay-android.apk \
     [/tmp/clay-macos-universal#clay-macos-universal if the Mac VM build succeeded] \
@@ -474,8 +492,8 @@ gh release create vX.Y.Z \
     --notes "Release vX.Y.Z"
 ```
 
-Note: the three Termux assets are not bracketed above — all are cross-compiled locally
-(Step 5), so they're always included in a full release.
+Note: the Linux ARM64 asset and the three Termux assets are not bracketed above — all are
+cross-compiled locally (Step 5), so they're always included in a full release.
 
 ### Step 9: Delete Old GitHub Releases
 
@@ -510,9 +528,9 @@ Record the deleted tags for the summary.
 until deleted. Once `gh release view vX.Y.Z --json assets` lists every uploaded asset, record
 each one's size for the summary, then delete the staged copies:
 ```bash
-rm -f /tmp/clay-linux-x86_64-musl /tmp/clay-linux-x86_64-gui /tmp/clay-windows-x86_64.exe \
-      /tmp/clay-macos-universal /tmp/clay-termux-aarch64 /tmp/clay-termux-aarch64-nogui \
-      /tmp/clay-termux-armv7-32bit-nogui
+rm -f /tmp/clay-linux-x86_64-musl /tmp/clay-linux-x86_64-gui /tmp/clay-linux-aarch64-musl \
+      /tmp/clay-windows-x86_64.exe /tmp/clay-macos-universal /tmp/clay-termux-aarch64 \
+      /tmp/clay-termux-aarch64-nogui /tmp/clay-termux-armv7-32bit-nogui
 ```
 Delete them only after a successful upload: if the upload failed, keep them for the retry.
 The APK is never staged in `/tmp` (it is uploaded from `android/clay-android.apk`, which is
@@ -553,6 +571,7 @@ Example (full release, all machines reachable):
 |--------|--------|------|----------|
 | Linux musl x86_64 | PASS | 12.3 MB | Yes |
 | Linux GUI x86_64 | PASS | 18.5 MB | Yes |
+| Linux ARM64 musl | PASS | 33.0 MB | Yes |
 | Windows x86_64 (VM) | PASS | 14.1 MB | Yes |
 | Android APK | PASS | 8.2 MB | Yes |
 | macOS universal | PASS | 15.0 MB | Yes |
@@ -561,7 +580,7 @@ Example (full release, all machines reachable):
 | Termux armv7 (no GUI) | PASS | 6.1 MB | Yes |
 
 Release: https://github.com/user/repo/releases/tag/vX.Y.Z
-Assets uploaded: 8
+Assets uploaded: 9
 Pruned target/: 41.2 GB here, 1.6 GB Mac VM, 1.9 GB Windows VM
 Old releases deleted: 22 (v1.7.1 ... v1.7.22; 1.7 keeps v1.7.0 and v1.7.23)
 ```
@@ -574,6 +593,7 @@ Example (full release, Windows VM unreachable, Mac VM did not come up):
 |--------|--------|------|----------|
 | Linux musl x86_64 | PASS | 12.3 MB | Yes |
 | Linux GUI x86_64 | PASS | 18.5 MB | Yes |
+| Linux ARM64 musl | PASS | 33.0 MB | Yes |
 | Windows x86_64 (VM) | Skipped (unreachable) | — | No |
 | Android APK | PASS | 8.2 MB | Yes |
 | macOS universal | Skipped (Mac VM did not come up) | — | No |
@@ -582,7 +602,7 @@ Example (full release, Windows VM unreachable, Mac VM did not come up):
 | Termux armv7 (no GUI) | PASS | 6.1 MB | Yes |
 
 Release: https://github.com/user/repo/releases/tag/vX.Y.Z
-Assets uploaded: 6
+Assets uploaded: 7
 ```
 
 Example (--android only):
@@ -594,6 +614,7 @@ Example (--android only):
 | Android APK | PASS | 8.2 MB | Yes |
 | Linux musl x86_64 | Skipped | — | No |
 | Linux GUI x86_64 | Skipped | — | No |
+| Linux ARM64 musl | Skipped | — | No |
 | Windows x86_64 | Skipped | — | No |
 | macOS universal | Skipped | — | No |
 | Termux aarch64 (GUI) | Skipped | — | No |
@@ -613,6 +634,7 @@ Example (--windows only):
 | Windows x86_64 (VM) | PASS | 14.1 MB | Yes |
 | Linux musl x86_64 | Skipped | — | No |
 | Linux GUI x86_64 | Skipped | — | No |
+| Linux ARM64 musl | Skipped | — | No |
 | Android APK | Skipped | — | No |
 | macOS universal | Skipped | — | No |
 | Termux aarch64 (GUI) | Skipped | — | No |

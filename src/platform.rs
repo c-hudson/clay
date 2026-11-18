@@ -1850,36 +1850,40 @@ pub fn get_executable_path() -> io::Result<(PathBuf, String)> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "self-update is not supported on this platform"))
 }
 
-/// Get the correct GitHub release asset name for this platform.
-/// These names must match exactly what the /release skill uploads to GitHub.
+/// The GitHub release asset `/update` installs for a build: `os` and `arch` as
+/// `std::env::consts` names them, `musl` for a musl build, `gui` for one with a GUI.
+/// `None` where no asset would keep what the build has: ARM64 Linux with a GUI (that
+/// asset is the console build), or any other CPU - never another CPU's binary.
+/// These names must match exactly what the /release skill uploads to GitHub
+/// (pinned by `every_update_asset_is_released`).
 #[cfg(not(target_os = "android"))]
-pub(crate) fn get_platform_asset_name() -> &'static str {
-    #[cfg(all(target_os = "linux", target_env = "musl"))]
-    { "clay-linux-x86_64-musl" }
+pub(crate) fn release_asset_for(os: &str, arch: &str, musl: bool, gui: bool) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") if musl => Some("clay-linux-x86_64-musl"),
+        ("linux", "x86_64") => Some("clay-linux-x86_64-gui"),
+        ("linux", "aarch64") if !gui => Some("clay-linux-aarch64-musl"),
+        ("macos", _) => Some("clay-macos-universal"),
+        // Windows on ARM runs the x86_64 build.
+        ("windows", _) => Some("clay-windows-x86_64.exe"),
+        _ => None,
+    }
+}
 
-    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    { "clay-linux-x86_64-gui" }
-
-    #[cfg(target_os = "macos")]
-    { "clay-macos-universal" }
-
-    #[cfg(target_os = "windows")]
-    { "clay-windows-x86_64.exe" }
-
-    #[cfg(target_os = "android")]
-    { "clay-termux-aarch64" }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
-    { "unknown" }
+/// The release asset for this build (`release_asset_for`).
+#[cfg(not(target_os = "android"))]
+pub(crate) fn get_platform_asset_name() -> Option<&'static str> {
+    release_asset_for(std::env::consts::OS, std::env::consts::ARCH,
+        cfg!(target_env = "musl"), cfg!(any(feature = "native-gui", feature = "webview-gui")))
 }
 
 /// Returns true if the given asset name is a plausible match for this platform.
 /// Used as a fallback when the exact asset name doesn't match, to give a better
-/// error message listing what IS available.
+/// error message listing what IS available. On Linux the CPU must match too: the
+/// release has an x86_64 and an ARM64 Linux build.
 #[cfg(not(target_os = "android"))]
 fn is_platform_asset_candidate(name: &str) -> bool {
     #[cfg(target_os = "linux")]
-    { name.contains("linux") }
+    { name.contains("linux") && name.contains(std::env::consts::ARCH) }
     #[cfg(target_os = "macos")]
     { name.contains("macos") || name.contains("mac") || name.contains("darwin") }
     #[cfg(target_os = "windows")]
@@ -2057,7 +2061,10 @@ where
     // Find correct asset for this platform.
     // First try an exact name match; if that fails, fall back to a platform predicate
     // so a future rename in the release skill doesn't produce a cryptic error.
-    let asset_name = get_platform_asset_name();
+    let asset_name = get_platform_asset_name().ok_or_else(|| format!(
+        "No release build for this platform ({}/{}{}): build it from source with ./build.sh",
+        std::env::consts::OS, std::env::consts::ARCH,
+        if cfg!(any(feature = "native-gui", feature = "webview-gui")) { " with a GUI" } else { "" }))?;
     let assets = release["assets"]
         .as_array()
         .ok_or("No assets in release")?;
@@ -2994,6 +3001,43 @@ mod tests {
                     }).unwrap_or(false)
                 })
             })
+    }
+
+    #[test]
+    fn release_asset_for_each_platform() {
+        let cases = [
+            (("linux", "x86_64", true, false), Some("clay-linux-x86_64-musl")),
+            (("linux", "x86_64", false, true), Some("clay-linux-x86_64-gui")),
+            (("linux", "x86_64", false, false), Some("clay-linux-x86_64-gui")),
+            (("linux", "aarch64", true, false), Some("clay-linux-aarch64-musl")),
+            (("linux", "aarch64", false, false), Some("clay-linux-aarch64-musl")),
+            // The ARM64 asset has no GUI: updating into it would lose this build's.
+            (("linux", "aarch64", false, true), None),
+            (("linux", "arm", true, false), None),
+            (("linux", "riscv64", true, false), None),
+            (("macos", "x86_64", false, true), Some("clay-macos-universal")),
+            (("macos", "aarch64", false, true), Some("clay-macos-universal")),
+            (("windows", "x86_64", false, true), Some("clay-windows-x86_64.exe")),
+            (("freebsd", "x86_64", false, false), None),
+        ];
+        for ((os, arch, musl, gui), want) in cases {
+            assert_eq!(release_asset_for(os, arch, musl, gui), want, "{os}/{arch} musl={musl} gui={gui}");
+        }
+    }
+
+    /// Every asset `/update` can ask for is one the release skill uploads (its Step 8
+    /// `gh release create`), so a rename on either side fails here, not at a user's update.
+    #[test]
+    fn every_update_asset_is_released() {
+        let skill = include_str!("../.claude/skills/release/SKILL.md");
+        for (os, arch, musl, gui) in [
+            ("linux", "x86_64", true, false), ("linux", "x86_64", false, true),
+            ("linux", "aarch64", true, false), ("macos", "aarch64", false, true),
+            ("windows", "x86_64", false, true),
+        ] {
+            let name = release_asset_for(os, arch, musl, gui).unwrap();
+            assert!(skill.contains(&format!("#{name}")), "the release skill uploads no {name}");
+        }
     }
 
     #[test]

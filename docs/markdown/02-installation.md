@@ -9,6 +9,14 @@ Pre-built binaries are available for common platforms. Download the appropriate 
 chmod +x clay-linux-x86_64-musl
 ./clay-linux-x86_64-musl
 
+# Linux x86_64 with the GUI and audio (Ubuntu 20.04, Debian 11, Fedora 32, RHEL 9 or newer)
+chmod +x clay-linux-x86_64-gui
+./clay-linux-x86_64-gui
+
+# Linux ARM64: Raspberry Pi 4/5 on 64-bit Pi OS, ARM servers (static musl, no GUI)
+chmod +x clay-linux-aarch64-musl
+./clay-linux-aarch64-musl
+
 # Termux ARM64, no GUI (works on any Android device via Termux)
 chmod +x clay-termux-aarch64-nogui
 ./clay-termux-aarch64-nogui
