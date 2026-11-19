@@ -713,8 +713,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.add_output(&format!("Action '{}' deleted.", action_name));
                             // Save settings to disk
                             let _ = persistence::save_settings(app);
-                            // Reopen actions list to show updated list
-                            app.open_actions_list_popup();
+                            // Back to the actions list, to show it updated
+                            app.return_to_actions_list();
                         }
                     }
                 } else if data.contains_key("web_save") {
@@ -740,7 +740,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 if data.contains_key("world_index") {
                     app.open_world_selector_new();
                 } else if data.contains_key("action_index") {
-                    app.open_actions_list_popup();
+                    app.return_to_actions_list();
                 } else if data.contains_key(popup::definitions::confirm::IMPORT_INSECURE_ADDR) {
                     app.pending_console_import = None;
                     app.add_output("Import cancelled.");
@@ -787,7 +787,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         // Create new world and open editor using new popup. Freshly
                         // created purely to populate the editor - Cancel must roll it
                         // back, same as /world -e <new name>.
-                        let new_name = format!("World {}", app.worlds.len() + 1);
+                        let names: Vec<&str> = app.worlds.iter().map(|w| w.name.as_str()).collect();
+                        let new_name = crate::util::new_world_name(&names);
                         let new_world = World::new(&new_name);
                         app.worlds.push(new_world);
                         let idx = app.worlds.len() - 1;
@@ -937,6 +938,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 let all_actions: Vec<ActionInfo> = app.settings.actions
                                     .iter()
                                     .enumerate()
+                                    .filter(|(_, a)| app.actions_scope.matches(a))
                                     .map(|(i, a)| ActionInfo {
                                         name: a.name.clone(),
                                         world: a.world.clone(),
@@ -962,11 +964,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                                 } else {
                                                     format!("({})", info.world)
                                                 };
-                                                let pattern_preview = if info.pattern.len() > 30 {
-                                                    format!("{}...", &info.pattern[..27])
-                                                } else {
-                                                    info.pattern.clone()
-                                                };
+                                                let pattern_preview = crate::util::truncate_str(&info.pattern, 30);
                                                 popup::ListItem {
                                                     id: info.index.to_string(),
                                                     columns: vec![
@@ -1001,6 +999,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     let all_actions: Vec<ActionInfo> = app.settings.actions
                         .iter()
                         .enumerate()
+                        .filter(|(_, a)| app.actions_scope.matches(a))
                         .map(|(i, a)| ActionInfo {
                             name: a.name.clone(),
                             world: a.world.clone(),
@@ -1027,11 +1026,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                     } else {
                                         format!("({})", info.world)
                                     };
-                                    let pattern_preview = if info.pattern.len() > 30 {
-                                        format!("{}...", &info.pattern[..27])
-                                    } else {
-                                        info.pattern.clone()
-                                    };
+                                    let pattern_preview = crate::util::truncate_str(&info.pattern, 30);
                                     popup::ListItem {
                                         id: info.index.to_string(),  // Store original index as ID
                                         columns: vec![
@@ -1086,8 +1081,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         }
                         // Save settings to disk
                         let _ = persistence::save_settings(app);
-                        // Reopen actions list to show updated list
-                        app.open_actions_list_popup();
+                        // Back to the actions list, to show it updated
+                        app.return_to_actions_list();
                     }
                 }
             }
@@ -1100,8 +1095,11 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             NewPopupAction::WorldEditorSaved(settings) => {
                 let idx = settings.world_index;
                 if idx < app.worlds.len() {
-                    // Update world name
-                    app.worlds[idx].name = settings.name;
+                    // Update world name, carrying the actions that name it (saved below)
+                    let old_name = std::mem::replace(&mut app.worlds[idx].name, settings.name.clone());
+                    if app.carry_world_rename(&old_name, &settings.name) {
+                        app.broadcast_actions();
+                    }
 
                     // Update world type. A change away from MudTimedPrompt invalidates
                     // any parked timed-prompt promotion, mirroring the same guard in
@@ -1161,6 +1159,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.login_command = settings.login_command;
                     app.worlds[idx].settings.first_command = settings.first_command;
                     app.worlds[idx].settings.status_panel = settings.status_panel;
+                    // Hide, a shell world's, after its type (set above).
+                    app.set_world_hidden(idx, settings.hidden);
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages;
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
                     app.worlds[idx].settings.auto_reconnect_secs = ar_secs;

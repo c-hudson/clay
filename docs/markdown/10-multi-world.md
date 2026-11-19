@@ -49,6 +49,10 @@ Configure in `/setup`:
 - Always switch to the alphabetically next world
 - Wraps from last to first
 
+A shell world with **Hide** on is never one of these switches' targets, and its text never
+counts as activity. `/sh`, its name and the World Selector still reach it (see the Shell
+Worlds chapter).
+
 ## Activity Indicators
 
 ### Separator Bar

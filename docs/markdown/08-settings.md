@@ -83,8 +83,8 @@ Android app, and the desktop menus the native GUI fills), or edit from World Sel
 
 | Setting | Description |
 |---------|-------------|
-| World name | Display name for this world |
-| World type | `MUD`, `MUD - Timed Prompt`, `Slack`, or `Discord`. The two MUD types connect identically; **MUD - Timed Prompt** additionally takes a line the server leaves unfinished as the prompt (see Prompt wait below). The guess never takes the text out of the output |
+| World name | This world's name: one word, no spaces (`My_MUD`, not `My MUD`). Every editor refuses a name with a space, and a world saved with one before this rule is renamed with `_` at start (`My MUD` becomes `My_MUD`), with a line saying so. A rename, either way, carries the actions whose World field names the world |
+| World type | `MUD`, `MUD - Timed Prompt`, `Slack`, `Discord`, or `Shell` (in a Clay that has shell worlds). The two MUD types connect identically; **MUD - Timed Prompt** additionally takes a line the server leaves unfinished as the prompt (see Prompt wait below). The guess never takes the text out of the output |
 | Hostname | Server address (e.g., mud.example.com) |
 | Port | Server port (e.g., 4000) |
 | Use SSL | Enable TLS/SSL connection |
@@ -92,6 +92,12 @@ Android app, and the desktop menus the native GUI fills), or edit from World Sel
 Slack and Discord worlds have their own fields instead (Token, Server/Workspace,
 Send To, Show Only, and a **Fetch** button that fills in pick lists); see the
 [Chat Worlds](#chat-worlds-discord-and-slack) chapter.
+
+A Shell world's editor has only its Server section: **Command** (what to run; blank is
+your login shell) and **Hide**, which keeps the world out of world switching, the tabs,
+the world menu, `/connections` and Recent Worlds, and makes its text never count as
+activity. `/sh`, its name and the World Selector still reach it. See the Shell Worlds
+chapter.
 
 ### Authentication Settings
 

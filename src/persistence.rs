@@ -628,6 +628,10 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if !world.settings.status_panel {
             writeln!(file, "status_panel=false")?;
         }
+        // Hide, a shell world's (written only when on).
+        if world.settings.hidden {
+            writeln!(file, "hidden=true")?;
+        }
         // Job 15 (plan Phase 4): same convention - default is `true`.
         if !world.settings.mcp_enabled {
             writeln!(file, "mcp_enabled=false")?;
@@ -1361,6 +1365,7 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
                         "status_panel" => world.settings.status_panel = value == "true",
+                        "hidden" => world.settings.hidden = value == "true",
                         "prompt_wait_ms" => {
                             world.settings.prompt_wait_ms =
                                 value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
@@ -1438,6 +1443,9 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
     app.apply_tf_clock_format(None);
     app.apply_tf_textdiv();
     *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
+    // A world saved with a space in its name, before world names were one word (also what
+    // /import brings in, through merge_settings_dat).
+    app.make_world_names_one_word();
     unknown
 }
 
@@ -1593,9 +1601,40 @@ fn push_archive_flags(flags: &mut String, line: &OutputLine) {
 
 /// The `w<n>` flag `push_archive_flags` wrote, if any.
 fn archive_seq_flag(flags: &str) -> Option<i64> {
-    let rest = &flags[flags.find('w')? + 1..];
+    number_flag(flags, 'w').and_then(|n| n.parse().ok())
+}
+
+/// The digits after flag letter `letter`, if the flags have it.
+fn number_flag(flags: &str, letter: char) -> Option<&str> {
+    let rest = &flags[flags.find(letter)? + 1..];
     let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    rest[..end].parse().ok()
+    Some(&rest[..end])
+}
+
+/// A saved line's text field: the escaped text, and for a line a `/substitute` rewrote
+/// (`OutputLine::original`) the escaped original right after it, with flag `o<n>` giving
+/// the escaped text's length in bytes. An older build ignores the flag and shows the two
+/// run together - only after a reload into an older binary.
+fn escaped_text_field(line: &OutputLine, flags: &mut String) -> String {
+    let escape = |t: &str| t.replace('\\', "\\\\").replace('\n', "\\n");
+    let text = escape(&line.text);
+    match &line.original {
+        Some(original) => {
+            flags.push('o');
+            flags.push_str(&text.len().to_string());
+            text + &escape(original)
+        }
+        None => text,
+    }
+}
+
+/// `escaped_text_field` read back: `(text, original)`.
+fn split_text_field(flags: &str, field: &str) -> (String, Option<String>) {
+    match number_flag(flags, 'o').and_then(|n| n.parse::<usize>().ok()) {
+        Some(len) if field.is_char_boundary(len) && len <= field.len() =>
+            (unescape_string(&field[..len]), Some(unescape_string(&field[len..]))),
+        _ => (unescape_string(field), None),
+    }
 }
 
 /// Serializing half of `save_reload_state`, split from the file creation so the emitted
@@ -2030,6 +2069,10 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         if !world.settings.status_panel {
             writeln!(file, "status_panel=false")?;
         }
+        // Hide, a shell world's (written only when on).
+        if world.settings.hidden {
+            writeln!(file, "hidden=true")?;
+        }
         // Job 15 (plan Phase 4): same convention as msp_enabled above.
         if !world.settings.mcp_enabled {
             writeln!(file, "mcp_enabled=false")?;
@@ -2154,7 +2197,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             if line.viewed { flags.push('v'); }
             flags.push_str(&line.hist.flags());
             push_archive_flags(&mut flags, line);
-            let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
+            let escaped = escaped_text_field(line, &mut flags);
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
         writeln!(file, "[pending:{}]", idx)?;
@@ -2167,7 +2210,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             if line.viewed { flags.push('v'); }
             flags.push_str(&line.hist.flags());
             push_archive_flags(&mut flags, line);
-            let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
+            let escaped = escaped_text_field(line, &mut flags);
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
     }
@@ -2383,8 +2426,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         // timestamp_secs|flags|seq|text
         if let (4, Ok(ts_secs)) = (parts.len(), parts[0].parse::<u64>()) {
             let flags = parts[1];
+            let (text, original) = split_text_field(flags, parts[3]);
             return OutputLine { archive_seq: archive_seq_flag(flags),
-                text: unescape_string(parts[3]),
+                text,
                 timestamp: UNIX_EPOCH + Duration::from_secs(ts_secs),
                 from_server: flags.contains('s'),
                 gagged: flags.contains('g'),
@@ -2397,6 +2441,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                 display_id: None,
                 hist: crate::LineHistory::from_flags(flags),
                 tf_attrs: None,
+                original,
             };
         }
         // Not a line this writer wrote (a hand edit): keep its text.
@@ -2942,6 +2987,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "mcp_enabled" => tw.settings.mcp_enabled = value == "true",
                             "mccp2_enabled" => tw.settings.mccp2_enabled = value == "true",
                             "status_panel" => tw.settings.status_panel = value == "true",
+                            "hidden" => tw.settings.hidden = value == "true",
                             "prompt_wait_ms" => {
                                 tw.settings.prompt_wait_ms =
                                     value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
@@ -3266,6 +3312,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         }
         app.split_top_rows = split_top_rows;
     }
+    // A reload from a build before world names were one word: after the restores above,
+    // which match worlds by their old names.
+    app.make_world_names_one_word();
 
     // Load auth key from ~/.clay/settings.dat (it's not in the reload state file)
     let settings_path = get_settings_path();
@@ -3507,6 +3556,7 @@ mod tests {
             auto_reconnect_on_web: true,                   // default: false
             msp_enabled: false,                            // default: true
             status_panel: false,                           // default: true
+            hidden: true,                                  // default: false
             mcp_enabled: false,                            // default: true
             mccp2_enabled: false,                          // default: true
             prompt_wait_ms: 2500,                          // default: 1000
@@ -3630,6 +3680,7 @@ mod tests {
         assert_eq!(a.auto_reconnect_on_web, b.auto_reconnect_on_web, "{context}: auto_reconnect_on_web");
         assert_eq!(a.msp_enabled, b.msp_enabled, "{context}: msp_enabled");
         assert_eq!(a.status_panel, b.status_panel, "{context}: status_panel");
+        assert_eq!(a.hidden, b.hidden, "{context}: hidden");
         assert_eq!(a.mcp_enabled, b.mcp_enabled, "{context}: mcp_enabled");
         assert_eq!(a.mccp2_enabled, b.mccp2_enabled, "{context}: mccp2_enabled");
         assert_eq!(a.prompt_wait_ms, b.prompt_wait_ms, "{context}: prompt_wait_ms");
@@ -4236,7 +4287,7 @@ mod tests {
             String::new(), "0".to_string(), true, true, true,
             "discord".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), "Guild".to_string(), "#dev".to_string(), String::new(),
-            Some(chat), None, None, None, None, None,
+            Some(chat), None, None, None, None, None, None,
         );
         let s = &app.worlds[0].settings;
         assert_eq!(s.discord_channel, "#dev");

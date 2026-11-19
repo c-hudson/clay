@@ -30,6 +30,9 @@ pub struct CachedLine {
     pub from_server: bool,
     pub gagged: bool,
     pub highlight: Option<String>,
+    /// `Line::original` (a file from before it has none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,7 +94,7 @@ mod tests {
         let w = CachedWorld {
             name: "Mud".into(),
             epoch: 42,
-            lines: vec![CachedLine { text: "hi".into(), ts: 5, seq: Some(7), from_server: true, gagged: false, highlight: None }],
+            lines: vec![CachedLine { text: "hi".into(), ts: 5, seq: Some(7), from_server: true, gagged: false, highlight: None, original: None }],
             seen: vec![(0, 7)],
         };
         save("Cache.Test:9000", std::slice::from_ref(&w));

@@ -113,15 +113,17 @@ impl Styler<'_> {
                 return styled.clone();
             }
         }
+        // Under F2 a line a /substitute rewrote is drawn as the MUD sent it.
+        let text = line.shown(self.decor.show_tags);
         let facts = LineFacts {
-            text: &line.text,
+            text,
             ts: line.ts,
             from_server: line.from_server,
             from_archive: line.from_archive,
             archive_sourced: line.archive_sourced,
             is_new,
             highlight: line.highlight.as_deref(),
-            action_match: self.matcher.is_some_and(|m| m.matches(&line.text, self.world)),
+            action_match: self.matcher.is_some_and(|m| m.matches(text, self.world)),
         };
         let styled = Arc::new(decorate(&facts, self.palette, self.style, self.decor));
         self.styled.insert(line.id, (is_new, styled.clone()));
@@ -1126,11 +1128,13 @@ impl ClayView {
                 continue;
             }
             // F4: only the lines containing Find's text.
-            if filter.as_deref().is_some_and(|f| !find::matches_filter(&find::plain(&line.text), f)) {
+            // Both read the text drawn (F2 shows a rewritten line's original).
+            let shown = line.shown(self.show_tags);
+            if filter.as_deref().is_some_and(|f| !find::matches_filter(&find::plain(shown), f)) {
                 continue;
             }
             // A grep window: only the lines matching its pattern.
-            if self.mode.grep.as_ref().is_some_and(|g| !g.matches(&line.text)) {
+            if self.mode.grep.as_ref().is_some_and(|g| !g.matches(shown)) {
                 continue;
             }
             if want_seqs {

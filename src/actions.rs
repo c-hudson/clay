@@ -155,6 +155,152 @@ pub fn action_matches_world(action_world: &str, world_name: &str) -> bool {
         || action_world.split(',').any(|w| w.trim().eq_ignore_ascii_case(world_name))
 }
 
+/// An action's World field (a comma list) with the entry naming `old` (trimmed, case
+/// ignored) changed to `new`, every other entry and its spacing as it was.
+pub fn rename_in_world_list(field: &str, old: &str, new: &str) -> String {
+    field
+        .split(',')
+        .map(|entry| {
+            let name = entry.trim();
+            if !name.is_empty() && name.eq_ignore_ascii_case(old) { entry.replacen(name, new, 1) } else { entry.to_string() }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `/actions`' usage line.
+pub const ACTIONS_USAGE: &str = "Usage: /actions [-w<world>] [<name>]";
+
+/// What `/actions [-w<world>] [<name>]` asks for (user request 2026-11-19), one rule for
+/// every interface: the console and the SSH console call it through
+/// `App::run_actions_command`, the native GUI from `input_view.rs`, and app.js's
+/// `parseActionsArgs`/`actionsQueryMatches`/`resolveActionsQuery`/`actionNameMatches` are
+/// its port (pinned by `app_js_opens_actions_by_the_same_rule`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActionsQuery {
+    /// `-w<world>`: the actions whose World field holds this, whole or in part,
+    /// case-insensitive.
+    pub world: String,
+    /// The actions with this name, case-insensitive: the whole name, or a wildcard
+    /// (`*` any run of characters, `?` one) over the whole name.
+    pub name: String,
+}
+
+/// What `/actions` opens for an [`ActionsQuery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionsOpen {
+    /// The Actions list, showing only the query's actions.
+    List,
+    /// The editor for the one action the name matched.
+    Edit(usize),
+    /// The name matched nothing: this line, and no window.
+    Nothing(String),
+}
+
+impl ActionsQuery {
+    /// `/actions`' arguments (the words after it): `-w<world>` or `-w <world>`, the other
+    /// words the name. A `-w` with no world, or any other option, is the usage line.
+    pub fn parse(args: &[&str]) -> Result<Self, String> {
+        let mut query = Self::default();
+        let mut name: Vec<&str> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = args[i];
+            if let Some(world) = arg.strip_prefix("-w") {
+                let world = if world.is_empty() {
+                    i += 1;
+                    args.get(i).copied().unwrap_or("")
+                } else {
+                    world
+                };
+                if world.is_empty() {
+                    return Err(format!("{ACTIONS_USAGE} (-w needs a world)"));
+                }
+                query.world = world.to_string();
+            } else if arg.len() > 1 && arg.starts_with('-') {
+                return Err(format!("{ACTIONS_USAGE} (no option {arg})"));
+            } else {
+                name.push(arg);
+            }
+            i += 1;
+        }
+        query.name = name.join(" ");
+        Ok(query)
+    }
+
+    /// Whether `action` is one of the query's.
+    pub fn matches(&self, action: &Action) -> bool {
+        (self.world.is_empty() || action.world.to_lowercase().contains(&self.world.to_lowercase()))
+            && (self.name.is_empty() || action_name_matches(&self.name, &action.name))
+    }
+
+    /// The list's note of what it shows (`World: zmc  Name: zmc_*`); empty for all of them.
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.world.is_empty() {
+            parts.push(format!("World: {}", self.world));
+        }
+        if !self.name.is_empty() {
+            parts.push(format!("Name: {}", self.name));
+        }
+        parts.join("  ")
+    }
+
+    /// What `/actions` opens: the list when no name was given; with one, the editor when
+    /// exactly one action matches, the list of them when more do, a line when none does.
+    pub fn resolve(&self, actions: &[Action]) -> ActionsOpen {
+        if self.name.is_empty() {
+            return ActionsOpen::List;
+        }
+        let mut hits = actions.iter().enumerate().filter(|(_, a)| self.matches(a)).map(|(i, _)| i);
+        match (hits.next(), hits.next()) {
+            (None, _) => ActionsOpen::Nothing(self.no_match()),
+            (Some(i), None) => ActionsOpen::Edit(i),
+            _ => ActionsOpen::List,
+        }
+    }
+
+    fn no_match(&self) -> String {
+        if !self.world.is_empty() {
+            return format!("No action matches '{}' in world '{}'.", self.name, self.world);
+        }
+        // `/actions <world>` was the world's list until 2026-11-19.
+        if !self.name.contains(['*', '?']) {
+            return format!("No action matches '{}'. A world's actions: /actions -w {}", self.name, self.name);
+        }
+        format!("No action matches '{}'.", self.name)
+    }
+}
+
+/// An action's name against `/actions`' `pattern`, case-insensitive: `*` stands for any
+/// run of characters, `?` for one, anything else for itself, over the whole name.
+pub fn action_name_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    // The last `*` seen and the name position it was tried at, to back up to.
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Find an action suitable for manual `/name` (or slash-less `name`) invocation
 /// from the given world.
 ///
@@ -297,8 +443,8 @@ pub fn substitute_action_args(command: &str, args_str: &str) -> String {
 }
 
 /// Splits an action's `command` field into sub-commands, substitutes `$1`-`$9`/`$*` with
-/// `args`, and filters out any resulting `/gag` invocation — manually invoking an action must
-/// never toggle a gag as a side effect. Shared by all three `Command::ActionCommand` dispatch
+/// `args`, and filters out any resulting `/gag` or `/substitute` invocation — manually invoking
+/// an action must never toggle a gag, or rewrite the next line, as a side effect. Shared by all three `Command::ActionCommand` dispatch
 /// sites (console/master-WS/daemon): each site still owns how it executes and displays the
 /// result of each returned command string, since that part differs by transport (TF result
 /// dispatch, `ClayCommand` handling, gating) — this only consolidates the identical
@@ -308,6 +454,9 @@ pub fn action_commands_to_run(action: &Action, args: &str) -> Vec<String> {
         .into_iter()
         .map(|cmd| substitute_action_args(&cmd, args))
         .filter(|cmd| !(cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ")))
+        // Invoked by hand there is no line to rewrite, and TF's /substitute would wait
+        // for the next line from the MUD.
+        .filter(|cmd| substitute_command_text(cmd).is_none())
         .collect()
 }
 
@@ -357,6 +506,59 @@ pub struct ActionTriggerResult {
     /// blank lines that follow. Independent of `should_gag` - an action may want the blanks
     /// gone while keeping the line itself visible.
     pub suppress_blanks: bool,
+    /// The action's `/substitute <text>`: the matched line is shown rewritten, in place,
+    /// keeping what the MUD sent as `OutputLine::original` (F2 and `/recall -ao` show it).
+    pub substitute: Option<ActionSubstitute>,
+}
+
+/// An action's `/substitute <text>`, handled like `/gag`: never run as a command (TF's
+/// `/substitute` run after the packet would rewrite whatever line came next), but applied
+/// to the line that matched. `template` is the text after `/substitute `, its `$0`-`$9`
+/// standing for the captures; `build` puts each capture back in the colours it had.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionSubstitute {
+    pub template: String,
+    /// Byte ranges of `$0`-`$9` in the line without escape codes (`None`: no such group,
+    /// or it didn't take part in the match).
+    pub spans: Vec<Option<(usize, usize)>>,
+}
+
+impl ActionSubstitute {
+    /// The rewritten line, from `line` (the line as received, escape codes and all): the
+    /// template's text as written, each `$N` the capture copied out of `line` with its
+    /// colours (`util::ansi_span`). `$` before anything but a digit stays a `$`.
+    pub fn build(&self, line: &str) -> String {
+        let mut out = String::with_capacity(self.template.len() + line.len());
+        let mut chars = self.template.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '$' {
+                if let Some(d) = chars.peek().and_then(|n| n.to_digit(10)) {
+                    chars.next();
+                    if let Some(Some((start, end))) = self.spans.get(d as usize) {
+                        out.push_str(&crate::util::ansi_span(line, *start, *end));
+                    }
+                    continue;
+                }
+            }
+            out.push(c);
+        }
+        out
+    }
+}
+
+/// `/substitute <text>` (or a bare `/substitute`, which empties the line) as an action's
+/// command: the text, else `None` for any other command.
+pub(crate) fn substitute_command_text(cmd: &str) -> Option<&str> {
+    const NAME: &str = "/substitute";
+    let head = cmd.get(..NAME.len())?;
+    if !head.eq_ignore_ascii_case(NAME) {
+        return None;
+    }
+    match &cmd[NAME.len()..] {
+        "" => Some(""),
+        rest if rest.starts_with(' ') => Some(&rest[1..]),
+        _ => None,
+    }
 }
 
 /// Convert a wildcard pattern (* and ?) to a regex pattern
@@ -498,7 +700,8 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
     let lines_to_check = &output_lines[start_idx..end_idx];
     // /recall -a<attrs>: the display attributes to take off a line's own (`g`, showing
     // gagged lines, is `show_gagged`).
-    let suppress = tf::TfAttributes::parse(&opts.suppress_attrs).ok().filter(|a| {
+    // `o` (-ao) is Clay's own letter, which TF's attribute grammar refuses.
+    let suppress = tf::TfAttributes::parse(&opts.suppress_attrs.replace('o', "")).ok().filter(|a| {
         a.bold || a.underline || a.reverse || a.hilite || a.error || a.warning || a.fg.is_some() || a.bg.is_some()
     });
     let now = std::time::SystemTime::now();
@@ -566,11 +769,14 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
             }
         }
 
+        // -ao: a line a /substitute rewrote is matched and shown as the MUD sent it;
+        // otherwise as it is shown, rewritten (F2 changes neither).
+        let source_text: &str = if opts.show_original { line.original_text() } else { &line.text };
         // Match against visible text only: when show_tags (F2) is off, strip MUD tags too
         let plain = if show_tags {
-            strip_ansi_codes(&line.text)
+            strip_ansi_codes(source_text)
         } else {
-            strip_ansi_codes(&strip_mud_tag(&line.text))
+            strip_ansi_codes(&strip_mud_tag(source_text))
         };
         let is_match = match &regex {
             Some(Ok(re)) => {
@@ -582,7 +788,9 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
         };
 
         // -a<attrs> (besides g): TF shows the line without those of its own attributes.
+        // The attributes kept are the shown text's, so an original is shown as it came.
         let text = match (&suppress, &line.tf_attrs) {
+            _ if opts.show_original && line.original.is_some() => std::borrow::Cow::Borrowed(source_text),
             (Some(suppress), Some(own)) => own.without(suppress).map(std::borrow::Cow::Owned)
                 .unwrap_or(std::borrow::Cow::Borrowed(line.text.as_str())),
             _ => std::borrow::Cow::Borrowed(line.text.as_str()),
@@ -738,7 +946,18 @@ pub fn check_action_triggers_plain(
                         }
                     });
 
-                    // Filter out /gag and /highlight, then substitute captures in commands
+                    // `/substitute <text>` rewrites this line (the last one wins). It is
+                    // not a command to run: run after the packet, TF's /substitute would
+                    // rewrite whichever line arrived next.
+                    let substitute = commands.iter().rev()
+                        .find_map(|cmd| substitute_command_text(cmd))
+                        .map(|template| ActionSubstitute {
+                            template: template.to_string(),
+                            spans: caps.iter().map(|m| m.map(|m| (m.start(), m.end()))).collect(),
+                        });
+
+                    // Filter out /gag, /highlight and /substitute, then substitute captures
+                    // in commands
                     let filtered_commands: Vec<String> = commands.into_iter()
                         .filter(|cmd| {
                             let lower = cmd.to_lowercase();
@@ -746,6 +965,7 @@ pub fn check_action_triggers_plain(
                                 && !lower.starts_with("/gag ")
                                 && lower != "/highlight"
                                 && !lower.starts_with("/highlight ")
+                                && substitute_command_text(cmd).is_none()
                         })
                         .map(|cmd| substitute_pattern_captures(&cmd, &captures))
                         .collect();
@@ -755,6 +975,7 @@ pub fn check_action_triggers_plain(
                         commands: filtered_commands,
                         highlight_color,
                         suppress_blanks: action.suppress_blanks,
+                        substitute,
                     });
                 }
             }
@@ -1764,5 +1985,67 @@ mod tests {
             Some("/greet".to_string())
         );
         assert_eq!(rewrite_slashless_action("greet", &actions, "MUD3"), None);
+    }
+
+    // --- /actions [-w<world>] [<name>] ---
+
+    fn named(name: &str, world: &str) -> Action {
+        Action { name: name.to_string(), world: world.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn actions_args_take_w_either_way_and_the_rest_as_the_name() {
+        let q = |w: &str, n: &str| ActionsQuery { world: w.to_string(), name: n.to_string() };
+        assert_eq!(ActionsQuery::parse(&[]), Ok(q("", "")));
+        assert_eq!(ActionsQuery::parse(&["-wzmc"]), Ok(q("zmc", "")));
+        assert_eq!(ActionsQuery::parse(&["-w", "zmc"]), Ok(q("zmc", "")));
+        assert_eq!(ActionsQuery::parse(&["zmc_idle"]), Ok(q("", "zmc_idle")));
+        assert_eq!(ActionsQuery::parse(&["-w", "zmc", "zmc_*"]), Ok(q("zmc", "zmc_*")));
+        assert_eq!(ActionsQuery::parse(&["zmc_*", "-wzmc"]), Ok(q("zmc", "zmc_*")));
+        assert!(ActionsQuery::parse(&["-w"]).unwrap_err().contains("-w needs a world"));
+        assert!(ActionsQuery::parse(&["-x", "a"]).unwrap_err().contains("no option -x"));
+        assert!(ActionsQuery::parse(&["-x"]).unwrap_err().starts_with(ACTIONS_USAGE));
+    }
+
+    #[test]
+    fn action_names_match_whole_with_star_and_question_mark() {
+        assert!(action_name_matches("zmc_idle", "ZMC_Idle"), "case is ignored");
+        assert!(!action_name_matches("zmc", "zmc_idle"), "without a wildcard, the whole name");
+        assert!(action_name_matches("zmc_*", "zmc_idle"));
+        assert!(action_name_matches("zmc_*", "zmc_"));
+        assert!(!action_name_matches("zmc_*", "zmc"));
+        assert!(action_name_matches("*idle", "zmc_idle"));
+        assert!(action_name_matches("*_*_*", "a_b_c"));
+        assert!(!action_name_matches("*_*_*", "a_b"));
+        assert!(action_name_matches("z?c*", "zmc_idle"));
+        assert!(!action_name_matches("z?c", "zc"));
+        assert!(action_name_matches("*", ""));
+        assert!(action_name_matches("a*b*c", "aXbYbZc"), "backs up past an early b");
+        assert!(action_name_matches("é?", "Éa"), "characters, not bytes");
+    }
+
+    #[test]
+    fn actions_opens_the_editor_for_one_match_the_list_for_more() {
+        let actions = vec![named("zmc_idle", "ZMC"), named("zmc_heal", "zmc2"), named("tell_reply", ""), named("heal", "Other")];
+        let open = |args: &[&str]| ActionsQuery::parse(args).unwrap().resolve(&actions);
+        assert_eq!(open(&[]), ActionsOpen::List);
+        assert_eq!(open(&["-w", "zmc"]), ActionsOpen::List, "-w alone is always the list");
+        assert_eq!(open(&["ZMC_IDLE"]), ActionsOpen::Edit(0));
+        assert_eq!(open(&["zmc_*"]), ActionsOpen::List);
+        assert_eq!(open(&["*_reply"]), ActionsOpen::Edit(2));
+        assert_eq!(open(&["-wzmc2", "zmc_*"]), ActionsOpen::Edit(1), "both narrow");
+        assert_eq!(
+            open(&["zmc"]),
+            ActionsOpen::Nothing("No action matches 'zmc'. A world's actions: /actions -w zmc".to_string()),
+            "the old /actions <world> is pointed at -w"
+        );
+        assert_eq!(open(&["zz*"]), ActionsOpen::Nothing("No action matches 'zz*'.".to_string()));
+        assert_eq!(open(&["-w", "other", "zmc_*"]), ActionsOpen::Nothing("No action matches 'zmc_*' in world 'other'.".to_string()));
+
+        let query = ActionsQuery::parse(&["-w", "zmc", "zmc_*"]).unwrap();
+        let listed: Vec<&str> = actions.iter().filter(|a| query.matches(a)).map(|a| a.name.as_str()).collect();
+        assert_eq!(listed, ["zmc_idle", "zmc_heal"], "the World field holds it, whole or in part");
+        assert_eq!(query.label(), "World: zmc  Name: zmc_*");
+        assert_eq!(ActionsQuery::default().label(), "");
     }
 }

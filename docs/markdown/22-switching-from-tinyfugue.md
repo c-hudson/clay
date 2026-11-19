@@ -42,6 +42,9 @@ everything else: you will see them in `/worlds` and every client. Running the
 `.tfrc` again changes only what a line says, and says nothing when nothing
 changed - a world you've adjusted in Clay's world editor keeps its other
 settings. Like TF, Clay warns when a file holding passwords can be read by others.
+A world's name is one word, as TF's `/addworld` already requires: Clay refuses a name
+with any whitespace in it everywhere (its editors, `/worlds -e`, `/addworld` and
+`addworld()`, which TF lets a tab through).
 
 A world's TF type (`-T`) is kept and shown in the world editor. `lp`, `lpp`
 and `diku` worlds log in by sending the character and password as two lines;
@@ -111,7 +114,9 @@ displayed as usual but stays out of it, and out of Clay's scrollback archive.
 `/recordline` puts a line into the world (`-w`), local (`-l`), global (`-g`, the
 default) or input (`-i`) history without showing it, as `savehist.tf` does.
 `/recall -a<attrs>` shows lines without those of their own attributes (`-ag` shows
-gagged ones), and `/echo -ag` keeps a line there without showing it.
+gagged ones), and `/echo -ag` keeps a line there without showing it. A line a
+`/substitute` rewrote is kept as the MUD sent it too: F2 shows that, and Clay's
+`/recall -ao` searches it (TF has no such letter).
 
 ## Connection hooks
 

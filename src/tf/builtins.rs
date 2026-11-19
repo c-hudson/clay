@@ -767,6 +767,7 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
                     // is shown (see RecallOptions::suppress_attrs's doc comment).
                     let attrs: String = opt_chars[i+1..].iter().collect();
                     opts.show_gagged = attrs.contains('g');
+                    opts.show_original = attrs.contains('o');
                     opts.suppress_attrs = attrs;
                     i = opt_chars.len();
                 }

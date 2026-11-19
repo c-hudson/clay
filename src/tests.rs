@@ -6481,7 +6481,7 @@
     /// `world.new_from_seq = 1` to bring it above the watermark. Ownership is the console's,
     /// since `rendering::line_is_new` always draws for the local instance.
     fn make_output_line(text: &str, marked_new: bool) -> OutputLine {
-        OutputLine { archive_seq: None, archive_sourced: false,
+        OutputLine { archive_seq: None, archive_sourced: false, original: None,
             text: text.to_string(),
             timestamp: std::time::SystemTime::now(),
             from_server: true,
@@ -9718,7 +9718,7 @@ third
             seq,
             end_seq: None,
             flush: false,
-            gagged: false, highlight_colors: Vec::new(),
+            gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
         };
 
         // Fill the channel past its capacity of 4 - the 5th broadcast must overflow it.
@@ -9790,7 +9790,7 @@ third
             end_seq: None,
             flush: false,
             gagged: false,
-            highlight_colors: Vec::new(),
+            highlight_colors: Vec::new(), originals: Vec::new(),
         }
     }
 
@@ -9910,7 +9910,7 @@ third
 
         // The server replies with the missing lines (seq 6..=10), exactly as
         // `handle_request_scrollback`'s after_seq branch would produce.
-        let gap_lines: Vec<TimestampedLine> = (6..=10u64).map(|seq| TimestampedLine { archive_sourced: false,
+        let gap_lines: Vec<TimestampedLine> = (6..=10u64).map(|seq| TimestampedLine { archive_sourced: false, original: None,
             text: format!("line{seq}"),
             ts: 0,
             gagged: false,
@@ -9974,7 +9974,7 @@ third
         // remote_client.rs) and receive its reply while pending_gap is STILL open - the
         // exact race this fix targets.
         let backfill_id = app.register_scrollback_request(0, ScrollbackRequestKind::Backfill);
-        let older_lines: Vec<TimestampedLine> = (90..=100u64).map(|seq| TimestampedLine { archive_sourced: false,
+        let older_lines: Vec<TimestampedLine> = (90..=100u64).map(|seq| TimestampedLine { archive_sourced: false, original: None,
             text: format!("line{seq}"),
             ts: 0,
             gagged: false,
@@ -10026,12 +10026,12 @@ third
         assert_eq!((before_seq, archive_before), (Some(101), None), "from the oldest live line");
         assert!(app.remote_history_request(0).is_none(), "one request at a time");
 
-        let live: Vec<TimestampedLine> = (98..=100u64).map(|seq| TimestampedLine { archive_sourced: false,
+        let live: Vec<TimestampedLine> = (98..=100u64).map(|seq| TimestampedLine { archive_sourced: false, original: None,
             text: format!("line{seq}"), ts: 0, gagged: false, from_server: true, seq,
             highlight_color: None, from_archive: false, viewed: false, display_id: None,
         }).collect();
         let archive: Vec<crate::websocket::ArchiveLine> = (0..3).map(|i| crate::websocket::ArchiveLine {
-            text: format!("old{i}"), ts_ms: 5_000 + i, wseq: Some(40 + i), gagged: i == 1,
+            text: format!("old{i}"), ts_ms: 5_000 + i, wseq: Some(40 + i), gagged: i == 1, original: None,
         }).collect();
         // A reply to something else changes nothing.
         app.handle_remote_ws_message(WsMessage::HistoryLines { world_index: 0, request_id: request_id + 1,
@@ -10261,6 +10261,7 @@ third
             mcp_enabled: true,
             mccp2_enabled: true,
             status_panel: Some(false),
+            hidden: Some(false),
             world_type: "mud_timed_prompt".to_string(),
             prompt_wait_ms: 2500,
             tf_type: String::new(),
@@ -10433,7 +10434,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Slack,
@@ -10459,7 +10460,7 @@ third
                 String::new(), "0".to_string(), true, true, true,
                 String::new(), 1000, None, String::new(), String::new(), String::new(),
                 String::new(), String::new(), String::new(), String::new(),
-                None, on, gag, None, None, None,
+                None, on, gag, None, None, None, None,
             );
         };
         save(&mut app, None, None);
@@ -10491,7 +10492,7 @@ third
                 String::new(), "0".to_string(), true, true, true,
                 String::new(), 1000, None, String::new(), String::new(), String::new(),
                 String::new(), String::new(), String::new(), String::new(),
-                None, None, None, None, commands, None,
+                None, None, None, None, commands, None, None,
             );
         };
         save(&mut app, None);
@@ -10524,7 +10525,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud_timed_prompt".to_string(), 2500, None, "xoxb-new".to_string(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt);
@@ -10548,7 +10549,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "shell".to_string(), 0, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Shell);
@@ -10577,7 +10578,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             "mud".to_string(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.world_type, WorldType::Mud);
@@ -10767,7 +10768,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10788,7 +10789,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -10809,7 +10810,7 @@ third
             String::new(), "0".to_string(), true, true, true,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -10888,7 +10889,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert!(!app.worlds[0].settings.mccp2_enabled);
         match rx.try_recv() {
@@ -10907,7 +10908,7 @@ third
             String::new(), "0".to_string(), true, true, false,
             String::new(), 1000, None, String::new(), String::new(), String::new(),
             String::new(), String::new(), String::new(), String::new(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert!(rx.try_recv().is_err(), "an unchanged save must not re-send the toggle");
     }
@@ -11417,7 +11418,7 @@ third
                 "utf8".to_string(), "connect".to_string(), "nop".to_string(), String::new(),
                 String::new(), "0".to_string(), true, true, true, String::new(), 1000, None,
                 String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), String::new(),
-                None, None, None, None, None, None,
+                None, None, None, None, None, None, None,
             );
             assert!(!app.worlds[0].settings.status_panel, "B={handler_b}: None leaves it");
             assert!(app.set_world_status_panel(0, true).contains("shown"));
@@ -11646,7 +11647,7 @@ third
     // shared methods both master-WS and daemon now call.
 
     fn make_pending_line(text: &str, highlighted: bool) -> OutputLine {
-        OutputLine { archive_seq: None, archive_sourced: false,
+        OutputLine { archive_seq: None, archive_sourced: false, original: None,
             text: text.to_string(),
             timestamp: std::time::SystemTime::now(),
             from_server: true,
@@ -12139,7 +12140,7 @@ third
             // case, same skip_serializing_if treatment as flush/gagged.
             end_seq: None,
             flush: false,
-            gagged: false, highlight_colors: Vec::new(),
+            gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("from_server"), "from_server should be omitted when true: {}", json);
@@ -12179,7 +12180,7 @@ third
             seq: 0,
             end_seq: Some(5),
             flush: false,
-            gagged: false, highlight_colors: Vec::new(),
+            gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"from_server\":false"), "from_server:false must be present on the wire: {}", json);
@@ -16245,7 +16246,7 @@ third
 
     #[test]
     fn test_scrollback_batch_round_trip() {
-        let line = TimestampedLine { archive_sourced: false,
+        let line = TimestampedLine { archive_sourced: false, original: None,
             text: "hello".to_string(),
             ts: 1234,
             gagged: false,
@@ -17010,7 +17011,7 @@ third
     /// including on the separator line.
     fn splice_archive_lines(world: &mut World, count: usize) {
         let archived: Vec<crate::scrollback::ScrollbackLine> = (0..count)
-            .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false,
+            .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false, original: None,
                 ts_ms: 1_000 + i as i64,
                 world: world.name.clone(),
                 text: format!("archived line {}", i),
@@ -17031,7 +17032,7 @@ third
         // carried "now" as its time, which made the timestamp fallback load the newest rows
         // again once the archive ran out. A gagged line stays gagged.
         let archived: Vec<crate::scrollback::ScrollbackLine> = (0..5)
-            .map(|i| crate::scrollback::ScrollbackLine { wseq: Some(10 + i), gagged: i == 2,
+            .map(|i| crate::scrollback::ScrollbackLine { wseq: Some(10 + i), gagged: i == 2, original: None,
                 ts_ms: 1_000 + i,
                 world: "W".to_string(),
                 text: format!("old {}", i),
@@ -17275,20 +17276,20 @@ third
         while rx.try_recv().is_ok() {}
 
         let regex = crate::remote_client::grep_regex("ARCHIVED 2", false);
-        app.handle_grep_archive(client_id, 1, None, regex.clone());
+        app.handle_grep_archive(client_id, 1, None, regex.clone(), false);
         let (hits, error) = grep_archive_reply(&mut rx);
         assert_eq!(error, None);
         let of = |w: &str| hits.iter().filter(|h| h.world == w).map(|h| h.text.clone()).collect::<Vec<_>>();
         assert_eq!(of(name), vec!["archived 2"], "20-29 are live: the client searches those itself");
         assert_eq!(of(gone), vec!["archived 2"], "a world only the archive has is searched whole");
 
-        app.handle_grep_archive(client_id, 2, Some(gone.to_lowercase()), crate::remote_client::grep_regex("*", false));
+        app.handle_grep_archive(client_id, 2, Some(gone.to_lowercase()), crate::remote_client::grep_regex("*", false), false);
         let (hits, _) = grep_archive_reply(&mut rx);
         assert_eq!(hits.iter().map(|h| h.text.clone()).collect::<Vec<_>>(), (0..5).map(|i| format!("archived {i}")).collect::<Vec<_>>(),
             "one world, by name in any case, oldest first");
 
         app.settings.scrollback_enabled = false;
-        app.handle_grep_archive(client_id, 3, None, regex);
+        app.handle_grep_archive(client_id, 3, None, regex, false);
         let (hits, error) = grep_archive_reply(&mut rx);
         assert!(hits.is_empty() && error.is_some_and(|e| e.contains("Archive Input/Output")));
     }
@@ -17415,7 +17416,7 @@ third
         for _ in 0..3 {
             let oldest = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false,
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false, original: None,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),
@@ -17450,7 +17451,7 @@ third
         for _ in 0..3 {
             let oldest = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false,
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false, original: None,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),
@@ -17522,7 +17523,7 @@ third
         for _ in 0..3 {
             let oldest = app.worlds[0].output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false,
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None, gagged: false, original: None,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),
@@ -23963,7 +23964,7 @@ fn the_web_world_editor_warns_and_sends_keep_alive_gag() {
 fn the_webview_page_asks_its_host_for_the_taskbar_and_notifications() {
     let js = include_str!("web/app.js");
     assert!(js.contains("if (!window.WEBVIEW_MODE || popupWindowMode || grepMode || noteMode) return;"));
-    assert!(js.contains("const liveText = isFromServer && !isGapFill && !world.is_activity;"));
+    assert!(js.contains("const liveText = isFromServer && !isGapFill && !world.is_activity && !isHiddenWorld(world);"), "a hidden shell world raises no alert");
     assert!(js.contains("if (liveText && !msg.gagged && msg.data) noteTaskbarAlert();"), "live, shown text only");
     assert!(js.contains("if (!taskbarAlert || taskbarAlertSent || document.hasFocus()) return;"));
     assert!(js.contains("desktopHostSend('badge:' + serverActivityCount);"));
@@ -24737,4 +24738,723 @@ fn disconnect_nobody_watches_is_activity_and_told_at_once() {
     let log = app.ws_broadcast_log.lock().unwrap();
     assert!(log.iter().any(|m| matches!(m, WsMessage::UnseenUpdate { world_index: 1, count: 1 })), "{log:?}");
     assert!(log.iter().any(|m| matches!(m, WsMessage::ActivityUpdate { count: 1 })), "{log:?}");
+}
+
+/// A world with one action whose command is `command`, matching `pattern` (a regexp).
+fn app_with_action(pattern: &str, command: &str) -> App {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("test"));
+    app.current_world_index = 0;
+    let mut action = crate::actions::Action { name: "s".to_string(), command: command.to_string(), ..Default::default() };
+    action.match_type = crate::actions::MatchType::Regexp;
+    action.patterns = vec![crate::actions::MatchPattern { pattern: pattern.to_string(), compiled_regex: None }];
+    action.compile_regex();
+    app.settings.actions = vec![action];
+    app
+}
+
+/// Feed `packets` to world 0 and run each one's action commands the way the event loops
+/// do (apploop.rs, main.rs): through TF, after the packet.
+fn feed_running_commands(app: &mut App, packets: &[&[u8]]) {
+    for packet in packets {
+        let cmds = app.process_server_data(0, packet, 24, 80, false);
+        for cmd in cmds {
+            assert!(!cmd.to_lowercase().starts_with("/substitute"), "/substitute is applied, never run: {cmd}");
+            let effects = app.run_tf_in_world(0, &cmd);
+            app.apply_tf_effects_now(effects, crate::tfrun::TfEffectCtx::for_world(0, false));
+        }
+    }
+}
+
+fn texts_and_originals(app: &App) -> Vec<(String, Option<String>, bool)> {
+    app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.original.clone(), l.gagged)).collect()
+}
+
+/// An action's `/substitute $1` rewrites the line it matched, in place, keeping what the MUD
+/// sent as the original. It was run as TF's /substitute after the packet, so the matched
+/// line stayed as it was and the NEXT line from the MUD was hidden and replaced (user
+/// report 2026-11-18, verified with this packet pair before the fix).
+#[test]
+fn an_actions_substitute_rewrites_its_own_line_in_place() {
+    let mut app = app_with_action(r"^(?:AlwaysGreat|The) (\S+ says '.*)$", "/substitute $1");
+    feed_running_commands(&mut app, &[
+        b"AlwaysGreat Ztheman says 'hi'\r\nafter one\r\n",
+        b"The Doctor says 'Chanel'\r\nnext packet line\r\n",
+    ]);
+    assert_eq!(texts_and_originals(&app), vec![
+        ("Ztheman says 'hi'".to_string(), Some("AlwaysGreat Ztheman says 'hi'".to_string()), false),
+        ("after one".to_string(), None, false),
+        ("Doctor says 'Chanel'".to_string(), Some("The Doctor says 'Chanel'".to_string()), false),
+        ("next packet line".to_string(), None, false),
+    ]);
+    // F2 draws the MUD's own text in the rewrite's place, one line either way.
+    let line = &app.worlds[0].output_lines[0];
+    assert_eq!(line.shown_text(false), "Ztheman says 'hi'");
+    assert_eq!(line.shown_text(true), "AlwaysGreat Ztheman says 'hi'");
+    let now = crate::CachedNow::new();
+    let drawn = crate::rendering::process_output_line(line, true, false, false, &now).expect("drawn under F2");
+    assert!(drawn.ends_with("AlwaysGreat Ztheman says 'hi'"), "{drawn:?}");
+    let drawn = crate::rendering::process_output_line(line, false, false, false, &now).expect("drawn");
+    assert_eq!(drawn, "Ztheman says 'hi'");
+}
+
+/// The captures keep the colours they had in the MUD's line; the text the template adds is
+/// plain.
+#[test]
+fn an_actions_substitute_keeps_the_captures_colours() {
+    let mut app = app_with_action(r"^(?:AlwaysGreat|The) (\S+) (says '.*)$", "/substitute <$1> $2");
+    feed_running_commands(&mut app, &[b"\x1b[1;32mAlwaysGreat\x1b[0m \x1b[33mZtheman\x1b[0m says 'hi'\r\n"]);
+    let line = &app.worlds[0].output_lines[0];
+    assert_eq!(crate::util::strip_ansi_codes(&line.text), "<Ztheman> says 'hi'");
+    assert!(line.text.contains("\x1b[33mZtheman"), "the capture keeps its yellow: {:?}", line.text);
+    assert_eq!(line.original.as_deref(), Some("\x1b[1;32mAlwaysGreat\x1b[0m \x1b[33mZtheman\x1b[0m says 'hi'"));
+}
+
+#[test]
+fn ansi_span_copies_a_span_with_the_colours_in_force() {
+    let s = "\x1b[31mred \x1b[1mbold\x1b[0m plain";
+    // "red bold plain": "bold" is 4..8, "plain" 9..14.
+    assert_eq!(crate::util::ansi_span(s, 4, 8), "\x1b[31m\x1b[1mbold\x1b[0m");
+    assert_eq!(crate::util::ansi_span(s, 9, 14), "\x1b[31m\x1b[1m\x1b[0mplain\x1b[0m");
+    assert_eq!(crate::util::ansi_span("no codes here", 3, 8), "codes");
+    assert_eq!(crate::util::ansi_span(s, 5, 5), "");
+    // Multi-byte text: offsets are bytes of the stripped text.
+    assert_eq!(crate::util::strip_ansi_codes(&crate::util::ansi_span("\x1b[32mé ü\x1b[0m", 3, 5)), "ü");
+}
+
+/// TF's /substitute rewrites in place too, in arrival order: it used to gag the line and
+/// add its text after the whole packet, so F2 showed both and the text could land below
+/// lines that arrived after it.
+#[test]
+fn tf_substitute_rewrites_in_place_and_in_order() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("test"));
+    app.current_world_index = 0;
+    app.tf_engine.execute(r#"/def -mregexp -t"^(AlwaysGreat|The) ([^ ]+ says '.*)$" notitle = /substitute %P2"#);
+    app.process_server_data(0, b"before\r\nThe Doctor says 'x'\r\nafter\r\n", 24, 80, false);
+    assert_eq!(texts_and_originals(&app), vec![
+        ("before".to_string(), None, false),
+        ("Doctor says 'x'".to_string(), Some("The Doctor says 'x'".to_string()), false),
+        ("after".to_string(), None, false),
+    ]);
+}
+
+/// A /substitute run anywhere but by one of a line's own triggers rewrites no line: a typed
+/// one used to wait in the engine and replace whatever line the MUD sent next.
+#[test]
+fn a_stray_tf_substitute_rewrites_nothing() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("test"));
+    app.current_world_index = 0;
+    let effects = app.run_tf_in_world(0, "/substitute stray");
+    app.apply_tf_effects_now(effects, crate::tfrun::TfEffectCtx::for_world(0, false));
+    app.process_server_data(0, b"a real line\r\n", 24, 80, false);
+    let line = app.worlds[0].output_lines.iter().find(|l| l.from_server).expect("the MUD's line");
+    assert_eq!((line.text.as_str(), line.gagged, line.original.is_none()), ("a real line", false, true));
+}
+
+/// Invoking an action by name never runs its /substitute (there is no line to rewrite).
+#[test]
+fn a_manually_run_action_drops_its_substitute() {
+    let action = crate::actions::Action { name: "s".to_string(), command: "/substitute x; say hi; /SUBSTITUTE".to_string(), ..Default::default() };
+    assert_eq!(crate::actions::action_commands_to_run(&action, ""), vec!["say hi".to_string()]);
+}
+
+/// /recall matches and shows the rewrite; -ao (and -ago) the MUD's own text.
+#[test]
+fn recall_ao_matches_and_shows_the_original() {
+    let mut app = app_with_action(r"^(?:AlwaysGreat|The) (\S+ says '.*)$", "/substitute $1");
+    feed_running_commands(&mut app, &[b"AlwaysGreat Ztheman says 'hi'\r\nplain line\r\n"]);
+    let recall = |app: &mut App, args: &str| -> Vec<String> {
+        let tf::TfCommandResult::Recall(opts) = tf::builtins::cmd_recall(args) else { panic!("{args}") };
+        app.recall_matches(&opts, 0).unwrap().into_iter().map(|(t, _)| t).collect()
+    };
+    assert_eq!(recall(&mut app, "*Ztheman*"), vec!["Ztheman says 'hi'".to_string()]);
+    assert!(recall(&mut app, "*AlwaysGreat*").is_empty(), "without -ao the rewrite is what's searched");
+    assert_eq!(recall(&mut app, "-ao *AlwaysGreat*"), vec!["AlwaysGreat Ztheman says 'hi'".to_string()]);
+    assert_eq!(recall(&mut app, "-ago *Ztheman*"), vec!["AlwaysGreat Ztheman says 'hi'".to_string()]);
+    assert_eq!(recall(&mut app, "-ao *plain*"), vec!["plain line".to_string()], "a line not rewritten is itself");
+}
+
+/// Every client gets the original beside the rewrite: live (`ServerData.originals`, parallel
+/// to its lines) and in a line list (`TimestampedLine.original`).
+#[test]
+fn the_original_rides_the_wire() {
+    let mut app = app_with_action(r"^(?:AlwaysGreat|The) (\S+ says '.*)$", "/substitute $1");
+    feed_running_commands(&mut app, &[b"plain\r\nAlwaysGreat Ztheman says 'hi'\r\n"]);
+    let log = app.ws_broadcast_log.lock().unwrap();
+    let originals = log.iter().find_map(|m| match m {
+        WsMessage::ServerData { data, originals, .. } if data.contains("Ztheman") => Some(originals.clone()),
+        _ => None,
+    }).expect("the line was broadcast");
+    assert_eq!(originals, vec![None, Some("AlwaysGreat Ztheman says 'hi'".to_string())]);
+    drop(log);
+    let tl = TimestampedLine::from_output_line(&app.worlds[0].output_lines[1]);
+    assert_eq!(tl.original.as_deref(), Some("AlwaysGreat Ztheman says 'hi'"));
+    let json = serde_json::to_string(&TimestampedLine::from_output_line(&app.worlds[0].output_lines[0])).unwrap();
+    assert!(!json.contains("original"), "omitted when there is none: {json}");
+}
+
+/// The original survives a hot reload (flag `o<n>`), a `|` in either text included.
+#[test]
+fn the_original_survives_a_reload() {
+    let mut app = app_with_action(r"^(?:AlwaysGreat|The) (\S+ says '.*)$", "/substitute $1");
+    feed_running_commands(&mut app, &[b"AlwaysGreat Zt|heman says 'a\\b|c'\r\nplain\r\n"]);
+    let mut buf: Vec<u8> = Vec::new();
+    crate::persistence::save_reload_state_to(&app, &mut buf).expect("save");
+    let mut reloaded = App::new();
+    crate::persistence::load_reload_state_from_str(&mut reloaded, &String::from_utf8(buf).unwrap()).expect("load");
+    let w = reloaded.worlds.iter().find(|w| w.name == "test").expect("world restored");
+    let got: Vec<(String, Option<String>)> = w.output_lines.iter().map(|l| (l.text.clone(), l.original.clone())).collect();
+    assert_eq!(got, vec![
+        ("Zt|heman says 'a\\b|c'".to_string(), Some("AlwaysGreat Zt|heman says 'a\\b|c'".to_string())),
+        ("plain".to_string(), None),
+    ]);
+}
+
+/// The archive keeps both texts; a search matches the rewrite, or with `original` the MUD's
+/// own text, and returns both. A file from before the column gets it at open, and a
+/// reader of one that never got it still works.
+#[test]
+fn the_archive_keeps_the_original() {
+    let dir = std::env::temp_dir().join(format!("clay_test_archive_original_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("scrollback.db");
+    let mut app = app_with_action(r"^(?:AlwaysGreat|The) (\S+ says '.*)$", "/substitute $1");
+    {
+        let sdb = crate::scrollback::ScrollbackDb::open(&db_path).expect("open archive");
+        app.worlds[0].scrollback_tx = Some(sdb.sender());
+        app.worlds[0].ensure_world_id();
+        feed_running_commands(&mut app, &[b"AlwaysGreat Ztheman says 'hi'\r\nplain\r\n"]);
+        app.worlds[0].scrollback_tx = None;
+        drop(sdb);
+    }
+    let query = |pattern: &str, original: bool| crate::scrollback::query(&db_path, &crate::scrollback::ArchiveQuery {
+        world: Some("test"), pattern, kind: crate::scrollback::PatternKind::Glob, before_wseq: None,
+        since_ms: None, until_ms: None, limit: 10, newest_first: true, original,
+    });
+    let mut hits = Vec::new();
+    for _ in 0..100 {
+        hits = query("*Ztheman*", false);
+        if !hits.is_empty() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(hits.len(), 1, "the rewrite is searched");
+    assert_eq!(hits[0].text, "Ztheman says 'hi'");
+    assert_eq!(hits[0].original.as_deref(), Some("AlwaysGreat Ztheman says 'hi'"));
+    assert!(query("AlwaysGreat*", false).is_empty());
+    assert_eq!(query("AlwaysGreat*", true).len(), 1, "with original, the MUD's text is searched (FTS indexes both)");
+    assert_eq!(query("plain", true).len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The SSH console builds its lines from the wire: a live batch's `originals` and a line
+/// list's `original` reach its lines, which it draws through the console's renderer.
+#[test]
+fn the_ssh_console_keeps_the_originals_it_is_sent() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("world0"));
+    app.current_world_index = 0;
+    app.handle_remote_ws_message(WsMessage::ServerData { archive_sourced: false,
+        world_index: 0, data: "plain\nZtheman says 'hi'".into(), is_viewed: true, ts: 0, from_server: true,
+        seq: 5, end_seq: Some(6), flush: false, gagged: false, highlight_colors: Vec::new(),
+        originals: vec![None, Some("AlwaysGreat Ztheman says 'hi'".into())],
+    });
+    let got: Vec<(String, Option<String>)> = app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.original.clone())).collect();
+    assert_eq!(got, vec![
+        ("plain".to_string(), None),
+        ("Ztheman says 'hi'".to_string(), Some("AlwaysGreat Ztheman says 'hi'".to_string())),
+    ]);
+    assert_eq!(app.worlds[0].output_lines[1].shown_text(true), "AlwaysGreat Ztheman says 'hi'");
+}
+
+/// The item ids (action indices) the console's Actions list shows, in its order.
+fn console_actions_listed(app: &App) -> Vec<String> {
+    let state = app.popup_manager.current().expect("a popup");
+    assert_eq!(state.definition.id, popup::PopupId("actions_list"));
+    match &state.field(popup::definitions::actions::ACTIONS_FIELD_LIST).expect("the list").kind {
+        popup::FieldKind::List { items, .. } => items.iter().map(|i| i.id.clone()).collect(),
+        other => panic!("not a list: {other:?}"),
+    }
+}
+
+/// `/actions [-w<world>] [<name>]` in the console (user request 2026-11-19): `-w` narrows
+/// the list to a world's actions, a name opens its editor, a wildcard with several matches
+/// lists only them - through the filter box and the return after an edit - and an editor
+/// opened by name closes back to the output.
+#[test]
+fn the_console_actions_command_edits_by_name_and_narrows_the_list() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("test"));
+    app.current_world_index = 0;
+    let named = |n: &str, w: &str| crate::actions::Action { name: n.into(), world: w.into(), ..Default::default() };
+    app.settings.actions = vec![named("zmc_idle", "ZMC"), named("zmc_heal", "zmc2"), named("other_heal", "")];
+    let run = |app: &mut App, line: &str| match parse_command(line) {
+        Command::Actions { query } => app.run_actions_command(query),
+        other => panic!("{line} parsed as {other:?}"),
+    };
+    let last_line = |app: &App| app.worlds[0].output_lines.last().map(|l| l.text.clone()).unwrap_or_default();
+
+    // A name: its editor, and closing it goes back to the output.
+    run(&mut app, "/actions ZMC_idle");
+    let state = app.popup_manager.current().expect("the editor");
+    assert_eq!(state.definition.id, popup::PopupId("action_editor"));
+    assert_eq!(state.get_custom("editing_index"), Some("0"));
+    app.popup_manager.close(); // what Save and Cancel do
+    app.return_to_actions_list();
+    assert!(app.popup_manager.current().is_none(), "no list behind an editor opened by name");
+
+    // A wildcard with two matches: the list of them, by name, saying so in its title.
+    run(&mut app, "/actions zmc_*");
+    assert_eq!(console_actions_listed(&app), ["1", "0"]);
+    assert_eq!(app.popup_manager.current().unwrap().definition.title, "Actions - Name: zmc_*");
+    // The filter box narrows within them: "he" also names other_heal, which stays out.
+    for code in [KeyCode::Char('/'), KeyCode::Enter, KeyCode::Char('h'), KeyCode::Char('e')] {
+        crate::input_handler::handle_key_event(KeyEvent::new(code, KeyModifiers::NONE), &mut app);
+    }
+    assert_eq!(console_actions_listed(&app), ["1"], "the filter box keeps the list's query");
+    // An edit from the list goes back to the same list.
+    app.open_action_editor_popup(Some(1));
+    app.popup_manager.close();
+    app.return_to_actions_list();
+    assert_eq!(console_actions_listed(&app), ["1", "0"]);
+
+    // -w, either way: the actions whose World field holds it, whole or in part.
+    app.popup_manager.close_all();
+    run(&mut app, "/actions -w zmc");
+    assert_eq!(console_actions_listed(&app), ["1", "0"]);
+    run(&mut app, "/actions -wzmc2 zmc_*");
+    assert_eq!(app.popup_manager.current().unwrap().definition.id, popup::PopupId("action_editor"), "one match: its editor");
+    run(&mut app, "/actions");
+    assert_eq!(console_actions_listed(&app), ["2", "1", "0"], "every action, the scope gone");
+
+    // No match, or a bad option: a line and no window.
+    app.popup_manager.close_all();
+    run(&mut app, "/actions zmc");
+    assert!(app.popup_manager.current().is_none());
+    assert_eq!(last_line(&app), "No action matches 'zmc'. A world's actions: /actions -w zmc");
+    run(&mut app, "/actions -w");
+    assert!(last_line(&app).starts_with("Usage: /actions [-w<world>] [<name>]"), "{}", last_line(&app));
+    assert!(app.popup_manager.current().is_none());
+}
+
+/// app.js's `/actions` is actions::ActionsQuery's rule ported step for step: the same
+/// usage line, the same `-w` forms, the same wildcard walk and the same lines for no match.
+#[test]
+fn app_js_opens_actions_by_the_same_rule() {
+    let js = include_str!("web/app.js");
+    let usage = format!("const ACTIONS_USAGE = '{}';", crate::actions::ACTIONS_USAGE);
+    for part in [
+        usage.as_str(),
+        "case '/actions':\n                actionsCommand(args);",
+        "function parseActionsArgs(args) {",
+        "if (arg.startsWith('-w')) {",
+        "if (world === '') return { error: ACTIONS_USAGE + ' (-w needs a world)' };",
+        "} else if (arg.length > 1 && arg.startsWith('-')) {",
+        "return { error: ACTIONS_USAGE + ' (no option ' + arg + ')' };",
+        "query.name = name.join(' ');",
+        "function actionNameMatches(pattern, name) {",
+        "if (pi < p.length && p[pi] === '*') {",
+        "} else if (pi < p.length && (p[pi] === '?' || p[pi] === n[ni])) {",
+        "pi = star[0] + 1;",
+        "ni = star[1] + 1;",
+        "star = [star[0], star[1] + 1];",
+        "while (pi < p.length && p[pi] === '*') pi += 1;",
+        "if (query.world && !(action.world || '').toLowerCase().includes(query.world.toLowerCase())) return false;",
+        "if (hits.length === 1) return { edit: hits[0] };",
+        "if (query.world) return \"No action matches '\" + query.name + \"' in world '\" + query.world + \"'.\";",
+        "return \"No action matches '\" + query.name + \"'. A world's actions: /actions -w \" + query.name;",
+        "if (!actionsQueryMatches(actionsQuery, action)) {",
+        "if (query.name) parts.push('Name: ' + query.name);",
+        "return parts.join('  ');",
+    ] {
+        assert!(js.contains(part), "app.js no longer has {part:?}: keep it and actions::ActionsQuery in step");
+    }
+    assert!(!js.contains("actionsWorldFilter"), "app.js has the old world-only filter again");
+}
+
+
+/// A world's name is one word (user ruling 2026-11-19): no whitespace of any kind, not
+/// empty, no leading "(" (TF's temporary worlds), and not Activity while that world exists.
+#[test]
+fn world_names_are_one_word() {
+    use crate::util::{new_world_name, one_word_world_name, world_name_problem, world_name_refusal};
+    assert_eq!(world_name_problem("Ztheman"), None);
+    assert_eq!(world_name_problem("zmc.example:4000"), None, "punctuation is fine");
+    for spaced in ["My World", "tab\there", "line\nbreak", "nbsp\u{a0}x", "ideo\u{3000}x"] {
+        assert_eq!(world_name_problem(spaced), Some("A world name is one word: no spaces."), "{spaced:?}");
+    }
+    assert_eq!(world_name_problem(""), Some("A world name can't be empty."));
+    assert_eq!(world_name_problem("(unnamed1)"), Some("A world name can't start with '('."));
+    assert_eq!(world_name_refusal("activity", true).as_deref(), Some("Activity is the Activity world's name; pick another."));
+    assert_eq!(world_name_refusal("activity", false), None);
+    assert_eq!(world_name_refusal("a b", false).as_deref(), Some("A world name is one word: no spaces."));
+
+    assert_eq!(one_word_world_name("  My   Big\tWorld "), "My_Big_World");
+    assert_eq!(one_word_world_name("clay (1)"), "clay_(1)");
+    assert_eq!(one_word_world_name("(x y)"), "x_y)");
+    assert_eq!(one_word_world_name("   "), "World");
+    assert!(world_name_problem(&one_word_world_name("((  odd  name")).is_none());
+
+    assert_eq!(new_world_name::<&str>(&[]), "NewWorld");
+    assert_eq!(new_world_name(&["newworld", "NewWorld2"]), "NewWorld3");
+    assert!(world_name_problem(&new_world_name(&["NewWorld"])).is_none());
+}
+
+/// A world saved with a space in its name before the rule is renamed at the load: one
+/// word, unique, the actions naming it follow, and the output is told once.
+#[test]
+fn a_saved_world_with_a_space_is_renamed_at_load() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.settings.actions.clear();
+    crate::persistence::load_settings_from_str(
+        &mut app,
+        "[world:My World]\nhostname=a.example\nport=4000\n\n[world:My_World]\nhostname=b.example\nport=4000\n\n[action:greet]\nworld=My World, Other\ncommand=say hi\n",
+    );
+    let names: Vec<&str> = app.worlds.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["My_World_2", "My_World"], "renamed, and not onto the world already named so");
+    assert_eq!(app.worlds[0].settings.hostname, "a.example", "the same world, its settings kept");
+    assert_eq!(app.settings.actions[0].world, "My_World_2, Other", "the action follows, the rest of its list kept");
+    assert_eq!(app.take_world_rename_notes(), ["World 'My World' is now 'My_World_2': world names are one word."]);
+    assert!(app.take_world_rename_notes().is_empty(), "said once");
+}
+
+/// A reload from a build before the rule carries the old name in its state: restored, it
+/// is one word too.
+#[test]
+fn a_reload_from_an_older_build_renames_a_spaced_world() {
+    let mut old = App::new();
+    old.worlds.clear();
+    old.worlds.push(World::new("Old Mud"));
+    old.current_world_index = 0;
+    let mut buf: Vec<u8> = Vec::new();
+    crate::persistence::save_reload_state_to(&old, &mut buf).expect("save");
+    let mut reloaded = App::new();
+    reloaded.worlds.clear();
+    crate::persistence::load_reload_state_from_str(&mut reloaded, &String::from_utf8(buf).unwrap()).expect("load");
+    assert_eq!(reloaded.worlds.iter().filter(|w| !w.is_activity).map(|w| w.name.as_str()).collect::<Vec<_>>(), ["Old_Mud"]);
+    assert_eq!(reloaded.world_rename_notes.len(), 1);
+}
+
+/// The server decides for every client: a new world that isn't one word isn't made, and a
+/// rename to one keeps the old name while the rest of the save applies.
+#[test]
+fn the_server_refuses_a_world_name_that_is_not_one_word() {
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("mud"));
+    app.current_world_index = 0;
+    app.create_world(7, "New World 2");
+    assert_eq!(app.worlds.len(), 1, "not created");
+    app.create_world(7, " NewWorld2 ");
+    assert_eq!(app.worlds.last().unwrap().name, "NewWorld2", "trimmed and created");
+
+    let rename = |app: &mut App, name: &str, host: &str| {
+        app.update_world_settings(
+            0, name.to_string(), host.to_string(), "4000".into(), String::new(), String::new(), false, false,
+            "utf8".into(), "Connect".into(), "NOP".into(), String::new(), String::new(), "0".into(),
+            false, false, true, "mud".into(), 1000, None, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(), None, None, None, None, None, None, None,
+        )
+    };
+    let refusal = rename(&mut app, "my mud", "mud.example");
+    assert_eq!(refusal.as_deref(), Some("A world name is one word: no spaces."));
+    assert_eq!(app.worlds[0].name, "mud", "the old name kept");
+    assert_eq!(app.worlds[0].settings.hostname, "mud.example", "the rest of the save applied");
+    assert_eq!(rename(&mut app, "my_mud", "mud.example"), None);
+    assert_eq!(app.worlds[0].name, "my_mud");
+
+    // The console's /worlds -e and TF's /addworld refuse the same names, a tab included.
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let _ = commands::handle_command("/worlds -e brand new", &mut app, event_tx.clone()).await;
+    });
+    assert!(app.find_world("brand new").is_none() && app.popup_manager.current().is_none());
+    let last = |app: &App| app.worlds[app.current_world_index].output_lines.last().map(|l| l.text.clone()).unwrap_or_default();
+    assert_eq!(last(&app), "A world name is one word: no spaces.");
+    let effects = app.run_tf_in_world(0, "/addworld tab\there host.example 4000");
+    app.apply_tf_effects_now(effects, crate::tfrun::TfEffectCtx::for_world(0, false));
+    let effects = app.run_tf_in_world(0, "/test addworld(\"tab\tthere\", \"\", \"host.example\", \"4000\")");
+    app.apply_tf_effects_now(effects, crate::tfrun::TfEffectCtx::for_world(0, false));
+    assert!(app.worlds.iter().all(|w| !w.name.contains('\t')), "{:?}", app.worlds.iter().map(|w| &w.name).collect::<Vec<_>>());
+}
+
+/// A BAMF portal's world is one word too, so the /worlds it queues finds it.
+#[test]
+fn a_bamf_portal_world_is_one_word() {
+    let portal = parse_bamf_portal("#### Please reconnect to Some Place@1.2.3.4 (mud.example) port 4000 ####").expect("a portal");
+    assert_eq!(portal.name, "Some_Place");
+}
+
+/// app.js checks a world's name by util::world_name_refusal's rule, ported step for step
+/// (the same messages, char::is_whitespace's set through FILLER_SPACE), and its Add gives
+/// util::new_world_name's names.
+#[test]
+fn app_js_checks_world_names_by_the_same_rule() {
+    let js = include_str!("web/app.js");
+    let msg = |name: &str| crate::util::world_name_problem(name).unwrap();
+    let activity = crate::util::world_name_refusal("Activity", true).unwrap();
+    let parts = [
+        format!("if (name === '') return \"{}\";", msg("")),
+        format!("if (FILLER_SPACE.test(name)) return '{}';", msg("a b")),
+        format!("if (name.startsWith('(')) return \"{}\";", msg("(a")),
+        format!("return \"{activity}\";"),
+        "if (worlds.some(w => w.is_activity) && name.trim().toLowerCase() === 'activity') {".to_string(),
+        "if (!taken('NewWorld')) return 'NewWorld';".to_string(),
+        "if (!taken('NewWorld' + i)) return 'NewWorld' + i;".to_string(),
+        "const name = newWorldName(worlds);".to_string(),
+        "const nameProblem = worldName === worlds[worldEditorIndex].name ? null : validateWorldName(worldName);".to_string(),
+        "if (!saveWorldEditor()) return;".to_string(),
+        "} else if (validateWorldName(name)) {".to_string(),
+    ];
+    for part in &parts {
+        assert!(js.contains(part.as_str()), "app.js no longer has {part:?}: keep validateWorldName/newWorldName and util in step");
+    }
+    assert!(!js.contains("'New World'"), "app.js names a new world with a space again");
+}
+
+/// The console's world editor (the SSH console's too: one key handler) keeps a name that
+/// isn't one word on screen, saying why, and saves once it is.
+#[test]
+fn the_console_world_editor_refuses_a_name_that_is_not_one_word() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use popup::definitions::world_editor::{WORLD_BTN_SAVE, WORLD_FIELD_NAME};
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("mud"));
+    app.current_world_index = 0;
+    app.open_world_editor_popup_new(0, false);
+    let save_with = |app: &mut App, name: &str| {
+        let state = app.popup_manager.current_mut().expect("the editor");
+        if state.editing {
+            state.commit_edit();
+        }
+        state.set_text(WORLD_FIELD_NAME, name.to_string());
+        state.select_button(WORLD_BTN_SAVE);
+        handle_new_popup_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    };
+    assert!(matches!(save_with(&mut app, "my mud"), NewPopupAction::None));
+    let state = app.popup_manager.current().expect("still open");
+    assert_eq!(state.error.as_deref(), Some("A world name is one word: no spaces."));
+    assert!(state.is_field_selected(WORLD_FIELD_NAME) && state.editing, "back on the name, editing it");
+    match save_with(&mut app, " my_mud ") {
+        NewPopupAction::WorldEditorSaved(settings) => assert_eq!(settings.name, "my_mud", "trimmed"),
+        _ => panic!("not saved"),
+    }
+    assert!(app.popup_manager.current().is_none());
+}
+
+/// A world renamed in an editor carries what is kept by its name (user request
+/// 2026-11-19): the actions' World entries naming it (case ignored, the rest of each list
+/// kept), TF's world file and its /watchdog override - through the server's rename, which
+/// every client's editor uses, and the console's own.
+#[test]
+fn renaming_a_world_carries_the_actions_that_name_it() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use popup::definitions::world_editor::{WORLD_BTN_SAVE, WORLD_FIELD_NAME};
+    let setup = || {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("mud"));
+        app.worlds.push(World::new("other"));
+        app.current_world_index = 0;
+        let named = |n: &str, w: &str| crate::actions::Action { name: n.into(), world: w.into(), ..Default::default() };
+        app.settings.actions = vec![named("a", "mud"), named("b", "Other, MUD"), named("c", "mudder"), named("d", "")];
+        app.tf_engine.world_files.insert("mud".into(), "mud.tf".into());
+        app.tf_engine.watchdog_overrides.insert("mud".into(), crate::tf::WatchdogConfig { enabled: false, n1: 2, n2: 5 });
+        app
+    };
+    let check = |app: &App, new: &str| {
+        let worlds: Vec<&str> = app.settings.actions.iter().map(|a| a.world.as_str()).collect();
+        assert_eq!(worlds, [new.to_string(), format!("Other, {new}"), "mudder".into(), String::new()]);
+        assert_eq!(app.tf_engine.world_files.get(&new.to_lowercase()).map(String::as_str), Some("mud.tf"));
+        assert!(app.tf_engine.watchdog_overrides.contains_key(new) && !app.tf_engine.watchdog_overrides.contains_key("mud"));
+    };
+
+    // The server's rename (every web, native and SSH editor's Save).
+    let mut app = setup();
+    let rename = |app: &mut App, name: &str| {
+        app.update_world_settings(
+            0, name.to_string(), String::new(), String::new(), String::new(), String::new(), false, false,
+            "utf8".into(), "Connect".into(), "NOP".into(), String::new(), String::new(), "0".into(),
+            false, false, true, "mud".into(), 1000, None, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(), None, None, None, None, None, None, None,
+        )
+    };
+    rename(&mut app, "my mud");
+    assert_eq!(app.settings.actions[0].world, "mud", "a refused rename carries nothing");
+    rename(&mut app, "Mine");
+    check(&app, "Mine");
+
+    // The console's own editor.
+    let mut app = setup();
+    app.open_world_editor_popup_new(0, false);
+    let state = app.popup_manager.current_mut().expect("the editor");
+    if state.editing {
+        state.commit_edit();
+    }
+    state.set_text(WORLD_FIELD_NAME, "Mine".to_string());
+    state.select_button(WORLD_BTN_SAVE);
+    crate::input_handler::handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.worlds[0].name, "Mine");
+    check(&app, "Mine");
+}
+
+/// A world list for the Hide tests: two connected MUD worlds around a connected shell world
+/// (index 1), hidden or not, and a MUD world with Hide set, which does nothing there.
+fn app_with_a_shell_world(hidden: bool) -> App {
+    let mut app = App::new();
+    app.worlds.clear();
+    for name in ["alpha", "term", "zulu", "mudhide"] {
+        let mut w = World::new(name);
+        w.connected = true;
+        app.worlds.push(w);
+    }
+    app.worlds[1].settings.world_type = WorldType::Shell;
+    app.worlds[1].settings.hidden = hidden;
+    app.worlds[3].settings.hidden = true;
+    app.current_world_index = 0;
+    app
+}
+
+/// A shell world with Hide on (user request 2026-11-19) is never a world switch's target -
+/// next, previous, Esc-w, the connected-world keys, /split's pick - while Hide on any
+/// other type does nothing.
+#[test]
+fn a_hidden_shell_world_is_left_out_of_world_cycling() {
+    let reached = |app: &App| {
+        let mut seen = std::collections::BTreeSet::new();
+        for from in 0..app.worlds.len() {
+            seen.extend(app.calculate_next_world_from(from, &[]));
+            seen.extend(app.calculate_prev_world_from(from, &[]));
+        }
+        seen
+    };
+    assert!(reached(&app_with_a_shell_world(false)).contains(&1), "shown, it is cycled to");
+    let mut app = app_with_a_shell_world(true);
+    assert!(app.worlds[1].is_hidden() && !app.worlds[3].is_hidden(), "Hide is a shell world's only");
+    assert!(!reached(&app).contains(&1), "hidden, never");
+    assert!(reached(&app).contains(&3));
+    for _ in 0..6 {
+        app.cycle_connected_world(1);
+        assert_ne!(app.current_world_index, 1, "the connected-world keys pass it by");
+    }
+    // /split's pick is alphabetical: after mudhide comes term, unless it is hidden.
+    let pick = |app: &App| {
+        let worlds: Vec<(&str, bool, bool)> = app.worlds.iter().map(|w| (w.name.as_str(), w.connected, w.is_activity || w.is_hidden())).collect();
+        crate::util::split_next_world(&worlds, 3)
+    };
+    assert_eq!(pick(&app_with_a_shell_world(false)), Some(1));
+    assert_eq!(pick(&app), Some(2), "/split's pick skips it");
+}
+
+/// A hidden shell world isn't one of the connected worlds anything lists, and never counts
+/// as activity; the World Selector and /listworlds still list it.
+#[test]
+fn a_hidden_shell_world_is_left_out_of_lists_and_activity() {
+    let mut app = app_with_a_shell_world(true);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let _ = commands::handle_command("/connections", &mut app, event_tx.clone()).await;
+    });
+    let listing = app.worlds[0].output_lines.iter().map(|l| crate::util::strip_ansi_codes(&l.text)).collect::<Vec<_>>().join("\n");
+    assert!(listing.contains("alpha") && listing.contains("zulu") && !listing.contains("term"), "{listing}");
+
+    app.sync_tf_world_info();
+    let tf = |app: &mut App, cmd: &str| format!("{:?}", app.tf_engine.execute(cmd));
+    let sockets = tf(&mut app, "/listsockets -s");
+    assert!(sockets.contains("alpha") && !sockets.contains("term"), "{sockets}");
+    assert_eq!(crate::tf::variables::get_special_var(&app.tf_engine, "nactive").as_deref(), Some("3"), "%nactive leaves it out");
+    let worlds = tf(&mut app, "/listworlds");
+    assert!(worlds.contains("term"), "/listworlds still lists it: {worlds}");
+
+    // No activity: its lines are no unseen, a count it had goes when Hide goes on.
+    app.worlds[1].add_output("Starting shell...", false, &Settings::default(), 24, 80, false, false, false);
+    assert_eq!(app.worlds[1].unseen_lines, 0, "client text in it is no activity");
+    let mut shown = app_with_a_shell_world(false);
+    shown.worlds[1].unseen_lines = 4;
+    assert!(shown.worlds[1].has_activity());
+    shown.set_world_hidden(1, true);
+    assert_eq!(shown.worlds[1].unseen_lines, 0);
+    assert!(!shown.worlds[1].has_activity() && shown.activity_count() == 0);
+
+    // The console's World Selector still lists it.
+    app.open_world_selector_new();
+    let state = app.popup_manager.current().expect("the selector");
+    let listed = format!("{:?}", state.definition.fields.iter().map(|f| format!("{:?}", f.kind)).collect::<Vec<_>>());
+    assert!(listed.contains("term"), "the World Selector keeps it");
+}
+
+/// /sh goes to the world named shell; without one, to a hidden shell world (one renamed,
+/// say) before making a new one.
+#[test]
+fn sh_goes_to_a_hidden_shell_world_when_none_is_named_shell() {
+    let mut app = app_with_a_shell_world(true);
+    assert_eq!(commands::prepare_shell_world(&mut app, ""), Ok("/worlds term".to_string()));
+    let mut named = app_with_a_shell_world(true);
+    let mut shell = World::new("shell");
+    shell.settings.world_type = WorldType::Shell;
+    named.worlds.push(shell);
+    assert_eq!(commands::prepare_shell_world(&mut named, ""), Ok("/worlds shell".to_string()), "the world named shell first");
+}
+
+/// The console's world editor (the SSH console's too) shows Hide for a shell world only,
+/// and its Save sets it.
+#[test]
+fn the_console_world_editor_has_hide_for_a_shell_world() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use popup::definitions::world_editor::{WORLD_BTN_SAVE, WORLD_FIELD_HIDE};
+    let mut app = app_with_a_shell_world(false);
+    app.open_world_editor_popup_new(0, false);
+    let visible = |app: &App| app.popup_manager.current().and_then(|s| s.field(WORLD_FIELD_HIDE)).is_some_and(|f| f.visible);
+    assert!(!visible(&app), "a MUD world has no Hide");
+    app.popup_manager.close_all();
+    app.open_world_editor_popup_new(1, false);
+    assert!(visible(&app), "a shell world does");
+    let state = app.popup_manager.current_mut().unwrap();
+    if state.editing {
+        state.commit_edit();
+    }
+    if let Some(popup::FieldKind::Toggle { value }) = state.field_mut(WORLD_FIELD_HIDE).map(|f| &mut f.kind) {
+        *value = true;
+    }
+    state.select_button(WORLD_BTN_SAVE);
+    crate::input_handler::handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.worlds[1].is_hidden(), "saved");
+}
+
+/// app.js reads a shell world's Hide as main.rs World::is_hidden does and leaves it out of
+/// the same places (tabs, world menu, Recent Worlds, connected cycling, /split's pick, the
+/// Taskbar Alert); its editor shows Hide for Shell only and drops Login and Options there.
+#[test]
+fn app_js_leaves_a_hidden_shell_world_out_like_the_server() {
+    let js = include_str!("web/app.js");
+    for part in [
+        "function isHiddenWorld(w) {",
+        "return !!(w && w.settings && w.settings.world_type === 'shell' && w.settings.hidden === true);",
+        ".filter(w => w.world.connected && !isHiddenWorld(w.world));",
+        ".filter(w => (w.world.connected || (w.world.unseen_lines || 0) > 0) && !isHiddenWorld(w.world));",
+        "at: w && !w.is_activity && !isHiddenWorld(w) ? w._lastActivityMs : undefined",
+        "if (w.connected && !isHiddenWorld(w) && !skip.includes(i)) connected.push(i);",
+        "if (w && ((!w.is_activity && !isHiddenWorld(w)) || i === current)) order.push(i);",
+        "elements.worldEditHideField?.classList.toggle('visible', isShell && worldEditHideKnown);",
+        "worldEditorContent().classList.toggle('we-shell', isShell);",
+        "hidden: worldEditHideKnown ? elements.worldEditHideToggle.classList.contains('active') : null,",
+    ] {
+        assert!(js.contains(part), "app.js no longer has {part:?}");
+    }
+    let css = include_str!("web/style.css");
+    assert!(css.contains(".world-editor-modal-content.we-shell [data-we-nav=\"login\"],"));
+    assert!(css.contains(".world-editor-modal-content.we-shell .we-section[data-we-section=\"options\"] {"));
+    assert!(include_str!("web/index.html").contains("<div id=\"world-edit-hide-toggle\" class=\"toggle\"></div>"));
 }

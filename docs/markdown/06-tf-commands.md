@@ -329,6 +329,18 @@ Define a macro, with an optional trigger pattern.
 | `-q` | Quiet: doesn't count toward the BACKGROUND hook or `/trigger`'s return value |
 | `name` omitted | Legal when `-t`/`-b`/`-B`/`-h` is given — the macro is addressed by number only |
 
+A trigger's body can rewrite the line it matched with `/substitute <text>`:
+
+```
+/def -mregexp -t"^(AlwaysGreat|The) ([^ ]+ says .*)$" notitle = /substitute %P2
+```
+
+The rewrite takes the line's place, and what the MUD sent is kept with it: F2 shows
+that in the rewrite's place, `/recall` searches the rewrite and `/recall -ao` what the MUD
+sent (`-ago` with gagged lines too). A Clay action's `/substitute` does the same (see
+Actions). Inside TF's double quotes a backslash escapes the next character, so write
+`[^ ]` rather than `\S` there.
+
 ### /undef / /undefn / /undeft
 Remove macros. All three are silent on success.
 
@@ -583,7 +595,7 @@ per-key/per-command ruling tables this was decided from.
   output (see [Telnet](14-telnet.md#timed-prompts-mud---timed-prompt-worlds)). For one
   world, set its type to **MUD - Timed Prompt** instead (`/addworld -T lp` does).
 - **Commands**: `/recall -D` (also searches the long-term scrollback
-  archive), `/world -e` (open the world editor), `/watchdog -w<world>`
+  archive), `/recall -ao` (a rewritten line as the MUD sent it), `/world -e` (open the world editor), `/watchdog -w<world>`
   (spam detection), the `/connections` table, `/trigger -d` (delete
   matching triggers), `/repeat -p<priority>`, long-form `/def -a"gag"`,
   `/quote -A` (keep escape sequences) and `/tfhelp` are all Clay extras kept

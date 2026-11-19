@@ -764,7 +764,7 @@ fn feed_lines(v: &mut ClayView, cx: &mut gpui::Context<ClayView>, world_index: u
             flush: false,
             gagged: false,
             archive_sourced: false,
-            highlight_colors: Vec::new(),
+            highlight_colors: Vec::new(), originals: Vec::new(),
         };
         let t0 = Instant::now();
         let fx = v.session.handle(crate::native_gui::core::client::Input::Message(Box::new(msg)));

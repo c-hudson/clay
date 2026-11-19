@@ -2648,6 +2648,16 @@ body.device-phone .side-tile-label {
     font-size: 12px;
     min-height: 14px;
 }
+/* Why Save refused the world's name (validateWorldName), under the Name; nothing at all
+   until then. */
+#world-edit-error {
+    font-size: 12px;
+    margin: 2px 0 0;
+    min-height: 0;
+}
+#world-edit-error:empty {
+    display: none;
+}
 
 /* The action editor's pattern list (built by app.js renderActionPatternRows). */
 .action-patterns-list {
@@ -3398,6 +3408,15 @@ body.device-phone .side-tile-label {
     display: flex;
 }
 
+/* A shell world has nothing in Login or Options: neither their buttons nor their
+   sections (app.js updateWorldEditorTypeVisibility sets .we-shell). */
+.world-editor-modal-content.we-shell [data-we-nav="login"],
+.world-editor-modal-content.we-shell [data-we-nav="options"],
+.world-editor-modal-content.we-shell .we-section[data-we-section="login"],
+.world-editor-modal-content.we-shell .we-section[data-we-section="options"] {
+    display: none !important;
+}
+
 .we-section-title {
     display: none;
     font-size: 11px;
@@ -3559,6 +3578,12 @@ body.device-phone .side-tile-label {
     .we-section[data-we-section="server"] { grid-area: server; }
     .we-section[data-we-section="login"] { grid-area: login; }
     .we-section[data-we-section="options"] { grid-area: options; }
+
+    /* A shell world: the Server section alone, across the card. */
+    .world-editor-modal-content.we-shell .we-card {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "server";
+    }
 
     .we-section-title {
         display: block;

@@ -219,6 +219,11 @@ pub(crate) async fn prepare_app(opts: SetupOptions) -> io::Result<Prepared> {
     if !from_template {
         app.ensure_activity_world();
     }
+    // Worlds renamed to one word at the load (App::make_world_names_one_word), in the
+    // output, where every client's InitialState carries them.
+    for note in app.take_world_rename_notes() {
+        app.add_output(&note);
+    }
 
     // Open scrollback archive if enabled - a Clay with files of its own.
     if app.policy.user_paths {
@@ -399,7 +404,7 @@ async fn reconstruct_connections(app: &mut App, event_tx: &mpsc::Sender<AppEvent
         let seq = app.worlds[world_idx].next_seq;
         app.worlds[world_idx].next_seq += 1;
         app.worlds[world_idx].output_lines.push(OutputLine::new_client(tls_msg.to_string(), seq));
-        if !app.world_watched(world_idx) {
+        if !app.world_watched(world_idx) && !app.worlds[world_idx].is_hidden() {
             if app.worlds[world_idx].unseen_lines == 0 {
                 app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
             }
@@ -917,7 +922,7 @@ pub(crate) async fn run_app_loop(app: &mut App, mut event_rx: mpsc::Receiver<App
                                     ts: crate::current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                                    flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                                 });
                             }
                         }

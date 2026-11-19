@@ -1586,7 +1586,8 @@ impl<'a> Evaluator<'a> {
                 if name.is_empty() {
                     return Err("addworld: name cannot be empty".to_string());
                 }
-                if name.contains(' ') {
+                // One word (util::world_name_problem: any whitespace), as /addworld.
+                if crate::util::world_name_problem(&name).is_some() {
                     return Err(format!("addworld: illegal world name: {}", name));
                 }
                 let field = |i: usize| values.get(i).filter(|v| !v.is_empty()).cloned();
@@ -2027,7 +2028,7 @@ impl<'a> Evaluator<'a> {
             "nactive" => {
                 if args.is_empty() {
                     let count = self.engine.world_info_cache.iter()
-                        .filter(|w| w.is_connected)
+                        .filter(|w| w.is_connected && !w.hidden)
                         .count();
                     Ok(TfValue::Integer(count as i64))
                 } else {

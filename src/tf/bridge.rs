@@ -46,6 +46,10 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>, worl
 pub fn process_line_plain(engine: &mut TfEngine, plain_line: &str, world: Option<&str>, world_type: Option<&str>) -> TfTriggerResult {
     let mut result = TfTriggerResult::default();
     let plain_line = plain_line.trim_end();
+    // Only a /substitute run by one of THIS line's triggers rewrites it. One run anywhere
+    // else (typed, a /repeat, a hook, a Clay action's command run after its packet) set
+    // the same field and waited here, rewriting whichever line came next.
+    engine.pending_substitution = None;
 
     // Run the matching triggers in their own frame, collecting what they did in order.
     // Their control results (a stray /exit or /return) have nothing to act on here.

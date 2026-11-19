@@ -502,7 +502,7 @@ fn search_line_visible(line: &OutputLine, show_tags: bool) -> bool {
     if line.is_hidden(show_tags) {
         return false;
     }
-    if is_ansi_only_line(&line.text) {
+    if is_ansi_only_line(line.shown_text(show_tags)) {
         return false;
     }
     true
@@ -563,7 +563,7 @@ impl SearchPopup {
                     .enumerate()
                     .filter(|(_, line)| {
                         search_line_visible(line, show_tags) && {
-                            let plain = strip_ansi_codes(&line.text);
+                            let plain = strip_ansi_codes(line.shown_text(show_tags));
                             regex.is_match(&plain)
                         }
                     })
@@ -579,7 +579,7 @@ impl SearchPopup {
                 .enumerate()
                 .filter(|(_, line)| {
                     search_line_visible(line, show_tags) && {
-                        let plain = strip_ansi_codes(&line.text);
+                        let plain = strip_ansi_codes(line.shown_text(show_tags));
                         plain.to_lowercase().contains(&search_lower)
                     }
                 })
@@ -1416,8 +1416,11 @@ struct TriggerProcessingResult {
     pub send_commands: Vec<String>,
     /// What the TF triggers did, in order (see `tf::effects`)
     pub tf_effects: Vec<tf::effects::TfEffect>,
-    /// Messages to display locally (a /substitute's replacement text)
-    pub messages: Vec<TfMessage>,
+    /// The line rewritten by an action's or TF's `/substitute` (TF's wins when both
+    /// do): shown in its place, the line itself kept as `OutputLine::original`.
+    pub rewrite: Option<String>,
+    /// The rewrite's own TF attributes (`/substitute -a`), for /recall -a.
+    pub rewrite_attrs: Option<Box<LineAttrs>>,
     /// Highlight color from action triggers
     pub highlight_color: Option<String>,
     /// The line as TF's display attributes show it, when a trigger gave it any.
@@ -1482,7 +1485,8 @@ fn parse_bamf_portal(line: &str) -> Option<BamfPortal> {
         return None;
     }
     Some(BamfPortal {
-        name: name.to_string(),
+        // The world it becomes: one word, as every world's name ("Some Place" -> Some_Place).
+        name: util::one_word_world_name(name),
         host: host.to_string(),
         port: port.to_string(),
     })
@@ -1502,7 +1506,8 @@ fn process_triggers(
         suppress_blanks: false,
         send_commands: Vec::new(),
         tf_effects: Vec::new(),
-        messages: Vec::new(),
+        rewrite: None,
+        rewrite_attrs: None,
         highlight_color: None,
         attributed: None,
         tf_fired: false,
@@ -1516,11 +1521,13 @@ fn process_triggers(
     let plain = strip_ansi_codes(line);
 
     // Check Clay action triggers
+    let mut action_substitute = None;
     if let Some(action_result) = actions::check_action_triggers_plain(&plain, world_name, actions) {
         result.send_commands.extend(action_result.commands);
         result.is_gagged = action_result.should_gag;
         result.suppress_blanks = action_result.suppress_blanks;
         result.highlight_color = action_result.highlight_color;
+        action_substitute = action_result.substitute;
     }
 
     // Check TF triggers
@@ -1542,29 +1549,36 @@ fn process_triggers(
         }));
     }
 
-    // Handle substitution: gag original, output substitute with attributes
+    // An action's `/substitute`: the line rewritten from its captures, in their colours.
+    if let Some(sub) = &action_substitute {
+        result.rewrite = Some(sub.build(line));
+    }
+
+    // TF's /substitute: the line is shown as its text (with its own attributes) in place,
+    // the line itself kept as the original. It used to be gagged and the text added after
+    // the whole packet, so F2 showed both and the text could land below later lines.
     if let Some((sub_text, sub_attrs)) = tf_result.substitution {
-        result.is_gagged = true;
-        let mut sub_own_attrs = None;
+        result.rewrite_attrs = None;
         let sub_with_attrs = match tf::TfAttributes::parse(&sub_attrs) {
             Ok(mut attrs) if !sub_attrs.is_empty() => {
                 let var = |name: &str| tf_engine.get_var(name).map(|v| v.to_string_value()).unwrap_or_default();
                 attrs.expand(&var("hiliteattr"), &var("error_attr"), &var("warning_attr"));
                 let drawn = tf::attrs::apply_to_line(&sub_text, &attrs, &[]);
+                // `-ag`: the rewritten line is gagged (F2 shows the original).
+                result.is_gagged |= attrs.gag;
                 if !attrs.to_sgr().is_empty() {
-                    sub_own_attrs = Some((sub_text, attrs));
+                    result.rewrite_attrs = Some(Box::new(LineAttrs { plain: sub_text, attrs, partials: Vec::new() }));
                 }
                 drawn
             }
             _ => sub_text,
         };
-        // `G`/`L`/`A` from the /substitute's own attributes or the trigger's.
-        let mut marks = LineMarks::parse(&sub_attrs);
-        let own = LineMarks::from_attrs(&tf_result.attrs);
-        marks.nohistory |= own.nohistory;
-        marks.nolog |= own.nolog;
-        marks.noactivity |= own.noactivity;
-        result.messages.push((sub_with_attrs, marks, sub_own_attrs));
+        // `G`/`L`/`A` from the /substitute's own attributes, with the trigger's above.
+        let marks = LineMarks::parse(&sub_attrs);
+        result.nohistory |= marks.nohistory;
+        result.nolog |= marks.nolog;
+        result.noactivity |= marks.noactivity;
+        result.rewrite = Some(sub_with_attrs);
     }
 
     result
@@ -2642,6 +2656,11 @@ pub struct WorldSettings {
     /// hides it for every world; it shows only while both are on. `/stats hide|show` (the
     /// GUIs' × on the panel) sets it too. Default on.
     pub status_panel: bool,
+    /// Edit World's Hide, shown for a Shell world only (user request 2026-11-19): the world
+    /// is left out of world cycling, every list of connected worlds and every activity
+    /// count; `/sh` (and its name, and the World Selector) still reach it. Meaningful only
+    /// for `WorldType::Shell` - ask `World::is_hidden`, never this field alone. Default off.
+    pub hidden: bool,
     /// Only relevant for `WorldType::MudTimedPrompt`: how long
     /// (`App::promote_due_timed_prompts`) waits, after a partial line with no
     /// terminating newline is parked with nothing else arriving, before promoting it to
@@ -2693,6 +2712,7 @@ impl Default for WorldSettings {
             mcp_enabled: true,
             mccp2_enabled: true,
             status_panel: true,
+            hidden: false,
             prompt_wait_ms: DEFAULT_PROMPT_WAIT_MS,
             tf_type: String::new(),
         }
@@ -2990,8 +3010,10 @@ pub enum Command {
     Setup,
     /// /web - show web settings popup
     Web,
-    /// /actions [world] - show actions popup, optionally filtered by world
-    Actions { world: Option<String> },
+    /// /actions [-w<world>] [<name>] - the actions list, narrowed to a world's actions;
+    /// a name opens that action's editor (a wildcard: the list of the matches, or the
+    /// editor for the only one). `Err`: the usage line (`actions::ActionsQuery`).
+    Actions { query: Result<actions::ActionsQuery, String> },
     /// /connections or /l - show connected worlds list
     WorldsList,
     /// /worlds (no args) - show world selector
@@ -3247,14 +3269,7 @@ pub fn parse_command(input: &str) -> Command {
         }
         "/setup" => Command::Setup,
         "/web" => Command::Web,
-        "/actions" => {
-            let world = if args.is_empty() {
-                None
-            } else {
-                Some(args.join(" "))
-            };
-            Command::Actions { world }
-        }
+        "/actions" => Command::Actions { query: actions::ActionsQuery::parse(args) },
         "/connections" | "/l" => Command::WorldsList,
         "/worlds" | "/world" => parse_world_command(args),
         "/shell" => Command::Shell { args: args.join(" ") },
@@ -4042,6 +4057,13 @@ pub struct OutputLine {
     /// The line's own TF display attributes, when it has any (a trigger's `-a`, `/echo
     /// -a`): `text` already shows them; these let `/recall -a<attrs>` show it without some.
     pub tf_attrs: Option<Box<LineAttrs>>,
+    /// The line as the MUD sent it, when an action's `/substitute` or TF's rewrote it:
+    /// `text` is the rewrite, shown normally; F2 (`show_tags`) shows this instead
+    /// (`shown_text`), `/recall -ao` reads it (`original_text`). Kept in the archive's
+    /// `original` column, the reload state's `o<n>` flag, and on the wire
+    /// (`TimestampedLine::original`, `ServerData::originals`). `None` for every line that
+    /// wasn't rewritten.
+    pub original: Option<String>,
 }
 
 /// A line's own TF display attributes, kept apart from the text they were drawn into, so
@@ -4131,9 +4153,17 @@ pub(crate) struct ConsoleTextDiv {
     pub forced: bool,
 }
 
-/// A line a trigger's `/substitute` shows: its text (attributes drawn in), its `G`/`L`/`A`,
-/// and - when it has display attributes of its own - its plain text with them.
-pub(crate) type TfMessage = (String, LineMarks, Option<(String, tf::TfAttributes)>);
+/// `ServerData`'s per-line lists for a batch of stored lines, parallel to its `data`:
+/// `(highlight_colors, originals)`, each left empty - and so off the wire - unless a line
+/// has one. A release used to send no colours at all, so a highlighted line held by
+/// more-mode reached the clients plain.
+fn wire_line_extras<'a>(lines: impl Iterator<Item = &'a OutputLine>) -> (Vec<Option<String>>, Vec<Option<String>>) {
+    let (colors, originals): (Vec<Option<String>>, Vec<Option<String>>) = lines
+        .map(|line| (line.highlight_color.clone(), line.wire_original()))
+        .unzip();
+    let keep = |v: Vec<Option<String>>| if v.iter().any(Option::is_some) { v } else { Vec::new() };
+    (keep(colors), keep(originals))
+}
 
 /// TF's per-line attributes that aren't about how a line looks: `G` (keep it out of the
 /// history), `L` (don't log it), `A` (no activity). A trigger's reach a server line through
@@ -4215,6 +4245,10 @@ impl LineHistory {
 /// input apart from notices.
 pub const INPUT_LINE_PREFIX: &str = "\u{00BB} "; // "» "
 
+/// Before the MUD's own text of a line a `/substitute` rewrote, on the per-world log's line
+/// after the rewrite (`World::write_log_line_with_original`).
+pub const LOG_ORIGINAL_PREFIX: &str = "(original) ";
+
 /// Reserved `OutputLine::display_id` for the local console TUI. WebSocket client ids are
 /// allocated from a counter starting at 1, and 0 is the embedded GUI, so `u64::MAX` can never
 /// collide with a real client.
@@ -4285,6 +4319,7 @@ impl OutputLine {
             display_id: None,
             hist: LineHistory::default(),
             tf_attrs: None,
+            original: None,
         }
     }
 
@@ -4295,6 +4330,23 @@ impl OutputLine {
     /// flag alone, or `/recall -D` and Page Up render archived text differently.
     pub fn shows_archive_prefix(&self) -> bool {
         self.from_archive || self.archive_sourced
+    }
+
+    /// The text an interface draws for this line: the MUD's own under F2 when a
+    /// `/substitute` rewrote it, else `text`. Every renderer and every row count that
+    /// depends on `show_tags` reads this, never `text`, or F2 measures one string and
+    /// draws another.
+    pub fn shown_text(&self, show_tags: bool) -> &str {
+        match &self.original {
+            Some(original) if show_tags => original,
+            _ => &self.text,
+        }
+    }
+
+    /// The line as the MUD sent it (`/recall -ao`): the original of a rewritten line,
+    /// else `text`.
+    pub fn original_text(&self) -> &str {
+        self.original.as_deref().unwrap_or(&self.text)
     }
 
     /// Whether the line is left out of the output: gagged, unless F2 (`show_tags`) shows
@@ -4310,6 +4362,11 @@ impl OutputLine {
     /// the server's `/recall` and log read (see `is_hidden`).
     pub fn wire_text(&self) -> String {
         if self.is_input { String::new() } else { self.text.replace('\r', "") }
+    }
+
+    /// `original` as a client is sent it: as `wire_text` treats `text`.
+    pub fn wire_original(&self) -> Option<String> {
+        if self.is_input { None } else { self.original.as_ref().map(|o| o.replace('\r', "")) }
     }
 
     pub fn new_client(text: String, seq: u64) -> Self {
@@ -4328,6 +4385,7 @@ impl OutputLine {
             display_id: None,
             hist: LineHistory::default(),
             tf_attrs: None,
+            original: None,
         }
     }
 
@@ -4347,11 +4405,12 @@ impl OutputLine {
             display_id: None,
             hist: LineHistory::default(),
             tf_attrs: None,
+            original: None,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false, archive_sourced: false, archive_seq: None, viewed: false, display_id: None, hist: LineHistory::default(), tf_attrs: None }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false, archive_sourced: false, archive_seq: None, viewed: false, display_id: None, hist: LineHistory::default(), tf_attrs: None, original: None }
     }
 
     /// A user-typed command captured on its way to the MUD. `gagged: true` is what makes it
@@ -4373,6 +4432,7 @@ impl OutputLine {
             display_id: None,
             hist: LineHistory::default(),
             tf_attrs: None,
+            original: None,
         }
     }
 
@@ -4412,6 +4472,12 @@ pub struct World {
     /// Lines of the packet being added that carry their own TF attributes, by text, with
     /// those attributes (`OutputLine::tf_attrs`).
     pub(crate) tf_line_attrs: Vec<(String, Box<LineAttrs>)>,
+    /// The MUD's own text of the lines `add_visible_run` hands the next `add_output`,
+    /// parallel to them (`None` where a line wasn't rewritten): `add_output` takes it and
+    /// puts each on the line it makes (`OutputLine::original`). By position, not by text
+    /// as the marks above are, because a rewrite can equal a line the MUD sent. Empty when
+    /// no line of the run was rewritten.
+    pub(crate) incoming_originals: Vec<Option<String>>,
     /// The cipher the current TLS connection settled on, when known (TF's CONNECT hook).
     pub(crate) tls_cipher: Option<String>,
     /// When the current connection came up, for `/info`; kept by a reload.
@@ -4823,6 +4889,7 @@ impl World {
             tf_nolog: Vec::new(),
             tf_nohistory: Vec::new(),
             tf_line_attrs: Vec::new(),
+            incoming_originals: Vec::new(),
             tls_cipher: None,
             connected_at: None,
             console_seen_seq: None,
@@ -5159,6 +5226,15 @@ impl World {
         }
     }
 
+    /// Log a line, and when a `/substitute` rewrote it, the MUD's own text after it
+    /// (`LOG_ORIGINAL_PREFIX`): the log keeps both, as the archive does.
+    fn write_log_line_with_original(&mut self, line: &str, original: Option<&str>) {
+        self.write_log_line(line);
+        if let Some(original) = original {
+            self.write_log_line(&format!("{LOG_ORIGINAL_PREFIX}{original}"));
+        }
+    }
+
     /// Capture a user-typed command into this world's history. The line is invisible in
     /// normal display and under F2 (see `OutputLine::is_input`'s doc comment) and is surfaced
     /// by `/recall -i`/`-l`/`-g` UNCONDITIONALLY - `log_input` only
@@ -5258,7 +5334,7 @@ impl World {
     /// not be reached. In the latter case the line is STILL queued — the writer
     /// assigns a number instead. Losing the number is acceptable; losing the line
     /// is not.
-    pub(crate) fn archive_line(&mut self, text: &str, gagged: bool) -> Option<i64> {
+    pub(crate) fn archive_line(&mut self, text: &str, original: Option<&str>, gagged: bool) -> Option<i64> {
         self.scrollback_tx.as_ref()?;
         // Mint before borrowing the sender: both borrow `self`.
         let uuid = self.ensure_world_id().to_string();
@@ -5270,6 +5346,7 @@ impl World {
         let tx = self.scrollback_tx.as_ref()?;
         let slot = tx.alloc_wseq(&uuid, &name);
         let mut entry = scrollback::ArchiveEntry::new(name, ts_ms, text.to_string(), gagged);
+        entry.original = original.map(str::to_string);
         if let Some((wid, wseq)) = slot {
             entry.wid = Some(wid);
             entry.wseq = Some(wseq);
@@ -5487,9 +5564,14 @@ impl World {
             self.lines_since_pause = visible;
         }
 
+        // The MUD's own text of the lines a /substitute rewrote, parallel to `text`'s lines
+        // (set by add_visible_run for this call only).
+        let originals = std::mem::take(&mut self.incoming_originals);
+
         // If we have a partial line from before, combine it with new text
         let had_partial = !self.partial_line.is_empty();
         let partial_was_in_pending = self.partial_in_pending;
+        let partial_prefix = if had_partial { self.partial_line.clone() } else { String::new() };
         let combined = if had_partial {
             let mut s = std::mem::take(&mut self.partial_line);
             s.push_str(text);
@@ -5562,8 +5644,12 @@ impl World {
                     Some(i) => { self.tf_nohistory.remove(i); true }
                     None => false,
                 };
+                // The first line of `text` completes the partial: a rewrite of it keeps the
+                // partial in front of the MUD's own text too.
+                let completed_original = originals.first().cloned().flatten()
+                    .map(|original| format!("{partial_prefix}{original}"));
                 let completed_archive_seq = if ends_with_newline && from_server && !completed_nohistory {
-                    self.archive_line(completed_line, false)
+                    self.archive_line(completed_line, completed_original.as_deref(), false)
                 } else {
                     None
                 };
@@ -5571,6 +5657,7 @@ impl World {
                 if partial_was_in_pending {
                     if let Some(i) = self.last_visible_pending_idx() {
                         self.pending_lines[i].text = completed_line.to_string();
+                        self.pending_lines[i].original = completed_original;
                         self.pending_lines[i].hist.nohistory |= completed_nohistory;
                         if completed_archive_seq.is_some() {
                             self.pending_lines[i].archive_seq = completed_archive_seq;
@@ -5578,6 +5665,7 @@ impl World {
                     }
                 } else if let Some(i) = self.last_visible_output_idx() {
                     self.output_lines[i].text = completed_line.to_string();
+                    self.output_lines[i].original = completed_original;
                     self.output_lines[i].hist.nohistory |= completed_nohistory;
                     if completed_archive_seq.is_some() {
                         self.output_lines[i].archive_seq = completed_archive_seq;
@@ -5637,10 +5725,13 @@ impl World {
             let is_last = i == line_count - 1;
             let is_partial = is_last && !ends_with_newline;
             let nolog = take_mark(&mut self.tf_nolog, line);
-            let noactivity = take_mark(&mut self.tf_noactivity, line);
+            // A hidden shell world's lines count as no activity too (World::is_hidden).
+            let noactivity = take_mark(&mut self.tf_noactivity, line) | self.is_hidden();
             let nohistory = take_mark(&mut self.tf_nohistory, line);
             let line_attrs = self.tf_line_attrs.iter().position(|(m, _)| m == line)
                 .map(|i| self.tf_line_attrs.remove(i).1);
+            // `lines[i]` is the run's line `i` (the first completes a partial, handled above).
+            let original = originals.get(i).cloned().flatten();
             // Durable archive sequence for this line, filled in below iff it is
             // actually archived. Stamped onto the OutputLine so /recall -D can
             // tell which archive rows the live buffer already covers.
@@ -5654,14 +5745,14 @@ impl World {
             // Write to log file if enabled (only for complete lines)
             if !is_partial {
                 if !nolog {
-                    self.write_log_line(line);
+                    self.write_log_line_with_original(line, original.as_deref());
                 }
                 // Archive server lines to long-term scrollback (not TF's `G` ones:
                 // that attribute keeps a line out of the history)
                 if from_server && !nohistory {
                     // Unbounded queue; a refusal is counted in ArchiveStats rather
                     // than vanishing the way try_send's dropped Result did.
-                    archive_seq = self.archive_line(line, false);
+                    archive_seq = self.archive_line(line, original.as_deref(), false);
                 }
             }
 
@@ -5693,6 +5784,7 @@ impl World {
             new_line.archive_seq = archive_seq;
             new_line.hist.nohistory = nohistory;
             new_line.tf_attrs = line_attrs;
+            new_line.original = original;
 
             // Built before measuring, so the budget can be taken off the real OutputLine
             // through the same path the renderer wraps with (`RowMetrics`) rather than off the
@@ -5950,7 +6042,18 @@ impl World {
 
     /// Returns true if this world has activity (unseen lines or pending output)
     pub(crate) fn has_activity(&self) -> bool {
-        self.unseen_lines > 0 || !self.pending_lines.is_empty()
+        // A hidden shell world never counts (its unseen lines aren't kept either).
+        !self.is_hidden() && (self.unseen_lines > 0 || !self.pending_lines.is_empty())
+    }
+
+    /// A shell world with Hide on (`WorldSettings::hidden`, user request 2026-11-19): left
+    /// out of world cycling (`App::switch_exclude`, the connected-world keys, `/split`'s
+    /// next world), the connected-world lists (`/connections`, TF's `/listsockets`, the
+    /// clients' tabs and world menu, Recent Worlds) and every activity count; reached by
+    /// `/sh`, its name and the World Selector. The native core's `World::is_hidden` and
+    /// app.js `isHiddenWorld` are its copies.
+    pub(crate) fn is_hidden(&self) -> bool {
+        self.settings.world_type == WorldType::Shell && self.settings.hidden
     }
 
     /// True while this world is disconnected but auto-reconnect is actively retrying it.
@@ -6230,10 +6333,26 @@ pub(crate) enum ScrollbackRequestKind {
     Backfill,
 }
 
+/// One line of a packet on its way into the output (`process_server_data`): the text to
+/// show, whether it is gagged, its `/highlight` colour, and - when an action's or TF's
+/// `/substitute` rewrote it - the line as the MUD sent it (`OutputLine::original`).
+struct PacketLine<'a> {
+    text: std::borrow::Cow<'a, str>,
+    gagged: bool,
+    highlight: Option<String>,
+    original: Option<String>,
+}
+
+impl<'a> PacketLine<'a> {
+    fn plain(text: &'a str, gagged: bool) -> Self {
+        PacketLine { text: std::borrow::Cow::Borrowed(text), gagged, highlight: None, original: None }
+    }
+}
+
 /// One run of consecutive lines of the same gagged-ness, as grouped by
-/// `process_server_data`: `(gagged, [(text, highlight_color)])`. Named because
-/// the nested tuple is otherwise repeated at every boundary it crosses.
-type OutputRun<'a> = (bool, Vec<(&'a str, Option<String>)>);
+/// `process_server_data`: `(gagged, lines)`. Named because the nested tuple is otherwise
+/// repeated at every boundary it crosses.
+type OutputRun<'a, 'b> = (bool, Vec<&'b PacketLine<'a>>);
 
 /// The console's split output (`/split`, user request 2026-10-30): a second pane above the
 /// usual one. The focused pane's world is `App::current_world_index`, so everything that
@@ -6580,6 +6699,15 @@ pub struct App {
     /// than NeedsInsecureConfirm, or if the confirm dialog is cancelled. See
     /// handle_import_result and plan i-d-like-to-make-snuggly-rain.md.
     pub pending_console_import: Option<(String, Option<String>, Option<String>)>,
+    /// Console TUI: the actions the Actions list shows, as `/actions` last asked
+    /// (`run_actions_command`); the list's rebuilds and its reopening after an edit keep it.
+    pub actions_scope: actions::ActionsQuery,
+    /// Console TUI: the action editor was opened by name (`/actions <name>`), so closing it
+    /// goes back to the output, not to a list the user never saw.
+    pub actions_edit_direct: bool,
+    /// What `make_world_names_one_word` renamed at the last load, for the output
+    /// (`take_world_rename_notes`).
+    pub world_rename_notes: Vec<String>,
     /// Remote client mode: pending /server --close request (re-exec as independent master)
     pub pending_remote_detach: bool,
     /// Remote client mode: pending /server host:port request (re-exec attached elsewhere)
@@ -6835,6 +6963,9 @@ impl App {
             mccp2_reload_deadline: None,
             pending_remote_connect: None,
             pending_console_import: None,
+            actions_scope: actions::ActionsQuery::default(),
+            actions_edit_direct: false,
+            world_rename_notes: Vec::new(),
             pending_remote_detach: false,
             pending_remote_switch: None,
             server_activity_count: 0, // Activity count from server (remote client mode)
@@ -7219,7 +7350,8 @@ impl App {
                 w.settings.port = "4096".to_string();
                 w
             } else {
-                World::new_with_splash(&get_binary_name(), true)
+                // The program's file name, one word ("clay (1).exe" would not be).
+                World::new_with_splash(&crate::util::one_word_world_name(&get_binary_name()), true)
             };
             initial_world.is_initial_world = true;
             initial_world.scrollback_tx = self.scrollback.as_ref().map(|db| db.sender());
@@ -7323,6 +7455,7 @@ impl App {
                 tf_type: world.settings.tf_type.clone(),
                 is_temporary: world.is_temporary,
                 is_activity: world.is_activity,
+                hidden: world.is_hidden(),
                 login: world.settings.auto_connect_type != AutoConnectType::NoLogin,
                 telnet: world.telnet_mode,
                 local_echo: !world.protocol.echo_masked,
@@ -7700,7 +7833,7 @@ impl App {
         let mut entries: Vec<(usize, u64)> = self.worlds
             .iter()
             .enumerate()
-            .filter(|(i, w)| *i != current_idx && !w.is_activity)
+            .filter(|(i, w)| *i != current_idx && !w.is_activity && !w.is_hidden())
             .filter_map(|(i, w)| {
                 // Use the more-recent of last_receive_time and last_send_time.
                 let recv = w.last_receive_time.map(|t| now.duration_since(t).as_secs());
@@ -7781,7 +7914,7 @@ impl App {
             ts: current_timestamp_secs(),
             from_server: false,
             seq: 0, end_seq: None,
-            flush: false, gagged: false, highlight_colors: Vec::new(),
+            flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
         });
     }
 
@@ -8463,6 +8596,7 @@ impl App {
             mcp_enabled: world.settings.mcp_enabled,
             mccp2_enabled: world.settings.mccp2_enabled,
             status_panel: world.settings.status_panel,
+            hidden: world.settings.hidden,
             prompt_wait_ms: world.settings.prompt_wait_ms,
             tf_type: world.settings.tf_type.clone(),
             slack_token: world.settings.slack_token.clone(),
@@ -8493,24 +8627,51 @@ impl App {
         }
     }
 
-    /// Open the actions list popup
-    fn open_actions_list_popup(&mut self) {
-        self.open_actions_list_popup_with_filter("");
+    /// `/actions [-w<world>] [<name>]` in the console and the SSH console
+    /// (`actions::ActionsQuery`, every interface's rule): the list of the query's actions,
+    /// the editor for the one action a name matched, or a line saying none did.
+    pub(crate) fn run_actions_command(&mut self, query: Result<actions::ActionsQuery, String>) {
+        let query = match query {
+            Ok(query) => query,
+            Err(usage) => {
+                self.add_output(&usage);
+                return;
+            }
+        };
+        match query.resolve(&self.settings.actions) {
+            actions::ActionsOpen::Nothing(line) => self.add_output(&line),
+            actions::ActionsOpen::Edit(index) => {
+                self.actions_scope = query;
+                self.actions_edit_direct = true;
+                self.open_action_editor_popup(Some(index));
+            }
+            actions::ActionsOpen::List => {
+                self.actions_scope = query;
+                self.actions_edit_direct = false;
+                self.open_actions_list_popup();
+            }
+        }
     }
 
-    /// Open the actions list popup with optional world filter
-    fn open_actions_list_popup_with_filter(&mut self, world_filter: &str) {
+    /// After the action editor or its Delete confirm closes: back to the Actions list, as
+    /// `/actions` last showed it, unless the editor was opened by name.
+    pub(crate) fn return_to_actions_list(&mut self) {
+        if std::mem::take(&mut self.actions_edit_direct) {
+            self.popup_manager.close_all();
+        } else {
+            self.open_actions_list_popup();
+        }
+    }
+
+    /// Open the actions list popup, showing the actions `/actions` asked for
+    /// (`actions_scope`).
+    fn open_actions_list_popup(&mut self) {
         use popup::definitions::actions::ACTIONS_FIELD_LIST;
 
         // Build items with indices for the popup
+        let scope = &self.actions_scope;
         let mut items: Vec<popup::ListItem> = self.settings.actions.iter().enumerate()
-            .filter(|(_, a)| {
-                if world_filter.is_empty() {
-                    true
-                } else {
-                    a.world.to_lowercase().contains(&world_filter.to_lowercase())
-                }
-            })
+            .filter(|(_, a)| scope.matches(a))
             .map(|(idx, a)| {
                 #[cfg(not(windows))]
                 let status = if a.enabled { "[✓]" } else { "[ ]" };
@@ -8556,8 +8717,10 @@ impl App {
 
         let visible_height = 10.min(items.len().max(3));
 
-        // Create the popup with the filtered actions
-        let def = popup::PopupDefinition::new(popup::PopupId("actions_list"), "Actions")
+        // Create the popup with the filtered actions; the title says what it is narrowed to.
+        let label = self.actions_scope.label();
+        let title = if label.is_empty() { "Actions".to_string() } else { format!("Actions - {label}") };
+        let def = popup::PopupDefinition::new(popup::PopupId("actions_list"), title)
             .with_field(popup::Field::new(
                 popup::definitions::actions::ACTIONS_FIELD_FILTER,
                 "Filter",
@@ -8659,7 +8822,7 @@ impl App {
             // `end_seq: None`) ever reached this handler. Regression from 99fe3dc
             // (2026-08-04); this arm's body never actually needed `end_seq`'s value, only
             // `msg_seq`, so dropping the literal match is a complete fix.
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq, flush, gagged, highlight_colors, archive_sourced, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq, flush, gagged, highlight_colors, archive_sourced, originals, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Flush: clear output buffer before appending new lines
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
@@ -8767,6 +8930,8 @@ impl App {
                             if let Some(Some(color)) = highlight_colors.get(i) {
                                 output_line.highlight_color = Some(color.clone());
                             }
+                            // The MUD's own text of a rewritten line, for F2 (likewise by `i`).
+                            output_line.original = originals.get(i).cloned().flatten();
                             world.output_lines.push(output_line);
                             // Track max received seq from server
                             if msg_seq > 0 {
@@ -8779,7 +8944,7 @@ impl App {
                             world.scroll_offset = world.output_lines.len().saturating_sub(1);
                         }
 
-                        if world_index != self.current_world_index {
+                        if world_index != self.current_world_index && !world.is_hidden() {
                             world.unseen_lines += line_count;
                         }
                         self.needs_output_redraw = true;
@@ -8987,6 +9152,7 @@ impl App {
                             display_id: None,
                             hist: LineHistory::default(),
                             tf_attrs: None,
+                            original: tl.original,
                         });
                         if tl.seq > 0 {
                             world.max_received_seq = tl.seq;
@@ -9178,6 +9344,7 @@ impl App {
                             display_id: None,
                             hist: LineHistory::default(),
                             tf_attrs: None,
+                            original: line.original,
                         };
                         world.output_lines.push(output_line);
                         if line.seq >= world.next_seq {
@@ -9265,6 +9432,7 @@ impl App {
                                     display_id: None,
                                     hist: LineHistory::default(),
                                     tf_attrs: None,
+                                    original: line.original,
                                 }).collect();
                             let insert_at = insert_at.min(world.output_lines.len());
                             let inserted = new_lines.len();
@@ -9301,6 +9469,7 @@ impl App {
                             display_id: None,
                             hist: LineHistory::default(),
                             tf_attrs: None,
+                            original: line.original,
                         }
                     }).collect();
                     world.prepend_live_history(new_lines);
@@ -9341,6 +9510,7 @@ impl App {
                         display_id: None,
                         hist: LineHistory::default(),
                         tf_attrs: None,
+                        original: line.original,
                     }).collect();
                 world.prepend_live_history(live);
                 if !archive.is_empty() {
@@ -9351,6 +9521,7 @@ impl App {
                         text: a.text,
                         wseq: a.wseq,
                         gagged: a.gagged,
+                        original: a.original,
                     }).collect();
                     let oldest_seq = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
                     let block = Self::build_archive_prepend(rows, oldest_seq);
@@ -9482,6 +9653,7 @@ impl App {
                         w.settings.status_panel = status_panel;
                         self.needs_output_redraw = true;
                     }
+                    w.settings.hidden = settings.hidden.unwrap_or(false);
                     // `WorldSettingsMsg::world_type` here is always the server's real
                     // post-apply value (update_world_settings reads it back from the
                     // world rather than echoing a possibly-empty incoming string), so
@@ -9747,6 +9919,7 @@ impl App {
                 display_id: None,
                 hist: LineHistory::default(),
                 tf_attrs: None,
+                original: tl.original,
             }
         }).collect();
         // Update next_seq to continue from highest seq in output_lines
@@ -9775,6 +9948,7 @@ impl App {
                 display_id: None,
                 hist: LineHistory::default(),
                 tf_attrs: None,
+                original: tl.original,
             }
         }).collect();
         // Update next_seq if pending_lines have higher seq values
@@ -9833,6 +10007,8 @@ impl App {
             mccp2_enabled: w.settings.mccp2_enabled,
             // Absent from a server before the switch: shown.
             status_panel: w.settings.status_panel.unwrap_or(true),
+            // Absent from a server before Hide: not hidden.
+            hidden: w.settings.hidden.unwrap_or(false),
             // World type (and the Slack/Discord fields below) were never hydrated here
             // before — a plain `WorldStateMsg` (connect-time InitialState, not the
             // WorldSettingsUpdated broadcast above) always carries the server's real
@@ -10121,6 +10297,8 @@ impl App {
                 // Take the most recent matches. The old ascending scan kept the
                 // OLDEST 10k, silently hiding recent history on a large archive.
                 newest_first: true,
+                // -ao matches the MUD's own text of a rewritten line, as the live half does.
+                original: opts.show_original,
             });
             // `archive_sourced` is what makes these render with 🛢️ instead of ✨ once
             // emit_recall re-emits them; the live half keeps its own provenance.
@@ -10129,6 +10307,7 @@ impl App {
                 let mut line = OutputLine::new_with_timestamp(sl.text, ts, i as u64);
                 line.archive_sourced = true;
                 line.archive_seq = sl.wseq;
+                line.original = sl.original;
                 line
             }).collect();
             // The cut above is computed first, from every live line: dropping TF's `G`
@@ -10299,7 +10478,7 @@ impl App {
             (Some(i), _) => i,
             (None, Some(_)) => return Err("The output is already split; /unsplit closes the pane without the focus.".to_string()),
             (None, None) => {
-                let worlds: Vec<(&str, bool, bool)> = self.worlds.iter().map(|w| (w.name.as_str(), w.connected, w.is_activity)).collect();
+                let worlds: Vec<(&str, bool, bool)> = self.worlds.iter().map(|w| (w.name.as_str(), w.connected, w.is_activity || w.is_hidden())).collect();
                 match crate::util::split_next_world(&worlds, self.current_world_index) {
                     Some(i) => i,
                     None => return Err("There is no other world to show.".to_string()),
@@ -10512,8 +10691,9 @@ impl App {
     /// `util::calculate_world_switch`'s own "no-op switch" convention.
     fn cycle_connected_world(&mut self, direction: i32) -> Option<usize> {
         let skip = self.split_exclude();
+        // A hidden shell world isn't one of the connected worlds cycled through.
         let connected: Vec<usize> = self.worlds.iter().enumerate()
-            .filter(|(i, w)| w.connected && !skip.contains(i))
+            .filter(|(i, w)| w.connected && !w.is_hidden() && !skip.contains(i))
             .map(|(i, _)| i)
             .collect();
         if connected.is_empty() {
@@ -10565,6 +10745,82 @@ impl App {
         self.activity_world().is_some() && name.trim().eq_ignore_ascii_case(crate::util::ACTIVITY_WORLD_NAME)
     }
 
+    /// Why `name` can't be a world's name here: `util::world_name_problem` (one word, user
+    /// ruling 2026-11-19), then the Activity world's; `None` when it can. Every place that
+    /// makes or renames a world asks it.
+    pub(crate) fn world_name_refusal(&self, name: &str) -> Option<String> {
+        crate::util::world_name_refusal(name, self.activity_world().is_some())
+    }
+
+    /// Worlds saved before world names were one word (user ruling 2026-11-19): each name
+    /// with whitespace becomes `util::one_word_world_name`'s, made unique with `_2`, `_3`,
+    /// and the actions' World fields and TF's world file follow it. Run at the end of every
+    /// load of the world list (settings.dat, the reload state, `/import`); what it renamed
+    /// waits in `world_rename_notes` for `take_world_rename_notes`.
+    pub(crate) fn make_world_names_one_word(&mut self) {
+        for i in 0..self.worlds.len() {
+            let old = self.worlds[i].name.clone();
+            if self.worlds[i].is_activity || !old.chars().any(char::is_whitespace) {
+                continue;
+            }
+            let base = crate::util::one_word_world_name(&old);
+            let taken = |name: &str, worlds: &[World]| worlds.iter().enumerate().any(|(j, w)| j != i && w.name.eq_ignore_ascii_case(name));
+            let mut new = base.clone();
+            let mut n = 2;
+            while taken(&new, &self.worlds) || self.reserved_world_name(&new) {
+                new = format!("{base}_{n}");
+                n += 1;
+            }
+            self.worlds[i].name = new.clone();
+            self.carry_world_rename(&old, &new);
+            self.world_rename_notes.push(format!("World '{old}' is now '{new}': world names are one word."));
+        }
+    }
+
+    /// What is kept by a world's name, moved from `old` to `new` as the world is renamed
+    /// (every editor's rename, `make_world_names_one_word`; user request 2026-11-19): each
+    /// action's World field entry naming it (`actions::rename_in_world_list`, case ignored),
+    /// TF's world file and its `/watchdog -w` override. Returns whether an action changed,
+    /// for a caller with clients to send `ActionsUpdated`; the caller saves settings.
+    pub(crate) fn carry_world_rename(&mut self, old: &str, new: &str) -> bool {
+        if old == new {
+            return false;
+        }
+        let mut actions_changed = false;
+        for action in &mut self.settings.actions {
+            let world = crate::actions::rename_in_world_list(&action.world, old, new);
+            if world != action.world {
+                action.world = world;
+                actions_changed = true;
+            }
+        }
+        if let Some(file) = self.tf_engine.world_files.remove(&old.to_lowercase()) {
+            self.tf_engine.world_files.insert(new.to_lowercase(), file);
+        }
+        let watchdog: Vec<String> = self.tf_engine.watchdog_overrides.keys().filter(|k| k.eq_ignore_ascii_case(old)).cloned().collect();
+        for key in watchdog {
+            if let Some(config) = self.tf_engine.watchdog_overrides.remove(&key) {
+                self.tf_engine.watchdog_overrides.insert(new.to_string(), config);
+            }
+        }
+        actions_changed
+    }
+
+    /// A rename moved actions' World fields (`carry_world_rename`): every client's list.
+    pub(crate) fn broadcast_actions(&self) {
+        self.ws_broadcast(WsMessage::ActionsUpdated { actions: self.settings.actions.clone() });
+    }
+
+    /// The lines `make_world_names_one_word` left, saving settings when there are any so
+    /// the new names are kept (and not reported again at the next start).
+    pub(crate) fn take_world_rename_notes(&mut self) -> Vec<String> {
+        let notes = std::mem::take(&mut self.world_rename_notes);
+        if !notes.is_empty() {
+            let _ = persistence::save_settings(self);
+        }
+        notes
+    }
+
     /// The line a command acting on a world gets for the Activity world, which has no
     /// settings, connection or notes of its own; `None` for any other world.
     pub(crate) fn activity_refusal(&self, idx: usize, what: &str) -> Option<String> {
@@ -10599,6 +10855,8 @@ impl App {
     fn switch_exclude(&self, exclude: &[usize]) -> Vec<usize> {
         let mut all = exclude.to_vec();
         all.extend(self.activity_world());
+        // A hidden shell world (`World::is_hidden`) is never cycled to either.
+        all.extend(self.worlds.iter().enumerate().filter(|(_, w)| w.is_hidden()).map(|(i, _)| i));
         all
     }
 
@@ -11076,6 +11334,7 @@ impl App {
                     ts_ms: r.ts_ms,
                     wseq: r.wseq,
                     gagged: r.gagged,
+                    original: r.original.map(|o| o.replace('\r', "")),
                 }).collect();
                 (archive, done)
             }
@@ -11098,7 +11357,9 @@ impl App {
     /// (`archive_cut`, as `/recall -D`), since the client searches the live lines itself; a
     /// world only the archive still has is searched whole. The newest `PER_WORLD` matches of
     /// each, oldest first, sent `CHUNK` at a time.
-    pub(crate) fn handle_grep_archive(&mut self, client_id: u64, request_id: u64, world: Option<String>, regex: String) {
+    /// `original` (`clay --grep -o`): a line a `/substitute` rewrote is matched and sent as
+    /// the MUD sent it.
+    pub(crate) fn handle_grep_archive(&mut self, client_id: u64, request_id: u64, world: Option<String>, regex: String, original: bool) {
         const PER_WORLD: usize = 10_000;
         const CHUNK: usize = 1000;
         let refuse = |app: &mut Self, error: String| {
@@ -11139,11 +11400,15 @@ impl App {
                 until_ms: *until_ms,
                 limit: PER_WORLD,
                 newest_first: true,
+                original,
             });
             hits.extend(rows.into_iter().map(|r| websocket::GrepArchiveHit {
                 world: name.clone(),
                 ts_ms: r.ts_ms,
-                text: r.text.replace('\r', ""),
+                text: match r.original {
+                    Some(o) if original => o,
+                    _ => r.text,
+                }.replace('\r', ""),
             }));
         }
         let mut chunks = hits.chunks(CHUNK).peekable();
@@ -11708,7 +11973,7 @@ impl App {
                 seq,
                 end_seq: Some(seq),
                 flush: false,
-                gagged: false, highlight_colors: Vec::new(),
+                gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
             });
         }
         displayed
@@ -11778,14 +12043,7 @@ impl App {
         // Parallel to the lines in `data`. Left empty (and omitted from the wire) unless at
         // least one line is highlighted, so the common path costs nothing - see
         // ServerData::highlight_colors.
-        let highlight_colors: Vec<Option<String>> = {
-            let colors: Vec<Option<String>> = world.output_lines.iter()
-                .skip(skip)
-                .take(count)
-                .map(|line| line.highlight_color.clone())
-                .collect();
-            if colors.iter().any(|c| c.is_some()) { colors } else { Vec::new() }
-        };
+        let (highlight_colors, originals) = wire_line_extras(world.output_lines.iter().skip(skip).take(count));
         self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
             archive_sourced,
             world_index: world_idx,
@@ -11798,6 +12056,7 @@ impl App {
             flush,
             gagged: false,
             highlight_colors,
+            originals,
         });
     }
 
@@ -12016,9 +12275,12 @@ impl App {
     /// world, broadcasts `WorldAdded` to all clients, and tells the requesting client its new
     /// index via `WorldCreated`.
     pub(crate) fn create_world(&mut self, client_id: u64, name: &str) {
-        if self.reserved_world_name(name) {
+        // One word, not the Activity world's (world_name_refusal): an older client's Add
+        // or /worlds -e can still send "New World 2".
+        let name = name.trim();
+        if let Some(refusal) = self.world_name_refusal(name) {
             let at = self.ws_client_worlds.get(&client_id).map(|v| v.world_index).unwrap_or(self.current_world_index);
-            self.ws_tell(client_id, at, &format!("{} is the Activity world's name; pick another.", crate::util::ACTIVITY_WORLD_NAME));
+            self.ws_tell(client_id, at, &refusal);
             return;
         }
         let new_world = World::new(name);
@@ -12061,6 +12323,7 @@ impl App {
             mcp_enabled: world.settings.mcp_enabled,
             mccp2_enabled: world.settings.mccp2_enabled,
             status_panel: Some(world.settings.status_panel),
+            hidden: Some(world.settings.hidden),
             world_type: world.settings.world_type.name().to_string(),
             prompt_wait_ms: world.settings.prompt_wait_ms,
             tf_type: world.settings.tf_type.clone(),
@@ -12095,6 +12358,25 @@ impl App {
 
     /// `/stats show|hide` (the GUIs' × on the panel): world `idx`'s own Status Panel switch,
     /// saved and told to every client. Returns the line to show.
+    /// Edit World's Hide (`WorldSettings::hidden`, a shell world's): the one way it changes.
+    /// Turning it on also drops the unseen count the world had, which nothing would clear
+    /// while it is left out of every count (`World::has_activity`). The caller saves.
+    pub(crate) fn set_world_hidden(&mut self, idx: usize, on: bool) {
+        let Some(world) = self.worlds.get_mut(idx) else { return };
+        if world.settings.hidden == on {
+            return;
+        }
+        world.settings.hidden = on;
+        if world.is_hidden() && world.unseen_lines > 0 {
+            world.unseen_lines = 0;
+            world.first_unseen_at = None;
+            self.ws_broadcast(WsMessage::UnseenUpdate { world_index: idx, count: 0 });
+        }
+        self.broadcast_activity();
+        // TF's copy of the worlds (`/listsockets`, `%nactive`) knows it too.
+        self.sync_tf_world_info();
+    }
+
     pub(crate) fn set_world_status_panel(&mut self, idx: usize, on: bool) -> String {
         let Some(world) = self.worlds.get_mut(idx) else { return String::new() };
         let name = world.name.clone();
@@ -12324,15 +12606,23 @@ impl App {
         status_panel: Option<bool>,
         login_command: Option<String>,
         first_command: Option<String>,
-    ) {
+        hidden: Option<bool>,
+    ) -> Option<String> {
         // The Activity world has no settings (every editor refuses to open it).
         if world_index >= self.worlds.len() || self.worlds[world_index].is_activity {
-            return;
+            return None;
         }
-        // Activity is the Activity world's name while it exists: a rename to it keeps the
-        // world's own name (`/addworld` and a new world refuse it).
-        let name = if self.reserved_world_name(&name) { self.worlds[world_index].name.clone() } else { name };
-        self.worlds[world_index].name = name.clone();
+        // A rename to a name that isn't one word, or to the Activity world's, keeps the
+        // world's own name (`world_name_refusal`, which `/addworld` and a new world ask
+        // too); the rest of the save applies, and the caller tells the client why.
+        let name = name.trim().to_string();
+        let refusal = if name == self.worlds[world_index].name { None } else { self.world_name_refusal(&name) };
+        let name = if refusal.is_some() { self.worlds[world_index].name.clone() } else { name };
+        // A rename carries the actions naming the world with it (saved below).
+        let old_name = std::mem::replace(&mut self.worlds[world_index].name, name.clone());
+        if self.carry_world_rename(&old_name, &name) {
+            self.broadcast_actions();
+        }
         self.worlds[world_index].settings.hostname = hostname.clone();
         self.worlds[world_index].settings.port = port.clone();
         self.worlds[world_index].settings.user = user.clone();
@@ -12400,6 +12690,11 @@ impl App {
             }
             self.worlds[world_index].settings.world_type = new_type;
         }
+        // Hide (a shell world's), after the type it depends on. None: a client from
+        // before it - leave it.
+        if let Some(on) = hidden {
+            self.set_world_hidden(world_index, on);
+        }
         self.worlds[world_index].settings.prompt_wait_ms = prompt_wait_ms;
         // None: a client that predates the field - leave it.
         if let Some(t) = tf_type {
@@ -12453,6 +12748,7 @@ impl App {
             mcp_enabled,
             mccp2_enabled,
             status_panel: Some(self.worlds[world_index].settings.status_panel),
+            hidden: Some(self.worlds[world_index].settings.hidden),
             // Read back from the world's own settings rather than the raw incoming
             // params: world_type and the Slack/Discord fields may have been left
             // unchanged above (empty incoming value), so the broadcast must reflect
@@ -12475,6 +12771,7 @@ impl App {
             has_slack_app_token: !self.worlds[world_index].settings.slack_app_token.is_empty(),
         };
         self.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
+        refusal
     }
 
     /// `WsMessage::UpdateGlobalSettings` handling — shared by master-WS and daemon (T37).
@@ -12870,6 +13167,8 @@ impl App {
         }
         let ts = current_timestamp_secs();
         let mut batch: Vec<String> = Vec::new();
+        // The batch's lines themselves, for its per-line lists (`wire_line_extras`).
+        let mut batch_lines: Vec<&OutputLine> = Vec::new();
         let mut batch_from_server = released[0].from_server;
         let mut batch_gagged = released[0].gagged;
         let mut batch_start_seq = released[0].seq;
@@ -12879,6 +13178,7 @@ impl App {
             let seq_contiguous = prev_seq.map(|p| line.seq == p + 1).unwrap_or(true);
             if (line.from_server != batch_from_server || line.gagged != batch_gagged || !seq_contiguous) && !batch.is_empty() {
                 let ws_data = batch.join("\n") + "\n";
+                let (highlight_colors, originals) = wire_line_extras(batch_lines.drain(..));
                 self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                     world_index: world_idx,
                     data: ws_data,
@@ -12887,7 +13187,7 @@ impl App {
                     from_server: batch_from_server,
                     seq: batch_start_seq,
                     end_seq: Some(batch_end_seq),
-                    flush: false, gagged: batch_gagged, highlight_colors: Vec::new(),
+                    flush: false, gagged: batch_gagged, highlight_colors, originals,
                 });
                 batch.clear();
                 batch_from_server = line.from_server;
@@ -12896,10 +13196,12 @@ impl App {
             }
             batch_end_seq = line.seq;
             batch.push(line.wire_text());
+            batch_lines.push(line);
             prev_seq = Some(line.seq);
         }
         if !batch.is_empty() {
             let ws_data = batch.join("\n") + "\n";
+            let (highlight_colors, originals) = wire_line_extras(batch_lines.drain(..));
             self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                 world_index: world_idx,
                 data: ws_data,
@@ -12908,7 +13210,7 @@ impl App {
                 from_server: batch_from_server,
                 seq: batch_start_seq,
                 end_seq: Some(batch_end_seq),
-                flush: false, gagged: batch_gagged, highlight_colors: Vec::new(),
+                flush: false, gagged: batch_gagged, highlight_colors, originals,
             });
         }
 
@@ -13199,7 +13501,7 @@ impl App {
                 seq, end_seq: Some(seq),
                 flush: false,
                 gagged: true, // clients store it and skip rendering unless F2/show-tags
-                highlight_colors: Vec::new(),
+                highlight_colors: Vec::new(), originals: Vec::new(),
             });
         }
         // Same reasoning as the existing gagged-line release paths: output_lines just grew,
@@ -14132,7 +14434,7 @@ impl App {
             ts: current_timestamp_secs(),
             from_server: false,
             seq: 0, end_seq: None,
-            flush: false, gagged: false, highlight_colors: Vec::new(),
+            flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
         });
     }
 
@@ -14152,7 +14454,7 @@ impl App {
             ts: current_timestamp_secs(),
             from_server: false,
             seq: 0, end_seq: None,
-            flush: false, gagged: false, highlight_colors: Vec::new(),
+            flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
         });
     }
 
@@ -14769,7 +15071,7 @@ impl App {
                 flush: true,
                 gagged: false,
                 archive_sourced: false,
-                highlight_colors: Vec::new(),
+                highlight_colors: Vec::new(), originals: Vec::new(),
             });
         }
         self.activity_viewers = now;
@@ -14782,29 +15084,35 @@ impl App {
     /// buffer, never broadcast; each client is sent its own as unnumbered lines (no seq to
     /// track or gap-fill), so nothing holds, counts, logs, archives or claims them.
     /// Triggers, TTS, hooks and activity all ran on the original.
-    fn copy_to_activity(&mut self, world_idx: usize, lines: &[&str]) {
+    /// `lines`: each line's text and, when a `/substitute` rewrote it, the MUD's own text
+    /// (the copy shows it under F2 as the world itself does).
+    fn copy_to_activity(&mut self, world_idx: usize, lines: &[(&str, Option<&str>)]) {
         let Some(act) = self.activity_world() else { return };
         if act == world_idx {
             return;
         }
         self.note_activity_viewers();
         // A blank or colour-only line is no activity: it would be the world's name alone.
-        let lines: Vec<&&str> = lines.iter().filter(|t| !crate::util::strip_ansi_codes(t).trim().is_empty()).collect();
+        let lines: Vec<&(&str, Option<&str>)> = lines.iter().filter(|(t, _)| !crate::util::strip_ansi_codes(t).trim().is_empty()).collect();
         if lines.is_empty() {
             return;
         }
         let label = crate::newbg::activity_label(&self.settings.new_indicator, &self.worlds[world_idx].name);
-        let texts: Vec<String> = lines.iter().map(|t| format!("{}{}", label, crate::util::strip_mud_tag(t))).collect();
+        let labelled = |t: &str| format!("{}{}", label, crate::util::strip_mud_tag(t));
+        let texts: Vec<String> = lines.iter().map(|(t, _)| labelled(t)).collect();
+        let originals: Vec<Option<String>> = lines.iter().map(|(_, o)| o.map(labelled)).collect();
         if self.console_showed_activity && !self.console_shows(world_idx) {
-            for text in &texts {
+            for (text, original) in texts.iter().zip(&originals) {
                 let seq = self.worlds[act].next_seq;
                 self.worlds[act].next_seq += 1;
                 let mut line = OutputLine::new(text.clone(), seq);
                 line.viewed = true;
+                line.original = original.clone();
                 self.worlds[act].push_line_respecting_pending(line, false);
             }
             self.needs_output_redraw = true;
         }
+        let originals = if originals.iter().any(Option::is_some) { originals } else { Vec::new() };
         let to: Vec<u64> = self.activity_viewers.iter().copied().filter(|&id| !self.client_shows(id, world_idx)).collect();
         if to.is_empty() {
             return;
@@ -14823,7 +15131,7 @@ impl App {
                 flush: false,
                 gagged: false,
                 archive_sourced: false,
-                highlight_colors: Vec::new(),
+                highlight_colors: Vec::new(), originals: originals.clone(),
             });
         }
     }
@@ -15087,7 +15395,7 @@ impl App {
     fn add_visible_run(
         &mut self,
         world_idx: usize,
-        run: &[(&str, Option<String>)],
+        run: &[&PacketLine<'_>],
         is_current: bool,
         console_height: u16,
         console_width: u16,
@@ -15103,11 +15411,11 @@ impl App {
         // Highlight colours are matched back by line content after add_output has wrapped
         // and stored the text, so the map only needs this run's lines.
         let highlight_map: std::collections::HashMap<String, Option<String>> = run.iter()
-            .filter(|(_, hl)| hl.is_some())
-            .map(|(line, hl)| (line.to_string(), hl.clone()))
+            .filter(|l| l.highlight.is_some())
+            .map(|l| (l.text.to_string(), l.highlight.clone()))
             .collect();
         let filtered_data = {
-            let lines_only: Vec<&str> = run.iter().map(|(line, _)| *line).collect();
+            let lines_only: Vec<&str> = run.iter().map(|l| l.text.as_ref()).collect();
             let mut result = lines_only.join("\n");
             if append_newline {
                 result.push('\n');
@@ -15131,6 +15439,12 @@ impl App {
             let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
                 && !self.worlds[world_idx].partial_in_pending;
 
+            // The MUD's own text of each rewritten line, parallel to the run, for add_output
+            // to put on the line it makes of each (`World::incoming_originals`); set only
+            // right before the call that takes it.
+            if run.iter().any(|l| l.original.is_some()) {
+                self.worlds[world_idx].incoming_originals = run.iter().map(|l| l.original.clone()).collect();
+            }
             // The settings are borrowed, not cloned per run: a clone carried every
             // action's compiled regex, each with an empty match cache to rebuild.
             self.worlds[world_idx].add_output(&filtered_data, is_current, &self.settings, output_height, output_width, true, true, self.show_tags);
@@ -15231,7 +15545,7 @@ impl App {
     ///
     /// Bypasses `add_output` entirely - it has no notion of a gagged line - so seq, `viewed`
     /// and archiving are all set by hand here.
-    fn add_gagged_run(&mut self, world_idx: usize, run: &[(&str, Option<String>)], is_current: bool, flush: bool) {
+    fn add_gagged_run(&mut self, world_idx: usize, run: &[&PacketLine<'_>], is_current: bool, flush: bool) {
         if run.is_empty() {
             return;
         }
@@ -15256,12 +15570,15 @@ impl App {
         let hold_gagged_in_pending = self.worlds[world_idx].paused
             && !self.worlds[world_idx].pending_lines.is_empty();
         // The lines that land in output_lines, for one broadcast after the loop.
-        let mut batch: Vec<(u64, String, Option<String>)> = Vec::new();
-        for (line, highlight) in run.iter().cloned() {
+        let mut batch: Vec<(u64, String, Option<String>, Option<String>)> = Vec::new();
+        for packet_line in run {
+            let line: &str = &packet_line.text;
+            let highlight = &packet_line.highlight;
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
             output_line.highlight_color = highlight.clone();
+            output_line.original = packet_line.original.clone();
             // Gagged or not, this is still text from the world: born viewed when someone's
             // watching, same as add_output does for non-gagged lines. Bypasses add_output
             // entirely so this must be set by hand.
@@ -15278,7 +15595,7 @@ impl App {
             // unconditional on which buffer it lands in, since archiving is a timestamped
             // log, not a seq-ordered live buffer other code indexes into.
             if !output_line.hist.nohistory {
-                output_line.archive_seq = self.worlds[world_idx].archive_line(line, true);
+                output_line.archive_seq = self.worlds[world_idx].archive_line(line, packet_line.original.as_deref(), true);
             }
             if hold_gagged_in_pending {
                 self.worlds[world_idx].pending_lines.push(output_line);
@@ -15287,16 +15604,18 @@ impl App {
                 continue;
             }
             self.worlds[world_idx].output_lines.push(output_line);
-            batch.push((seq, line.replace('\r', ""), highlight));
+            batch.push((seq, line.replace('\r', ""), highlight.clone(), packet_line.original.as_ref().map(|o| o.replace('\r', ""))));
         }
         // One ServerData for the run - consecutive seqs, all landing in output_lines
         // together (the hold above is decided once per run). A message per gagged line
         // used to multiply what a packet cost every client, and a flood of them could fill
         // a slow client's channel, each drop then costing a resync round trip.
-        let Some((&(first, _, _), &(last, _, _))) = batch.first().zip(batch.last()) else { return };
-        let data = batch.iter().map(|(_, text, _)| text.as_str()).collect::<Vec<_>>().join("\n") + "\n";
+        let Some((&(first, ..), &(last, ..))) = batch.first().zip(batch.last()) else { return };
+        let data = batch.iter().map(|(_, text, ..)| text.as_str()).collect::<Vec<_>>().join("\n") + "\n";
         let highlight_colors: Vec<Option<String>> =
-            if batch.iter().any(|(_, _, h)| h.is_some()) { batch.iter().map(|(_, _, h)| h.clone()).collect() } else { Vec::new() };
+            if batch.iter().any(|(_, _, h, _)| h.is_some()) { batch.iter().map(|(_, _, h, _)| h.clone()).collect() } else { Vec::new() };
+        let originals: Vec<Option<String>> =
+            if batch.iter().any(|(.., o)| o.is_some()) { batch.iter().map(|(.., o)| o.clone()).collect() } else { Vec::new() };
         self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
             world_index: world_idx,
             data,
@@ -15306,7 +15625,7 @@ impl App {
             seq: first, end_seq: Some(last),
             // Only ever true for the first message of a packet that cleared the splash.
             flush,
-            gagged: true, highlight_colors,
+            gagged: true, highlight_colors, originals,
         });
     }
 
@@ -15432,7 +15751,7 @@ impl App {
 
         // Process action triggers on complete lines
         // Track lines with gagged flag and highlight color: (line, is_gagged, highlight_color)
-        let mut processed_lines: Vec<(std::borrow::Cow<'_, str>, bool, Option<String>)> = Vec::new();
+        let mut processed_lines: Vec<PacketLine<'_>> = Vec::new();
         // A non-quiet TF trigger fired on this packet (TF's BGTRIG, for a background world).
         let mut tf_trigger_fired = false;
         let mut commands_to_execute: Vec<String> = mcp_replies;
@@ -15440,7 +15759,6 @@ impl App {
             self.handle_mcp_event(world_idx, event);
         }
         let mut tf_effects: Vec<tf::effects::TfEffect> = Vec::new();
-        let mut tf_messages: Vec<TfMessage> = Vec::new();
         let ends_with_newline = combined_data.ends_with('\n');
         let lines: Vec<&str> = combined_data.lines().collect();
         let line_count = lines.len();
@@ -15457,7 +15775,7 @@ impl App {
             // An answered timed prompt: shown and logged, never matched again - it was
             // already handled as the prompt (PROMPT hook, auto-login).
             if i < answered_lines {
-                processed_lines.push((std::borrow::Cow::Borrowed(*line), false, None));
+                processed_lines.push(PacketLine::plain(line, false));
                 continue;
             }
 
@@ -15467,7 +15785,7 @@ impl App {
                 // Don't drop the idler echo — gag it so F2 (show_tags) can reveal it like
                 // any other gagged line, on console/web/GUI.
                 if !is_partial {
-                    processed_lines.push((std::borrow::Cow::Borrowed(*line), true, None));
+                    processed_lines.push(PacketLine::plain(line, true));
                 }
                 continue;
             }
@@ -15492,7 +15810,7 @@ impl App {
                     let plain = strip_ansi_for_watchdog(line);
                     let done = left <= 1 || plain.contains("Use the WHO command") || plain.contains("### end of messages ###");
                     self.worlds[world_idx].quiet_login_lines = if done { None } else { Some(left - 1) };
-                    processed_lines.push((std::borrow::Cow::Borrowed(*line), true, None));
+                    processed_lines.push(PacketLine::plain(line, true));
                     continue;
                 }
                 // Gag the blank run that follows an action with "Suppress Blanks" set. Placed
@@ -15502,7 +15820,7 @@ impl App {
                 // reveals it, matching how /gag already behaves.
                 if suppress_blanks_remaining > 0 && is_visually_empty(line) {
                     suppress_blanks_remaining -= 1;
-                    processed_lines.push((std::borrow::Cow::Borrowed(*line), true, None));
+                    processed_lines.push(PacketLine::plain(line, true));
                     continue;
                 }
                 // Any visible line ends the run, even if fewer than the cap were consumed.
@@ -15552,13 +15870,21 @@ impl App {
                 let tr = process_triggers(line, &world_name_for_triggers, world_type_for_triggers, &self.settings.actions, &mut self.tf_engine);
                 commands_to_execute.extend(tr.send_commands);
                 tf_effects.extend(tr.tf_effects);
-                tf_messages.extend(tr.messages);
                 if tr.suppress_blanks {
                     suppress_blanks_remaining = SUPPRESS_BLANKS_MAX;
                 }
-                let shown = match tr.attributed {
-                    Some(text) => std::borrow::Cow::Owned(text),
-                    None => std::borrow::Cow::Borrowed(*line),
+                // A `/substitute` shows its rewrite in the line's place and keeps the line
+                // (as its triggers' attributes drew it) for F2 and /recall -ao.
+                let (shown, original, line_attrs) = match tr.rewrite {
+                    Some(rewrite) => (
+                        std::borrow::Cow::Owned(rewrite),
+                        Some(tr.attributed.unwrap_or_else(|| line.to_string())),
+                        tr.rewrite_attrs,
+                    ),
+                    None => match tr.attributed {
+                        Some(text) => (std::borrow::Cow::Owned(text), None, tr.line_attrs),
+                        None => (std::borrow::Cow::Borrowed(*line), None, tr.line_attrs),
+                    },
                 };
                 if tr.nolog {
                     self.worlds[world_idx].tf_nolog.push(shown.to_string());
@@ -15566,22 +15892,27 @@ impl App {
                 if tr.nohistory {
                     self.worlds[world_idx].tf_nohistory.push(shown.to_string());
                 }
-                if let Some(line_attrs) = tr.line_attrs {
+                if let Some(line_attrs) = line_attrs {
                     self.worlds[world_idx].tf_line_attrs.push((shown.to_string(), line_attrs));
                 }
                 if tr.noactivity {
                     self.worlds[world_idx].tf_noactivity.push(shown.to_string());
                 }
                 tf_trigger_fired |= tr.tf_fired;
-                processed_lines.push((shown, tr.is_gagged || watchdog_gagged, tr.highlight_color));
+                processed_lines.push(PacketLine {
+                    text: shown,
+                    gagged: tr.is_gagged || watchdog_gagged,
+                    highlight: tr.highlight_color,
+                    original,
+                });
             }
         }
 
         // BAMF portal detection: #### Please reconnect to name@addr (host) port NNN ####
         let bamf_val = self.tf_engine.get_var("bamf").map(|v| v.to_string_value()).unwrap_or_default();
         if is_mud && (bamf_val == "1" || bamf_val.eq_ignore_ascii_case("on") || bamf_val == "old") {
-            for (line, _, _) in &processed_lines {
-                if let Some(portal) = parse_bamf_portal(line) {
+            for packet_line in &processed_lines {
+                if let Some(portal) = parse_bamf_portal(&packet_line.text) {
                     let world_name = self.worlds[world_idx].name.clone();
                     let user = self.worlds[world_idx].settings.user.clone();
                     let password = self.worlds[world_idx].settings.password.clone();
@@ -15664,12 +15995,12 @@ impl App {
         // so instead group the lines into consecutive runs of the same gagged-ness and
         // alternate between the two paths, which preserves arrival order exactly.
         let mut runs: Vec<OutputRun> = Vec::new();
-        for (line, gagged, highlight) in &processed_lines {
+        for packet_line in &processed_lines {
             match runs.last_mut() {
-                Some((run_gagged, items)) if *run_gagged == *gagged => {
-                    items.push((line.as_ref(), highlight.clone()));
+                Some((run_gagged, items)) if *run_gagged == packet_line.gagged => {
+                    items.push(packet_line);
                 }
-                _ => runs.push((*gagged, vec![(line.as_ref(), highlight.clone())])),
+                _ => runs.push((packet_line.gagged, vec![packet_line])),
             }
         }
 
@@ -15677,10 +16008,10 @@ impl App {
         // a packet as a single utterance, so it must not be run per-run.
         // An answered prompt (the first `answered_lines`) was already the prompt: not spoken,
         // and no BGTEXT for it.
-        let non_gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
+        let non_gagged_lines: Vec<(&str, Option<&str>)> = processed_lines.iter()
             .skip(answered_lines)
-            .filter(|(_, gagged, _)| !gagged)
-            .map(|(line, _, highlight)| (line.as_ref(), highlight.clone()))
+            .filter(|l| !l.gagged)
+            .map(|l| (l.text.as_ref(), l.original.as_deref()))
             .collect();
 
         // Clear the splash once for the whole packet, rather than letting the first VISIBLE
@@ -15752,9 +16083,9 @@ impl App {
 
         if !non_gagged_lines.is_empty() {
             // Text-to-speech, for each interface showing this world with its own.
-            let lines: Vec<&str> = non_gagged_lines.iter().map(|(line, _)| *line).collect();
-            self.speak_arrivals(world_idx, &lines);
-            self.copy_to_activity(world_idx, &lines);
+            let texts: Vec<&str> = non_gagged_lines.iter().map(|(t, _)| *t).collect();
+            self.speak_arrivals(world_idx, &texts);
+            self.copy_to_activity(world_idx, &non_gagged_lines);
         }
 
         // Keep scroll at bottom if we were already there, even when paused.
@@ -15765,11 +16096,6 @@ impl App {
             let saved_vlo = self.worlds[world_idx].visual_line_offset;
             self.worlds[world_idx].scroll_to_bottom();
             self.worlds[world_idx].visual_line_offset = saved_vlo;
-        }
-
-        // Display /substitute replacement text
-        for (msg, marks, own) in tf_messages {
-            self.emit_client_text_marked(world_idx, &msg, is_daemon_mode, marks, own);
         }
 
         // What the TF triggers did, in order, for this world: output and sends now; from
@@ -15844,7 +16170,8 @@ impl App {
             // (user report 2026-11-08). The clients are told at once, as process_server_data
             // tells them of every other unseen line: nothing more will arrive from a world
             // that just disconnected to carry the count.
-            if !watched {
+            // A hidden shell world's "Disconnected." is no activity either.
+            if !watched && !self.worlds[world_idx].is_hidden() {
                 if self.worlds[world_idx].unseen_lines == 0 {
                     self.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
                 }
@@ -15876,7 +16203,7 @@ impl App {
                     ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                     from_server: false,
                     seq, end_seq: Some(seq),
-                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                    flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                 });
             }
         }
@@ -15906,7 +16233,7 @@ impl App {
                     ts: msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                     from_server: false,
                     seq, end_seq: Some(seq),
-                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                    flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                 });
             }
         }
@@ -15944,7 +16271,7 @@ impl App {
                 ts: current_timestamp_secs(),
                 from_server: false,
                 seq: 0, end_seq: None,
-                flush: false, gagged: false, highlight_colors: Vec::new(),
+                flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
             }),
         }
     }
@@ -16731,7 +17058,7 @@ impl App {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             self.worlds[world_idx].output_lines.push(OutputLine::new_client(mccp2_msg.to_string(), seq));
-            if !self.world_watched(world_idx) {
+            if !self.world_watched(world_idx) && !self.worlds[world_idx].is_hidden() {
                 if self.worlds[world_idx].unseen_lines == 0 {
                     self.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
                 }
@@ -17341,7 +17668,7 @@ impl App {
                 ts: current_timestamp_secs(),
                 from_server: false,
                 seq: 0, end_seq: None,
-                flush: false, gagged: false, highlight_colors: Vec::new(),
+                flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
             }),
         }
     }
@@ -17747,7 +18074,7 @@ impl App {
                 ts: current_timestamp_secs(),
                 from_server: false,
                 seq: 0, end_seq: None,
-                flush: false, gagged: false, highlight_colors: Vec::new(),
+                flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
             }),
             None => {}
         }
@@ -18335,7 +18662,7 @@ impl App {
                     end_seq: Some(run[run.len() - 1].seq),
                     flush: false,
                     gagged: run[0].gagged,
-                    highlight_colors: Vec::new(),
+                    highlight_colors: Vec::new(), originals: Vec::new(),
                 });
                 run.clear();
             };
@@ -18832,7 +19159,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                    flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                 });
             }
             Command::Notify { message } => {
@@ -18923,7 +19250,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                    flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                 });
             }
             Command::Reach { refresh, lookup } => self.ws_reach(client_id, world_index, refresh, lookup, event_tx),
@@ -18956,7 +19283,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
+                            flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                         });
                     }
                 } else if world_index < self.worlds.len() {
@@ -19063,7 +19390,7 @@ impl App {
         self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
             world_index, data, is_viewed: false,
             ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
-            flush: false, gagged: false, highlight_colors: Vec::new(),
+            flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
         });
     }
 
@@ -19300,7 +19627,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
+                            flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                         });
                     } else {
                         // Save current world index, switch to target, connect, then restore
@@ -19409,15 +19736,18 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command } => {
-                self.update_world_settings(
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command, hidden } => {
+                // A refused rename (not one word, or Activity) keeps the old name: say why.
+                if let Some(refusal) = self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                     msp_enabled, mcp_enabled, mccp2_enabled,
                     world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                     discord_token, discord_guild, discord_channel, discord_dm_user, chat,
-                    keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command,
-                );
+                    keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command, hidden,
+                ) {
+                    self.ws_tell(client_id, world_index, &format!("World name not changed: {refusal}"));
+                }
             }
             WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } => {
                 self.update_global_settings(
@@ -19670,6 +20000,7 @@ impl App {
                     };
                     util::WorldListInfo {
                         name: world.name.clone(),
+                        hidden: world.is_hidden(),
                         connected: world.connected,
                         is_current: idx == current_idx,
                         is_ssl: world.is_tls,
@@ -19741,8 +20072,8 @@ impl App {
             WsMessage::RequestHistory { world_index, count, request_id, before_seq, before_ts, archive_before } => {
                 self.handle_request_history(client_id, world_index, count, request_id, before_seq, before_ts, archive_before);
             }
-            WsMessage::GrepArchive { request_id, world, regex } => {
-                self.handle_grep_archive(client_id, request_id, world, regex);
+            WsMessage::GrepArchive { request_id, world, regex, original } => {
+                self.handle_grep_archive(client_id, request_id, world, regex, original);
             }
             WsMessage::ToggleWorldGmcp { world_index } => self.toggle_world_gmcp(world_index),
             // The map (src/map): one shared method each, as handler B does.
@@ -19822,6 +20153,8 @@ impl App {
                 persistence::merge_theme_dat(self, &theme_dat);
                 persistence::merge_keybindings_dat(self, &keybindings_dat);
 
+                // An imported world named with a space was renamed to one word.
+                let renamed = self.take_world_rename_notes();
                 let _ = persistence::save_settings(self);
                 let _ = std::fs::write(clay_config_path("theme.dat"), self.theme_file.generate_file_content());
                 let _ = self.keybindings.save(&clay_config_path("keybindings.dat"));
@@ -19836,6 +20169,9 @@ impl App {
 
                 if is_console {
                     self.pending_console_import = None;
+                    for note in &renamed {
+                        self.add_output(note);
+                    }
                     // Master TUI/desktop: offer /reload (re-exec) to apply immediately,
                     // rather than just printing a passive notice — plan step 9.
                     self.popup_manager.open(popup::definitions::confirm::create_import_reload_dialog(&summary));
@@ -19850,6 +20186,10 @@ impl App {
                     let initial_state = self.build_initial_state(self.display_owner_id(client_id));
                     self.ws_send_initial_state_and_mark(client_id, initial_state);
                     self.ws_send_to_client(client_id, WsMessage::ImportResult { success: true, summary });
+                    let at = self.ws_client_worlds.get(&client_id).map(|v| v.world_index).unwrap_or(self.current_world_index);
+                    for note in &renamed {
+                        self.ws_tell(client_id, at, note);
+                    }
                 }
             }
             Err(remote_client::ImportClientError::NeedsInsecureConfirm) => {
@@ -20129,6 +20469,7 @@ impl App {
                     mcp_enabled: world.settings.mcp_enabled,
                     mccp2_enabled: world.settings.mccp2_enabled,
                     status_panel: Some(world.settings.status_panel),
+                    hidden: Some(world.settings.hidden),
                     world_type: world.settings.world_type.name().to_string(),
                     prompt_wait_ms: world.settings.prompt_wait_ms,
                     tf_type: world.settings.tf_type.clone(),
@@ -20720,6 +21061,7 @@ impl App {
             line.from_server = true;
             line.from_archive = true;
             line.gagged = al.gagged;
+            line.original = al.original;
             // Carry the REAL archive sequence (the protocol `seq` above stays
             // fabricated, and `from_archive` still keeps these off the wire). This
             // is what stops a Page Up followed by /recall -D from listing the same
@@ -21447,6 +21789,8 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) mcp_enabled: bool,
     pub(crate) mccp2_enabled: bool,
     pub(crate) status_panel: bool,
+    /// A shell world's Hide (`WorldSettings::hidden`).
+    pub(crate) hidden: bool,
     /// Only meaningful for `world_type == "mud_timed_prompt"` - see
     /// `WorldSettings::prompt_wait_ms`'s doc comment.
     pub(crate) prompt_wait_ms: u64,
@@ -21545,7 +21889,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_KEEP_ALIVE_GAG, WORLD_FIELD_LOGIN_COMMAND, WORLD_FIELD_FIRST_COMMAND,
         WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_PROMPT_WAIT_MS,
         WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED, WORLD_FIELD_TF_TYPE,
-        WORLD_FIELD_STATUS_LINE,
+        WORLD_FIELD_STATUS_LINE, WORLD_FIELD_HIDE,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
         WORLD_FIELD_DISCORD_CHANNELS, WORLD_FIELD_SLACK_APP_TOKEN, WORLD_FIELD_SLACK_CHANNELS,
@@ -21557,6 +21901,16 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         IMPORT_BTN_GO, IMPORT_BTN_CANCEL,
     };
 
+    // The world editor's Save asks util::world_name_refusal, which needs these from the
+    // App the popup state borrows.
+    let activity_exists = app.activity_world().is_some();
+    let world_current_name = app.popup_manager.current()
+        .filter(|s| s.definition.id == popup::PopupId("world_editor"))
+        .and_then(|s| s.get_custom("world_index"))
+        .and_then(|i| i.parse::<usize>().ok())
+        .and_then(|i| app.worlds.get(i))
+        .map(|w| w.name.clone())
+        .unwrap_or_default();
     // Clear mouse highlight on any keyboard interaction
     if let Some(state) = app.popup_manager.current_mut() {
         state.highlight = None;
@@ -23299,6 +23653,12 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
 
         // World editor popup handling
         if is_world_editor {
+            // Save refuses a name that isn't one word (util::world_name_refusal); the
+            // world's own name is what it had, so an unchanged one always saves.
+            let name_refusal = |state: &popup::PopupState, current: &str| -> Option<String> {
+                let name = state.get_text(WORLD_FIELD_NAME).unwrap_or("").trim().to_string();
+                if name == current { None } else { crate::util::world_name_refusal(&name, activity_exists) }
+            };
             // Get world index from custom state
             let world_index: usize = state.get_custom("world_index")
                 .and_then(|s| s.parse().ok())
@@ -23336,6 +23696,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     mcp_enabled: state.get_bool(WORLD_FIELD_MCP_ENABLED).unwrap_or(true),
                     mccp2_enabled: state.get_bool(WORLD_FIELD_MCCP2_ENABLED).unwrap_or(true),
                     status_panel: state.get_bool(WORLD_FIELD_STATUS_LINE).unwrap_or(true),
+                    hidden: state.get_bool(WORLD_FIELD_HIDE).unwrap_or(false),
                     // Text field parsed on save (same convention as port/auto-reconnect);
                     // anything unparsable falls back to the default rather than 0.
                     prompt_wait_ms: state.get_text(WORLD_FIELD_PROMPT_WAIT_MS)
@@ -23431,7 +23792,15 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         state.commit_edit();
                     } else if state.is_on_button() {
                         if state.is_button_focused(WORLD_BTN_SAVE) {
-                            let settings = extract_settings();
+                            if let Some(refusal) = name_refusal(state, &world_current_name) {
+                                state.error = Some(refusal);
+                                state.error_at = Some(std::time::Instant::now());
+                                state.select_field(WORLD_FIELD_NAME);
+                                state.start_edit();
+                                return NewPopupAction::None;
+                            }
+                            let mut settings = extract_settings();
+                            settings.name = settings.name.trim().to_string();
                             app.popup_manager.close();
                             return NewPopupAction::WorldEditorSaved(Box::new(settings));
                         } else if state.is_button_focused(WORLD_BTN_CANCEL) {
@@ -23546,7 +23915,15 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         // Not editing: bare letters are button hotkeys only (never
                         // implicit text entry - Enter is required to start editing).
                         if btn_id == WORLD_BTN_SAVE {
-                            let settings = extract_settings();
+                            if let Some(refusal) = name_refusal(state, &world_current_name) {
+                                state.error = Some(refusal);
+                                state.error_at = Some(std::time::Instant::now());
+                                state.select_field(WORLD_FIELD_NAME);
+                                state.start_edit();
+                                return NewPopupAction::None;
+                            }
+                            let mut settings = extract_settings();
+                            settings.name = settings.name.trim().to_string();
                             app.popup_manager.close();
                             return NewPopupAction::WorldEditorSaved(Box::new(settings));
                         } else if btn_id == WORLD_BTN_CANCEL {
@@ -24058,6 +24435,8 @@ async fn main() -> io::Result<()> {
     let mut grep_follow_mode = false;
     // -D: the archive too - the host's with a host, else this machine's scrollback.db.
     let mut grep_archive = false;
+    // -o: a line a /substitute rewrote is matched and printed as the MUD sent it.
+    let mut grep_original = false;
     let mut grep_pattern: Option<String> = None;
     if grep_mode {
         let mut gi = 0;
@@ -24075,6 +24454,7 @@ async fn main() -> io::Result<()> {
                 "--noesc" => grep_strip_ansi = true,
                 "-f" => grep_follow_mode = true,
                 "-D" => grep_archive = true,
+                "-o" => grep_original = true,
                 other if other.starts_with('-') => {
                     eprintln!("Error: Unknown grep option '{}'. Use -h for help.", other);
                     std::process::exit(1);
@@ -24205,11 +24585,16 @@ async fn main() -> io::Result<()> {
             limit: 100_000,
             // The newest matches, so a large archive doesn't hide the recent ones.
             newest_first: true,
+            original: grep_original,
         });
         // Every world's wseq counts on its own: time is the one order across worlds.
         results.sort_by_key(|l| l.ts_ms);
         for line in &results {
-            println!("{}", remote_client::grep_line(line.ts_ms / 1000, true, &line.world, &line.text, grep_strip_ansi));
+            let text = match &line.original {
+                Some(original) if grep_original => original,
+                _ => &line.text,
+            };
+            println!("{}", remote_client::grep_line(line.ts_ms / 1000, true, &line.world, text, grep_strip_ansi));
         }
         // grep's convention: 1 when nothing matched.
         if results.is_empty() {
@@ -24253,6 +24638,7 @@ async fn main() -> io::Result<()> {
             grep_strip_ansi,
             grep_follow_mode,
             grep_archive,
+            grep_original,
         ).await;
     }
 
@@ -24782,6 +25168,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // so that more-mode continues seamlessly. Disconnected worlds have their
     // pending_lines cleared in the cleanup pass below (line ~17205).
 
+    // Worlds renamed to one word at the load (App::make_world_names_one_word).
+    startup_messages.extend(app.take_world_rename_notes());
     // An earlier Clay on this machine that crashed (src/crashlog.rs).
     startup_messages.extend(crashlog::take_notices());
     // Now display any startup messages
@@ -24821,8 +25209,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             let seq = app.worlds[world_idx].next_seq;
             app.worlds[world_idx].next_seq += 1;
             app.worlds[world_idx].output_lines.push(OutputLine::new_client(tls_msg.to_string(), seq));
-            // Unseen unless somebody watches it (one rule, `world_watched`).
-            if !app.world_watched(world_idx) {
+            // Unseen unless somebody watches it (one rule, `world_watched`), or it is a
+            // hidden shell world.
+            if !app.world_watched(world_idx) && !app.worlds[world_idx].is_hidden() {
                 if app.worlds[world_idx].unseen_lines == 0 {
                     app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
                 }
@@ -26054,7 +26443,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                                    flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                                 });
                             }
                         }
@@ -26585,7 +26974,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
+                            flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                         });
                     }
                 }

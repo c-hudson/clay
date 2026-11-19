@@ -17,7 +17,7 @@ use gpui_component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::select::{Select, SelectState};
 
 use super::MainEvent;
-use crate::actions::{Action, MatchPattern, MatchType};
+use crate::actions::{Action, ActionsQuery, MatchPattern, MatchType};
 use crate::native_gui::ui::ClayView;
 use crate::native_gui::ui::dialogs::{self, DialogEvent, Host};
 use crate::native_gui::ui::kit::{self, Btn, Kit, ListDown, ListEnter, ListEscape, ListPageDown, ListPageUp, ListUp};
@@ -25,14 +25,14 @@ use crate::websocket::WsMessage;
 
 type Choice = Entity<SelectState<Vec<&'static str>>>;
 
-/// The actions the list shows, in its order: by name, narrowed by the window's world
-/// (`/actions <world>`) and the filter box (name, world or any pattern).
-pub fn shown(actions: &[Action], world: &str, filter: &str) -> Vec<usize> {
-    let (world, filter) = (world.to_lowercase(), filter.to_lowercase());
+/// The actions the list shows, in its order: by name, narrowed to the window's query
+/// (`/actions [-w<world>] [<name>]`) and the filter box (name, world or any pattern).
+pub fn shown(actions: &[Action], query: &ActionsQuery, filter: &str) -> Vec<usize> {
+    let filter = filter.to_lowercase();
     let mut out: Vec<usize> = (0..actions.len())
         .filter(|&i| {
             let a = &actions[i];
-            if !world.is_empty() && !a.world.to_lowercase().contains(&world) {
+            if !query.matches(a) {
                 return false;
             }
             filter.is_empty()
@@ -88,8 +88,11 @@ struct Editor {
 pub struct ActionsView {
     main: WeakEntity<ClayView>,
     filter: Entity<InputState>,
-    /// `/actions <world>`: only that world's actions.
-    world: String,
+    /// `/actions [-w<world>] [<name>]`: only the actions it asked for.
+    query: ActionsQuery,
+    /// The editor was opened by name (`/actions <name>`), so closing it closes the window:
+    /// there is no list the user came from.
+    direct: bool,
     selected: Option<usize>,
     editor: Option<Editor>,
     stack: dialogs::Stack,
@@ -107,7 +110,7 @@ fn chosen(c: &Choice, cx: &App) -> &'static str {
 }
 
 impl ActionsView {
-    pub fn new(main: WeakEntity<ClayView>, world: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(main: WeakEntity<ClayView>, query: ActionsQuery, edit: Option<usize>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter actions..."));
         let mut subs = vec![cx.subscribe_in(&filter, window, |this, _, ev: &InputEvent, _w, cx| {
             if let InputEvent::Change = ev {
@@ -130,19 +133,33 @@ impl ActionsView {
                 cx.notify();
             }));
         }
-        let mut v = Self { main, filter, world: world.unwrap_or_default(), selected: None, editor: None, stack: Default::default(), _subs: subs };
+        let mut v = Self { main, filter, query, direct: false, selected: None, editor: None, stack: Default::default(), _subs: subs };
         v.selected = v.list(cx).first().copied();
+        if let Some(index) = edit {
+            v.edit_direct(index, window, cx);
+        }
         v
     }
 
-    /// `/actions <world>` again while the window is open.
-    pub fn set_world(&mut self, world: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        self.world = world.unwrap_or_default();
+    /// `/actions` again while the window is open.
+    pub fn set_query(&mut self, query: ActionsQuery, edit: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.query = query;
+        self.direct = false;
         self.filter.update(cx, |f, cx| f.set_value("", window, cx));
         self.editor = None;
         self.selected = self.list(cx).first().copied();
         self.filter.update(cx, |f, cx| f.focus(window, cx));
+        if let Some(index) = edit {
+            self.edit_direct(index, window, cx);
+        }
         cx.notify();
+    }
+
+    /// `/actions <name>` matched one action: its editor, with no list behind it.
+    fn edit_direct(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = Some(index);
+        self.edit(Some(index), window, cx);
+        self.direct = true;
     }
 
     fn actions(&self, cx: &App) -> Vec<Action> {
@@ -150,7 +167,7 @@ impl ActionsView {
     }
 
     fn list(&self, cx: &App) -> Vec<usize> {
-        shown(&self.actions(cx), &self.world, &self.filter.read(cx).value())
+        shown(&self.actions(cx), &self.query, &self.filter.read(cx).value())
     }
 
     fn step(&mut self, by: isize, cx: &mut Context<Self>) {
@@ -202,6 +219,10 @@ impl ActionsView {
 
     fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor = None;
+        if std::mem::take(&mut self.direct) {
+            cx.emit(DialogEvent::Close);
+            return;
+        }
         self.filter.update(cx, |f, cx| f.focus(window, cx));
         cx.notify();
     }
@@ -333,6 +354,7 @@ impl ActionsView {
         };
         let has_sel = self.selected.is_some_and(|s| s < actions.len());
         let sel = self.selected;
+        let label = self.query.label();
         div()
             .key_context(kit::LIST_CONTEXT)
             .size_full()
@@ -356,7 +378,7 @@ impl ActionsView {
                     .flex_col()
                     .gap(px(4.0))
                     .child(k.input(&self.filter).font_family(mono.clone()))
-                    .when(!self.world.is_empty(), |d| d.child(div().text_color(t.accent).text_size(px(12.0)).child(format!("World: {}", self.world)))),
+                    .when(!label.is_empty(), |d| d.child(div().text_color(t.accent).text_size(px(12.0)).child(label))),
             )
             .child(
                 k.card_frame()
@@ -572,9 +594,13 @@ mod tests {
     #[test]
     fn the_list_is_sorted_and_filtered_as_the_web_lists_it() {
         let a = vec![action("zap", "", &["^z"]), action("Alpha", "Mud", &[]), action("heal", "other", &["hp low", "dying"])];
-        assert_eq!(shown(&a, "", ""), vec![1, 2, 0]);
-        assert_eq!(shown(&a, "mud", ""), vec![1], "the window's world");
-        assert_eq!(shown(&a, "", "dyi"), vec![2], "any pattern");
+        let all = ActionsQuery::default();
+        let query = |args: &[&str]| ActionsQuery::parse(args).unwrap();
+        assert_eq!(shown(&a, &all, ""), vec![1, 2, 0]);
+        assert_eq!(shown(&a, &query(&["-w", "mud"]), ""), vec![1], "the window's world");
+        assert_eq!(shown(&a, &query(&["*a*"]), ""), vec![1, 2, 0], "the window's name");
+        assert_eq!(shown(&a, &query(&["-woth", "*a*"]), ""), vec![2], "both");
+        assert_eq!(shown(&a, &all, "dyi"), vec![2], "any pattern");
         assert_eq!(pattern_column(&a[1]), "(manual)");
         assert_eq!(pattern_column(&a[2]), "hp low +1 more");
     }

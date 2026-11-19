@@ -146,7 +146,7 @@ impl ClayView {
                     cx,
                 );
             }
-            "actions" => self.open_actions(None, cx),
+            "actions" => self.open_actions(Default::default(), None, cx),
             "world-selector" => self.open_worlds(super::windows::worlds::Show::Selector, cx),
             // This window's world (`/worlds -e`).
             "edit-world" => {
@@ -185,14 +185,15 @@ impl ClayView {
         }
     }
 
-    /// The Actions window, narrowed to a world for `/actions <world>`.
-    pub(super) fn open_actions(&mut self, world: Option<String>, cx: &mut Context<Self>) {
+    /// The Actions window, showing the actions `/actions [-w<world>] [<name>]` asked for,
+    /// or with `edit` the editor for the one action its name matched.
+    pub(super) fn open_actions(&mut self, query: crate::actions::ActionsQuery, edit: Option<usize>, cx: &mut Context<Self>) {
         use super::windows::{Kind as Win, actions::ActionsView};
-        let again = world.clone();
+        let again = query.clone();
         self.open_window(
             Win::Actions,
-            move |main, window, cx| cx.new(|cx| ActionsView::new(main, world, window, cx)),
-            move |view, window, cx| view.update(cx, |v, cx| v.set_world(again, window, cx)),
+            move |main, window, cx| cx.new(|cx| ActionsView::new(main, query, edit, window, cx)),
+            move |view, window, cx| view.update(cx, |v, cx| v.set_query(again, edit, window, cx)),
             cx,
         );
     }
@@ -231,7 +232,11 @@ impl ClayView {
                 let name = name.join(" ");
                 match find(self, &name) {
                     Some(i) => self.open_worlds(Show::Edit(i), cx),
-                    None => self.send_message(WsMessage::CreateWorld { name }, cx),
+                    // A new world's name is one word (util::world_name_refusal).
+                    None => match crate::util::world_name_refusal(&name, self.session.core.worlds.iter().any(|w| w.is_activity)) {
+                        Some(refusal) => self.client_line(&refusal, cx),
+                        None => self.send_message(WsMessage::CreateWorld { name }, cx),
+                    },
                 }
             }
             name @ [..] => {

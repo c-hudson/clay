@@ -12,7 +12,7 @@ http_port=9000
 cert_file=
 key_file=
 
-# The game. world_name is shown on the page. first_command is sent to the game first thing
+# The game. world_name is shown on the page, one word (no spaces). first_command is sent to the game first thing
 # on every visitor's connection, before anything else, with %host% replaced by the
 # visitor's address; \n separates lines. encoding is utf8, latin1 or fansi; ssl=true for a
 # game that speaks TLS on this port.

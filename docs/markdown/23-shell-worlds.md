@@ -14,13 +14,30 @@ It works the same from the console, the GUI, the web page and the Android app at
 to a Clay that has shell worlds. A world you already have named `shell` that isn't a Shell
 world is left alone. (`/sh <command>` is still TinyFugue's: it runs that command.)
 
-To make one of your own, in the world editor choose **Type: Shell**. The only other field
-is **Command**:
+To make one of your own, in the world editor choose **Type: Shell**. A shell world's
+editor has only its Server section (no Login or Options), with two fields, **Command**
+and **Hide**:
 
-- Leave it blank to run your login shell (`$SHELL -l`; on Windows, the command
+- Leave Command blank to run your login shell (`$SHELL -l`; on Windows, the command
   interpreter in `%COMSPEC%`, usually `cmd.exe`).
 - Set it to run something else instead, for example `top`, `ssh server`, or
   `tmux attach`. It runs through your shell (`$SHELL -lc "<command>"`).
+
+## Hide
+
+Turn **Hide** on to keep a shell world out of the way:
+
+- **Switching:** next/previous world, Esc-w, the connected-world keys (Esc-Left/Right)
+  and a bare `/split` never land on it.
+- **Lists of connected worlds:** it is not in the tabs, the status bar's world menu,
+  `/connections` (`/l`), TinyFugue's `/listsockets`, `%nactive`, `/send -W`, or Recent
+  Worlds.
+- **Activity:** new text in it never counts. No ACT, no unseen count, no Taskbar Alert,
+  and no ACTIVITY hook.
+
+`/sh` and `/shell` still go to it. They go to the world named `shell`, or, when there is
+none, to a hidden shell world. Its name (`/world <name>`) and the World Selector still
+reach it too, and that is where you edit it to turn Hide off again.
 
 Then connect the world the way you connect any other — `/worlds <name>`, the Connect
 button, or switching to it. Disconnecting (`/dc`, the Disconnect button) ends the shell;

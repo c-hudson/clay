@@ -639,6 +639,7 @@
                                 <span class="setting-label">Name</span>
                                 <div class="setting-value">
                                     <input type="text" id="world-edit-name" class="editor-input" autocomplete="off">
+                                    <div id="world-edit-error" class="error"></div>
                                 </div>
                             </div>
                             <div class="setting-row">
@@ -657,6 +658,14 @@
                                 <span class="setting-label" id="world-edit-hostname-label">Hostname</span>
                                 <div class="setting-value">
                                     <input type="text" id="world-edit-hostname" class="editor-input" autocomplete="off">
+                                </div>
+                            </div>
+                            <!-- A shell world's Hide (WorldSettings::hidden): shown for Shell only,
+                                 and only by a server that sends it. -->
+                            <div class="setting-row type-gated" id="world-edit-hide-field" title="Leave this shell world out of world switching, the tabs and connected-world lists, and activity. /sh still goes to it.">
+                                <span class="setting-label">Hide</span>
+                                <div class="setting-value">
+                                    <div id="world-edit-hide-toggle" class="toggle"></div>
                                 </div>
                             </div>
                             <div class="setting-row type-gated" id="world-edit-port-field">

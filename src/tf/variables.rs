@@ -29,7 +29,7 @@ pub(crate) fn get_special_var(engine: &TfEngine, name: &str) -> Option<String> {
         // Status
         "nworlds" => Some(engine.world_info_cache.len().to_string()),
         "nactive" => Some(engine.world_info_cache.iter()
-            .filter(|w| w.is_connected)
+            .filter(|w| w.is_connected && !w.hidden)
             .count()
             .to_string()),
         _ => None,

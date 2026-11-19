@@ -517,16 +517,18 @@ pub(crate) fn process_output_line(line: &OutputLine, show_tags: bool, temp_conve
     if line.is_hidden(show_tags) {
         return None;
     }
+    // Under F2 a line a /substitute rewrote shows as the MUD sent it.
+    let shown = line.shown_text(show_tags);
     // Skip lines that are only ANSI codes (cursor control garbage)
-    if is_ansi_only_line(&line.text) {
+    if is_ansi_only_line(shown) {
         return None;
     }
     // For legitimate blank lines (empty or whitespace-only without background colors), render as blank
-    if is_visually_empty(&line.text) && !has_background_color(&line.text) {
+    if is_visually_empty(shown) && !has_background_color(shown) {
         return Some(String::new());
     }
     // Colorize square emoji (🟩🟨 etc.) with ANSI codes
-    let text = colorize_square_emojis(&line.text, zwj_enabled);
+    let text = colorize_square_emojis(shown, zwj_enabled);
     // Strip the MUD tag BEFORE adding any prefix. strip_mud_tag only fires on a line that
     // starts with '[', so prefixing first silently suppresses it — which is why /recall
     // output used to keep tags that the same line shows stripped when it arrives live. It
@@ -1556,7 +1558,7 @@ fn compose_pane(app: &App, pane: ConsolePane, reveal: Option<&crate::reveal::Rev
 
     // Helper to check if a line should be highlighted
     let should_highlight = |line: &OutputLine| -> bool {
-        highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns)
+        highlight_actions && line_matches_compiled_patterns(line.shown_text(show_tags), &compiled_patterns)
     };
 
     // Check if filter popup is active with a non-empty filter, OR (Job 15's /limit -a)

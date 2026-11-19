@@ -1810,8 +1810,9 @@ fn cmd_connections(engine: &TfEngine, args: &str) -> TfCommandResult {
         }
     }
 
+    // A hidden shell world isn't one of the connected worlds listed.
     let mut worlds: Vec<&super::WorldInfoCache> = engine.world_info_cache.iter()
-        .filter(|w| w.is_connected)
+        .filter(|w| w.is_connected && !w.hidden)
         .collect();
 
     if let Some(ref pattern) = name_pattern {
@@ -1843,6 +1844,7 @@ fn cmd_connections(engine: &TfEngine, args: &str) -> TfCommandResult {
     let worlds_info: Vec<crate::util::WorldListInfo> = worlds.iter().map(|w| {
         crate::util::WorldListInfo {
             name: w.name.clone(),
+            hidden: w.hidden,
             connected: w.is_connected,
             is_current: engine.current_world.as_deref() == Some(w.name.as_str()),
             is_ssl: w.use_ssl,
@@ -2812,8 +2814,10 @@ Options:
   -q          Quiet (set %? but don't display)
   -mtype      Match type: simple, glob (default), regexp
   -a<attrs>   Suppress the given attributes (comma-optional letters, /help
-              attributes - e.g. -ag shows gagged lines; every other letter is
-              accepted but Clay's history has nothing else to suppress)
+              attributes - e.g. -ag shows gagged lines; the display letters
+              take a line's own attributes off). Clay adds -ao: a line a
+              /substitute rewrote is matched and shown as the MUD sent it
+              (without it, as it is shown). -ago does both.
   -An         Show n lines of context after each match
   -Bn         Show n lines of context before each match
   -Cn         Equivalent to -An -Bn
@@ -3023,7 +3027,7 @@ Examples:
                 "/grab <text>\n\nPut <text> into the input buffer. Any text already in the input\nbuffer is discarded first (unlike /input, which inserts without\ndiscarding).\n\nExample:\n  /def reedit = /grab /edit %1 = $%1".to_string()
             )),
             "substitute" => TfCommandResult::Success(Some(
-                "/substitute [-a<attrs>] [-p] text\n\nReplace the current trigger line with different text.\nOnly works inside a trigger body.\n\nOptions:\n  -a<attrs>  Give text the named display attributes\n  -p         Interpret \"@{attr}\" sequences inline, as in /echo\n\nFunction form: $[substitute(text [,attrs [,inline]])]\n\nExample:\n  /def -t\"* says *\" colorize = /substitute [%1] %2".to_string()
+                "/substitute [-a<attrs>] [-p] text\n\nReplace the current trigger line with different text.\nOnly works inside a trigger body. The line keeps its place, and\nwhat the MUD sent is kept with it: F2 shows that instead, and\n/recall -ao searches it. (In a Clay action's command, /substitute\nis applied to the matched line the same way, $0-$9 keeping their\ncolours.)\n\nOptions:\n  -a<attrs>  Give text the named display attributes\n  -p         Interpret \"@{attr}\" sequences inline, as in /echo\n\nFunction form: $[substitute(text [,attrs [,inline]])]\n\nExample:\n  /def -t\"* says *\" colorize = /substitute [%1] %2".to_string()
             )),
             "cat" | "paste" => TfCommandResult::Success(Some(
                 "/cat and /paste are not supported in Clay.\nUse bracketed paste instead (paste normally into the input area).".to_string()
@@ -4058,7 +4062,7 @@ fn cmd_fg(engine: &TfEngine, args: &str) -> TfCommandResult {
 
     if let Some(n) = cycle {
         let names: Vec<&str> = engine.world_info_cache.iter()
-            .filter(|w| w.is_connected)
+            .filter(|w| w.is_connected && !w.hidden)
             .map(|w| w.name.as_str())
             .collect();
         if names.is_empty() {

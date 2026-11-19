@@ -212,6 +212,14 @@ against real tf 5.0b8, mostly by driving it in a pty.
   older names (`red`, `bold,underline`) still work. `/recall -a<attrs>` shows lines
   without those of their *own* attributes (a trigger's, `/echo -a`'s, `/substitute
   -a`'s) and leaves attributes inside the text alone, as TF does.
+- **`/substitute`** (Clay extra, 2026-11-18): the rewrite takes the line's place and the
+  line the MUD sent is kept with it (`OutputLine::original`): F2 draws it in the
+  rewrite's place, `/recall -ao` (Clay's letter: no TF attribute is `o`) matches and
+  shows it, the archive and the log keep both. Before, the line was gagged and the text
+  added after the whole packet, so F2 showed both and the text could land below later
+  lines. A `/substitute` not run by the line's own trigger rewrites nothing (it used to
+  wait and replace the next line). A Clay action's `/substitute <text>` is the same,
+  applied like `/gag`, its `$0`-`$9` keeping their colours.
 - **History**: `/recordline [-lig] [-w[<world>]] [-t<time>] [-a<attrs>] [-p]` records
   a line without displaying, logging or archiving it (stored hidden, like captured
   input): `-w` lines are found by `/recall -w`, `-l` by `-l`, `-g` (the default) only by

@@ -274,7 +274,8 @@ impl ClayView {
             return None;
         }
         let core = &self.session.core;
-        let connected: Vec<(usize, String)> = core.worlds.iter().enumerate().filter(|(_, w)| w.connected).map(|(i, w)| (i, w.name.clone())).collect();
+        // A hidden shell world has no tab (`World::is_hidden`).
+        let connected: Vec<(usize, String)> = core.worlds.iter().enumerate().filter(|(_, w)| w.connected && !w.is_hidden()).map(|(i, w)| (i, w.name.clone())).collect();
         if connected.is_empty() {
             return None;
         }

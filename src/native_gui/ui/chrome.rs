@@ -733,7 +733,8 @@ impl ClayView {
     /// The world-switch menu: connected worlds, and disconnected ones with unseen output.
     fn world_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let core = &self.session.core;
-        let list: Vec<(usize, &World)> = core.worlds.iter().enumerate().filter(|(_, w)| w.connected || w.unseen > 0).collect();
+        // A hidden shell world isn't listed (`World::is_hidden`).
+        let list: Vec<(usize, &World)> = core.worlds.iter().enumerate().filter(|(_, w)| (w.connected || w.unseen > 0) && !w.is_hidden()).collect();
         let hide_current = list.len() > 5;
         let mut items = Vec::new();
         for (i, w) in list {

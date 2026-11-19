@@ -563,7 +563,12 @@ pub enum WsMessage {
         /// transmitted on the live path at all, so a highlighted line arrived and rendered
         /// plain on web/Android until some resync re-hydrated it from
         /// `InitialState`/`ScrollbackLines`, both of which do carry it per line.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")] highlight_colors: Vec<Option<String>> },
+        #[serde(default, skip_serializing_if = "Vec::is_empty")] highlight_colors: Vec<Option<String>>,
+        /// Per line, parallel to `data` like `highlight_colors`: the MUD's own text of a line
+        /// a `/substitute` rewrote (`OutputLine::original`), drawn in its place under F2.
+        /// Empty (and omitted) unless a line in the batch was rewritten; an older client
+        /// ignores it and shows the rewrite under F2 too.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")] originals: Vec<Option<String>> },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
@@ -923,6 +928,10 @@ pub enum WsMessage {
         /// client, or an editor with no such switch - leaves it.
         #[serde(default)]
         status_panel: Option<bool>,
+        /// Edit World's Hide for a shell world (`WorldSettings::hidden`). None - an older
+        /// client, or an editor without the row - leaves it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hidden: Option<bool>,
     },
     /// World editor "Fetch": look up a chat world's servers/channels with the given
     /// (possibly unsaved) tokens. Empty token = use the stored one. Reply:
@@ -1421,6 +1430,9 @@ pub enum WsMessage {
         request_id: u64,
         #[serde(default)] world: Option<String>,
         regex: String,
+        /// `clay --grep -o`: match and send the MUD's own text of a line a `/substitute`
+        /// rewrote. A 1.7.38 server ignores it and matches the text as shown.
+        #[serde(default, skip_serializing_if = "is_false")] original: bool,
     },
     // (server -> client) A part of the answer to GrepArchive, oldest first within a world;
     // the last has `done`. `error`: no archive to search (the client still searches the live
@@ -1774,6 +1786,9 @@ pub struct ArchiveLine {
     pub wseq: Option<i64>,
     #[serde(default)]
     pub gagged: bool,
+    /// The MUD's own text of a line a `/substitute` rewrote, shown under F2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
 }
 
 /// One archive line that matched a `GrepArchive` (`GrepArchiveLines.lines`).
@@ -1816,6 +1831,10 @@ pub struct TimestampedLine {
     /// so an older peer simply never shows a marker rather than showing a wrong one.
     #[serde(default)]
     pub display_id: Option<u64>,
+    /// Mirrors `OutputLine::original`: the MUD's own text of a line a `/substitute`
+    /// rewrote, shown under F2 in place of `text`. Omitted when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
 }
 
 impl TimestampedLine {
@@ -1855,6 +1874,8 @@ impl TimestampedLine {
             archive_sourced: line.archive_sourced,
             viewed: line.viewed,
             display_id: line.display_id,
+            // As `text`: never for what the user typed (never rewritten anyway).
+            original: line.wire_original(),
         }
     }
 }
@@ -2086,6 +2107,11 @@ pub struct WorldSettingsMsg {
     /// server before the switch: the status display shows, and the editors have no switch.
     #[serde(default)]
     pub status_panel: Option<bool>,
+    /// Mirrors `WorldSettings::hidden` (Edit World's Hide, a shell world's; ask the
+    /// clients' `is_hidden`, which reads it with the type). `None` from a server before it:
+    /// not hidden, and the editors have no Hide row.
+    #[serde(default)]
+    pub hidden: Option<bool>,
     /// Mirrors `WorldSettings::world_type` (`WorldType::name()`) so the web/GUI
     /// editor can show/select MUD, MUD - Timed Prompt, Slack, or Discord - closing
     /// the pre-existing three-interface-rule gap where world type was console-only.

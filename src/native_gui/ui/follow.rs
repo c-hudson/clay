@@ -334,7 +334,7 @@ mod tests {
             end_seq: None,
             flush: false,
             gagged: false,
-            highlight_colors: Vec::new(),
+            highlight_colors: Vec::new(), originals: Vec::new(),
         }
     }
 

@@ -1135,9 +1135,17 @@ impl ClayView {
                 let args: Vec<&str> = command.split_whitespace().skip(1).collect();
                 self.worlds_command(&args, cx);
             }
+            // `/actions [-w<world>] [<name>]`: every interface's rule (actions::ActionsQuery).
             "/actions" => {
-                let world = command.split_whitespace().nth(1).map(str::to_string);
-                self.open_actions(world, cx);
+                let args: Vec<&str> = command.split_whitespace().skip(1).collect();
+                match crate::actions::ActionsQuery::parse(&args) {
+                    Err(usage) => self.client_line(&usage, cx),
+                    Ok(query) => match query.resolve(&self.session.core.actions) {
+                        crate::actions::ActionsOpen::Nothing(line) => self.client_line(&line, cx),
+                        crate::actions::ActionsOpen::Edit(index) => self.open_actions(query, Some(index), cx),
+                        crate::actions::ActionsOpen::List => self.open_actions(query, None, cx),
+                    },
+                }
             }
             "/connections" | "/l" => {
                 let fx = self.session.send(crate::websocket::WsMessage::RequestConnectionsList);

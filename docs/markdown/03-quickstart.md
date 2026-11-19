@@ -20,7 +20,7 @@ The splash screen shows the Clay logo with the tagline "A 90s MUD client written
 
 ![World Editor](images/tui/world-editor.png)
 
-   - **World name**: A friendly name (e.g., "MyMUD")
+   - **World name**: A friendly name, one word with no spaces (e.g., "MyMUD")
    - **Hostname**: The server address (e.g., "mud.example.com")
    - **Port**: The server port (e.g., 4000)
    - **Use SSL**: Enable if the server supports TLS

@@ -170,6 +170,9 @@ pub struct Line {
     /// the archive, which is where the next request continues. Such a line has no seq
     /// and is `from_archive`, so every seq rule, the cache, ▶ and New Only pass it by.
     pub archive: Option<ArchiveCursor>,
+    /// The MUD's own text when an action's or TF's `/substitute` rewrote `text`
+    /// (`OutputLine::original`): drawn in its place under F2 (`shown`).
+    pub original: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -246,6 +249,14 @@ const TRIM_SLACK: usize = MAX_LINES / 8;
 type HistoryPos = (Option<u64>, Option<ArchiveCursor>);
 
 impl World {
+    /// A shell world with Hide on: main.rs `World::is_hidden`'s copy, read from the
+    /// server's settings (an older server sends no `hidden`: not hidden). Left out of the
+    /// tabs, the world menu, Recent Worlds, connected cycling, `/split`'s pick and the
+    /// Taskbar Alert.
+    pub fn is_hidden(&self) -> bool {
+        self.settings.as_ref().is_some_and(|s| s.world_type == "shell" && s.hidden == Some(true))
+    }
+
     /// Where the next older lines come from: the oldest archive line once the buffer
     /// starts with some, else the oldest live line (with its time, for a server that has
     /// lost it).
@@ -558,6 +569,7 @@ impl ClientCore {
                         from_server: l.from_server,
                         gagged: l.gagged,
                         highlight: l.highlight.clone(),
+                        original: l.original.clone(),
                     })
                     .collect();
                 CachedWorld { name: w.name.clone(), epoch: w.epoch, lines, seen: w.seen.ranges().to_vec() }
@@ -579,6 +591,7 @@ impl ClientCore {
                 l.from_server = cl.from_server;
                 l.gagged = cl.gagged;
                 l.highlight = cl.highlight.clone();
+                l.original = cl.original.clone();
                 // Shown before, and what's new is the server's to say (ClaimedNew): taken as
                 // unviewed, every cached line was guessed ▶ when its world was shown (app.js
                 // caches its lines whole, `viewed` and all, so its guesses stay right).
@@ -971,7 +984,8 @@ impl ClientCore {
     /// `cycleConnectedWorldLocal`); negative goes back.
     pub fn cycle_connected(&mut self, n: isize, now: Instant) -> Vec<Effect> {
         let skip = self.skip();
-        let connected: Vec<usize> = (0..self.worlds.len()).filter(|&i| self.worlds[i].connected && !skip.contains(&i)).collect();
+        // A hidden shell world isn't one of the connected worlds cycled through.
+        let connected: Vec<usize> = (0..self.worlds.len()).filter(|&i| self.worlds[i].connected && !self.worlds[i].is_hidden() && !skip.contains(&i)).collect();
         if !connected.is_empty() {
             let pos = connected.iter().position(|&i| i == self.current);
             let len = connected.len() as isize;
@@ -1340,8 +1354,8 @@ impl ClientCore {
                 self.settings_rev = self.settings_rev.wrapping_add(1);
                 self.changed();
             }
-            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, end_seq, flush, gagged, archive_sourced, highlight_colors } => {
-                let d = Data { world_index, data, is_viewed, ts, from_server, seq, end_seq, flush, gagged, archive_sourced, highlight_colors };
+            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, end_seq, flush, gagged, archive_sourced, highlight_colors, originals } => {
+                let d = Data { world_index, data, is_viewed, ts, from_server, seq, end_seq, flush, gagged, archive_sourced, highlight_colors, originals };
                 self.on_server_data(d);
             }
             WsMessage::ScrollbackLines { world_index, lines, backfill_complete, clamped_by_pending, request_id } => {
@@ -1727,6 +1741,7 @@ impl ClientCore {
             from_archive: false,
             scrollback: false,
             archive: None,
+            original: None,
         }
     }
 
@@ -1734,6 +1749,7 @@ impl ClientCore {
     fn line_from_archive(&mut self, a: &ArchiveLine) -> Line {
         let mut l = self.new_line(&a.text, (a.ts_ms.max(0) / 1000) as u64, None);
         l.gagged = a.gagged;
+        l.original = a.original.as_deref().map(|o| super::decor::truncate(o).into_owned());
         l.viewed = true;
         l.from_archive = true;
         l.scrollback = true;
@@ -1746,6 +1762,7 @@ impl ClientCore {
         l.from_server = t.from_server;
         l.gagged = t.gagged || crate::telnet::has_keep_alive_marker(&t.text);
         l.highlight = t.highlight_color.clone();
+        l.original = t.original.as_deref().map(|o| super::decor::truncate(o).into_owned());
         l.viewed = t.viewed;
         l.display_id = t.display_id;
         l.archive_sourced = t.archive_sourced;
@@ -1798,7 +1815,7 @@ impl ClientCore {
             .worlds
             .iter()
             .enumerate()
-            .filter(|(i, w)| *i != self.current && !w.is_activity)
+            .filter(|(i, w)| *i != self.current && !w.is_activity && !w.is_hidden())
             .filter_map(|(i, w)| w.last_activity.map(|at| (i, now.saturating_duration_since(at))))
             .collect();
         list.sort_by_key(|&(_, ago)| ago);
@@ -1953,9 +1970,10 @@ impl ClientCore {
             }
         }
         let mut data = d.data;
-        if d.from_server && !gap_fill && !self.worlds[d.world_index].is_activity {
+        if d.from_server && !gap_fill && !self.worlds[d.world_index].is_activity && !self.worlds[d.world_index].is_hidden() {
             // Output from the MUD now, not a refill of history. (The Activity world's lines
-            // are copies: their own worlds already counted them.)
+            // are copies: their own worlds already counted them. A hidden shell world
+            // raises no activity at all.)
             self.worlds[d.world_index].last_activity = Some(Instant::now());
             self.live_text |= !d.gagged && !data.is_empty();
         }
@@ -1987,6 +2005,7 @@ impl ClientCore {
             // The keepalive's reply is a gagged line, F2 or not, as on the console.
             line.gagged = d.gagged || crate::telnet::has_keep_alive_marker(text);
             line.highlight = d.highlight_colors.get(k).cloned().flatten();
+            line.original = d.originals.get(k).cloned().flatten().map(|o| super::decor::truncate(&o).into_owned());
             line.viewed = d.is_viewed;
             line.archive_sourced = d.archive_sourced;
             fresh.push(line);
@@ -2400,6 +2419,7 @@ struct Data {
     gagged: bool,
     archive_sourced: bool,
     highlight_colors: Vec<Option<String>>,
+    originals: Vec<Option<String>>,
 }
 
 /// Split on any line ending (`\r\n`, `\n`, `\r`), as `data.split(/\r\n|\n|\r/)`.
@@ -2529,7 +2549,16 @@ impl Line {
     /// typed comes as one, the server keeping the text for `/recall` alone (the console's
     /// `OutputLine::is_hidden`).
     pub fn is_hidden(&self, show_tags: bool) -> bool {
-        (self.gagged && (!show_tags || self.text.is_empty())) || hidden_line(&self.text)
+        (self.gagged && (!show_tags || self.text.is_empty())) || hidden_line(self.shown(show_tags))
+    }
+
+    /// The text drawn for the line: the MUD's own under F2 when a `/substitute` rewrote
+    /// it, else `text` (`OutputLine::shown_text`).
+    pub fn shown(&self, show_tags: bool) -> &str {
+        match &self.original {
+            Some(original) if show_tags => original,
+            _ => &self.text,
+        }
     }
 }
 

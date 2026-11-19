@@ -231,10 +231,13 @@ type on the other device. The same panel is the **Remote Access** button in `/we
 See the **Web Interface** chapter, "Reaching Clay from outside your network".
 
 ### /actions
-Open the Actions editor to create triggers.
+Open the Actions editor to create triggers, or one action's editor by its name.
 
 ```
-/actions
+/actions                 Every action
+/actions -w <world>      Only that world's actions (also -w<world>)
+/actions <name>          Edit the action with that name
+/actions zmc_*           * and ? are wildcards: one match is edited, several are listed
 ```
 
 See the **Actions** chapter for details.

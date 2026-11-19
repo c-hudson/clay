@@ -99,7 +99,9 @@ impl crate::App {
         let is_current = idx == self.current_world_index || self.ws_client_viewing(idx);
         let Some(screen) = self.worlds[idx].shell_screen.as_mut() else { return };
         let applied = screen.apply(snapshot);
-        if applied.gained_printable && !is_current {
+        // A hidden shell world (`World::is_hidden`) raises no activity: no unseen count,
+        // no ACT, no ACTIVITY hook. Its screen still updates.
+        if applied.gained_printable && !is_current && !self.worlds[idx].is_hidden() {
             let unseen_before = self.worlds[idx].unseen_lines;
             if unseen_before == 0 && self.worlds[idx].first_unseen_at.is_none() {
                 self.worlds[idx].first_unseen_at = Some(Instant::now());

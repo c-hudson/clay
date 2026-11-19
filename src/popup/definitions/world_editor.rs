@@ -61,6 +61,9 @@ pub const WORLD_FIELD_CHAT_STATUS: FieldId = FieldId(47);
 /// MUD worlds: the Login Command, three lines run after Clay's auto-login.
 pub const WORLD_FIELD_LOGIN_COMMAND: FieldId = FieldId(48);
 pub const WORLD_FIELD_FIRST_COMMAND: FieldId = FieldId(49);
+/// Hide: a shell world's (`WorldSettings::hidden`) - out of cycling, the connected-world
+/// lists and activity; shown for a Shell world only.
+pub const WORLD_FIELD_HIDE: FieldId = FieldId(50);
 
 // Button IDs
 pub const WORLD_BTN_SAVE: ButtonId = ButtonId(1);
@@ -190,6 +193,8 @@ pub struct WorldSettings {
     pub mccp2_enabled: bool,
     /// The world's Status Panel switch, "Status Line" here.
     pub status_panel: bool,
+    /// A shell world's Hide (`WorldSettings::hidden`).
+    pub hidden: bool,
     /// Only meaningful for `world_type == "mud_timed_prompt"` - see the matching
     /// `WorldSettings::prompt_wait_ms` (main.rs) doc comment.
     pub prompt_wait_ms: u64,
@@ -261,6 +266,12 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             WORLD_FIELD_HOSTNAME,
             "Hostname",
             FieldKind::text(&settings.hostname),
+        ))
+        // A shell world's only other setting (update_field_visibility shows it there).
+        .with_field(Field::new(
+            WORLD_FIELD_HIDE,
+            "Hide",
+            FieldKind::toggle(settings.hidden),
         ))
         .with_field(Field::new(
             WORLD_FIELD_PORT,
@@ -493,6 +504,10 @@ fn world_editor_help_text() -> Vec<String> {
         "gets this shell as you - do not expose Clay to untrusted networks with a shell",
         "world. Not allowed in multiuser mode.",
         "",
+        "Hide (a Shell world's): leaves the world out of the switch-world keys, the",
+        "tabs, the world menu, /connections and Recent Worlds, and its text is never",
+        "activity. /sh, its name and the World Selector still reach it.",
+        "",
         "--- Slack / Discord ---",
         "",
         "A Discord world is one server; a Slack world is one",
@@ -649,12 +664,15 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
     }
 
     // A shell world (src/shell) shows only the Hostname row, relabelled "Command" (blank
-    // runs the login shell). Every other MUD field stays hidden.
+    // runs the login shell), and its Hide. Every other MUD field stays hidden.
     if let Some(field) = def.get_field_mut(WORLD_FIELD_HOSTNAME) {
         field.label = if world_type.is_shell() { "Command".to_string() } else { "Hostname".to_string() };
         if world_type.is_shell() {
             field.visible = true;
         }
+    }
+    if let Some(field) = def.get_field_mut(WORLD_FIELD_HIDE) {
+        field.visible = world_type.is_shell();
     }
 
     // Keep-alive command and gag only visible for MUD with custom keep-alive

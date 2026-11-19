@@ -213,6 +213,7 @@ mod tests {
             from_archive: false,
             scrollback: false,
             archive: None,
+            original: None,
         }
     }
 

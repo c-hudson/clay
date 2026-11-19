@@ -45,16 +45,9 @@ pub fn shown(worlds: &[World], filter: &str, only_connected: bool) -> Vec<usize>
         .collect()
 }
 
-/// "New World", then "New World 2", 3... (app.js `addNewWorld`).
+/// `NewWorld`, then `NewWorld2`, 3... (`util::new_world_name`, every interface's Add).
 pub fn new_world_name(worlds: &[World]) -> String {
-    let taken = |n: &str| worlds.iter().any(|w| w.name.eq_ignore_ascii_case(n));
-    let mut name = "New World".to_string();
-    let mut k = 1;
-    while taken(&name) {
-        k += 1;
-        name = format!("New World {k}");
-    }
-    name
+    crate::util::new_world_name(&worlds.iter().map(|w| w.name.as_str()).collect::<Vec<_>>())
 }
 
 /// A Fetch result's list (servers or channels): pick one to fill its text box.
@@ -102,6 +95,11 @@ struct Editor {
     /// The Login Command card's three lines (`WorldSettings::login_command`).
     login_command: Entity<TextareaState>,
     chat: ChatPicker,
+    /// Why Save refused the name (`util::world_name_refusal`: one word), under the Name.
+    error: Option<String>,
+    /// A shell world's Hide (`WorldSettingsMsg::hidden`); None from a server before it,
+    /// which shows no Hide row.
+    hidden: Option<bool>,
 }
 
 impl Editor {
@@ -270,6 +268,8 @@ impl WorldsView {
                 cx.new(|cx| TextareaState::new(window, cx).rows(3).default_value(c).placeholder("say hello;say goodbye\nlook"))
             },
             chat: ChatPicker::default(),
+            error: None,
+            hidden: s.hidden,
             fields,
         };
         // The ##rand## warning follows the command as it is typed.
@@ -281,10 +281,13 @@ impl WorldsView {
             })
             .detach();
         }
-        // A new type starts the Fetch picker over.
+        // A new type starts the Fetch picker over; a shell world has only its Server section.
         cx.subscribe(&editor.world_type.state, |this, _, _: &SelectEvent<Vec<SharedString>>, cx| {
             if let Some(ed) = &mut this.editor {
                 ed.chat = ChatPicker { seq: ed.chat.seq + 1, ..Default::default() };
+                if ed.world_type.value(cx) == "shell" {
+                    ed.section = Section::Server;
+                }
             }
             cx.notify();
         })
@@ -313,12 +316,24 @@ impl WorldsView {
             return;
         }
         let t = |n: &str| ed.text(n, cx);
+        // A world's name is one word (util::world_name_refusal); its own name always saves.
+        let name = t("name").trim().to_string();
+        let worlds = self.worlds(cx);
+        if worlds.get(ed.index).is_none_or(|w| w.name != name) {
+            if let Some(refusal) = crate::util::world_name_refusal(&name, worlds.iter().any(|w| w.is_activity)) {
+                if let Some(ed) = &mut self.editor {
+                    ed.error = Some(refusal);
+                }
+                cx.notify();
+                return;
+            }
+        }
         let world_type = ed.world_type.value(cx);
         let prompt_wait_ms = t("prompt_wait_ms").trim().parse::<f64>().ok().filter(|n| n.is_finite()).map_or(1000, |n| n.max(0.0).trunc() as u64);
         let tf_type = t("tf_type").trim().to_string();
         let msg = WsMessage::UpdateWorldSettings {
             world_index: ed.index,
-            name: t("name"),
+            name,
             hostname: t("hostname"),
             port: t("port"),
             user: t("user"),
@@ -349,6 +364,7 @@ impl WorldsView {
             login_command: Some(ed.login_command.read(cx).value().to_string()),
             first_command: Some(t("first_command")),
             status_panel: ed.status_panel,
+            hidden: ed.hidden,
             chat: Some(ChatSettingsUpdate {
                 discord_guild: t("discord_guild").trim().to_string(),
                 discord_channel: t("discord_channel").trim().to_string(),
@@ -690,10 +706,29 @@ impl WorldsView {
         let select = |p: &Pick| Select::new(&p.state).w_full().into_any_element();
         let chat_list = |l: &Option<ChatList>| l.as_ref().map(|l| div().mt(px(4.0)).child(Select::new(&l.state).w_full().placeholder("(choose from list...)")));
         let with_pick = |name: &str, l: &Option<ChatList>| div().flex().flex_col().child(input(name)).children(chat_list(l)).into_any_element();
-        let mut server = div().flex().flex_col().gap(px(6.0)).child(row("Name", input("name"))).child(row("Type", select(&ed.world_type)));
+        let mut server = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(row("Name", input("name")))
+            .when_some(ed.error.clone(), |d, e| d.child(row("", k.error(Some(&e)).into_any_element())))
+            .child(row("Type", select(&ed.world_type)));
         if is_shell {
             // The Host field carries the command; blank runs the login shell.
             server = server.child(row("Command", input("hostname")));
+            // Hide: out of cycling, the connected-world lists and activity (/sh reaches it).
+            if let Some(hidden) = ed.hidden {
+                server = server.child(row(
+                    "Hide",
+                    k.toggle("world-hide", hidden, cx.listener(|this, _, _w, cx| {
+                        if let Some(ed) = &mut this.editor {
+                            ed.hidden = ed.hidden.map(|h| !h);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                ));
+            }
         }
         if is_mud {
             server = server.child(row("Hostname", input("hostname"))).child(row("Port", input("port"))).child(row(
@@ -834,7 +869,15 @@ impl WorldsView {
             );
         }
         let section_title = |s: &'static str| div().text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(t.accent).pt(px(6.0)).pb(px(2.0)).child(s.to_uppercase());
-        let body: gpui::AnyElement = if wide {
+        // A shell world has nothing in Login or Options: its Server section alone, and no
+        // Login or Options tile beside it.
+        let body: gpui::AnyElement = if is_shell {
+            if wide {
+                div().flex().child(div().flex_1().min_w_0().flex().flex_col().gap(px(6.0)).child(section_title("Server")).child(server)).into_any_element()
+            } else {
+                server.into_any_element()
+            }
+        } else if wide {
             div()
                 .flex()
                 .gap(px(28.0))
@@ -859,10 +902,12 @@ impl WorldsView {
                     cx.notify();
                 }))
             };
-            k.sidebar()
-                .child(item(Section::Server, "we-server", "Server", cx))
-                .child(item(Section::Login, "we-login", login_label, cx))
-                .child(item(Section::Options, "we-options", "Options", cx))
+            let bar = k.sidebar().child(item(Section::Server, "we-server", "Server", cx));
+            if is_shell {
+                bar
+            } else {
+                bar.child(item(Section::Login, "we-login", login_label, cx)).child(item(Section::Options, "we-options", "Options", cx))
+            }
         });
         let index = ed.index;
         div()

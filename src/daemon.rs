@@ -323,7 +323,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
+                                flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                             });
                         } else {
                             let mut sent_to_server = false;
@@ -530,7 +530,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false, highlight_colors: Vec::new(),
+                        flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                     });
                 }
                 Command::Notify { message } => {
@@ -628,7 +628,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false, highlight_colors: Vec::new(),
+                        flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                     });
                 }
                 Command::Reach { refresh, lookup } => app.ws_reach(client_id, world_index, refresh, lookup, event_tx),
@@ -667,7 +667,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
+                                flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                             });
 
                             // In the background: awaiting the connect here froze this whole loop (and
@@ -681,7 +681,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
+                                flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                             });
                         }
                     } else if world_index < app.worlds.len() {
@@ -760,7 +760,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false, highlight_colors: Vec::new(),
+                        flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                     });
                     return;
                 }
@@ -773,7 +773,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                    flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                 });
 
                 // Attempt connection
@@ -825,7 +825,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false, highlight_colors: Vec::new(),
+                    flush: false, gagged: false, highlight_colors: Vec::new(), originals: Vec::new(),
                 });
                 if !app.worlds[world_index].connected {
                     // In the background: awaiting the connect here froze this whole loop (and
@@ -1097,6 +1097,7 @@ pub(crate) async fn handle_daemon_ws_message_impl(
                 };
                 util::WorldListInfo {
                     name: world.name.clone(),
+                    hidden: world.is_hidden(),
                     connected: world.connected,
                     is_current: idx == current_idx,
                     is_ssl: world.is_tls,
@@ -1242,8 +1243,8 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::RequestHistory { world_index, count, request_id, before_seq, before_ts, archive_before } => {
             app.handle_request_history(client_id, world_index, count, request_id, before_seq, before_ts, archive_before);
         }
-        WsMessage::GrepArchive { request_id, world, regex } => {
-            app.handle_grep_archive(client_id, request_id, world, regex);
+        WsMessage::GrepArchive { request_id, world, regex, original } => {
+            app.handle_grep_archive(client_id, request_id, world, regex, original);
         }
         WsMessage::RequestWorldState { world_index } => {
             app.handle_request_world_state(client_id, world_index);
@@ -1257,15 +1258,18 @@ pub(crate) async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command } => {
-            app.update_world_settings(
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user, chat, keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command, hidden } => {
+            // A refused rename (not one word, or Activity) keeps the old name: say why.
+            if let Some(refusal) = app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 msp_enabled, mcp_enabled, mccp2_enabled,
                 world_type, prompt_wait_ms, tf_type, slack_token, slack_channel, slack_workspace,
                 discord_token, discord_guild, discord_channel, discord_dm_user, chat,
-                keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command,
-            );
+                keep_alive_gag_enabled, keep_alive_gag, status_panel, login_command, first_command, hidden,
+            ) {
+                app.ws_tell(client_id, world_index, &format!("World name not changed: {refusal}"));
+            }
         }
         WsMessage::CalculateNextWorld { current_index, exclude } => {
             let next_idx = app.calculate_next_world_from(current_index, &exclude);

@@ -37,6 +37,7 @@ fn tl(seq: u64, text: &str) -> TimestampedLine {
         archive_sourced: false,
         viewed: true,
         display_id: None,
+        original: None,
     }
 }
 
@@ -53,7 +54,7 @@ fn data(world: usize, seq: u64, text: &str) -> WsMessage {
         flush: false,
         gagged: false,
         archive_sourced: false,
-        highlight_colors: Vec::new(),
+        highlight_colors: Vec::new(), originals: Vec::new(),
     }
 }
 
@@ -333,6 +334,29 @@ fn what_the_user_typed_is_hidden_under_f2_too() {
     assert_eq!(without, vec!["line 0"]);
 }
 
+#[test]
+fn a_rewritten_lines_original_is_kept_and_drawn_under_f2() {
+    // `ServerData.originals` is parallel to its lines, as `highlight_colors` is; a line a
+    // /substitute rewrote shows its original under F2 (`Line::shown`), the rest themselves.
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    let mut m = data(0, 1, "plain\nZtheman says 'hi'\n");
+    if let WsMessage::ServerData { originals, .. } = &mut m {
+        *originals = vec![None, Some("AlwaysGreat Ztheman says 'hi'".into())];
+    }
+    h.msg(m);
+    let lines = &h.core.worlds[0].lines;
+    let shown = |f2: bool| lines.iter().map(|l| l.shown(f2).to_string()).collect::<Vec<_>>();
+    assert_eq!(shown(false), vec!["line 0", "plain", "Ztheman says 'hi'"]);
+    assert_eq!(shown(true), vec!["line 0", "plain", "AlwaysGreat Ztheman says 'hi'"]);
+    // And from a line list (InitialState, scrollback), and through the disk cache.
+    let mut w = world_msg(1, "B", 0..1, 9);
+    w.output_lines_ts[0].original = Some("The Doctor says 'x'".into());
+    let line = h.core.line_from_ts(&w.output_lines_ts[0]);
+    assert_eq!(line.shown(true), "The Doctor says 'x'");
+    assert_eq!(line.shown(false), "line 0");
+}
+
 /// A sent line takes the world's prompt only when it answers it (user report 2026-11-13:
 /// after `/url` the prompt was gone, Ctrl+L or not - the server sends no new prompt for a
 /// command that stays there). Text for the MUD still clears it, and a chat world's prompt,
@@ -414,7 +438,7 @@ fn an_empty_flush_empties_the_activity_world_and_adds_nothing() {
         flush: true,
         gagged: false,
         archive_sourced: false,
-        highlight_colors: Vec::new(),
+        highlight_colors: Vec::new(), originals: Vec::new(),
     });
     assert!(h.texts(1).is_empty(), "{:?}", h.texts(1));
     // Its lines are copies: no Recent Worlds entry, no Taskbar Alert from them.
@@ -1086,7 +1110,7 @@ fn cached(name: &str, epoch: u64, seqs: std::ops::Range<u64>) -> crate::native_g
     use crate::native_gui::core::cache::{CachedLine, CachedWorld};
     let lines: Vec<CachedLine> = seqs
         .clone()
-        .map(|s| CachedLine { text: format!("cached {s}"), ts: 1_000, seq: Some(s), from_server: true, gagged: false, highlight: None })
+        .map(|s| CachedLine { text: format!("cached {s}"), ts: 1_000, seq: Some(s), from_server: true, gagged: false, highlight: None, original: None })
         .collect();
     CachedWorld { name: name.into(), epoch, lines, seen: vec![(seqs.start, seqs.end - 1)] }
 }
@@ -1444,7 +1468,7 @@ fn a_line_without_a_seq_is_never_guessed() {
         end_seq: None,
         flush: false,
         gagged: false,
-        highlight_colors: Vec::new(),
+        highlight_colors: Vec::new(), originals: Vec::new(),
     });
     let _ = h.core.switch_world(1, h.now);
     let me = h.core.display_id;
@@ -1738,7 +1762,7 @@ fn a_disconnect_ends_the_echo_mask() {
 // ---- On-demand history (RequestHistory / HistoryLines) ----
 
 fn archive_line(i: i64) -> crate::websocket::ArchiveLine {
-    crate::websocket::ArchiveLine { text: format!("old {i}"), ts_ms: 500_000 + i, wseq: Some(40 + i), gagged: false }
+    crate::websocket::ArchiveLine { text: format!("old {i}"), ts_ms: 500_000 + i, wseq: Some(40 + i), gagged: false, original: None }
 }
 
 /// The RequestHistory sent since the last look, if any.
@@ -2014,7 +2038,7 @@ fn archive_lines_go_first_and_only_when_unpinned() {
         other => panic!("a history request, not {other:?}"),
     };
     let archive = (0..3)
-        .map(|k| crate::websocket::ArchiveLine { text: format!("old {k}"), ts_ms: 1000 + k, wseq: Some(k), gagged: false })
+        .map(|k| crate::websocket::ArchiveLine { text: format!("old {k}"), ts_ms: 1000 + k, wseq: Some(k), gagged: false, original: None })
         .collect();
     h.msg(WsMessage::HistoryLines { world_index: 0, request_id: id, before_seq: Some(0), archive_before: None, lines: Vec::new(), archive, done: false });
     assert_eq!(h.texts(0)[..3], ["old 0", "old 1", "old 2"]);
@@ -2029,4 +2053,34 @@ fn archive_lines_go_first_and_only_when_unpinned() {
     assert_eq!(w.lines.len(), MAX_LINES);
     assert!(w.lines[0].archive.is_none(), "the archive lead went first");
     assert_eq!(w.history_position().0, (Some(total + 1 - MAX_LINES as u64), None));
+}
+
+/// A shell world with Hide on (main.rs `World::is_hidden`): the native core reads it from
+/// the server's settings and its connected-world keys pass it by; another type's Hide, or
+/// an older server's missing field, hides nothing.
+#[test]
+fn a_hidden_shell_world_is_passed_by_and_known_as_hidden() {
+    let mut worlds: Vec<WorldStateMsg> = ["alpha", "term", "zulu"].iter().enumerate().map(|(i, n)| world_msg(i, n, 0..1, 1)).collect();
+    for w in &mut worlds {
+        w.connected = true;
+    }
+    worlds[1].settings.world_type = "shell".into();
+    worlds[1].settings.hidden = Some(true);
+    worlds[2].settings.hidden = Some(true);
+    let mut h = H::password();
+    h.connect_and_login().initial(worlds);
+    assert!(h.core.worlds[1].is_hidden());
+    assert!(!h.core.worlds[2].is_hidden(), "Hide is a shell world's only");
+    for _ in 0..4 {
+        let now = h.now;
+        let fx = h.core.cycle_connected(1, now);
+        h.keep(fx);
+        assert_ne!(h.core.current, 1, "the connected-world keys pass it by");
+    }
+    let mut older = world_msg(0, "term", 0..1, 1);
+    older.settings.world_type = "shell".into();
+    older.settings.hidden = None;
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![older]);
+    assert!(!h.core.worlds[0].is_hidden(), "a server before Hide hides nothing");
 }

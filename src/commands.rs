@@ -895,7 +895,14 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 // creation but must never touch a pre-existing world.
                 match app.find_world(world_name) {
                     Some(existing_idx) => (existing_idx, false),
-                    None => (app.find_or_create_world(world_name), true),
+                    None => {
+                        // A new world's name is one word (App::world_name_refusal).
+                        if let Some(refusal) = app.world_name_refusal(world_name.trim()) {
+                            app.add_output(&refusal);
+                            return false;
+                        }
+                        (app.find_or_create_world(world_name.trim()), true)
+                    }
                 }
             } else {
                 // /worlds -e - edit current world
@@ -972,6 +979,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 };
                 util::WorldListInfo {
                     name: world.name.clone(),
+                    hidden: world.is_hidden(),
                     connected: world.connected,
                     is_current: idx == current_idx,
                     is_ssl: world.is_tls,
@@ -987,13 +995,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             let output = util::format_worlds_list(&worlds_info);
             app.add_output(&output);
         }
-        Command::Actions { world } => {
-            if let Some(world_name) = world {
-                app.open_actions_list_popup_with_filter(&world_name);
-            } else {
-                app.open_actions_list_popup();
-            }
-        }
+        Command::Actions { query } => app.run_actions_command(query),
         Command::RemoteAttach { addr, close, cancel } => {
             if cancel {
                 if app.pending_remote_connect.take().is_some() {
@@ -1872,7 +1874,8 @@ pub(crate) fn execute_send_command(
     };
 
     let targets: Vec<usize> = if all_worlds {
-        (0..app.worlds.len()).filter(|&i| app.worlds[i].connected).collect()
+        // Every connected world but a hidden shell world (World::is_hidden).
+        (0..app.worlds.len()).filter(|&i| app.worlds[i].connected && !app.worlds[i].is_hidden()).collect()
     } else if let Some(type_pattern) = world_type {
         // "mud" is a literal (no wildcard chars), so the anchored regex it compiles to
         // (`^mud$`) would not match `MudTimedPrompt::name()` ("mud_timed_prompt") even
@@ -2580,14 +2583,9 @@ fn add_or_update_world(
     let world_idx = if let Some(idx) = existing_idx {
         idx
     } else {
-        if name.is_empty() {
-            return Err("Error: World name cannot be empty".to_string());
-        }
-        if name.contains(' ') {
-            return Err("Error: World name cannot contain spaces".to_string());
-        }
-        if name.starts_with('(') {
-            return Err("Error: World name cannot start with '('".to_string());
+        // One word (util::world_name_problem): not empty, no whitespace, no leading "(".
+        if let Some(problem) = crate::util::world_name_problem(name) {
+            return Err(format!("Error: {problem}"));
         }
         let mut new_world = World::new(name);
         new_world.scrollback_tx = app.scrollback.as_ref().map(|db| db.sender());
@@ -2652,8 +2650,9 @@ pub(crate) fn apply_world_definition(
     let (idx, added) = match app.find_world_index(&op.name) {
         Some(idx) => (idx, false),
         None => {
-            // TF: a new world's name may not begin with "(" (a temporary world's).
-            if op.name.is_empty() || op.name.starts_with('(') || op.name.contains(' ') {
+            // TF: a new world's name may not begin with "(" (a temporary world's); Clay's
+            // is one word too (util::world_name_problem, any whitespace).
+            if crate::util::world_name_problem(&op.name).is_some() {
                 app.emit_client_text(message_world_idx, &format!("addworld: illegal world name: {}", op.name), is_daemon_mode);
                 return;
             }
@@ -2833,6 +2832,11 @@ pub(crate) fn prepare_shell_world(app: &mut App, args: &str) -> Result<String, S
         if world.settings.world_type != WorldType::Shell {
             return Err(format!("World '{}' isn't a shell world, so /shell leaves it alone.", world.name));
         }
+        return Ok(format!("/worlds {}", world.name));
+    }
+    // No world named shell: a hidden shell world (World::is_hidden) is /sh's - one renamed,
+    // say - before a new one is made.
+    if let Some(world) = app.worlds.iter().find(|w| w.is_hidden()) {
         return Ok(format!("/worlds {}", world.name));
     }
     #[cfg(not(feature = "shell-worlds"))]

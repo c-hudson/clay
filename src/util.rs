@@ -239,6 +239,66 @@ pub fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
+/// The part of `s` (a line with escape codes) that `strip_ansi_codes(s)[start..end]` is,
+/// drawn as it was in `s`: the colour codes in force at `start` first (every SGR code
+/// before it, in order), then the raw text with the codes inside the span, then a reset
+/// when any code was copied. `start`/`end` are byte offsets into the stripped text, as a
+/// regex over it reports them (an action's `$1`); escape codes are recognised exactly as
+/// `strip_ansi_codes` recognises them, so the offsets line up. Used by an action's
+/// `/substitute`, which builds its rewrite from captures and keeps their colours.
+pub fn ansi_span(s: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut prefix = String::new();
+    let mut plain_pos = 0usize;
+    let mut copied_code = false;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\x1b' {
+            // The whole sequence, as strip_ansi_codes skips it: ESC [ ... final, or ESC x.
+            let mut seq_end = i + c.len_utf8();
+            let mut is_sgr = false;
+            if let Some(&(j, next)) = chars.peek() {
+                chars.next();
+                seq_end = j + next.len_utf8();
+                if next == '[' {
+                    while let Some(&(k, t)) = chars.peek() {
+                        chars.next();
+                        seq_end = k + t.len_utf8();
+                        if t.is_alphabetic() || t == '~' {
+                            is_sgr = t == 'm';
+                            break;
+                        }
+                    }
+                }
+            }
+            let code = &s[i..seq_end];
+            if plain_pos < start || (plain_pos == start && out.is_empty()) {
+                if is_sgr {
+                    prefix.push_str(code);
+                }
+            } else if plain_pos < end {
+                out.push_str(code);
+                copied_code = true;
+            }
+            continue;
+        }
+        if plain_pos >= start && plain_pos < end {
+            out.push(c);
+        }
+        plain_pos += c.len_utf8();
+        if plain_pos >= end && plain_pos > start {
+            break;
+        }
+    }
+    if prefix.is_empty() && !copied_code {
+        return out;
+    }
+    format!("{prefix}{out}\x1b[0m")
+}
+
 /// Normalize a prompt string: strip CR/LF, strip trailing spaces, add exactly one space
 pub fn normalize_prompt(text: &str) -> String {
     let clean = text.replace('\r', "").replace('\n', " ");
@@ -895,6 +955,54 @@ pub fn calculate_world_switch(
 /// The Activity world's name (user request 2026-11-05): `/world activity`, or `act`.
 pub const ACTIVITY_WORLD_NAME: &str = "Activity";
 
+/// Why `name` can't be a world's name, for a name already trimmed; `None` when it can.
+/// A world name is one word (user ruling 2026-11-19): `-w<world>`, TF's hook arguments and
+/// `/world <host> <port>` all take it as one token. The leading `(` is TF's temporary
+/// worlds' (`(unnamed1)`). Every place that makes or renames a world asks this, the server
+/// through `App::world_name_refusal`; app.js `validateWorldName` is its port.
+pub fn world_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("A world name can't be empty.")
+    } else if name.chars().any(char::is_whitespace) {
+        Some("A world name is one word: no spaces.")
+    } else if name.starts_with('(') {
+        Some("A world name can't start with '('.")
+    } else {
+        None
+    }
+}
+
+/// `world_name_problem`, then the Activity world's name while one exists: why `name`
+/// can't be a new or renamed world's. `App::world_name_refusal` (the server's every
+/// chokepoint), the consoles' world editor and the native GUI's ask it; app.js
+/// `validateWorldName` is its port.
+pub fn world_name_refusal(name: &str, activity_world_exists: bool) -> Option<String> {
+    if let Some(problem) = world_name_problem(name) {
+        return Some(problem.to_string());
+    }
+    (activity_world_exists && name.trim().eq_ignore_ascii_case(ACTIVITY_WORLD_NAME))
+        .then(|| format!("{ACTIVITY_WORLD_NAME} is the Activity world's name; pick another."))
+}
+
+/// `name` made into a world name `world_name_problem` takes: trimmed, each run of
+/// whitespace one `_`, a leading `(` dropped, `World` when nothing is left. For names Clay
+/// didn't get to refuse: one saved before the rule, a BAMF portal's, the program's own.
+pub fn one_word_world_name(name: &str) -> String {
+    let joined = name.split_whitespace().collect::<Vec<_>>().join("_");
+    let joined = joined.trim_start_matches('(');
+    if joined.is_empty() { "World".to_string() } else { joined.to_string() }
+}
+
+/// The name an Add button gives a new world: `NewWorld`, else the first free `NewWorld2`,
+/// `NewWorld3`, ... (case ignored). app.js `newWorldName` is its port.
+pub fn new_world_name<S: AsRef<str>>(existing: &[S]) -> String {
+    let taken = |n: &str| existing.iter().any(|e| e.as_ref().eq_ignore_ascii_case(n));
+    if !taken("NewWorld") {
+        return "NewWorld".to_string();
+    }
+    (2..).map(|i| format!("NewWorld{i}")).find(|n| !taken(n)).unwrap_or_default()
+}
+
 /// The world an Activity world line came from: its first word, since every line there
 /// starts with its world's name and a world name never has a space.
 pub fn activity_line_world(text: &str) -> Option<String> {
@@ -970,8 +1078,8 @@ pub fn parse_split_args(args: &str) -> Result<(Option<SplitLines>, Option<String
 /// The world a bare `/split` opens beside `current` (user ruling 2026-10-30: "the next in
 /// order"): the next connected world after it in alphabetical order (case-insensitive,
 /// wrapping), else the next of all worlds; None when there is no other world. `worlds` is
-/// each world's (name, connected, is_activity): the Activity world is never picked, only
-/// named. The one rule for every interface: the console and the native GUI call this,
+/// each world's (name, connected, skip): a skipped world - the Activity world, a hidden
+/// shell world - is never picked, only named. The one rule for every interface: the console and the native GUI call this,
 /// app.js `splitNextWorld` is a port of it.
 pub fn split_next_world(worlds: &[(&str, bool, bool)], current: usize) -> Option<usize> {
     let mut order: Vec<usize> = (0..worlds.len()).filter(|&i| !worlds[i].2 || i == current).collect();
@@ -1046,6 +1154,8 @@ pub struct WorldListInfo {
     pub last_nop_secs: Option<u64>,
     pub next_nop_secs: Option<u64>,
     pub buffer_size: usize,
+    /// A hidden shell world (`World::is_hidden`): never listed.
+    pub hidden: bool,
 }
 
 /// Format the connected worlds list for /l command output
@@ -1058,9 +1168,9 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
     const CYAN: &str = "\x1b[36m";
     const RESET: &str = "\x1b[0m";
 
-    // Filter to connected worlds only
+    // Filter to connected worlds only, a hidden shell world never
     let connected_worlds: Vec<&WorldListInfo> = worlds.iter()
-        .filter(|w| w.connected)
+        .filter(|w| w.connected && !w.hidden)
         .collect();
 
     if connected_worlds.is_empty() {
@@ -1997,7 +2107,7 @@ mod tests {
             name: "test".into(), connected: false, is_current: false,
             is_ssl: false, is_proxy: false, unseen_lines: 0,
             last_send_secs: None, last_recv_secs: None,
-            last_nop_secs: None, next_nop_secs: None, buffer_size: 0,
+            last_nop_secs: None, next_nop_secs: None, buffer_size: 0, hidden: false,
         }];
         assert_eq!(format_worlds_list(&worlds), "No worlds connected.");
     }
@@ -2009,7 +2119,7 @@ mod tests {
             is_ssl: true, is_proxy: false, unseen_lines: 5,
             last_send_secs: Some(60), last_recv_secs: Some(30),
             last_nop_secs: Some(120), next_nop_secs: Some(180),
-            buffer_size: 100,
+            buffer_size: 100, hidden: false,
         }];
         let result = format_worlds_list(&worlds);
         assert!(result.contains("World"));

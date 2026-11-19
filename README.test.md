@@ -170,7 +170,7 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'   # live grep, tail
 | `/setup` | Open global settings |
 | `/web` | Open web/WebSocket settings |
 | `/import [host[:port]]` | Pull worlds, actions, theme, and keybindings from another Clay instance |
-| `/actions [world]` | Open actions/triggers editor |
+| `/actions [-w<world>] [<name>]` | Open the actions list (`-w`: a world's); a name edits that action (`*` `?` wildcards; several matches are listed) |
 | `/edit [file\|-l]` | Split-screen notes editor, or `-l` for the notes list popup |
 | `/font` | Font settings popup (web/GUI only) |
 | `/tag` | Toggle MUD tag display with timestamps (same as F2) |

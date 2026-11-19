@@ -103,7 +103,7 @@ impl ClayView {
             (Some(i), _) => i,
             (None, true) => return Err("The output is already split; /unsplit closes the pane without the focus.".to_string()),
             (None, false) => {
-                let worlds: Vec<(&str, bool, bool)> = core.worlds.iter().map(|w| (w.name.as_str(), w.connected, w.is_activity)).collect();
+                let worlds: Vec<(&str, bool, bool)> = core.worlds.iter().map(|w| (w.name.as_str(), w.connected, w.is_activity || w.is_hidden())).collect();
                 match crate::util::split_next_world(&worlds, core.current) {
                     Some(i) => i,
                     None => return Err("There is no other world to show.".to_string()),

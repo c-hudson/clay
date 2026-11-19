@@ -5,8 +5,20 @@ Actions are automated triggers that match incoming MUD output and execute comman
 ## Opening the Actions Editor
 
 ```
-/actions
+/actions                 # Every action
+/actions -w MyMUD        # Only MyMUD's actions (-wMyMUD works too)
+/actions heal_self       # Edit the action named heal_self
+/actions heal_*          # * and ? are wildcards
 ```
+
+- `-w` lists the actions whose World field holds what you give, whole or in part
+  (`-w zmc` finds `ZMC` and `zmc2`); case is ignored.
+- A name opens that action's editor straight away, case ignored. Closing the editor
+  goes back to the output, since no list was opened.
+- In a name, `*` stands for any run of characters and `?` for one. One match opens its
+  editor; several are shown in the Actions list, which then lists only them (the note
+  under its filter box says so). No match prints a line saying so.
+- `-w` and a name together narrow both ways: `/actions -w zmc *_idle`.
 
 ![Actions List](images/tui/actions-list.png)
 
@@ -148,6 +160,37 @@ Name: quiet_combat
 Pattern: *misses you*
 Command: /gag;#set misses %{misses}+1
 ```
+
+## Rewriting Lines (/substitute)
+
+Use `/substitute <text>` in the command to show the matched line as `<text>` instead.
+`$0`-`$9` stand for the captures, as in any command, and each keeps the colours it had
+in the MUD's line:
+
+```
+Name: no_titles
+Match Type: Regexp
+Pattern: ^(?:AlwaysGreat|The) (\S+ says '.*)$
+Command: /substitute $1
+```
+
+`AlwaysGreat Ztheman says 'hi'` is then shown as `Ztheman says 'hi'`.
+
+**Rewriting behavior:**
+- The rewritten line takes the line's place; it is one line, not a copy
+- What the MUD sent is kept with it: **F2** shows it in the rewrite's place
+- `/recall` searches and shows the rewrite; `/recall -ao` searches and shows what the
+  MUD sent (`-ago` adds gagged lines too). `clay --grep ... -o` does the same from the
+  command line
+- The archive and the per-world log keep both: the log writes the rewrite, then the
+  MUD's text on the next line after `(original) `
+- Keep the pattern narrow: a pattern that drops a leading `The ` alone would turn
+  "The door opens." into "door opens." too
+- The text can't hold a `;`, which separates commands
+- An action run by name (`/no_titles`) has no line to rewrite, so its `/substitute` is
+  skipped
+
+TinyFugue's `/substitute` in a `/def` trigger works the same way (see TinyFugue Commands).
 
 ## Manual Invocation
 

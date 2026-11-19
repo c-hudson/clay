@@ -61,6 +61,7 @@ pub(crate) fn grep_line(ts_secs: i64, dated: bool, world: &str, text: &str, stri
 /// Run as grep client connecting to remote daemon (--grep=host:port)
 /// Searches world output for matching lines and prints to stdout; with `archive` (`-D`)
 /// the host's archive too (`GrepArchive`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_grep_client(
     addr: &str,
     pattern: &str,
@@ -69,6 +70,9 @@ pub(crate) async fn run_grep_client(
     strip_ansi: bool,
     follow_mode: bool,
     archive: bool,
+    // -o: a line a /substitute rewrote is matched and printed as the MUD sent it
+    // (`OutputLine::original`); without it, as it is shown.
+    original: bool,
 ) -> io::Result<()> {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use futures::SinkExt;
@@ -327,11 +331,15 @@ pub(crate) async fn run_grep_client(
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             match serde_json::from_str::<WsMessage>(&text) {
-                                Ok(WsMessage::ServerData { world_index, data, from_server, ts, .. }) => {
+                                Ok(WsMessage::ServerData { world_index, data, from_server, ts, originals, .. }) => {
                                     if !from_server { continue; }
                                     if !matches_world(world_index) { continue; }
                                     let world_name = world_names.get(&world_index).map(|s| s.as_str()).unwrap_or("?");
-                                    for line in data.lines() {
+                                    for (i, line) in data.lines().enumerate() {
+                                        let line = match originals.get(i) {
+                                            Some(Some(o)) if original => o.as_str(),
+                                            _ => line,
+                                        };
                                         let clean = strip_ansi_codes(line);
                                         if re.is_match(&clean) {
                                             print!("{}{eol}", format_line(ts, world_name, line));
@@ -479,6 +487,7 @@ pub(crate) async fn run_grep_client(
                 request_id: 1,
                 world: world_filter.map(str::to_string),
                 regex: regex_pattern.clone(),
+                original,
             });
             loop {
                 match ws_read.next().await {
@@ -527,10 +536,14 @@ pub(crate) async fn run_grep_client(
             .collect();
         for (world_idx, line) in &all_lines {
             if !line.from_server { continue; }
-            let clean = strip_ansi_codes(&line.text);
+            let text = match &line.original {
+                Some(o) if original => o.as_str(),
+                _ => line.text.as_str(),
+            };
+            let clean = strip_ansi_codes(text);
             if re.is_match(&clean) {
                 let world_name = world_names.get(world_idx).map(|s| s.as_str()).unwrap_or("?");
-                found.push((line.ts, format_line(line.ts, world_name, &line.text)));
+                found.push((line.ts, format_line(line.ts, world_name, text)));
             }
         }
         found.sort_by_key(|(ts, _)| *ts);
@@ -2292,8 +2305,8 @@ pub(crate) fn handle_remote_client_key(
                             let _ = ws_tx.send(WsMessage::UpdateActions {
                                 actions: app.settings.actions.clone()
                             });
-                            // Reopen actions list to show updated list
-                            app.open_actions_list_popup();
+                            // Back to the actions list, to show it updated
+                            app.return_to_actions_list();
                         }
                     }
                 } else if data.contains_key("web_save_remote") {
@@ -2321,7 +2334,7 @@ pub(crate) fn handle_remote_client_key(
                 if data.contains_key("world_index") {
                     app.open_world_selector_new();
                 } else if data.contains_key("action_index") {
-                    app.open_actions_list_popup();
+                    app.return_to_actions_list();
                 } else if data.contains_key(popup::definitions::confirm::PICTURE_UPLOAD) {
                     app.picture_drop_answered(false);
                 }
@@ -2360,7 +2373,8 @@ pub(crate) fn handle_remote_client_key(
                 }
                 // The server creates it; its editor opens on the server's WorldCreated.
                 crate::WorldSelectorAction::Add => {
-                    let _ = ws_tx.send(WsMessage::CreateWorld { name: format!("World {}", app.worlds.len() + 1) });
+                    let names: Vec<&str> = app.worlds.iter().map(|w| w.name.as_str()).collect();
+                    let _ = ws_tx.send(WsMessage::CreateWorld { name: crate::util::new_world_name(&names) });
                 }
             },
             NewPopupAction::WorldSelectorFilter => app.refilter_world_selector(),
@@ -2559,6 +2573,7 @@ pub(crate) fn handle_remote_client_key(
                                 let all_actions: Vec<ActionInfo> = app.settings.actions
                                     .iter()
                                     .enumerate()
+                                    .filter(|(_, a)| app.actions_scope.matches(a))
                                     .map(|(i, a)| ActionInfo {
                                         name: a.name.clone(),
                                         world: a.world.clone(),
@@ -2581,11 +2596,7 @@ pub(crate) fn handle_remote_client_key(
                                                 } else {
                                                     format!("({})", info.world)
                                                 };
-                                                let pattern_preview = if info.pattern.len() > 30 {
-                                                    format!("{}...", &info.pattern[..27])
-                                                } else {
-                                                    info.pattern.clone()
-                                                };
+                                                let pattern_preview = crate::util::truncate_str(&info.pattern, 30);
                                                 popup::ListItem {
                                                     id: info.index.to_string(),
                                                     columns: vec![
@@ -2618,6 +2629,7 @@ pub(crate) fn handle_remote_client_key(
                     let all_actions: Vec<ActionInfo> = app.settings.actions
                         .iter()
                         .enumerate()
+                        .filter(|(_, a)| app.actions_scope.matches(a))
                         .map(|(i, a)| ActionInfo {
                             name: a.name.clone(),
                             world: a.world.clone(),
@@ -2641,11 +2653,7 @@ pub(crate) fn handle_remote_client_key(
                                     } else {
                                         format!("({})", info.world)
                                     };
-                                    let pattern_preview = if info.pattern.len() > 30 {
-                                        format!("{}...", &info.pattern[..27])
-                                    } else {
-                                        info.pattern.clone()
-                                    };
+                                    let pattern_preview = crate::util::truncate_str(&info.pattern, 30);
                                     popup::ListItem {
                                         id: info.index.to_string(),
                                         columns: vec![
@@ -2687,6 +2695,8 @@ pub(crate) fn handle_remote_client_key(
                 let _ = ws_tx.send(WsMessage::UpdateActions {
                     actions: app.settings.actions.clone()
                 });
+                // Back to the actions list, as the console goes
+                app.return_to_actions_list();
             }
             NewPopupAction::ActionEditorDelete { editing_index } => {
                 if editing_index < app.settings.actions.len() {
@@ -2752,6 +2762,7 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.login_command = settings.login_command.clone();
                     app.worlds[idx].settings.first_command = settings.first_command.clone();
                     app.worlds[idx].settings.status_panel = settings.status_panel;
+                    app.worlds[idx].settings.hidden = settings.hidden;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages.clone();
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
                     app.worlds[idx].settings.auto_reconnect_secs = ar_secs;
@@ -2798,6 +2809,7 @@ pub(crate) fn handle_remote_client_key(
                         keep_alive_gag_enabled: Some(settings.keep_alive_gag_enabled),
                         keep_alive_gag: Some(settings.keep_alive_gag),
                         status_panel: Some(settings.status_panel),
+                        hidden: Some(settings.hidden),
                         login_command: Some(settings.login_command),
                         first_command: Some(settings.first_command),
                     });
@@ -3142,16 +3154,16 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
             Some(n) => match app.find_world(n) {
                 Some(idx) => app.open_world_editor_popup_new(idx, false),
                 // A new world is the server's to create; its editor opens on the
-                // server's WorldCreated (as the web and GUI do).
-                None => {
-                    let _ = ws_tx.send(WsMessage::CreateWorld { name: n.clone() });
-                }
+                // server's WorldCreated (as the web and GUI do). Its name is one word.
+                None => match app.world_name_refusal(n.trim()) {
+                    Some(refusal) => app.add_output(&refusal),
+                    None => {
+                        let _ = ws_tx.send(WsMessage::CreateWorld { name: n.trim().to_string() });
+                    }
+                },
             },
         },
-        Command::Actions { world } => match world {
-            Some(world_name) => app.open_actions_list_popup_with_filter(&world_name),
-            None => app.open_actions_list_popup(),
-        },
+        Command::Actions { query } => app.run_actions_command(query),
         // Only a server from before `/note <file>` went to the server bounces it back;
         // sending it to it again would just bounce again.
         Command::Edit { filename: Some(_) } if from_server => {
@@ -3235,8 +3247,9 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
 /// computed target is the world already current (nothing to do).
 fn cycle_connected_world_target(app: &App, direction: i32) -> Option<usize> {
     let skip = app.split_exclude();
+    // A hidden shell world isn't one of the connected worlds cycled through.
     let connected: Vec<usize> = app.worlds.iter().enumerate()
-        .filter(|(i, w)| w.connected && !skip.contains(i))
+        .filter(|(i, w)| w.connected && !w.is_hidden() && !skip.contains(i))
         .map(|(i, _)| i)
         .collect();
     if connected.is_empty() {
@@ -4275,15 +4288,18 @@ mod tests {
     }
 
     /// The World Selector's Add asks the server for the world; the server's WorldCreated
-    /// opens its editor. `/worlds -e <new>` does the same.
+    /// opens its editor. `/worlds -e <new>` does the same, for a one-word name only.
     #[test]
     fn new_worlds_are_the_servers_to_create() {
         let (mut app, tx, mut rx) = remote_note_app(1);
         type_line(&mut app, &tx, "/worlds -e brand new");
+        assert!(drain(&mut rx).is_empty(), "a world name is one word: nothing asked");
+        assert_eq!(app.worlds[0].output_lines.last().map(|l| l.text.as_str()), Some("A world name is one word: no spaces."));
+        type_line(&mut app, &tx, "/worlds -e brand_new");
         let sent = drain(&mut rx);
-        assert!(matches!(sent.as_slice(), [WsMessage::CreateWorld { name }] if name == "brand new"), "{sent:?}");
+        assert!(matches!(sent.as_slice(), [WsMessage::CreateWorld { name }] if name == "brand_new"), "{sent:?}");
         assert_eq!(app.worlds.len(), 1, "not created in this console's mirror");
-        app.worlds.push(crate::World::new("brand new"));
+        app.worlds.push(crate::World::new("brand_new"));
         app.handle_remote_ws_message(WsMessage::WorldCreated { world_index: 1 });
         assert!(app.has_new_popup(), "the editor opens on the server's answer");
     }

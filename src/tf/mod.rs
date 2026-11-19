@@ -357,6 +357,10 @@ pub struct RecallOptions {
     pub timestamp_format: Option<String>,  // -t[format]
     pub show_line_numbers: bool,    // #
     pub show_gagged: bool,          // -a<attrs> containing 'g' (e.g. -ag)
+    /// -a<attrs> containing 'o' (-ao, -ago): a line a `/substitute` rewrote is matched and
+    /// shown as the MUD sent it (`OutputLine::original`), the rewrite being taken off as
+    /// `g` takes off the gag. Clay's own letter: no TF attribute is 'o'.
+    pub show_original: bool,
     /// The raw `-a<attrs>` value verbatim (`/help attributes`): 'g' shows gagged lines
     /// (`show_gagged`, above); the display attributes are taken off each line's own
     /// (`OutputLine::tf_attrs`) as it is shown, as TF does - not off attributes inside
@@ -1077,6 +1081,10 @@ pub struct WorldInfoCache {
     pub is_temporary: bool,
     /// Clay's Activity world: no world definition, so never listed, saved or purged.
     pub is_activity: bool,
+    /// A hidden shell world (`World::is_hidden`): not one of the connected worlds -
+    /// `/listsockets`, `%nactive`/`nactive()` and `/fg -c` leave it out (`/listworlds`
+    /// still lists it, as the World Selector does).
+    pub hidden: bool,
     /// Automatic login is enabled for this world (`world_info(w, "login")`).
     pub login: bool,
     /// The server speaks telnet (it has negotiated something).

@@ -621,6 +621,7 @@
         worldEditorModal: document.getElementById('world-editor-modal'),
         worldEditorTitle: document.getElementById('world-editor-title'),
         worldEditName: document.getElementById('world-edit-name'),
+        worldEditError: document.getElementById('world-edit-error'),
         worldEditTypeSelect: document.getElementById('world-edit-type-select'),
         worldEditHostnameField: document.getElementById('world-edit-hostname-field'),
         worldEditHostname: document.getElementById('world-edit-hostname'),
@@ -666,6 +667,8 @@
         worldEditMccp2EnabledToggle: document.getElementById('world-edit-mccp2-enabled-toggle'),
         worldEditStatusPanelField: document.getElementById('world-edit-status-panel-field'),
         worldEditStatusPanelToggle: document.getElementById('world-edit-status-panel-toggle'),
+        worldEditHideField: document.getElementById('world-edit-hide-field'),
+        worldEditHideToggle: document.getElementById('world-edit-hide-toggle'),
         worldEditSlackTokenField: document.getElementById('world-edit-slack-token-field'),
         worldEditSlackToken: document.getElementById('world-edit-slack-token'),
         worldEditSlackChannelField: document.getElementById('world-edit-slack-channel-field'),
@@ -1361,7 +1364,10 @@
     let actionsConfirmPopupOpen = false;
     let selectedActionIndex = -1;
     let editingActionIndex = -1;  // -1 = new action, >=0 = editing existing
-    let actionsWorldFilter = '';  // Filter by world from /actions <world>
+    // `/actions [-w<world>] [<name>]`: the actions the list shows (actions::ActionsQuery).
+    let actionsQuery = { world: '', name: '' };
+    // The editor was opened by name (`/actions <name>`): closing it closes the Actions popup.
+    let actionsEditDirect = false;
 
     // Tag display state
     let showTags = false;
@@ -3055,7 +3061,7 @@
     }
 
     function recentWorldEntries() {
-        return worlds.map((w, i) => ({ i, at: w && !w.is_activity ? w._lastActivityMs : undefined }))
+        return worlds.map((w, i) => ({ i, at: w && !w.is_activity && !isHiddenWorld(w) ? w._lastActivityMs : undefined }))
             .filter(e => e.i !== currentWorldIndex && typeof e.at === 'number')
             .sort((a, b) => b.at - a.at)
             .slice(0, 6);
@@ -5460,7 +5466,8 @@
                         // Output from the MUD now (not a refill of history): Recent Worlds,
                         // and the Taskbar Alert. The Activity world's lines are copies, which
                         // their own worlds already counted.
-                        const liveText = isFromServer && !isGapFill && !world.is_activity;
+                        // A hidden shell world raises no activity at all.
+                        const liveText = isFromServer && !isGapFill && !world.is_activity && !isHiddenWorld(world);
                         if (liveText) noteWorldActivity(msg.world_index);
                         if (liveText && !msg.gagged && msg.data) noteTaskbarAlert();
 
@@ -5548,7 +5555,12 @@
                             // instead of guessing every line is unviewed - without it, lines
                             // that arrived while the console (or another client) was watching
                             // would be optimistically marked ▶ and then taken back.
+                            // The MUD's own text of a line a /substitute rewrote, drawn in its
+                            // place under F2 (shownText); parallel like highlight_colors.
+                            const lineOriginal = (Array.isArray(msg.originals) && msg.originals.length > rawIdx)
+                                ? msg.originals[rawIdx] : null;
                             const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: lineGagged, highlight_color: lineHighlight, viewed: !!msg.is_viewed, archive_sourced: !!msg.archive_sourced };
+                            if (lineOriginal) lineObj.original = truncateIfNeeded(lineOriginal);
 
                             if (isGapFill) {
                                 // This batch fills a historical hole, not the tail — collect it
@@ -6646,7 +6658,8 @@
                             seq: line.seq || 0,
                             highlight_color: line.highlight_color,
                             from_archive: line.from_archive || false,
-                            archive_sourced: line.archive_sourced || false
+                            archive_sourced: line.archive_sourced || false,
+                            original: line.original || undefined
                         });
                     }
                     if (msg.world_index === currentWorldIndex) {
@@ -7024,7 +7037,7 @@
         const onScreen = worldIndex === currentWorldIndex;
         // The Activity world never pauses: it is there to watch everything go by.
         const pages = moreModeEnabled && !(heldWorld && heldWorld.is_activity);
-        const rows = (m.paused || !pages) ? 0 : lineRows(text, !!(obj && obj.gagged));
+        const rows = (m.paused || !pages) ? 0 : lineRows(obj ? shownText(obj) : text, !!(obj && obj.gagged));
 
         if (m.paused) {
             // Already paused, queue the line info
@@ -7063,6 +7076,15 @@
             || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f1e6 && cp <= 0x1f1ff)
             || (cp >= 0x1f300 && cp <= 0x1faff) || (cp >= 0x20000 && cp <= 0x3fffd)) return 2;
         return 1;
+    }
+
+    // The text drawn for a stored line: under F2 the MUD's own text of a line an action's or
+    // TF's /substitute rewrote (OutputLine::shown_text), else the line as it is shown.
+    // Everything that draws a line, counts its rows or searches what is on screen reads
+    // this, never `.text` alone.
+    function shownText(lineObj) {
+        if (!lineObj || typeof lineObj !== 'object') return lineObj;
+        return (showTags && lineObj.original) ? lineObj.original : lineObj.text;
     }
 
     // How many screen rows a line takes at the output's current width - the same estimate
@@ -7164,7 +7186,7 @@
         let n = 0;
         while (n < held.length) {
             const item = held[n];
-            const rows = lineRows(item.text, !!(item.obj && item.obj.gagged));
+            const rows = lineRows(item.obj ? shownText(item.obj) : item.text, !!(item.obj && item.obj.gagged));
             if (used > 0 && used + rows > budget) break;
             used += rows;
             n++;
@@ -7515,6 +7537,7 @@
             && (asked.before_seq === null || l.seq < asked.before_seq));
         const arch = (msg.archive || []).map(a => ({
             text: a.text, ts: Math.floor(a.ts_ms / 1000), from_server: true, gagged: !!a.gagged,
+            original: a.original || undefined,
             viewed: true, archive_sourced: true, highlight_color: null, _has_real_seq: false,
             _archive: { wseq: typeof a.wseq === 'number' ? a.wseq : null, ts_ms: a.ts_ms },
         }));
@@ -8854,7 +8877,7 @@
 
         switch (firstWord) {
             case '/actions':
-                openActionsListPopup(args.join(' ') || null);
+                actionsCommand(args);
                 break;
 
             // A /split an action or macro ran on the server: this page's own.
@@ -8897,6 +8920,9 @@
                         const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
                         if (idx >= 0) {
                             openWorldEditorPopup(idx);
+                        } else if (validateWorldName(name)) {
+                            // A new world's name is one word.
+                            appendClientLine(validateWorldName(name));
                         } else {
                             send({ type: 'CreateWorld', name: name });
                         }
@@ -9140,7 +9166,8 @@
     function cycleConnectedWorldLocal(direction) {
         const connected = [];
         const skip = splitExclude();
-        worlds.forEach((w, i) => { if (w.connected && !skip.includes(i)) connected.push(i); });
+        // A hidden shell world isn't one of the connected worlds cycled through.
+        worlds.forEach((w, i) => { if (w.connected && !isHiddenWorld(w) && !skip.includes(i)) connected.push(i); });
         if (connected.length === 0) return null;
         const len = connected.length;
         const currentPos = connected.indexOf(currentWorldIndex);
@@ -9580,10 +9607,19 @@
         return !!(worlds[i] && worlds[i].is_activity);
     }
 
+    // A shell world with Hide on (main.rs World::is_hidden; an older server sends no
+    // `hidden`: not hidden). Left out of the tabs, the world menu, Recent Worlds, connected
+    // cycling, /split's pick and the Taskbar Alert; /sh, its name and the World Selector
+    // still reach it.
+    function isHiddenWorld(w) {
+        return !!(w && w.settings && w.settings.world_type === 'shell' && w.settings.hidden === true);
+    }
+
     function splitNextWorld(current) {
         const order = [];
-        // The Activity world is only ever named, never the next one (util::split_next_world).
-        worlds.forEach((w, i) => { if (w && (!w.is_activity || i === current)) order.push(i); });
+        // The Activity world and a hidden shell world are only ever named, never the next one
+        // (util::split_next_world).
+        worlds.forEach((w, i) => { if (w && ((!w.is_activity && !isHiddenWorld(w)) || i === current)) order.push(i); });
         order.sort((a, b) => {
             const x = (worlds[a].name || '').toLowerCase(), y = (worlds[b].name || '').toLowerCase();
             return x < y ? -1 : x > y ? 1 : a - b;
@@ -10222,7 +10258,7 @@
         for (let i = 0; i < lines.length; i++) {
             const lineObj = lines[i];
             if (!lineObj) continue;
-            const rawLine = typeof lineObj === 'string' ? lineObj : lineObj.text;
+            const rawLine = typeof lineObj === 'string' ? lineObj : shownText(lineObj);
             const plain = stripAnsiForFilter(String(rawLine).replace(/[\r\n]+/g, ''));
             if (matchesFilter(plain, searchText)) {
                 searchMatchIndices.push(lineObj);
@@ -10325,7 +10361,7 @@
             { l: '/translate &lt;lang&gt; &lt;text&gt;', r: 'Translate text' },
             { l: '/url &lt;url&gt;', r: 'Shorten a URL' },
             { heading: 'Actions &amp; Triggers' },
-            { l: '/actions [world]', r: 'Open actions editor' },
+            { l: '/actions [-w&lt;world&gt;] [name]', r: 'Actions list; a name edits that action (wildcards * ?)' },
             { l: '/gag [pattern]', r: 'Gag lines matching pattern (none: turn gags on)' },
             { l: '/&lt;action_name&gt; [args]', r: 'Execute named action' },
             { heading: 'Settings' },
@@ -10597,7 +10633,7 @@
         } else if (kind === 'help') {
             if (!helpPopupOpen) openHelpPopup();
         } else if (kind === 'actions') {
-            if (!actionsEditorPopupOpen) openActionsListPopup(arg || null);
+            if (!actionsEditorPopupOpen) openActionsQuery(actionsQueryFromArg(arg));
         } else if (kind === 'info') {
             infoPopupAsk(arg);
         } else if (kind === 'worlds') {
@@ -10961,6 +10997,12 @@
             'User: Your character/login name. Used for auto-login.', '',
             'Password: Your password. Used for auto-login.', '',
             'Use SSL: Enable TLS/SSL encryption for the connection.', '',
+            'Type Shell: a terminal on the machine Clay runs on; its',
+            '  only settings are Command and Hide.', '',
+            'Hide (a Shell world\'s): leaves the world out of world',
+            '  switching, the tabs, the world menu, /connections and',
+            '  Recent Worlds, and its text is never activity. /sh, its',
+            '  name and the World Selector still reach it.', '',
             'Auto Login: How to send credentials on connect.',
             '  Connect: Send "connect user password".',
             '  Prompt: Wait for prompts, send user then password.',
@@ -12520,7 +12562,7 @@
             if (held.size && held.has(lineObj)) continue;
 
             // Handle both old string format and new object format
-            const rawLine = typeof lineObj === 'string' ? lineObj : lineObj.text;
+            const rawLine = typeof lineObj === 'string' ? lineObj : shownText(lineObj);
             const lineTs = typeof lineObj === 'object' ? lineObj.ts : null;
             const lineGagged = typeof lineObj === 'object' ? lineObj.gagged : false;
             const lineHighlightColor = typeof lineObj === 'object' ? lineObj.highlight_color : null;
@@ -12643,8 +12685,6 @@
     // `lineIndex`: the line's index in output_lines, or the line object itself (more-mode's
     // held lines pass the object: older history put in front moves every index).
     function appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null, archiveSourced = false) {
-        // Strip newlines/carriage returns
-        const cleanText = String(text).replace(/[\r\n]+/g, '');
         const world = worlds[worldIndex];
         // The window has slid up into history (setRenderRange): the tail isn't drawn, so
         // neither is this; sliding back down draws it.
@@ -12652,6 +12692,8 @@
         const byObject = lineIndex !== null && typeof lineIndex === 'object';
         const lineObj = byObject ? lineIndex : (world && world.output_lines ? world.output_lines[lineIndex] : null);
         if (byObject) lineIndex = world && world.output_lines ? world.output_lines.lastIndexOf(lineObj) : -1;
+        // Strip newlines/carriage returns. Under F2 a rewritten line is its original.
+        const cleanText = String(lineObj && typeof lineObj === 'object' ? shownText(lineObj) : text).replace(/[\r\n]+/g, '');
         const gagged = !!(lineObj && typeof lineObj === 'object' && lineObj.gagged);
         // The same rules as renderOutput(): a line it wouldn't draw isn't drawn here either.
         if (!lineIsDrawn(cleanText, gagged)) return;
@@ -15493,13 +15535,137 @@
 
     // Actions popup functions (split into List and Editor)
 
-    // Open Actions List popup
-    function openActionsListPopup(worldFilter = null) {
-        if (openInPopupWindow('actions', worldFilter || null)) return;
+    // `/actions [-w<world>] [<name>]`: actions::ActionsQuery's rule, ported step for step
+    // (pinned by app_js_opens_actions_by_the_same_rule).
+    const ACTIONS_USAGE = 'Usage: /actions [-w<world>] [<name>]';
+
+    // The words after /actions: `-w<world>` or `-w <world>`, the other words the name.
+    function parseActionsArgs(args) {
+        const query = { world: '', name: '' };
+        const name = [];
+        for (let i = 0; i < args.length; i++) {
+            const arg = args[i];
+            if (arg.startsWith('-w')) {
+                let world = arg.slice(2);
+                if (world === '') {
+                    i += 1;
+                    world = args[i] || '';
+                }
+                if (world === '') return { error: ACTIONS_USAGE + ' (-w needs a world)' };
+                query.world = world;
+            } else if (arg.length > 1 && arg.startsWith('-')) {
+                return { error: ACTIONS_USAGE + ' (no option ' + arg + ')' };
+            } else {
+                name.push(arg);
+            }
+        }
+        query.name = name.join(' ');
+        return { query: query };
+    }
+
+    // An action's name against the pattern, case-insensitive: `*` any run of characters,
+    // `?` one, anything else itself, over the whole name.
+    function actionNameMatches(pattern, name) {
+        const p = Array.from(pattern.toLowerCase());
+        const n = Array.from(name.toLowerCase());
+        let pi = 0, ni = 0, star = null;
+        while (ni < n.length) {
+            if (pi < p.length && p[pi] === '*') {
+                star = [pi, ni];
+                pi += 1;
+            } else if (pi < p.length && (p[pi] === '?' || p[pi] === n[ni])) {
+                pi += 1;
+                ni += 1;
+            } else if (star) {
+                pi = star[0] + 1;
+                ni = star[1] + 1;
+                star = [star[0], star[1] + 1];
+            } else {
+                return false;
+            }
+        }
+        while (pi < p.length && p[pi] === '*') pi += 1;
+        return pi === p.length;
+    }
+
+    function actionsQueryMatches(query, action) {
+        if (query.world && !(action.world || '').toLowerCase().includes(query.world.toLowerCase())) return false;
+        return !query.name || actionNameMatches(query.name, action.name || '');
+    }
+
+    // The list's note of what it shows (`World: zmc  Name: zmc_*`).
+    function actionsQueryLabel(query) {
+        const parts = [];
+        if (query.world) parts.push('World: ' + query.world);
+        if (query.name) parts.push('Name: ' + query.name);
+        return parts.join('  ');
+    }
+
+    // The list without a name; with one, the editor for the only match, the list of
+    // several, a line for none.
+    function resolveActionsQuery(query, list) {
+        if (!query.name) return { list: true };
+        const hits = [];
+        list.forEach(function(a, i) { if (actionsQueryMatches(query, a)) hits.push(i); });
+        if (hits.length === 0) return { nothing: actionsNoMatch(query) };
+        if (hits.length === 1) return { edit: hits[0] };
+        return { list: true };
+    }
+
+    function actionsNoMatch(query) {
+        if (query.world) return "No action matches '" + query.name + "' in world '" + query.world + "'.";
+        // `/actions <world>` was the world's list until 2026-11-19.
+        if (!/[*?]/.test(query.name)) return "No action matches '" + query.name + "'. A world's actions: /actions -w " + query.name;
+        return "No action matches '" + query.name + "'.";
+    }
+
+    function actionsCommand(args) {
+        const parsed = parseActionsArgs(args);
+        if (parsed.error) {
+            appendClientLine(parsed.error);
+            return;
+        }
+        openActionsQuery(parsed.query);
+    }
+
+    // A popup window's arg (openInPopupWindow) back into a query.
+    function actionsQueryFromArg(arg) {
+        if (arg && typeof arg === 'object') return { world: String(arg.world || ''), name: String(arg.name || '') };
+        return { world: '', name: '' };
+    }
+
+    function openActionsQuery(query) {
+        const open = resolveActionsQuery(query, actions);
+        if (open.nothing !== undefined) {
+            appendClientLine(open.nothing);
+            popupWindowCloseIfIdle();
+            return;
+        }
+        if (openInPopupWindow('actions', { world: query.world, name: query.name })) return;
+        if (open.edit !== undefined) {
+            openActionEditorDirect(query, open.edit);
+        } else {
+            openActionsListPopup(query);
+        }
+    }
+
+    // `/actions <name>` matched one action: its editor, with no list behind it.
+    function openActionEditorDirect(query, index) {
+        if (actionsListPopupOpen) closeActionsListPopup();
+        actionsQuery = query;
+        selectedActionIndex = index;  // the editor's Delete deletes the selected action
+        openActionsEditorPopup(index);
+        actionsEditDirect = true;
+    }
+
+    // Open Actions List popup, showing the actions `query` asks for (all without one).
+    function openActionsListPopup(query = null) {
+        if (openInPopupWindow('actions', query ? { world: query.world, name: query.name } : null)) return;
         actionsListPopupOpen = true;
-        actionsWorldFilter = worldFilter || '';
+        actionsEditDirect = false;
+        actionsQuery = query || { world: '', name: '' };
         elements.actionFilter.value = '';
-        elements.actionWorldFilterIndicator.textContent = worldFilter ? `World: ${worldFilter}` : '';
+        elements.actionWorldFilterIndicator.textContent = actionsQueryLabel(actionsQuery);
         selectedActionIndex = -1;
         elements.actionsListModal.className = 'modal visible';
         renderActionsList();
@@ -15515,7 +15681,7 @@
     // Close Actions List popup
     function closeActionsListPopup() {
         actionsListPopupOpen = false;
-        actionsWorldFilter = '';
+        actionsQuery = { world: '', name: '' };
         elements.actionFilter.value = '';
         elements.actionWorldFilterIndicator.textContent = '';
         elements.actionsListModal.className = 'modal';
@@ -15526,13 +15692,12 @@
     // Get indices of actions matching current filters
     function getFilteredActionIndices() {
         const filterText = elements.actionFilter.value.toLowerCase();
-        const worldFilterLower = actionsWorldFilter.toLowerCase();
 
         return actions
             .map((action, index) => ({ action, index }))
             .filter(({ action }) => {
-                // World filter (from /actions <world>)
-                if (worldFilterLower && !action.world.toLowerCase().includes(worldFilterLower)) {
+                // The query (from /actions [-w<world>] [<name>])
+                if (!actionsQueryMatches(actionsQuery, action)) {
                     return false;
                 }
                 // Text filter (from filter input)
@@ -16313,10 +16478,17 @@
         elements.actionName.focus();
     }
 
-    // Close Actions Editor popup (return to list)
+    // Close Actions Editor popup (return to list; opened by name, close it all)
     function closeActionsEditorPopup() {
         actionsEditorPopupOpen = false;
         elements.actionsEditorModal.className = 'modal';
+        if (actionsEditDirect) {
+            actionsEditDirect = false;
+            actionsQuery = { world: '', name: '' };
+            elements.input.focus();
+            popupWindowCloseIfIdle();
+            return;
+        }
         elements.actionsListModal.className = 'modal visible';
         actionsListPopupOpen = true;
         renderActionsList();
@@ -17769,15 +17941,31 @@
         }
     }
 
+    // A world's name is one word (user ruling 2026-11-19): util::world_name_problem and
+    // util::world_name_refusal ported step for step (pinned by
+    // app_js_checks_world_names_by_the_same_rule). The server checks too.
+    function validateWorldName(name) {
+        if (name === '') return "A world name can't be empty.";
+        if (FILLER_SPACE.test(name)) return 'A world name is one word: no spaces.';
+        if (name.startsWith('(')) return "A world name can't start with '('.";
+        if (worlds.some(w => w.is_activity) && name.trim().toLowerCase() === 'activity') {
+            return "Activity is the Activity world's name; pick another.";
+        }
+        return null;
+    }
+
+    // util::new_world_name: NewWorld, then NewWorld2, NewWorld3, ...
+    function newWorldName(list) {
+        const taken = n => list.some(w => (w.name || '').toLowerCase() === n.toLowerCase());
+        if (!taken('NewWorld')) return 'NewWorld';
+        for (let i = 2; ; i++) {
+            if (!taken('NewWorld' + i)) return 'NewWorld' + i;
+        }
+    }
+
     function addNewWorld() {
         // Generate a unique world name
-        let baseName = 'New World';
-        let name = baseName;
-        let counter = 1;
-        while (worlds.some(w => w.name.toLowerCase() === name.toLowerCase())) {
-            counter++;
-            name = baseName + ' ' + counter;
-        }
+        const name = newWorldName(worlds);
         // Send CreateWorld message - server creates the world, broadcasts WorldAdded,
         // and sends WorldCreated back to us so we can open the editor
         send({
@@ -17918,6 +18106,7 @@
 
         worldEditorPopupOpen = true;
         worldEditorIndex = worldIndex;
+        elements.worldEditError.textContent = '';
         const world = worlds[worldIndex];
 
         // Populate form fields
@@ -17983,6 +18172,9 @@
         }
         // The world's Status Panel: default on; a server from before it sends none, and the
         // row stays hidden (the type gating shows it only with this cleared).
+        // Hide (a shell world's): only a server that sends it shows the row.
+        worldEditHideKnown = typeof world.settings?.hidden === 'boolean';
+        elements.worldEditHideToggle.classList.toggle('active', world.settings?.hidden === true);
         const statusPanelKnown = typeof world.settings?.status_panel === 'boolean';
         elements.worldEditStatusPanelToggle.classList.toggle('active', world.settings?.status_panel !== false);
         elements.worldEditStatusPanelField.style.display = statusPanelKnown ? '' : 'none';
@@ -18110,6 +18302,10 @@
         'worldEditDiscordChannelField', 'worldEditDiscordChannelsField'
     ];
 
+    // Whether the edited world's server sends Hide (WorldSettingsMsg.hidden), so the row
+    // shows and Save sends it; set by openWorldEditorPopup.
+    let worldEditHideKnown = false;
+
     // Show/hide World Editor rows for the currently selected Type - called on editor
     // open and on every Type/Keep Alive change (the console equivalent re-runs
     // automatically via the update_visibility! macro on the same events).
@@ -18124,9 +18320,15 @@
         WORLD_EDIT_MUD_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isMud));
         WORLD_EDIT_SLACK_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isSlack));
         WORLD_EDIT_DISCORD_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isDiscord));
-        // A shell world shows only the Hostname row, relabelled "Command".
+        // A shell world shows only the Hostname row, relabelled "Command", and its Hide -
+        // and no Login or Options button or section, which hold nothing for it (.we-shell).
         if (isShell) {
             elements.worldEditHostnameField?.classList.add('visible');
+        }
+        elements.worldEditHideField?.classList.toggle('visible', isShell && worldEditHideKnown);
+        worldEditorContent().classList.toggle('we-shell', isShell);
+        if (isShell && worldEditorContent().dataset.weActive !== 'server') {
+            setWorldEditorSection('server');
         }
         const hostnameLabel = document.getElementById('world-edit-hostname-label');
         if (hostnameLabel) hostnameLabel.textContent = isShell ? 'Command' : 'Hostname';
@@ -18165,8 +18367,17 @@
         elements.worldEditKeepAliveWarningField.classList.toggle('visible', shown);
     }
 
+    // Returns whether it saved: a name that isn't one word stays in the editor, saying why.
     function saveWorldEditor() {
-        if (worldEditorIndex < 0 || worldEditorIndex >= worlds.length) return;
+        if (worldEditorIndex < 0 || worldEditorIndex >= worlds.length) return false;
+        const worldName = elements.worldEditName.value.trim();
+        const nameProblem = worldName === worlds[worldEditorIndex].name ? null : validateWorldName(worldName);
+        if (nameProblem) {
+            elements.worldEditError.textContent = nameProblem;
+            elements.worldEditName.focus();
+            return false;
+        }
+        elements.worldEditError.textContent = '';
 
         const worldType = elements.worldEditTypeSelect.value;
         // Number.isFinite (not `|| 1000`) so an explicit 0 survives - 0 is a real,
@@ -18190,7 +18401,7 @@
         send({
             type: 'UpdateWorldSettings',
             world_index: worldEditorIndex,
-            name: elements.worldEditName.value,
+            name: worldName,
             hostname: elements.worldEditHostname.value,
             port: elements.worldEditPort.value,
             user: elements.worldEditUser.value,
@@ -18212,6 +18423,7 @@
             mccp2_enabled: elements.worldEditMccp2EnabledToggle.classList.contains('active'),
             // null = unchanged: the server has no such switch (the row was hidden).
             status_panel: elements.worldEditStatusPanelField.style.display === 'none' ? null : elements.worldEditStatusPanelToggle.classList.contains('active'),
+            hidden: worldEditHideKnown ? elements.worldEditHideToggle.classList.contains('active') : null,
             world_type: worldType,
             prompt_wait_ms: promptWaitMs,
             tf_type: tfType,
@@ -18237,7 +18449,7 @@
 
         // Update local state
         const world = worlds[worldEditorIndex];
-        world.name = elements.worldEditName.value;
+        world.name = worldName;
         if (!world.settings) world.settings = {};
         world.settings.hostname = elements.worldEditHostname.value;
         world.settings.port = elements.worldEditPort.value;
@@ -18262,6 +18474,9 @@
         world.settings.msp_enabled = elements.worldEditMspEnabledToggle.classList.contains('active');
         world.settings.mcp_enabled = elements.worldEditMcpEnabledToggle.classList.contains('active');
         world.settings.mccp2_enabled = elements.worldEditMccp2EnabledToggle.classList.contains('active');
+        if (worldEditHideKnown) {
+            world.settings.hidden = elements.worldEditHideToggle.classList.contains('active');
+        }
         if (elements.worldEditStatusPanelField.style.display !== 'none') {
             world.settings.status_panel = elements.worldEditStatusPanelToggle.classList.contains('active');
         }
@@ -18280,6 +18495,7 @@
         if (slackAppToken) world.settings.slack_app_token = slackAppToken;
 
         closeWorldEditorPopup();
+        return true;
     }
 
     function saveAndConnectWorldEditor() {
@@ -18288,8 +18504,9 @@
         // Save the index before saveWorldEditor() resets it via closeWorldEditorPopup()
         const indexToConnect = worldEditorIndex;
 
-        // Save first (this closes the popup and resets worldEditorIndex to -1)
-        saveWorldEditor();
+        // Save first (this closes the popup and resets worldEditorIndex to -1); a refused
+        // name connects nothing.
+        if (!saveWorldEditor()) return;
 
         // Then connect using the saved index
         send({
@@ -19721,7 +19938,7 @@
     function getConnectedWorlds() {
         return worlds
             .map((w, i) => ({ world: w, index: i }))
-            .filter(w => w.world.connected);
+            .filter(w => w.world.connected && !isHiddenWorld(w.world));
     }
 
     // Worlds shown in the world-switch dropdown: connected worlds, plus any
@@ -19732,7 +19949,7 @@
     function getWorldSwitcherWorlds() {
         return worlds
             .map((w, i) => ({ world: w, index: i }))
-            .filter(w => w.world.connected || (w.world.unseen_lines || 0) > 0);
+            .filter(w => (w.world.connected || (w.world.unseen_lines || 0) > 0) && !isHiddenWorld(w.world));
     }
 
     // Rebuild the tabs-ribbon strip from the current connected-worlds list and
@@ -20076,9 +20293,10 @@
         if (searchPopupOpen && except !== 'search') closeSearchPopup();
         if (emojiPopupOpen) closeEmojiPopup();
         if (helpPopupOpen) closeHelpPopup();
-        if (actionsListPopupOpen) closeActionsListPopup();
-        if (actionsEditorPopupOpen) closeActionsEditorPopup();
+        // The editor first: closing it goes back to the list.
         if (actionsConfirmPopupOpen) closeActionsConfirmPopup();
+        if (actionsEditorPopupOpen) closeActionsEditorPopup();
+        if (actionsListPopupOpen) closeActionsListPopup();
         if (settingsPopupOpen) closeSettingsPopup();
         if (worldsPopupOpen) closeWorldsPopup();
         if (worldSelectorPopupOpen) closeWorldSelectorPopup();
@@ -22077,6 +22295,9 @@
             this.classList.toggle('active');
         };
         elements.worldEditStatusPanelToggle.onclick = function() {
+            this.classList.toggle('active');
+        };
+        elements.worldEditHideToggle.onclick = function() {
             this.classList.toggle('active');
         };
         elements.worldEditKeepAliveSelect.onchange = function() {

@@ -122,7 +122,14 @@ impl WebDat {
                 "http_port" => w.http_port = parse_port(value).ok_or_else(|| bad("a port is 1 to 65535"))?,
                 "cert_file" => w.cert_file = cert_path(value, dir),
                 "key_file" => w.key_file = cert_path(value, dir),
-                "world_name" => w.world_name = value.to_string(),
+                // One word, like every world's name (util::world_name_problem); empty is
+                // the hostname, below.
+                "world_name" => {
+                    if let Some(problem) = Some(value).filter(|v| !v.is_empty()).and_then(crate::util::world_name_problem) {
+                        return Err(bad(&format!("world_name must be one word ({problem})")));
+                    }
+                    w.world_name = value.to_string();
+                }
                 "hostname" => w.hostname = value.to_string(),
                 "port" => w.port = parse_port(value).ok_or_else(|| bad("a port is 1 to 65535"))?,
                 "ssl" => w.ssl = parse_bool(value).ok_or_else(|| bad("true or false"))?,
@@ -353,6 +360,15 @@ mod tests {
         assert_eq!(w.key_file, "/etc/key.pem");
         assert!(w.has_certificate());
         assert_eq!(w.world_name, "mud.example.org", "world_name defaults to the hostname");
+    }
+
+    /// world_name is a world's name, so one word like every other (user ruling 2026-11-19).
+    #[test]
+    fn world_name_is_one_word() {
+        let err = WebDat::parse("hostname=mud.example.org\nport=4000\nworld_name=My MUD\n", dir()).unwrap_err();
+        assert_eq!(err, "web.dat line 3: world_name=My MUD - world_name must be one word (A world name is one word: no spaces.)");
+        assert!(WebDat::parse("hostname=mud.example.org\nport=4000\nworld_name=My_MUD\n", dir()).is_ok());
+        assert!(WebDat::parse("hostname=mud.example.org\nport=4000\nworld_name=\n", dir()).is_ok(), "empty is the hostname");
     }
 
     #[test]

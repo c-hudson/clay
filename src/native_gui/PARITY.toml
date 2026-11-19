@@ -1815,7 +1815,7 @@ section = "wire"
 phase = 4
 status = "done"
 feature = "wire UpdateWorldSettings"
-note = "the world editor's Save (chat fields authoritative, as app.js)"
+note = "the world editor's Save (chat fields authoritative, as app.js; a shell world's Hide as `hidden`)"
 
 [[item]]
 id = "wire:ChatLookup"
@@ -2928,7 +2928,7 @@ id = "ui:window.actions"
 section = "dialogs"
 phase = 4
 status = "done"
-feature = "the Actions window: filter box (name, world, patterns), /actions <world>, sorted Name/World/Pattern list, arrows wrap, Enter or double-click edits, Add/Edit/Delete/Ok, ? help"
+feature = "the Actions window: filter box (name, world, patterns), /actions [-w<world>] [<name>] (a name's one match opens its editor, closing the window after), sorted Name/World/Pattern list, arrows wrap, Enter or double-click edits, Add/Edit/Delete/Ok, ? help"
 note = "app.js openActionsListPopup"
 
 [[item]]
@@ -2960,7 +2960,7 @@ id = "ui:dialog.world_editor"
 section = "dialogs"
 phase = 4
 status = "done"
-feature = "the world editor: Server/Login(Channels)/Options sections with a side bar (both columns from 900x640), rows gated by type, toggles, selects, Fetch picker, Save/Connect, Delete asks"
+feature = "the world editor: Server/Login(Channels)/Options sections with a side bar (both columns from 900x640), rows gated by type, toggles, selects, Fetch picker, Save/Connect, Delete asks; a Shell world: the Server section alone, with Command and Hide"
 note = "app.js openWorldEditorPopup"
 
 [[item]]

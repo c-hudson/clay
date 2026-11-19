@@ -54,6 +54,15 @@ pub struct ScrollbackLine {
     /// (`load_before_wseq`/`load_before_path`), which show it the way it was shown live;
     /// a search's results leave it false.
     pub gagged: bool,
+    /// The MUD's own text when a `/substitute` rewrote `text` (the `original` column;
+    /// `None` in a file from before the column and for every line not rewritten).
+    pub original: Option<String>,
+}
+
+/// The `original` column as a SELECT names it: `NULL` in a file no writer since the column has
+/// opened yet (the column is added at open), which a reader must still read.
+fn original_column(conn: &Connection, prefix: &str) -> String {
+    if has_column(conn, "output_log", "original") { format!("{prefix}original") } else { "NULL".to_string() }
 }
 
 /// A search against the archive.
@@ -87,6 +96,9 @@ pub struct ArchiveQuery<'a> {
     /// always took the oldest, which on a large archive silently hid recent
     /// history behind the limit.
     pub newest_first: bool,
+    /// Match the MUD's own text of a rewritten line rather than its rewrite
+    /// (`/recall -ao`, `clay --grep -o`); every row still comes back with both.
+    pub original: bool,
 }
 
 /// What `open` found on disk.
@@ -129,7 +141,8 @@ const OUTPUT_LOG_V2: &str = "
         wseq     INTEGER NOT NULL,
         ts_ms    INTEGER NOT NULL,
         line_raw TEXT NOT NULL,
-        gagged   INTEGER NOT NULL DEFAULT 0
+        gagged   INTEGER NOT NULL DEFAULT 0,
+        original TEXT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_log_wid_wseq ON output_log(wid, wseq);
     CREATE INDEX IF NOT EXISTS idx_log_wid_ts ON output_log(wid, ts_ms);
@@ -199,6 +212,8 @@ pub struct ArchiveEntry {
     pub world: String,
     pub ts_ms: i64,
     pub text: String,
+    /// The MUD's own text when a `/substitute` rewrote `text` (`OutputLine::original`).
+    pub original: Option<String>,
     pub gagged: bool,
     pub wid: Option<i64>,
     pub wseq: Option<i64>,
@@ -206,7 +221,7 @@ pub struct ArchiveEntry {
 
 impl ArchiveEntry {
     pub fn new(world: String, ts_ms: i64, text: String, gagged: bool) -> Self {
-        Self { world, ts_ms, text, gagged, wid: None, wseq: None }
+        Self { world, ts_ms, text, original: None, gagged, wid: None, wseq: None }
     }
 }
 
@@ -424,6 +439,12 @@ impl ScrollbackDb {
                 conn.execute_batch("PRAGMA journal_mode=WAL;")?;
                 conn.execute_batch(SCHEMA_V2)?;
                 conn.execute_batch(OUTPUT_LOG_V2)?;
+                // `original` (the MUD's text of a rewritten line) came after 1.7.38 as a
+                // nullable column, so the file stays v2: an older Clay reads and writes
+                // it as before, its rows simply having none.
+                if !has_column(&conn, "output_log", "original") {
+                    conn.execute_batch("ALTER TABLE output_log ADD COLUMN original TEXT;")?;
+                }
             }
         }
         drop(conn);
@@ -637,6 +658,7 @@ impl ScrollbackDb {
                 text: row.get(2)?,
                 wseq: None,
                 gagged: false,
+                original: None,
             })
         });
 
@@ -817,7 +839,8 @@ pub fn query(path: &Path, q: &ArchiveQuery) -> Vec<ScrollbackLine> {
     };
     let order = if q.newest_first { "DESC" } else { "ASC" };
     let sql = format!(
-        "SELECT o.ts_ms, o.line_raw, o.wseq, o.wid FROM output_log o {where_clause} ORDER BY o.wseq {order}"
+        "SELECT o.ts_ms, o.line_raw, o.wseq, o.wid, {} FROM output_log o {where_clause} ORDER BY o.wseq {order}",
+        original_column(&conn, "o."),
     );
 
     let mut stmt = match conn.prepare(&sql) {
@@ -836,6 +859,7 @@ pub fn query(path: &Path, q: &ArchiveQuery) -> Vec<ScrollbackLine> {
             row.get::<_, String>(1)?,
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
+            row.get::<_, Option<String>>(4).ok().flatten(),
         ))
     };
     let rows = match &fts_expr {
@@ -845,9 +869,13 @@ pub fn query(path: &Path, q: &ArchiveQuery) -> Vec<ScrollbackLine> {
 
     let mut out: Vec<ScrollbackLine> = Vec::new();
     if let Ok(iter) = rows {
-        for (ts_ms, text, wseq, wid) in iter.flatten() {
+        for (ts_ms, text, wseq, wid, original) in iter.flatten() {
+            let searched = match &original {
+                Some(o) if q.original => o,
+                _ => &text,
+            };
             let matched = match &regex {
-                Some(re) => re.is_match(&crate::util::strip_ansi_codes(&text)),
+                Some(re) => re.is_match(&crate::util::strip_ansi_codes(searched)),
                 None => true,
             };
             if !matched {
@@ -868,7 +896,7 @@ pub fn query(path: &Path, q: &ArchiveQuery) -> Vec<ScrollbackLine> {
                     })
                     .clone()
             };
-            out.push(ScrollbackLine { ts_ms, world, text, wseq: Some(wseq), gagged: false });
+            out.push(ScrollbackLine { ts_ms, world, text, wseq: Some(wseq), gagged: false, original });
             if out.len() >= q.limit {
                 break;
             }
@@ -920,10 +948,11 @@ pub fn load_before_wseq(path: &Path, world: &str, before_wseq: i64, count: usize
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let mut stmt = match conn.prepare(
-        "SELECT ts_ms, line_raw, wseq, gagged FROM output_log
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT ts_ms, line_raw, wseq, gagged, {} FROM output_log
          WHERE wid = ?1 AND wseq < ?2 ORDER BY wseq DESC LIMIT ?3",
-    ) {
+        original_column(&conn, ""),
+    )) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -934,6 +963,7 @@ pub fn load_before_wseq(path: &Path, world: &str, before_wseq: i64, count: usize
             text: row.get(1)?,
             wseq: row.get(2).ok(),
             gagged: row.get::<_, i64>(3).unwrap_or(0) != 0,
+            original: row.get(4).ok().flatten(),
         })
     });
     let mut lines: Vec<ScrollbackLine> =
@@ -953,12 +983,15 @@ pub fn load_before_path(path: &Path, world: &str, before_ts_ms: i64, count: usiz
     }
 
     // Fetch the N rows just before the timestamp, then reverse to get oldest-first
-    let sql = "SELECT o.ts_ms, w.name, o.line_raw, o.gagged FROM output_log o \
+    let sql = format!(
+        "SELECT o.ts_ms, w.name, o.line_raw, o.gagged, {} FROM output_log o \
          JOIN worlds w ON w.wid = o.wid \
          WHERE w.name = ?1 COLLATE NOCASE AND o.ts_ms < ?2 \
-         ORDER BY o.ts_ms DESC LIMIT ?3";
+         ORDER BY o.ts_ms DESC LIMIT ?3",
+        original_column(&conn, "o."),
+    );
 
-    let mut stmt = match conn.prepare(sql) {
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -970,6 +1003,7 @@ pub fn load_before_path(path: &Path, world: &str, before_ts_ms: i64, count: usiz
             text: row.get(2)?,
             wseq: None,
             gagged: row.get::<_, i64>(3).unwrap_or(0) != 0,
+            original: row.get(4).ok().flatten(),
         })
     });
 
@@ -1077,18 +1111,28 @@ fn flush_batch(
             continue;
         };
         let res = tx.execute(
-            "INSERT INTO output_log (wid, wseq, ts_ms, line_raw, gagged)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![wid, wseq, row.ts_ms, row.text, row.gagged as i32],
+            "INSERT INTO output_log (wid, wseq, ts_ms, line_raw, gagged, original)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![wid, wseq, row.ts_ms, row.text, row.gagged as i32, row.original],
         );
         if res.is_ok() {
             // Index the ANSI-stripped form, in the same transaction, so
             // the index can never disagree with the table. There are no
-            // triggers because a trigger cannot strip ANSI.
+            // triggers because a trigger cannot strip ANSI. A rewritten line indexes
+            // its original too: FTS only picks candidates, and either text may be the
+            // one searched (`ArchiveQuery::original`).
             let rowid = tx.last_insert_rowid();
+            let txt = match &row.original {
+                Some(original) => format!(
+                    "{}\n{}",
+                    crate::util::strip_ansi_codes(&row.text),
+                    crate::util::strip_ansi_codes(original)
+                ),
+                None => crate::util::strip_ansi_codes(&row.text),
+            };
             let _ = tx.execute(
                 "INSERT INTO output_fts (rowid, txt) VALUES (?1, ?2)",
-                params![rowid, crate::util::strip_ansi_codes(&row.text)],
+                params![rowid, txt],
             );
         }
         if let Err(e) = res {
@@ -1134,15 +1178,17 @@ pub fn export_csv(db_path: &Path, out_path: &Path) -> Result<usize, String> {
 
     let mut file = std::fs::File::create(out_path)
         .map_err(|e| format!("cannot create {}: {}", out_path.display(), e))?;
-    writeln!(file, "id,world,datetime_local,ts_epoch_ms,gagged,text,raw,wseq")
+    // `original_raw`: the MUD's own text of a line a /substitute rewrote (empty otherwise).
+    writeln!(file, "id,world,datetime_local,ts_epoch_ms,gagged,text,raw,wseq,original_raw")
         .map_err(|e| format!("write error: {}", e))?;
 
     let mut stmt = conn
-        .prepare(
-            "SELECT o.id, o.ts_ms, w.name, o.line_raw, o.gagged, o.wseq
+        .prepare(&format!(
+            "SELECT o.id, o.ts_ms, w.name, o.line_raw, o.gagged, o.wseq, {}
              FROM output_log o JOIN worlds w ON w.wid = o.wid
              ORDER BY w.name ASC, o.wseq ASC",
-        )
+            original_column(&conn, "o."),
+        ))
         .map_err(|e| format!("prepare failed: {}", e))?;
     let rows = stmt
         .query_map([], |row| {
@@ -1153,13 +1199,14 @@ pub fn export_csv(db_path: &Path, out_path: &Path) -> Result<usize, String> {
                 row.get::<_, String>(3)?,
                 row.get::<_, i32>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6).ok().flatten(),
             ))
         })
         .map_err(|e| format!("query failed: {}", e))?;
 
     let mut count = 0usize;
     for row in rows.flatten() {
-        let (id, ts_ms, world, line_raw, gagged_int, wseq) = row;
+        let (id, ts_ms, world, line_raw, gagged_int, wseq, original) = row;
         let lt = crate::util::local_time_from_epoch(ts_ms / 1000);
         let datetime_str = format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -1167,7 +1214,7 @@ pub fn export_csv(db_path: &Path, out_path: &Path) -> Result<usize, String> {
         );
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             id,
             csv_escape(&world),
             csv_escape(&datetime_str),
@@ -1176,6 +1223,7 @@ pub fn export_csv(db_path: &Path, out_path: &Path) -> Result<usize, String> {
             csv_escape(&crate::util::strip_ansi_codes(&line_raw)),
             csv_escape(&line_raw),
             wseq,
+            csv_escape(original.as_deref().unwrap_or("")),
         )
         .map_err(|e| format!("write error: {}", e))?;
         count += 1;
@@ -1423,8 +1471,9 @@ mod tests {
         let body = std::fs::read_to_string(&out).expect("read csv");
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(
-            lines[0], "id,world,datetime_local,ts_epoch_ms,gagged,text,raw,wseq",
-            "the header is a user-facing contract: the six original columns, then wseq"
+            lines[0], "id,world,datetime_local,ts_epoch_ms,gagged,text,raw,wseq,original_raw",
+            "the header is a user-facing contract: the six original columns, then wseq, then \
+             original_raw (after 1.7.38), each new one at the end"
         );
         // Sorted by world ASC then wseq ASC: O'Brien, Other, then Zmc's four.
         assert!(lines[1].contains("O'Brien"));
@@ -1560,7 +1609,7 @@ mod tests {
         assert!(ScrollbackDb::search(db.path(), Some("Zmc"), "*", None, None, 10, false).is_empty());
         assert!(query(db.path(), &ArchiveQuery {
             world: Some("Zmc"), pattern: "*", kind: PatternKind::Glob,
-            before_wseq: None, since_ms: None, until_ms: None, limit: 10, newest_first: true,
+            before_wseq: None, since_ms: None, until_ms: None, limit: 10, newest_first: true, original: false,
         }).is_empty());
         assert!(load_before_path(db.path(), "Zmc", 9_999, 10).is_empty());
         assert!(load_before_wseq(db.path(), "Zmc", 999, 10).is_empty());
@@ -1707,7 +1756,7 @@ mod tests {
         let got = query(db.path(), &ArchiveQuery {
             world: Some("Zmc"), pattern: "*dragon*", kind: PatternKind::Glob,
             before_wseq: Some(floor), since_ms: None, until_ms: None,
-            limit: 10_000, newest_first: true,
+            limit: 10_000, newest_first: true, original: false,
         });
         let got_seqs: Vec<i64> = got.iter().filter_map(|l| l.wseq).collect();
         assert_eq!(got_seqs.len(), 500, "exactly the half memory does not cover");
@@ -1729,7 +1778,7 @@ mod tests {
         let got = query(db.path(), &ArchiveQuery {
             world: Some("Zmc"), pattern: "*dragon*", kind: PatternKind::Glob,
             before_wseq: None, since_ms: None, until_ms: None,
-            limit: 10_000, newest_first: true,
+            limit: 10_000, newest_first: true, original: false,
         });
         assert_eq!(got.len(), 50, "with nothing in memory, everything is fair game");
     }
@@ -1741,7 +1790,7 @@ mod tests {
         let newest = query(db.path(), &ArchiveQuery {
             world: Some("Zmc"), pattern: "*dragon*", kind: PatternKind::Glob,
             before_wseq: None, since_ms: None, until_ms: None,
-            limit: 10, newest_first: true,
+            limit: 10, newest_first: true, original: false,
         });
         let seqs_out: Vec<i64> = newest.iter().filter_map(|l| l.wseq).collect();
         assert_eq!(seqs_out, seqs[90..].to_vec(), "the limit must keep the most recent matches");
@@ -1749,7 +1798,7 @@ mod tests {
         let oldest = query(db.path(), &ArchiveQuery {
             world: Some("Zmc"), pattern: "*dragon*", kind: PatternKind::Glob,
             before_wseq: None, since_ms: None, until_ms: None,
-            limit: 10, newest_first: false,
+            limit: 10, newest_first: false, original: false,
         });
         let seqs_old: Vec<i64> = oldest.iter().filter_map(|l| l.wseq).collect();
         assert_eq!(seqs_old, seqs[..10].to_vec(), "and the old ordering is still available");
@@ -1869,7 +1918,7 @@ mod tests {
             let with_fts = query(db.path(), &ArchiveQuery {
                 world: Some("Zmc"), pattern: pat, kind,
                 before_wseq: None, since_ms: None, until_ms: None,
-                limit: 10_000, newest_first: true,
+                limit: 10_000, newest_first: true, original: false,
             });
             // Force the scan path by disabling the gate, then restore it.
             let conn = Connection::open(db.path()).expect("open");
@@ -1878,7 +1927,7 @@ mod tests {
             let scan_only = query(db.path(), &ArchiveQuery {
                 world: Some("Zmc"), pattern: pat, kind,
                 before_wseq: None, since_ms: None, until_ms: None,
-                limit: 10_000, newest_first: true,
+                limit: 10_000, newest_first: true, original: false,
             });
             let conn = Connection::open(db.path()).expect("open");
             meta_set(&conn, "migration_state", "done");
@@ -1938,14 +1987,14 @@ mod tests {
         let hits = query(db.path(), &ArchiveQuery {
             world: Some("Zmc"), pattern: "common word*", kind: PatternKind::Glob,
             before_wseq: None, since_ms: None, until_ms: None,
-            limit: 100_000, newest_first: true,
+            limit: 100_000, newest_first: true, original: false,
         });
         assert_eq!(hits.len() as i64, FTS_SELECTIVITY_CAP + 500);
 
         let rare = query(db.path(), &ArchiveQuery {
             world: Some("Zmc"), pattern: "zebra*", kind: PatternKind::Glob,
             before_wseq: None, since_ms: None, until_ms: None,
-            limit: 100, newest_first: true,
+            limit: 100, newest_first: true, original: false,
         });
         assert_eq!(rare.len(), 1, "a selective term still finds its row through the index");
     }
@@ -1984,7 +2033,7 @@ mod tests {
         let hits = query(db.path(), &ArchiveQuery {
             world: Some("Zmc"), pattern: "a wandering*", kind: PatternKind::Glob,
             before_wseq: None, since_ms: None, until_ms: None,
-            limit: 10, newest_first: true,
+            limit: 10, newest_first: true, original: false,
         });
         assert_eq!(hits.len(), 1, "the write path must index as it inserts, not on a later rebuild");
     }
