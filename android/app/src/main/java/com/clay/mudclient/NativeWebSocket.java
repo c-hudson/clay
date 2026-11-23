@@ -412,6 +412,17 @@ public class NativeWebSocket {
             }
         }
 
+        /** 32 ASCII hex digits: what a login challenge was, never what a knock nonce is. */
+        static boolean couldBeLoginChallenge(byte[] nonce) {
+            for (byte b : nonce) {
+                boolean hex = (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F');
+                if (!hex) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         private void performKnock() throws IOException {
             OutputStream out = getOutputStream();
             DataInputStream in = new DataInputStream(getInputStream());
@@ -427,6 +438,15 @@ public class NativeWebSocket {
                 throw new IOException("bad knock challenge magic");
             }
             byte[] challenge = Arrays.copyOfRange(challengeMsg, 2, 34);
+            // Never answer a nonce that could be a login challenge (32 ASCII hex digits,
+            // what ServerHello.challenge was until 1.7.40): the answer below is the same
+            // hash the WebSocket login takes, and this goes out before TLS, so whoever
+            // sent it could log in with it (src/http.rs knock_nonce_could_be_login_challenge).
+            // A real nonce is 32 random bytes; no server sends one that is all hex.
+            if (couldBeLoginChallenge(challenge)) {
+                Log.w(TAG, "KNOCK-RELAY-REFUSED: the knock challenge is a login challenge; not answered");
+                throw new IOException("knock challenge looks like a login challenge");
+            }
 
             // C->S RESPONSE: raw SHA256(auth_key_utf8 || challenge)
             byte[] digest;

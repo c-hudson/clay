@@ -153,7 +153,7 @@ impl ClayView {
                 let current = self.session.core.current;
                 self.open_worlds(super::windows::worlds::Show::Edit(current), cx);
             }
-            "setup" | "web" | "font" => self.open_settings(super::windows::settings::Tab::from_name(name), cx),
+            "setup" | "web" | "font" | "server" => self.open_settings(super::windows::settings::Tab::from_name(name), cx),
             "notes" => self.open_notes(cx),
             "notes-list" => self.open_notes_list(cx),
             "new-window" => self.open_world_window(None, cx),
@@ -338,7 +338,7 @@ impl ClayView {
                 return;
             }
             self.stash_input_for_relaunch();
-            let args = crate::platform::attached_switch_args(std::env::args().skip(1).collect(), UiKind::Console);
+            let args = crate::platform::attached_switch_args(crate::clientconf::launch_args(), UiKind::Console);
             if let Err(e) = crate::platform::exec_with_args(args) {
                 self.client_line(&format!("% Couldn't start again: {e}"), cx);
             }
@@ -358,7 +358,7 @@ impl ClayView {
             self.send_message(WsMessage::SendCommand { world_index, command: "/reload".into() }, cx);
             return;
         }
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = crate::clientconf::launch_args();
         let args = match target {
             Some(t) => relaunch_args(&args, t),
             None => args,
@@ -371,7 +371,7 @@ impl ClayView {
     /// `/update`, this GUI's own half (src/selfupdate.rs): the server's is over. When
     /// the server's install already replaced this binary (same machine, same file)
     /// there is nothing to download - just the restart.
-    pub(super) fn self_update(&mut self, force: bool, cx: &mut Context<Self>) {
+    pub(super) fn self_update(&mut self, want: crate::selfupdate::UpdateWant, cx: &mut Context<Self>) {
         const LABEL: &str = "This GUI";
         let attached = self.session.target.key();
         if crate::selfupdate::exe_replaced() {
@@ -381,7 +381,7 @@ impl ClayView {
         }
         #[cfg(target_os = "android")]
         {
-            let _ = force;
+            let _ = want;
             self.client_line(&crate::selfupdate::unavailable(LABEL), cx);
         }
         #[cfg(not(target_os = "android"))]
@@ -397,7 +397,7 @@ impl ClayView {
                     let _ = found_tx.send(version);
                     std::future::ready(())
                 };
-                let _ = tx.send(crate::platform::check_and_download_update(force, found).await);
+                let _ = tx.send(crate::platform::check_and_download_update(want, found).await);
             });
             cx.spawn(async move |this, cx| {
                 // A newer release, downloading (dropped unsent when there is none).
@@ -548,7 +548,7 @@ impl ClayView {
     /// that failed.
     fn restart_now(&mut self, cx: &mut Context<Self>) {
         self.stash_input_for_relaunch();
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = crate::clientconf::launch_args();
         if let Err(e) = crate::platform::exec_with_args(args) {
             self.client_line(&format!("% Couldn't start again: {e}"), cx);
         }
@@ -604,11 +604,13 @@ impl ClayView {
 
     /// `/server ...` (app.js sendCommand's remote-GUI branch): attach to another Clay,
     /// asked twice within 15 seconds; `--cancel` forgets the first. The native GUI only
-    /// ever attaches, so there's no `--close` (become a server) here.
+    /// ever attaches, so there's no `--close` (become a server) here. Bare, the Server
+    /// page: this machine's default server.
     pub(super) fn server_command(&mut self, args: &[&str], cx: &mut Context<Self>) {
         const CONFIRM_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
         match args {
-            [] => self.client_line("Usage: /server host:port  (or)  /server host port  (or)  /server --cancel", cx),
+            // This machine's default server (src/clientconf.rs).
+            [] => self.open_settings(super::windows::settings::Tab::Server, cx),
             ["--close", ..] => self.client_line("The native GUI only attaches to a running Clay, so /server --close isn't available here.", cx),
             ["--cancel", ..] => {
                 let had = self.surf.pending_server.take().is_some();
@@ -995,6 +997,18 @@ impl ClayView {
             return;
         }
         let Some(edit) = self.session.core.settings.clone() else {
+            // The Server page is this machine's (src/clientconf.rs), not the server's: it
+            // opens on its own while there's no connection - a default server that can't
+            // be reached is put right here.
+            if tab == Tab::Server {
+                self.open_window(
+                    Win::Server,
+                    move |main, window, cx| cx.new(|cx| super::windows::server::ServerView::new(main, window, cx)),
+                    move |_view, _window, _cx| {},
+                    cx,
+                );
+                return;
+            }
             self.client_line("% Settings are available once connected.", cx);
             return;
         };

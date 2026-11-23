@@ -425,6 +425,14 @@ pub fn serialize_settings_for_export(app: &App) -> String {
 /// When `plaintext_secrets` is true, passwords/tokens are written in cleartext instead of
 /// their encrypted-at-rest form — see `serialize_settings_for_export`. Shared so the two
 /// callers can never drift apart on which fields are considered secret.
+/// settings.dat's text for `app`, for tests elsewhere that check what it holds.
+#[cfg(test)]
+pub(crate) fn settings_to_string_for_test(app: &App) -> String {
+    let mut out = Vec::new();
+    write_settings_dat(app, &mut out, true).expect("write");
+    String::from_utf8(out).unwrap()
+}
+
 fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) -> io::Result<()> {
     let secret = |s: &str| -> String {
         if plaintext_secrets { s.to_string() } else { encrypt_password(s) }
@@ -542,6 +550,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     }
     writeln!(file, "announce_screen_reader={}", app.settings.announce_screen_reader)?;
     writeln!(file, "status_panel={}", app.settings.status_panel)?;
+    writeln!(file, "update_newest={}", app.settings.update_newest)?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
     for (key, place) in &app.settings.icon_bar_profiles {
         writeln!(file, "icon_bar.{key}={}", place.name())?;
@@ -777,8 +786,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
 
 /// Parse just the `[global]` section of a settings.dat-style file into a key->value map
 /// of raw strings, for the debug-mode audit-log diff in `save_settings_to_path_with_source`.
-/// Returns an empty map if the file doesn't exist or has no `[global]` section.
-fn read_global_section(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+/// Returns an empty map if the file doesn't exist or has no `[global]` section. Also how
+/// `clay --upgrade` reads one setting with no `App` (`selfupdate::upgrade_cli`).
+pub(crate) fn read_global_section(path: &std::path::Path) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -1332,6 +1342,7 @@ pub fn load_settings_from_str_reporting(app: &mut App, content: &str) -> Vec<Str
                         crate::telnet::set_announce_screen_reader(app.settings.announce_screen_reader);
                     }
                     "status_panel" => app.settings.status_panel = value == "true",
+                    "update_newest" => app.settings.update_newest = value == "true",
                     "icon_bar" => {
                         app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
@@ -1771,6 +1782,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     }
     writeln!(file, "announce_screen_reader={}", app.settings.announce_screen_reader)?;
     writeln!(file, "status_panel={}", app.settings.status_panel)?;
+    writeln!(file, "update_newest={}", app.settings.update_newest)?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
     for (key, place) in &app.settings.icon_bar_profiles {
         writeln!(file, "icon_bar.{key}={}", place.name())?;
@@ -2863,6 +2875,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         crate::telnet::set_announce_screen_reader(app.settings.announce_screen_reader);
                     }
                     "status_panel" => app.settings.status_panel = value == "true",
+                    "update_newest" => app.settings.update_newest = value == "true",
                     "icon_bar" => {
                         app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
@@ -3488,6 +3501,7 @@ mod tests {
             screen_reader_profiles: [("browser-windows".to_string(), true), ("app-android".to_string(), false)].into_iter().collect(), // default: empty
             announce_screen_reader: true,      // default: false
             status_panel: false,               // default: true
+            update_newest: true,               // default: false
             icon_bar: IconBarMode::All,        // default: AppTablet
             icon_bar_profiles: [
                 ("native-linux".to_string(), crate::IconBarPlace::Left),
@@ -3640,6 +3654,7 @@ mod tests {
         assert_eq!(a.screen_reader_profiles, b.screen_reader_profiles, "{context}: screen_reader_profiles");
         assert_eq!(a.announce_screen_reader, b.announce_screen_reader, "{context}: announce_screen_reader");
         assert_eq!(a.status_panel, b.status_panel, "{context}: status_panel");
+        assert_eq!(a.update_newest, b.update_newest, "{context}: update_newest");
         assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
         assert_eq!(a.picture_host, b.picture_host, "{context}: picture_host");
         assert_eq!(a.font_profiles, b.font_profiles, "{context}: font_profiles");
@@ -5058,6 +5073,7 @@ pattern=foo
         assert_ne!(non_default.screen_reader_profiles, default.screen_reader_profiles, "screen_reader_profiles should differ");
         assert_ne!(non_default.announce_screen_reader, default.announce_screen_reader, "announce_screen_reader should differ");
         assert_ne!(non_default.status_panel, default.status_panel, "status_panel should differ");
+        assert_ne!(non_default.update_newest, default.update_newest, "update_newest should differ");
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");
         assert_ne!(non_default.icon_bar_profiles, default.icon_bar_profiles, "icon_bar_profiles should differ");
         assert_ne!(non_default.picture_host, default.picture_host, "picture_host should differ");

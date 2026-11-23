@@ -11438,6 +11438,104 @@ third
         assert!(!app.settings.status_panel, "an older client's save leaves it");
     }
 
+    /// Settings' "/update to newest" (user request 2026-11-23): off by default, set by any
+    /// interface's save, sent to clients, left alone by an older client's save - and no
+    /// switch at all for a login that may not update the server.
+    #[test]
+    fn update_to_newest_is_one_setting_that_only_the_servers_operator_sets() {
+        let mut app = App::new();
+        assert!(!app.settings.update_newest, "off by default");
+        assert_eq!(app.build_global_settings_msg().update_newest, Some(false));
+        save_tabs_from(&mut app, "none", crate::websocket::SettingsAdditions { update_newest: Some(true), ..Default::default() });
+        assert!(app.settings.update_newest);
+        assert_eq!(app.build_global_settings_msg().update_newest, Some(true));
+        save_tabs_from(&mut app, "none", Default::default());
+        assert!(app.settings.update_newest, "an older client's save leaves it");
+        save_tabs_from(&mut app, "none", crate::websocket::SettingsAdditions { update_newest: Some(false), ..Default::default() });
+        assert!(!app.settings.update_newest);
+
+        // A clay_multi user: no switch, and a save that names it changes nothing.
+        app.policy = crate::instance::Policy::user();
+        assert_eq!(app.update_newest_shown(), None);
+        assert_eq!(app.build_global_settings_msg().update_newest, None);
+        save_tabs_from(&mut app, "none", crate::websocket::SettingsAdditions { update_newest: Some(true), ..Default::default() });
+        assert!(!app.settings.update_newest);
+
+        // An attached console whose server sent none shows no row and sends none back.
+        let mut console = App::new();
+        let mut from_older = App::new().build_global_settings_msg();
+        from_older.update_newest = None;
+        console.apply_global_settings(&from_older);
+        assert!(!console.update_newest_known && !console.settings.update_newest);
+        assert_eq!(console.update_newest_shown(), None);
+        let mut from_newer = App::new().build_global_settings_msg();
+        from_newer.update_newest = Some(true);
+        console.apply_global_settings(&from_newer);
+        assert!(console.update_newest_known && console.settings.update_newest);
+        assert_eq!(console.update_newest_shown(), Some(true));
+    }
+
+    /// The setting is labelled "/update to newest" (the user's words, 2026-11-23) in every
+    /// interface's General settings: the console's `/setup` row, the native GUI's switch
+    /// and the web page's row all carry `setup::UPDATE_NEWEST_LABEL`.
+    #[test]
+    fn update_to_newest_has_one_label_in_every_interface() {
+        use crate::popup::definitions::setup::{SETUP_FIELD_STATUS_LINE, SETUP_FIELD_UPDATE_NEWEST, UPDATE_NEWEST_LABEL};
+        assert_eq!(UPDATE_NEWEST_LABEL, "/update to newest");
+        let html = include_str!("web/index.html");
+        assert!(html.contains(&format!("<span class=\"setting-label\" id=\"setup-update-newest-label\">{UPDATE_NEWEST_LABEL}</span>")));
+        assert!(html.contains("id=\"setup-update-newest-toggle\""));
+        let js = include_str!("web/app.js");
+        assert!(js.contains("['setup-update-newest-toggle', updateNewestSetting !== null]"), "hidden where the server sent none");
+        assert!(js.contains("update_newest: updateNewestSetting,"), "and sent back only where it is shown");
+        let native = include_str!("native_gui/ui/windows/settings.rs");
+        assert!(native.contains("if let Some(on) = e.update_newest {") && native.contains("setup::UPDATE_NEWEST_LABEL"));
+
+        // The console's row sits after Status Line, only where there is a value to show.
+        let mut app = App::new();
+        app.open_setup_popup_new();
+        let state = app.popup_manager.current().expect("the Setup popup");
+        let ids: Vec<_> = state.definition.fields.iter().map(|f| f.id).collect();
+        let at = ids.iter().position(|id| *id == SETUP_FIELD_UPDATE_NEWEST).expect("the row");
+        assert_eq!(ids[at - 1], SETUP_FIELD_STATUS_LINE);
+        assert_eq!(state.definition.fields[at].label, UPDATE_NEWEST_LABEL);
+        assert_eq!(state.get_bool(SETUP_FIELD_UPDATE_NEWEST), Some(false));
+        // Switched on and saved, the Save carries it.
+        let state = app.popup_manager.current_mut().unwrap();
+        state.select_field(SETUP_FIELD_UPDATE_NEWEST);
+        state.toggle_current();
+        let save = crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), crossterm::event::KeyModifiers::NONE);
+        match handle_new_popup_key(&mut app, save) {
+            NewPopupAction::SetupSaved(settings) => assert_eq!(settings.update_newest, Some(true)),
+            _ => panic!("S saves the Setup popup"),
+        }
+        // No row for a user who can't update the server, and then the Save names nothing.
+        app.policy = crate::instance::Policy::user();
+        app.open_setup_popup_new();
+        let state = app.popup_manager.current().expect("the Setup popup");
+        assert!(state.definition.fields.iter().all(|f| f.id != SETUP_FIELD_UPDATE_NEWEST));
+        match handle_new_popup_key(&mut app, save) {
+            NewPopupAction::SetupSaved(settings) => assert_eq!(settings.update_newest, None),
+            _ => panic!("S saves the Setup popup"),
+        }
+    }
+
+    /// `/update`'s flags, in any order (they were read from the first argument only).
+    #[test]
+    fn test_parse_update_command_flags() {
+        let want = |line: &str| match parse_command(line) {
+            Command::Update { want } => want,
+            other => panic!("Expected Update, got {:?}", other),
+        };
+        use crate::selfupdate::UpdateWant;
+        assert_eq!(want("/update"), UpdateWant { force: false, newest: false });
+        assert_eq!(want("/update -f"), UpdateWant { force: true, newest: false });
+        assert_eq!(want("/update --force"), UpdateWant { force: true, newest: false });
+        assert_eq!(want("/update --newest"), UpdateWant { force: false, newest: true });
+        assert_eq!(want("/update --newest -f"), UpdateWant { force: true, newest: true });
+        assert_eq!(want("/update -f --newest"), UpdateWant { force: true, newest: true });
+    }
+
     /// The map's client messages work the same through both server handlers (their
     /// wildcards would hide a missing arm): a client's MapWatch is answered with the world's
     /// state and its whole area, a picked room with its route, a search with rooms, Walk
@@ -14195,8 +14293,8 @@ third
                     "Every other interface is already paused.".to_string()
                 } else {
                     assert!(ph_told, "B={handler_b}: the phone shows its PAUSED badge");
-                    let console = if handler_b { "" } else { "the console and " };
-                    format!("Paused on: {console}client 9 (Web, 192.168.1.20).")
+                    let console = if handler_b { "" } else { "Console, " };
+                    format!("Paused on: {console}192.168.1.20")
                 };
                 assert!(said.iter().any(|l| l.starts_with(&reply)), "B={handler_b} round {round}: {said:?}");
             }
@@ -14218,11 +14316,11 @@ third
         let _a = tts_test_client(&server, 3);
         let _b = tts_test_client(&server, 4);
         app.ws_server = Some(server);
-        assert_eq!(app.pause_other_interfaces(None), "Paused on: client 3 (Web, 192.168.1.20) and client 4 (Web, 192.168.1.20).");
+        assert_eq!(app.pause_other_interfaces(None), "Paused on: 192.168.1.20, 192.168.1.20");
         assert!(!app.console_paused, "the console typed it");
 
-        // Three or more are a list with "and" before the last (the user's wording
-        // 2026-11-16: "Paused on: x, x, and x."); a client asked, so the console is one.
+        // Each is listed with commas between, the console as Console and a client by its
+        // address alone (user request 2026-11-19); a client asked, so the console is one.
         let mut app = App::new();
         app.worlds.clear();
         app.worlds.push(World::new("A"));
@@ -14235,7 +14333,7 @@ third
         }
         assert_eq!(
             app.pause_other_interfaces(Some(3)),
-            "Paused on: the console, client 4 (Web, 192.168.1.20), and client 5 (Web, 192.168.1.20)."
+            "Paused on: Console, 192.168.1.20, 192.168.1.20"
         );
     }
 
@@ -25457,4 +25555,120 @@ fn app_js_leaves_a_hidden_shell_world_out_like_the_server() {
     assert!(css.contains(".world-editor-modal-content.we-shell [data-we-nav=\"login\"],"));
     assert!(css.contains(".world-editor-modal-content.we-shell .we-section[data-we-section=\"options\"] {"));
     assert!(include_str!("web/index.html").contains("<div id=\"world-edit-hide-toggle\" class=\"toggle\"></div>"));
+}
+
+/// A bare /server (user request 2026-11-21) opens the console's Server popup; its Save
+/// writes this machine's client.dat (src/clientconf.rs), the password encrypted, and
+/// nothing of it reaches settings.dat. `/server host` still asks to confirm.
+#[tokio::test]
+async fn the_console_server_popup_saves_this_machines_default_server() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use popup::definitions::server::{SERVER_BTN_SAVE, SERVER_FIELD_HOST, SERVER_FIELD_PASSWORD, SERVER_FIELD_PORT, SERVER_POPUP_ID};
+    let _lock = crate::clientconf::FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let file = crate::clay_config_path(crate::clientconf::FILE);
+    let _ = std::fs::remove_file(&file);
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("A"));
+    app.is_master = true;
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(10);
+    let _ = commands::handle_command("/server", &mut app, event_tx.clone()).await;
+    let state = app.popup_manager.current_mut().expect("the Server popup");
+    assert_eq!(state.definition.id, SERVER_POPUP_ID);
+    assert_eq!(state.get_text(SERVER_FIELD_HOST), Some(""), "no default server yet");
+    state.set_text(SERVER_FIELD_HOST, "mud.example".into());
+    state.set_text(SERVER_FIELD_PORT, "4000".into());
+    state.set_text(SERVER_FIELD_PASSWORD, "pw-in-the-clear".into());
+    state.select_button(SERVER_BTN_SAVE);
+    crate::input_handler::handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.popup_manager.current().is_none(), "saved and closed");
+    let conf = crate::clientconf::ClientConf::load();
+    assert_eq!(conf.default_server(), Some("mud.example:4000"));
+    assert_eq!(conf.login_for("mud.example:4000").and_then(|l| l.password().map(str::to_string)).as_deref(), Some("pw-in-the-clear"));
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert!(!on_disk.contains("pw-in-the-clear"), "{on_disk}");
+    assert!(app.worlds[0].output_lines.iter().any(|l| l.text.contains("now attaches to mud.example:4000")));
+    let dat = crate::persistence::settings_to_string_for_test(&app);
+    assert!(!dat.contains("mud.example"), "settings.dat holds none of it");
+    // A bad port keeps the popup open and says why.
+    let _ = commands::handle_command("/server", &mut app, event_tx.clone()).await;
+    let state = app.popup_manager.current_mut().unwrap();
+    assert_eq!(state.get_text(SERVER_FIELD_HOST), Some("mud.example"), "the page as saved");
+    state.set_text(SERVER_FIELD_PORT, "x".into());
+    state.select_button(SERVER_BTN_SAVE);
+    crate::input_handler::handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.popup_manager.current().and_then(|s| s.error.clone()).is_some_and(|e| e.contains("not a port")));
+    app.popup_manager.close_all();
+    // /server host is the attach it was, asked twice.
+    let _ = commands::handle_command("/server other.example", &mut app, event_tx).await;
+    assert!(app.worlds[0].output_lines.iter().any(|l| l.text.contains("again within 15s to confirm")));
+    let _ = std::fs::remove_file(&file);
+}
+
+/// /setup has this machine's Preferred Interface (src/clientconf.rs), offering only what
+/// can run here, and its Save writes client.dat only when it was changed.
+#[test]
+fn the_console_setup_has_this_machines_preferred_interface() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use popup::definitions::setup::{SETUP_BTN_SAVE, SETUP_FIELD_PREFERRED_INTERFACE};
+    let _lock = crate::clientconf::FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let file = crate::clay_config_path(crate::clientconf::FILE);
+    let _ = std::fs::remove_file(&file);
+    let mut app = App::new();
+    app.worlds.clear();
+    app.worlds.push(World::new("A"));
+    app.open_setup_popup_new();
+    let state = app.popup_manager.current_mut().unwrap();
+    let field = state.field(SETUP_FIELD_PREFERRED_INTERFACE).expect("Preferred Interface");
+    let offered: Vec<String> = match &field.kind {
+        popup::FieldKind::Select { options, .. } => options.iter().map(|o| o.value.clone()).collect(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(offered.first().map(String::as_str), Some("tui"), "the TUI is always offered");
+    let expect: Vec<&str> = crate::clientconf::offered().iter().map(|i| i.name()).collect();
+    assert_eq!(offered, expect);
+    // Saved unchanged: nothing written.
+    state.select_button(SETUP_BTN_SAVE);
+    crate::input_handler::handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(!file.exists() || crate::clientconf::ClientConf::load().preferred.is_none(), "an unchanged choice writes nothing");
+    let _ = std::fs::remove_file(&file);
+}
+
+/// app.js's WebView GUI side of this machine's choices (src/clientconf.rs): the Server tile
+/// and Preferred Interface only with CLIENT_CONF, the app's own rows hidden, Save through
+/// the `client-conf:` IPC, the saved auth key tried first.
+#[test]
+fn app_js_keeps_this_machines_server_page_on_this_machine() {
+    let js = include_str!("web/app.js");
+    for part in [
+        "const CLIENT_CONF = (window.CLIENT_CONF && typeof window.CLIENT_CONF === 'object') ? window.CLIENT_CONF : null;",
+        "clayServerTabBtn.style.display = (isAndroid || CLIENT_CONF) ? '' : 'none';",
+        "elements.settingsClayServerSection.classList.toggle('cs-desktop', !isAndroid && !!CLIENT_CONF);",
+        "sendIpc('client-conf:' + JSON.stringify(msg));",
+        "if (!saveClientConf()) return;",
+        // The page is never given a saved secret, sends one only when typed, and sends
+        // the Server page only when its tab was opened (security review 2026-11-21).
+        "set('cs-password', '');",
+        "set('cs-auth-key', '');",
+        "var server = null;",
+        "if (desktopServerLoaded) {",
+        "password: typedPassword === '' ? null : typedPassword,",
+        "authKey: typedKey === '' ? null : typedKey,",
+        "forget: desktopServerForget",
+        "if (inherited && typeof inherited.authKey === 'string' && inherited.authKey !== '' && !authKey) {",
+        "appendClientLine(SERVER_PAGE_ELSEWHERE);",
+    ] {
+        assert!(js.contains(part), "app.js no longer has {part:?}");
+    }
+    let css = include_str!("web/style.css");
+    assert!(css.contains("#settings-clay-server.cs-desktop .cs-android-only { display: none !important; }"));
+    let html = include_str!("web/index.html");
+    assert!(html.contains("<select id=\"setup-preferred-interface-select\" class=\"form-select\"></select>"));
+    for id in ["cs-host", "cs-port", "cs-username", "cs-password", "cs-auth-key", "cs-forget-btn"] {
+        assert!(html.contains(&format!("id=\"{id}\"")), "{id}");
+    }
+    // Nothing in the page reads a stored secret out of CLIENT_CONF.
+    for gone in ["sv.password", "sv.authKey", "CLIENT_CONF.server.password", "CLIENT_CONF.server.authKey"] {
+        assert!(!js.contains(gone), "app.js still reads {gone}");
+    }
 }

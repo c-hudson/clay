@@ -75,7 +75,17 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
     #[cfg(target_os = "linux")]
     let gpu = gpu.unwrap_or_else(|| std::thread::spawn(gpu_plan));
     // An auth key to use instead of the one remembered for this server (scripts, tests).
-    let auth_key = std::env::var("CLAY_AUTH_KEY").ok().filter(|k| !k.is_empty());
+    let mut auth_key = std::env::var("CLAY_AUTH_KEY").ok().filter(|k| !k.is_empty());
+    // Neither variable given: the login this machine saved for the server, if any
+    // (src/clientconf.rs, Settings > Server) - the default server's, or any other's.
+    let mut username = None;
+    if !local && !ssh && password.is_none() && auth_key.is_none() {
+        if let Some(login) = crate::clientconf::ClientConf::load().login_for(&target.key()) {
+            username = login.username().map(str::to_string);
+            password = login.password().map(str::to_string);
+            auth_key = login.auth_key().map(str::to_string);
+        }
+    }
     // WebKitGTK blends text linearly; GPUI's Linux renderer defaults to gamma 1.8, which
     // measured 15% heavier than the WebView. 1.0 matches it to within 2%.
     #[cfg(target_os = "linux")]
@@ -101,7 +111,7 @@ pub fn run(target: Option<String>, snapshot: Option<String>, verify: Option<u64>
     #[cfg(target_os = "macos")]
     disable_font_smoothing();
     ui::emoji::init(runtime.clone());
-    let (session, events) = core::session::Session::new(&runtime, target, password, auth_key);
+    let (session, events) = core::session::Session::with_credentials(&runtime, target, core::client::Credentials { username, password, auth_key });
     if let Some(secs) = verify {
         std::process::exit(core::verify::run(session, events, secs));
     }

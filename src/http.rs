@@ -677,6 +677,32 @@ pub(crate) fn knock_expected_response(key: &str, challenge: &[u8; 32]) -> [u8; 3
     hasher.finalize().into()
 }
 
+/// Whether a knock nonce could be a WebSocket login challenge: 32 ASCII hex digits, which
+/// is what `ServerHello.challenge` was until 1.7.40. **A client must never answer one**
+/// (security review 2026-11-21): the knock's answer is `SHA256(key || nonce)` and the
+/// login's is `hex(SHA256(key || challenge))`, the same hash over the same 32 bytes, and
+/// the knock goes out before TLS - so anyone on the network path could read a server's
+/// login challenge, hand it to a client as the knock nonce, and log in with the answer,
+/// the certificate pin never coming into it. A real nonce is 32 random bytes (all hex
+/// about once in 2^128, and the server never sends one that is: `knock_nonce`). The
+/// server's half of the fix is the login challenge's length (`websocket::LOGIN_CHALLENGE_BYTES`):
+/// 64 characters, which no 32-byte nonce can spell.
+pub(crate) fn knock_nonce_could_be_login_challenge(nonce: &[u8; 32]) -> bool {
+    nonce.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// A knock nonce: 32 random bytes that a client's `knock_nonce_could_be_login_challenge`
+/// check never refuses. `None`: the random source failed.
+fn knock_nonce() -> Option<[u8; 32]> {
+    let mut nonce = [0u8; 32];
+    loop {
+        getrandom::getrandom(&mut nonce).ok()?;
+        if !knock_nonce_could_be_login_challenge(&nonce) {
+            return Some(nonce);
+        }
+    }
+}
+
 /// Outcome of `run_knock_handshake`.
 enum KnockOutcome {
     Success,
@@ -711,12 +737,11 @@ async fn run_knock_handshake(
         return KnockOutcome::Fail;
     }
 
-    let mut challenge = [0u8; 32];
-    if getrandom::getrandom(&mut challenge).is_err() {
+    let Some(challenge) = knock_nonce() else {
         log_remote_event("KNOCK-FAIL", client_ip, "rng failure");
         gate.strike(client_ip, "knock-rng-failure").await;
         return KnockOutcome::Fail;
-    }
+    };
     let mut challenge_msg = [0u8; 34];
     challenge_msg[0..2].copy_from_slice(&KNOCK_CHALLENGE_MAGIC);
     challenge_msg[2..34].copy_from_slice(&challenge);
@@ -2465,6 +2490,42 @@ mod knock_tests {
         let challenge = [0x01u8; 32];
         let digest = knock_expected_response("testkey", &challenge);
         assert_eq!(digest, TESTKEY_CHALLENGE_ALL_ONES_DIGEST);
+    }
+
+    /// The knock relay (security review 2026-11-21) and its two fixes. The flaw: a knock's
+    /// answer over a 32-character login challenge IS that challenge's login answer, and
+    /// the knock goes out before TLS. So a client never answers such a nonce, and a
+    /// server's login challenge is 64 characters, which no 32-byte nonce can spell.
+    #[test]
+    fn a_knock_answer_can_no_longer_be_a_login_answer() {
+        use crate::websocket::{hash_with_challenge, new_login_challenge};
+        // What a server sent as its login challenge until 1.7.40.
+        let old_challenge = "0123456789abcdef0123456789abcdef";
+        let as_nonce: [u8; 32] = old_challenge.as_bytes().try_into().unwrap();
+        assert_eq!(
+            hex::encode(knock_expected_response("the-key", &as_nonce)),
+            hash_with_challenge("the-key", old_challenge),
+            "the flaw: the same hash over the same bytes"
+        );
+        // The client's half: such a nonce is never answered (native net.rs `knock`,
+        // Android KnockSocket.couldBeLoginChallenge).
+        assert!(knock_nonce_could_be_login_challenge(&as_nonce));
+        let upper: [u8; 32] = old_challenge.to_uppercase().as_bytes().try_into().unwrap();
+        assert!(knock_nonce_could_be_login_challenge(&upper));
+        assert!(!knock_nonce_could_be_login_challenge(&[7u8; 32]));
+        let mut one_off = as_nonce;
+        one_off[31] = b'g';
+        assert!(!knock_nonce_could_be_login_challenge(&one_off));
+        // The server's half: its nonce is never one a client refuses, and its login
+        // challenge is twice a nonce's length, so no nonce's answer is its answer.
+        for _ in 0..200 {
+            assert!(!knock_nonce_could_be_login_challenge(&knock_nonce().unwrap()));
+        }
+        let challenge = new_login_challenge().unwrap();
+        assert_eq!(challenge.len(), 64);
+        assert!(challenge.bytes().all(|b| b.is_ascii_hexdigit()));
+        let prefix: [u8; 32] = challenge.as_bytes()[..32].try_into().unwrap();
+        assert_ne!(hex::encode(knock_expected_response("the-key", &prefix)), hash_with_challenge("the-key", &challenge));
     }
 
     #[test]

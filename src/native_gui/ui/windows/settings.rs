@@ -1,5 +1,7 @@
-//! The Settings window (app.js `openSettingsPopup`): General, Web and Font tabs and one
-//! Save, plus the sidebar's links to the Theme, Keybind and Action editors.
+//! The Settings window (app.js `openSettingsPopup`): General, Web, Font and Server tabs and
+//! one Save, plus the sidebar's links to the Theme, Keybind and Action editors.
+//! - Server (windows/server.rs) and General's Preferred Interface are this machine's
+//!   (src/clientconf.rs): Save writes them to its client.dat, never to the server.
 //! - It edits a copy of the settings and sends it back with one `UpdateGlobalSettings`
 //!   (the password is never in that copy: blank means unchanged, as app.js sends it).
 //! - The Font tab previews on the main window as it goes; Cancel puts the saved font
@@ -30,6 +32,8 @@ pub enum Tab {
     General,
     Web,
     Font,
+    /// This machine's default server (windows/server.rs).
+    Server,
 }
 
 impl Tab {
@@ -38,6 +42,7 @@ impl Tab {
         match name {
             "web" => Tab::Web,
             "font" => Tab::Font,
+            "server" => Tab::Server,
             _ => Tab::General,
         }
     }
@@ -47,6 +52,7 @@ impl Tab {
             Tab::General => "General",
             Tab::Web => "Web",
             Tab::Font => "Font",
+            Tab::Server => "Server",
         }
     }
 }
@@ -121,6 +127,13 @@ pub struct SettingsView {
     reveal_before: String,
     port_mode: Pick,
     custom_cert: Pick,
+    /// Preferred Interface (src/clientconf.rs): the interfaces this machine can start in,
+    /// and what it showed - Save writes client.dat only when that was changed.
+    preferred: Pick,
+    preferred_shown: crate::clientconf::Interface,
+    /// The Server tab (windows/server.rs) and why its Save failed.
+    server: super::server::ServerForm,
+    server_error: Option<String>,
     transparency: Entity<SliderState>,
     fields: Fields,
     fonts: Vec<(String, String, bool)>,
@@ -217,6 +230,10 @@ impl SettingsView {
         // Text Reveal: this GUI's own value; picking its Custom entry asks for the number.
         let reveal_value = edit.text_reveal_profiles.get(key).cloned().unwrap_or_else(|| "off".to_string());
         let text_reveal = Self::reveal_pick(&reveal_value, window, cx);
+        let preferred_shown = crate::clientconf::shown_preference(&crate::clientconf::ClientConf::load());
+        let offered: Vec<(&str, &str)> = crate::clientconf::offered().into_iter().map(|i| (i.name(), i.label())).collect();
+        let preferred = Pick::new(&offered, preferred_shown.name(), window, cx);
+        let server = super::server::ServerForm::new(window, cx);
         subs.push(cx.subscribe_in(&text_reveal.state, window, |this, _, _: &SelectEvent<Vec<SharedString>>, window, cx| this.text_reveal_changed(window, cx)));
         let v = Self {
             world_switch: Pick::new(&[("Unseen First", "Unseen First"), ("Alphabetical", "Alphabetical")], &edit.world_switch_mode, window, cx),
@@ -248,6 +265,10 @@ impl SettingsView {
             reveal_before: reveal_value,
             port_mode: Pick::new(&[("disabled", "Disabled"), ("9000", "9000"), ("custom", "Custom")], port_mode, window, cx),
             custom_cert: Pick::new(&[("no", "No"), ("yes", "Yes")], if edit.tls_configured { "yes" } else { "no" }, window, cx),
+            preferred,
+            preferred_shown,
+            server,
+            server_error: None,
             main,
             focus: cx.focus_handle(),
             tab,
@@ -410,7 +431,32 @@ impl SettingsView {
         let _ = self.main.update(cx, |v, cx| v.preview_settings(Some(edit), cx));
     }
 
+    /// This machine's half of Save (src/clientconf.rs): the Server tab and Preferred
+    /// Interface to client.dat. `Err` keeps the window open on the Server tab.
+    fn save_this_machine(&mut self, cx: &mut Context<Self>) -> Result<Option<String>, String> {
+        let said = self.server.save(cx)?;
+        if let Some(chosen) = crate::clientconf::Interface::from_name(&self.preferred.value(cx)) {
+            let mut conf = crate::clientconf::ClientConf::load();
+            if crate::clientconf::save_preference(&mut conf, self.preferred_shown, chosen) {
+                conf.save()?;
+            }
+        }
+        Ok(said)
+    }
+
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.save_this_machine(cx) {
+            Ok(Some(said)) => {
+                let _ = self.main.update(cx, |v, cx| v.client_line(&said, cx));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.server_error = Some(e);
+                self.tab = Tab::Server;
+                cx.notify();
+                return;
+            }
+        }
         let multiuser = self.main.upgrade().is_some_and(|m| m.read(cx).session.core.is_multiuser());
         let (problem, blocks) = self.web_problem(cx);
         if !multiuser && blocks {
@@ -498,6 +544,7 @@ impl SettingsView {
             Tab::General => "setup",
             Tab::Web => "web",
             Tab::Font => "font",
+            Tab::Server => "server",
         };
         let main = self.main.clone();
         dialogs::open_help(self, main, key, window, cx);
@@ -587,6 +634,11 @@ impl SettingsView {
         if let Some(on) = e.status_panel {
             switches.push(("Status Panel", on, |s| s.status_panel = s.status_panel.map(|on| !on)));
         }
+        // "/update to newest": every update takes the newest release of any kind. The
+        // server's own setting; none from a server before it or one this login may not update.
+        if let Some(on) = e.update_newest {
+            switches.push((crate::popup::definitions::setup::UPDATE_NEWEST_LABEL, on, |s| s.update_newest = s.update_newest.map(|on| !on)));
+        }
         let left = div().flex_none().flex().flex_col().children(switches.into_iter().map(|(label, on, flip)| {
             row(k, label, k.toggle(label, on, cx.listener(move |this, _, _w, cx| {
                 flip(&mut this.edit);
@@ -605,6 +657,7 @@ impl SettingsView {
             .child(row(k, "Icon Bar", self.icon_bar.view()))
             .child(row(k, "Picture Host", self.picture_host.view()))
             .child(row(k, "Separator Style", self.separator.view()))
+            .child(row(k, "Preferred Interface", self.preferred.view()))
             .child(row(k, "New Indicator", self.new_indicator.view()))
             .child(row(k, "Text Reveal", self.text_reveal.view()));
         // Two cards: the values, then the switches and the remaining choices.
@@ -889,6 +942,7 @@ impl Render for SettingsView {
             .child(tab_btn(Tab::General, "set-general", cx))
             .child(tab_btn(Tab::Web, "set-web", cx))
             .child(tab_btn(Tab::Font, "set-font", cx))
+            .child(tab_btn(Tab::Server, "set-server", cx))
             .child(k.sidebar_divider())
             .child(link("settings-theme", "Theme", "set-theme", "theme-editor", cx))
             .child(link("settings-keybind", "Keybind", "set-keybind", "keybind-editor", cx))
@@ -897,6 +951,7 @@ impl Render for SettingsView {
             Tab::General => self.general(&k, cx),
             Tab::Web => self.web(&k, cx),
             Tab::Font => self.font(&k, cx),
+            Tab::Server => self.server.view(&k, self.server_error.as_deref()),
         };
         div()
             .id("settings-window")

@@ -1589,6 +1589,11 @@ body.desktop-input #menu-dropdown .menu-item[data-action="emoji_picker"] { displ
 /* Settings > Clay Server, Run on This Phone: Allow Other Devices' note and error. */
 .cs-lan-note { padding: 2px 0 4px; font-size: 0.78em; opacity: 0.85; text-align: left; }
 .cs-lan-error { padding: 2px 0 4px; font-size: 0.78em; color: var(--error-color); text-align: left; }
+/* The WebView GUI's Server page (window.CLIENT_CONF, src/clientconf.rs): this machine's
+   default server - Host, Port, Username, Password, Auth Key and nothing of the app's own. */
+#settings-clay-server.cs-desktop .cs-android-only { display: none !important; }
+#settings-clay-server:not(.cs-desktop) .cs-desktop-only { display: none !important; }
+#cs-desktop-note { padding: 6px 0 2px; font-size: 0.78em; opacity: 0.85; text-align: left; }
 
 /* ─── Size popup ───
    The output's size in characters (80x24), in the middle of the window while it is

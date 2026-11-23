@@ -90,6 +90,9 @@ enum WvEvent {
     Badge { count: usize, from: tao::window::WindowId },
     /// `/notify`, from the page that got it (every window's page does).
     Notify { title: String, message: String, from: tao::window::WindowId },
+    /// A page's `client-conf:` (this machine's Server page and Preferred Interface, as
+    /// JSON): taken only from the Settings window, whose it is.
+    ClientConf { payload: String, from: tao::window::WindowId },
 }
 
 use crate::theme::ThemeFile;
@@ -140,9 +143,90 @@ fn parse_new_window_payload(rest: &str) -> (Option<String>, Option<InheritedAuth
 /// JSON is a valid JS literal; `<`, U+2028 and U+2029 are escaped as well so
 /// a password containing `</script>` can't end the inline script block.
 fn inherited_auth_js(auth: &InheritedAuth) -> String {
-    let json = serde_json::json!({ "password": auth.password, "username": auth.username }).to_string();
-    let json = json.replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
-    format!("window.INHERITED_AUTH = {};", json)
+    format!("window.INHERITED_AUTH = {};", js_json(&serde_json::json!({ "password": auth.password, "username": auth.username })))
+}
+
+/// JS statement that hands the login saved for the server (src/clientconf.rs) to the main
+/// window's app.js, as `inherited_auth_js` does a parent's - with the auth key too, which
+/// the page tries first. Escaped the same way.
+fn saved_login_js(login: &crate::clientconf::ServerLogin) -> String {
+    format!("window.INHERITED_AUTH = {};", js_json(&serde_json::json!({
+        "password": login.password,
+        "username": login.username,
+        "authKey": login.auth_key,
+    })))
+}
+
+/// JS statement that hands this machine's start-up choices (src/clientconf.rs) to a page:
+/// the interfaces Preferred Interface offers and the one it shows, and the Server page
+/// (the default server and its user name). **Never the stored password or auth key**
+/// (security review 2026-11-21): every window's page gets this, a window showing another
+/// server's text among them, so the page is told only whether each is saved and its
+/// fields stay blank ("leave blank to keep", as the Web tab's password). The Settings
+/// window saves back with `client-conf:` (`save_client_conf_from_page`); nothing of it is
+/// ever sent to the server.
+fn client_conf_js() -> String {
+    let conf = crate::clientconf::ClientConf::load();
+    let page = conf.server_page();
+    let interfaces: Vec<serde_json::Value> = crate::clientconf::offered().into_iter()
+        .map(|i| serde_json::json!({ "value": i.name(), "label": i.label() }))
+        .collect();
+    format!("window.CLIENT_CONF = {};", js_json(&serde_json::json!({
+        "interfaces": interfaces,
+        "preferred": crate::clientconf::shown_preference(&conf).name(),
+        "server": {
+            "host": page.host,
+            "port": page.port,
+            "username": page.username,
+            "hasPassword": !page.password.is_empty(),
+            "hasAuthKey": !page.auth_key.is_empty(),
+        },
+    })))
+}
+
+/// The Settings window's Save of the Server tab and Preferred Interface (`client-conf:` +
+/// JSON `{server, preferred, shown}`): written to this machine's client.dat, the
+/// preference only when the page changed it. `server` is `null` when the Server tab was
+/// never opened (nothing of it changes - a Save from General must not clear the default
+/// server), else `{host, port, username, password, authKey, forget}`: a `null` password
+/// or key is one the page didn't type and stays as saved for that same server
+/// (`ClientConf::set_server_page_edit`); `forget` drops what is saved for it.
+fn save_client_conf_from_page(json: &str) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let text = |o: &serde_json::Value, k: &str| o[k].as_str().unwrap_or("").to_string();
+    let mut conf = crate::clientconf::ClientConf::load();
+    if v["server"].is_object() {
+        let s = &v["server"];
+        conf.set_server_page_edit(&crate::clientconf::ServerPageEdit {
+            host: text(s, "host").trim().to_string(),
+            port: text(s, "port").trim().to_string(),
+            username: text(s, "username").trim().to_string(),
+            password: s["password"].as_str().map(str::to_string),
+            auth_key: s["authKey"].as_str().map(|k| k.trim().to_string()),
+            forget: s["forget"].as_bool().unwrap_or(false),
+        })?;
+    }
+    let (shown, chosen) = (v["shown"].as_str().and_then(crate::clientconf::Interface::from_name), v["preferred"].as_str().and_then(crate::clientconf::Interface::from_name));
+    if let (Some(shown), Some(chosen)) = (shown, chosen) {
+        crate::clientconf::save_preference(&mut conf, shown, chosen);
+    }
+    conf.save()
+}
+
+/// JS statement that locks a new window to a world. The name can be a server's
+/// (`OpenWindow { world }`), so it is spliced as a `js_json` literal, never between quotes.
+fn lock_world_js(world: &str) -> String {
+    format!("window.LOCK_WORLD = {};", js_str(world))
+}
+
+/// JS statement that makes a window a grep window (`/window --grep`), `js_json` likewise.
+fn grep_mode_js(pattern: &str, use_regex: bool) -> String {
+    format!("window.GREP_MODE = {};", js_json(&serde_json::json!({ "pattern": pattern, "regex": use_regex })))
+}
+
+/// Whether a `client-conf:` from window `from` is taken: only from the Settings window.
+fn client_conf_sender_ok<Id: PartialEq>(settings_window: Option<Id>, from: Id) -> bool {
+    settings_window.is_some_and(|id| id == from)
 }
 
 /// Combine a window's mode JS (GREP_MODE / NOTE_MODE) with an inherited login.
@@ -164,9 +248,19 @@ fn settings_tab_name(v: &serde_json::Value) -> String {
 }
 
 /// A JSON value as a JS literal safe to splice into evaluate_script / an inline
-/// <script>: `<`, U+2028 and U+2029 escaped.
+/// <script>: `<`, U+2028 and U+2029 escaped, so it can't end the script element or a
+/// line, and `'` too, so the text `build_html`'s splices look for (`window.WS_PROTOCOL =
+/// '...';`) can never occur inside a value and be spliced into. **Every value put into a
+/// page goes through this** (security review 2026-11-21: `LOCK_WORLD` was spliced as
+/// `'...'` with only `'` escaped, so a server's `OpenWindow` world name of `\';...//` or
+/// `</script>` ran as script in the new window).
 fn js_json(v: &serde_json::Value) -> String {
-    v.to_string().replace('<', "\\u003c").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
+    v.to_string().replace('<', "\\u003c").replace('\'', "\\u0027").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
+}
+
+/// A string as a JS string literal (`js_json`).
+fn js_str(s: &str) -> String {
+    js_json(&serde_json::Value::String(s.to_string()))
 }
 
 /// JS that hands a font-preview payload to a window's app.js. The payload came
@@ -224,6 +318,9 @@ struct WebViewParams {
     server_host: Option<String>,
     server_port: Option<u16>,
     server_secure: bool,
+    /// Attached: the login this machine saved for the server (src/clientconf.rs, Settings >
+    /// Server), handed to the main window's page as an inherited one.
+    saved_login: Option<crate::clientconf::ServerLogin>,
 }
 
 /// Read the gui_theme name from ~/.clay/settings.dat (defaults to "dark").
@@ -544,6 +641,7 @@ pub fn run_master_webgui() -> io::Result<()> {
         server_host: None, // Master mode — no separate server URL needed
         server_port: None,
         server_secure: false,
+        saved_login: None,
     };
 
     let result = create_webview_window("Clay", &params, Some(gui_to_app_tx));
@@ -560,6 +658,9 @@ pub fn run_master_webgui() -> io::Result<()> {
 /// If the remote server only accepts wss://, falls back to a local WS proxy
 /// that handles TLS with self-signed cert support (WebKit rejects self-signed certs).
 pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::Result<()> {
+    // The login this machine saved for the server (src/clientconf.rs, Settings > Server);
+    // none over --ssh, where the address names the SSH host.
+    let saved_login = if ssh.is_none() { crate::clientconf::ClientConf::load().login_for(addr) } else { None };
     // Check for display server availability (Linux only)
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -631,6 +732,7 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
             server_host: Some(server_host),
             server_port: Some(server_port),
             server_secure: true,
+            saved_login: saved_login.clone(),
         };
 
         let result = create_webview_window("Clay", &params, None);
@@ -708,6 +810,7 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
             server_host: Some(host.clone()),
             server_port: Some(port),
             server_secure: true,
+            saved_login: saved_login.clone(),
         };
 
         let result = create_webview_window("Clay", &params, None);
@@ -724,6 +827,7 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
             server_host: Some(host),
             server_port: Some(port),
             server_secure: false,
+            saved_login: saved_login.clone(),
         };
 
         create_webview_window("Clay", &params, None)
@@ -913,20 +1017,27 @@ fn build_html(params: &WebViewParams) -> String {
     // (app.js attachedLocalVersionDetail; a WebView running Clay itself ignores it).
     html = html.replace(
         &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
-        &format!("window.WS_PROTOCOL = '{}';\n        window.CLIENT_VERSION_DETAIL = '{}';",
-            params.ws_protocol, crate::version_detail().replace('\\', "\\\\").replace('\'', "\\'")),
+        &format!("window.WS_PROTOCOL = '{}';\n        window.CLIENT_VERSION_DETAIL = {};",
+            params.ws_protocol, js_str(&crate::version_detail())),
     );
     // An earlier Clay here that crashed (src/crashlog.rs): the page says so once it has a
     // world (app.js showCrashNotices). JSON is valid JavaScript; `<` is escaped so the text
     // can't close the script element.
     let notices = crate::crashlog::take_notices();
     if !notices.is_empty() {
-        let json = serde_json::to_string(&notices).unwrap_or_else(|_| "[]".to_string()).replace('<', "\\u003c");
+        let json = serde_json::to_value(&notices).map(|v| js_json(&v)).unwrap_or_else(|_| "[]".to_string());
         html = html.replace(
             &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
             &format!("window.WS_PROTOCOL = '{}';\n        window.CLAY_CRASH_NOTICES = {};", params.ws_protocol, json),
         );
     }
+
+    // This machine's start-up choices (src/clientconf.rs): every window's Settings shows
+    // them, the Settings window above all.
+    html = html.replace(
+        &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
+        &format!("window.WS_PROTOCOL = '{}';\n        {}", params.ws_protocol, client_conf_js()),
+    );
 
     // Inject real server address for /window command (when using WS proxy)
     if let (Some(ref real_host), Some(real_port)) = (&params.server_host, params.server_port) {
@@ -1187,7 +1298,7 @@ document.addEventListener('DOMContentLoaded', function() {
 /// (`WvEvent::Reload`, the same argv). Every line names this program. When the
 /// server's install already replaced this binary (same machine, same file) there is
 /// nothing to download - just the restart.
-fn self_update_thread(force: bool, proxy: EventLoopProxy<WvEvent>) {
+fn self_update_thread(want: crate::selfupdate::UpdateWant, proxy: EventLoopProxy<WvEvent>) {
     const LABEL: &str = "This GUI";
     let attached = crate::selfupdate::attached_target_from_args().unwrap_or_else(|| "the same server".to_string());
     let say = |text: String| { let _ = proxy.send_event(WvEvent::UpdateStatus(text)); };
@@ -1199,7 +1310,7 @@ fn self_update_thread(force: bool, proxy: EventLoopProxy<WvEvent>) {
     }
     #[cfg(target_os = "android")]
     {
-        let _ = force;
+        let _ = want;
         say(crate::selfupdate::unavailable(LABEL));
     }
     #[cfg(not(target_os = "android"))]
@@ -1215,7 +1326,7 @@ fn self_update_thread(force: bool, proxy: EventLoopProxy<WvEvent>) {
             say(crate::selfupdate::updating(Some(LABEL), &version));
             std::future::ready(())
         };
-        let outcome: Result<String, String> = match rt.block_on(crate::platform::check_and_download_update(force, found)) {
+        let outcome: Result<String, String> = match rt.block_on(crate::platform::check_and_download_update(want, found)) {
             Ok(success) => crate::platform::install_update(&success.temp_path).map(|()| success.version),
             Err(e) => Err(e),
         };
@@ -1292,22 +1403,19 @@ fn dispatch_ipc_message(
         // Close only the window that sent this — unlike "quit" (whole app),
         // this is what a spawned window's own Cancel/close button should use.
         let _ = proxy.send_event(WvEvent::CloseWindow(window_id));
-    } else if body == "update" || body == "update-force" {
+    } else if let Some(want) = crate::selfupdate::UpdateWant::from_ipc(body) {
         // This GUI's own half of /update (src/selfupdate.rs): app.js asks for it once
-        // the server's half is over. The master runs Clay in-process, so it has no
+        // the server's half is over, as `update`, `update-force`, `update-newest` or
+        // `update-force-newest`. The master runs Clay in-process, so it has no
         // separate binary: its /update is the server's own, whose hot reload starts
         // this window again (app.js sends it there itself; this is for an older page).
-        let force = body == "update-force";
         if is_master {
             if let Some(ref tx) = reload_tx {
-                let _ = tx.send(crate::WsMessage::SendCommand {
-                    world_index: 0,
-                    command: (if force { "/update -f" } else { "/update" }).to_string(),
-                });
+                let _ = tx.send(crate::WsMessage::SendCommand { world_index: 0, command: want.command() });
             }
         } else {
             let proxy = proxy.clone();
-            std::thread::spawn(move || self_update_thread(force, proxy));
+            std::thread::spawn(move || self_update_thread(want, proxy));
         }
     } else if body == "reload:console" {
         // `/reload --console` in an attached WebView (app.js; the master's goes to its server).
@@ -1326,6 +1434,10 @@ fn dispatch_ipc_message(
         } else {
             let _ = proxy.send_event(WvEvent::Reload { to_console: false });
         }
+    } else if let Some(json) = body.strip_prefix("client-conf:") {
+        // Settings' Server tab and Preferred Interface: this machine's client.dat. The
+        // event loop takes it only from the Settings window (it knows which that is).
+        let _ = proxy.send_event(WvEvent::ClientConf { payload: json.to_string(), from: window_id });
     } else if body == "connect-close" {
         // /server --close: only meaningful for a remote GUI (detach and become a master).
         // The master webview never sends this — its /server is handled server-side.
@@ -1374,8 +1486,7 @@ fn build_webview(
     if let Some(world_name) = world_lock {
         html_content = html_content.replace(
             &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
-            &format!("window.WS_PROTOCOL = '{}';\n        window.LOCK_WORLD = '{}';",
-                params.ws_protocol, world_name.replace('\'', "\\'")),
+            &format!("window.WS_PROTOCOL = '{}';\n        {}", params.ws_protocol, lock_world_js(world_name)),
         );
     }
 
@@ -1627,7 +1738,10 @@ fn create_webview_window(
     }
 
     // Build the first webview
-    let webview = build_webview(&window, params, &proxy, &reload_tx, None, None, None)?;
+    // Attached with a login saved for the server: the page logs in with it as with an
+    // inherited one (app.js seedInheritedAuth), its auth key first.
+    let saved_js = params.saved_login.as_ref().map(saved_login_js);
+    let webview = build_webview(&window, params, &proxy, &reload_tx, None, saved_js.as_deref(), None)?;
 
     #[cfg(unix)]
     drop(_stderr_guard);
@@ -1719,8 +1833,7 @@ fn create_webview_window(
             }
             Event::UserEvent(WvEvent::UpdateStatus(ref msg)) => {
                 // Broadcast update status to all webviews
-                let escaped = msg.replace('\\', "\\\\").replace('\'', "\\'");
-                let script = format!("window.showUpdateStatus('{}')", escaped);
+                let script = format!("window.showUpdateStatus({})", js_str(msg));
                 for wv in webviews.values() {
                     let _ = wv.evaluate_script(&script);
                 }
@@ -1744,7 +1857,7 @@ fn create_webview_window(
                     show(&why);
                     return;
                 }
-                let args: Vec<String> = std::env::args().skip(1).collect();
+                let args: Vec<String> = crate::clientconf::launch_args();
                 #[cfg_attr(not(any(all(unix, not(target_os = "android")), windows)), allow(unused_variables))]
                 let args = if to_console {
                     crate::platform::attached_switch_args(args, crate::platform::UiKind::Console)
@@ -1796,9 +1909,8 @@ fn create_webview_window(
                 // state lives on whichever server it's attached to.
                 if let Err(e) = crate::platform::exec_relaunch(addr.as_deref(), true) {
                     if let Some(wv) = webviews.values().next() {
-                        let escaped = e.to_string().replace('\\', "\\\\").replace('\'', "\\'");
                         let _ = wv.evaluate_script(&format!(
-                            "window.showUpdateStatus('Connect failed: {}')", escaped
+                            "window.showUpdateStatus({})", js_str(&format!("Connect failed: {e}"))
                         ));
                     }
                 }
@@ -1846,11 +1958,7 @@ fn create_webview_window(
                 };
 
                 // Build GREP_MODE JS injection
-                let escaped_pattern = pattern.replace('\\', "\\\\").replace('\'', "\\'");
-                let grep_js = format!(
-                    "window.GREP_MODE = {{ pattern: '{}', regex: {} }};",
-                    escaped_pattern, use_regex
-                );
+                let grep_js = grep_mode_js(pattern, use_regex);
                 let world_lock = world.as_deref();
                 let extra_js = spawned_window_js(Some(grep_js), auth);
                 if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, extra_js.as_deref(), None) {
@@ -1897,13 +2005,25 @@ fn create_webview_window(
                     *control_flow = ControlFlow::Exit;
                 }
             }
+            Event::UserEvent(WvEvent::ClientConf { ref payload, from }) => {
+                // Only the Settings window saves this machine's start-up choices: a
+                // window showing a server's text has no business rewriting where the next
+                // bare `clay` attaches (security review 2026-11-21).
+                if client_conf_sender_ok(popup_windows.get("settings").copied(), from) {
+                    if let Err(e) = save_client_conf_from_page(payload) {
+                        crate::debug_log(true, &format!("webview: client.dat not saved: {e}"));
+                    }
+                } else {
+                    crate::debug_log(true, "webview: client-conf from a window that isn't Settings, ignored");
+                }
+            }
             Event::UserEvent(WvEvent::PopupWindow { kind, ref arg, ref auth }) => {
                 let kind_json = serde_json::Value::String(kind.to_string()).to_string();
                 // /info's window: this process's own figures as of now, for an attached GUI
                 // (app.js shows them only when this GUI doesn't run Clay itself).
                 let host_info = if kind == "info" {
-                    serde_json::to_string(&crate::info::own_process_section("This GUI's process"))
-                        .map(|json| format!("window.CLAY_HOST_INFO = {json};"))
+                    serde_json::to_value(crate::info::own_process_section("This GUI's process"))
+                        .map(|v| format!("window.CLAY_HOST_INFO = {};", js_json(&v)))
                         .unwrap_or_default()
                 } else {
                     String::new()
@@ -2146,6 +2266,91 @@ mod inherited_auth_tests {
 #[cfg(test)]
 mod settings_window_tests {
     use super::*;
+
+    /// The page is handed this machine's start-up choices (src/clientconf.rs) without the
+    /// stored secrets, and the Settings window saves them back to client.dat: a secret it
+    /// didn't type stays, a Save that never opened the Server tab changes nothing of it,
+    /// and the preference is written only when changed (security review 2026-11-21).
+    #[test]
+    fn a_page_reads_and_saves_this_machines_server_page() {
+        let _lock = crate::clientconf::FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let file = crate::clay_config_path(crate::clientconf::FILE);
+        let _ = std::fs::remove_file(&file);
+        let read = || -> serde_json::Value {
+            let js = client_conf_js();
+            serde_json::from_str(js.strip_prefix("window.CLIENT_CONF = ").unwrap().strip_suffix(';').unwrap()).unwrap()
+        };
+        let v = read();
+        assert_eq!(v["interfaces"][0]["value"], "tui", "{v}");
+        assert_eq!((&v["server"]["host"], &v["server"]["hasPassword"]), (&serde_json::json!(""), &serde_json::json!(false)));
+        save_client_conf_from_page(r#"{"server":{"host":"mud.example","port":"4000","username":"","password":"pw-secret</script>","authKey":"key-secret"},"shown":"tui","preferred":"tui"}"#).unwrap();
+        let conf = crate::clientconf::ClientConf::load();
+        assert_eq!(conf.default_server(), Some("mud.example:4000"));
+        assert_eq!(conf.preferred, None, "unchanged: not written");
+        // What the page is given: that they are saved, never what they are.
+        let js = client_conf_js();
+        assert!(!js.contains("pw-secret") && !js.contains("key-secret") && !js.contains('<'), "{js}");
+        let v = read();
+        assert_eq!((&v["server"]["hasPassword"], &v["server"]["hasAuthKey"]), (&serde_json::json!(true), &serde_json::json!(true)));
+        assert!(v["server"].get("password").is_none() && v["server"].get("authKey").is_none());
+        // A Save from General (the Server tab never opened): the default server stays.
+        save_client_conf_from_page(r#"{"server":null,"shown":"tui","preferred":"tui"}"#).unwrap();
+        assert_eq!(crate::clientconf::ClientConf::load().default_server(), Some("mud.example:4000"));
+        // The Server tab saved with both secrets untyped: both stay.
+        save_client_conf_from_page(r#"{"server":{"host":"mud.example","port":"4000","username":"bob","password":null,"authKey":null}}"#).unwrap();
+        let login = crate::clientconf::ClientConf::load().login_for("mud.example:4000").unwrap();
+        assert_eq!((login.username(), login.password(), login.auth_key()), (Some("bob"), Some("pw-secret</script>"), Some("key-secret")));
+        // Forget drops them.
+        save_client_conf_from_page(r#"{"server":{"host":"mud.example","port":"4000","username":"","password":null,"authKey":null,"forget":true}}"#).unwrap();
+        assert!(crate::clientconf::ClientConf::load().login_for("mud.example:4000").is_none());
+        assert!(save_client_conf_from_page(r#"{"server":{"host":"mud.example","port":"x"}}"#).is_err());
+        assert!(save_client_conf_from_page(r#"{"server":{"host":"mud.example';x","port":""}}"#).is_err());
+        save_client_conf_from_page(r#"{"shown":"tui","preferred":"gui"}"#).unwrap();
+        assert_eq!(crate::clientconf::ClientConf::load().preferred, Some(crate::clientconf::Interface::Gui));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Only the Settings window's `client-conf:` is taken.
+    #[test]
+    fn only_the_settings_window_saves_client_conf() {
+        assert!(client_conf_sender_ok(Some(7), 7));
+        assert!(!client_conf_sender_ok(Some(7), 1), "the main window, a /window, a grep window");
+        assert!(!client_conf_sender_ok(None, 1), "no Settings window open");
+    }
+
+    /// A value spliced into a page's inline script comes out as the string it was and
+    /// nothing more, whatever a server put in it (`OpenWindow { world }`): no quote,
+    /// backslash, `</script>` or the splice's own marker text ends the literal.
+    #[test]
+    fn a_spliced_value_cannot_become_script() {
+        let hostile = [
+            "\\';alert(1);//",
+            "</script><script>alert(1)</script>",
+            "a\nb\u{2028}c",
+            "window.WS_PROTOCOL = 'ws';",
+            "\"]});alert(1);//",
+        ];
+        for world in hostile {
+            let js = lock_world_js(world);
+            let literal = js.strip_prefix("window.LOCK_WORLD = ").unwrap().strip_suffix(';').unwrap();
+            assert_eq!(serde_json::from_str::<String>(literal).unwrap(), world, "{js}");
+            assert!(!literal.contains('<') && !literal.contains('\'') && !literal.contains('\n') && !literal.contains('\u{2028}'), "{js}");
+            let js = grep_mode_js(world, true);
+            let literal = js.strip_prefix("window.GREP_MODE = ").unwrap().strip_suffix(';').unwrap();
+            let v: serde_json::Value = serde_json::from_str(literal).unwrap();
+            assert_eq!((v["pattern"].as_str(), v["regex"].as_bool()), (Some(world), Some(true)), "{js}");
+            assert!(!literal.contains('<') && !literal.contains('\''), "{js}");
+        }
+        // In the page itself: the marker the later splices look for is still there once,
+        // so a world name holding it was not spliced into.
+        let params = WebViewParams {
+            ws_host: "127.0.0.1".into(), ws_port: 1, ws_protocol: "ws".into(), auto_password: None,
+            theme_css: String::new(), server_host: None, server_port: None, server_secure: false, saved_login: None,
+        };
+        let marker = "window.WS_PROTOCOL = 'ws';";
+        let html = build_html(&params).replace(marker, &format!("{marker}\n        {}", lock_world_js(marker)));
+        assert_eq!(html.matches(marker).count(), 1, "the marker never occurs inside a spliced value");
+    }
 
     #[test]
     fn settings_tab_name_accepts_only_tab_ids() {

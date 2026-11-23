@@ -57,6 +57,18 @@ pub const SETUP_FIELD_ANNOUNCE_SCREEN_READER: FieldId = FieldId(33);
 /// Status Line (`Settings::status_panel`, the GUIs' Status Panel): the MUD's status display
 /// at all, one setting for the instance.
 pub const SETUP_FIELD_STATUS_LINE: FieldId = FieldId(34);
+/// Preferred Interface (src/clientconf.rs): what a bare `clay` on this machine starts in.
+/// This machine's own choice, saved to its client.dat by the console showing it - never
+/// to settings.dat or a server (user request 2026-11-21). See
+/// [`add_preferred_interface_field`].
+pub const SETUP_FIELD_PREFERRED_INTERFACE: FieldId = FieldId(35);
+/// "/update to newest" (`Settings::update_newest`): every update command takes the newest
+/// release of any kind, where it otherwise takes the newest stable one. One setting for
+/// the instance (user request 2026-11-23, the label as the user wrote it).
+pub const SETUP_FIELD_UPDATE_NEWEST: FieldId = FieldId(36);
+/// The setting's label, in every interface's General settings (app.js and the native
+/// GUI's Settings are pinned to it by a test).
+pub const UPDATE_NEWEST_LABEL: &str = "/update to newest";
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -454,6 +466,25 @@ pub fn add_status_line_field(def: &mut PopupDefinition, on: bool) {
     def.fields.insert(at, Field::new(SETUP_FIELD_STATUS_LINE, "Status Line", FieldKind::toggle(on)));
 }
 
+/// The "/update to newest" row (`Settings::update_newest`), after Status Line. Added to the
+/// popup `create_setup_popup` built, by both consoles, where `App::update_newest_shown`
+/// has a value to show.
+pub fn add_update_newest_field(def: &mut PopupDefinition, on: bool) {
+    let at = def.fields.iter().position(|f| f.id == SETUP_FIELD_STATUS_LINE).map_or(def.fields.len(), |i| i + 1);
+    def.fields.insert(at, Field::new(SETUP_FIELD_UPDATE_NEWEST, UPDATE_NEWEST_LABEL, FieldKind::toggle(on)));
+}
+
+/// The Preferred Interface row, after Separator Style: the interfaces this machine can
+/// start in (`clientconf::offered`, "only provide which options are available"), showing
+/// `shown`. Added to the popup `create_setup_popup` built, by both consoles; its Save
+/// writes client.dat only when the choice was changed (`clientconf::save_preference`).
+pub fn add_preferred_interface_field(def: &mut PopupDefinition, offered: &[crate::clientconf::Interface], shown: crate::clientconf::Interface) {
+    let options: Vec<SelectOption> = offered.iter().map(|i| SelectOption::new(i.name(), i.label())).collect();
+    let idx = offered.iter().position(|i| *i == shown).unwrap_or(0);
+    let at = def.fields.iter().position(|f| f.id == SETUP_FIELD_SEPARATOR_STYLE).map_or(def.fields.len(), |i| i + 1);
+    def.fields.insert(at, Field::new(SETUP_FIELD_PREFERRED_INTERFACE, "Preferred Interface", FieldKind::select(options, idx)));
+}
+
 /// The Import button (Import Settings), for the master console (a remote console has no
 /// `/import`, as its `/menu` has no Import Settings).
 pub fn add_import_button(def: &mut PopupDefinition) {
@@ -551,6 +582,11 @@ fn setup_help_text() -> Vec<String> {
         "  (the GUIs' Status Panel). Off hides them for every",
         "  world; Edit World has a switch for one world.",
         "",
+        "/update to newest: Off, /update installs the newest",
+        "  stable version (1.8.0, 1.9.0, ...). On, every update",
+        "  takes the newest version of any kind, alphas too",
+        "  (1.8.1, 1.8.2, ...), as /update --newest does.",
+        "",
         "New Indicator: How text that arrived while you were",
         "  in another world is marked. Character: a green ▶",
         "  in front of each line. Background: a green glow",
@@ -616,6 +652,14 @@ fn setup_help_text() -> Vec<String> {
         "  TinyFugue: gaps filled with underscores on the",
         "  terminal background. One setting for every",
         "  interface; only a console's bar changes.",
+        "",
+        "Preferred Interface: What Clay starts in on this",
+        "  machine when the command line names none (a bare",
+        "  `clay`): TUI (this console), GUI or Web GUI - only",
+        "  those this machine can run are offered. Started",
+        "  where it can't run, Clay takes one that can.",
+        "  `--console` and `--gui` still choose. Kept on this",
+        "  machine (client.dat), never on a server.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 

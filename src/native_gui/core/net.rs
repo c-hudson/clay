@@ -256,6 +256,13 @@ async fn knock(stream: &mut TcpStream, key: &str) -> Result<(), String> {
         return Err("not a knock challenge".into());
     }
     let nonce: [u8; 32] = challenge[2..].try_into().expect("32 bytes");
+    // Never answer a nonce that could be a login challenge: the answer would log
+    // whoever sent it in (http::knock_nonce_could_be_login_challenge). No real server
+    // sends one; said in debug.log whatever the Debug setting.
+    if crate::http::knock_nonce_could_be_login_challenge(&nonce) {
+        crate::debug_log(true, "native-gui: KNOCK-RELAY-REFUSED: the knock challenge is a login challenge (someone between here and the server?); not answered");
+        return Err("the knock challenge looks like a login challenge".into());
+    }
     let response = knock_expected_response(key, &nonce);
     tokio::time::timeout(KNOCK_TIMEOUT, stream.write_all(&response)).await.map_err(step("response"))?.map_err(|e| e.to_string())?;
     let mut ack = [0u8; 2];
@@ -377,6 +384,33 @@ mod tests {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         knock(&mut stream, "the-key").await.unwrap();
         assert!(server.await.unwrap());
+    }
+
+    /// A knock nonce that could be a login challenge is never answered (security review
+    /// 2026-11-21, `http::knock_nonce_could_be_login_challenge`): someone on the path
+    /// offering a server's login challenge as the nonce gets nothing to log in with.
+    #[tokio::test]
+    async fn a_login_challenge_offered_as_a_knock_nonce_is_not_answered() {
+        use crate::http::KNOCK_CHALLENGE_MAGIC;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut hello = [0u8; 6];
+            s.read_exact(&mut hello).await.unwrap();
+            let mut ch = KNOCK_CHALLENGE_MAGIC.to_vec();
+            ch.extend_from_slice(b"0123456789abcdef0123456789abcdef");
+            s.write_all(&ch).await.unwrap();
+            // Whatever the client sends next, until it hangs up.
+            let mut got = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut got)).await;
+            got
+        });
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let refused = knock(&mut stream, "the-key").await;
+        assert!(refused.is_err_and(|e| e.contains("login challenge")));
+        drop(stream);
+        assert!(relay.await.unwrap().is_empty(), "not one byte of an answer went out");
     }
 
     #[tokio::test]

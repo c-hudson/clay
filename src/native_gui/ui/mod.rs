@@ -479,7 +479,7 @@ impl ClayView {
                     }
                     _ => {}
                 },
-                Effect::SelfUpdate { force } => self.self_update(force, cx),
+                Effect::SelfUpdate { want } => self.self_update(want, cx),
                 _ => {}
             }
         }

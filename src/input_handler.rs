@@ -827,6 +827,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.settings.status_panel = settings.status_panel;
                     app.needs_output_redraw = true;
                 }
+                if let Some(on) = settings.update_newest {
+                    app.settings.update_newest = on;
+                }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_indicator = crate::NewIndicator::from_name(&settings.new_indicator);

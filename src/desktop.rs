@@ -317,9 +317,13 @@ mod desktop_file {
         quoted
     }
 
+    /// The entry runs a bare `clay` (until 2026-11-21 `clay --gui`): a start that names no
+    /// interface takes this machine's Preferred Interface and default server
+    /// (src/clientconf.rs), and `--gui` is always a standalone Clay by user ruling. With no
+    /// terminal the TUI can't run, so a launcher's start is never a console.
     pub(super) fn text(exe: &Path) -> String {
         format!(
-            "[Desktop Entry]\nType=Application\nName=Clay\nGenericName=MUD Client\nComment=A MUD client\nExec={} --gui\nIcon=clay\nTerminal=false\nCategories=Network;Game;\nStartupWMClass=clay\n{MARK}\n",
+            "[Desktop Entry]\nType=Application\nName=Clay\nGenericName=MUD Client\nComment=A MUD client\nExec={}\nIcon=clay\nTerminal=false\nCategories=Network;Game;\nStartupWMClass=clay\n{MARK}\n",
             exec_quote(exe)
         )
     }
@@ -590,12 +594,12 @@ mod tests {
         let exe = Path::new("/opt/My Clay/clay");
         assert_eq!(desktop_file::write(&dir, exe).unwrap(), Some("clay.desktop written"));
         let text = std::fs::read_to_string(&file).unwrap();
-        assert!(text.contains("Exec=\"/opt/My Clay/clay\" --gui\n"), "{text}");
+        assert!(text.contains("Exec=\"/opt/My Clay/clay\"\n"), "{text}");
         assert!(text.contains("StartupWMClass=clay\n") && text.contains("Icon=clay\n"));
         assert!(dir.join("icons/hicolor/256x256/apps/clay.png").exists());
         assert_eq!(desktop_file::write(&dir, exe).unwrap(), None, "unchanged");
         assert_eq!(desktop_file::write(&dir, Path::new("/usr/bin/clay")).unwrap(), Some("clay.desktop updated"));
-        assert!(std::fs::read_to_string(&file).unwrap().contains("Exec=\"/usr/bin/clay\" --gui"));
+        assert!(std::fs::read_to_string(&file).unwrap().contains("Exec=\"/usr/bin/clay\"\n"));
         assert_eq!(desktop_file::write(&dir, Path::new("/usr/bin/clay (deleted)")).unwrap(), None, "a replaced binary is the same one");
         std::fs::write(&file, "[Desktop Entry]\nName=My Clay\nExec=myclay\n").unwrap();
         assert_eq!(desktop_file::write(&dir, exe).unwrap(), None);

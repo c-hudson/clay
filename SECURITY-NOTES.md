@@ -57,6 +57,12 @@ UI stays locked for non-listed addresses, and a knocked connection that asks for
 gets dropped (`KNOCK-HTTP-DENIED`). The knock does not skip login: normal WebSocket auth
 still follows.
 
+The knock goes out before TLS, so its answer is built never to double as a login: since
+1.7.40 a Clay server's login challenge is longer than any knock challenge, and the
+Android app and the GUI refuse a knock challenge that looks like a login challenge
+(before that, someone on the network path between a device holding an auth key and its
+server could have used one to log in - update both ends).
+
 The Android app knocks automatically whenever it has an auth key, over both `ws` and
 `wss`, and falls back to a plain connection against older Clay servers. Regenerating or
 revoking the key takes effect immediately, with no restart. A device that knocks

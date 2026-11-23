@@ -34,7 +34,9 @@ Open with `/setup` command:
 | Screen Reader | For use with a screen reader (see **Accessibility**): new lines are read out once as they appear, Text Reveal is off, this interface's TTS stays quiet so nothing is read twice, and the focus stays where you put it. Kept per interface, set in each interface's own Settings; turned on by itself, once, in the GUI and the Android app when a screen reader is running and that interface never chose. In `settings.dat`: `screen_reader` (the console), `screen_reader.<interface key>` (the others) | Off |
 | MUDs: Screen Reader | Tell the games you connect to that you use a screen reader (the MTTS screen-reader flag), so a game that knows it can send simpler text. One global setting, shown everywhere; takes effect at the next connect. In `settings.dat`: `announce_screen_reader` | Off |
 | Status Panel | Show the stats a game sends over GMCP `Char.*` or MSDP (HP, mana and the like): the panel above the bar in the GUIs, the web page and the Android app, the status line in the console, where `/setup` calls it Status Line (see **Status Display** in the Interface chapter). Off hides it for every world, in every interface; each world also has its own switch in its editor. One global setting, shown everywhere. In `settings.dat`: `status_panel` | On |
+| /update to newest | Which release an update installs. Off: the newest stable release (a version ending in `.0`, such as 1.8.0). On: the newest release of any kind, alphas too (1.8.1, 1.8.2, ...), for every update command: `/update`, `/update -f` and `clay --upgrade` all act as if `--newest` were typed. To go back to a stable release, switch it off and run `/update -f`. One global setting of the Clay being updated, shown everywhere; an attached GUI or console follows the server's when it updates its own program. Not shown to a user of a multiuser server, who can't update it. In `settings.dat`: `update_newest` | Off |
 | Picture Host | Where Share Picture uploads a picture (see **Sharing a Picture**): catbox.moe, sxcu.net, x0.at or tmpfiles.org (2d: deleted after two days), each also "+ URL Short" (the link goes through `/url`'s shortening), or Off. In `settings.dat`: `picture_host` (`catbox`, `catbox+short`, ..., `off`) | catbox.moe |
+| Preferred Interface | What a bare `clay` on this machine starts in (a command line that names `--console`, `--gui` or `--web-gui` still chooses): TUI, GUI or Web GUI. Only those this machine can run are offered: the GUI where the build has it and a window can open in the session Settings is shown in (not over SSH), the Web GUI only in a build with it (Termux's). Started where it can't run, Clay takes one that can (GUI, then Web GUI, then TUI). This machine's own, not the Clay you are attached to: kept in `~/.clay/client.dat` (`preferred_interface`), saved only when you change it - so a Save in `/setup` over SSH, which offers no GUI, keeps a GUI preference. Shown in the console's `/setup` and the two GUIs' Settings, not a browser or the Android app, which start no Clay | Clay's own default |
 | Separator Style | The look of the bar above the input. Clay: the gaps are spaces on the status bar colour, the look of the GUIs and the web page. TinyFugue: the gaps are underscores on the terminal background, as TinyFugue draws its status line. The look applies to TF's status line too once a script has changed it (see **Switching from TinyFugue**), in every interface; a `%status_pad` or `%status_attr` the script set is honoured in either look. Changing the setting from TinyFugue back to Clay hands the bar back to Clay: TF's layout and every `status_*` variable a script set go back to their defaults (set them again if wanted). One global setting, shown in every interface's Settings (the Theme Editor's Separator Bar group sets the same value). In `settings.dat`: `separator_style` (`web` for Clay, `tinyfugue`) | Clay |
 
 ### Settings Shown per Interface
@@ -51,6 +53,7 @@ shown keeps its value; saving from there never changes it.
 | Taskbar Alert | the native and WebView GUIs only, the interfaces that have a taskbar button |
 | Font sizes: Phone and Tablet | a browser and the Android app; the GUIs are desktops and show only Desktop |
 | Separator Style | everywhere: one global setting, the look of Clay's bar in the console and of TF's status line in every interface |
+| Preferred Interface, Server | the console's `/setup` and `/server`, the native and WebView GUIs: this machine's own (client.dat); not a browser, not the Android app (its Clay Server tab is its own) |
 | TTS, Speak Mode | everywhere, but each interface's own: the console's `/setup` sets the console's, a phone's Settings the phone's (the Android app's), a GUI's that GUI's, kept per program and OS like fonts |
 | Kokoro Voice | where Kokoro can speak: the GUIs and the console (not its static Linux build); not a browser or the Android app, which speak with the device's own voice |
 
@@ -71,6 +74,36 @@ When enabled (and F2/Show tags is on), temperatures typed in the input area are 
 - Type `100C ` → Shows `100C(212F) `
 
 Useful for international MUD players.
+
+## Server (/server)
+
+This machine's default server: the Clay a bare `clay` attaches to, instead of running one
+of its own, as the Android app's Clay Server tab sets the app's. `/server` alone
+opens it - in the console and the SSH console a popup, in the GUIs the Server page of
+Settings (a window of its own while the GUI has no connection, so a server that can't be
+reached can be put right there).
+
+| Field | Description |
+|-------|-------------|
+| Host | The other Clay's address, with its web path after it if it has one (`host/path`). Blank: no default server; the logins saved stay, for an attach by name |
+| Port | Its web port; 9000 when blank |
+| Username | Only for a multiuser (`clay_multi`) server |
+| Password | Its login password |
+| Auth Key | Its auth key (Settings > Web on that Clay). Tried first, then the password; when neither works Clay asks as it would without them |
+
+The login is kept per server (`host:port`), so any attach to that server uses it: the
+default server, `clay --gui=host`, `clay --console=host`, `/server host` and a `/reload`
+of an attached GUI. `CLAY_PASSWORD` and `CLAY_AUTH_KEY` still win for the native GUI. The
+page is this machine's: kept in `~/.clay/client.dat` (written owner-only, the password and
+key encrypted with this machine's `secure.key` as world passwords are), never in
+settings.dat and never sent to the Clay you are attached to. `clay --gui` and
+`clay --console` always run this machine's own Clay. Not in a browser, which starts no
+Clay; the Android app keeps its own Clay Server tab.
+
+In the WebView GUI the page is never shown a saved password or key: both fields open
+blank, reading "Saved - leave blank to keep" when one is saved. Type a new one to
+replace it, or press Forget to drop both at the next Save. The native GUI and the
+console show them masked.
 
 ## Per-World Settings (/worlds -e)
 

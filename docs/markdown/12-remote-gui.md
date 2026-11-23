@@ -41,8 +41,12 @@ console everywhere else:
   millisecond or two. A `DISPLAY` left behind in a tmux session after its X server ended, or
   none at all (a text console, a server), gets the console.
 
+This machine's **Preferred Interface** and **default server** (Settings > General and Settings
+> Server; see "First Run" in the Installation chapter) come first: a bare `clay` opens the
+preferred interface where it can run, attached to the default server when one is set.
+
 Naming an interface always wins: `--gui` and `--web-gui` open the window and `--console` the
-console whatever the check would say. A `/reload` or a crash restart keeps whichever
+console whatever the check would say, and alone they run this machine's own Clay. A `/reload` or a crash restart keeps whichever
 interface Clay is in, and `/reload --console` / `/reload --gui` switch it (see the Hot
 Reload chapter).
 
@@ -170,8 +174,10 @@ window itself.
 - **Linux launcher entry:** docks match a window to an application by its `.desktop`
   file, so at start either GUI writes `~/.local/share/applications/clay.desktop` (and
   Clay's icon into `~/.local/share/icons/hicolor/`), naming the program it was started
-  from. This also puts Clay in the desktop's application menu. The file is written only
-  when it is missing, or when it is Clay's own and names another program. A
+  from. This also puts Clay in the desktop's application menu. The entry runs a bare
+  `clay`, so it opens this machine's Preferred Interface (with no terminal, never the
+  TUI) attached to its default server, where one is set. The file is written only
+  when it is missing, or when it is Clay's own and says something else. A
   `clay.desktop` without the line `X-Clay-Generated=true` is yours and is never
   touched, and a build run from a cargo `target` directory never writes one.
 

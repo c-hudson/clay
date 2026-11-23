@@ -80,10 +80,11 @@ phone and SSH console attached to this Clay. It is `/remote --pause` on each of 
 /pause
 ```
 
-Clay answers with the ones it paused, each client by the number `/remote` lists it under:
+Clay answers with the ones it paused: `Console` for the console, and each other interface
+by its address (`/remote` lists them in full):
 
 ```
-Paused on: the console, client 3 (Web, 192.168.1.20), and client 4 (RemoteGUI, 127.0.0.1).
+Paused on: Console, 192.168.1.20, 127.0.0.1
 ```
 
 A paused interface stops counting as watching its world, so text arriving there shows as
@@ -207,6 +208,20 @@ Open the Global Settings popup.
 - GUI Theme - Dark, Light, Dark - New or Light - New (see Themes in the Interface chapter)
 - TLS Proxy - Enable TLS connection preservation
 - ANSI Music - Enable music playback
+- Preferred Interface - What a bare `clay` on this machine starts in: TUI, GUI or Web GUI, only those it can run (kept on this machine, not the Clay you are attached to)
+
+### /server
+Alone: open the Server settings - this machine's default server, the Clay a bare `clay`
+attaches to, and its login (Host, Port, Username, Password, Auth Key). Kept on this
+machine in `~/.clay/client.dat`, the password and key encrypted; `clay --gui` and
+`clay --console` still run this machine's own Clay. See **Server** in the Settings chapter.
+
+```
+/server                  This machine's default server
+/server host[:port]      Start again attached to that Clay (asked twice within 15 s)
+/server --close          Detach: start again as this machine's own Clay
+/server --cancel         Forget a /server host waiting to be confirmed
+```
 
 ### /web
 Open Web Settings popup for HTTP/WebSocket configuration.
@@ -266,27 +281,42 @@ Also triggered by:
 See the **Hot Reload** chapter for details.
 
 ### /update
-Update Clay to the latest GitHub release.
+Update Clay to the newest stable release on GitHub.
 
 ```
-/update [-f]
+/update [-f] [--newest]
 ```
+
+Clay's versions come in two kinds. A version ending in `.0` (1.8.0, 1.9.0) is a **stable**
+release. Any other number (1.8.1, 1.8.2) is an **alpha**: newer work, less tried.
+
+| Command | Installs |
+|---------|----------|
+| `/update` | The newest stable release, if it is newer than the one running |
+| `/update --newest` | The newest release of either kind, if it is newer |
+| `/update -f` | The newest stable release, even when it is not newer. On an alpha this goes back to the stable version |
+| `/update -f --newest` | The newest release of either kind, even when it is not newer |
+
+The **/update to newest** setting (Settings, General; `/setup` in the console) makes every
+update a `--newest` one, `-f` and `clay --upgrade` included. Off, the default, updates stay
+on stable releases.
 
 Typed in the console (or in a GUI that runs Clay itself), it checks GitHub, downloads
 this platform's build, installs it over the running binary and hot-reloads, keeping your
-connections. `-f` installs the latest release even when it is not newer. An update that
-works says two lines:
+connections. An update that works says two lines:
 
 ```
 Updating Clay to v1.7.10 from v1.7.9
 Reload successful
 ```
 
-Already up to date, or a failed download, is one line saying so.
+Already up to date, or a failed download, is one line saying so; it names the release it
+compared with (`latest stable: v1.8.0`, or `newest: v1.8.3`).
 
 `clay --upgrade` does the same download and install from the command line, without
 starting the console or a GUI, and exits; it ends with a line saying where the new version
-is installed (there is no reload to say so).
+is installed (there is no reload to say so). `clay --upgrade --newest` takes the newest
+release of either kind.
 
 Typed in a remote client - the desktop GUI attached with `--gui=host`, the SSH console,
 the web page, the Android app - it updates what can be updated: first the Clay you are

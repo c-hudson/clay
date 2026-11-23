@@ -3036,6 +3036,22 @@ feature = "General > Separator Style (Web | TinyFugue): the console's bar, one g
 note = "app.js setupSeparatorStyle"
 
 [[item]]
+id = "ui:settings.preferred_interface"
+section = "dialogs"
+phase = 5
+status = "done"
+feature = "General > Preferred Interface (TUI | GUI | Web GUI, only those this machine can run: clientconf::offered): what a bare clay on this machine starts in; saved by the window to this machine's client.dat (only when changed), never in UpdateGlobalSettings"
+note = "app.js #setup-preferred-interface-row (with CLIENT_CONF); console setup SETUP_FIELD_PREFERRED_INTERFACE; src/clientconf.rs"
+
+[[item]]
+id = "ui:settings.server"
+section = "dialogs"
+phase = 5
+status = "done"
+feature = "Settings > Server (and a bare /server; a window of its own with no connection): this machine's default server - Host, Port, Username, Password, Auth Key - which a bare clay attaches to; saved to client.dat, the secrets encrypted, never sent to the server; a saved login is used for any attach to that server"
+note = "app.js Clay Server tab in .cs-desktop form (window.CLIENT_CONF, the client-conf: IPC); console popup/definitions/server.rs; src/clientconf.rs"
+
+[[item]]
 id = "ui:settings.new_indicator"
 section = "dialogs"
 phase = 4
@@ -3066,6 +3082,14 @@ phase = 5
 status = "done"
 feature = "the Transparency slider: every window (text and all) at that opacity on X11 (_NET_WM_WINDOW_OPACITY, what GTK set_opacity sets there) and on Wayland where the compositor has wp_alpha_modifier_v1 (KWin; ui/wl.rs), its preview live; kept but not applied on Windows, macOS and any other Wayland compositor, as in the WebView GUI"
 note = "app.js applyTransparency"
+
+[[item]]
+id = "ui:settings.update_newest"
+section = "dialogs"
+phase = 0
+status = "done"
+feature = "Settings > General: \"/update to newest\" switch (user request 2026-11-23): every update command takes the newest release of any kind, where it otherwise takes the newest stable one (X.Y.0)"
+note = "windows/settings.rs General switches, shown only when GlobalSettingsMsg.update_newest is Some (the server's own setting; none from an older server or to a login that may not update it); settings_update sends it back; core start_update adds it to this GUI's own /update (selfupdate::UpdateWant::with_setting)"
 
 [[item]]
 id = "ui:settings.taskbar_alert"
@@ -3152,7 +3176,7 @@ id = "ui:command.server"
 section = "windows"
 phase = 5
 status = "done"
-feature = "/server host:port (asked twice within 15 s, --cancel) attaches this GUI to another Clay by starting again with --gui=<addr> (--ssh dropped, as the WebView GUI drops it); --close (become a server) is not offered: the native GUI only attaches"
+feature = "/server host:port (asked twice within 15 s, --cancel) attaches this GUI to another Clay by starting again with --gui=<addr> (--ssh dropped, as the WebView GUI drops it); --close (become a server) is not offered: the native GUI only attaches; a bare /server opens Settings > Server (ui:settings.server)"
 note = "app.js sendCommand remote-GUI branch; platform::exec_relaunch"
 
 [[item]]

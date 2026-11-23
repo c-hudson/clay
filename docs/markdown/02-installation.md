@@ -189,6 +189,24 @@ session; on Linux, a display server listening), and the console otherwise - in a
 reached over SSH, say. `--gui` and `--console` choose for you; see "With no flag" in the
 GUI chapter.
 
+Two settings kept on this machine change what a bare `clay` does (and the desktop
+launcher, which runs a bare `clay`):
+
+- **Preferred Interface** (Settings > General, the console's `/setup`): TUI, GUI or Web
+  GUI, offered only where this machine can run it. Started where it can't run (the GUI over
+  SSH, the TUI from the desktop launcher, which has no terminal), Clay takes one that can,
+  in the order GUI, Web GUI, TUI.
+- **The default server** (Settings > Server, or `/server` alone): the address of another
+  Clay and its login. A bare `clay` then attaches to it, in the Preferred Interface,
+  instead of running a Clay of its own, and logs in with the saved auth key or password
+  (asking only when neither works).
+
+Neither overrides the command line: `clay --gui` and `clay --console` always run this
+machine's own Clay, and `--gui=host` attaches to the host it names - with the login saved
+for that host, if there is one. Both are kept in `~/.clay/client.dat` (`~/clay/client.dat`
+on Windows), the password and key encrypted with this machine's key as world passwords
+are; nothing of them goes to the Clay you are attached to.
+
 ## Command-Line Options
 
 | Option | Description |
@@ -204,7 +222,7 @@ GUI chapter.
 | `--web-front` | Run the web gateway (the `clay_web` build runs it with no options too; see the Web Gateway chapter) |
 | `--local-server` | Run headless, loopback-only, for an embedding client (e.g. the Android app); with `CLAY_LOCAL_SERVER_LAN=1` in the environment it listens on every interface (the app's Allow Other Devices) |
 | `--port=<N>` | Override the listen port (used with `--local-server`) |
-| `--upgrade` | Download the newest release from GitHub, install it over this binary and exit, without starting the console or a GUI (`/update`'s install, from the command line). A Clay already running from the same file keeps its version until it restarts or `/reload`s. Not on Termux |
+| `--upgrade` | Download the newest stable release (1.8.0, 1.9.0, ...) from GitHub, install it over this binary and exit, without starting the console or a GUI (`/update`'s install, from the command line). With `--newest`, or with **/update to newest** on in this machine's settings, the newest release of any kind, alphas too. A Clay already running from the same file keeps its version until it restarts or `/reload`s. Not on Termux |
 | `--grep=host[:port] <pattern>` | Search a running Clay's output and print the matching lines (`CLAY_PASSWORD` holds its password): `-w <world>` one world, `--regexp` a regular expression instead of a glob, `--noesc` without colour codes, `-f` follow new output like `tail -f`, `-D` its archive too, each line dated, `-o` a line an action's `/substitute` rewrote matched and printed as the MUD sent it |
 | `--grep -D <pattern>` | Search this machine's archive (`~/.clay/scrollback.db`) directly, with no Clay running; `-w`, `--regexp`, `--noesc` and `-o` as above |
 | `--dump[=<dir>]` | Export the archive to `scrollback_dump.csv` (default: the current directory) |

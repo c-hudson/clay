@@ -24,6 +24,13 @@
 //! The server answers a client's request with [`WsMessage::UpdateOutcome`]
 //! (`src/websocket.rs`); an older server, which bounces `/update` back as
 //! `ExecuteLocalCommand`, is answered by the client moving on to its own step.
+//!
+//! **Which release** (user ruling 2026-11-23): `X.Y.0` is the stable version and any other
+//! number an alpha. Every update command installs the newest stable release;
+//! `--newest`, or Settings' "/update to newest", takes the highest version of either kind
+//! ([`UpdateWant`], `platform::pick_release`). An alpha is published as a GitHub
+//! pre-release, so a Clay from before this rule - which asks GitHub for its "latest
+//! release" - stays on the stable version too.
 
 #[cfg(not(target_os = "android"))]
 use std::path::Path;
@@ -37,20 +44,79 @@ pub const SERVER_ANSWER_TIMEOUT: Duration = Duration::from_secs(90);
 /// The label of the Clay a client is attached to (and of the console's own Clay).
 pub const SERVER: &str = "Server";
 
+/// What an update command asks for (user ruling 2026-11-23: `X.Y.0` is the stable version,
+/// any other number an alpha). Every update command installs the newest **stable** release
+/// unless `newest` is set, which takes the highest version there is, stable or alpha;
+/// `force` installs it even when it is not newer than this build - so `/update -f` on an
+/// alpha goes back to the stable version. `Settings::update_newest` (Settings' "/update to
+/// newest") sets `newest` on every update command ([`UpdateWant::with_setting`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UpdateWant {
+    pub force: bool,
+    pub newest: bool,
+}
+
+impl UpdateWant {
+    /// `/update`'s arguments, in any order: `-f`/`--force`, `--newest`. Anything else is
+    /// ignored, as it always was.
+    pub fn parse<'a>(args: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut want = UpdateWant::default();
+        for a in args {
+            match a {
+                "-f" | "--force" => want.force = true,
+                "--newest" => want.newest = true,
+                _ => {}
+            }
+        }
+        want
+    }
+
+    /// The command a client sends its server. `-f` goes first: a server before `--newest`
+    /// reads only the first argument (and then installs the stable release, its only kind).
+    pub fn command(self) -> String {
+        let mut cmd = String::from("/update");
+        if self.force {
+            cmd.push_str(" -f");
+        }
+        if self.newest {
+            cmd.push_str(" --newest");
+        }
+        cmd
+    }
+
+    /// With Settings' "/update to newest" on, every update command is a `--newest` one.
+    pub fn with_setting(mut self, update_newest: bool) -> Self {
+        self.newest |= update_newest;
+        self
+    }
+
+    /// The WebView page's IPC body for its own half (`webview_gui::dispatch_ipc_message`;
+    /// app.js `proceedOwnUpdate` builds the same four).
+    pub fn from_ipc(body: &str) -> Option<Self> {
+        match body {
+            "update" => Some(UpdateWant { force: false, newest: false }),
+            "update-force" => Some(UpdateWant { force: true, newest: false }),
+            "update-newest" => Some(UpdateWant { force: false, newest: true }),
+            "update-force-newest" => Some(UpdateWant { force: true, newest: true }),
+            _ => None,
+        }
+    }
+}
+
 /// A client's `/update`, step by step (the native GUI's core and the SSH console keep
 /// one of these; app.js keeps the same thing as `updateFlow`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientFlow {
     /// `/update` went to the server; waiting for its `UpdateOutcome`.
-    WaitingServer { force: bool, since: Instant },
+    WaitingServer { want: UpdateWant, since: Instant },
     /// The server updated and is reloading; waiting to be connected to it again.
-    WaitingReconnect { force: bool },
+    WaitingReconnect { want: UpdateWant },
 }
 
 impl ClientFlow {
-    pub fn force(&self) -> bool {
+    pub fn want(&self) -> UpdateWant {
         match self {
-            ClientFlow::WaitingServer { force, .. } | ClientFlow::WaitingReconnect { force } => *force,
+            ClientFlow::WaitingServer { want, .. } | ClientFlow::WaitingReconnect { want } => *want,
         }
     }
 }
@@ -103,19 +169,22 @@ pub fn unavailable(label: &str) -> String {
     format!("{label}: update is not available on this platform.")
 }
 
-/// `clay --upgrade`: install the newest GitHub release over this binary and exit, with no
-/// console or GUI (it runs before either starts, so it prints). Up to date already is a
-/// success. A Clay already running from this file keeps its version until it restarts or
-/// `/reload`s. Returns the exit code.
-pub async fn upgrade_cli() -> i32 {
+/// `clay --upgrade [--newest]`: install the newest stable GitHub release (the newest of
+/// any kind with `--newest`, or with "/update to newest" on in this machine's
+/// settings.dat) over this binary and exit, with no console or GUI (it runs before either
+/// starts, so it prints). Up to date already is a success. A Clay already running from
+/// this file keeps its version until it restarts or `/reload`s. Returns the exit code.
+pub async fn upgrade_cli(newest: bool) -> i32 {
     #[cfg(target_os = "android")]
     {
+        let _ = newest;
         eprintln!("{}", unavailable("Clay"));
         1
     }
     #[cfg(not(target_os = "android"))]
     {
-        let downloaded = crate::platform::check_and_download_update(false, |version| async move {
+        let want = UpdateWant { force: false, newest }.with_setting(saved_update_newest());
+        let downloaded = crate::platform::check_and_download_update(want, |version| async move {
             println!("{}", updating(None, &version));
         })
         .await;
@@ -135,6 +204,15 @@ pub async fn upgrade_cli() -> i32 {
             }
         }
     }
+}
+
+/// Settings' "/update to newest" as this machine's settings.dat has it, for
+/// `clay --upgrade`, which runs with no `App` to ask.
+#[cfg(not(target_os = "android"))]
+fn saved_update_newest() -> bool {
+    crate::persistence::read_global_section(&crate::get_settings_path())
+        .get("update_newest")
+        .is_some_and(|v| v == "true")
 }
 
 /// `clay --upgrade` installed a release (no reload follows to say so).
@@ -260,13 +338,53 @@ mod tests {
     }
 
     #[test]
+    fn update_flags_are_read_in_any_order_and_sent_force_first() {
+        let want = |v: &[&str]| UpdateWant::parse(v.iter().copied());
+        assert_eq!(want(&[]), UpdateWant { force: false, newest: false });
+        assert_eq!(want(&["-f"]), UpdateWant { force: true, newest: false });
+        assert_eq!(want(&["--force"]), UpdateWant { force: true, newest: false });
+        assert_eq!(want(&["--newest"]), UpdateWant { force: false, newest: true });
+        assert_eq!(want(&["--newest", "-f"]), UpdateWant { force: true, newest: true });
+        assert_eq!(want(&["-f", "--newest"]), UpdateWant { force: true, newest: true });
+        assert_eq!(want(&["now", "please"]), UpdateWant::default(), "anything else is ignored");
+        // `-f` first: a server before `--newest` reads only the first argument.
+        assert_eq!(want(&[]).command(), "/update");
+        assert_eq!(want(&["-f"]).command(), "/update -f");
+        assert_eq!(want(&["--newest"]).command(), "/update --newest");
+        assert_eq!(want(&["--newest", "-f"]).command(), "/update -f --newest");
+        // What is sent parses back to what was asked.
+        for w in [want(&[]), want(&["-f"]), want(&["--newest"]), want(&["-f", "--newest"])] {
+            assert_eq!(UpdateWant::parse(w.command().split_whitespace().skip(1)), w);
+        }
+    }
+
+    #[test]
+    fn the_setting_makes_every_update_a_newest_one() {
+        let plain = UpdateWant::default();
+        assert_eq!(plain.with_setting(false), plain);
+        assert_eq!(plain.with_setting(true), UpdateWant { force: false, newest: true });
+        // -f too (user's answer 2026-11-23): the setting is `--newest` on every command.
+        assert_eq!(UpdateWant { force: true, newest: false }.with_setting(true), UpdateWant { force: true, newest: true });
+        assert_eq!(UpdateWant { force: false, newest: true }.with_setting(false), UpdateWant { force: false, newest: true });
+    }
+
+    #[test]
+    fn the_webview_ipc_bodies_carry_both_flags() {
+        assert_eq!(UpdateWant::from_ipc("update"), Some(UpdateWant::default()));
+        assert_eq!(UpdateWant::from_ipc("update-force"), Some(UpdateWant { force: true, newest: false }));
+        assert_eq!(UpdateWant::from_ipc("update-newest"), Some(UpdateWant { force: false, newest: true }));
+        assert_eq!(UpdateWant::from_ipc("update-force-newest"), Some(UpdateWant { force: true, newest: true }));
+        assert_eq!(UpdateWant::from_ipc("reload"), None);
+    }
+
+    #[test]
     fn every_client_line_names_its_program() {
         assert_eq!(updating(None, "9.9.9"), format!("Updating Clay to v9.9.9 from v{}", crate::VERSION));
         assert_eq!(updating(Some("This GUI"), "9.9.9"), format!("This GUI: updating Clay to v9.9.9 from v{}", crate::VERSION));
         assert_eq!(failed(None, &Ok("1.7.5".into())), None, "a success says nothing more");
         assert_eq!(failed(Some(SERVER), &Ok("1.7.5".into())), None);
-        assert_eq!(failed(Some(SERVER), &Err("Already up to date (current: v1.7.5, latest: v1.7.5)".into())).unwrap(),
-            "Server: Already up to date (current: v1.7.5, latest: v1.7.5)");
+        assert_eq!(failed(Some(SERVER), &Err("Already up to date (current: v1.8.0, latest stable: v1.8.0)".into())).unwrap(),
+            "Server: Already up to date (current: v1.8.0, latest stable: v1.8.0)");
         assert_eq!(failed(None, &Err("Download failed: HTTP 404".into())).unwrap(), "Download failed: HTTP 404");
         assert!(replaced_on_disk("This GUI", "mini:9000").starts_with("This GUI: its binary was replaced"));
         assert!(server_too_old().starts_with("Server: "));

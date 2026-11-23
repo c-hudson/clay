@@ -18,6 +18,18 @@ Follow these steps in order. You are the orchestrator — read build output, dia
 Parse `$ARGUMENTS` for the version and any platform flags:
 
 - **Version**: The first non-flag token. Prepend `v` if it doesn't start with `v`. Normalize (e.g., "1.0 beta" → "v1.0.0-beta"). If no version token, read from `Cargo.toml` line 3.
+- **Stable or alpha** (user ruling 2026-11-23): a version whose last number is 0
+  (`1.8.0`, `1.9.0`) is a **stable** release; any other (`1.8.1`, `1.8.2`) is an **alpha**.
+  The builds are the same. What differs is how the GitHub release is published in Step 8:
+  an alpha is a **pre-release**, a stable version is a normal release and GitHub's latest.
+  Clay's `/update` installs only stable versions unless `--newest` (or the "/update to
+  newest" setting) asks for alphas too, and it chooses by version number. But every Clay up
+  to 1.7.x asks GitHub for its "latest release", which is "the newest one not marked a
+  pre-release" - so an alpha published without the mark would be installed by all of them,
+  and the README's `releases/latest/download/...` links would hand out alphas.
+  ```bash
+  case "$VERSION" in *.0) KIND=stable ;; *) KIND=alpha ;; esac   # VERSION = X.Y.Z, no "v"
+  ```
 - **Platform flags**: `--android`, `--mac`, `--linux` — at most one may be specified. If present, the release is limited to that platform only (see "Platform-limited release" below).
 - **No phone needed**: every Termux asset (GUI included) is cross-compiled locally in Step 5. macOS is built on the local Mac VM, which is started on demand.
 
@@ -476,9 +488,10 @@ gh release upload vX.Y.Z /tmp/clay-linux-x86_64-musl#clay-linux-x86_64-musl /tmp
 
 Do **not** delete assets for platforms not being released in this run.
 
-**If the release doesn't exist (full release only):** Create it with whatever assets were collected (omit paths for any machine that was skipped/unreachable):
+**If the release doesn't exist (full release only):** Create it with whatever assets were collected (omit paths for any machine that was skipped/unreachable). **An alpha (Step 1's `KIND`) is created with `--prerelease`, a stable version with `--latest`**:
 ```bash
-gh release create vX.Y.Z \
+[ "$KIND" = alpha ] && KIND_FLAG=--prerelease || KIND_FLAG=--latest
+gh release create vX.Y.Z $KIND_FLAG \
     /tmp/clay-linux-x86_64-musl#clay-linux-x86_64-musl \
     /tmp/clay-linux-x86_64-gui#clay-linux-x86_64-gui \
     /tmp/clay-linux-aarch64-musl#clay-linux-aarch64-musl \
@@ -494,6 +507,18 @@ gh release create vX.Y.Z \
 
 Note: the Linux ARM64 asset and the three Termux assets are not bracketed above — all are
 cross-compiled locally (Step 5), so they're always included in a full release.
+
+**Then check what GitHub calls the latest release, every time** (a partial release too: an
+existing release keeps its kind, but look anyway). It must be the newest **stable**
+version: vX.Y.Z itself after a stable release, the series' `X.Y.0` after an alpha.
+```bash
+gh api repos/c-hudson/clay/releases/latest --jq .tag_name      # a vN.N.0 tag, never an alpha
+gh release view vX.Y.Z --json isPrerelease --jq .isPrerelease  # true for an alpha, false for stable
+```
+If an alpha came out as the latest (the flag was forgotten, or the release already existed
+from a run before this rule), fix it at once, before anything else:
+`gh release edit vX.Y.Z --prerelease`, then check again. A stable release that isn't the
+latest: `gh release edit vX.Y.Z --prerelease=false --latest`.
 
 ### Step 9: Delete Old GitHub Releases
 
@@ -556,6 +581,8 @@ prune their own `target/` in Steps 6a and 6b. Report each `Freed N GB` line in t
 ### Step 11: Print Summary
 
 Print a summary table showing:
+- Whether vX.Y.Z is a stable release or an alpha (a pre-release), and which tag GitHub now
+  calls the latest
 - Each build target attempted, pass/fail status, and file size
 - Skipped targets marked as "Skipped"
 - The GitHub release URL

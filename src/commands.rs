@@ -1010,6 +1010,11 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 app.add_output("Already running as an independent master.");
                 return false;
             }
+            // A bare /server: this machine's default server (src/clientconf.rs).
+            if addr.is_empty() {
+                app.open_server_popup();
+                return false;
+            }
             if !app.is_master {
                 app.add_output("Only the master client can use /server.");
                 return false;
@@ -1461,10 +1466,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
         }
         Command::Tts { args } => app.tts_command(&args, None, &event_tx),
-        Command::Update { force } => {
+        Command::Update { want } => {
             // The console is the server: its /update is the server's own update
             // (src/selfupdate.rs); the result comes back as AppEvent::UpdateResult.
-            app.start_server_update(force, None, &event_tx);
+            app.start_server_update(want, None, &event_tx);
         }
         Command::Remote => {
             // requesting_client_id 0 = console (results displayed via add_output in RemoteListResult handler)

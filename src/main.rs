@@ -78,6 +78,7 @@ pub mod desktop;
 pub mod zoom;
 pub mod sizepopup;
 pub mod keptwindow;
+pub mod clientconf;
 pub mod selfupdate;
 #[cfg(feature = "native-gui")]
 pub mod native_gui;
@@ -95,7 +96,7 @@ Options:
   --gui[=host]       GUI mode
   -D                 Run as headless daemon server
   --port=<N>         Override the listen port (used with --local-server)
-  --upgrade          Update client to newest release on GitHub
+  --upgrade          Update client to newest stable release on GitHub
   --grep=host <pat>  Search world output
      -w <world>      Limit to a specific world
      --regexp        Search using regexps
@@ -2297,6 +2298,13 @@ pub struct Settings {
     /// Settings (user ruling 2026-11-02). A world's own switch is `WorldSettings::status_panel`;
     /// the display shows only while both are on (`App::status_display_wanted`). Default on.
     pub status_panel: bool,
+    /// Settings' "/update to newest" (user request 2026-11-23): every update command -
+    /// `/update`, `/update -f`, `clay --upgrade` - takes the newest release of any kind,
+    /// as if `--newest` were typed (`selfupdate::UpdateWant::with_setting`), where it
+    /// otherwise takes the newest stable one (`X.Y.0`). One setting for the instance, in
+    /// every interface's General settings; an attached client applies the server's to its
+    /// own half too. Default off.
+    pub update_newest: bool,
     /// The shared Icon Bar setting (web/GUI/Android only, see IconBarMode): what an older
     /// peer reads and writes, and where an interface without its own place takes it from.
     pub icon_bar: IconBarMode,
@@ -2485,6 +2493,7 @@ impl Default for Settings {
             screen_reader_profiles: std::collections::BTreeMap::new(),
             announce_screen_reader: false,
             status_panel: true,
+            update_newest: false,
             icon_bar: IconBarMode::AppTablet,
             icon_bar_profiles: std::collections::BTreeMap::new(),
             picture_host: picture::PictureService::default(),
@@ -3004,8 +3013,9 @@ pub enum Command {
     /// /reload [--console|--gui] - hot reload binary, in the console or the GUI (`None`:
     /// the one it runs). `bad`: an option it doesn't know, for the usage line.
     Reload { ui: Option<platform::UiKind>, bad: Option<String> },
-    /// /update - check for and install updates from GitHub
-    Update { force: bool },
+    /// /update [-f] [--newest] - check for and install updates from GitHub
+    /// (`selfupdate::UpdateWant`: the newest stable release, or with `--newest` the newest)
+    Update { want: selfupdate::UpdateWant },
     /// /setup - show global settings popup
     Setup,
     /// /web - show web settings popup
@@ -3263,10 +3273,7 @@ pub fn parse_command(input: &str) -> Command {
             let (ui, bad) = platform::reload_options(args.iter().copied());
             Command::Reload { ui, bad }
         }
-        "/update" => {
-            let force = args.first().map(|a| *a == "-f" || *a == "--force").unwrap_or(false);
-            Command::Update { force }
-        }
+        "/update" => Command::Update { want: selfupdate::UpdateWant::parse(args.iter().copied()) },
         "/setup" => Command::Setup,
         "/web" => Command::Web,
         "/actions" => Command::Actions { query: actions::ActionsQuery::parse(args) },
@@ -6662,7 +6669,7 @@ pub struct App {
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Remote client mode: this console's own binary is to be updated now (Some(force)) -
     /// set once the server's part of `/update` is over (src/selfupdate.rs).
-    pub pending_update: Option<bool>,
+    pub pending_update: Option<selfupdate::UpdateWant>,
     /// Remote client mode: where a `/update` stands while the server's part runs.
     pub update_flow: Option<selfupdate::ClientFlow>,
     /// Remote client mode: `/note` asked the server for this world's notes
@@ -6676,6 +6683,11 @@ pub struct App {
     /// going away; the console restarts itself (attached again) once its own update is
     /// over, whatever that update's result.
     pub update_server_reloading: bool,
+    /// Remote client mode: the server sent no "/update to newest"
+    /// (`GlobalSettingsMsg.update_newest` `None`: one from before the setting, or a login
+    /// that may not update it), so `/setup` shows no row for it and a save sends none.
+    /// Always true in a Clay of its own.
+    pub update_newest_known: bool,
     /// Remote client mode: pending /reload request (re-exec local binary)
     pub pending_reload: bool,
     /// Remote console: the server ran `/quit` for this console (an action, a macro): the
@@ -6954,6 +6966,7 @@ impl App {
             ws_client_tx: None, // Set when running as remote client (--console mode)
             pending_update: None,
             update_flow: None,
+            update_newest_known: true,
             pending_note_open: None,
             pending_note_list: None,
             update_server_reloading: false,
@@ -7178,6 +7191,7 @@ impl App {
             screen_reader_profiles: Some(self.settings.screen_reader_profiles.clone()),
             announce_screen_reader: self.settings.announce_screen_reader,
             status_panel: Some(self.settings.status_panel),
+            update_newest: self.update_newest_shown(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             tf_bound_keys_json: self.tf_bound_keys_json(),
@@ -7291,6 +7305,10 @@ impl App {
             self.settings.status_panel = status_panel;
             self.needs_output_redraw = true;
         }
+        // Settings' "/update to newest" (absent: no switch here, and this console's own
+        // /update takes the stable release).
+        self.update_newest_known = settings.update_newest.is_some();
+        self.settings.update_newest = settings.update_newest.unwrap_or(false);
         let old_tts_mode = self.settings.tts_mode;
         match &settings.tts_profiles {
             // This attached console's own text-to-speech, kept by the server under its key
@@ -8448,7 +8466,7 @@ impl App {
 
     /// Open the new setup popup for global settings
     fn open_setup_popup_new(&mut self) {
-        use popup::definitions::setup::{add_import_button, add_screen_reader_fields, add_status_line_field, create_setup_popup, SETUP_FIELD_MORE_MODE};
+        use popup::definitions::setup::{add_import_button, add_screen_reader_fields, add_status_line_field, add_update_newest_field, create_setup_popup, SETUP_FIELD_MORE_MODE};
 
         let world_switching = match self.settings.world_switch_mode {
             WorldSwitchMode::UnseenFirst => "unseen_first",
@@ -8484,6 +8502,13 @@ impl App {
         );
         add_screen_reader_fields(&mut def, self.settings.screen_reader, self.settings.announce_screen_reader);
         add_status_line_field(&mut def, self.settings.status_panel);
+        if let Some(on) = self.update_newest_shown() {
+            add_update_newest_field(&mut def, on);
+        }
+        // This machine's Preferred Interface (src/clientconf.rs), whichever Clay the console
+        // is attached to: what it shows is kept, so Save writes only a change.
+        let shown = clientconf::shown_preference(&clientconf::ClientConf::load());
+        popup::definitions::setup::add_preferred_interface_field(&mut def, &clientconf::offered(), shown);
         if self.is_master {
             add_import_button(&mut def);
         }
@@ -8492,6 +8517,7 @@ impl App {
         // Select first field
         if let Some(state) = self.popup_manager.current_mut() {
             state.select_field(SETUP_FIELD_MORE_MODE);
+            state.set_custom("preferred_shown", shown.name());
         }
     }
 
@@ -9291,21 +9317,26 @@ impl App {
                 // itself once its own update is done (run_console_client).
                 if let Some(flow) = self.update_flow.take() {
                     self.update_server_reloading = reloading;
-                    self.pending_update = Some(flow.force());
+                    self.pending_update = Some(flow.want());
                 }
             }
             WsMessage::ExecuteLocalCommand { command } => {
                 // A command whose window is this console's, run on the server (an action, a
                 // macro) or answered by it (the bounce of a typed one): the remote console's
                 // one dispatcher, told it came from the server so nothing goes back.
-                if let Command::Update { force } = parse_command(&command) {
+                if let Command::Update { want } = parse_command(&command) {
                     // A server from before UpdateOutcome bounces /update back here
                     // (src/selfupdate.rs): it can't be updated from a client, so go
-                    // on with this console's own update.
-                    if self.update_flow.take().is_some() {
-                        self.add_output(&selfupdate::server_too_old());
-                    }
-                    self.pending_update = Some(force);
+                    // on with this console's own update - with what was asked here,
+                    // which the echo may not carry whole.
+                    let want = match self.update_flow.take() {
+                        Some(flow) => {
+                            self.add_output(&selfupdate::server_too_old());
+                            flow.want()
+                        }
+                        None => want.with_setting(self.settings.update_newest),
+                    };
+                    self.pending_update = Some(want);
                 } else {
                     let tx = self.ws_client_tx.clone().unwrap_or_else(|| mpsc::unbounded_channel().0);
                     if crate::remote_client::run_remote_command(self, &command, &tx, true) {
@@ -11799,6 +11830,13 @@ impl App {
         self.needs_output_redraw = true;
     }
 
+    /// A bare `/server` in the console or the SSH console: the Server popup, this machine's
+    /// default server and its login (src/clientconf.rs, user request 2026-11-21).
+    pub(crate) fn open_server_popup(&mut self) {
+        let page = clientconf::ClientConf::load().server_page();
+        self.popup_manager.open(popup::definitions::server::create_server_popup(&page));
+    }
+
     /// Handle a `/server host:port` request from a master instance. Returns true if the
     /// caller should proceed with the relaunch now, false if it printed a message instead
     /// (usage error, or a confirmation warning that requires repeating the command).
@@ -12345,6 +12383,13 @@ impl App {
 
     /// Is world `idx`'s status display (GMCP `Char.*`/MSDP) wanted? Settings' Status Panel and
     /// the world's own (Edit World) both on. `/stats` lists the data whatever they say.
+    /// Settings' "/update to newest" as an interface's Settings shows it, or `None` for no
+    /// switch at all: a login that may not update this Clay (a clay_multi user, a clay_web
+    /// visitor), and an attached console whose server sent none.
+    pub(crate) fn update_newest_shown(&self) -> Option<bool> {
+        (self.policy.server_wide && self.update_newest_known).then_some(self.settings.update_newest)
+    }
+
     pub(crate) fn status_display_wanted(&self, idx: usize) -> bool {
         self.settings.status_panel && self.worlds.get(idx).is_some_and(|w| w.settings.status_panel)
     }
@@ -12868,7 +12913,7 @@ impl App {
         taskbar_alert: Option<bool>,
         more: websocket::SettingsAdditions,
     ) {
-        let websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } = more;
+        let websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile, update_newest } = more;
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
         self.settings.temp_convert_enabled = temp_convert_enabled;
@@ -12991,6 +13036,13 @@ impl App {
             if self.settings.status_panel != on {
                 self.settings.status_panel = on;
                 self.needs_output_redraw = true;
+            }
+        }
+        // Settings' "/update to newest": the server's own, so only its operator's
+        // (`policy.server_wide`; a clay_multi user is shown no switch and can set none).
+        if let Some(on) = update_newest {
+            if self.policy.server_wide {
+                self.settings.update_newest = on;
             }
         }
         self.settings.icon_bar = IconBarMode::from_name(&icon_bar);
@@ -14602,8 +14654,9 @@ impl App {
     /// `None` = the console). The asker's other connections - a browser's other tabs, a
     /// GUI's other windows (`same_interface`) - are the same interface and are left alone.
     /// Each paused one resumes as soon as it is used. The reply, for whoever asked, names
-    /// them (`Paused on: the console, client 3 (Web, 10.0.0.2), and client 4 (...).`, the
-    /// user's wording 2026-11-16; a client's number is what `/remote --pause <id>` takes).
+    /// them with commas between: `Console` for the console, a client by its address alone
+    /// (`Paused on: Console, 10.0.0.2, 127.0.0.1`; user request 2026-11-19, replacing the
+    /// 2026-11-16 `the console, client 3 (Web, 10.0.0.2), and ...`).
     pub(crate) fn pause_other_interfaces(&mut self, asker: Option<u64>) -> String {
         let mut paused = Vec::new();
         let mut already = 0;
@@ -14613,18 +14666,18 @@ impl App {
             } else {
                 self.console_paused = true;
                 self.needs_output_redraw = true;
-                paused.push("the console".to_string());
+                paused.push("Console".to_string());
             }
         }
-        let mut clients: Vec<(u64, bool, String)> = match self.ws_server {
+        let mut clients: Vec<(u64, bool)> = match self.ws_server {
             Some(ref server) => server.clients.read().unwrap().iter()
                 .filter(|(_, c)| c.authenticated)
-                .map(|(&id, c)| (id, c.paused, format!("{:?}", c.client_type)))
+                .map(|(&id, c)| (id, c.paused))
                 .collect(),
             None => Vec::new(),
         };
-        clients.sort_by_key(|(id, ..)| *id);
-        for (id, was_paused, kind) in clients {
+        clients.sort_by_key(|(id, _)| *id);
+        for (id, was_paused) in clients {
             if asker.is_some_and(|asker| self.same_interface(asker, id)) {
                 continue;
             }
@@ -14632,7 +14685,7 @@ impl App {
                 already += 1;
             } else if let Some(ip) = self.ws_set_client_paused(id, true) {
                 self.ws_send_to_client(id, WsMessage::PausedState { paused: true });
-                paused.push(format!("client {} ({}, {})", id, kind, ip));
+                paused.push(ip);
             }
         }
         if paused.is_empty() {
@@ -14640,7 +14693,7 @@ impl App {
                 .to_string();
         }
         self.broadcast_activity();
-        format!("Paused on: {}.", crate::util::and_list(&paused))
+        format!("Paused on: {}", paused.join(", "))
     }
 
     /// Toggle the paused state for a WebSocket client.
@@ -17985,8 +18038,9 @@ impl App {
     /// The server's half of `/update` (src/selfupdate.rs): check GitHub and download in
     /// the background; `finish_server_update` installs and reloads when the result
     /// comes back as `AppEvent::UpdateResult`. `reply_to` None = the console asked.
-    /// The multiuser server refuses: its users aren't its operator.
-    pub(crate) fn start_server_update(&mut self, force: bool, reply_to: Option<(u64, usize)>, event_tx: &mpsc::Sender<AppEvent>) {
+    /// The multiuser server refuses: its users aren't its operator. Settings' "/update to
+    /// newest" is added here, the one place for the console and both handlers.
+    pub(crate) fn start_server_update(&mut self, want: selfupdate::UpdateWant, reply_to: Option<(u64, usize)>, event_tx: &mpsc::Sender<AppEvent>) {
         if !self.policy.server_wide {
             self.reply_update_line(reply_to, &selfupdate::multiuser_refused());
             self.send_update_outcome(reply_to, false, false, "");
@@ -17994,7 +18048,7 @@ impl App {
         }
         #[cfg(target_os = "android")]
         {
-            let _ = (force, event_tx);
+            let _ = (want, event_tx);
             self.reply_update_line(reply_to, &selfupdate::unavailable(selfupdate::SERVER));
             self.send_update_outcome(reply_to, false, false, "");
         }
@@ -18002,9 +18056,10 @@ impl App {
         {
             let event_tx = event_tx.clone();
             let label = Self::update_label(reply_to);
+            let want = want.with_setting(self.settings.update_newest);
             tokio::spawn(async move {
                 let line_tx = event_tx.clone();
-                let result = check_and_download_update(force, move |version| async move {
+                let result = check_and_download_update(want, move |version| async move {
                     let line = selfupdate::updating(label, &version);
                     let _ = line_tx.send(AppEvent::UpdateLine { line, reply_to }).await;
                 })
@@ -19212,13 +19267,13 @@ impl App {
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: "/quit".to_string() });
             }
             Command::Tts { args } => self.tts_command(&args, Some((client_id, world_index)), event_tx),
-            Command::Update { force } => {
+            Command::Update { want } => {
                 // The server's half of a client's /update (src/selfupdate.rs): check,
                 // download, install, hot reload - answering the client with an
                 // UpdateOutcome so it then updates itself. (This used to bounce the
                 // command back to the client as ExecuteLocalCommand, which the native GUI
                 // forwarded to the server again: a silent ping-pong.)
-                self.start_server_update(force, Some((client_id, world_index)), event_tx);
+                self.start_server_update(want, Some((client_id, world_index)), event_tx);
             }
             Command::Reload { ui, bad } => {
                 // A client's /reload reloads the console it is attached to; `--console` and
@@ -19749,7 +19804,7 @@ impl App {
                     self.ws_tell(client_id, world_index, &format!("World name not changed: {refusal}"));
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, input_height_phone, input_height_tablet, input_height_desktop, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, mouse_enabled: _, zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled, log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert, tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile, update_newest } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -19760,7 +19815,7 @@ impl App {
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled,
                     zwj_enabled, new_line_indicator, new_indicator, tts_mode, tts_speak_mode, tts_voice, scrollback_enabled,
                     log_input_enabled, clear_input_on_send, keyboard_always_visible, tabs, icon_bar, picture_host, separator_style, text_reveal_profile, font_profile, tts_profile, taskbar_alert,
-                    websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile },
+                    websocket::SettingsAdditions { tabs_profile, screen_reader_profile, announce_screen_reader, status_panel, icon_bar_profile, update_newest },
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -21681,6 +21736,9 @@ pub(crate) struct SetupSettings {
     pub(crate) announce_screen_reader: bool,
     /// Status Line (`Settings::status_panel`), one setting for the instance.
     pub(crate) status_panel: bool,
+    /// "/update to newest" (`Settings::update_newest`), one setting for the instance;
+    /// `None` when the popup had no row for it (`App::update_newest_shown`).
+    pub(crate) update_newest: Option<bool>,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -21962,6 +22020,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     let is_notes_list = popup_id == Some(popup::PopupId("notes_list"));
     let is_recent_worlds = popup_id == Some(popup::PopupId("recent_worlds"));
     let is_import = popup_id == Some(popup::PopupId("import"));
+    let is_server = popup_id == Some(popup::definitions::server::SERVER_POPUP_ID);
 
     // The Setup popup's settings, as Save gives them (also the Text Reveal prompt's OK when
     // that Save asked for the number first).
@@ -22002,6 +22061,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             screen_reader: state.get_bool(popup::definitions::setup::SETUP_FIELD_SCREEN_READER).unwrap_or(false),
             announce_screen_reader: state.get_bool(popup::definitions::setup::SETUP_FIELD_ANNOUNCE_SCREEN_READER).unwrap_or(false),
             status_panel: state.get_bool(popup::definitions::setup::SETUP_FIELD_STATUS_LINE).unwrap_or(true),
+            update_newest: state.get_bool(popup::definitions::setup::SETUP_FIELD_UPDATE_NEWEST),
         }
     }
 
@@ -22015,8 +22075,27 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             return NewPopupAction::None;
         }
         let settings = setup_settings(state);
+        let problem = save_preferred_interface(state).err();
         app.popup_manager.close();
+        if let Some(problem) = problem {
+            app.add_output(&problem);
+        }
         NewPopupAction::SetupSaved(settings)
+    }
+
+    // Setup's Preferred Interface is this machine's (src/clientconf.rs), not one of the
+    // settings SetupSaved carries to settings.dat or a server: written to client.dat by the
+    // console showing it, and only when it was changed from what it showed.
+    fn save_preferred_interface(state: &popup::PopupState) -> Result<(), String> {
+        let shown = state.get_custom("preferred_shown").and_then(clientconf::Interface::from_name);
+        let chosen = state.get_selected(popup::definitions::setup::SETUP_FIELD_PREFERRED_INTERFACE)
+            .and_then(clientconf::Interface::from_name);
+        let (Some(shown), Some(chosen)) = (shown, chosen) else { return Ok(()) };
+        let mut conf = clientconf::ClientConf::load();
+        if clientconf::save_preference(&mut conf, shown, chosen) {
+            conf.save()?;
+        }
+        Ok(())
     }
 
     if let Some(state) = app.popup_manager.current_mut() {
@@ -23030,6 +23109,91 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
                         if btn_id == IMPORT_BTN_CANCEL {
                             app.popup_manager.close();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // The Server popup (a bare /server; src/clientconf.rs): text fields only, as
+        // /import's. Save writes this machine's client.dat - never settings.dat or the
+        // Clay this console is attached to.
+        if is_server {
+            use popup::definitions::server::{page_of, SERVER_BTN_CANCEL, SERVER_BTN_SAVE};
+            match key.code {
+                Esc => {
+                    if state.editing {
+                        state.commit_edit();
+                    } else {
+                        app.popup_manager.close();
+                    }
+                }
+                Enter => {
+                    if state.editing {
+                        state.commit_edit();
+                    } else if state.is_button_focused(SERVER_BTN_SAVE) {
+                        let page = page_of(state);
+                        let mut conf = clientconf::ClientConf::load();
+                        match conf.set_server_page(&page).and_then(|()| conf.save()) {
+                            Ok(()) => {
+                                app.popup_manager.close();
+                                app.add_output(&clientconf::saved_message(&conf));
+                            }
+                            Err(e) => {
+                                state.error = Some(e);
+                                state.error_at = Some(std::time::Instant::now());
+                            }
+                        }
+                    } else if state.is_button_focused(SERVER_BTN_CANCEL) {
+                        app.popup_manager.close();
+                    } else if !state.is_on_button() {
+                        state.start_edit();
+                    }
+                }
+                Up => {
+                    if state.editing { state.commit_edit(); }
+                    state.prev_item();
+                }
+                Down => {
+                    if state.editing { state.commit_edit(); }
+                    state.next_item();
+                }
+                Left => {
+                    if state.editing { state.cursor_left(); } else if state.is_on_button() { state.prev_button(); }
+                }
+                Right => {
+                    if state.editing { state.cursor_right(); } else if state.is_on_button() { state.next_button(); }
+                }
+                Tab => {
+                    if state.editing { state.commit_edit(); }
+                    state.cycle_field_buttons();
+                }
+                BackTab => {
+                    if state.editing { state.commit_edit(); }
+                    state.cycle_field_buttons_rev();
+                }
+                Backspace => {
+                    if state.editing { state.backspace(); }
+                }
+                Delete => {
+                    if state.editing { state.delete_char(); }
+                }
+                Home => {
+                    if state.editing { state.cursor_home(); }
+                }
+                End => {
+                    if state.editing { state.cursor_end(); }
+                }
+                Char(c) => {
+                    if state.editing {
+                        state.insert_char(c);
+                    } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        if btn_id == SERVER_BTN_CANCEL {
+                            app.popup_manager.close();
+                        } else if btn_id == SERVER_BTN_SAVE {
+                            state.select_button(SERVER_BTN_SAVE);
                         }
                     }
                 }
@@ -24126,6 +24290,7 @@ async fn main() -> io::Result<()> {
     let mut local_server_mode = false;
     let mut tts_install_mode = false;
     let mut upgrade_mode = false;
+    let mut upgrade_newest = false;
     let mut local_server_port: Option<u16> = None;
     let mut is_reload_arg = false;
     let mut is_crash_arg = false;
@@ -24183,6 +24348,8 @@ async fn main() -> io::Result<()> {
                 "--local-server" => local_server_mode = true,
                 "--tts-install" => tts_install_mode = true,
                 "--upgrade" => upgrade_mode = true,
+                // With --upgrade: the newest release of any kind, not only a stable one.
+                "--newest" => upgrade_newest = true,
                 "--reload" => is_reload_arg = true,
                 "--crash" => is_crash_arg = true,
                 "--console" => console_arg = Some(None),
@@ -24250,6 +24417,7 @@ async fn main() -> io::Result<()> {
             std::process::exit(1);
         }
     }
+    let tf_given = tf_startup_opts.given;
     tfstartup::set_startup_opts(tf_startup_opts);
 
     // Handle -h / --help
@@ -24262,7 +24430,7 @@ async fn main() -> io::Result<()> {
     if upgrade_mode {
         // `clay --upgrade`: /update's download and install, from the command line, with
         // no GUI or console (selfupdate::upgrade_cli).
-        std::process::exit(selfupdate::upgrade_cli().await);
+        std::process::exit(selfupdate::upgrade_cli(upgrade_newest).await);
     }
 
     if show_help {
@@ -24335,6 +24503,31 @@ async fn main() -> io::Result<()> {
         }
         if chosen != wanted {
             platform::note_restart_fallback(chosen);
+        }
+    }
+
+    // A start that names no interface (a bare `clay`, the desktop launcher): this
+    // machine's Preferred Interface and default server, from ~/.clay/client.dat
+    // (src/clientconf.rs, user request 2026-11-21). A command line that names one is taken
+    // as it is: `--gui` and `--console` are always a standalone Clay (user ruling, the
+    // same day), and a restart names the interface it was in.
+    let names_its_mode = console_arg.is_some() || gui_arg.is_some() || web_gui_arg.is_some()
+        || is_reload_arg || is_crash_arg || daemon_mode || multiuser_mode || web_front_mode
+        || local_server_mode || ssh_mode || ssh_proxy_mode || grep_mode || dump_mode
+        || tls_proxy_config.is_some() || native_gui_snapshot.is_some() || native_gui_verify.is_some();
+    if !names_its_mode && !cfg!(any(feature = "multiuser", feature = "web-front")) {
+        let conf = clientconf::ClientConf::load();
+        if let Some((interface, host)) = clientconf::resolve_start(&conf, clientconf::Can::at_start(), tf_given) {
+            debug_log(true, &format!("STARTUP: client.dat: {} {}", interface.name(),
+                host.as_deref().map(|h| format!("attached to {h}")).unwrap_or_else(|| "standalone".to_string())));
+            if let Some(h) = &host {
+                clientconf::note_resolved_attach(interface.flag(), h);
+            }
+            match interface {
+                clientconf::Interface::Tui => console_arg = Some(host),
+                clientconf::Interface::Gui => gui_arg = Some(host),
+                clientconf::Interface::WebGui => web_gui_arg = Some(host),
+            }
         }
     }
 

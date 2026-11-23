@@ -11,6 +11,7 @@ pub mod help;
 pub mod info;
 pub mod keybind_editor;
 pub mod notes;
+pub mod server;
 pub mod settings;
 pub mod theme_editor;
 pub mod worlds;
@@ -41,6 +42,8 @@ pub enum Kind {
     Emoji,
     /// `/info`'s report.
     Info,
+    /// The Server page on its own (a bare `/server` with no connection; windows/server.rs).
+    Server,
 }
 
 impl Kind {
@@ -58,6 +61,7 @@ impl Kind {
             Kind::ActionEditor => ("Clay - Action Editor", 960.0, 700.0),
             Kind::Emoji => ("Clay - Emoji", emoji::WIDTH, emoji::height()),
             Kind::Info => ("Clay - Info", 760.0, 760.0),
+            Kind::Server => ("Clay - Server", 480.0, 440.0),
         }
     }
 }

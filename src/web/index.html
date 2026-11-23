@@ -1070,6 +1070,12 @@
                                                 <div id="setup-status-panel-toggle" class="toggle"></div>
                                             </div>
                                         </div>
+                                        <div class="setting-row" title="Off: /update installs the newest stable version (1.8.0, 1.9.0, ...). On: every update takes the newest version of any kind, alphas too (1.8.1, 1.8.2, ...), as /update --newest does. One setting for the Clay being updated.">
+                                            <span class="setting-label" id="setup-update-newest-label">/update to newest</span>
+                                            <div class="setting-value">
+                                                <div id="setup-update-newest-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
                                         <div class="setting-row" title="Off (TinyFugue's default): lines you send stay in the input area above the next one until they scroll off. On: Enter clears the input. Phones always clear.">
                                             <span class="setting-label">Clear Input on Send</span>
                                             <div class="setting-value">
@@ -1193,6 +1199,14 @@
                                                     <option value="web">Clay</option>
                                                     <option value="tinyfugue">TinyFugue</option>
                                                 </select>
+                                            </div>
+                                        </div>
+                                        <!-- This machine's own (src/clientconf.rs): shown only where the page's host
+                                             starts Clay on this machine (the WebView GUI's CLIENT_CONF). -->
+                                        <div class="setting-row" id="setup-preferred-interface-row" style="display:none" title="What Clay starts in on this machine when the command line names no interface (a bare clay): TUI, GUI or Web GUI - only those this machine can run are offered. Started where it can't run, Clay takes one that can. Kept on this machine, never on the server.">
+                                            <span class="setting-label">Preferred Interface</span>
+                                            <div class="setting-value">
+                                                <select id="setup-preferred-interface-select" class="form-select"></select>
                                             </div>
                                         </div>
                                         <div class="setting-row" title="Type newly arrived lines, and the screen a world switch shows, onto the screen behind a glitching cursor: Slow 30, Normal 60, Fast 120, Super Fast 240 characters a second (200 in the Android app), or Custom, which asks for the number. New Only asks for a number too, but types on only text this interface hasn't shown yet: a world switch draws what you saw before whole, so new text stands out and the screen draws faster. Only how lines are drawn; scrolling and paging are unchanged. Kept per interface: this one's own.">
@@ -1401,7 +1415,9 @@
                                 </div>
                             </div>
                         </div>
-                        <!-- Clay Server section (Android only) -->
+                        <!-- Clay Server section: the Android app's, and the WebView GUI's Server page
+                             (window.CLIENT_CONF, src/clientconf.rs), which shows only Host, Port,
+                             Username, Password and Auth Key (.cs-desktop hides .cs-android-only). -->
                         <div class="settings-section" id="settings-clay-server">
                             <div class="popup-body card-stack">
                                 <div class="card">
@@ -1409,7 +1425,7 @@
                                      app (updateAndroidUI() in app.js gates the tab itself), so
                                      this choice is deliberately Android-only, mirroring the
                                      desktop GUI where the local instance IS the app already. -->
-                                <div class="setting-row">
+                                <div class="setting-row cs-android-only">
                                     <span class="setting-label">Run Mode</span>
                                     <div class="setting-value">
                                         <select id="cs-run-mode" class="web-input">
@@ -1462,7 +1478,7 @@
                                         <input type="text" id="cs-port" autocomplete="off" class="web-input" placeholder="9000">
                                     </div>
                                 </div>
-                                <div class="setting-row" title="Tunnel the connection to Host:Port through SSH instead of connecting directly">
+                                <div class="setting-row cs-android-only" title="Tunnel the connection to Host:Port through SSH instead of connecting directly">
                                     <span class="setting-label">SSH</span>
                                     <div class="setting-value">
                                         <select id="cs-ssh-enabled" class="web-input">
@@ -1471,7 +1487,7 @@
                                         </select>
                                     </div>
                                 </div>
-                                <div id="cs-ssh-fields" style="display:none;">
+                                <div id="cs-ssh-fields" class="cs-android-only" style="display:none;">
                                 <div class="setting-row">
                                     <span class="setting-label">SSH User</span>
                                     <div class="setting-value">
@@ -1504,13 +1520,13 @@
                                 </div>
                                 </div>
                                 <!-- end cs-ssh-fields -->
-                                <div class="setting-row">
+                                <div class="setting-row cs-android-only">
                                     <span class="setting-label">Remote Host</span>
                                     <div class="setting-value">
                                         <input type="text" id="cs-remote-host" autocomplete="off" class="web-input" placeholder="teenymush.dynu.net">
                                     </div>
                                 </div>
-                                <div class="setting-row">
+                                <div class="setting-row cs-android-only">
                                     <span class="setting-label">Connection Mode</span>
                                     <div class="setting-value">
                                         <select id="cs-connection-mode" class="web-input">
@@ -1539,18 +1555,27 @@
                                     <span class="setting-label">Auth Key</span>
                                     <div class="setting-value" style="display:flex;gap:4px;align-items:center">
                                         <input type="text" id="cs-auth-key" autocomplete="off" class="web-input" style="font-family:monospace;font-size:0.8em;flex:1">
-                                        <button id="cs-auth-key-download" class="btn btn-sm" title="Save to Downloads">Download</button>
+                                        <button id="cs-auth-key-download" class="btn btn-sm cs-android-only" title="Save to Downloads">Download</button>
                                     </div>
                                 </div>
                                 <div id="cs-auth-key-error" style="display:none;padding:2px 0 4px;font-size:0.78em;color:var(--error-color);"></div>
-                                <div class="setting-row" id="cs-share-logs-row" title="Send Clay's diagnostic logs off this device using the normal Android share sheet (email, Drive, messaging). The logs live in the app's private storage, so this is the only way to get at them without a USB cable.">
+                                <!-- The WebView GUI's Server page is never given the saved password or key
+                                     (app.js populateDesktopServerTab): Forget drops them at the next Save. -->
+                                <div class="setting-row cs-desktop-only" id="cs-forget-row" style="display:none" title="Drop the password and auth key saved for this server when you Save.">
+                                    <span class="setting-label">Saved Login</span>
+                                    <div class="setting-value">
+                                        <button id="cs-forget-btn" class="btn btn-sm">Forget</button>
+                                    </div>
+                                </div>
+                                <div id="cs-desktop-note" class="cs-desktop-only">A bare <code>clay</code> on this machine attaches to this Clay, in the Preferred Interface; <code>clay --gui</code> and <code>clay --console</code> run this machine's own. Kept on this machine, the password and key encrypted - never sent to the Clay you are attached to, and never shown here once saved: a blank Password or Auth Key keeps the saved one. Blank Host: no default server.</div>
+                                <div class="setting-row cs-android-only" id="cs-share-logs-row" title="Send Clay's diagnostic logs off this device using the normal Android share sheet (email, Drive, messaging). The logs live in the app's private storage, so this is the only way to get at them without a USB cable.">
                                     <span class="setting-label">Diagnostic Logs</span>
                                     <div class="setting-value">
                                         <button id="cs-share-logs-btn" class="btn btn-sm">Share Logs</button>
                                     </div>
                                 </div>
                                 <div id="cs-share-logs-status" style="display:none;padding:2px 0 4px;font-size:0.78em;opacity:0.85;"></div>
-                                <div class="setting-row" title="Forget all pinned TLS certificates for remote servers this app has connected to. The next connection to each server re-pins whatever certificate it presents.">
+                                <div class="setting-row cs-android-only" title="Forget all pinned TLS certificates for remote servers this app has connected to. The next connection to each server re-pins whatever certificate it presents.">
                                     <span class="setting-label">Pinned Certificates</span>
                                     <div class="setting-value">
                                         <button id="cs-clear-pins-btn" class="btn btn-sm">Clear Pinned Certificates</button>

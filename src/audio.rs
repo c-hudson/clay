@@ -315,26 +315,26 @@ pub fn play_file(
     }
 }
 
-/// B5 (security remediation): validate a MUD-supplied GMCP `Client.Media.*` URL before
-/// it's ever handed to curl. `download_to_cache` is the single choke point both media
-/// call sites (`main.rs` "Play" and "Load") route through, so validating here covers
-/// both.
+/// How many redirects a media download follows, each one re-validated (`fetch_media`).
+const MEDIA_MAX_REDIRECTS: usize = 5;
+/// How long a media download may take before it is abandoned.
+const MEDIA_DOWNLOAD_TIMEOUT_SECS: u64 = 30;
+
+/// Whether a single URL is an allowed media target: an `http`/`https` scheme and a host
+/// that isn't a *literal* loopback/link-local/private/ULA address. **Applied to every
+/// redirect hop** (`fetch_media`'s redirect policy), not only the first URL — a redirect
+/// to an internal address is the exact bypass this closes (security review 2026-11-21).
 ///
-/// - Only `http`/`https` schemes are allowed — this alone blocks `file://` (arbitrary
-///   local file read, e.g. `file:///etc/passwd`) and other exotic schemes (`gopher://`,
-///   etc.).
-/// - The host is rejected if it's a *literal* loopback/link-local/private (RFC1918) IP —
-///   this blocks the common SSRF targets, notably the cloud-metadata endpoint
-///   `169.254.169.254` (link-local).
+/// - Only `http`/`https` — blocks `file://` (arbitrary local-file read, e.g.
+///   `file:///etc/passwd`) and other exotic schemes.
+/// - A literal loopback/link-local/private/ULA IP is rejected — the common SSRF targets,
+///   notably the cloud-metadata endpoint `169.254.169.254` (link-local).
 ///
-/// Known limitation (documented rather than solved here): this only inspects the literal
-/// host in the URL. A *hostname* that resolves to an internal address (or one that's
-/// rebound between this check and curl's own DNS resolution — "DNS rebinding") is not
-/// caught. Closing that fully would mean resolving the hostname ourselves and pinning
-/// curl to the resolved IP (e.g. via `curl --resolve` or `--connect-to`), which is more
-/// invasive than this Phase-B pass; left as a follow-up (see SECURITY-ROADMAP.md).
-fn validate_media_url(url_str: &str) -> Result<url::Url, &'static str> {
-    let parsed = url::Url::parse(url_str).map_err(|_| "invalid URL")?;
+/// Residual limitation (unchanged): a *hostname* that resolves to an internal address is
+/// not caught here (DNS rebinding) — closing that fully means resolving in-process and
+/// pinning the connection to the vetted IP (see SECURITY-ROADMAP.md). The redirect path,
+/// which used to be wide open (`curl -L` followed a redirect to any host), is now closed.
+fn media_url_host_allowed(parsed: &url::Url) -> Result<(), &'static str> {
     match parsed.scheme() {
         "http" | "https" => {}
         _ => return Err("only http/https URLs are allowed"),
@@ -346,10 +346,11 @@ fn validate_media_url(url_str: &str) -> Result<url::Url, &'static str> {
             }
         }
         Some(url::Host::Ipv6(ip)) => {
-            // fe80::/10 = link-local unicast (top 10 bits of the first segment).
+            // fe80::/10 = link-local unicast; fc00::/7 = unique-local (RFC 4193).
             let is_link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
-            if ip.is_loopback() || ip.is_unspecified() || is_link_local {
-                return Err("target host is a loopback/link-local IPv6 address");
+            let is_unique_local = (ip.segments()[0] & 0xfe00) == 0xfc00;
+            if ip.is_loopback() || ip.is_unspecified() || is_link_local || is_unique_local {
+                return Err("target host is a loopback/link-local/ULA IPv6 address");
             }
             if let Some(v4) = ip.to_ipv4_mapped() {
                 if v4.is_loopback() || v4.is_link_local() || v4.is_private() || v4.is_unspecified() {
@@ -357,9 +358,18 @@ fn validate_media_url(url_str: &str) -> Result<url::Url, &'static str> {
                 }
             }
         }
-        Some(url::Host::Domain(_)) => {} // resolved by curl at connect time; see limitation above
+        Some(url::Host::Domain(_)) => {} // resolved at connect time; see limitation above
         None => return Err("URL has no host"),
     }
+    Ok(())
+}
+
+/// B5 (security remediation): validate a MUD-supplied GMCP `Client.Media.*` / MSP URL
+/// before it is fetched. `download_to_cache` is the single choke point both media call
+/// sites (`main.rs` "Play"/"Load" and the MSP `U=` path) route through.
+fn validate_media_url(url_str: &str) -> Result<url::Url, &'static str> {
+    let parsed = url::Url::parse(url_str).map_err(|_| "invalid URL")?;
+    media_url_host_allowed(&parsed)?;
     Ok(parsed)
 }
 
@@ -439,15 +449,55 @@ pub fn resolve_msp_local_path(name: &str, base_dir: &Path) -> Result<std::path::
     }
 }
 
-/// Download a file to the cache directory.
-/// Returns the cache path on success. Uses curl for the download.
-/// Called from background threads.
+/// A reqwest client for a media download: it re-validates **every redirect hop's host**
+/// with `media_url_host_allowed`, so a public host can't 302-redirect the fetch to an
+/// internal address (security review 2026-11-21 — `curl -L` used to follow a redirect to
+/// any host). Normal web-PKI (CA) verification is used, as for any public media host; the
+/// pinned `TofuVerifier` is only for Clay/MUD sockets, not this.
+fn build_media_client() -> Result<reqwest::Client, reqwest::Error> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MEDIA_MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        match media_url_host_allowed(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            // A redirect to an internal/non-http host: stop here (the bytes gathered so
+            // far, if any, are discarded by the caller on the resulting status/None).
+            Err(_) => attempt.stop(),
+        }
+    });
+    reqwest::Client::builder()
+        .redirect(policy)
+        .timeout(std::time::Duration::from_secs(MEDIA_DOWNLOAD_TIMEOUT_SECS))
+        .build()
+}
+
+/// Fetch `url`'s bytes, following only redirects whose host passes `media_url_host_allowed`.
+/// `None` on any error (unreachable, non-2xx, a redirect stopped by the policy). Runs on
+/// its own current-thread runtime: `download_to_cache` is called from a plain
+/// `std::thread`, never inside the app's tokio runtime.
+fn fetch_media(url: &str) -> Option<Vec<u8>> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+    runtime.block_on(async {
+        let client = build_media_client().ok()?;
+        let resp = client.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.bytes().await.ok().map(|b| b.to_vec())
+    })
+}
+
+/// Download a media file to the cache directory, returning the cache path on success.
+/// Called from background threads. The URL is a MUD-supplied GMCP/MSP media URL: it and
+/// every redirect it follows are validated against the SSRF host block-list
+/// (`media_url_host_allowed`).
 pub fn download_to_cache(
     url: &str,
     cache_dir: &Path,
 ) -> Option<std::path::PathBuf> {
-    // B5: reject anything that isn't a plain http/https URL to a non-internal host
-    // before we ever touch the filesystem cache path or spawn curl.
+    // Reject anything that isn't a plain http/https URL to a non-internal host before we
+    // ever touch the filesystem cache path or make a request.
     if validate_media_url(url).is_err() {
         return None;
     }
@@ -458,25 +508,10 @@ pub fn download_to_cache(
     if cache_path.exists() {
         return Some(cache_path);
     }
-    let cache_path_str = cache_path.to_string_lossy().to_string();
-    let status = std::process::Command::new("curl")
-        .args([
-            "-s", "-o", &cache_path_str,
-            // B5: constrain both the initial request and any redirect target to
-            // http/https — matches the scheme check above but also stops a same-scheme
-            // redirect chain from hopping to a disallowed scheme mid-flight.
-            "--proto", "=http,https",
-            "--proto-redir", "=http,https",
-            "-L",
-            url,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    if status.is_ok() && cache_path.exists() {
-        Some(cache_path)
-    } else {
-        None
+    let bytes = fetch_media(url)?;
+    match std::fs::write(&cache_path, &bytes) {
+        Ok(()) => Some(cache_path),
+        Err(_) => None,
     }
 }
 
@@ -540,6 +575,82 @@ mod media_url_tests {
     #[test]
     fn accepts_normal_http_url() {
         assert!(validate_media_url("http://cdn.example.com/media/x.wav").is_ok());
+    }
+
+    /// The per-hop host check `fetch_media`'s redirect policy applies: a redirect target
+    /// that is an internal/non-http host is rejected exactly like an initial URL, so a
+    /// public host can't 302 the download to an internal address (security review
+    /// 2026-11-21). Also covers the widened IPv6 ULA block.
+    #[test]
+    fn a_redirect_target_is_held_to_the_same_host_rule() {
+        use super::media_url_host_allowed;
+        let url = |s: &str| url::Url::parse(s).unwrap();
+        for blocked in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/x", "http://10.0.0.5/x", "http://192.168.1.1/x",
+            "http://[::1]/x", "http://[fd00::1]/x", "http://[fc00::1]/x",
+            "file:///etc/passwd", "gopher://evil/x",
+        ] {
+            assert!(media_url_host_allowed(&url(blocked)).is_err(), "should block {blocked}");
+        }
+        for ok in ["https://cdn.example.com/x.mp3", "http://203.0.113.7/x.wav"] {
+            assert!(media_url_host_allowed(&url(ok)).is_ok(), "should allow {ok}");
+        }
+    }
+
+    /// End to end: the redirect policy `fetch_media` builds stops a redirect to a loopback
+    /// (stand-in for "internal") host. A tiny local server 302s to a second local server;
+    /// the second must never be reached. The initial request to a loopback host is itself
+    /// fine here — the policy fires only on the redirect, which is the real bypass.
+    #[test]
+    fn the_redirect_policy_blocks_a_redirect_to_an_internal_host() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Server B: records whether it was ever reached; it must not be.
+        let reached = Arc::new(AtomicBool::new(false));
+        let b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b_port = b.local_addr().unwrap().port();
+        {
+            let reached = reached.clone();
+            std::thread::spawn(move || {
+                if let Ok((mut s, _)) = b.accept() {
+                    reached.store(true, Ordering::SeqCst);
+                    let mut buf = [0u8; 256];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbad");
+                }
+            });
+        }
+        // Server A: 302 to server B.
+        let a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_port = a.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = a.accept() {
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+                let body = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{b_port}/secret\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let got = runtime.block_on(async {
+            let client = super::build_media_client().unwrap();
+            let resp = client.get(format!("http://127.0.0.1:{a_port}/start")).send().await;
+            // The redirect is stopped, so the client returns the 3xx (or an error), never B's body.
+            match resp {
+                Ok(r) => r.bytes().await.map(|b| b.to_vec()).unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!reached.load(Ordering::SeqCst), "the redirect to the internal host was followed");
+        assert_ne!(got, b"bad", "server B's body was fetched");
     }
 }
 

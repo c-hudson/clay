@@ -1091,6 +1091,10 @@ pub enum WsMessage {
         /// `None` (an older client) = unchanged.
         #[serde(default)]
         status_panel: Option<bool>,
+        /// Settings' "/update to newest" (`Settings::update_newest`), one setting for the
+        /// instance. `None` (an older client, or one shown no switch) = unchanged.
+        #[serde(default)]
+        update_newest: Option<bool>,
         /// This client's own icon bar place (`IconBarPlace` name), under its interface key
         /// (user request 2026-11-04). `None` (an older client, one with none of its own, or
         /// a server before the split) = unchanged; such a client edits the shared `icon_bar`.
@@ -2200,6 +2204,7 @@ pub struct SettingsAdditions {
     pub announce_screen_reader: Option<bool>,
     pub status_panel: Option<bool>,
     pub icon_bar_profile: Option<InterfaceChoice>,
+    pub update_newest: Option<bool>,
 }
 
 /// One interface's own choice of a per-interface setting, by name: its key
@@ -2519,6 +2524,12 @@ pub struct GlobalSettingsMsg {
     /// from a server before it: the status display shows, and Settings has no switch.
     #[serde(default)]
     pub status_panel: Option<bool>,
+    /// Settings' "/update to newest" (`Settings::update_newest`): every update command
+    /// takes the newest release, alpha or stable. `None` from a server before it, and to
+    /// a login that may not update the server (a clay_multi user): Settings has no
+    /// switch, and the client's own `/update` takes the stable release.
+    #[serde(default)]
+    pub update_newest: Option<bool>,
     /// Theme colors from ~/.clay/theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
@@ -3518,6 +3529,22 @@ pub fn hash_password(password: &str) -> String {
 }
 
 /// Compute SHA256(stored_hash + challenge) for challenge-response auth verification
+/// The random bytes in a login challenge (`ServerHello.challenge`, hex: 64 characters).
+/// **Never 16** (32 characters, as it was until 1.7.40): a CLAY-KNOCK nonce is 32 bytes
+/// and its answer is this same hash, so a 32-character challenge could be handed to a
+/// client as a knock nonce before TLS and the answer used to log in
+/// (`http::knock_nonce_could_be_login_challenge`, security review 2026-11-21). Clients
+/// hash the challenge as the string it is, whatever its length.
+pub const LOGIN_CHALLENGE_BYTES: usize = 32;
+
+/// A fresh login challenge, or `None` when the random source fails (the connection is
+/// then refused: a predictable challenge would let a recorded answer be replayed).
+pub fn new_login_challenge() -> Option<String> {
+    let mut bytes = [0u8; LOGIN_CHALLENGE_BYTES];
+    getrandom::getrandom(&mut bytes).ok()?;
+    Some(hex::encode(bytes))
+}
+
 pub fn hash_with_challenge(stored_hash: &str, challenge: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(stored_hash.as_bytes());
@@ -3802,13 +3829,9 @@ where
     // (or otherwise predictable) challenge would let an attacker who knows a user's
     // password hash replay a precomputed response, so refuse the connection outright
     // rather than proceeding with a weak/default challenge (C2, security remediation).
-    let challenge = {
-        let mut bytes = [0u8; 16];
-        if getrandom::getrandom(&mut bytes).is_err() {
-            crate::http::log_remote_event("WS-REJECT", &client_ip, "rng failure generating auth challenge");
-            return Err("failed to generate secure auth challenge".into());
-        }
-        hex::encode(bytes)
+    let Some(challenge) = new_login_challenge() else {
+        crate::http::log_remote_event("WS-REJECT", &client_ip, "rng failure generating auth challenge");
+        return Err("failed to generate secure auth challenge".into());
     };
 
     // Send ServerHello immediately to tell client about multiuser mode

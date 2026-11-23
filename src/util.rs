@@ -1111,16 +1111,6 @@ pub fn calculate_prev_world(
 // Connected Worlds List Formatting (/l command)
 // ============================================================================
 
-/// A list as a sentence writes it: `a`, `a and b`, `a, b, and c`.
-pub fn and_list(items: &[String]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.clone(),
-        [first, second] => format!("{first} and {second}"),
-        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
-    }
-}
-
 /// Format a duration as a human-readable string
 /// - Under 60 minutes: Xm (e.g., 12m, 45m)
 /// - 1-24 hours: X.Xh (e.g., 2.5h, 12.3h)
@@ -1797,18 +1787,6 @@ mod tests {
     #[test]
     fn test_strip_tag_empty_parens() {
         assert_eq!(strip_mud_tag("[time()] Hello"), "[time()] Hello");
-    }
-
-    // --- and_list ---
-
-    #[test]
-    fn and_list_joins_as_a_sentence_does() {
-        let list = |items: &[&str]| and_list(&items.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(list(&[]), "");
-        assert_eq!(list(&["a"]), "a");
-        assert_eq!(list(&["a", "b"]), "a and b");
-        assert_eq!(list(&["a", "b", "c"]), "a, b, and c");
-        assert_eq!(list(&["a", "b", "c", "d"]), "a, b, c, and d");
     }
 
     // --- format_duration_short ---

@@ -16,6 +16,7 @@ pub mod modify_key;
 pub mod recent_worlds;
 pub mod remote_access;
 pub mod reveal_speed;
+pub mod server;
 pub mod setup;
 pub mod web;
 pub mod notes_list;

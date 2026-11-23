@@ -1047,8 +1047,8 @@ impl ClayView {
         // first, then this GUI's own (Effect::SelfUpdate). Running Clay itself: the
         // server's update restarts this window with it, so it goes there like any command.
         if first.eq_ignore_ascii_case("/update") && !crate::native_gui::runs_clay() {
-            let force = trimmed.split_whitespace().skip(1).any(|a| a == "-f" || a == "--force");
-            let fx = self.session.core.start_update(force, Instant::now());
+            let want = crate::selfupdate::UpdateWant::parse(trimmed.split_whitespace().skip(1));
+            let fx = self.session.core.start_update(want, Instant::now());
             let rest = self.session.apply(fx);
             self.after(rest, cx);
             self.editor.remember(&cmd, masked);

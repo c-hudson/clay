@@ -176,6 +176,29 @@ into `handle_ws_client`) and safer (two independent proofs); the client already 
 key-based WS auth, so the second proof costs nothing. Knocks are accepted from ANY
 non-banned IP including allow-listed ones (the client can't know its list status).
 
+**The knock's answer must never be usable as a login answer (security review
+2026-11-21).** "Replay-proof" above was true of the knock alone. Step 3's digest and the
+WebSocket login's (`hash_with_challenge`: hex of `SHA256(key || challenge)`) were the
+same hash, and until 1.7.40 the login challenge was 32 hex characters - 32 bytes, a
+knock nonce's length. The knock goes out before TLS, so anyone on the network path could
+open their own connection to the server, read its login challenge `C`, hand `C` to a
+client as the knock nonce, and log in with the hex of the client's answer. The
+certificate pin never came into it; a native GUI or Android app holding an auth key gave
+a full login to whoever sat between it and any non-loopback server. Two rules close it,
+neither needing a protocol version:
+- **A client never answers a nonce that could be a login challenge** (32 ASCII hex
+  digits): `http::knock_nonce_could_be_login_challenge`, asked by the native GUI's
+  `knock` (core/net.rs) and Android's `KnockSocket.couldBeLoginChallenge`; the refusal is
+  logged as `KNOCK-RELAY-REFUSED` and the client connects without the knock. This is what
+  protects a new client against an old server. The server's own nonce is never one
+  (`http::knock_nonce`).
+- **A server's login challenge is 64 hex characters** (`websocket::LOGIN_CHALLENGE_BYTES`
+  = 32, `new_login_challenge`): no 32-byte nonce spells it, and SHA-256's padding rules
+  out extending a 32-byte answer into it. This protects an old client against a new
+  server. Every client hashes the challenge as the string it is, so none had to change.
+What is left, by design: a relayed knock can still open the allow-list gate, which only
+reaches the login.
+
 Server needs the plaintext auth key synchronously at accept time: share via
 `Arc<std::sync::RwLock<Option<String>>>` (see `SecurityGate`, Phase 0), updated by
 `handle_ws_key_request`/`handle_ws_key_revoke` and settings load/reload. In multiuser
@@ -333,9 +356,15 @@ files (`secure.key`, `settings.dat`, `multiuser.dat`, `key.pem`, the reload-stat
 `settings-audit.log`) are created 0600 and `~/.clay` is 0700, via
 `util::write_secret_file`/`secure_create_file`/`secure_append_file` (the TLS private key
 `key.pem` was previously world-readable). Static-secret comparisons use the shared
-`util::constant_time_eq`. The GMCP media auto-download validates the URL (http/https
-only; `file:`/loopback/link-local/RFC1918 rejected) and constrains curl with `--proto`/
-`--proto-redir` — closing a MUD-triggerable SSRF + local-file read. RNG failures fail
+`util::constant_time_eq`. The GMCP/MSP media auto-download validates the URL (http/https
+only; `file:`/loopback/link-local/RFC1918/ULA rejected) — closing a MUD-triggerable SSRF
++ local-file read. **The fetch uses `reqwest` with a redirect policy that re-validates
+every hop's host** (`audio::fetch_media`/`build_media_client`, security review
+2026-11-21): the old `curl -L --proto-redir` constrained only a redirect's *scheme*, so a
+public host could 302 the download to an internal address (`169.254.169.254`, a router,
+RFC1918) — blind SSRF (the body only reaches the audio decoder). Residual, unchanged: a
+*hostname* that resolves to an internal address (DNS rebinding) is not caught; closing it
+means an in-process resolve + IP pin. RNG failures fail
 closed (WS challenge refuses the connection; `generate_auth_key` returns `None`) instead
 of proceeding with zeroed bytes. The plain-HTTP→HTTPS redirect sanitizes the reflected
 `Host` header. `println!`/`eprintln!` were routed through `debug_log` per the TUI rule.

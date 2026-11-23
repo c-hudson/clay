@@ -218,7 +218,7 @@ pub(crate) async fn run_grep_client(
             Some(Ok(Message::Text(text))) => {
                 if let Ok(WsMessage::AuthResponse { success, error, .. }) = serde_json::from_str::<WsMessage>(&text) {
                     if !success {
-                        eprintln!("Authentication failed: {}", error.unwrap_or_default());
+                        eprintln!("Authentication failed: {}", printable(&error.unwrap_or_default()));
                         std::process::exit(1);
                     }
                     break;
@@ -793,12 +793,47 @@ enum ConnectError {
     Failed(String),
 }
 
+/// A server's text as it goes to the terminal before the TUI is up (a refusal's reason, a
+/// close frame's): its control characters dropped - an escape sequence there would be the
+/// server writing to this terminal - and cut at 200 characters.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(200).collect()
+}
+
 /// What a reconnect logs in with: the password's hash, never the password itself (the
-/// challenge answer needs only the hash), and on a multiuser server the user name.
+/// challenge answer needs only the hash), and on a multiuser server the user name; or the
+/// auth key this machine saved for the server (src/clientconf.rs), which goes first.
 #[derive(Clone)]
 struct SavedLogin {
     username: Option<String>,
     password_hash: String,
+    auth_key: Option<String>,
+}
+
+impl SavedLogin {
+    /// The login answering `challenge`: the auth key's answer when there is one, else the
+    /// password's - neither ever sent as itself.
+    fn auth_request(&self, challenge: &str) -> WsMessage {
+        let (password_hash, auth_key) = match &self.auth_key {
+            Some(key) => (String::new(), Some(hash_with_challenge(key, challenge))),
+            None => (hash_with_challenge(&self.password_hash, challenge), None),
+        };
+        WsMessage::AuthRequest {
+            password_hash,
+            username: self.username.clone(),
+            current_world: None,
+            auth_key,
+            request_key: false,
+            challenge_response: true,
+            resume: Vec::new(),
+            resume_epochs: Vec::new(),
+            client_version: String::new(),
+            client_uid: String::new(),
+            instance_id: String::new(),
+            // This console's own text-to-speech is kept under this key.
+            interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string(),
+        }
+    }
 }
 
 impl ConnectTarget {
@@ -947,21 +982,7 @@ async fn reconnect_once(
         if multiuser && login.username.is_none() {
             return Err(ConnectError::Refused("the server now asks for a user name".to_string()));
         }
-        let auth = WsMessage::AuthRequest {
-            password_hash: hash_with_challenge(&login.password_hash, &challenge),
-            username: login.username.clone(),
-            current_world: None,
-            auth_key: None,
-            request_key: false,
-            challenge_response: true,
-            resume: Vec::new(),
-            resume_epochs: Vec::new(),
-            client_version: String::new(),
-            client_uid: String::new(),
-            instance_id: String::new(),
-            // This console's own text-to-speech is kept under this key.
-            interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string(),
-        };
+        let auth = login.auth_request(&challenge);
         let json = serde_json::to_string(&auth).map_err(|e| ConnectError::Failed(e.to_string()))?;
         write.send(Message::Text(json)).await.map_err(|e| ConnectError::Failed(e.to_string()))?;
         let initial = tokio::time::timeout(RECONNECT_STEP_TIMEOUT, async {
@@ -1199,9 +1220,58 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
         }
     };
 
-    // Prompt for username if in multiuser mode
+    // The login this machine saved for the server (src/clientconf.rs, Settings > Server):
+    // tried first; a refused one falls back to the prompts below.
     let mut username: Option<String> = None;
-    if multiuser_mode {
+    let mut saved_login: Option<SavedLogin> = None;
+    let saved = match &target {
+        ConnectTarget::Direct { remote, .. } => crate::clientconf::ClientConf::load().login_for(&remote.host_port),
+        #[cfg(feature = "ssh-transport")]
+        ConnectTarget::Ssh { .. } => None,
+    };
+    if let Some(login) = saved.filter(|l| (l.password().is_some() || l.auth_key().is_some()) && (!multiuser_mode || l.username().is_some())) {
+        let user = multiuser_mode.then(|| login.username().unwrap_or_default().to_string());
+        let kept = SavedLogin {
+            username: user.clone(),
+            password_hash: login.password().map(hash_password).unwrap_or_default(),
+            auth_key: login.auth_key().map(str::to_string),
+        };
+        let _ = ws_tx.send(kept.auth_request(&server_challenge));
+        let answer = tokio::time::timeout(RECONNECT_STEP_TIMEOUT, async {
+            loop {
+                match ws_read.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(WsMessage::AuthResponse { success, error, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                            return Some((success, error.unwrap_or_default()));
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return None,
+                    _ => {}
+                }
+            }
+        }).await;
+        match answer {
+            Ok(Some((true, _))) => {
+                username = user;
+                saved_login = Some(kept);
+            }
+            Ok(Some((false, error))) => {
+                let error = printable(&error);
+                println!("The login saved for this server was refused ({}); asking instead.", if error.is_empty() { "no reason given" } else { &error });
+            }
+            Ok(None) => {
+                eprintln!("Connection closed during the login");
+                return Ok(());
+            }
+            Err(_) => {
+                eprintln!("No answer from the server to the login");
+                return Ok(());
+            }
+        }
+    }
+
+    // Prompt for username if in multiuser mode
+    if saved_login.is_none() && multiuser_mode {
         print!("Username? ");
         let _ = io::stdout().flush();
 
@@ -1241,89 +1311,89 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     }
 
     // Prompt for password
-    print!("Password? ");
-    let _ = io::stdout().flush();
-
-    // Read password with raw mode for character-by-character input
-    let mut password = String::new();
-    // Kept for reconnecting (the hash only).
-    let mut saved_login: Option<SavedLogin> = None;
-    enable_raw_mode()?;
     let mut event_stream = EventStream::new();
-    loop {
-        tokio::select! {
-            maybe_event = event_stream.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe_event {
-                    if key.kind != KeyEventKind::Press { continue; }
-                    match key.code {
-                        KeyCode::Enter => {
-                            disable_raw_mode()?;
-                            println!(); // Move to next line after password
-                            // Send authentication with challenge-response
-                            let password_hash = hash_password(&password);
-                            password.clear();
-                            let challenge_hash = hash_with_challenge(&password_hash, &server_challenge);
-                            saved_login = Some(SavedLogin { username: username.clone(), password_hash });
-                            // `resume` is empty: a reconnect gets the server's whole state
-                            // again (apply_initial_state replaces the mirrored worlds), so
-                            // there is no per-world state to resume from. Live gap recovery
-                            // for a connection that stays up is handled separately via
-                            // `ResyncRequired` in `App::handle_remote_ws_message`
-                            // (PROTOCOL-ROADMAP.md Step 6).
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username: username.clone(), current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string() });
-                            break;
+    if saved_login.is_none() {
+        print!("Password? ");
+        let _ = io::stdout().flush();
+
+        // Read password with raw mode for character-by-character input
+        let mut password = String::new();
+        enable_raw_mode()?;
+        loop {
+            tokio::select! {
+                maybe_event = event_stream.next() => {
+                    if let Some(Ok(Event::Key(key))) = maybe_event {
+                        if key.kind != KeyEventKind::Press { continue; }
+                        match key.code {
+                            KeyCode::Enter => {
+                                disable_raw_mode()?;
+                                println!(); // Move to next line after password
+                                // Send authentication with challenge-response
+                                let password_hash = hash_password(&password);
+                                password.clear();
+                                let challenge_hash = hash_with_challenge(&password_hash, &server_challenge);
+                                saved_login = Some(SavedLogin { username: username.clone(), password_hash, auth_key: None });
+                                // `resume` is empty: a reconnect gets the server's whole state
+                                // again (apply_initial_state replaces the mirrored worlds), so
+                                // there is no per-world state to resume from. Live gap recovery
+                                // for a connection that stays up is handled separately via
+                                // `ResyncRequired` in `App::handle_remote_ws_message`
+                                // (PROTOCOL-ROADMAP.md Step 6).
+                                let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username: username.clone(), current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(), instance_id: String::new(), interface_key: crate::REMOTE_CONSOLE_REVEAL_KEY.to_string() });
+                                break;
+                            }
+                            KeyCode::Char(c) => {
+                                password.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                password.pop();
+                            }
+                            KeyCode::Esc => {
+                                disable_raw_mode()?;
+                                println!();
+                                return Ok(());
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char(c) => {
-                            password.push(c);
+                    }
+                }
+                msg = ws_read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(WsMessage::AuthResponse { success, error, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                                if !success {
+                                    disable_raw_mode()?;
+                                    println!();
+                                    eprintln!("Authentication failed: {}", printable(&error.unwrap_or_default()));
+                                    return Ok(());
+                                }
+                                // Auth success - continue to wait for InitialState
+                                break;
+                            }
                         }
-                        KeyCode::Backspace => {
-                            password.pop();
-                        }
-                        KeyCode::Esc => {
+                        Some(Ok(Message::Close(frame))) => {
                             disable_raw_mode()?;
                             println!();
+                            match frame.map(|f| f.reason.to_string()).filter(|r| !r.is_empty()) {
+                                Some(reason) => eprintln!("Connection closed: {}", printable(&reason)),
+                                None => eprintln!("Connection closed"),
+                            }
                             return Ok(());
                         }
+                        None => {
+                            disable_raw_mode()?;
+                            println!();
+                            eprintln!("Connection closed");
+                            return Ok(());
+                        }
+                        // Ping/Pong/Binary/etc. and transport errors: not a close, keep waiting.
                         _ => {}
                     }
                 }
             }
-            msg = ws_read.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(WsMessage::AuthResponse { success, error, .. }) = serde_json::from_str::<WsMessage>(&text) {
-                            if !success {
-                                disable_raw_mode()?;
-                                println!();
-                                eprintln!("Authentication failed: {}", error.unwrap_or_default());
-                                return Ok(());
-                            }
-                            // Auth success - continue to wait for InitialState
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        disable_raw_mode()?;
-                        println!();
-                        match frame.map(|f| f.reason.to_string()).filter(|r| !r.is_empty()) {
-                            Some(reason) => eprintln!("Connection closed: {reason}"),
-                            None => eprintln!("Connection closed"),
-                        }
-                        return Ok(());
-                    }
-                    None => {
-                        disable_raw_mode()?;
-                        println!();
-                        eprintln!("Connection closed");
-                        return Ok(());
-                    }
-                    // Ping/Pong/Binary/etc. and transport errors: not a close, keep waiting.
-                    _ => {}
-                }
-            }
         }
     }
-    let saved_login = saved_login.unwrap_or(SavedLogin { username, password_hash: String::new() });
+    let saved_login = saved_login.unwrap_or(SavedLogin { username, password_hash: String::new(), auth_key: None });
 
     // Create App struct and set it up for remote client mode
     let mut app = App::new();
@@ -1358,7 +1428,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                     Ok(WsMessage::AuthResponse { success: false, error, .. }) => {
                         disable_raw_mode()?;
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        eprintln!("Authentication failed: {}", error.unwrap_or_default());
+                        eprintln!("Authentication failed: {}", printable(&error.unwrap_or_default()));
                         return Ok(());
                     }
                     Ok(msg @ WsMessage::InitialState { .. }) => {
@@ -1388,7 +1458,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                 let _ = execute!(terminal.backend_mut(), crossterm::event::DisableBracketedPaste);
                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                 match frame.map(|f| f.reason.to_string()).filter(|r| !r.is_empty()) {
-                    Some(reason) => eprintln!("Connection closed while waiting for initial state: {reason}"),
+                    Some(reason) => eprintln!("Connection closed while waiting for initial state: {}", printable(&reason)),
                     None => eprintln!("Connection closed while waiting for initial state"),
                 }
                 return Ok(());
@@ -1755,8 +1825,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 }
                             }
                             // The server's half of /update is over: this console's own.
-                            if let Some(force) = app.pending_update.take() {
-                                own_update_running = start_own_update(&mut app, &update_tx, force);
+                            if let Some(want) = app.pending_update.take() {
+                                own_update_running = start_own_update(&mut app, &update_tx, want);
                             }
                             needs_redraw = true;
                             // Import Picture: a drop the terminal types is a burst with more
@@ -1812,8 +1882,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             }
                             // The server's half of /update is over (UpdateOutcome, or an
                             // old server's bounce): this console's own.
-                            if let Some(force) = app.pending_update.take() {
-                                own_update_running = start_own_update(&mut app, &update_tx, force);
+                            if let Some(want) = app.pending_update.take() {
+                                own_update_running = start_own_update(&mut app, &update_tx, want);
                             }
                             needs_redraw = true;
                         }
@@ -1915,9 +1985,9 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             // The server never answered the /update: go on with this console's own.
             () = &mut update_timeout, if update_timeout_armed => {
                 update_timeout_armed = false;
-                if let Some(crate::selfupdate::ClientFlow::WaitingServer { force, .. }) = app.update_flow.take() {
+                if let Some(crate::selfupdate::ClientFlow::WaitingServer { want, .. }) = app.update_flow.take() {
                     app.add_output(&crate::selfupdate::server_no_answer());
-                    own_update_running = start_own_update(&mut app, &update_tx, force);
+                    own_update_running = start_own_update(&mut app, &update_tx, want);
                     needs_redraw = true;
                 }
             }
@@ -2108,7 +2178,7 @@ static RELAUNCH_ARGS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::
 /// attached to the same server.
 #[cfg(any(all(unix, not(target_os = "android")), windows))]
 fn relaunch_args(ui: Option<crate::platform::UiKind>) -> Vec<String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = crate::clientconf::launch_args();
     match ui {
         Some(kind) => crate::platform::attached_switch_args(args, kind),
         None => args,
@@ -2131,7 +2201,7 @@ fn relaunch_and_wait() {
         }
     };
     let args = RELAUNCH_ARGS.lock().unwrap_or_else(|p| p.into_inner()).take()
-        .unwrap_or_else(|| std::env::args().skip(1).collect());
+        .unwrap_or_else(crate::clientconf::launch_args);
     // `/reload --gui`: a GUI, which needs no console and isn't waited for in this one.
     if args.iter().any(|a| a.starts_with("--gui=")) {
         use std::os::windows::process::CommandExt;
@@ -2199,7 +2269,7 @@ enum OwnUpdate {
 /// `update_tx`); false when there was nothing to download - the server's install
 /// already replaced this binary (same machine, same file), so the console restarts
 /// at once - or when this platform can't self-update.
-fn start_own_update(app: &mut App, update_tx: &mpsc::Sender<OwnUpdate>, force: bool) -> bool {
+fn start_own_update(app: &mut App, update_tx: &mpsc::Sender<OwnUpdate>, want: crate::selfupdate::UpdateWant) -> bool {
     if crate::selfupdate::exe_replaced() {
         app.add_output(&crate::selfupdate::replaced_on_disk(OWN_LABEL, &attached_to()));
         relaunch_console(app);
@@ -2210,7 +2280,7 @@ fn start_own_update(app: &mut App, update_tx: &mpsc::Sender<OwnUpdate>, force: b
         let update_tx = update_tx.clone();
         tokio::spawn(async move {
             let found_tx = update_tx.clone();
-            let result = check_and_download_update(force, move |version| async move {
+            let result = check_and_download_update(want, move |version| async move {
                 let _ = found_tx.send(OwnUpdate::Found(version)).await;
             })
             .await;
@@ -2220,7 +2290,7 @@ fn start_own_update(app: &mut App, update_tx: &mpsc::Sender<OwnUpdate>, force: b
     }
     #[cfg(target_os = "android")]
     {
-        let _ = (update_tx, force);
+        let _ = (update_tx, want);
         app.add_output(&crate::selfupdate::unavailable(OWN_LABEL));
         if app.update_server_reloading {
             relaunch_console(app);
@@ -2408,6 +2478,9 @@ pub(crate) fn handle_remote_client_key(
                     app.settings.status_panel = settings.status_panel;
                     app.needs_output_redraw = true;
                 }
+                if let Some(on) = settings.update_newest {
+                    app.settings.update_newest = on;
+                }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_indicator = crate::NewIndicator::from_name(&settings.new_indicator);
@@ -2513,6 +2586,8 @@ pub(crate) fn handle_remote_client_key(
                     announce_screen_reader: Some(app.settings.announce_screen_reader),
                     status_panel: Some(app.settings.status_panel),
                     icon_bar_profile: None,
+                    // None where the server sent none: nothing of ours to send back.
+                    update_newest: app.update_newest_known.then_some(app.settings.update_newest),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -3171,15 +3246,18 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
         }
         // /note, /note -l, /note <file>: the editor here, the notes and files the server's.
         Command::Edit { .. } | Command::EditList => app.run_note_command(&parsed),
-        Command::Update { force } if !from_server => {
+        Command::Update { want } if !from_server => {
             // /update updates what can be updated (src/selfupdate.rs): the server first,
             // then - once it has answered (and come back, if it reloaded) - this console's
             // own binary. The answer arrives as UpdateOutcome (App::handle_remote_ws_message).
+            // The server's "/update to newest" counts for this console's half too, so
+            // both programs land on the same version.
             if app.update_flow.is_some() || app.pending_update.is_some() {
                 app.add_output("An update is already in progress.");
             } else {
-                app.update_flow = Some(crate::selfupdate::ClientFlow::WaitingServer { force, since: std::time::Instant::now() });
-                to_server(app, (if force { "/update -f" } else { "/update" }).to_string());
+                let want = want.with_setting(app.settings.update_newest);
+                app.update_flow = Some(crate::selfupdate::ClientFlow::WaitingServer { want, since: std::time::Instant::now() });
+                to_server(app, want.command());
             }
         }
         // This console's own binary (the server's /reload is the server's); `--gui` starts
@@ -3205,7 +3283,8 @@ pub(crate) fn run_remote_command(app: &mut App, cmd: &str, ws_tx: &mpsc::Unbound
             } else if close {
                 app.pending_remote_detach = true;
             } else if addr.is_empty() {
-                app.add_output("Usage: /server host:port  (or)  /server host port  (or)  /server --close");
+                // This machine's default server (src/clientconf.rs), not the attached one's.
+                app.open_server_popup();
             } else {
                 app.pending_remote_switch = Some(addr);
             }
@@ -3808,6 +3887,7 @@ pub(crate) fn send_global_settings(app: &mut App, ws_password: String, ws_tx: &t
         announce_screen_reader: None,
         status_panel: None,
         icon_bar_profile: None,
+        update_newest: None,
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
@@ -3859,6 +3939,30 @@ pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server's text printed before the TUI is up carries no control characters: an
+    /// escape sequence in a refusal's reason would be the server writing to this terminal.
+    #[test]
+    fn server_text_for_the_terminal_has_no_control_characters() {
+        assert_eq!(printable("Invalid auth key"), "Invalid auth key");
+        assert_eq!(printable("bad\u{1b}[2J\u{1b}]0;owned\u{7}\r\nnext"), "bad[2J]0;ownednext");
+        assert_eq!(printable(&"x".repeat(500)).len(), 200);
+    }
+
+    /// The login a console logs in and reconnects with: a saved auth key's challenge
+    /// answer when there is one (never the key), else the password's.
+    #[test]
+    fn a_saved_login_answers_the_challenge_with_its_key_first() {
+        let key = SavedLogin { username: None, password_hash: hash_password("pw"), auth_key: Some("the-key".into()) };
+        let WsMessage::AuthRequest { password_hash, auth_key, challenge_response, .. } = key.auth_request("c1") else { panic!() };
+        assert_eq!(auth_key.as_deref(), Some(hash_with_challenge("the-key", "c1").as_str()));
+        assert!(password_hash.is_empty() && challenge_response);
+        let pw = SavedLogin { username: Some("alice".into()), password_hash: hash_password("pw"), auth_key: None };
+        let WsMessage::AuthRequest { password_hash, auth_key, username, .. } = pw.auth_request("c2") else { panic!() };
+        assert_eq!(password_hash, hash_with_challenge(&hash_password("pw"), "c2"));
+        assert!(auth_key.is_none());
+        assert_eq!(username.as_deref(), Some("alice"));
+    }
 
     /// A minimal `App` with `connected.len()` worlds named `w0`, `w1`, ... whose
     /// `connected` flags match `connected` in order - enough to exercise

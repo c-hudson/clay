@@ -2001,10 +2001,51 @@ pub(crate) fn is_newer_version(remote: &str, current: &str) -> bool {
 #[cfg(not(target_os = "android"))]
 pub(crate) const UP_TO_DATE: &str = "Already up to date";
 
-/// Check GitHub for latest release and download the binary if newer. `found` is told the
-/// new release's version before the download starts (`selfupdate::updating`'s line).
+/// Is `version` (no leading `v`) a stable one? `X.Y.0` is, and nothing else: any other
+/// patch number is an alpha, and so is anything with a `-suffix` (user ruling 2026-11-23).
+#[cfg(any(not(target_os = "android"), test))]
+pub(crate) fn is_stable_version(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) && parts[2].parse::<u64>() == Ok(0)
+}
+
+/// A release tag's version, for one of the form `vX.Y.Z` or `vX.Y.Z-suffix`; anything
+/// else on the releases page is not a Clay version and is never offered.
+#[cfg(any(not(target_os = "android"), test))]
+fn release_tag_version(tag: &str) -> Option<&str> {
+    let version = tag.strip_prefix('v')?;
+    let base = version.split('-').next().unwrap_or(version);
+    let numbers: Vec<&str> = base.split('.').collect();
+    (numbers.len() == 3 && numbers.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))).then_some(version)
+}
+
+/// The release an update installs, from GitHub's list: the highest version there is when
+/// `newest`, else the highest stable one (`is_stable_version`). Chosen by version number,
+/// never by the list's order or GitHub's pre-release mark; drafts are skipped.
+#[cfg(any(not(target_os = "android"), test))]
+pub(crate) fn pick_release(releases: &[serde_json::Value], newest: bool) -> Option<&serde_json::Value> {
+    let mut best: Option<(&serde_json::Value, &str)> = None;
+    for release in releases {
+        if release["draft"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(version) = release["tag_name"].as_str().and_then(release_tag_version) else { continue };
+        if !newest && !is_stable_version(version) {
+            continue;
+        }
+        if best.is_none_or(|(_, held)| is_newer_version(version, held)) {
+            best = Some((release, version));
+        }
+    }
+    best.map(|(release, _)| release)
+}
+
+/// Check GitHub for the release `want` asks for (the newest stable one, or with `newest`
+/// the newest of any kind - `selfupdate::UpdateWant`) and download the binary if it is
+/// newer than this build, or whatever it is with `force`. `found` is told the release's
+/// version before the download starts (`selfupdate::updating`'s line).
 #[cfg(not(target_os = "android"))]
-pub async fn check_and_download_update<F, Fut>(force: bool, found: F) -> Result<UpdateSuccess, String>
+pub async fn check_and_download_update<F, Fut>(want: crate::selfupdate::UpdateWant, found: F) -> Result<UpdateSuccess, String>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = ()>,
@@ -2014,34 +2055,21 @@ where
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    // Try /releases/latest first (works for non-prerelease tags), then fall back to
-    // /releases (includes pre-releases like v1.0.0-beta)
-    let release: serde_json::Value = {
-        let resp = client
-            .get("https://api.github.com/repos/c-hudson/clay/releases/latest")
-            .send()
-            .await
-            .map_err(|e| format!("Failed to check for updates: {}", e))?;
-
-        if resp.status().is_success() {
-            resp.json().await
-                .map_err(|e| format!("Invalid response: {}", e))?
-        } else {
-            // /latest returned 404 (pre-release only) — try listing all releases
-            let releases: serde_json::Value = client
-                .get("https://api.github.com/repos/c-hudson/clay/releases?per_page=1")
-                .send()
-                .await
-                .map_err(|e| format!("Failed to check for updates: {}", e))?
-                .json()
-                .await
-                .map_err(|e| format!("Invalid response: {}", e))?;
-
-            releases.as_array()
-                .and_then(|a| a.first().cloned())
-                .ok_or("No releases found on GitHub")?
-        }
-    };
+    // The whole list, and the choice made here by version number: GitHub's
+    // /releases/latest is "the newest release not marked a pre-release", which is the
+    // stable one only as long as every alpha was published with that mark.
+    let releases: serde_json::Value = client
+        .get("https://api.github.com/repos/c-hudson/clay/releases?per_page=100")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to check for updates: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("Invalid response: {}", e))?;
+    let release = releases
+        .as_array()
+        .and_then(|list| pick_release(list, want.newest))
+        .ok_or(if want.newest { "No releases found on GitHub" } else { "No stable release found on GitHub" })?;
 
     // Extract version from tag_name (strip leading 'v')
     let tag = release["tag_name"]
@@ -2051,10 +2079,10 @@ where
     let remote_version = tag.trim_start_matches('v');
 
     // Compare versions
-    if !force && !is_newer_version(remote_version, VERSION) {
+    if !want.force && !is_newer_version(remote_version, VERSION) {
         return Err(format!(
-            "{UP_TO_DATE} (current: v{}, latest: v{})",
-            VERSION, remote_version
+            "{UP_TO_DATE} (current: v{}, {}: v{})",
+            VERSION, if want.newest { "newest" } else { "latest stable" }, remote_version
         ));
     }
 
@@ -2983,6 +3011,55 @@ mod tests {
         assert!(!is_newer_version("1.0.0-alpha", "1.0.0"));
     }
 
+    #[test]
+    fn only_x_y_0_is_a_stable_version() {
+        for v in ["1.8.0", "1.7.0", "2.0.0", "10.12.0"] {
+            assert!(is_stable_version(v), "{v}");
+        }
+        for v in ["1.8.1", "1.7.39", "1.8.0-beta", "1.8", "1.8.0.0", "1.8.x", "", "v1.8.0", "1..0"] {
+            assert!(!is_stable_version(v), "{v}");
+        }
+    }
+
+    /// The user's rule (2026-11-23): every update takes the newest stable release unless
+    /// `--newest`, which takes the highest version of either kind.
+    #[test]
+    fn an_update_picks_the_newest_stable_release_unless_newest_is_asked() {
+        let rel = |tag: &str| serde_json::json!({ "tag_name": tag, "draft": false, "prerelease": false, "assets": [] });
+        let tag = |r: Option<&serde_json::Value>| r.and_then(|r| r["tag_name"].as_str()).map(str::to_string);
+        // GitHub lists by creation date; the choice must not depend on the order.
+        let list = vec![rel("v1.8.3"), rel("v1.8.2"), rel("v1.8.0"), rel("v1.7.39"), rel("v1.7.0"), rel("v1.8.1")];
+        assert_eq!(tag(pick_release(&list, false)).as_deref(), Some("v1.8.0"));
+        assert_eq!(tag(pick_release(&list, true)).as_deref(), Some("v1.8.3"));
+        let mut reversed = list.clone();
+        reversed.reverse();
+        assert_eq!(tag(pick_release(&reversed, false)).as_deref(), Some("v1.8.0"));
+        assert_eq!(tag(pick_release(&reversed, true)).as_deref(), Some("v1.8.3"));
+
+        // A new stable version is the newest of all until its first alpha.
+        let list = vec![rel("v1.9.0"), rel("v1.8.7"), rel("v1.8.0")];
+        assert_eq!(tag(pick_release(&list, false)).as_deref(), Some("v1.9.0"));
+        assert_eq!(tag(pick_release(&list, true)).as_deref(), Some("v1.9.0"));
+
+        // GitHub's own pre-release mark decides nothing: the version number does.
+        let mut marked = rel("v1.8.0");
+        marked["prerelease"] = serde_json::json!(true);
+        assert_eq!(tag(pick_release(&[marked, rel("v1.7.39")], false)).as_deref(), Some("v1.8.0"));
+
+        // Drafts, tags that are not versions, and a suffixed version (never stable).
+        let mut draft = rel("v2.0.0");
+        draft["draft"] = serde_json::json!(true);
+        let list = vec![draft, rel("nightly"), rel("v3"), rel("1.9.0"), rel("v1.9.0-beta"), rel("v1.8.0")];
+        assert_eq!(tag(pick_release(&list, false)).as_deref(), Some("v1.8.0"));
+        assert_eq!(tag(pick_release(&list, true)).as_deref(), Some("v1.9.0-beta"));
+
+        // Only alphas published: nothing stable to offer.
+        let list = vec![rel("v1.8.2"), rel("v1.8.1")];
+        assert_eq!(pick_release(&list, false), None);
+        assert_eq!(tag(pick_release(&list, true)).as_deref(), Some("v1.8.2"));
+        assert_eq!(pick_release(&[], true), None);
+    }
+
     // Simulate the asset-lookup logic from check_and_download_update to verify
     // the exact-match + fallback behaviour without making real HTTP requests.
     fn find_asset<'a>(assets: &'a serde_json::Value, asset_name: &str) -> Option<&'a serde_json::Value> {
@@ -3027,6 +3104,21 @@ mod tests {
 
     /// Every asset `/update` can ask for is one the release skill uploads (its Step 8
     /// `gh release create`), so a rename on either side fails here, not at a user's update.
+    /// An alpha must be published as a GitHub pre-release: every Clay up to 1.7.x asks
+    /// GitHub for its "latest release" (the newest one without that mark), and so do the
+    /// README's download links. The release skill carries the rule (and so does the local,
+    /// untracked `release.sh`, which a test can't read: it isn't in the repository).
+    #[test]
+    fn the_release_tools_publish_an_alpha_as_a_pre_release() {
+        let skill = include_str!("../.claude/skills/release/SKILL.md");
+        assert!(skill.contains("KIND_FLAG=--prerelease || KIND_FLAG=--latest"), "Step 8 picks the flag by the version's kind");
+        assert!(skill.contains("gh release create vX.Y.Z $KIND_FLAG"), "and creates the release with it");
+        assert!(skill.contains("releases/latest --jq .tag_name"), "and checks what GitHub calls the latest");
+        // The README's links are the stable release's, by GitHub's own "latest".
+        let readme = include_str!("../README.md");
+        assert!(readme.contains("releases/latest/download/clay-linux-x86_64-musl"));
+    }
+
     #[test]
     fn every_update_asset_is_released() {
         let skill = include_str!("../.claude/skills/release/SKILL.md");

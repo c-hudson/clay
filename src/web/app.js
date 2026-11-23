@@ -736,6 +736,7 @@
         setupScreenReaderToggle: document.getElementById('setup-screen-reader-toggle'),
         setupAnnounceScreenReaderToggle: document.getElementById('setup-announce-screen-reader-toggle'),
         setupStatusPanelToggle: document.getElementById('setup-status-panel-toggle'),
+        setupUpdateNewestToggle: document.getElementById('setup-update-newest-toggle'),
         setupTaskbarAlertToggle: document.getElementById('setup-taskbar-alert-toggle'),
         setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
@@ -744,6 +745,8 @@
         setupIconBarSelect: document.getElementById('setup-iconbar-select'),
         setupPictureHostSelect: document.getElementById('setup-picture-host-select'),
         setupSeparatorStyleSelect: document.getElementById('setup-separator-style-select'),
+        setupPreferredInterfaceRow: document.getElementById('setup-preferred-interface-row'),
+        setupPreferredInterfaceSelect: document.getElementById('setup-preferred-interface-select'),
         setupTextRevealSelect: document.getElementById('setup-text-reveal-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewIndicatorSelect: document.getElementById('setup-new-indicator-select'),
@@ -936,6 +939,12 @@
     // (a cross-origin opener throws, which is the origin check). Seeds the
     // same in-memory lastGoodPassword a reconnect uses, so it goes through the
     // normal ServerHello challenge-response and is cleared on rejection.
+    // This machine's start-up choices (src/clientconf.rs), from a host that starts Clay on
+    // this machine - the WebView GUI (webview_gui.rs client_conf_js): the interfaces
+    // Preferred Interface offers and the one it shows, and the Server page. Saved back with
+    // the `client-conf:` IPC, never to the server. A browser and the Android app have none.
+    const CLIENT_CONF = (window.CLIENT_CONF && typeof window.CLIENT_CONF === 'object') ? window.CLIENT_CONF : null;
+
     (function seedInheritedAuth() {
         var inherited = null;
         if (window.INHERITED_AUTH) {
@@ -953,6 +962,12 @@
             lastGoodPassword = inherited.password;
             lastGoodUsername = (typeof inherited.username === 'string' && inherited.username !== '')
                 ? inherited.username : null;
+        }
+        // The WebView GUI attached with the login this machine saved for the server
+        // (webview_gui.rs saved_login_js, src/clientconf.rs): its auth key, tried first at
+        // the ServerHello like Android's; a refused key falls back to the password.
+        if (inherited && typeof inherited.authKey === 'string' && inherited.authKey !== '' && !authKey) {
+            authKey = inherited.authKey;
         }
     })();
     // MCP simpleedit session (plan Job 15): unlike noteMode above, this is never a
@@ -989,10 +1004,15 @@
     let historyIndex = -1;
     let connectionFailures = 0;
     let reloadReconnect = false;
-    // /update (src/selfupdate.rs), while the server's half runs: {force, stage, timer}
-    // with stage 'server' (waiting for its UpdateOutcome) or 'reconnect' (it updated and
-    // is reloading; our own half follows the next InitialState).
+    // /update (src/selfupdate.rs), while the server's half runs: {want, stage, timer}
+    // with want = {force, newest} (selfupdate::UpdateWant) and stage 'server' (waiting for
+    // its UpdateOutcome) or 'reconnect' (it updated and is reloading; our own half follows
+    // the next InitialState).
     let updateFlow = null;
+    // Settings' "/update to newest" (Settings::update_newest), one setting for the
+    // instance: every update command takes the newest release, alpha or stable. null
+    // from a server before it, or one this login may not update: no switch.
+    let updateNewestSetting = null;
     let reloadReconnectAttempts = 0;
     let inputHeight = 1;
     let splashLines = [];  // Splash screen lines for multiuser mode
@@ -1583,6 +1603,7 @@
     let setupScreenReader = false;
     let setupAnnounceScreenReader = false;
     let setupStatusPanel = true;
+    let setupUpdateNewest = false;
     let setupTaskbarAlert = false;
     let setupTtsMode = 'Off';
     let setupTabsMode = 'none';
@@ -2606,6 +2627,11 @@
     // /reload's usage line, and its answer to --console/--gui in a window with neither (a
     // browser, the phone app): main.rs RELOAD_USAGE / RELOAD_SWITCH_ELSEWHERE, word for word.
     const RELOAD_USAGE = "Usage: /reload [--console|--gui]";
+    // The Server page's Password and Auth Key placeholder when one is saved (the page is
+    // never given the value).
+    const DESKTOP_SERVER_SAVED_HINT = 'Saved - leave blank to keep';
+    // A bare /server in a browser (clientconf::SERVER_PAGE_ELSEWHERE, pinned by a test).
+    const SERVER_PAGE_ELSEWHERE = "A bare /server sets the default server of a machine that starts Clay, in its GUI or console; a browser starts no Clay, so it has none.";
     const RELOAD_SWITCH_ELSEWHERE = "/reload --console and --gui switch the Clay they're typed in, and this window has none to switch. /reload alone reloads the server.";
 
     const INTERNAL_COMMANDS = [
@@ -3306,6 +3332,7 @@
 
         // The TTS choices this page has, before the custom dropdowns copy them.
         pruneTtsChoices();
+        fillPreferredInterfaceChoices();
         // Create custom dropdowns on mobile
         if (device.mode === 'phone' || device.mode === 'tablet') {
             initCustomDropdowns();
@@ -5374,7 +5401,7 @@
                 }
                 // Connected again after the server's /update reload: our own half now.
                 if (updateFlow && updateFlow.stage === 'reconnect') {
-                    const f = updateFlow.force;
+                    const f = updateFlow.want;
                     updateFlow = null;
                     proceedOwnUpdate(f);
                 }
@@ -6444,7 +6471,7 @@
                     if (msg.reloading) {
                         updateFlow.stage = 'reconnect';
                     } else {
-                        const f = updateFlow.force;
+                        const f = updateFlow.want;
                         updateFlow = null;
                         proceedOwnUpdate(f);
                     }
@@ -8344,6 +8371,22 @@
             }
         }
 
+        // A bare /server: this machine's default server (src/clientconf.rs, user request
+        // 2026-11-21) - the Server page where the page's host starts Clay here (the WebView
+        // GUI, master or attached), the app's Clay Server tab in the Android app; a browser
+        // starts no Clay, so it has none.
+        if (cmdTrimmed === '/server') {
+            elements.input.value = '';
+            if (window.Android && typeof window.Android.openServerSettings === 'function') {
+                openSettingsPopup('clay-server');
+            } else if (CLIENT_CONF) {
+                openSettingsPopup('clay-server');
+            } else {
+                appendClientLine(SERVER_PAGE_ELSEWHERE);
+            }
+            return;
+        }
+
         // Intercept /server in remote WebView mode — this client attaches to/detaches
         // from remote Clay servers directly; never forwarded to the currently-attached
         // server (the master WebView's /server is handled server-side instead).
@@ -8853,12 +8896,31 @@
     // Execute a command locally (called from server via ExecuteLocalCommand message).
     // The server's parse_command() is the single source of truth for command parsing.
     // This function only handles the UI/popup side of commands.
+    // /update's flags, in any order: -f/--force and --newest (selfupdate::UpdateWant::parse).
+    // Every update takes the newest stable release unless --newest - or Settings'
+    // "/update to newest" - asks for the newest of any kind.
+    function parseUpdateWant(args) {
+        const want = { force: false, newest: false };
+        (args || []).forEach(function(a) {
+            if (a === '-f' || a === '--force') want.force = true;
+            else if (a === '--newest') want.newest = true;
+        });
+        return want;
+    }
+
+    // The command sent to the server; -f first, since a server before --newest reads only
+    // the first argument (UpdateWant::command).
+    function updateCommand(want) {
+        return '/update' + (want.force ? ' -f' : '') + (want.newest ? ' --newest' : '');
+    }
+
     // /update, this program's own half (src/selfupdate.rs): the server's is over.
-    function proceedOwnUpdate(force) {
+    function proceedOwnUpdate(want) {
         if (window.WEBVIEW_MODE) {
             // The desktop GUI's binary: the native side checks, downloads, installs and
-            // restarts this window attached again, reporting through showUpdateStatus.
-            sendIpc(force ? 'update-force' : 'update');
+            // restarts this window attached again, reporting through showUpdateStatus
+            // (UpdateWant::from_ipc reads these four bodies).
+            sendIpc('update' + (want.force ? '-force' : '') + (want.newest ? '-newest' : ''));
         } else if (window.Android) {
             appendClientLine('This app: update it by installing the latest clay-android.apk from https://github.com/c-hudson/clay/releases');
         } else {
@@ -9008,16 +9070,20 @@
                 // first, then - once it has answered, and come back if it reloaded - this
                 // program's own binary (the desktop WebView GUI). Each line says which
                 // program it is about; the two never run at the same time.
-                const forceFlag = args.length > 0 && (args[0] === '-f' || args[0] === '--force');
-                const serverCmd = forceFlag ? '/update -f' : '/update';
+                // The server's "/update to newest" counts for this program's half too.
+                const want = parseUpdateWant(args);
+                if (updateNewestSetting === true) want.newest = true;
+                const serverCmd = updateCommand(want);
                 if (fromServer) {
                     // An older server bounced /update back instead of answering it: it
-                    // can't be updated from here, so go on with our own half.
+                    // can't be updated from here, so go on with our own half - with what
+                    // was asked here, which the echo may not carry whole.
                     if (updateFlow) {
+                        const asked = updateFlow.want;
                         clearTimeout(updateFlow.timer);
                         updateFlow = null;
                         appendClientLine('Server: this Clay is too old to be updated from a client (before v1.7.5); update it where it runs.');
-                        proceedOwnUpdate(forceFlag);
+                        proceedOwnUpdate(asked);
                     }
                     promptAfter = false;
                     break;
@@ -9034,13 +9100,13 @@
                     break;
                 }
                 updateFlow = {
-                    force: forceFlag,
+                    want: want,
                     stage: 'server',
                     timer: setTimeout(function() {
                         if (!updateFlow) return;
                         updateFlow = null;
                         appendClientLine('Server: no answer to the update request; going on with this program\'s own update.');
-                        proceedOwnUpdate(forceFlag);
+                        proceedOwnUpdate(want);
                     }, 90000)
                 };
                 send({ type: 'SendCommand', world_index: currentWorldIndex, command: serverCmd });
@@ -10347,6 +10413,7 @@
             { l: '/disconnect [world|-ALL] (or /dc)', r: 'Disconnect a world (the current one if none)' },
             { l: '/connections (or /l)', r: 'List connected worlds' },
             { l: '/chat [channels|users|to|msg]', r: 'Slack/Discord world (or /discord, /slack)' },
+            { l: '/server', r: "This machine's default server (Settings > Server)" },
             { l: '/server &lt;host[:port]&gt;', r: 'Attach to a remote Clay server' },
             { l: '/server --close', r: 'Detach and become an independent master' },
             { l: '/server --cancel', r: 'Cancel a pending confirmation' },
@@ -10390,7 +10457,7 @@
             { l: '/version', r: 'Show version (this program and the server)' },
             { l: '/info [world]', r: 'Behind the scenes: telnet, memory, clients' },
             { l: '/reload [--console|--gui]', r: 'Hot reload binary (switching interface)' },
-            { l: '/update [-f]', r: 'Update the server, then this program' },
+            { l: '/update [-f] [--newest]', r: 'Update the server, then this program' },
             { l: '/testmusic', r: 'Test ANSI music playback' },
             { l: '/tts [status|install|remove|voices|voice &lt;name&gt;|test]', r: 'Text-to-speech for this interface; Kokoro voice' },
             { l: '/quit', r: 'Exit client' },
@@ -10893,6 +10960,10 @@
             '  keyboard is attached.', '',
             'Debug: Enables debug logging to ~/.clay/debug.log.', '',
             'ANSI Music: Play ANSI music sequences from MUDs.', '',
+            '/update to newest: Off, /update installs the newest',
+            '  stable version (1.8.0, 1.9.0, ...). On, every update',
+            '  takes the newest version of any kind, alphas too',
+            '  (1.8.1, 1.8.2, ...), as /update --newest does.', '',
             'ZWJ Sequence (set in the console\'s /setup): For',
             '  terminals that support combined emoji (ZWJ). If',
             '  unsupported, shows two separate emoji instead of',
@@ -10904,6 +10975,12 @@
             '  /url\'s shortening. "(2d)": tmpfiles.org deletes it',
             '  after 2 days. Uploads are public. "Off" turns',
             '  picture uploads off.', '',
+            'Preferred Interface (the GUIs): what Clay starts in on',
+            '  this machine when the command line names none (a',
+            '  bare clay): TUI, GUI or Web GUI, only those this',
+            '  machine can run. Started where it can\'t run, Clay',
+            '  takes one that can; --console and --gui still choose.',
+            '  Kept on this machine, never on the server.', '',
             'Import: copy settings, theme and keybindings',
             '  from another Clay (/import). Settings closes first;',
             '  the import replaces what it shows.'
@@ -11116,6 +11193,30 @@
             '  KA     - Time until next keep-alive packet',
             '  Buffer - Number of lines in output buffer', '',
             'Click a world to switch to it.'
+        ],
+        // This machine's Server page (clientconf::SERVER_PAGE_HELP, pinned by a test).
+        server: [
+            'Server - this machine\'s default server',
+            '',
+            'A bare `clay` on this machine (no --console, --gui or',
+            '--web-gui; the desktop launcher too) attaches to this',
+            'Clay instead of running its own, in the Preferred',
+            'Interface (Settings > General). `clay --gui` and',
+            '`clay --console` always run this machine\'s own Clay.',
+            '',
+            'Host: the other Clay\'s address, with its web path',
+            '  after it if it has one (host/path). Blank: no',
+            '  default server.',
+            'Port: its web port (9000 when blank).',
+            'Username: only for a multiuser (clay_multi) server.',
+            'Password / Auth Key: its login. The key is tried',
+            '  first, then the password; without either Clay',
+            '  asks. Any attach to this server uses them, as',
+            '  `--gui=host` and `/server host` do.',
+            '',
+            'Kept on this machine (client.dat), the password and',
+            'key encrypted as world passwords are; never sent to',
+            'the Clay you are attached to.'
         ],
         'clay-server': [
             'Clay Server - Connection Settings', '',
@@ -14473,6 +14574,8 @@
     function receiveStatusPanel(settings) {
         statusPanelSetting = (settings.status_panel === undefined || settings.status_panel === null) ? null : !!settings.status_panel;
         updateStatsPanel();
+        // Settings' "/update to newest", from the same message (null: no switch).
+        updateNewestSetting = (settings.update_newest === undefined || settings.update_newest === null) ? null : !!settings.update_newest;
     }
 
     function updateStatsPanel() {
@@ -15291,9 +15394,18 @@
     // Update UI based on Android app detection
     function updateAndroidUI() {
         const isAndroid = typeof Android !== 'undefined' && Android.openServerSettings;
-        // Show Clay Server settings tab button only in Android app
+        // The Clay Server tile: the Android app's, and the WebView GUI's Server page
+        // (CLIENT_CONF: this machine's default server, src/clientconf.rs). A browser starts
+        // no Clay, so it has none.
         const clayServerTabBtn = document.getElementById('settings-clay-server-btn');
-        if (clayServerTabBtn) clayServerTabBtn.style.display = isAndroid ? '' : 'none';
+        if (clayServerTabBtn) {
+            clayServerTabBtn.style.display = (isAndroid || CLIENT_CONF) ? '' : 'none';
+            const label = clayServerTabBtn.querySelector('.side-tile-label');
+            if (!isAndroid && CLIENT_CONF && label) label.textContent = 'Server';
+        }
+        if (elements.settingsClayServerSection) {
+            elements.settingsClayServerSection.classList.toggle('cs-desktop', !isAndroid && !!CLIENT_CONF);
+        }
         // Open in Browser button is visible in all interfaces (not Android-only)
         // Share Logs is an Android bridge (the logs are in app-private storage there); on web
         // and the desktop GUI the same files are simply on the machine you are already using.
@@ -16624,18 +16736,139 @@
         if (elements.settingsClayServerSection) {
             elements.settingsClayServerSection.classList.toggle('active', tab === 'clay-server');
         }
-        var titles = { general: 'General', web: 'Web', font: 'Font', 'clay-server': 'Clay Server' };
+        var desktopServer = !window.Android && !!CLIENT_CONF;
+        var titles = { general: 'General', web: 'Web', font: 'Font', 'clay-server': desktopServer ? 'Server' : 'Clay Server' };
         elements.settingsTitle.textContent = titles[tab] || tab;
-        // Rename Save button when on clay-server tab (will reconnect)
+        // Rename Save button when on clay-server tab (will reconnect) - the app's; the
+        // WebView GUI's Server page only saves (a bare `clay` uses it next time).
         if (elements.settingsSaveBtn) {
-            elements.settingsSaveBtn.textContent = tab === 'clay-server' ? 'Save & Connect' : 'Save';
+            elements.settingsSaveBtn.textContent = (tab === 'clay-server' && !desktopServer) ? 'Save & Connect' : 'Save';
         }
         if (elements.settingsImportBtn) {
             elements.settingsImportBtn.style.display = tab === 'general' ? '' : 'none';
         }
         if (tab === 'clay-server') {
-            populateClayServerTab();
+            if (window.Android) populateClayServerTab();
+            else populateDesktopServerTab();
         }
+    }
+
+    // Preferred Interface's choices: the interfaces this machine can start in
+    // (CLIENT_CONF.interfaces, clientconf::offered), put in at load before the custom
+    // dropdowns copy the select.
+    function fillPreferredInterfaceChoices() {
+        var prefSel = elements.setupPreferredInterfaceSelect;
+        if (!prefSel || !CLIENT_CONF || !Array.isArray(CLIENT_CONF.interfaces)) return;
+        prefSel.innerHTML = '';
+        CLIENT_CONF.interfaces.forEach(function(i) {
+            var o = document.createElement('option');
+            o.value = i.value;
+            o.textContent = i.label;
+            prefSel.appendChild(o);
+        });
+        prefSel.value = CLIENT_CONF.preferred;
+    }
+
+    // The WebView GUI's Server page (CLIENT_CONF.server): this machine's default server.
+    // The page is never given the saved password or auth key (security review
+    // 2026-11-21: this page also shows other servers' text), only whether each is saved:
+    // their fields stay blank, and a blank field keeps what is saved - as the Web tab's
+    // password does. Forget drops them at the next Save.
+    var desktopServerLoaded = false;   // the fields were filled since Settings opened
+    var desktopServerForget = false;   // Forget was pressed
+    function populateDesktopServerTab() {
+        if (!CLIENT_CONF) return;
+        if (!desktopServerLoaded) {
+            var sv = CLIENT_CONF.server || {};
+            var set = function(id, v) { var el = document.getElementById(id); if (el) el.value = v || ''; };
+            set('cs-host', sv.host);
+            set('cs-port', sv.port || '9000');
+            set('cs-username', sv.username);
+            set('cs-password', '');
+            set('cs-auth-key', '');
+            desktopServerLoaded = true;
+            desktopServerForget = false;
+            var err = document.getElementById('cs-auth-key-error');
+            if (err) { err.style.display = 'none'; err.textContent = ''; }
+        }
+        showDesktopServerSaved();
+        setClayServerRemoteFields(false);
+    }
+
+    // What the two secret fields and the Forget row say about what is saved.
+    function showDesktopServerSaved() {
+        var sv = (CLIENT_CONF && CLIENT_CONF.server) || {};
+        var hasPassword = !!sv.hasPassword && !desktopServerForget;
+        var hasKey = !!sv.hasAuthKey && !desktopServerForget;
+        var hint = function(id, saved) {
+            var el = document.getElementById(id);
+            if (el) el.placeholder = saved ? DESKTOP_SERVER_SAVED_HINT : '';
+        };
+        hint('cs-password', hasPassword);
+        hint('cs-auth-key', hasKey);
+        var row = document.getElementById('cs-forget-row');
+        if (row) row.style.display = (hasPassword || hasKey) ? '' : 'none';
+    }
+
+    // The Server page's port, as the native one takes it (clientconf::ServerPage::address):
+    // blank, or 1-65535. Why not, or null.
+    function desktopServerProblem(host, port) {
+        if (/\s/.test(host)) return 'A host has no spaces.';
+        if (port !== '' && !(/^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535)) {
+            return "'" + port + "' is not a port (1-65535).";
+        }
+        return null;
+    }
+
+    // Save's half for this machine (CLIENT_CONF): the Server page and Preferred Interface
+    // to client.dat through the host (webview_gui.rs save_client_conf_from_page), the
+    // preference only when it was changed from what the page showed. False: the Server
+    // page has a problem, shown on it.
+    // The Server page goes only when its tab was opened in this Settings (`server: null`
+    // changes nothing: a Save from General must not clear the default server), and a
+    // secret only when it was typed (`null` keeps what is saved for that server).
+    function saveClientConf() {
+        if (!CLIENT_CONF || window.Android) return true;
+        var val = function(id) { return ((document.getElementById(id) || {}).value || ''); };
+        var server = null;
+        if (desktopServerLoaded) {
+            var typedPassword = val('cs-password');
+            var typedKey = val('cs-auth-key').trim();
+            server = {
+                host: val('cs-host').trim(),
+                port: val('cs-port').trim(),
+                username: val('cs-username').trim(),
+                password: typedPassword === '' ? null : typedPassword,
+                authKey: typedKey === '' ? null : typedKey,
+                forget: desktopServerForget
+            };
+            var problem = desktopServerProblem(server.host, server.port);
+            if (problem) {
+                switchSettingsTab('clay-server');
+                var err = document.getElementById('cs-auth-key-error');
+                if (err) { err.textContent = problem; err.style.display = ''; }
+                return false;
+            }
+        }
+        var sel = elements.setupPreferredInterfaceSelect;
+        var msg = { server: server, shown: CLIENT_CONF.preferred, preferred: sel ? sel.value : CLIENT_CONF.preferred };
+        sendIpc('client-conf:' + JSON.stringify(msg));
+        if (server) {
+            var was = CLIENT_CONF.server || {};
+            var same = (was.host || '') === server.host && String(was.port || '') === server.port;
+            var kept = same && !server.forget;
+            CLIENT_CONF.server = {
+                host: server.host, port: server.port, username: server.username,
+                hasPassword: server.password !== null || (kept && !!was.hasPassword),
+                hasAuthKey: server.authKey !== null || (kept && !!was.hasAuthKey)
+            };
+            // The typed secrets don't stay in the page once sent.
+            ['cs-password', 'cs-auth-key'].forEach(function(id) { var el = document.getElementById(id); if (el) el.value = ''; });
+        }
+        desktopServerLoaded = false;
+        desktopServerForget = false;
+        if (sel && sel.value !== CLIENT_CONF.preferred) CLIENT_CONF.preferred = sel.value;
+        return true;
     }
 
     function openEditorPage(page) {
@@ -16663,6 +16896,9 @@
         // the Settings window itself shows the popup in place.
         if (openInPopupWindow('settings', tab || 'general')) return;
         settingsPopupOpen = true;
+        // The Server page is filled again when its tab is opened (populateDesktopServerTab).
+        desktopServerLoaded = false;
+        desktopServerForget = false;
         // Load general edit state
         setupMoreMode = moreModeEnabled;
         setupWorldSwitchMode = worldSwitchMode;
@@ -16672,6 +16908,7 @@
         setupScreenReader = screenReader;
         setupAnnounceScreenReader = announceScreenReader;
         setupStatusPanel = statusPanelSetting !== false;
+        setupUpdateNewest = updateNewestSetting === true;
         setupTaskbarAlert = taskbarAlert;
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'kokoro' ? 'Kokoro' : ttsMode === 'edge' ? 'Edge' : 'Off';
         // Where only Local is offered, any engine reads as Local (the device's voice spoke).
@@ -16791,6 +17028,9 @@
         if (elements.setupStatusPanelToggle) {
             elements.setupStatusPanelToggle.classList.toggle('active', setupStatusPanel);
         }
+        if (elements.setupUpdateNewestToggle) {
+            elements.setupUpdateNewestToggle.classList.toggle('active', setupUpdateNewest);
+        }
         if (elements.setupClearInputToggle) {
             elements.setupClearInputToggle.classList.toggle('active', setupClearInput);
         }
@@ -16829,6 +17069,16 @@
         if (elements.setupPictureHostSelect) {
             elements.setupPictureHostSelect.value = setupPictureHost;
             updateCustomDropdown(elements.setupPictureHostSelect);
+        }
+        // Preferred Interface: this machine's (CLIENT_CONF), only where the host starts Clay.
+        if (elements.setupPreferredInterfaceRow) {
+            var showPreferred = !!(CLIENT_CONF && !window.Android && Array.isArray(CLIENT_CONF.interfaces) && CLIENT_CONF.interfaces.length);
+            elements.setupPreferredInterfaceRow.style.display = showPreferred ? '' : 'none';
+            var prefSel = elements.setupPreferredInterfaceSelect;
+            if (showPreferred && prefSel) {
+                prefSel.value = CLIENT_CONF.preferred;
+                updateCustomDropdown(prefSel);
+            }
         }
         if (elements.setupSeparatorStyleSelect) {
             elements.setupSeparatorStyleSelect.value = setupSeparatorStyle;
@@ -16912,6 +17162,9 @@
             ['setup-announce-screen-reader-toggle', screenReaderProfiles !== null],
             // A server from before Status Panel keeps none.
             ['setup-status-panel-toggle', statusPanelSetting !== null],
+            // "/update to newest": none from a server before it, or one this login may
+            // not update.
+            ['setup-update-newest-toggle', updateNewestSetting !== null],
             ['setup-taskbar-alert-toggle', !!window.WEBVIEW_MODE],
             ['font-phone-minus', !window.WEBVIEW_MODE],
             ['font-tablet-minus', !window.WEBVIEW_MODE],
@@ -16994,6 +17247,8 @@
             announce_screen_reader: screenReaderProfiles ? announceScreenReader : null,
             // Settings' Status Panel; null = unchanged (a server from before it).
             status_panel: statusPanelSetting,
+            // Settings' "/update to newest"; null = unchanged (no switch shown here).
+            update_newest: updateNewestSetting,
             // The shared Icon Bar goes back as the server sent it (or as an older server's
             // one setting); this page's own place goes as icon_bar_profile (null = it has
             // none of its own, or the server keeps none).
@@ -17044,6 +17299,8 @@
             showRevealSpeedDialog(revealSelect, setupTextReveal, revealEntry, saveSettingsAll);
             return;
         }
+        // This machine's Server page and Preferred Interface (the WebView GUI): client.dat.
+        if (!saveClientConf()) return;
         // Clay Server tab (Android only) — save to SharedPreferences and reload
         if (settingsActiveTab === 'clay-server' && window.Android) {
             var runMode = ((document.getElementById('cs-run-mode') || {}).value || 'remote');
@@ -17154,6 +17411,7 @@
             statusPanelSetting = setupStatusPanel;
             updateStatsPanel();
         }
+        if (updateNewestSetting !== null) updateNewestSetting = setupUpdateNewest;
         taskbarAlert = setupTaskbarAlert;
         ttsMode = setupTtsMode.toLowerCase();
         if (elements.setupTtsVoiceInput) {
@@ -22382,6 +22640,12 @@
                 updateSetupPopupUI();
             };
         }
+        if (elements.setupUpdateNewestToggle) {
+            elements.setupUpdateNewestToggle.onclick = function() {
+                setupUpdateNewest = !setupUpdateNewest;
+                updateSetupPopupUI();
+            };
+        }
         if (elements.setupClearInputToggle) {
             elements.setupClearInputToggle.onclick = function() {
                 setupClearInput = !setupClearInput;
@@ -22785,6 +23049,15 @@
                 }, 2000);
             };
         }
+        // The WebView GUI's Server page: Forget drops the saved password and key at the
+        // next Save (the page never holds them, so it can only ask).
+        var csForgetBtn = document.getElementById('cs-forget-btn');
+        if (csForgetBtn) {
+            csForgetBtn.onclick = function() {
+                desktopServerForget = true;
+                showDesktopServerSaved();
+            };
+        }
         // Migrated from the now-deleted SettingsActivity.java's "Clear Pinned
         // Certificates" button - same CertPinning.clearAllPins() call, now reachable
         // from the clay-server settings tab instead of the dead native Settings screen.
@@ -22864,7 +23137,7 @@
         if (elements.settingsHelpBtn) elements.settingsHelpBtn.onclick = function() {
             var helpTab = settingsActiveTab === 'web' ? 'web' :
                           settingsActiveTab === 'font' ? 'font' :
-                          settingsActiveTab === 'clay-server' ? 'clay-server' : 'setup';
+                          settingsActiveTab === 'clay-server' ? (window.Android ? 'clay-server' : 'server') : 'setup';
             openPopupHelp(helpTab);
         };
         if (elements.settingsImportBtn) elements.settingsImportBtn.onclick = openImportFromSettings;

@@ -1,6 +1,7 @@
 //! `ClientCore` against scripted server messages: the web client's rules, one at a time.
 
 use super::*;
+use crate::selfupdate::UpdateWant;
 use crate::websocket::{TimestampedLine, WorldStateMsg, WsMessage};
 
 const CHALLENGE: &str = "abc123";
@@ -615,7 +616,7 @@ fn update_asks_the_server_and_goes_on_with_its_own_half_when_the_server_answers(
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
     h.drain();
-    let e = h.core.start_update(false, h.now);
+    let e = h.core.start_update(UpdateWant::default(), h.now);
     h.keep(e);
     assert!(h.sent().iter().any(|m| matches!(m, WsMessage::SendCommand { command, .. } if command == "/update")));
     assert!(h.core.update_in_progress());
@@ -623,7 +624,7 @@ fn update_asks_the_server_and_goes_on_with_its_own_half_when_the_server_answers(
     h.advance(Duration::from_secs(5));
     assert!(!h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { .. })));
     h.msg(WsMessage::UpdateOutcome { ok: false, reloading: false, version: String::new() });
-    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { force: false })));
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { want } if *want == UpdateWant::default())));
     assert!(!h.core.update_in_progress());
 }
 
@@ -631,7 +632,7 @@ fn update_asks_the_server_and_goes_on_with_its_own_half_when_the_server_answers(
 fn update_waits_for_the_reconnect_when_the_server_reloads() {
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
-    let e = h.core.start_update(true, h.now);
+    let e = h.core.start_update(UpdateWant { force: true, newest: false }, h.now);
     h.keep(e);
     h.drain();
     h.msg(WsMessage::UpdateOutcome { ok: true, reloading: true, version: "9.9.9".into() });
@@ -645,20 +646,20 @@ fn update_waits_for_the_reconnect_when_the_server_reloads() {
     h.msg(WsMessage::AuthResponse { success: true, error: None, username: None, multiuser_mode: false });
     h.drain();
     h.initial(vec![world_msg(0, "A", 0..1, 9)]);
-    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { force: true })), "once connected again");
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { want } if *want == UpdateWant { force: true, newest: false })), "once connected again");
 }
 
 #[test]
 fn update_treats_an_old_servers_bounce_as_no_server_update() {
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
-    let e = h.core.start_update(false, h.now);
+    let e = h.core.start_update(UpdateWant::default(), h.now);
     h.keep(e);
     h.drain();
     // An older server answers /update by sending it back as ExecuteLocalCommand.
     h.msg(WsMessage::ExecuteLocalCommand { command: "/update".into() });
     let effects = h.drain();
-    assert!(effects.iter().any(|e| matches!(e, Effect::SelfUpdate { force: false })));
+    assert!(effects.iter().any(|e| matches!(e, Effect::SelfUpdate { want } if *want == UpdateWant::default())));
     assert!(!effects.iter().any(|e| matches!(e, Effect::Event(m) if matches!(**m, WsMessage::ExecuteLocalCommand { .. }))),
         "the bounce is consumed, never handed to the window (which would send it back: the old ping-pong)");
     assert!(h.texts(0).iter().any(|t| t.contains("too old")));
@@ -669,13 +670,13 @@ fn update_treats_an_old_servers_bounce_as_no_server_update() {
 fn update_gives_up_waiting_for_the_server_after_the_timeout() {
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
-    let e = h.core.start_update(false, h.now);
+    let e = h.core.start_update(UpdateWant::default(), h.now);
     h.keep(e);
     h.drain();
     h.advance(crate::selfupdate::SERVER_ANSWER_TIMEOUT - Duration::from_secs(1));
     assert!(!h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { .. })));
     h.advance(Duration::from_secs(2));
-    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { force: false })));
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { want } if *want == UpdateWant::default())));
     assert!(h.texts(0).iter().any(|t| t.contains("no answer")));
 }
 
@@ -683,13 +684,53 @@ fn update_gives_up_waiting_for_the_server_after_the_timeout() {
 fn a_second_update_while_one_runs_is_refused() {
     let mut h = H::password();
     h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
-    let e = h.core.start_update(false, h.now);
+    let e = h.core.start_update(UpdateWant::default(), h.now);
     h.keep(e);
     h.drain();
-    let e = h.core.start_update(false, h.now);
+    let e = h.core.start_update(UpdateWant::default(), h.now);
     h.keep(e);
     assert!(h.sent().is_empty());
     assert!(h.texts(0).iter().any(|t| t.contains("already in progress")));
+}
+
+/// `/update --newest` (user ruling 2026-11-23): the flag goes to the server and stays with
+/// this GUI's own half, so both programs take the same release.
+#[test]
+fn update_newest_reaches_the_server_and_this_guis_own_half() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    h.drain();
+    let e = h.core.start_update(UpdateWant { force: true, newest: true }, h.now);
+    h.keep(e);
+    // `-f` first: a server before `--newest` reads only the first argument.
+    assert!(h.sent().iter().any(|m| matches!(m, WsMessage::SendCommand { command, .. } if command == "/update -f --newest")));
+    h.msg(WsMessage::UpdateOutcome { ok: false, reloading: false, version: String::new() });
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { want } if *want == UpdateWant { force: true, newest: true })));
+}
+
+/// The server's "/update to newest" makes a plain `/update` here a `--newest` one too.
+#[test]
+fn the_servers_update_to_newest_setting_counts_for_this_guis_update() {
+    let mut h = H::password();
+    h.connect_and_login().initial(vec![world_msg(0, "A", 0..1, 9)]);
+    let mut s = settings();
+    s.update_newest = Some(true);
+    h.msg(WsMessage::GlobalSettingsUpdated { settings: s, input_height: 1 });
+    h.drain();
+    let e = h.core.start_update(UpdateWant::default(), h.now);
+    h.keep(e);
+    assert!(h.sent().iter().any(|m| matches!(m, WsMessage::SendCommand { command, .. } if command == "/update --newest")));
+    h.msg(WsMessage::UpdateOutcome { ok: false, reloading: false, version: String::new() });
+    assert!(h.drain().iter().any(|e| matches!(e, Effect::SelfUpdate { want } if *want == UpdateWant { force: false, newest: true })));
+
+    // Off (or a server from before the setting, `None`): the stable release.
+    let mut s = settings();
+    s.update_newest = Some(false);
+    h.msg(WsMessage::GlobalSettingsUpdated { settings: s, input_height: 1 });
+    h.drain();
+    let e = h.core.start_update(UpdateWant::default(), h.now);
+    h.keep(e);
+    assert!(h.sent().iter().any(|m| matches!(m, WsMessage::SendCommand { command, .. } if command == "/update")));
 }
 
 #[test]

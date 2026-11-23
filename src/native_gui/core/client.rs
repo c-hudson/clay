@@ -120,7 +120,7 @@ pub enum Effect {
     Event(Box<WsMessage>),
     /// `/update`, its own half (src/selfupdate.rs): the server's is over - update this
     /// program's binary now and restart attached again.
-    SelfUpdate { force: bool },
+    SelfUpdate { want: crate::selfupdate::UpdateWant },
 }
 
 /// Which world to ask the server for.
@@ -728,13 +728,17 @@ impl ClientCore {
     /// `/update` typed here (src/selfupdate.rs): the server's half first - its answer
     /// (`UpdateOutcome`), an old server's bounce, a reconnect after its reload, or the
     /// timeout in `tick` then yields `Effect::SelfUpdate` for this program's own half.
-    pub fn start_update(&mut self, force: bool, now: Instant) -> Vec<Effect> {
+    ///
+    /// The server's "/update to newest" counts for this program's half too, so both land
+    /// on the same version.
+    pub fn start_update(&mut self, want: crate::selfupdate::UpdateWant, now: Instant) -> Vec<Effect> {
         if self.update_flow.is_some() {
             return self.client_line("An update is already in progress.");
         }
-        self.update_flow = Some(crate::selfupdate::ClientFlow::WaitingServer { force, since: now });
+        let want = want.with_setting(self.settings.as_ref().and_then(|s| s.update_newest) == Some(true));
+        self.update_flow = Some(crate::selfupdate::ClientFlow::WaitingServer { want, since: now });
         let world_index = self.current;
-        self.send(WsMessage::SendCommand { world_index, command: (if force { "/update -f" } else { "/update" }).to_string() });
+        self.send(WsMessage::SendCommand { world_index, command: want.command() });
         self.take()
     }
 
@@ -1154,11 +1158,11 @@ impl ClientCore {
             self.out.push(Effect::Disconnect);
         }
         // The server never answered the /update: go on with our own half.
-        if let Some(crate::selfupdate::ClientFlow::WaitingServer { force, since }) = self.update_flow {
+        if let Some(crate::selfupdate::ClientFlow::WaitingServer { want, since }) = self.update_flow {
             if now.saturating_duration_since(since) >= crate::selfupdate::SERVER_ANSWER_TIMEOUT {
                 self.update_flow = None;
                 self.client_line(&crate::selfupdate::server_no_answer());
-                self.out.push(Effect::SelfUpdate { force });
+                self.out.push(Effect::SelfUpdate { want });
             }
         }
         if self.is_online() {
@@ -1270,9 +1274,9 @@ impl ClientCore {
             WsMessage::UpdateOutcome { reloading, .. } => {
                 if let Some(flow) = self.update_flow.take() {
                     if reloading {
-                        self.update_flow = Some(crate::selfupdate::ClientFlow::WaitingReconnect { force: flow.force() });
+                        self.update_flow = Some(crate::selfupdate::ClientFlow::WaitingReconnect { want: flow.want() });
                     } else {
-                        self.out.push(Effect::SelfUpdate { force: flow.force() });
+                        self.out.push(Effect::SelfUpdate { want: flow.want() });
                     }
                 }
             }
@@ -1281,7 +1285,7 @@ impl ClientCore {
             WsMessage::ExecuteLocalCommand { command } if self.update_flow.is_some() && is_update_command(&command) => {
                 let flow = self.update_flow.take().expect("checked");
                 self.client_line(&crate::selfupdate::server_too_old());
-                self.out.push(Effect::SelfUpdate { force: flow.force() });
+                self.out.push(Effect::SelfUpdate { want: flow.want() });
             }
             // A command the server parsed that opens something on this side (app.js
             // `executeLocalCommand`): the window acts on it.
@@ -1332,8 +1336,8 @@ impl ClientCore {
                 self.splash_lines = splash_lines;
                 self.on_initial_state(worlds, settings, current_world_index, your_display_id, now);
                 // Connected again after the server's /update reload: our own half now.
-                if let Some(crate::selfupdate::ClientFlow::WaitingReconnect { force }) = self.update_flow.take() {
-                    self.out.push(Effect::SelfUpdate { force });
+                if let Some(crate::selfupdate::ClientFlow::WaitingReconnect { want }) = self.update_flow.take() {
+                    self.out.push(Effect::SelfUpdate { want });
                 }
                 for entry in tf_status {
                     if let Some(w) = self.worlds.get_mut(entry.world_index) {
@@ -2521,10 +2525,13 @@ pub fn settings_update(s: &GlobalSettingsMsg) -> WsMessage {
         // None from a server before Status Panel: nothing to send back.
         status_panel: s.status_panel,
         icon_bar_profile: s.icon_bar_profile_update(crate::font_profile::native_key()),
+        // None where the server sent none (one from before it, or a login that may not
+        // update it): nothing to send back.
+        update_newest: s.update_newest,
     }
 }
 
-/// `/update` or `/update -f`, as the server echoes it back (src/selfupdate.rs).
+/// `/update` with whatever flags, as the server echoes it back (src/selfupdate.rs).
 fn is_update_command(command: &str) -> bool {
     command.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/update"))
 }

@@ -62,7 +62,7 @@ headless and multi-user servers, self-update.
 
 ## Download
 
-Get the latest version from the [releases page](https://github.com/c-hudson/clay/releases/latest):
+Get the latest stable version from the [releases page](https://github.com/c-hudson/clay/releases/latest):
 
 - **Windows:** [clay-windows-x86_64.exe](https://github.com/c-hudson/clay/releases/latest/download/clay-windows-x86_64.exe)
 - **macOS** (Intel and Apple Silicon): [clay-macos-universal](https://github.com/c-hudson/clay/releases/latest/download/clay-macos-universal)
@@ -80,6 +80,13 @@ Get the latest version from the [releases page](https://github.com/c-hudson/clay
   for 32-bit phones
 
 On Linux and macOS, make the file executable (`chmod +x`) before running it.
+
+**Stable and alpha versions.** A version ending in `.0` (1.8.0, 1.9.0) is a stable
+release, and it is what the links above and `/update` install. Any other number (1.8.1,
+1.8.2) is an alpha: newer work, less tried, listed as a pre-release on the
+[releases page](https://github.com/c-hudson/clay/releases). `/update --newest`, or the
+**/update to newest** setting, installs the newest version of either kind;
+`/update -f` goes back to the stable one.
 
 ## How To Use
 

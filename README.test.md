@@ -104,7 +104,7 @@ cargo build --release --no-default-features --features rustls-backend,ssh-transp
 
 | Option | Description |
 |--------|-------------|
-| *(none)* | The GUI where a window can open (a GUI build, a desktop session, not over SSH), else the console |
+| *(none)* | This machine's Preferred Interface, attached to its default server (Settings > General / Settings > Server, kept in `~/.clay/client.dat`) where set; else the GUI where a window can open (a GUI build, a desktop session, not over SSH), else the console. `--console`/`--gui` alone always run this machine's own Clay |
 | `--console[=host[:port]]` | Console mode, or attach to a remote server (port 9000) |
 | `--gui[=host[:port]]` | Native GUI (a build without it opens the WebView one), or attach to a remote server (port 9000) |
 | `--web-gui[=host[:port]]` | WebView GUI, or attach to a remote server (port 9000) |
@@ -145,7 +145,7 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'   # live grep, tail
 | `/version` | Show version info |
 | `/quit` | Exit the client |
 | `/reload` | Hot reload the binary |
-| `/update [-f]` | Download and install latest release |
+| `/update [-f] [--newest]` | Download and install the newest stable release (`--newest`: alphas too) |
 | `/menu` | Open menu popup |
 
 **Worlds & Connections:**
@@ -169,6 +169,7 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'   # live grep, tail
 |---------|-------------|
 | `/setup` | Open global settings |
 | `/web` | Open web/WebSocket settings |
+| `/server` | This machine's default server (alone); `/server host[:port]` attaches, `--close` detaches |
 | `/import [host[:port]]` | Pull worlds, actions, theme, and keybindings from another Clay instance |
 | `/actions [-w<world>] [<name>]` | Open the actions list (`-w`: a world's); a name edits that action (`*` `?` wildcards; several matches are listed) |
 | `/edit [file\|-l]` | Split-screen notes editor, or `-l` for the notes list popup |
