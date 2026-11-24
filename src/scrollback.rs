@@ -293,6 +293,15 @@ pub struct ArchiveStats {
     warned: AtomicBool,
 }
 
+/// What the writer thread is sent: a line to archive, or a nudge to look at its shutdown
+/// flag. The writer sleeps in `recv` while it has nothing queued (it used to wake every
+/// 50 ms to look, 20 times a second for the life of the process), so `flush_and_close`
+/// has to send it something.
+enum WriterMsg {
+    Row(ArchiveEntry),
+    Wake,
+}
+
 /// Cloneable handle a `World` uses to stream lines to the archive.
 ///
 /// Wraps an UNBOUNDED channel. The previous `SyncSender` + `try_send` pair
@@ -301,7 +310,7 @@ pub struct ArchiveStats {
 /// fill it.
 #[derive(Clone)]
 pub struct ArchiveSender {
-    tx: mpsc::Sender<ArchiveEntry>,
+    tx: mpsc::Sender<WriterMsg>,
     stats: Arc<ArchiveStats>,
     alloc: Arc<std::sync::Mutex<Option<WseqAllocator>>>,
 }
@@ -332,7 +341,7 @@ impl ArchiveSender {
             ));
         }
         self.stats.depth.fetch_add(1, Ordering::Relaxed);
-        if self.tx.send(entry).is_err() {
+        if self.tx.send(WriterMsg::Row(entry)).is_err() {
             // Writer thread is gone (it failed to open the database). Undo the
             // depth bump and count the loss.
             self.stats.depth.fetch_sub(1, Ordering::Relaxed);
@@ -381,7 +390,8 @@ impl ScrollbackDb {
     pub fn flush_and_close(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = self.writer.take() {
-            // The writer wakes at least every 50ms, so this returns promptly.
+            // The writer sleeps until it is sent something: wake it to see the flag.
+            let _ = self.tx.tx.send(WriterMsg::Wake);
             let _ = handle.join();
         }
     }
@@ -451,7 +461,7 @@ impl ScrollbackDb {
         let writable = matches!(state, ArchiveState::Empty | ArchiveState::Ready);
 
         let db_path = path.to_path_buf();
-        let (tx, rx) = mpsc::channel::<ArchiveEntry>();
+        let (tx, rx) = mpsc::channel::<WriterMsg>();
         let writer_path = db_path.clone();
         let stats = Arc::new(ArchiveStats::default());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -479,11 +489,20 @@ impl ScrollbackDb {
                 let mut backoff_ms: u64 = 0;
 
                 loop {
-                    match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(entry) => {
+                    // Nothing queued: sleep until something is sent (a line, or
+                    // `flush_and_close`'s wake). Lines queued: until their flush is due.
+                    let got = if batch.is_empty() {
+                        rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    } else {
+                        let due_in = Duration::from_millis(500 + backoff_ms).saturating_sub(last_flush.elapsed());
+                        rx.recv_timeout(due_in)
+                    };
+                    match got {
+                        Ok(WriterMsg::Row(entry)) => {
                             writer_stats.depth.fetch_sub(1, Ordering::Relaxed);
                             batch.push(entry);
                         }
+                        Ok(WriterMsg::Wake) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             // Every sender is gone, so anything still buffered is all
                             // there will ever be — drain it rather than one batch.
@@ -510,10 +529,11 @@ impl ScrollbackDb {
                     // so a burst becomes one transaction rather than many.
                     while batch.len() < 1000 {
                         match rx.try_recv() {
-                            Ok(entry) => {
+                            Ok(WriterMsg::Row(entry)) => {
                                 writer_stats.depth.fetch_sub(1, Ordering::Relaxed);
                                 batch.push(entry);
                             }
+                            Ok(WriterMsg::Wake) => {}
                             Err(_) => break,
                         }
                     }
@@ -527,10 +547,11 @@ impl ScrollbackDb {
                         loop {
                             while batch.len() < 1000 {
                                 match rx.try_recv() {
-                                    Ok(entry) => {
+                                    Ok(WriterMsg::Row(entry)) => {
                                         writer_stats.depth.fetch_sub(1, Ordering::Relaxed);
                                         batch.push(entry);
                                     }
+                                    Ok(WriterMsg::Wake) => {}
                                     Err(_) => break,
                                 }
                             }
@@ -1110,11 +1131,14 @@ fn flush_batch(
             failed.push(row);
             continue;
         };
-        let res = tx.execute(
-            "INSERT INTO output_log (wid, wseq, ts_ms, line_raw, gagged, original)
+        // `prepare_cached`: the two inserts are parsed once per connection, not once per
+        // row - parsing them was two fifths of the writer's work (measured 2026-11-23).
+        let res = tx
+            .prepare_cached(
+                "INSERT INTO output_log (wid, wseq, ts_ms, line_raw, gagged, original)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![wid, wseq, row.ts_ms, row.text, row.gagged as i32, row.original],
-        );
+            )
+            .and_then(|mut insert| insert.execute(params![wid, wseq, row.ts_ms, row.text, row.gagged as i32, row.original]));
         if res.is_ok() {
             // Index the ANSI-stripped form, in the same transaction, so
             // the index can never disagree with the table. There are no
@@ -1130,10 +1154,9 @@ fn flush_batch(
                 ),
                 None => crate::util::strip_ansi_codes(&row.text),
             };
-            let _ = tx.execute(
-                "INSERT INTO output_fts (rowid, txt) VALUES (?1, ?2)",
-                params![rowid, txt],
-            );
+            let _ = tx
+                .prepare_cached("INSERT INTO output_fts (rowid, txt) VALUES (?1, ?2)")
+                .and_then(|mut index| index.execute(params![rowid, txt]));
         }
         if let Err(e) = res {
             crate::debug_log(true, &format!(

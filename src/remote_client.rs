@@ -1523,6 +1523,12 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     // The text-reveal effect's next frame (src/reveal.rs), set only by a draw that found a
     // line still revealing on screen.
     let mut reveal_due: Option<tokio::time::Instant> = None;
+    // Draws that the server's messages ask for are paced (rendering::DrawPacer):
+    // `ws_dirty` is such a draw wanted, `draw_due` when one that was held back is due.
+    // `needs_redraw` stays what input, timers and everything else ask: at once, and
+    // with the output area repainted whatever flags were set (the key paths count on it).
+    let mut ws_dirty = false;
+    let mut draw_pacer = crate::rendering::DrawPacer::default();
 
     loop {
         // /reload or /update on Windows: the new console starts once this loop is over.
@@ -1531,10 +1537,12 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             break;
         }
         // Draw if needed
-        if needs_redraw || app.needs_output_redraw {
-            // Check current popup visibility
-            let any_popup_visible = app.has_new_popup() || app.confirm_dialog.visible;
-
+        let any_popup_visible = app.has_new_popup() || app.confirm_dialog.visible;
+        let popup_changed = any_popup_visible != app.popup_was_visible;
+        let urgent_draw = needs_redraw || app.needs_terminal_clear || popup_changed;
+        let draw_now = draw_pacer.draw_now(ws_dirty || app.needs_output_redraw, urgent_draw, std::time::Instant::now());
+        let draw_due = draw_pacer.due().map(tokio::time::Instant::from_std);
+        if draw_now {
             // When transitioning to popup: terminal.clear() resets ratatui's buffers
             // so the diff writes ALL popup cells (full coverage, no bleed-through).
             // Ratatui handles both output and popup rendering when popup is visible.
@@ -1542,6 +1550,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                 terminal.clear()?;
             }
             app.popup_was_visible = any_popup_visible;
+            let cleared = app.needs_terminal_clear;
 
             // Toggle mouse capture when popup visibility changes
             let want_mouse = any_popup_visible || app.shell_live(app.current_world_index);
@@ -1579,10 +1588,17 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             }
 
             terminal.draw(|f| ui(f, &mut app))?;
-            // Render output with crossterm (bypasses ratatui's buggy ANSI handling)
-            reveal_due = render_output_crossterm(&app).map(|d| tokio::time::Instant::now() + d);
+            // Render output with crossterm (bypasses ratatui's buggy ANSI handling):
+            // always for a draw input or a timer asked for; for one a server message
+            // asked for, only when the output changed (the flag, read after `ui`, which
+            // sets it too), a popup came or went, or the terminal was cleared. The reveal
+            // timer is set only by a pass that ran.
+            if needs_redraw || app.needs_output_redraw || popup_changed || cleared {
+                reveal_due = render_output_crossterm(&app).map(|d| tokio::time::Instant::now() + d);
+                app.needs_output_redraw = false;
+            }
             needs_redraw = false;
-            app.needs_output_redraw = false;
+            ws_dirty = false;
             // The output area as just laid out - not the terminal's height less a guess at
             // the rest - since the server sizes more-mode and a shell world's PTY by it: a
             // PTY taller than this area has its bottom rows drawn off the screen. Sent on
@@ -1865,6 +1881,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             if matches!(ws_msg, WsMessage::ServerReloading) {
                                 server_reloading = true;
                             }
+                            // What it changes on screen, asked before it is applied.
+                            let draws = app.remote_message_draw(&ws_msg);
                             app.handle_remote_ws_message(ws_msg);
                             // The server ran /quit for this console (an action, a macro).
                             if app.pending_quit {
@@ -1885,7 +1903,16 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             if let Some(want) = app.pending_update.take() {
                                 own_update_running = start_own_update(&mut app, &update_tx, want);
                             }
-                            needs_redraw = true;
+                            // A paced draw, and none for a message that changed nothing
+                            // on this screen (App::remote_message_draw).
+                            match draws {
+                                crate::RemoteDraw::Nothing => {}
+                                crate::RemoteDraw::Bar => ws_dirty = true,
+                                crate::RemoteDraw::All => {
+                                    ws_dirty = true;
+                                    app.needs_output_redraw = true;
+                                }
+                            }
                         }
                         Err(e) => {
                             // Invalid JSON / undeserializable message - log and keep the
@@ -1992,6 +2019,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                 }
             }
             // Text reveal: the next frame of a line being typed onto the screen.
+            // A draw that was held back is due (rendering::DrawPacer): back to the top.
+            _ = tokio::time::sleep_until(draw_due.unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86400))), if draw_due.is_some() => {}
             _ = tokio::time::sleep_until(reveal_due.unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86400))), if reveal_due.is_some() => {
                 reveal_due = None;
                 needs_redraw = true;

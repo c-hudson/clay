@@ -1009,6 +1009,19 @@
     // its UpdateOutcome) or 'reconnect' (it updated and is reloading; our own half follows
     // the next InitialState).
     let updateFlow = null;
+    // The theme's 16 ANSI colours and their names as parseAnsi uses them, read from the
+    // page's CSS variables once per theme. parseAnsi used to read them afresh for every
+    // coloured line - 16 computed-style reads, each forcing a style pass over the lines
+    // just inserted. forgetAnsiPalette() drops them wherever the theme's variables are
+    // written (applyThemeColors, applyThemeAppearance - which every writer of #theme-vars
+    // calls). Declared up here, before any of those can run: they are called while the
+    // page starts.
+    let ansiPaletteKept = null;
+    let ansiColorNamesKept = null;
+    function forgetAnsiPalette() {
+        ansiPaletteKept = null;
+        ansiColorNamesKept = null;
+    }
     // Settings' "/update to newest" (Settings::update_newest), one setting for the
     // instance: every update command takes the newest release, alpha or stable. null
     // from a server before it, or one this login may not update: no switch.
@@ -2400,6 +2413,7 @@
     // Android app, to the system bars around it. Call it after the theme variables have
     // been written (applyThemeColors, ThemeCssVarsUpdated), since it reads them back.
     function applyThemeAppearance() {
+        forgetAnsiPalette();
         applyNewGlow();
         if (splitPane) applyPaneGrey();
         const light = themeBgIsLight();
@@ -2423,6 +2437,7 @@
             }
             css += '}';
             el.textContent = css;
+            forgetAnsiPalette();
             // Re-apply window opacity for webview mode
             if (window.WEBVIEW_MODE) applyTransparency(guiTransparency);
         } catch (e) {
@@ -5906,13 +5921,12 @@
                     }
                     // The editor may have moved the theme across the light/dark line.
                     applyThemeAppearance();
-                    // themeAnsiPalette/colorNameToRgb are declared inside parseAnsi()
-                    // itself (let, re-initialized to null on every call), so each call
-                    // already re-reads the CSS vars fresh - no cache to reset here.
-                    // (T1.9: this used to assign to those names directly, which under
-                    // 'use strict' threw ReferenceError on every theme change, since
-                    // those identifiers aren't in scope here - renderOutput() below
-                    // never ran and every client showed an error banner.)
+                    // parseAnsi's palette is kept per theme (ansiPaletteKept) and was
+                    // just dropped by applyThemeAppearance() above, so the render below
+                    // reads the new colours. (T1.9: this once assigned to parseAnsi's own
+                    // local names, which under 'use strict' threw ReferenceError on every
+                    // theme change - never reach into parseAnsi from here; call
+                    // forgetAnsiPalette().)
                     renderOutput();
                 }
                 break;
@@ -6298,7 +6312,7 @@
                 // Another client (console, web, or GUI) has viewed this world
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].unseen_lines = 0;
-                    updateStatusBar();
+                    statusBarSoon();
                 }
                 break;
 
@@ -6406,14 +6420,16 @@
                 // Server's unseen count changed - update our copy
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].unseen_lines = msg.count || 0;
-                    updateStatusBar();
+                    statusBarSoon();
                 }
                 break;
 
             case 'ActivityUpdate':
                 // Server's activity count - just display it
                 serverActivityCount = msg.count || 0;
-                updateStatusBar();
+                // The taskbar's badge at once (one comparison); the bar itself once a frame.
+                reportBadge();
+                statusBarSoon();
                 break;
 
             case 'PausedState':
@@ -6433,7 +6449,7 @@
                     // Text held by the server's more-mode came from the MUD all the same.
                     if ((msg.count || 0) > (worlds[msg.world_index].pending_count || 0)) noteTaskbarAlert();
                     worlds[msg.world_index].pending_count = msg.count || 0;
-                    updateStatusBar();
+                    statusBarSoon();
                 }
                 break;
 
@@ -12918,13 +12934,13 @@
             }
             return palette;
         }
-        let themeAnsiPalette = null;
+        let themeAnsiPalette = ansiPaletteKept;
 
         // 256-color palette (first 16 are standard, 16-231 are RGB cube, 232-255 are grayscale)
         function color256ToRgb(n) {
             if (n < 16) {
                 // Standard 16 colors from theme
-                if (!themeAnsiPalette) themeAnsiPalette = getThemeAnsiPalette();
+                if (!themeAnsiPalette) themeAnsiPalette = ansiPaletteKept = getThemeAnsiPalette();
                 return themeAnsiPalette[n];
             } else if (n < 232) {
                 // 216 color cube (6x6x6) - xterm uses specific values, not linear
@@ -12944,7 +12960,7 @@
 
         // Color name to RGB mapping - reads from theme palette
         function getColorNameToRgb() {
-            if (!themeAnsiPalette) themeAnsiPalette = getThemeAnsiPalette();
+            if (!themeAnsiPalette) themeAnsiPalette = ansiPaletteKept = getThemeAnsiPalette();
             const p = themeAnsiPalette;
             return {
                 'black': p[0], 'red': p[1], 'green': p[2], 'yellow': p[3],
@@ -12954,7 +12970,7 @@
                 'bright-cyan': p[14], 'bright-white': p[15]
             };
         }
-        let colorNameToRgb = null;
+        let colorNameToRgb = ansiColorNamesKept;
 
         // Read a single theme color CSS var (e.g. --theme-fg, --theme-bg) as RGB, with
         // a fallback if the var is missing/malformed. Mirrors getThemeAnsiPalette()'s
@@ -12978,7 +12994,7 @@
 
         // Get RGB from class name or style
         function getFgRgb(classes, style) {
-            if (!colorNameToRgb) colorNameToRgb = getColorNameToRgb();
+            if (!colorNameToRgb) colorNameToRgb = ansiColorNamesKept = getColorNameToRgb();
             // Check inline style first
             const styleMatch = style.match(/color:\s*rgb\((\d+),(\d+),(\d+)\)/);
             if (styleMatch) return [parseInt(styleMatch[1]), parseInt(styleMatch[2]), parseInt(styleMatch[3])];
@@ -12993,7 +13009,7 @@
         }
 
         function getBgRgb(classes, style) {
-            if (!colorNameToRgb) colorNameToRgb = getColorNameToRgb();
+            if (!colorNameToRgb) colorNameToRgb = ansiColorNamesKept = getColorNameToRgb();
             // Check inline style first
             const styleMatch = style.match(/background-color:\s*rgb\((\d+),(\d+),(\d+)\)/);
             if (styleMatch) return [parseInt(styleMatch[1]), parseInt(styleMatch[2]), parseInt(styleMatch[3])];
@@ -14675,6 +14691,18 @@
         });
     }
 
+    // The bar after one of the server's counter messages (UnseenUpdate, UnseenCleared,
+    // ActivityUpdate, PendingLinesUpdate). The server sends two or three of them after
+    // every packet of every world, and each used to rebuild the whole bar on the spot -
+    // reading the layout while the lines just inserted were still unlaid-out, so a layout
+    // per message: 0.2 ms a packet for a world not even shown (measured 2026-11-23). Once a
+    // frame while the page is on screen; at once while it is hidden, where no frame comes
+    // and the bar's side effects (the title, the app's badge) must not wait for one.
+    function statusBarSoon() {
+        if (document.hidden) updateStatusBar();
+        else scheduleStatusBar();
+    }
+
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
         reportBadge();
@@ -14916,14 +14944,17 @@
     // Update time (Clay's 12-hour H:MM, no AM/PM - or %clock_format)
     function updateTime() {
         const now = new Date();
+        // Written only when it reads differently: this runs every second, and the same
+        // text set again still dirties the bar.
+        let text;
         if (clockFormat) {
-            elements.statusTime.textContent = tfFormatTime(clockFormat, now);
-            return;
+            text = tfFormatTime(clockFormat, now);
+        } else {
+            let hours = now.getHours() % 12;
+            if (hours === 0) hours = 12;
+            text = `${hours}:${now.getMinutes().toString().padStart(2, '0')}`;
         }
-        let hours = now.getHours() % 12;
-        if (hours === 0) hours = 12;
-        const minutes = now.getMinutes().toString().padStart(2, '0');
-        elements.statusTime.textContent = `${hours}:${minutes}`;
+        if (elements.statusTime.textContent !== text) elements.statusTime.textContent = text;
     }
 
     // Set input area height (number of lines)

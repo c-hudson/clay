@@ -196,6 +196,15 @@ rodio = { version = "0.17", optional = true, default-features = false, features 
 wry = { version = "0.48", optional = true }
 tao = { version = "0.34", optional = true }
 
+# The static Linux builds (musl: the x86_64 and ARM64 release assets, the Drobo build) use
+# mimalloc as their allocator (`#[global_allocator]` in src/main.rs). musl's own malloc was
+# 27% of the server's work per line of MUD text, and now and then fell into a slow mode
+# that spent half a run in mmap/munmap (measured 2026-11-23; .claude/rules/performance.md).
+# Every other platform keeps its own allocator. It is C, built by the `cc` crate with the
+# same compiler `ring` and SQLite already need for these targets.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
@@ -248,3 +257,13 @@ gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
 # output is unchanged. Bump this back to `2` temporarily if you need deep gdb inspection.
 [profile.dev]
 debug = "line-tables-only"
+
+# Release builds: fat LTO and one codegen unit (user decision 2026-11-23, from the CPU
+# measurements in .claude/rules/performance.md): 7-12% less CPU on the server's hot paths
+# and a binary about a quarter smaller, for a build about 2.3 times as long. It applies to
+# every release build, on every builder. One that can't finish with it (memory, time)
+# builds with `CARGO_PROFILE_RELEASE_LTO=thin` in its environment, and the release summary
+# says so - never by editing this section for one platform.
+[profile.release]
+lto = "fat"
+codegen-units = 1

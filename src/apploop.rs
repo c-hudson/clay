@@ -640,10 +640,6 @@ pub(crate) async fn run_app_loop(app: &mut App, mut event_rx: mpsc::Receiver<App
         reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
     }
 
-    // GUI reload check - polls atomic flag set by IPC handler (100ms interval)
-    let mut gui_reload_check = tokio::time::interval(Duration::from_millis(100));
-    gui_reload_check.tick().await; // consume first immediate tick
-
     // SIGUSR1 handler for hot reload: the GUI masters' (as it was; -D reloads from a
     // client's /reload, an instance never from a signal of its own).
     #[cfg(all(unix, not(target_os = "android")))]
@@ -1104,8 +1100,9 @@ pub(crate) async fn run_app_loop(app: &mut App, mut event_rx: mpsc::Receiver<App
                 process_tick_sleep.as_mut().reset(next);
             }
 
-            // GUI reload check - polls atomic flag set by WebView IPC handler
-            _ = gui_reload_check.tick(), if gui_quit => {
+            // GUI reload: the WebView IPC handler set the flag and woke this arm
+            // (GUI_RELOAD_NOTIFY keeps a wake-up sent while the loop was busy elsewhere).
+            _ = crate::GUI_RELOAD_NOTIFY.notified(), if gui_quit => {
                 if crate::GUI_RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
                     #[cfg(not(target_os = "android"))]
                     {

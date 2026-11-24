@@ -24,6 +24,13 @@ pub mod chat;
 /// emulator are behind the `shell-worlds` feature.
 pub mod shell;
 
+/// The static Linux builds' allocator (see `Cargo.toml`: musl's own malloc was over a
+/// quarter of the work per line). Only where the C library is musl; Windows, macOS, the
+/// glibc GUI build, Termux and Android keep theirs.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // A server must not contain shell worlds (user ruling 2026-11-07), so neither server
 // feature is ever built with `shell-worlds` (a default feature), and a binary is one
 // server or the other.
@@ -86,6 +93,17 @@ pub mod testserver;
 #[cfg(test)]
 pub mod testharness;
 
+/// What a server message asks an attached console to draw (`App::remote_message_draw`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteDraw {
+    /// Nothing on screen changed.
+    Nothing,
+    /// The bar (the ratatui pass); the output area is as it was.
+    Bar,
+    /// Everything, as every message used to.
+    All,
+}
+
 /// `clay -h`: the common options only (user request 2026-11-17, the user's own wording);
 /// every option is `/help clay`'s (popup/definitions/help.rs, pinned by a test there).
 pub(crate) const CLI_USAGE: &str = "\
@@ -146,6 +164,11 @@ static OUTPUT_DEBUG_HEADER_WRITTEN: AtomicBool = AtomicBool::new(false);
 static STARTUP_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Flag set by IPC handler to request reload — checked by headless event loop
 pub static GUI_RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Wakes the headless loop to look at `GUI_RELOAD_REQUESTED`. Whoever sets the flag
+/// notifies here: the loop used to poll the flag every 100 ms instead, ten wake-ups a
+/// second (forty counting the runtime's own) for the life of every GUI's Clay and of the
+/// Android app's bundled server, which never sets it.
+pub static GUI_RELOAD_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// Flag set by HTTP server after successful bind — checked by GUI readiness wait
 pub static GUI_HTTP_READY: AtomicBool = AtomicBool::new(false);
 /// The port that server bound (set with `GUI_HTTP_READY`): the configured one, or the next
@@ -5362,11 +5385,29 @@ impl World {
         slot.map(|(_, wseq)| wseq)
     }
 
+    /// The highest seq this world holds, without walking the buffer. This runs for every
+    /// world at every client's keepalive (`audit_broadcast_ledger`), and a scan of a
+    /// million-line session took 3.4 ms each time. `output_lines` is sorted by seq after
+    /// its archive prefix (the Page Up block: made-up seqs in several runs, so that part
+    /// is scanned - it is bounded by what was paged in), and `pending_lines` is sorted and
+    /// above everything shown, so the last line of each is its highest.
+    fn highest_held_seq(&self) -> Option<u64> {
+        let prefix = self.output_lines.partition_point(|l| l.from_archive);
+        let paged_in = self.output_lines.iter().take(prefix).map(|l| l.seq).max();
+        let live = if prefix < self.output_lines.len() { self.output_lines.last().map(|l| l.seq) } else { None };
+        let held = self.pending_lines.last().map(|l| l.seq);
+        [paged_in, live, held].into_iter().flatten().max()
+    }
+
     pub(crate) fn ensure_next_seq_above_buffer(&mut self) {
-        let highest = self.output_lines.iter()
-            .chain(self.pending_lines.iter())
-            .map(|l| l.seq)
-            .max();
+        let highest = self.highest_held_seq();
+        // The whole suite checks the shortcut against the plain scan.
+        #[cfg(test)]
+        assert_eq!(
+            highest,
+            self.output_lines.iter().chain(self.pending_lines.iter()).map(|l| l.seq).max(),
+            "highest_held_seq disagrees with a scan of the buffer"
+        );
         if let Some(h) = highest {
             if h >= self.next_seq {
                 self.next_seq = h.saturating_add(1);
@@ -5554,12 +5595,20 @@ impl World {
             self.scroll_offset = 0;
         }
         let max_lines = (output_height as usize).saturating_sub(2);
+        // Rows are counted only for more-mode: with it off nothing pauses, so nothing
+        // below measures a line (each measure wraps the whole line, which was over a third
+        // of the server's work per line; and a world nobody viewed re-measured a screenful
+        // of old lines on every packet). `lines_since_pause` then stands where it was -
+        // sending a command or a release still zeroes it - and switching more-mode on
+        // resets and recounts nothing: counting simply starts from that moment, added to
+        // what the count already was (user ruling 2026-11-23), as both GUIs' own counts do.
+        let counting = settings.more_mode_enabled;
 
         // For non-current worlds that aren't paused: recalculate lines_since_pause
         // based on actual visible content at the bottom of output_lines.
         // Without this, lines_since_pause carries over from when the user was viewing
         // the world, causing immediate pause when new output arrives.
-        if !is_current && !self.paused && self.lines_since_pause >= max_lines && max_lines > 0 {
+        if counting && !is_current && !self.paused && self.lines_since_pause >= max_lines && max_lines > 0 {
             let mut visible = 0;
             for line in self.output_lines.iter().rev() {
                 let vl = metrics.rows(line);
@@ -5619,7 +5668,7 @@ impl World {
             // comment: a gagged keepalive line or captured user input can land after the
             // partial while it's still outstanding, e.g. a MUD prompt with no trailing
             // newline followed by the player typing a command).
-            let old_visual = if partial_was_in_pending {
+            let old_visual = if partial_was_in_pending || !counting {
                 0
             } else if let Some(i) = self.last_visible_output_idx() {
                 metrics.rows(&self.output_lines[i])
@@ -5677,13 +5726,15 @@ impl World {
                     if completed_archive_seq.is_some() {
                         self.output_lines[i].archive_seq = completed_archive_seq;
                     }
-                    let new_visual = metrics.rows(&self.output_lines[i]);
                     // Re-count at the completed line's final wrapped height. Does
                     // NOT retroactively trigger a pause even if this pushes over
                     // budget — the very next line will pause correctly, and
                     // pausing mid-completion here would be a riskier UX change
                     // than the accounting fix itself.
-                    self.lines_since_pause = (self.lines_since_pause + new_visual).saturating_sub(old_visual);
+                    if counting {
+                        let new_visual = metrics.rows(&self.output_lines[i]);
+                        self.lines_since_pause = (self.lines_since_pause + new_visual).saturating_sub(old_visual);
+                    }
                 }
             }
 
@@ -5798,7 +5849,7 @@ impl World {
             // raw &str. `rows_as` supplies `will_be_marked_new` because nobody owns this line
             // yet: `display_id` is still None, but whoever looks at this world next will claim
             // it and the ▶ prefix will then steal two columns.
-            let visual_lines = metrics.rows_as(&new_line, will_be_marked_new);
+            let visual_lines = if counting { metrics.rows_as(&new_line, will_be_marked_new) } else { 0 };
 
             // Use projected line count (current + this line's visual lines) for pause trigger.
             // A blank line is a line like any other here (user ruling 2026-11-11): it counts
@@ -8026,6 +8077,9 @@ impl App {
             return;
         }
         let target = Some((client_id, world_index));
+        if refresh {
+            reach::forget_local_addrs();
+        }
         for line in reach::format_reach_lines(&self.build_reachability_info()) {
             self.reply_reach_line(target, &line);
         }
@@ -8837,6 +8891,29 @@ impl App {
     }
 
     /// Handle incoming WebSocket message when running as remote client
+    /// What a message from the server changes on this attached console's screen, asked
+    /// **before** the message is handled (it compares with what the console holds). The
+    /// console used to draw everything for every message - twice a packet, since each
+    /// packet of text is followed by an `ActivityUpdate`: 505 µs a packet (2026-11-23).
+    /// Anything not named here is `All`, as before.
+    pub(crate) fn remote_message_draw(&self, msg: &WsMessage) -> RemoteDraw {
+        match msg {
+            // Text, stats and held-line counts of a world in neither pane: nothing drawn.
+            WsMessage::ServerData { world_index, .. } | WsMessage::StatsUpdate { world_index, .. }
+                if !self.console_shows(*world_index) => RemoteDraw::Nothing,
+            WsMessage::PendingLinesUpdate { world_index, count } | WsMessage::PendingCountUpdate { world_index, count } => {
+                let unchanged = self.worlds.get(*world_index).is_none_or(|w| w.pending_count == *count);
+                if unchanged || !self.console_shows(*world_index) { RemoteDraw::Nothing } else { RemoteDraw::All }
+            }
+            // The activity count is on the bar; the same count again changes nothing.
+            WsMessage::ActivityUpdate { count } if *count == self.server_activity_count => RemoteDraw::Nothing,
+            WsMessage::ActivityUpdate { .. } => RemoteDraw::Bar,
+            // Counts the console draws nowhere.
+            WsMessage::UnseenUpdate { .. } | WsMessage::UnseenCleared { .. } => RemoteDraw::Nothing,
+            _ => RemoteDraw::All,
+        }
+    }
+
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
             // `end_seq` is intentionally not matched/bound here (absorbed by `..`): this arm
@@ -8973,7 +9050,10 @@ impl App {
                         if world_index != self.current_world_index && !world.is_hidden() {
                             world.unseen_lines += line_count;
                         }
-                        self.needs_output_redraw = true;
+                        // Only a world in one of this console's panes changes its output.
+                        if self.console_shows(world_index) {
+                            self.needs_output_redraw = true;
+                        }
                     }
                 }
             }
@@ -9105,11 +9185,14 @@ impl App {
                 }
             }
             WsMessage::PendingLinesUpdate { world_index, count } => {
+                let shown = self.console_shows(world_index);
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Track pending count from daemon (no actual lines stored client-side)
                     world.pending_count = count;
                     world.paused = count > 0;
-                    self.needs_output_redraw = true;
+                    if shown {
+                        self.needs_output_redraw = true;
+                    }
                 }
             }
             WsMessage::PendingReleased { world_index, count: _ } => {
@@ -9218,9 +9301,9 @@ impl App {
             }
             WsMessage::CalculatedWorld { index: None } => {}
             WsMessage::ActivityUpdate { count } => {
-                // Server's activity count changed - update our copy
+                // Server's activity count changed - update our copy. It is on the bar,
+                // which the ratatui draw repaints: nothing in the output area changes.
                 self.server_activity_count = count;
-                self.needs_output_redraw = true;
             }
             WsMessage::ShowTagsChanged { show_tags } => {
                 // Server toggled show_tags (F2 or /tag command)
@@ -9243,7 +9326,10 @@ impl App {
             WsMessage::StatsUpdate { world_index, stats } => {
                 if world_index < self.worlds.len() {
                     self.worlds[world_index].mirrored_stats = stats;
-                    self.needs_output_redraw = true;
+                    // The status line drawn is a shown world's.
+                    if self.console_shows(world_index) {
+                        self.needs_output_redraw = true;
+                    }
                 }
             }
             // The map (src/map), as the server sends it for this console's map pane.
@@ -9390,10 +9476,13 @@ impl App {
             }
             WsMessage::PendingCountUpdate { world_index, count } => {
                 // Periodic pending count update from server
+                let shown = self.console_shows(world_index);
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     world.pending_count = count;
                     world.paused = count > 0;
-                    self.needs_output_redraw = true;
+                    if shown {
+                        self.needs_output_redraw = true;
+                    }
                 }
             }
             WsMessage::ScrollbackLines { world_index, lines, backfill_complete: _, clamped_by_pending: _, request_id } => {
@@ -11949,7 +12038,7 @@ impl App {
             self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
         }
 
-        if world_idx == self.current_world_index {
+        if self.console_shows(world_idx) {
             self.needs_output_redraw = true;
         }
     }
@@ -12180,7 +12269,7 @@ impl App {
         }
         self.broadcast_activity();
 
-        if world_idx == self.current_world_index {
+        if self.console_shows(world_idx) {
             self.needs_output_redraw = true;
         }
     }
@@ -15462,10 +15551,12 @@ impl App {
             return;
         }
         // Highlight colours are matched back by line content after add_output has wrapped
-        // and stored the text, so the map only needs this run's lines.
+        // and stored the text, so the map only needs this run's lines. Keyed by the text
+        // without its escape codes, which is what the lookup below asks with: keyed by the
+        // raw text, a line the MUD (or a TF attribute) had coloured never got its highlight.
         let highlight_map: std::collections::HashMap<String, Option<String>> = run.iter()
             .filter(|l| l.highlight.is_some())
-            .map(|l| (l.text.to_string(), l.highlight.clone()))
+            .map(|l| (strip_ansi_codes(&l.text), l.highlight.clone()))
             .collect();
         let filtered_data = {
             let lines_only: Vec<&str> = run.iter().map(|l| l.text.as_ref()).collect();
@@ -15561,8 +15652,14 @@ impl App {
                 }
             }
 
-            // Mark output for redraw whenever output changes
-            self.needs_output_redraw = true;
+            // Mark the output for a repaint when it changed on screen: the world is in
+            // one of the console's panes. Text for a world not shown changes only the bar
+            // (the activity count), which every event's ratatui draw repaints anyway - a
+            // whole repaint of the output area per packet of any world was most of what a
+            // busy background world cost the console.
+            if self.console_shows(world_idx) {
+                self.needs_output_redraw = true;
+            }
 
             // For synchronized more-mode: only broadcast lines that went to output_lines
             // Lines that went to pending_lines will be broadcast when released
@@ -15601,6 +15698,12 @@ impl App {
     fn add_gagged_run(&mut self, world_idx: usize, run: &[&PacketLine<'_>], is_current: bool, flush: bool) {
         if run.is_empty() {
             return;
+        }
+        // Gagged lines are drawn while tags are shown (F2): a run of them on a world the
+        // console shows is then a change on screen. (Any world's visible text used to
+        // repaint the output and so covered for this.)
+        if self.show_tags && self.console_shows(world_idx) {
+            self.needs_output_redraw = true;
         }
         // Invariant: World::output_lines is always sorted by seq (see the doc comment on
         // App::broadcast_released_lines, which real-seq release broadcasts depend on). Pushing
@@ -16234,8 +16337,8 @@ impl App {
                 self.broadcast_activity();
             }
 
-            // Mark output for redraw if this is the current world
-            if world_idx == self.current_world_index {
+            // Mark output for redraw if the console shows this world (either pane)
+            if self.console_shows(world_idx) {
                 self.needs_output_redraw = true;
             }
 
@@ -16930,10 +17033,11 @@ impl App {
         for msg in outcome.broadcasts {
             self.ws_broadcast(msg);
         }
-        if outcome.stats_changed {
+        if outcome.stats_changed && self.console_shows(world_idx) {
             // Plan Job 4: the console status line is repainted by render_output_crossterm,
             // gated on this flag (same as every other output change) rather than the
-            // ~150ms WS-broadcast coalescing in flush_dirty_stats (D4).
+            // ~150ms WS-broadcast coalescing in flush_dirty_stats (D4). Only for a world
+            // on screen: another world's stats change nothing the console draws.
             self.needs_output_redraw = true;
         }
 
@@ -18271,6 +18375,9 @@ impl App {
         if !self.policy.server_wide {
             return;
         }
+        // This machine's addresses are listed afresh too (`reach::local_ipv4_addrs` keeps
+        // them a minute otherwise); the results below rebuild the panel.
+        reach::forget_local_addrs();
         self.spawn_firewall_check(reply_to, event_tx.clone());
         self.start_port_mapping(reply_to, event_tx);
     }
@@ -24451,6 +24558,9 @@ async fn main() -> io::Result<()> {
         if cfg!(feature = "shell-worlds") { features.push("shell-worlds"); }
         if cfg!(feature = "multiuser") { features.push("multiuser"); }
         if cfg!(feature = "web-front") { features.push("web-front"); }
+        // Not a cargo feature, but part of what this build is: the static Linux builds'
+        // allocator (the `#[global_allocator]` at the top of this file).
+        if cfg!(target_env = "musl") { features.push("mimalloc"); }
         let features_str = if features.is_empty() {
             "none".to_string()
         } else {
@@ -25931,6 +26041,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // it costs nothing while nothing animates.
     let reveal_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(reveal_sleep);
+    // Draws that MUD text and other app events ask for are paced (rendering::DrawPacer):
+    // one that comes too soon after the last is owed, and this timer fires when it is due.
+    let mut draw_pacer = rendering::DrawPacer::default();
+    let draw_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(draw_sleep);
     // Job 5 (T2.7): a hot reload restores `World::reconnect_at` from the state file,
     // but this timer always starts at FAR_FUTURE and is only ever re-armed by later
     // events (a disconnect, a web-triggered reconnect) or by firing once - nothing
@@ -25982,8 +26097,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             debug_log(is_debug_enabled(), &format!("LOOP: iteration {}", loop_count));
         }
 
-        // Track whether this iteration changed visible state requiring a redraw
+        // Track whether this iteration changed visible state requiring a redraw. Two
+        // kinds (rendering::DrawPacer): `needs_draw` is asked by what may wait a frame - MUD
+        // text and the other app events - and `urgent_draw` by what may not: input, the
+        // timers, a cleared terminal.
         let mut needs_draw = false;
+        let mut urgent_draw = false;
 
         // Reap any zombie child processes (TLS proxies that have exited)
         // This is a fast non-blocking call that prevents defunct processes from accumulating
@@ -25994,7 +26113,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         tokio::select! {
             // Terminal events (keyboard and mouse input)
             maybe_event = event_stream.next() => {
-                needs_draw = true;
+                urgent_draw = true;
                 if let Some(Ok(event)) = maybe_event {
                 // Handle mouse events
                 if let Event::Mouse(mouse) = event {
@@ -26344,7 +26463,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.drop_sniffer.end_key();
                     if app.drop_sniffer.is_active() {
                         if crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
-                            needs_draw = false;
+                            urgent_draw = false;
                         } else {
                             app.finish_typed_burst();
                         }
@@ -26389,10 +26508,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
                             }
 
-                            // Check if terminal needs full redraw (after splash clear)
+                            // Check if terminal needs full redraw (after splash clear). The
+                            // clear resets ratatui's buffers, so everything is repainted,
+                            // the output area too, and now - whichever world's splash it was
+                            // (text for a world not on screen asks for no repaint by itself).
                             if app.worlds[world_idx].needs_redraw {
                                 app.worlds[world_idx].needs_redraw = false;
                                 terminal.clear()?;
+                                app.needs_output_redraw = true;
+                                urgent_draw = true;
                             }
 
                             // Execute any triggered commands
@@ -26686,7 +26810,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
             // Periodic timer for clock updates and keepalive checks (once per minute)
             _ = keepalive_interval.tick() => {
-                needs_draw = true; // Clock display updates every minute
+                urgent_draw = true; // Clock display updates every minute
                 // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE).
                 app.reap_stale_ws_client_worlds();
                 app.note_crash_context();
@@ -26800,7 +26924,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Timed-prompt inference: promote any WorldType::MudTimedPrompt world
                 // whose parked partial has waited past prompt_wait_ms.
                 if app.promote_due_timed_prompts(now) {
-                    needs_draw = true; // Prompt promoted — redraw input area
+                    urgent_draw = true; // Prompt promoted — redraw input area
                 }
                 // Re-arm: check again in 150ms if any world still needs it
                 let any_pending_prompt = app.worlds.iter().any(|w| w.fansi_detect_until.is_some());
@@ -26823,13 +26947,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // arm would fire on every iteration. The draw below re-arms it for the
                 // next frame if a line is still revealing.
                 reveal_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
-                needs_draw = true;
+                urgent_draw = true;
                 app.needs_output_redraw = true;
+            }
+
+            // A draw that was held back is due (rendering::DrawPacer). Parked again
+            // first, as above; the pacer still knows the draw is owed.
+            _ = &mut draw_sleep => {
+                draw_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
             }
 
             // TF repeat process tick — only fires when processes exist
             _ = &mut process_tick_sleep => {
-                needs_draw = true; // Process may produce output
+                urgent_draw = true; // Process may produce output
                 for (ctx, effects) in app.tick_tf_processes(std::time::Instant::now(), false) {
                     if tfrun::run_tf_effects_console(&mut app, effects, ctx, &event_tx).await {
                         return Ok(());
@@ -26933,10 +27063,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
                         }
 
-                        // Check if terminal needs full redraw (after splash clear)
+                        // Check if terminal needs full redraw (after splash clear); as in
+                        // the select arm above, the clear is followed by a whole repaint.
                         if app.worlds[world_idx].needs_redraw {
                             app.worlds[world_idx].needs_redraw = false;
                             let _ = terminal.clear();
+                            app.needs_output_redraw = true;
+                            urgent_draw = true;
                         }
 
                         // Execute any triggered commands
@@ -27203,6 +27336,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         if !app.pending_terminal_ops.is_empty() {
             drop(std::mem::replace(&mut event_stream, EventStream::new()));
             run_terminal_ops(&mut app, terminal)?;
+            // The terminal was handed over and cleared: its repaint doesn't wait.
+            urgent_draw = true;
         }
         // TF's mail check, and its status area when a script has it: drawn in place of
         // the separator bar, and sent to the clients
@@ -27277,13 +27412,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             walk_sleep.as_mut().reset(tokio::time::Instant::from_std(due));
         }
 
-        // Skip drawing when no visible state changed (e.g., pending update WS broadcast)
-        if needs_draw {
-            // Check if any popup is now visible
-            let any_popup_visible = app.confirm_dialog.visible
-                || app.filter_popup.visible
-                || app.search_popup.visible
-                || app.has_new_popup();
+        // Skip drawing when no visible state changed (e.g., pending update WS broadcast),
+        // and hold back a draw that only MUD text or another app event asked for when the
+        // last such draw was under a frame ago (rendering::DrawPacer): it is owed, and
+        // `draw_sleep` brings the loop back for it. A popup opening or closing and a
+        // terminal clear are urgent like input, whatever caused them.
+        let any_popup_visible = app.confirm_dialog.visible
+            || app.filter_popup.visible
+            || app.search_popup.visible
+            || app.has_new_popup();
+        let urgent_draw = urgent_draw || app.needs_terminal_clear || any_popup_visible != app.popup_was_visible;
+        let draw_now = draw_pacer.draw_now(needs_draw, urgent_draw, std::time::Instant::now());
+        if let Some(due) = draw_pacer.due() {
+            pull_in_deadline(draw_sleep.as_mut(), due);
+        }
+        if draw_now {
 
             // When transitioning to popup: terminal.clear() resets ratatui's buffers so
             // the diff will write ALL popup cells (full coverage, no bleed-through).

@@ -1263,6 +1263,62 @@ fn crossterm_visible_width(s: &str) -> usize {
     width
 }
 
+/// How often the console repaints for text that arrives by itself: at most once in this
+/// long ([`DrawPacer`]). A screen refresh; nothing on the wire waits for it.
+pub(crate) const DRAW_PACE: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Paces the console's draws that network and app events ask for.
+///
+/// A burst of MUD text is already one draw (the loops drain what is queued first), but
+/// lines that trickle in one packet at a time each got a draw of their own: a whole
+/// `terminal.draw` and a repaint of the output area, 4 KB and about 300 µs a packet in
+/// the console and twice that in the remote console (measured 2026-11-23). Here such a
+/// draw happens at once when the last one was at least [`DRAW_PACE`] ago, and otherwise
+/// is *owed*: the loop arms a timer for [`DrawPacer::due`] and draws then, so the last
+/// line of a stream is never left undrawn.
+///
+/// An **urgent** draw - a key, a paste, the mouse, a resize, a popup opening or closing,
+/// a terminal clear, the text-reveal or any other timer - is never held back, and takes
+/// an owed one with it. A draw for input alone doesn't count as a paced one, so the
+/// first reply after a keystroke is drawn at once.
+#[derive(Debug, Default)]
+pub(crate) struct DrawPacer {
+    /// A paced draw was held back and is still to be done.
+    owed: bool,
+    /// When paced changes were last drawn.
+    last_paced: Option<std::time::Instant>,
+}
+
+impl DrawPacer {
+    /// Should this turn of the loop draw? `paced`: something that may wait asked for a
+    /// draw this turn; `urgent`: something that may not. Draws what is owed too.
+    pub(crate) fn draw_now(&mut self, paced: bool, urgent: bool, now: std::time::Instant) -> bool {
+        let waiting = paced || self.owed;
+        if !urgent && !waiting {
+            return false;
+        }
+        let in_time = self.last_paced.is_none_or(|at| now.saturating_duration_since(at) >= DRAW_PACE);
+        if urgent || in_time {
+            if waiting {
+                self.last_paced = Some(now);
+            }
+            self.owed = false;
+            true
+        } else {
+            self.owed = true;
+            false
+        }
+    }
+
+    /// When the owed draw is due, for the loop's timer; `None` when none is owed.
+    pub(crate) fn due(&self) -> Option<std::time::Instant> {
+        if !self.owed {
+            return None;
+        }
+        Some(self.last_paced.map_or_else(std::time::Instant::now, |at| at + DRAW_PACE))
+    }
+}
+
 /// Render output area using raw crossterm (bypasses ratatui's buggy rendering)
 /// Returns early if a popup or the editor is visible (let ratatui handle those)
 /// Paint the output area with raw crossterm, each pane on its own rows (`/split`); a pane

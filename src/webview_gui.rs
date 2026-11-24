@@ -1425,6 +1425,7 @@ fn dispatch_ipc_message(
     } else if body == "reload" {
         if is_master {
             crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::GUI_RELOAD_NOTIFY.notify_one();
             if let Some(ref tx) = reload_tx {
                 let _ = tx.send(crate::WsMessage::SendCommand {
                     world_index: 0,

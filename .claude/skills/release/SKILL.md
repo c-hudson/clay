@@ -140,6 +140,14 @@ Every remote build must be verified to be at this SHA (see Step 6).
 
 Skip targets not selected by a platform flag.
 
+**Release builds are fat LTO with one codegen unit** (`[profile.release]` in `Cargo.toml`,
+since v1.8.1; `.claude/rules/performance.md`), so each one takes a few minutes even when
+only Clay itself changed (the musl build about 3 min 40 s). A builder that can't finish with
+it - out of memory, or far out of time - builds that one asset with
+`CARGO_PROFILE_RELEASE_LTO=thin` set in its environment (cmd.exe: `set
+CARGO_PROFILE_RELEASE_LTO=thin && cargo ...`), and the summary says which asset. Never edit
+the profile for one platform.
+
 **Run local cargo builds ONE AT A TIME.** They are not independent, whatever the target
 triple says: cargo takes an exclusive lock on the whole `target/` directory, so a second
 build prints `Blocking waiting for file lock on build directory` and waits. That is merely

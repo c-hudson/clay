@@ -612,18 +612,61 @@ pub fn world_type_matches(macro_def: &TfMacro, types: Option<(&str, &str)>) -> b
     let Some(ref pattern) = macro_def.world_type else { return true; };
     let Some((tf_type, clay_type)) = types else { return false; };
     let mode = macro_def.trigger.as_ref().map(|t| t.match_mode).unwrap_or_default();
-    // A type is matched whole, as TF matches it - so stdlib.tf's `-T{}` means "untyped"
-    // and `-T{tiny|tiny.*}` doesn't match "notiny" (a regexp is a regexp: unanchored).
+    with_world_type_regex(pattern, mode, |re| {
+        let Some(re) = re else { return false };
+        // TF's own type (`/addworld -T`), else Clay's name for the type - "mud" for either
+        // kind of MUD world, so `-Tmud` keeps working on a timed-prompt one.
+        re.is_match(tf_type)
+            || re.is_match(clay_type)
+            || (clay_type == "mud_timed_prompt" && re.is_match("mud"))
+    })
+}
+
+/// A `-T` pattern as the regex that matches a whole world type, or `None` for one that
+/// doesn't compile (which matches nothing). A type is matched whole, as TF matches it - so
+/// stdlib.tf's `-T{}` means "untyped" and `-T{tiny|tiny.*}` doesn't match "notiny" (a
+/// regexp is a regexp: unanchored).
+fn compile_world_type_pattern(pattern: &str, mode: TfMatchMode) -> Option<Regex> {
     let re = match mode {
         TfMatchMode::Regexp => compile_pattern(pattern, mode),
         _ => compile_pattern(pattern, mode).map(|re| re.and_then(|re| Regex::new(&format!("^(?:{})$", re.as_str())).ok())),
     };
-    let Ok(Some(re)) = re else { return false };
-    // TF's own type (`/addworld -T`), else Clay's name for the type - "mud" for either
-    // kind of MUD world, so `-Tmud` keeps working on a timed-prompt one.
-    re.is_match(tf_type)
-        || re.is_match(clay_type)
-        || (clay_type == "mud_timed_prompt" && re.is_match("mud"))
+    re.ok().flatten()
+}
+
+/// How many `-T` patterns a thread keeps compiled per matching style; past it the style's
+/// table starts over (scripts that make patterns up as they go must not grow it forever).
+const WORLD_TYPE_PATTERNS_MAX: usize = 256;
+
+thread_local! {
+    /// `-T` patterns compiled once, by matching style and then by pattern. `world_type_matches`
+    /// runs for every `-T` macro on every line a world sends (and on every hook that fires),
+    /// and used to compile its pattern each time - twice for a glob: ten such triggers cost
+    /// 700 µs a line, sixty times all the rest of a line's work (measured 2026-11-23).
+    /// Keyed by what the regex is made from, so a macro changed by `/edit`, a new `-m`, or
+    /// one restored after a reload needs no upkeep; per thread, as each instance's engine is.
+    static WORLD_TYPE_PATTERNS: std::cell::RefCell<[std::collections::HashMap<String, Option<Regex>>; 3]> = Default::default();
+}
+
+/// Run `f` with the compiled `-T` pattern (see [`WORLD_TYPE_PATTERNS`]). The regex is lent,
+/// never cloned: a cloned `Regex` starts with an empty cache of its own.
+fn with_world_type_regex<R>(pattern: &str, mode: TfMatchMode, f: impl FnOnce(Option<&Regex>) -> R) -> R {
+    let style = match mode {
+        TfMatchMode::Simple => 0,
+        TfMatchMode::Glob => 1,
+        TfMatchMode::Regexp => 2,
+    };
+    WORLD_TYPE_PATTERNS.with(|tables| {
+        let mut tables = tables.borrow_mut();
+        let table = &mut tables[style];
+        if !table.contains_key(pattern) {
+            if table.len() >= WORLD_TYPE_PATTERNS_MAX {
+                table.clear();
+            }
+            table.insert(pattern.to_string(), compile_world_type_pattern(pattern, mode));
+        }
+        f(table.get(pattern).and_then(Option::as_ref))
+    })
 }
 
 /// Match a line against a trigger and return captures if matched
@@ -638,6 +681,11 @@ pub struct TriggerMatch<'a> {
 pub fn match_trigger<'a>(trigger: &TfTrigger, line: &'a str) -> Option<TriggerMatch<'a>> {
     let regex = trigger.compiled.as_ref()?;
 
+    // Nearly every line matches nearly no trigger: `is_match` answers that without the
+    // capture-group search `captures` runs (and its allocation).
+    if !regex.is_match(line) {
+        return None;
+    }
     let caps = regex.captures(line)?;
     let full = caps.get(0)?;
 
@@ -2527,6 +2575,45 @@ mod tests {
         plain.sort();
         assert_eq!(plain, vec!["mud", "untyped"]);
         assert_eq!(fired(&mut engine, "Other"), vec!["mud"], "-T{{tiny|tiny.*}} matches the whole type");
+    }
+
+    /// The `-T` pattern is compiled once and kept by (style, pattern): the answers are the
+    /// same on every call, the same pattern means different things in different styles, a
+    /// pattern that doesn't compile matches nothing, and the table starts over when full.
+    #[test]
+    fn test_world_type_pattern_is_compiled_once_per_style() {
+        let with = |style: &str, pattern: &str| parse_def(&format!(r#"-m{style} -T"{pattern}" -t"x" m = /echo x"#)).unwrap();
+        let types = |tf: &'static str| Some((tf, "mud"));
+        for _ in 0..3 {
+            // Glob: `tiny.*` is a literal dot then anything; whole-type.
+            assert!(world_type_matches(&with("glob", "tiny.*"), types("tiny.muck")));
+            assert!(!world_type_matches(&with("glob", "tiny.*"), types("tinymuck")));
+            // Regexp: `tiny.*` is any character, unanchored.
+            assert!(world_type_matches(&with("regexp", "tiny.*"), types("tinymuck")));
+            assert!(world_type_matches(&with("regexp", "tiny.*"), types("notinymuck")));
+            // Simple: the pattern itself, whole.
+            assert!(world_type_matches(&with("simple", "tiny.*"), types("tiny.*")));
+            assert!(!world_type_matches(&with("simple", "tiny.*"), types("tiny.muck")));
+            // Clay's own name for the type, and "mud" for a timed-prompt world.
+            assert!(world_type_matches(&with("glob", "mud"), Some(("", "mud"))));
+            assert!(world_type_matches(&with("glob", "mud"), Some(("", "mud_timed_prompt"))));
+            // A pattern that isn't a regex matches nothing, every time.
+            assert!(!world_type_matches(&with("regexp", "(unclosed"), types("(unclosed")));
+        }
+        WORLD_TYPE_PATTERNS.with(|t| {
+            let t = t.borrow();
+            assert!(t[1].contains_key("tiny.*") && t[2].contains_key("tiny.*") && t[0].contains_key("tiny.*"));
+            assert!(matches!(t[2].get("(unclosed"), Some(None)), "the failure is kept too, not retried per line");
+        });
+        // Full: the table starts over, and what is asked next still answers right.
+        for i in 0..WORLD_TYPE_PATTERNS_MAX + 10 {
+            assert!(!world_type_matches(&with("glob", &format!("made-up-{i}")), types("tiny.muck")));
+        }
+        WORLD_TYPE_PATTERNS.with(|t| assert!(t.borrow()[1].len() <= WORLD_TYPE_PATTERNS_MAX));
+        assert!(world_type_matches(&with("glob", "tiny.*"), types("tiny.muck")));
+        // A macro with no -T matches any world; one with -T and no world to ask, none.
+        assert!(world_type_matches(&parse_def(r#"-t"x" m = /echo x"#).unwrap(), None));
+        assert!(!world_type_matches(&with("glob", "mud"), None));
     }
 
     #[test]

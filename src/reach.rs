@@ -324,10 +324,41 @@ pub fn format_reach_lines(info: &ReachabilityInfo) -> Vec<String> {
 /// Deliberately a *separate* function from `get_local_ip_addresses()`: that one
 /// feeds the self-signed certificate's SANs and its change detection, and
 /// widening it would regenerate the cert and trip every client's TOFU pin.
+///
+/// **Kept for [`LOCAL_ADDRS_TTL`].** Listing them runs a subprocess on every platform
+/// (`hostname -I`, `ipconfig`, `ifconfig`), and this is asked for by every
+/// `GlobalSettingsMsg` built - so by every login and every settings broadcast, on the
+/// event loop: each login stalled the whole server about 53 ms (measured 2026-11-23). A
+/// machine's addresses change rarely; an explicit refresh (`/reach --refresh`, a Refresh
+/// button) asks again at once ([`forget_local_addrs`]).
 pub fn local_ipv4_addrs() -> Vec<String> {
+    let mut kept = LOCAL_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(addrs) = still_fresh(&kept, std::time::Instant::now()) {
+        return addrs;
+    }
     let mut raw: Vec<String> = crate::get_local_ip_addresses();
     raw.extend(platform_extra_v4());
-    dedupe_usable_v4(raw)
+    let addrs = dedupe_usable_v4(raw);
+    *kept = Some((std::time::Instant::now(), addrs.clone()));
+    addrs
+}
+
+/// How long [`local_ipv4_addrs`] answers from its last listing.
+pub const LOCAL_ADDRS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The last listing and when it was made; one for the process (the machine's addresses
+/// are every instance's).
+static LOCAL_ADDRS: std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>> = std::sync::Mutex::new(None);
+
+/// The kept listing, while it is younger than [`LOCAL_ADDRS_TTL`].
+fn still_fresh(kept: &Option<(std::time::Instant, Vec<String>)>, now: std::time::Instant) -> Option<Vec<String>> {
+    let (at, addrs) = kept.as_ref()?;
+    (now.saturating_duration_since(*at) < LOCAL_ADDRS_TTL).then(|| addrs.clone())
+}
+
+/// Ask the system again at the next [`local_ipv4_addrs`]: the user asked for a refresh.
+pub fn forget_local_addrs() {
+    *LOCAL_ADDRS.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Extra addresses from the platform's interface lister; empty on Linux, where
@@ -642,6 +673,22 @@ mod tests {
                    \tinet 192.168.1.30 netmask 0xffffff00 broadcast 192.168.1.255\n\
                    utun3: flags=8051<UP,POINTOPOINT> mtu 1280\n\tinet 100.101.102.104 --> 100.101.102.104 netmask 0xffffffff\n";
         assert_eq!(parse_ifconfig_v4(out), vec!["127.0.0.1", "192.168.1.30", "100.101.102.104"]);
+    }
+
+    /// The address list is listed once a minute at most (each listing runs a subprocess,
+    /// and every login asks), and never reused past that.
+    #[test]
+    fn the_address_list_is_kept_for_a_minute() {
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let list = vec!["192.168.1.20".to_string()];
+        let at = |secs_ago: u64| Some((now - std::time::Duration::from_secs(secs_ago), list.clone()));
+        assert_eq!(still_fresh(&at(0), now), Some(list.clone()));
+        assert_eq!(still_fresh(&at(59), now), Some(list.clone()));
+        assert_eq!(still_fresh(&at(60), now), None);
+        assert_eq!(still_fresh(&at(600), now), None);
+        assert_eq!(still_fresh(&None, now), None);
+        // An empty listing is an answer too (a machine with no network): kept like any other.
+        assert_eq!(still_fresh(&Some((now, Vec::new())), now), Some(Vec::new()));
     }
 
     #[test]

@@ -12,7 +12,7 @@ Open with `/setup` command:
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| More mode | Enable more-style pausing | On |
+| More mode | Enable more-style pausing: output stops when a screenful has arrived, until you release it. Switched on in the middle of a session, it counts the lines that arrive from that moment on; nothing already on screen is held or recounted | On |
 | Spell check | Enable spell checking | On |
 | Temp convert | Auto-convert temperatures in input | Off |
 | World Switching | World cycling behavior | Unseen First |

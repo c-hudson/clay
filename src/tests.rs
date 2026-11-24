@@ -1971,6 +1971,79 @@
             "Expected 77 pending lines, got {}", world.pending_lines.len());
     }
 
+    /// With more-mode off no row is counted at all (each count wraps the whole line: a
+    /// third of the server's work per line, and for a world nobody viewed a screenful of
+    /// old lines re-measured on every packet): whole lines, a partial and its completion,
+    /// a filtered partial, a watched world and an unwatched one all leave the count alone.
+    #[test]
+    fn more_mode_off_counts_no_rows() {
+        let off = Settings { more_mode_enabled: false, ..Settings::default() };
+        for is_current in [true, false] {
+            let mut world = World::new("test");
+            world.lines_since_pause = 5;
+            let data: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+            world.add_output(&data, is_current, &off, 24, 80, false, true, false);
+            assert_eq!(world.lines_since_pause, 5, "whole lines (is_current={is_current})");
+            // A partial line, then its completion (a long one, several rows).
+            world.add_output("a prompt> ", is_current, &off, 24, 80, false, true, false);
+            assert_eq!(world.lines_since_pause, 5);
+            world.add_output(&format!("{}\n", "x".repeat(400)), is_current, &off, 24, 80, false, true, false);
+            assert_eq!(world.lines_since_pause, 5, "a completed partial");
+            // A partial that completes into nothing shown is removed, uncounted.
+            world.add_output("   ", is_current, &off, 24, 80, false, true, false);
+            world.add_output("\n", is_current, &off, 24, 80, false, true, false);
+            assert_eq!(world.lines_since_pause, 5, "a filtered partial");
+            assert!(!world.paused && world.pending_lines.is_empty());
+            assert_eq!(world.output_lines.len(), 101);
+            assert!(world.output_lines.windows(2).all(|w| w[0].seq < w[1].seq), "sorted by seq");
+        }
+    }
+
+    /// Switching more-mode on resets and recounts nothing (user ruling 2026-11-23:
+    /// "Switching on the more mode should not get a fresh page. It should just start the
+    /// counting of lines"): rows are counted from then on, added to what the world's count
+    /// already was, whatever arrived while it was off.
+    #[test]
+    fn more_mode_switched_on_counts_from_where_the_count_stood() {
+        let off = Settings { more_mode_enabled: false, ..Settings::default() };
+        let on = Settings { more_mode_enabled: true, ..Settings::default() };
+        let lines = |n: usize, tag: &str| -> String { (1..=n).map(|i| format!("{tag} {i}\n")).collect() };
+        // The page is 24 - 2 = 22 rows. The count stood at 5 when more-mode went off.
+        let mut world = World::new("test");
+        world.add_output(&lines(5, "before"), true, &on, 24, 80, false, true, false);
+        assert_eq!(world.lines_since_pause, 5);
+        world.add_output(&lines(500, "while off"), true, &off, 24, 80, false, true, false);
+        assert_eq!(world.lines_since_pause, 5, "nothing counted while off");
+        assert!(!world.paused);
+        // On again: 17 more rows fill the page, the 18th pauses, the rest is held.
+        world.add_output(&lines(17, "after"), true, &on, 24, 80, false, true, false);
+        assert!(!world.paused, "the page is exactly full");
+        assert_eq!(world.lines_since_pause, 22);
+        world.add_output(&lines(10, "more"), true, &on, 24, 80, false, true, false);
+        assert!(world.paused);
+        assert_eq!(world.pending_lines.len(), 9, "the line that filled the page is shown, the rest held");
+
+        // A count the last sent command zeroed starts a full page, as it always did.
+        let mut world = World::new("test");
+        world.add_output(&lines(300, "while off"), true, &off, 24, 80, false, true, false);
+        assert_eq!(world.lines_since_pause, 0);
+        world.add_output(&lines(22, "after"), true, &on, 24, 80, false, true, false);
+        assert!(!world.paused);
+        world.add_output(&lines(1, "one more"), true, &on, 24, 80, false, true, false);
+        assert!(world.paused);
+
+        // A world still paused with held lines when more-mode went off and nothing arrived
+        // since keeps both: switching on touches nothing.
+        let mut world = World::new("test");
+        world.add_output(&lines(40, "held"), true, &on, 24, 80, false, true, false);
+        let (held, count) = (world.pending_lines.len(), world.lines_since_pause);
+        assert!(world.paused && held > 0);
+        world.add_output(&lines(3, "on again"), true, &on, 24, 80, false, true, false);
+        assert!(world.paused);
+        assert_eq!(world.pending_lines.len(), held + 3, "behind a pause every line is held");
+        assert_eq!(world.lines_since_pause, count);
+    }
+
     // Regression: sending a command while scrolled up into scrollback must NOT drop the
     // user back to the bottom. reset_more_mode_on_send() must be a no-op unless the
     // viewport is already at the bottom.
@@ -13703,6 +13776,192 @@ third
 
     /// `/hilite` colours are applied to the server-side buffer but used to be dropped on the
     /// live path entirely, so a highlighted line arrived and rendered plain until a resync.
+    /// The console's draw pacer (rendering::DrawPacer): text that trickles in one packet at
+    /// a time is drawn at most once a frame, input and timers at once, and a draw held
+    /// back is always made.
+    #[test]
+    fn the_draw_pacer_holds_back_only_what_may_wait() {
+        use crate::rendering::{DrawPacer, DRAW_PACE};
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut p = DrawPacer::default();
+        // Nothing asked, nothing drawn, nothing owed.
+        assert!(!p.draw_now(false, false, ms(0)));
+        assert_eq!(p.due(), None);
+        // The first paced draw is at once.
+        assert!(p.draw_now(true, false, ms(0)));
+        assert_eq!(p.due(), None);
+        // A second inside the frame is owed, due a frame after the last.
+        assert!(!p.draw_now(true, false, ms(5)));
+        assert_eq!(p.due(), Some(ms(0) + DRAW_PACE));
+        // More of them change nothing: the deadline never moves later.
+        assert!(!p.draw_now(true, false, ms(10)));
+        assert_eq!(p.due(), Some(ms(0) + DRAW_PACE));
+        // The timer brings the loop back with nothing new asked: the owed draw is made.
+        assert!(p.draw_now(false, false, ms(16)));
+        assert_eq!(p.due(), None);
+        // ... and that draw starts the next frame.
+        assert!(!p.draw_now(true, false, ms(20)));
+        assert_eq!(p.due(), Some(ms(16) + DRAW_PACE));
+        // Urgent goes at once and takes the owed draw with it.
+        assert!(p.draw_now(false, true, ms(21)));
+        assert_eq!(p.due(), None);
+        assert!(!p.draw_now(true, false, ms(22)), "it drew paced changes, so it started a frame");
+        assert!(p.draw_now(false, false, ms(21 + 16)));
+
+        // A draw for input alone opens no frame: the first reply after a key is at once.
+        let mut p = DrawPacer::default();
+        assert!(p.draw_now(true, false, ms(100)));
+        assert!(p.draw_now(false, true, ms(200)), "a key");
+        assert!(p.draw_now(true, false, ms(201)), "its reply, a millisecond later");
+        // A steady trickle: 200 lines a second for a second is about sixty draws, not 200
+        // (the loop's timer fires an owed draw when it is due, between two lines).
+        let mut p = DrawPacer::default();
+        let mut draws = 0;
+        for i in 0..200u64 {
+            let at = ms(1000 + i * 5);
+            if p.due().is_some_and(|due| due <= at) {
+                let due = p.due().unwrap();
+                assert!(p.draw_now(false, false, due));
+                draws += 1;
+            }
+            if p.draw_now(true, false, at) { draws += 1; }
+        }
+        assert!((58..=66).contains(&draws), "{draws} draws");
+        // The last line is owed or drawn, never forgotten.
+        if let Some(due) = p.due() {
+            assert!(p.draw_now(false, false, due));
+        }
+        assert_eq!(p.due(), None);
+    }
+
+    /// Text for a world the console doesn't show asks for no repaint of the output area
+    /// (it was a whole repaint per packet, whichever world the packet was for); a world in
+    /// either pane does, and so does a gagged run under F2.
+    #[test]
+    fn only_a_world_on_screen_asks_for_an_output_repaint() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["Alpha", "Bravo", "Charlie"] {
+            let mut w = World::new(name);
+            w.connected = true;
+            w.showing_splash = false;
+            app.worlds.push(w);
+        }
+        app.current_world_index = 0;
+        app.console_tui = true;
+        let mut fed = |app: &mut App, world: usize, bytes: &[u8]| -> bool {
+            app.needs_output_redraw = false;
+            app.process_server_data(world, bytes, 24, 80, false);
+            app.needs_output_redraw
+        };
+        assert!(fed(&mut app, 0, b"shown\r\n"), "the world on screen");
+        assert!(!fed(&mut app, 1, b"elsewhere\r\n"), "a world not on screen");
+        assert_eq!(app.worlds[1].output_lines.len(), 1, "its line is stored all the same");
+        // Split: the other pane's world is on screen too.
+        assert_eq!(app.split_open(Some("Charlie")), Ok(()));
+        assert!(app.console_shows(2));
+        assert!(fed(&mut app, 2, b"the other pane\r\n"));
+        assert!(!fed(&mut app, 1, b"still elsewhere\r\n"));
+        // A gagged run is drawn only while tags are shown (F2).
+        let mut gag = crate::actions::Action { name: "g".to_string(), command: "/gag".to_string(), ..Default::default() };
+        gag.patterns = vec![crate::actions::MatchPattern { pattern: "^SPAM".to_string(), compiled_regex: None }];
+        gag.compile_regex();
+        app.settings.actions = vec![gag];
+        app.show_tags = false;
+        assert!(!fed(&mut app, 0, b"SPAM hidden\r\n"));
+        app.show_tags = true;
+        assert!(fed(&mut app, 0, b"SPAM shown under F2\r\n"));
+        assert!(!fed(&mut app, 1, b"SPAM elsewhere\r\n"));
+    }
+
+    /// An attached console draws nothing for a message that changes nothing on its screen
+    /// (it drew everything for every message: twice a packet, counting the ActivityUpdate
+    /// that follows each one), the bar alone for a new activity count, and everything for
+    /// whatever isn't named.
+    #[test]
+    fn an_attached_console_draws_only_what_a_message_changes() {
+        use crate::RemoteDraw::{All, Bar, Nothing};
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["Alpha", "Bravo", "Charlie"] {
+            app.worlds.push(World::new(name));
+        }
+        app.current_world_index = 0;
+        let text = |world_index: usize| WsMessage::ServerData {
+            world_index, data: "a line\n".to_string(), is_viewed: false, ts: 0, from_server: true,
+            seq: 1, end_seq: Some(1), flush: false, gagged: false, archive_sourced: false,
+            highlight_colors: Vec::new(), originals: Vec::new(),
+        };
+        assert_eq!(app.remote_message_draw(&text(0)), All);
+        assert_eq!(app.remote_message_draw(&text(1)), Nothing);
+        // The activity count: on the bar, and only when it changes.
+        app.server_activity_count = 2;
+        assert_eq!(app.remote_message_draw(&WsMessage::ActivityUpdate { count: 2 }), Nothing);
+        assert_eq!(app.remote_message_draw(&WsMessage::ActivityUpdate { count: 3 }), Bar);
+        assert_eq!(app.remote_message_draw(&WsMessage::UnseenUpdate { world_index: 1, count: 9 }), Nothing);
+        assert_eq!(app.remote_message_draw(&WsMessage::UnseenCleared { world_index: 0 }), Nothing);
+        // Held lines: a shown world's count changing.
+        app.worlds[0].pending_count = 4;
+        assert_eq!(app.remote_message_draw(&WsMessage::PendingCountUpdate { world_index: 0, count: 4 }), Nothing);
+        assert_eq!(app.remote_message_draw(&WsMessage::PendingCountUpdate { world_index: 0, count: 5 }), All);
+        assert_eq!(app.remote_message_draw(&WsMessage::PendingLinesUpdate { world_index: 0, count: 0 }), All);
+        assert_eq!(app.remote_message_draw(&WsMessage::PendingLinesUpdate { world_index: 1, count: 7 }), Nothing);
+        // Anything else is everything, as before.
+        assert_eq!(app.remote_message_draw(&WsMessage::WorldSwitched { new_index: 1 }), All);
+        assert_eq!(app.remote_message_draw(&WsMessage::WorldDisconnected { world_index: 1 }), All);
+
+        // And the handlers leave the output flag alone where nothing in the output changed.
+        let mut applied = |app: &mut App, msg: WsMessage| -> bool {
+            app.needs_output_redraw = false;
+            app.handle_remote_ws_message(msg);
+            app.needs_output_redraw
+        };
+        assert!(applied(&mut app, text(0)));
+        assert!(!applied(&mut app, text(1)));
+        assert_eq!(app.worlds[1].output_lines.last().map(|l| l.text.as_str()), Some("a line"), "kept all the same");
+        assert!(!applied(&mut app, WsMessage::ActivityUpdate { count: 5 }));
+        assert_eq!(app.server_activity_count, 5);
+        assert!(!applied(&mut app, WsMessage::PendingLinesUpdate { world_index: 1, count: 7 }));
+        assert_eq!(app.worlds[1].pending_count, 7);
+        assert!(applied(&mut app, WsMessage::PendingLinesUpdate { world_index: 0, count: 1 }));
+    }
+
+    /// An action's `/highlight` colours the line it matched whether or not the MUD had
+    /// coloured that line itself. The colours are matched back to the stored lines by text,
+    /// and that map was keyed by the raw text but asked with the text stripped of its
+    /// escape codes - so a line with any colour code never got its highlight (found by a
+    /// test line in the 2026-11-23 CPU investigation, where the same action's /echo fired).
+    #[test]
+    fn an_actions_highlight_reaches_a_line_the_mud_coloured() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        let mut action = crate::actions::Action { name: "hl".to_string(), command: "/highlight blue".to_string(), ..Default::default() };
+        action.patterns = vec![crate::actions::MatchPattern { pattern: "treasure".to_string(), compiled_regex: None }];
+        action.compile_regex();
+        app.settings.actions = vec![action];
+
+        app.process_server_data(
+            0,
+            b"a plain treasure line\r\n\x1b[32ma green\x1b[0m treasure \x1b[1;31mline\x1b[0m\r\nnothing to see\r\n\x1b[33mnothing coloured\x1b[0m\r\n",
+            24, 80, false,
+        );
+
+        let got: Vec<(String, Option<String>)> = app.worlds[0].output_lines.iter()
+            .map(|l| (crate::util::strip_ansi_codes(&l.text), l.highlight_color.clone()))
+            .collect();
+        assert_eq!(got, vec![
+            ("a plain treasure line".to_string(), Some("blue".to_string())),
+            ("a green treasure line".to_string(), Some("blue".to_string())),
+            ("nothing to see".to_string(), None),
+            ("nothing coloured".to_string(), None),
+        ]);
+        // The MUD's own colours are still in the stored line.
+        assert!(app.worlds[0].output_lines[1].text.contains("\x1b[32m"));
+    }
+
     /// The array is omitted (empty) when nothing in the batch is highlighted, so the common
     /// path stays free.
     #[test]
@@ -17533,6 +17792,43 @@ third
         let next = world.next_seq;
         assert!(!world.output_lines.iter().any(|l| l.seq == next),
             "the next live line would be issued seq {}, which is already in the buffer", next);
+    }
+
+    /// The keepalive's "is next_seq above everything held" check finds the highest seq
+    /// without walking the live buffer (3.4 ms a client a keepalive on a million-line
+    /// session): the paged-in archive block, the last live line, the last held line.
+    #[test]
+    fn the_highest_held_seq_is_found_without_a_scan() {
+        let mut world = World::new("w");
+        world.output_lines.clear();
+        world.next_seq = 0;
+        world.ensure_next_seq_above_buffer();
+        assert_eq!(world.next_seq, 0, "nothing held, nothing to repair");
+        // Held lines sit above everything shown.
+        for seq in 0..10u64 {
+            world.output_lines.push(OutputLine::new(format!("shown {seq}"), seq));
+        }
+        for seq in 10..20u64 {
+            world.pending_lines.push(OutputLine::new(format!("held {seq}"), seq));
+        }
+        world.next_seq = 5;
+        world.ensure_next_seq_above_buffer();
+        assert_eq!(world.next_seq, 20);
+        // Only a paged-in archive block, with made-up seqs above the counter.
+        let mut world = World::new("w");
+        world.output_lines.clear();
+        for seq in [7u64, 8, 9, 3, 4] {
+            let mut line = OutputLine::new(format!("archived {seq}"), seq);
+            line.from_archive = true;
+            world.output_lines.push(line);
+        }
+        world.next_seq = 2;
+        world.ensure_next_seq_above_buffer();
+        assert_eq!(world.next_seq, 10, "the block's highest, wherever in the block it is");
+        // A counter already above everything is left alone.
+        world.next_seq = 500;
+        world.ensure_next_seq_above_buffer();
+        assert_eq!(world.next_seq, 500);
     }
 
     #[test]
@@ -24312,6 +24608,45 @@ fn the_web_page_announces_shown_lines_once_in_screen_reader_mode() {
     assert!(!js[js.find("function renderOutput(").unwrap()..].split("\n    function ").next().unwrap().contains("announceLine"), "never from a redraw");
     assert!(js.contains("screen_reader_profile: (screenReaderProfiles && fontProfileKey in screenReaderProfiles)"));
     assert!(js.contains("if (screenReader) return 0;"), "no Text Reveal in Screen Reader mode");
+}
+
+/// The web page's output path (the 2026-11-23 CPU fixes): the server's counter messages
+/// rebuild the bar once a frame, not once each - two or three follow every packet of every
+/// world, and each read the layout over lines just inserted - and the ANSI palette is read
+/// once per theme, not once per coloured line. Pinned by source, as the other app.js rules
+/// are; run for real in headless Firefox when any of it changes.
+#[test]
+fn the_web_page_rebuilds_its_bar_once_a_frame_and_reads_the_palette_once() {
+    let js = include_str!("web/app.js");
+    let func = |name: &str| -> &str {
+        let start = js.find(&format!("    function {name}(")).unwrap_or_else(|| panic!("no function {name}"));
+        js[start..].split("\n    function ").next().unwrap()
+    };
+    let case = |name: &str| -> &str {
+        let start = js.find(&format!("            case '{name}':")).unwrap_or_else(|| panic!("no case {name}"));
+        let rest = &js[start..];
+        &rest[..rest.find("                break;").unwrap()]
+    };
+    // The four counter messages: never the whole bar on the spot.
+    for name in ["UnseenCleared", "UnseenUpdate", "ActivityUpdate", "PendingLinesUpdate"] {
+        let body = case(name);
+        assert!(body.contains("statusBarSoon();"), "{name} schedules the bar");
+        assert!(!body.contains("updateStatusBar();"), "{name} must not rebuild the bar itself");
+    }
+    assert!(case("ActivityUpdate").contains("reportBadge();"), "the taskbar's badge doesn't wait for a frame");
+    let soon = func("statusBarSoon");
+    assert!(soon.contains("if (document.hidden) updateStatusBar();") && soon.contains("else scheduleStatusBar();"),
+        "a hidden page gets no frame: its bar is rebuilt at once");
+
+    // The ANSI palette: kept per theme, dropped wherever the theme's variables are written.
+    let parse = func("parseAnsi");
+    assert!(parse.contains("let themeAnsiPalette = ansiPaletteKept;") && parse.contains("let colorNameToRgb = ansiColorNamesKept;"));
+    assert!(func("applyThemeAppearance").contains("forgetAnsiPalette();"));
+    assert!(func("applyThemeColors").contains("forgetAnsiPalette();"));
+    assert!(js.find("let ansiPaletteKept = null;").unwrap() < js.find("    function applyThemeAppearance(").unwrap(),
+        "declared before the theme functions can run (they are called while the page starts)");
+    // The clock, every second: set only when its text changes.
+    assert!(func("updateTime").contains("if (elements.statusTime.textContent !== text) elements.statusTime.textContent = text;"));
 }
 
 /// The size popup (src/sizepopup.rs): the web page shows the output's size in characters

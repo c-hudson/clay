@@ -1443,6 +1443,10 @@ pub fn run_command_capture(cmd: &str, args: &[&str], timeout_secs: u64) -> Optio
     let mut child = command.spawn().ok()?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // Wait in short steps that grow to 50 ms: a tool that answers in a couple of
+    // milliseconds (`hostname -I`) used to cost its caller a full 50 ms nap every time,
+    // and most callers are on an event loop.
+    let mut nap = std::time::Duration::from_millis(1);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -1456,7 +1460,8 @@ pub fn run_command_capture(cmd: &str, args: &[&str], timeout_secs: u64) -> Optio
                     let _ = child.wait();
                     return None;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(std::time::Duration::from_millis(50));
             }
             Err(_) => return None,
         }

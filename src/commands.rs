@@ -840,6 +840,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output(&get_version_string());
         }
         Command::Reach { refresh, lookup } => {
+            if refresh {
+                crate::reach::forget_local_addrs();
+            }
             for line in crate::reach::format_reach_lines(&app.build_reachability_info()) {
                 app.add_output(&line);
             }

@@ -923,6 +923,11 @@ pub fn check_action_triggers_plain(
         // Test each pattern in order; first match fires the action
         for mp in &action.patterns {
             if let Some(ref regex) = mp.compiled_regex {
+                // Nearly every line matches nearly no action: `is_match` answers that
+                // without the capture-group search `captures` runs (and its allocation).
+                if !regex.is_match(plain_line) {
+                    continue;
+                }
                 if let Some(caps) = regex.captures(plain_line) {
                     // Extract capture groups: $0 is full match, $1-$9 are groups
                     let captures: Vec<&str> = caps.iter()
